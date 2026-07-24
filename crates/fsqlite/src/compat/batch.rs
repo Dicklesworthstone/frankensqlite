@@ -1,5 +1,7 @@
 //! `execute_batch` support, analogous to `rusqlite::Connection::execute_batch`.
 
+use std::future::Future;
+
 use fsqlite_error::FrankenError;
 
 use crate::Connection;
@@ -23,13 +25,13 @@ pub trait BatchExt {
     ///     CREATE INDEX IF NOT EXISTS idx_name ON users(name);
     /// ")?;
     /// ```
-    fn execute_batch(&self, sql: &str) -> Result<(), FrankenError>;
+    fn execute_batch(&self, sql: &str) -> impl Future<Output = Result<(), FrankenError>>;
 }
 
 impl BatchExt for Connection {
     #[allow(clippy::use_self)]
-    fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
-        Connection::execute_batch(self, sql)
+    async fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
+        Connection::execute_batch(self, sql).await
     }
 }
 

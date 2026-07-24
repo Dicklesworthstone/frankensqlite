@@ -2,8 +2,8 @@
 use super::*;
 
 impl Connection {
-    pub(super) fn pragma_integrity_check_rows(&self, quick: bool) -> Vec<Row> {
-        let outcome = match self.validate_database_integrity(quick) {
+    pub(super) async fn pragma_integrity_check_rows(&self, quick: bool) -> Vec<Row> {
+        let outcome = match self.validate_database_integrity(quick).await {
             Ok(()) => "ok".to_owned(),
             Err(err) => err.to_string(),
         };
@@ -12,7 +12,7 @@ impl Connection {
         }]
     }
 
-    pub(super) fn pragma_wal_checkpoint_rows(
+    pub(super) async fn pragma_wal_checkpoint_rows(
         &self,
         pragma: &fsqlite_ast::PragmaStatement,
     ) -> Result<Vec<Row>> {
@@ -34,8 +34,10 @@ impl Connection {
                 ],
             }]);
         }
+        let cx = self.op_cx()?;
         if self.wal_checkpoint_blocked_by_active_concurrent_txns() {
-            let log_frames = i64::try_from(self.pager.wal_frame_count()).unwrap_or(i64::MAX);
+            let log_frames =
+                i64::try_from(self.pager.wal_frame_count(&cx).await).unwrap_or(i64::MAX);
             return Ok(vec![Row {
                 values: vec![
                     SqliteValue::Integer(1),
@@ -45,11 +47,10 @@ impl Connection {
             }]);
         }
 
-        let cx = self.op_cx()?;
-        self.invalidate_cached_write_txn(&cx);
-        self.invalidate_cached_read_snapshot(&cx);
+        self.invalidate_cached_write_txn(&cx).await;
+        self.invalidate_cached_read_snapshot(&cx).await;
         let checkpoint_metrics_before = fsqlite_wal::GLOBAL_WAL_METRICS.snapshot();
-        let result = self.pager.checkpoint(&cx, mode)?;
+        let result = self.pager.checkpoint(&cx, mode).await?;
         let checkpoint_metrics_after = fsqlite_wal::GLOBAL_WAL_METRICS.snapshot();
         let checkpoint_duration_us = checkpoint_metrics_after
             .checkpoint_duration_us_total

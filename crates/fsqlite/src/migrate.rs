@@ -108,7 +108,7 @@ impl MigrationRunner {
     ///
     /// Returns `FrankenError` if any SQL statement fails or the tracking
     /// table cannot be created/queried.
-    pub fn run(&self, conn: &Connection) -> Result<MigrationResult, FrankenError> {
+    pub async fn run(&self, conn: &Connection) -> Result<MigrationResult, FrankenError> {
         // Ensure the tracking table exists.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS _schema_migrations (\
@@ -116,23 +116,24 @@ impl MigrationRunner {
                 name TEXT NOT NULL, \
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))\
             );",
-        )?;
+        )
+        .await?;
 
         // Read the current maximum version.
-        let initial_version = Self::read_current_version(conn)?;
+        let initial_version = Self::read_current_version(conn).await?;
         let was_fresh = initial_version == 0;
         let mut applied = Vec::new();
 
         for migration in &self.migrations {
-            if Self::version_is_applied(conn, migration.version)? {
+            if Self::version_is_applied(conn, migration.version).await? {
                 continue;
             }
 
-            if Self::apply_one(conn, migration)? {
+            if Self::apply_one(conn, migration).await? {
                 applied.push(migration.version);
             }
         }
-        let current_version = Self::read_current_version(conn)?;
+        let current_version = Self::read_current_version(conn).await?;
 
         Ok(MigrationResult {
             applied,
@@ -142,8 +143,10 @@ impl MigrationRunner {
     }
 
     /// Reads `MAX(version)` from `_schema_migrations`, returning 0 if empty.
-    fn read_current_version(conn: &Connection) -> Result<i64, FrankenError> {
-        let rows = conn.query("SELECT MAX(version) FROM _schema_migrations;")?;
+    async fn read_current_version(conn: &Connection) -> Result<i64, FrankenError> {
+        let rows = conn
+            .query("SELECT MAX(version) FROM _schema_migrations;")
+            .await?;
         if let Some(row) = rows.first() {
             match row.get(0) {
                 Some(SqliteValue::Integer(v)) => Ok(*v),
@@ -154,11 +157,13 @@ impl MigrationRunner {
         }
     }
 
-    fn version_is_applied(conn: &Connection, version: i64) -> Result<bool, FrankenError> {
-        let rows = conn.query_with_params(
-            "SELECT 1 FROM _schema_migrations WHERE version = ?1 LIMIT 1;",
-            &[SqliteValue::Integer(version)],
-        )?;
+    async fn version_is_applied(conn: &Connection, version: i64) -> Result<bool, FrankenError> {
+        let rows = conn
+            .query_with_params(
+                "SELECT 1 FROM _schema_migrations WHERE version = ?1 LIMIT 1;",
+                &[SqliteValue::Integer(version)],
+            )
+            .await?;
         Ok(!rows.is_empty())
     }
 
@@ -167,10 +172,10 @@ impl MigrationRunner {
     ///
     /// Returns `true` when this connection actually applied the migration and
     /// `false` when another connection finished it first.
-    fn apply_one(conn: &Connection, migration: &Migration) -> Result<bool, FrankenError> {
+    async fn apply_one(conn: &Connection, migration: &Migration) -> Result<bool, FrankenError> {
         let started = Instant::now();
         loop {
-            match Self::apply_one_once(conn, migration) {
+            match Self::apply_one_once(conn, migration).await {
                 Err(FrankenError::Busy) if started.elapsed() < MIGRATION_BUSY_RETRY_TIMEOUT => {
                     thread::sleep(MIGRATION_BUSY_RETRY_BACKOFF);
                 }
@@ -179,40 +184,48 @@ impl MigrationRunner {
         }
     }
 
-    fn apply_one_once(conn: &Connection, migration: &Migration) -> Result<bool, FrankenError> {
-        conn.execute("BEGIN IMMEDIATE;")?;
-        let result = (|| -> Result<bool, FrankenError> {
-            if Self::version_is_applied(conn, migration.version)? {
-                conn.execute("COMMIT;")?;
+    async fn apply_one_once(
+        conn: &Connection,
+        migration: &Migration,
+    ) -> Result<bool, FrankenError> {
+        conn.execute("BEGIN IMMEDIATE;").await?;
+        let result: Result<bool, FrankenError> = async {
+            if Self::version_is_applied(conn, migration.version).await? {
+                conn.execute("COMMIT;").await?;
                 return Ok(false);
             }
 
-            Self::apply_one_inner(conn, migration)?;
-            conn.execute("COMMIT;")?;
+            Self::apply_one_inner(conn, migration).await?;
+            conn.execute("COMMIT;").await?;
             Ok(true)
-        })();
+        }
+        .await;
 
         match result {
             Ok(applied) => Ok(applied),
             Err(err) => {
                 // Best-effort rollback; ignore rollback errors since
                 // the original error is more informative.
-                let _ = conn.execute("ROLLBACK;");
+                let _ = conn.execute("ROLLBACK;").await;
                 Err(err)
             }
         }
     }
 
     /// Executes migration SQL and records the version, without transaction management.
-    fn apply_one_inner(conn: &Connection, migration: &Migration) -> Result<(), FrankenError> {
-        conn.execute_batch(migration.up_sql)?;
+    async fn apply_one_inner(
+        conn: &Connection,
+        migration: &Migration,
+    ) -> Result<(), FrankenError> {
+        conn.execute_batch(migration.up_sql).await?;
         conn.execute_with_params(
             "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2);",
             &[
                 SqliteValue::Integer(migration.version),
                 SqliteValue::Text(migration.name.into()),
             ],
-        )?;
+        )
+        .await?;
         Ok(())
     }
 }

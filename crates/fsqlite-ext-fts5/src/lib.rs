@@ -8,6 +8,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::AsyncFnMut;
 use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
@@ -2291,65 +2292,30 @@ impl Fts5ShadowRows {
 /// All methods take `&mut self` because the host implementation drives a
 /// b-tree cursor; they MUST read from the same transaction snapshot as the
 /// owning query so results are MVCC-consistent.
+#[allow(async_fn_in_trait)]
 pub trait Fts5OnDiskReader {
     /// Raw `_data.block` bytes for an encoded id, or `None` if the row is absent.
-    fn read_data_block(&mut self, id: i64) -> Result<Option<Vec<u8>>>;
+    async fn read_data_block(&mut self, id: i64) -> Result<Option<Vec<u8>>>;
 
     /// The `_idx` leaf page to begin scanning for `term` within segment
     /// `segid`: the page of the largest indexed term `<= term`. `None` means
     /// "no indexed term `<= term` in this segment" — the caller starts at the
     /// segment's first page (still correct, just scans from the start).
-    fn idx_candidate_page(&mut self, segid: u32, term: &[u8]) -> Result<Option<u32>>;
+    async fn idx_candidate_page(&mut self, segid: u32, term: &[u8]) -> Result<Option<u32>>;
 
     /// The `_docsize` row (per-column token counts) for `rowid`, or `None`.
-    fn read_docsize(&mut self, rowid: i64, column_count: usize) -> Result<Option<Fts5DocsizeRow>>;
+    async fn read_docsize(
+        &mut self,
+        rowid: i64,
+        column_count: usize,
+    ) -> Result<Option<Fts5DocsizeRow>>;
 
     /// The `_content` row (column text values) for `rowid`, or `None`.
-    fn read_content(&mut self, rowid: i64, column_count: usize) -> Result<Option<Vec<String>>>;
-}
-
-/// In-memory [`Fts5OnDiskReader`] over the decoded shadow rows currently bound
-/// to a reopened table. It lets the recency-correct lazy enumeration
-/// ([`collect_doclist_recency`]) run directly over a [`Fts5ShadowRows`] without
-/// a pager, which is how a reopened CONTENTLESS table hydrates its in-memory
-/// index from persisted segments before the first mutation. Only the two
-/// segment-reading primitives are meaningful here; `_docsize`/`_content`
-/// point-reads are unused by the term enumeration (a contentless table keeps no
-/// `_content` rows anyway).
-struct Fts5ShadowRowReader<'a> {
-    data: &'a [Fts5DataRow],
-    idx: &'a [Fts5IdxRow],
-}
-
-impl Fts5OnDiskReader for Fts5ShadowRowReader<'_> {
-    fn read_data_block(&mut self, id: i64) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .data
-            .iter()
-            .find(|row| row.id == id)
-            .map(|row| row.block.clone()))
-    }
-
-    fn idx_candidate_page(&mut self, segid: u32, term: &[u8]) -> Result<Option<u32>> {
-        Ok(self
-            .idx
-            .iter()
-            .filter(|row| row.segid == segid && row.term.as_slice() <= term)
-            .max_by(|left, right| left.term.cmp(&right.term))
-            .map(|row| row.btree_page))
-    }
-
-    fn read_docsize(
+    async fn read_content(
         &mut self,
-        _rowid: i64,
-        _column_count: usize,
-    ) -> Result<Option<Fts5DocsizeRow>> {
-        Ok(None)
-    }
-
-    fn read_content(&mut self, _rowid: i64, _column_count: usize) -> Result<Option<Vec<String>>> {
-        Ok(None)
-    }
+        rowid: i64,
+        column_count: usize,
+    ) -> Result<Option<Vec<String>>>;
 }
 
 /// Lazily fetch the doclist for an exact `term` within one on-disk segment,
@@ -2357,20 +2323,22 @@ impl Fts5OnDiskReader for Fts5ShadowRowReader<'_> {
 /// the leaf scan in [`Fts5SegmentReader::exact_postings`] but sources leaf
 /// blocks through an [`Fts5OnDiskReader`] instead of an in-memory slice, so a
 /// reopened index is queried by reading just the pages a term touches.
-fn lazy_segment_exact_postings(
-    reader: &mut dyn Fts5OnDiskReader,
+async fn lazy_segment_exact_postings<R: Fts5OnDiskReader>(
+    reader: &mut R,
     segment: &Fts5StructureSegment,
     term: &[u8],
 ) -> Result<Vec<Fts5DoclistEntry>> {
     let start = reader
-        .idx_candidate_page(segment.segid, term)?
+        .idx_candidate_page(segment.segid, term)
+        .await?
         .unwrap_or(segment.pgno_first)
         .clamp(segment.pgno_first, segment.pgno_last);
     let mut pgno = start;
     while pgno <= segment.pgno_last {
         let id = fts5_data_rowid(segment.segid, false, 0, pgno, "segment leaf")?;
         let block = reader
-            .read_data_block(id)?
+            .read_data_block(id)
+            .await?
             .ok_or_else(|| fts5_data_error("missing segment leaf page"))?;
         let leaf = Fts5SegmentLeaf::decode(&block)?;
         for seg_term in leaf.terms {
@@ -2389,13 +2357,13 @@ fn lazy_segment_exact_postings(
 /// single `(stored_term, entries)` group, trying both the main-index marker key
 /// and the raw token (a given segment uses one encoding, so the first non-empty
 /// lookup is authoritative). Empty when the term is absent from the segment.
-fn lazy_segment_exact_group(
-    reader: &mut dyn Fts5OnDiskReader,
+async fn lazy_segment_exact_group<R: Fts5OnDiskReader>(
+    reader: &mut R,
     segment: &Fts5StructureSegment,
     term: &[u8],
 ) -> Result<Vec<(Vec<u8>, Vec<Fts5DoclistEntry>)>> {
     for key in segment_lookup_keys(term) {
-        let entries = lazy_segment_exact_postings(reader, segment, &key)?;
+        let entries = lazy_segment_exact_postings(reader, segment, &key).await?;
         if !entries.is_empty() {
             return Ok(vec![(key, entries)]);
         }
@@ -2407,8 +2375,8 @@ fn lazy_segment_exact_group(
 /// whose doclist entries still physically live in the segment. Reads only the
 /// single hash page the rowid maps to (`rowid % tombstone_page_count`). A
 /// segment with no tombstone pages can never tombstone a rowid.
-fn rowid_tombstoned_in_segment(
-    reader: &mut dyn Fts5OnDiskReader,
+async fn rowid_tombstoned_in_segment<R: Fts5OnDiskReader>(
+    reader: &mut R,
     segment: &Fts5StructureSegment,
     rowid: u64,
 ) -> Result<bool> {
@@ -2422,7 +2390,7 @@ fn rowid_tombstoned_in_segment(
         hash_pgno,
     }
     .encode()?;
-    let Some(block) = reader.read_data_block(id)? else {
+    let Some(block) = reader.read_data_block(id).await? else {
         return Ok(false);
     };
     Ok(Fts5TombstonePage::decode(&block)?.contains_rowid(count, rowid))
@@ -2442,22 +2410,20 @@ fn rowid_tombstoned_in_segment(
 /// deletes term `t` for a row while inserting a different term `t2` for the same
 /// row does not let `t`'s delete marker suppress the live `t2` entry — essential
 /// for correct prefix queries that span several terms of one document.
-fn collect_doclist_recency<F>(
-    reader: &mut dyn Fts5OnDiskReader,
+async fn collect_doclist_recency<R, F>(
+    reader: &mut R,
     structure: &Fts5StructureRecord,
     mut per_segment: F,
 ) -> Result<Vec<Fts5DoclistEntry>>
 where
-    F: FnMut(
-        &mut dyn Fts5OnDiskReader,
-        &Fts5StructureSegment,
-    ) -> Result<Vec<(Vec<u8>, Vec<Fts5DoclistEntry>)>>,
+    R: Fts5OnDiskReader,
+    F: AsyncFnMut(&mut R, &Fts5StructureSegment) -> Result<Vec<(Vec<u8>, Vec<Fts5DoclistEntry>)>>,
 {
     let mut out = Vec::new();
     let mut seen: HashSet<(Vec<u8>, u64)> = HashSet::new();
     for level in &structure.levels {
         for segment in level.segments.iter().rev() {
-            for (term, entries) in per_segment(reader, segment)? {
+            for (term, entries) in per_segment(reader, segment).await? {
                 for entry in entries {
                     if !seen.insert((term.clone(), entry.rowid)) {
                         // An older segment's occurrence of this (term, rowid):
@@ -2469,7 +2435,7 @@ where
                         // for this term (and shadows older live occurrences).
                         continue;
                     }
-                    if rowid_tombstoned_in_segment(reader, segment, entry.rowid)? {
+                    if rowid_tombstoned_in_segment(reader, segment, entry.rowid).await? {
                         continue;
                     }
                     out.push(entry);
@@ -2480,38 +2446,64 @@ where
     Ok(out)
 }
 
-/// Collect every LIVE posting across `structure`'s segments, grouped by stored
-/// term, applying the same multi-segment recency + tombstone semantics as
-/// [`collect_doclist_recency`] but PRESERVING the per-term identity (which the
-/// flat merge discards). Each returned term still carries its stored index
-/// marker byte (`FTS5_MAIN_PREFIX_BYTE ++ token` for main-index terms).
-///
-/// Used to hydrate a reopened contentless table's in-memory inverted index from
-/// its persisted segments: an empty prefix enumerates all main-index terms,
-/// recency keeps the newest `(term, rowid)` occurrence, and deletes/tombstones
-/// are dropped so the rebuilt index matches what a live query would see.
-fn collect_live_term_groups(
-    reader: &mut dyn Fts5OnDiskReader,
+/// Collect every LIVE posting across already-decoded shadow-row segments,
+/// grouped by stored term with the same recency and tombstone semantics as the
+/// lazy reader. This synchronous row-native path is used only while hydrating
+/// in-memory state before a mutation; keeping it separate means the live
+/// on-disk boundary stays genuinely async without manufacturing an executor.
+fn collect_live_term_groups_from_shadow_rows(
+    data: &[Fts5DataRow],
+    idx: &[Fts5IdxRow],
     structure: &Fts5StructureRecord,
 ) -> Result<Vec<(Vec<u8>, Vec<Fts5DoclistEntry>)>> {
+    let row_set = Fts5SegmentRowSet::new(data, idx);
     let mut by_term: BTreeMap<Vec<u8>, Vec<Fts5DoclistEntry>> = BTreeMap::new();
     let mut seen: HashSet<(Vec<u8>, u64)> = HashSet::new();
+
     for level in &structure.levels {
         for segment in level.segments.iter().rev() {
-            for (term, entries) in lazy_segment_prefix_groups(reader, segment, &[])? {
+            let mut groups = Vec::new();
+            for key in segment_lookup_keys(&[]) {
+                groups = row_set
+                    .reader(segment)
+                    .prefix_matches(&key)?
+                    .into_iter()
+                    .map(|term_match| (term_match.term, term_match.postings.entries))
+                    .collect();
+                if !groups.is_empty() {
+                    break;
+                }
+            }
+
+            for (term, entries) in groups {
                 for entry in entries {
-                    if !seen.insert((term.clone(), entry.rowid)) {
-                        // Older segment's (term, rowid): shadowed by the newer one.
+                    if !seen.insert((term.clone(), entry.rowid)) || entry.poslist.delete {
                         continue;
                     }
-                    if entry.poslist.delete {
-                        // Newest occurrence is a delete marker: rowid is dead.
-                        continue;
+                    let tombstoned = if segment.tombstone_page_count == 0 {
+                        false
+                    } else {
+                        let hash_pgno =
+                            u32::try_from(entry.rowid % u64::from(segment.tombstone_page_count))
+                                .unwrap_or(0);
+                        let id = Fts5DataRowid::Tombstone {
+                            segid: segment.segid,
+                            hash_pgno,
+                        }
+                        .encode()?;
+                        data.iter()
+                            .find(|row| row.id == id)
+                            .map(|row| {
+                                Fts5TombstonePage::decode(&row.block).map(|page| {
+                                    page.contains_rowid(segment.tombstone_page_count, entry.rowid)
+                                })
+                            })
+                            .transpose()?
+                            .unwrap_or(false)
+                    };
+                    if !tombstoned {
+                        by_term.entry(term.clone()).or_default().push(entry);
                     }
-                    if rowid_tombstoned_in_segment(reader, segment, entry.rowid)? {
-                        continue;
-                    }
-                    by_term.entry(term.clone()).or_default().push(entry);
                 }
             }
         }
@@ -2526,14 +2518,15 @@ fn collect_live_term_groups(
 /// deleted or updated-away document is correctly excluded even though its
 /// original posting still physically exists in an older segment). Parity
 /// counterpart of `Fts5ShadowQuery::exact_entries` for the lazy (reopened) path.
-pub fn lazy_exact_doclist_entries(
-    reader: &mut dyn Fts5OnDiskReader,
+pub async fn lazy_exact_doclist_entries<R: Fts5OnDiskReader>(
+    reader: &mut R,
     structure: &Fts5StructureRecord,
     term: &[u8],
 ) -> Result<Vec<Fts5DoclistEntry>> {
-    collect_doclist_recency(reader, structure, |reader, segment| {
-        lazy_segment_exact_group(reader, segment, term)
+    collect_doclist_recency(reader, structure, async |reader, segment| {
+        lazy_segment_exact_group(reader, segment, term).await
     })
+    .await
 }
 
 /// Collect the matching terms within one on-disk segment whose stored term
@@ -2541,13 +2534,14 @@ pub fn lazy_exact_doclist_entries(
 /// a `(stored_term, entries)` group preserving the term identity so the recency
 /// merge can key on `(term, rowid)`. Reads only the leaf pages from the prefix's
 /// candidate page onward; mirrors [`Fts5SegmentReader::prefix_matches`].
-fn lazy_segment_prefix_term_groups(
-    reader: &mut dyn Fts5OnDiskReader,
+async fn lazy_segment_prefix_term_groups<R: Fts5OnDiskReader>(
+    reader: &mut R,
     segment: &Fts5StructureSegment,
     prefix: &[u8],
 ) -> Result<Vec<(Vec<u8>, Vec<Fts5DoclistEntry>)>> {
     let start = reader
-        .idx_candidate_page(segment.segid, prefix)?
+        .idx_candidate_page(segment.segid, prefix)
+        .await?
         .unwrap_or(segment.pgno_first)
         .clamp(segment.pgno_first, segment.pgno_last);
     let mut groups = Vec::new();
@@ -2555,7 +2549,8 @@ fn lazy_segment_prefix_term_groups(
     while pgno <= segment.pgno_last {
         let id = fts5_data_rowid(segment.segid, false, 0, pgno, "segment leaf")?;
         let block = reader
-            .read_data_block(id)?
+            .read_data_block(id)
+            .await?
             .ok_or_else(|| fts5_data_error("missing segment leaf page"))?;
         let leaf = Fts5SegmentLeaf::decode(&block)?;
         for seg_term in leaf.terms {
@@ -2577,13 +2572,13 @@ fn lazy_segment_prefix_term_groups(
 
 /// Per-segment prefix lookup over both the marked and raw lookup keys (a segment
 /// uses one encoding, so the first non-empty result is authoritative).
-fn lazy_segment_prefix_groups(
-    reader: &mut dyn Fts5OnDiskReader,
+async fn lazy_segment_prefix_groups<R: Fts5OnDiskReader>(
+    reader: &mut R,
     segment: &Fts5StructureSegment,
     prefix: &[u8],
 ) -> Result<Vec<(Vec<u8>, Vec<Fts5DoclistEntry>)>> {
     for key in segment_lookup_keys(prefix) {
-        let groups = lazy_segment_prefix_term_groups(reader, segment, &key)?;
+        let groups = lazy_segment_prefix_term_groups(reader, segment, &key).await?;
         if !groups.is_empty() {
             return Ok(groups);
         }
@@ -2602,14 +2597,15 @@ fn lazy_segment_prefix_groups(
 /// (reopened) path; the dual main/raw lookup keys make it correct against both
 /// stock-SQLite segments (terms stored as `FTS5_MAIN_PREFIX_BYTE ++ token`) and
 /// frankensqlite-encoded segments.
-pub fn lazy_prefix_doclist_entries(
-    reader: &mut dyn Fts5OnDiskReader,
+pub async fn lazy_prefix_doclist_entries<R: Fts5OnDiskReader>(
+    reader: &mut R,
     structure: &Fts5StructureRecord,
     prefix: &[u8],
 ) -> Result<Vec<Fts5DoclistEntry>> {
-    collect_doclist_recency(reader, structure, |reader, segment| {
-        lazy_segment_prefix_groups(reader, segment, prefix)
+    collect_doclist_recency(reader, structure, async |reader, segment| {
+        lazy_segment_prefix_groups(reader, segment, prefix).await
     })
+    .await
 }
 
 /// Decode an FTS5 `_docsize.sz` blob into per-column token counts. The blob is
@@ -6500,6 +6496,18 @@ pub(crate) trait Fts5DoclistProvider {
         queries: &[&str],
         weights: &[f64],
     ) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
+        let (matching_docs, query_terms) = self.evaluate_queries(queries)?;
+        self.rank_matching_docs(matching_docs, &query_terms, weights)
+    }
+
+    /// Parse, validate, and evaluate `queries`, but do not rank the matching
+    /// rowids yet. The lazy on-disk provider uses this phase boundary to fetch
+    /// `_docsize` only for actual matches before invoking the same ranking
+    /// implementation as the in-memory provider.
+    fn evaluate_queries(
+        &self,
+        queries: &[&str],
+    ) -> std::result::Result<(Vec<i64>, Vec<String>), Fts5QueryError> {
         let mut combined_docs: Option<Vec<i64>> = None;
         let mut query_terms = Vec::new();
 
@@ -6517,9 +6525,19 @@ pub(crate) trait Fts5DoclistProvider {
             });
         }
 
+        Ok((combined_docs.unwrap_or_default(), query_terms))
+    }
+
+    /// Rank already-matched rowids using the provider's BM25 primitives.
+    fn rank_matching_docs(
+        &self,
+        matching_docs: Vec<i64>,
+        query_terms: &[String],
+        weights: &[f64],
+    ) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
         let mut results = Vec::new();
-        for rowid in combined_docs.unwrap_or_default() {
-            results.push((rowid, self.bm25_score(rowid, &query_terms, weights)?));
+        for rowid in matching_docs {
+            results.push((rowid, self.bm25_score(rowid, query_terms, weights)?));
         }
         results.sort_by(|left, right| {
             left.1
@@ -7033,26 +7051,26 @@ impl Fts5DoclistProvider for Fts5ShadowQuery<'_> {
 /// each term's postings (expression evaluation, then BM25 `df`/`tf`) and each
 /// result's `_docsize` into ONE on-disk scan/read apiece, so cost stays bounded
 /// by the doclists a query actually touches rather than the whole corpus.
-pub struct Fts5LazyQuery<'a> {
-    reader: std::cell::RefCell<&'a mut dyn Fts5OnDiskReader>,
+pub struct Fts5LazyQuery<'a, R: Fts5OnDiskReader> {
+    reader: &'a mut R,
     columns: &'a [String],
     tokenizer: &'a dyn Fts5Tokenizer,
     detail: DetailMode,
     structure: Fts5StructureRecord,
     averages: Option<Fts5AveragesRecord>,
     column_count: usize,
-    exact_cache: std::cell::RefCell<HashMap<String, std::rc::Rc<Vec<Fts5DoclistEntry>>>>,
-    prefix_cache: std::cell::RefCell<HashMap<String, std::rc::Rc<Vec<Fts5DoclistEntry>>>>,
-    docsize_cache: std::cell::RefCell<HashMap<i64, u32>>,
+    exact_cache: HashMap<String, Vec<Fts5DoclistEntry>>,
+    prefix_cache: HashMap<String, Vec<Fts5DoclistEntry>>,
+    docsize_cache: HashMap<i64, u32>,
 }
 
-impl<'a> Fts5LazyQuery<'a> {
+impl<'a, R: Fts5OnDiskReader> Fts5LazyQuery<'a, R> {
     /// Build a lazy query over `reader`, reading the structure (id=10) and
     /// averages (id=1) records ONCE up front. A missing structure row means an
     /// empty index (every query yields nothing); a missing averages row leaves
     /// BM25 `N`/`avgdl` at zero (a freshly flushed segment always writes it).
-    pub fn new(
-        reader: &'a mut dyn Fts5OnDiskReader,
+    pub async fn new(
+        reader: &'a mut R,
         columns: &'a [String],
         tokenizer: &'a dyn Fts5Tokenizer,
         detail: DetailMode,
@@ -7060,6 +7078,7 @@ impl<'a> Fts5LazyQuery<'a> {
         let column_count = columns.len();
         let structure = match reader
             .read_data_block(FTS5_STRUCTURE_ROWID)
+            .await
             .map_err(shadow_query_storage_error)?
         {
             Some(block) => {
@@ -7069,6 +7088,7 @@ impl<'a> Fts5LazyQuery<'a> {
         };
         let averages = match reader
             .read_data_block(FTS5_AVERAGES_ROWID)
+            .await
             .map_err(shadow_query_storage_error)?
         {
             Some(block) => Some(
@@ -7078,52 +7098,161 @@ impl<'a> Fts5LazyQuery<'a> {
             None => None,
         };
         Ok(Self {
-            reader: std::cell::RefCell::new(reader),
+            reader,
             columns,
             tokenizer,
             detail,
             structure,
             averages,
             column_count,
-            exact_cache: std::cell::RefCell::new(HashMap::new()),
-            prefix_cache: std::cell::RefCell::new(HashMap::new()),
-            docsize_cache: std::cell::RefCell::new(HashMap::new()),
+            exact_cache: HashMap::new(),
+            prefix_cache: HashMap::new(),
+            docsize_cache: HashMap::new(),
         })
     }
 
     /// Run a single MATCH query, returning `(rowid, bm25)` pairs sorted by score.
-    pub fn search(
-        &self,
+    pub async fn search(
+        &mut self,
         query: &str,
         weights: &[f64],
     ) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
-        self.search_with_weights(&[query], weights)
+        self.search_queries_with_weights(&[query], weights).await
     }
 
     /// Run one or more MATCH queries (AND-combined), mirroring
     /// [`Fts5ShadowQuery::search_queries_with_weights`].
-    pub fn search_queries_with_weights(
-        &self,
+    pub async fn search_queries_with_weights(
+        &mut self,
         queries: &[&str],
         weights: &[f64],
     ) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
-        self.search_with_weights(queries, weights)
+        self.prefetch_query_doclists(queries).await?;
+        let (matching_docs, query_terms) = self.evaluate_queries(queries)?;
+        self.prefetch_doc_lengths(&matching_docs).await?;
+        self.rank_matching_docs(matching_docs, &query_terms, weights)
     }
 
     /// Point-read the `_content` row for a (result) `rowid`, so projection reads
     /// only the LIMITed result set rather than the whole corpus.
-    pub fn content_for_rowid(
-        &self,
+    pub async fn content_for_rowid(
+        &mut self,
         rowid: i64,
     ) -> std::result::Result<Option<Vec<String>>, Fts5QueryError> {
         self.reader
-            .borrow_mut()
             .read_content(rowid, self.column_count)
+            .await
             .map_err(shadow_query_storage_error)
+    }
+
+    async fn prefetch_query_doclists(
+        &mut self,
+        queries: &[&str],
+    ) -> std::result::Result<(), Fts5QueryError> {
+        fn collect_lookups(
+            expr: &Fts5Expr,
+            exact: &mut BTreeSet<String>,
+            prefixes: &mut BTreeSet<String>,
+        ) {
+            match expr {
+                Fts5Expr::Term(term) => {
+                    exact.insert(term.clone());
+                }
+                Fts5Expr::Prefix(prefix) => {
+                    prefixes.insert(prefix.clone());
+                }
+                Fts5Expr::Phrase(words) => {
+                    exact.extend(words.iter().cloned());
+                }
+                Fts5Expr::PhrasePrefix(words, prefix) => {
+                    exact.extend(words.iter().cloned());
+                    prefixes.insert(prefix.clone());
+                }
+                Fts5Expr::And(left, right)
+                | Fts5Expr::Or(left, right)
+                | Fts5Expr::Not(left, right) => {
+                    collect_lookups(left, exact, prefixes);
+                    collect_lookups(right, exact, prefixes);
+                }
+                Fts5Expr::Near(operands, _) => {
+                    for operand in operands {
+                        match operand {
+                            Fts5NearOperand::Term(term) => {
+                                exact.insert(term.clone());
+                            }
+                            Fts5NearOperand::Prefix(prefix) => {
+                                prefixes.insert(prefix.clone());
+                            }
+                            Fts5NearOperand::Phrase(words) => {
+                                exact.extend(words.iter().cloned());
+                            }
+                        }
+                    }
+                }
+                Fts5Expr::ColumnFilter(_, inner) | Fts5Expr::InitialToken(inner) => {
+                    collect_lookups(inner, exact, prefixes);
+                }
+            }
+        }
+
+        let mut exact = BTreeSet::new();
+        let mut prefixes = BTreeSet::new();
+        for query in queries {
+            let tokens = parse_fts5_query(query)?;
+            let expr = normalize_query_expr_with_tokenizer(build_expr(&tokens)?, self.tokenizer);
+            validate_detail_mode(&expr, self.detail)?;
+            validate_column_filters(&expr, self.columns)?;
+            collect_lookups(&expr, &mut exact, &mut prefixes);
+            // BM25 consults an exact doclist for every scoring term, including
+            // a prefix operand's literal prefix.
+            exact.extend(extract_query_terms(&expr));
+        }
+
+        for term in exact {
+            if self.exact_cache.contains_key(&term) {
+                continue;
+            }
+            let entries =
+                lazy_exact_doclist_entries(&mut *self.reader, &self.structure, term.as_bytes())
+                    .await
+                    .map_err(shadow_query_storage_error)?;
+            self.exact_cache.insert(term, entries);
+        }
+        for prefix in prefixes {
+            if self.prefix_cache.contains_key(&prefix) {
+                continue;
+            }
+            let entries =
+                lazy_prefix_doclist_entries(&mut *self.reader, &self.structure, prefix.as_bytes())
+                    .await
+                    .map_err(shadow_query_storage_error)?;
+            self.prefix_cache.insert(prefix, entries);
+        }
+        Ok(())
+    }
+
+    async fn prefetch_doc_lengths(
+        &mut self,
+        rowids: &[i64],
+    ) -> std::result::Result<(), Fts5QueryError> {
+        for &rowid in rowids {
+            if self.docsize_cache.contains_key(&rowid) {
+                continue;
+            }
+            let length = self
+                .reader
+                .read_docsize(rowid, self.column_count)
+                .await
+                .map_err(shadow_query_storage_error)?
+                .as_ref()
+                .map_or(0, Fts5DocsizeRow::total_tokens);
+            self.docsize_cache.insert(rowid, length);
+        }
+        Ok(())
     }
 }
 
-impl Fts5DoclistProvider for Fts5LazyQuery<'_> {
+impl<R: Fts5OnDiskReader> Fts5DoclistProvider for Fts5LazyQuery<'_, R> {
     fn columns(&self) -> &[String] {
         self.columns
     }
@@ -7140,53 +7269,24 @@ impl Fts5DoclistProvider for Fts5LazyQuery<'_> {
         &self,
         term: &str,
     ) -> std::result::Result<Vec<Fts5DoclistEntry>, Fts5QueryError> {
-        if let Some(cached) = self.exact_cache.borrow().get(term) {
-            return Ok((**cached).clone());
-        }
-        let entries = lazy_exact_doclist_entries(
-            &mut **self.reader.borrow_mut(),
-            &self.structure,
-            term.as_bytes(),
-        )
-        .map_err(shadow_query_storage_error)?;
-        self.exact_cache
-            .borrow_mut()
-            .insert(term.to_owned(), std::rc::Rc::new(entries.clone()));
-        Ok(entries)
+        self.exact_cache.get(term).cloned().ok_or_else(|| {
+            Fts5QueryError::ShadowStorage(format!("exact doclist `{term}` was not prefetched"))
+        })
     }
 
     fn prefix_entries(
         &self,
         prefix: &str,
     ) -> std::result::Result<Vec<Fts5DoclistEntry>, Fts5QueryError> {
-        if let Some(cached) = self.prefix_cache.borrow().get(prefix) {
-            return Ok((**cached).clone());
-        }
-        let entries = lazy_prefix_doclist_entries(
-            &mut **self.reader.borrow_mut(),
-            &self.structure,
-            prefix.as_bytes(),
-        )
-        .map_err(shadow_query_storage_error)?;
-        self.prefix_cache
-            .borrow_mut()
-            .insert(prefix.to_owned(), std::rc::Rc::new(entries.clone()));
-        Ok(entries)
+        self.prefix_cache.get(prefix).cloned().ok_or_else(|| {
+            Fts5QueryError::ShadowStorage(format!("prefix doclist `{prefix}` was not prefetched"))
+        })
     }
 
     fn doc_length(&self, rowid: i64) -> std::result::Result<u32, Fts5QueryError> {
-        if let Some(cached) = self.docsize_cache.borrow().get(&rowid) {
-            return Ok(*cached);
-        }
-        let length = self
-            .reader
-            .borrow_mut()
-            .read_docsize(rowid, self.column_count)
-            .map_err(shadow_query_storage_error)?
-            .as_ref()
-            .map_or(0, Fts5DocsizeRow::total_tokens);
-        self.docsize_cache.borrow_mut().insert(rowid, length);
-        Ok(length)
+        self.docsize_cache.get(&rowid).copied().ok_or_else(|| {
+            Fts5QueryError::ShadowStorage(format!("docsize row {rowid} was not prefetched"))
+        })
     }
 
     fn total_docs(&self) -> std::result::Result<u64, Fts5QueryError> {
@@ -7491,13 +7591,7 @@ impl Fts5Table {
         if structure.segment_count() == 0 {
             return Ok(());
         }
-        let groups = {
-            let mut reader = Fts5ShadowRowReader {
-                data: &rows.data,
-                idx: &rows.idx,
-            };
-            collect_live_term_groups(&mut reader, &structure)?
-        };
+        let groups = collect_live_term_groups_from_shadow_rows(&rows.data, &rows.idx, &structure)?;
         let docsize = rows.docsize.clone();
         // Last use of `rows` (the &self.shadow_rows borrow) — released here so the
         // index/docsize writes below can take `self` mutably.
@@ -7508,7 +7602,8 @@ impl Fts5Table {
             self.config.tokendata_enabled(),
         );
         for (stored_term, entries) in groups {
-            // `collect_live_term_groups` (empty prefix) yields only MAIN-index
+            // `collect_live_term_groups_from_shadow_rows` (empty prefix) yields
+            // only MAIN-index
             // terms; `append_position` rebuilds the prefix indexes from the raw
             // token. A given segment stores terms in ONE encoding: stock SQLite
             // and frankensqlite's own writer mark main terms as
@@ -7793,23 +7888,24 @@ impl Fts5Table {
 
     /// Answer MATCH queries in lazy mode by point-reading persisted on-disk
     /// segments through `reader`, projecting `_content` only for result rows.
-    pub fn search_rows_lazy(
+    pub async fn search_rows_lazy<R: Fts5OnDiskReader>(
         &self,
-        reader: &mut dyn Fts5OnDiskReader,
+        reader: &mut R,
         queries: &[&str],
         weights: &[f64],
     ) -> std::result::Result<Vec<(i64, f64, Vec<String>)>, Fts5QueryError> {
         let tokenizer = self.create_tokenizer_instance();
-        let query = Fts5LazyQuery::new(
+        let mut query = Fts5LazyQuery::new(
             reader,
             &self.columns,
             tokenizer.as_ref(),
             self.config.detail_mode(),
-        )?;
-        let ranked = query.search_queries_with_weights(queries, weights)?;
+        )
+        .await?;
+        let ranked = query.search_queries_with_weights(queries, weights).await?;
         let mut out = Vec::with_capacity(ranked.len());
         for (rowid, score) in ranked {
-            let columns = query.content_for_rowid(rowid)?.unwrap_or_default();
+            let columns = query.content_for_rowid(rowid).await?.unwrap_or_default();
             out.push((rowid, score, columns));
         }
         Ok(out)
@@ -8112,8 +8208,9 @@ impl Fts5Table {
     /// on success, appends `leaf_data_row`, replaces `structure_data_row` and
     /// `averages_data_row`, and appends `docsize_rows` to `_docsize`. Live
     /// MATCH keeps reading the in-memory `self.index`; reopen rehydrates from
-    /// the multi-segment structure via `collect_live_term_groups`, so the extra
-    /// segments are transparent to readers.
+    /// the multi-segment structure via
+    /// `collect_live_term_groups_from_shadow_rows`, so the extra segments are
+    /// transparent to readers.
     ///
     /// Returns `None` when `new_docs` is empty (nothing to persist).
     pub fn encode_incremental_insert_flush(
@@ -10850,7 +10947,7 @@ mod tests {
     }
 
     impl Fts5OnDiskReader for SliceOnDiskReader {
-        fn read_data_block(&mut self, id: i64) -> Result<Option<Vec<u8>>> {
+        async fn read_data_block(&mut self, id: i64) -> Result<Option<Vec<u8>>> {
             Ok(self
                 .data
                 .iter()
@@ -10858,7 +10955,7 @@ mod tests {
                 .map(|row| row.block.clone()))
         }
 
-        fn idx_candidate_page(&mut self, segid: u32, term: &[u8]) -> Result<Option<u32>> {
+        async fn idx_candidate_page(&mut self, segid: u32, term: &[u8]) -> Result<Option<u32>> {
             Ok(self
                 .idx
                 .iter()
@@ -10867,7 +10964,7 @@ mod tests {
                 .map(|row| row.btree_page))
         }
 
-        fn read_docsize(
+        async fn read_docsize(
             &mut self,
             _rowid: i64,
             _column_count: usize,
@@ -10875,7 +10972,7 @@ mod tests {
             Ok(None)
         }
 
-        fn read_content(
+        async fn read_content(
             &mut self,
             _rowid: i64,
             _column_count: usize,
@@ -10904,23 +11001,30 @@ mod tests {
 
     #[test]
     fn test_fts5_lazy_exact_doclist_merges_raw_and_prefixed_segment_keys() {
-        let cx = Cx::new();
-        let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
-        let mut rows = sample_shadow_query_rows(&base);
-        let structure = add_prefixed_brown_segment(&mut rows);
-        let mut reader = SliceOnDiskReader {
-            data: rows.data,
-            idx: rows.idx,
-        };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build FTS5 lazy-reader test runtime");
+        runtime.block_on(async {
+            let cx = Cx::new();
+            let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+            let mut rows = sample_shadow_query_rows(&base);
+            let structure = add_prefixed_brown_segment(&mut rows);
+            let mut reader = SliceOnDiskReader {
+                data: rows.data,
+                idx: rows.idx,
+            };
 
-        let mut rowids: Vec<u64> = lazy_exact_doclist_entries(&mut reader, &structure, b"brown")
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.rowid)
-            .collect();
-        rowids.sort_unstable();
-        rowids.dedup();
-        assert_eq!(rowids, vec![1, 4, 30]);
+            let mut rowids: Vec<u64> =
+                lazy_exact_doclist_entries(&mut reader, &structure, b"brown")
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|entry| entry.rowid)
+                    .collect();
+            rowids.sort_unstable();
+            rowids.dedup();
+            assert_eq!(rowids, vec![1, 4, 30]);
+        });
     }
 
     #[test]

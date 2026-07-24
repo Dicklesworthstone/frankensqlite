@@ -1,5 +1,7 @@
 //! Connection extension traits for rusqlite-style query patterns.
 
+use std::future::Future;
+
 use fsqlite_error::FrankenError;
 use fsqlite_types::value::SqliteValue;
 
@@ -33,7 +35,7 @@ pub trait ConnectionExt {
         sql: &str,
         params: &[ParamValue],
         f: F,
-    ) -> Result<T, FrankenError>
+    ) -> impl Future<Output = Result<T, FrankenError>>
     where
         F: FnOnce(&Row) -> Result<T, FrankenError>;
 
@@ -55,25 +57,34 @@ pub trait ConnectionExt {
         sql: &str,
         params: &[ParamValue],
         f: F,
-    ) -> Result<Vec<T>, FrankenError>
+    ) -> impl Future<Output = Result<Vec<T>, FrankenError>>
     where
         F: FnMut(&Row) -> Result<T, FrankenError>;
 
     /// Execute a SQL statement with `ParamValue` parameters, returning affected row count.
-    fn execute_compat(&self, sql: &str, params: &[ParamValue]) -> Result<usize, FrankenError>;
+    fn execute_compat(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+    ) -> impl Future<Output = Result<usize, FrankenError>>;
 }
 
 impl ConnectionExt for Connection {
-    fn query_row_map<T, F>(&self, sql: &str, params: &[ParamValue], f: F) -> Result<T, FrankenError>
+    async fn query_row_map<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        f: F,
+    ) -> Result<T, FrankenError>
     where
         F: FnOnce(&Row) -> Result<T, FrankenError>,
     {
         let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();
-        let row = self.query_row_with_params(sql, &values)?;
+        let row = self.query_row_with_params(sql, &values).await?;
         f(&row)
     }
 
-    fn query_map_collect<T, F>(
+    async fn query_map_collect<T, F>(
         &self,
         sql: &str,
         params: &[ParamValue],
@@ -87,13 +98,18 @@ impl ConnectionExt for Connection {
         self.query_with_params_for_each(sql, &values, |row| {
             mapped.push(f(row)?);
             Ok(())
-        })?;
+        })
+        .await?;
         Ok(mapped)
     }
 
-    fn execute_compat(&self, sql: &str, params: &[ParamValue]) -> Result<usize, FrankenError> {
+    async fn execute_compat(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+    ) -> Result<usize, FrankenError> {
         let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();
-        self.execute_with_params(sql, &values)
+        self.execute_with_params(sql, &values).await
     }
 }
 

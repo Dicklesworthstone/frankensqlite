@@ -1,3 +1,4 @@
+#![allow(clippy::future_not_send)]
 //! B-tree cursor implementation (§11, bd-2kvo).
 //!
 //! A cursor maintains a position within a single B-tree (either table or
@@ -40,8 +41,10 @@ use fsqlite_types::{PageData, PageNumber, SqliteValue, WitnessKey};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::future::Future;
 #[cfg(target_arch = "x86_64")]
 use std::intrinsics::prefetch_read_data;
+use std::ops::AsyncFnOnce;
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// OPT-1: process-wide shared default `CollationRegistry`.
@@ -59,7 +62,7 @@ fn default_collation_registry() -> &'static Arc<Mutex<CollationRegistry>> {
     static DEFAULT: OnceLock<Arc<Mutex<CollationRegistry>>> = OnceLock::new();
     DEFAULT.get_or_init(|| Arc::new(Mutex::new(CollationRegistry::new())))
 }
-use tracing::{Level, debug, trace, warn};
+use tracing::{Instrument, Level, debug, trace, warn};
 
 /// Environment variable controlling the default per-cursor read-witness
 /// retention cap. Parsed once at first cursor construction. `0` (the
@@ -243,14 +246,22 @@ fn cell_ptrs_are_descending(ptrs: &[u16]) -> bool {
 /// The real implementation wraps a `TransactionHandle`.
 pub trait PageReader {
     /// Read a page by number, returning the raw bytes.
-    fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>>;
+    fn read_page<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<Vec<u8>>> + 'a;
 
     /// Read a page by number, returning owned page data.
     ///
     /// Implementations can override this to forward shared page buffers
     /// without forcing an intermediate `Vec<u8>` clone.
-    fn read_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
-        Ok(PageData::from_vec(self.read_page(cx, page_no)?))
+    fn read_page_data<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a {
+        async move { Ok(PageData::from_vec(self.read_page(cx, page_no).await?)) }
     }
 
     /// Read a page for B-tree cursor traversal.
@@ -258,8 +269,12 @@ pub trait PageReader {
     /// Transaction-backed implementations may override this to avoid recording
     /// a coarse SIREAD page witness while the cursor emits finer cell/range
     /// witnesses for the logical B-tree operation.
-    fn read_btree_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
-        self.read_page_data(cx, page_no)
+    fn read_btree_page_data<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a {
+        async move { self.read_page_data(cx, page_no).await }
     }
 
     /// Hint that a page is likely to be needed soon.
@@ -280,14 +295,24 @@ pub trait PageReader {
 /// Trait for writing pages (needed for insert/delete).
 pub trait PageWriter: PageReader {
     /// Write raw data to a page.
-    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()>;
+    fn write_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + 'a;
 
     /// Write owned page data to a page.
     ///
     /// Implementations can override this to adopt owned page buffers without
     /// routing through a borrowed slice first.
-    fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
-        self.write_page(cx, page_no, data.as_bytes())
+    fn write_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move { self.write_page(cx, page_no, data.as_bytes()).await }
     }
 
     /// Temporarily take ownership of an unpublished staged page image.
@@ -309,19 +334,24 @@ pub trait PageWriter: PageReader {
     }
 
     /// Restore a page image previously taken with `try_take_staged_page_data`.
-    fn restore_staged_page_data(
-        &mut self,
-        cx: &Cx,
+    fn restore_staged_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
         page_no: PageNumber,
         data: PageData,
-    ) -> Result<()> {
-        self.write_page_data(cx, page_no, data)
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move { self.write_page_data(cx, page_no, data).await }
     }
 
     /// Allocate a new page.
-    fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber>;
+    fn allocate_page<'a>(&'a mut self, cx: &'a Cx)
+    -> impl Future<Output = Result<PageNumber>> + 'a;
     /// Free a page.
-    fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()>;
+    fn free_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<()>> + 'a;
     /// Record a granular write witness for fine-grained SSI.
     fn record_write_witness(&mut self, cx: &Cx, key: WitnessKey);
 }
@@ -380,12 +410,23 @@ impl<'a, T: TransactionHandle + ?Sized> TransactionPageIo<'a, T> {
     }
 }
 
+// Keep the adapter's future type explicit: sibling methods forward the pager's
+// RPITIT directly, and this method only maps its owned page result to bytes.
+#[allow(clippy::manual_async_fn)]
 impl<T: TransactionHandle + ?Sized> PageReader for TransactionPageIo<'_, T> {
-    fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-        Ok(self.txn.get_page(cx, page_no)?.into_vec())
+    fn read_page<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
+        async move { Ok(self.txn.get_page(cx, page_no).await?.into_vec()) }
     }
 
-    fn read_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
+    fn read_page_data<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a {
         self.txn.get_page(cx, page_no)
     }
 
@@ -395,11 +436,21 @@ impl<T: TransactionHandle + ?Sized> PageReader for TransactionPageIo<'_, T> {
 }
 
 impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
-    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+    fn write_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + 'a {
         self.txn.write_page(cx, page_no, data)
     }
 
-    fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
+    fn write_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> impl Future<Output = Result<()>> + 'a {
         self.txn.write_page_data(cx, page_no, data)
     }
 
@@ -415,20 +466,27 @@ impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
         <T as TransactionHandle>::try_mutate_staged_page_data(self.txn, page_no, f)
     }
 
-    fn restore_staged_page_data(
-        &mut self,
-        cx: &Cx,
+    fn restore_staged_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
         page_no: PageNumber,
         data: PageData,
-    ) -> Result<()> {
+    ) -> impl Future<Output = Result<()>> + 'a {
         <T as TransactionHandle>::restore_staged_page_data(self.txn, cx, page_no, data)
     }
 
-    fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
+    fn allocate_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> impl Future<Output = Result<PageNumber>> + 'a {
         self.txn.allocate_page(cx)
     }
 
-    fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+    fn free_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<()>> + 'a {
         self.txn.free_page(cx, page_no)
     }
 
@@ -534,12 +592,21 @@ impl MemPageStore {
     }
 }
 
+// These in-memory operations deliberately return immediate-ready RPITIT
+// futures while preserving the same call contract as transaction-backed I/O.
+#[allow(clippy::manual_async_fn)]
 impl PageReader for MemPageStore {
-    fn read_page(&self, _cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-        self.pages
-            .get(&page_no.get())
-            .cloned()
-            .ok_or_else(|| FrankenError::internal("page not found"))
+    fn read_page<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
+        async move {
+            self.pages
+                .get(&page_no.get())
+                .cloned()
+                .ok_or_else(|| FrankenError::internal("page not found"))
+        }
     }
 
     fn prefetch_page_hint(&self, _cx: &Cx, page_no: PageNumber) {
@@ -558,64 +625,90 @@ impl PageReader for MemPageStore {
     }
 }
 
+#[allow(clippy::manual_async_fn)]
 impl PageWriter for MemPageStore {
-    fn write_page(&mut self, _cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-        let page_size = self.page_size as usize;
-        if data.len() > page_size {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "test page store refused oversized page write: {} > {}",
-                    data.len(),
-                    page_size
-                ),
-            });
+    fn write_page<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        page_no: PageNumber,
+        data: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            let page_size = self.page_size as usize;
+            if data.len() > page_size {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "test page store refused oversized page write: {} > {}",
+                        data.len(),
+                        page_size
+                    ),
+                });
+            }
+            let mut page = vec![0_u8; page_size];
+            let copy_len = data.len().min(page_size);
+            page[..copy_len].copy_from_slice(&data[..copy_len]);
+            self.pages.insert(page_no.get(), page);
+            self.set_page_slot_present(page_no, true);
+            Ok(())
         }
-        let mut page = vec![0_u8; page_size];
-        let copy_len = data.len().min(page_size);
-        page[..copy_len].copy_from_slice(&data[..copy_len]);
-        self.pages.insert(page_no.get(), page);
-        self.set_page_slot_present(page_no, true);
-        Ok(())
     }
 
-    fn write_page_data(&mut self, _cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
-        let page_size = self.page_size as usize;
-        if data.len() > page_size {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "test page store refused oversized page write: {} > {}",
-                    data.len(),
-                    page_size
-                ),
-            });
+    fn write_page_data<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            let page_size = self.page_size as usize;
+            if data.len() > page_size {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "test page store refused oversized page write: {} > {}",
+                        data.len(),
+                        page_size
+                    ),
+                });
+            }
+            let mut page = vec![0_u8; page_size];
+            let copy_len = data.len().min(page_size);
+            page[..copy_len].copy_from_slice(&data.as_bytes()[..copy_len]);
+            self.pages.insert(page_no.get(), page);
+            self.set_page_slot_present(page_no, true);
+            Ok(())
         }
-        let mut page = vec![0_u8; page_size];
-        let copy_len = data.len().min(page_size);
-        page[..copy_len].copy_from_slice(&data.as_bytes()[..copy_len]);
-        self.pages.insert(page_no.get(), page);
-        self.set_page_slot_present(page_no, true);
-        Ok(())
     }
 
-    fn allocate_page(&mut self, _cx: &Cx) -> Result<PageNumber> {
-        let next = self
-            .pages
-            .keys()
-            .copied()
-            .max()
-            .unwrap_or(1)
-            .checked_add(1)
-            .ok_or(FrankenError::DatabaseFull)?;
-        let pgno = PageNumber::new(next).ok_or(FrankenError::DatabaseFull)?;
-        self.pages.insert(next, vec![0u8; self.page_size as usize]);
-        self.set_page_slot_present(pgno, true);
-        Ok(pgno)
+    fn allocate_page<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+    ) -> impl Future<Output = Result<PageNumber>> + 'a {
+        async move {
+            let next = self
+                .pages
+                .keys()
+                .copied()
+                .max()
+                .unwrap_or(1)
+                .checked_add(1)
+                .ok_or(FrankenError::DatabaseFull)?;
+            let pgno = PageNumber::new(next).ok_or(FrankenError::DatabaseFull)?;
+            self.pages.insert(next, vec![0u8; self.page_size as usize]);
+            self.set_page_slot_present(pgno, true);
+            Ok(pgno)
+        }
     }
 
-    fn free_page(&mut self, _cx: &Cx, page_no: PageNumber) -> Result<()> {
-        self.pages.remove(&page_no.get());
-        self.set_page_slot_present(page_no, false);
-        Ok(())
+    fn free_page<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            self.pages.remove(&page_no.get());
+            self.set_page_slot_present(page_no, false);
+            Ok(())
+        }
     }
 
     fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
@@ -2322,7 +2415,7 @@ impl<P: PageReader> BtCursor<P> {
     /// payload bytes. The cursor is left on the first unconsumed row
     /// (mismatch/fallback) or advanced once to the next logical row/eof after
     /// the matched local segment.
-    pub fn count_equal_first_index_key_run_integer_local_segment(
+    pub async fn count_equal_first_index_key_run_integer_local_segment(
         &mut self,
         cx: &Cx,
         probe_value: i64,
@@ -2449,13 +2542,13 @@ impl<P: PageReader> BtCursor<P> {
                             .cell_idx = last_cell_idx;
                     }
                     matched_total = matched_total.wrapping_add(matched);
-                    if !self.advance_next(cx)? {
+                    if !self.advance_next(cx).await? {
                         return Ok(FirstIndexKeyIntegerLocalRunSegment::Matched(matched_total));
                     }
                 }
                 LocalRunScanOutcome::MatchedCurrent(matched) => {
                     matched_total = matched_total.wrapping_add(matched);
-                    if !self.advance_next(cx)? {
+                    if !self.advance_next(cx).await? {
                         return Ok(FirstIndexKeyIntegerLocalRunSegment::Matched(matched_total));
                     }
                 }
@@ -2657,10 +2750,11 @@ impl<P: PageReader> BtCursor<P> {
     /// `RowSetRead` loops for batch UPDATE/DELETE. The cursor first probes the
     /// current leaf, then the immediate next leaf, before falling back to the
     /// normal root-to-leaf seek path.
-    pub fn advance_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult> {
-        self.with_btree_op(cx, BtreeOpType::Seek, |cursor| {
-            cursor.table_advance_to(cx, rowid)
+    pub async fn advance_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult> {
+        self.with_btree_op(cx, BtreeOpType::Seek, async |cursor| {
+            cursor.table_advance_to(cx, rowid).await
         })
+        .await
     }
 
     /// Issue an explicit best-effort prefetch hint for `page_no`.
@@ -2777,7 +2871,7 @@ impl<P: PageReader> BtCursor<P> {
         }
     }
 
-    fn measure_tree_depth(&mut self, cx: &Cx) -> Result<usize> {
+    async fn measure_tree_depth(&mut self, cx: &Cx) -> Result<usize> {
         let saved_stats = self.active_op_stats.take();
         let mut depth = 0usize;
         let mut current_page = self.root_page;
@@ -2789,7 +2883,7 @@ impl<P: PageReader> BtCursor<P> {
                 });
             }
 
-            let entry = match self.load_page(cx, current_page) {
+            let entry = match self.load_page(cx, current_page).await {
                 Ok(e) => e,
                 Err(err) => break Err(err),
             };
@@ -2835,7 +2929,7 @@ impl<P: PageReader> BtCursor<P> {
     /// constant factor than the `first()/while next()` row-by-row scan.
     ///
     /// bd-wwqen.1 (B1.1): direct COUNT(*) fast path.
-    pub fn count_all_rows(&mut self, cx: &Cx) -> Result<i64> {
+    pub async fn count_all_rows(&mut self, cx: &Cx) -> Result<i64> {
         // Save and restore cursor state so this doesn't disturb
         // any in-progress iteration.
         let saved_eof = self.at_eof;
@@ -2843,7 +2937,7 @@ impl<P: PageReader> BtCursor<P> {
         self.at_eof = true;
 
         // bd-wwqen.1: iterative B-tree walk — no recursion overhead.
-        let result = self.count_all_rows_iterative(cx);
+        let result = self.count_all_rows_iterative(cx).await;
 
         // Restore cursor state.
         self.stack.clear();
@@ -2856,7 +2950,7 @@ impl<P: PageReader> BtCursor<P> {
     /// pattern. Walks every page exactly once without recursion, extracting
     /// child page numbers directly from raw cell bytes (4-byte BE at cell
     /// offset) to avoid full parse_cell_at overhead.
-    fn count_all_rows_iterative(&mut self, cx: &Cx) -> Result<i64> {
+    async fn count_all_rows_iterative(&mut self, cx: &Cx) -> Result<i64> {
         // Pending child pages for a depth-first walk. Interior pages are read
         // once: all child page numbers are extracted from their cell-pointer
         // array up front instead of rereading the parent for each child.
@@ -2869,7 +2963,7 @@ impl<P: PageReader> BtCursor<P> {
             self.note_page_visit(current_page);
             self.record_range_page_witness(cx, current_page);
 
-            let page_data = self.pager.read_btree_page_data(cx, current_page)?;
+            let page_data = self.pager.read_btree_page_data(cx, current_page).await?;
             let page_bytes = page_data.as_bytes();
             let header = cell::parse_page_header(page_bytes, current_page)?;
 
@@ -3102,11 +3196,11 @@ impl<P: PageReader> BtCursor<P> {
         Ok(routed_child == self.root_page)
     }
 
-    fn record_depth_gauge(&mut self, cx: &Cx) -> Result<()> {
+    async fn record_depth_gauge(&mut self, cx: &Cx) -> Result<()> {
         let depth = if self.stack.is_empty() {
             match self.last_known_depth {
                 Some(depth) => depth,
-                None => self.measure_tree_depth(cx)?,
+                None => self.measure_tree_depth(cx).await?,
             }
         } else {
             self.stack.len()
@@ -3133,9 +3227,9 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     #[inline]
-    fn with_btree_op<T, F>(&mut self, cx: &Cx, op_type: BtreeOpType, work: F) -> Result<T>
+    async fn with_btree_op<T, F>(&mut self, cx: &Cx, op_type: BtreeOpType, work: F) -> Result<T>
     where
-        F: FnOnce(&mut Self) -> Result<T>,
+        F: AsyncFnOnce(&mut Self) -> Result<T>,
     {
         instrumentation::record_operation(op_type);
 
@@ -3143,17 +3237,17 @@ impl<P: PageReader> BtCursor<P> {
         // one branch, direct work call, then a tiny postlude. The traced/stats
         // machinery stays in a cold helper so it does not bloat the hot body.
         if tracing::enabled!(target: "fsqlite.btree", Level::DEBUG) {
-            return self.with_btree_op_tracing(cx, op_type, work);
+            return self.with_btree_op_tracing(cx, op_type, work).await;
         }
 
-        let result = work(self);
-        self.finish_btree_op_postlude(cx, op_type);
+        let result = work(self).await;
+        self.finish_btree_op_postlude(cx, op_type).await;
         result
     }
 
     #[inline]
-    fn finish_btree_op_postlude(&mut self, cx: &Cx, op_type: BtreeOpType) {
-        if let Err(error) = self.record_depth_gauge(cx) {
+    async fn finish_btree_op_postlude(&mut self, cx: &Cx, op_type: BtreeOpType) {
+        if let Err(error) = self.record_depth_gauge(cx).await {
             debug!(
                 op_type = op_type.as_str(),
                 error = %error,
@@ -3168,9 +3262,14 @@ impl<P: PageReader> BtCursor<P> {
 
     #[cold]
     #[inline(never)]
-    fn with_btree_op_tracing<T, F>(&mut self, cx: &Cx, op_type: BtreeOpType, work: F) -> Result<T>
+    async fn with_btree_op_tracing<T, F>(
+        &mut self,
+        cx: &Cx,
+        op_type: BtreeOpType,
+        work: F,
+    ) -> Result<T>
     where
-        F: FnOnce(&mut Self) -> Result<T>,
+        F: AsyncFnOnce(&mut Self) -> Result<T>,
     {
         let span = tracing::span!(
             Level::DEBUG,
@@ -3180,12 +3279,11 @@ impl<P: PageReader> BtCursor<P> {
             splits = tracing::field::Empty,
             merges = tracing::field::Empty
         );
-        let _entered = span.enter();
-        debug!(op_type = op_type.as_str(), "starting btree operation");
+        debug!(parent: &span, op_type = op_type.as_str(), "starting btree operation");
 
         self.active_op_stats = Some(BtreeOpRuntimeStats::default());
-        let result = work(self);
-        self.finish_btree_op_postlude(cx, op_type);
+        let result = work(self).instrument(span.clone()).await;
+        self.finish_btree_op_postlude(cx, op_type).await;
 
         let stats = self.active_op_stats.take().unwrap_or_default();
         span.record("pages_visited", stats.pages_visited);
@@ -3215,7 +3313,7 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// Load a page into a stack entry.
-    fn load_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<StackEntry> {
+    async fn load_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<StackEntry> {
         observe_cursor_cancellation(cx)?;
 
         // Alien Optimization: Hot-path Stack Elision.
@@ -3232,7 +3330,7 @@ impl<P: PageReader> BtCursor<P> {
         }
 
         self.note_page_visit(page_no);
-        let page_data = self.pager.read_btree_page_data(cx, page_no)?;
+        let page_data = self.pager.read_btree_page_data(cx, page_no).await?;
         let header_offset = cell::header_offset_for_page(page_no);
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
         let mut cell_pointers = take_pooled_cell_pointers();
@@ -3258,11 +3356,11 @@ impl<P: PageReader> BtCursor<P> {
     ///
     /// This is required immediately after in-place writes because some test
     /// pagers do not surface dirty-state through `is_dirty()`.
-    fn reload_page_fresh(&mut self, cx: &Cx, page_no: PageNumber) -> Result<StackEntry> {
+    async fn reload_page_fresh(&mut self, cx: &Cx, page_no: PageNumber) -> Result<StackEntry> {
         observe_cursor_cancellation(cx)?;
         self.note_page_visit(page_no);
         instrumentation::record_page_header_rebuild();
-        let page_data = self.pager.read_btree_page_data(cx, page_no)?;
+        let page_data = self.pager.read_btree_page_data(cx, page_no).await?;
         let header_offset = cell::header_offset_for_page(page_no);
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
         let mut cell_pointers = take_pooled_cell_pointers();
@@ -3379,7 +3477,7 @@ impl<P: PageReader> BtCursor<P> {
     /// round-trip property tests (`prop_btree_reverse_iter_matches_btreemap_rev`,
     /// `prop_btree_forward_and_reverse_round_trip`,
     /// `prop_index_btree_reverse_iter_matches_sorted_rev`) guard this path.
-    fn move_to_leftmost_leaf(
+    async fn move_to_leftmost_leaf(
         &mut self,
         cx: &Cx,
         page_no: PageNumber,
@@ -3399,7 +3497,7 @@ impl<P: PageReader> BtCursor<P> {
                 });
             }
 
-            let mut entry = self.load_page(cx, current_page)?;
+            let mut entry = self.load_page(cx, current_page).await?;
             entry.cell_idx = 0;
 
             if entry.header.page_type.is_leaf() {
@@ -3530,7 +3628,7 @@ impl<P: PageReader> BtCursor<P> {
     /// backward-progress defects (infinite loops / replayed subtrees after an
     /// interior pop), since fixed. The reverse-iteration and round-trip property
     /// tests guard this path.
-    fn move_to_rightmost_leaf(
+    async fn move_to_rightmost_leaf(
         &mut self,
         cx: &Cx,
         page_no: PageNumber,
@@ -3547,7 +3645,7 @@ impl<P: PageReader> BtCursor<P> {
                 });
             }
 
-            let mut entry = self.load_page(cx, current_page)?;
+            let mut entry = self.load_page(cx, current_page).await?;
 
             if entry.header.page_type.is_leaf() {
                 let leaf_page_no = entry.page_no;
@@ -3673,13 +3771,13 @@ impl<P: PageReader> BtCursor<P> {
     ///
     /// Upward split propagation cannot trust the stale cursor-stack `cell_idx`
     /// after a lower-level balance rewrites the tree shape underneath it.
-    fn find_child_slot_by_page_no(
+    async fn find_child_slot_by_page_no(
         &mut self,
         cx: &Cx,
         parent_page_no: PageNumber,
         child_page_no: PageNumber,
     ) -> Result<u16> {
-        let entry = self.reload_page_fresh(cx, parent_page_no)?;
+        let entry = self.reload_page_fresh(cx, parent_page_no).await?;
         if !entry.header.page_type.is_interior() {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -3704,8 +3802,8 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// Seek to a rowid in a table B-tree. Returns the seek result.
-    fn table_seek(&mut self, cx: &Cx, target_rowid: i64) -> Result<SeekResult> {
-        let res = self.table_seek_for_insert(cx, target_rowid)?;
+    async fn table_seek(&mut self, cx: &Cx, target_rowid: i64) -> Result<SeekResult> {
+        let res = self.table_seek_for_insert(cx, target_rowid).await?;
         if !res.is_found() && self.at_eof {
             // We fell off the right edge of the leaf.
             // Determine if there is a successor up the tree.
@@ -3720,7 +3818,7 @@ impl<P: PageReader> BtCursor<P> {
             if has_successor {
                 // There is a successor. Reset eof and use advance_next to reach it.
                 self.at_eof = false;
-                let advanced = self.advance_next(cx)?;
+                let advanced = self.advance_next(cx).await?;
                 if advanced {
                     let successor = self
                         .stack
@@ -3747,15 +3845,15 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// Advance a table cursor to `target_rowid`, reusing nearby leaf pages first.
-    fn table_advance_to(&mut self, cx: &Cx, target_rowid: i64) -> Result<SeekResult> {
+    async fn table_advance_to(&mut self, cx: &Cx, target_rowid: i64) -> Result<SeekResult> {
         observe_cursor_cancellation(cx)?;
 
-        let Some(entry) = self.load_current_table_leaf(cx)? else {
-            return self.table_seek(cx, target_rowid);
+        let Some(entry) = self.load_current_table_leaf(cx).await? else {
+            return self.table_seek(cx, target_rowid).await;
         };
 
         let Some((min_rowid, max_rowid)) = Self::table_leaf_rowid_bounds(&entry)? else {
-            return self.table_seek(cx, target_rowid);
+            return self.table_seek(cx, target_rowid).await;
         };
 
         if target_rowid >= min_rowid && target_rowid <= max_rowid {
@@ -3763,8 +3861,8 @@ impl<P: PageReader> BtCursor<P> {
         }
 
         if target_rowid > max_rowid
-            && self.advance_to_next_table_leaf(cx)?
-            && let Some(next_entry) = self.load_current_table_leaf(cx)?
+            && self.advance_to_next_table_leaf(cx).await?
+            && let Some(next_entry) = self.load_current_table_leaf(cx).await?
             && let Some((next_min_rowid, next_max_rowid)) =
                 Self::table_leaf_rowid_bounds(&next_entry)?
             && target_rowid >= next_min_rowid
@@ -3773,15 +3871,15 @@ impl<P: PageReader> BtCursor<P> {
             return self.position_on_loaded_table_leaf(cx, next_entry, target_rowid);
         }
 
-        self.table_seek(cx, target_rowid)
+        self.table_seek(cx, target_rowid).await
     }
 
     /// Internal seek used by INSERT that anchors the cursor on the leaf where
     /// the target belongs, even if it falls off the right edge.
-    fn table_seek_for_insert(&mut self, cx: &Cx, target_rowid: i64) -> Result<SeekResult> {
+    async fn table_seek_for_insert(&mut self, cx: &Cx, target_rowid: i64) -> Result<SeekResult> {
         observe_cursor_cancellation(cx)?;
 
-        if let Some(result) = self.try_table_seek_cache(cx, target_rowid)? {
+        if let Some(result) = self.try_table_seek_cache(cx, target_rowid).await? {
             return Ok(result);
         }
 
@@ -3796,7 +3894,7 @@ impl<P: PageReader> BtCursor<P> {
                 });
             }
 
-            let entry = self.load_page(cx, current_page)?;
+            let entry = self.load_page(cx, current_page).await?;
 
             // Guard: detect is_table vs actual page-type mismatch early.
             // If the cursor was opened with is_table=true but the page is
@@ -3874,7 +3972,11 @@ impl<P: PageReader> BtCursor<P> {
         }
     }
 
-    fn try_table_seek_cache(&mut self, cx: &Cx, target_rowid: i64) -> Result<Option<SeekResult>> {
+    async fn try_table_seek_cache(
+        &mut self,
+        cx: &Cx,
+        target_rowid: i64,
+    ) -> Result<Option<SeekResult>> {
         observe_cursor_cancellation(cx)?;
 
         for slot_idx in 0..TABLE_SEEK_CACHE_SLOTS {
@@ -3908,7 +4010,7 @@ impl<P: PageReader> BtCursor<P> {
                 self.note_page_visit(cached.page_no);
                 None
             } else {
-                Some(self.load_page(cx, cached.page_no)?)
+                Some(self.load_page(cx, cached.page_no).await?)
             };
 
             let (result, cell_count) = {
@@ -3968,7 +4070,7 @@ impl<P: PageReader> BtCursor<P> {
         Ok(None)
     }
 
-    fn load_current_table_leaf(&mut self, cx: &Cx) -> Result<Option<StackEntry>> {
+    async fn load_current_table_leaf(&mut self, cx: &Cx) -> Result<Option<StackEntry>> {
         let Some(current) = self.stack.last() else {
             return Ok(None);
         };
@@ -3979,7 +4081,7 @@ impl<P: PageReader> BtCursor<P> {
             return Ok(None);
         }
         let current_page = current.page_no;
-        let entry = self.load_page(cx, current_page)?;
+        let entry = self.load_page(cx, current_page).await?;
         if entry.header.cell_count == 0 {
             return Ok(None);
         }
@@ -4037,7 +4139,7 @@ impl<P: PageReader> BtCursor<P> {
         Ok(seek_result)
     }
 
-    fn advance_to_next_table_leaf(&mut self, cx: &Cx) -> Result<bool> {
+    async fn advance_to_next_table_leaf(&mut self, cx: &Cx) -> Result<bool> {
         let Some(top) = self.stack.last().cloned() else {
             return Ok(false);
         };
@@ -4052,7 +4154,7 @@ impl<P: PageReader> BtCursor<P> {
             .cell_idx = top.header.cell_count - 1;
         self.at_eof = false;
 
-        let advanced = self.advance_next_impl(cx, false)?;
+        let advanced = self.advance_next_impl(cx, false).await?;
         Ok(advanced
             && !self.at_eof
             && self
@@ -4256,22 +4358,26 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// Seek to a key in an index B-tree. Returns the seek result.
-    fn index_seek(&mut self, cx: &Cx, target_key: &[u8]) -> Result<SeekResult> {
+    async fn index_seek(&mut self, cx: &Cx, target_key: &[u8]) -> Result<SeekResult> {
         self.index_seek_with_bias(cx, target_key, IndexSeekBias::LowerBound)
+            .await
     }
 
     /// Seek to the first key after the complete equal-prefix run.
-    fn index_seek_upper_bound(&mut self, cx: &Cx, target_key: &[u8]) -> Result<SeekResult> {
+    async fn index_seek_upper_bound(&mut self, cx: &Cx, target_key: &[u8]) -> Result<SeekResult> {
         self.index_seek_with_bias(cx, target_key, IndexSeekBias::UpperBound)
+            .await
     }
 
-    fn index_seek_with_bias(
+    async fn index_seek_with_bias(
         &mut self,
         cx: &Cx,
         target_key: &[u8],
         bias: IndexSeekBias,
     ) -> Result<SeekResult> {
-        let res = self.index_seek_for_insert_with_bias(cx, target_key, bias)?;
+        let res = self
+            .index_seek_for_insert_with_bias(cx, target_key, bias)
+            .await?;
         if !res.is_found() && self.at_eof {
             // We fell off the right edge of the leaf.
             // Determine if there is a successor up the tree.
@@ -4286,7 +4392,7 @@ impl<P: PageReader> BtCursor<P> {
             if has_successor {
                 // There is a successor. Reset eof and use advance_next to reach it.
                 self.at_eof = false;
-                let advanced = self.advance_next(cx)?;
+                let advanced = self.advance_next(cx).await?;
                 if !advanced {
                     self.at_eof = true;
                 }
@@ -4297,11 +4403,12 @@ impl<P: PageReader> BtCursor<P> {
 
     /// Internal seek used by INSERT that anchors the cursor on the leaf where
     /// the target belongs, even if it falls off the right edge.
-    fn index_seek_for_insert(&mut self, cx: &Cx, target_key: &[u8]) -> Result<SeekResult> {
+    async fn index_seek_for_insert(&mut self, cx: &Cx, target_key: &[u8]) -> Result<SeekResult> {
         self.index_seek_for_insert_with_bias(cx, target_key, IndexSeekBias::LowerBound)
+            .await
     }
 
-    fn index_seek_for_insert_with_bias(
+    async fn index_seek_for_insert_with_bias(
         &mut self,
         cx: &Cx,
         target_key: &[u8],
@@ -4319,7 +4426,7 @@ impl<P: PageReader> BtCursor<P> {
                 });
             }
 
-            let entry = self.load_page(cx, current_page)?;
+            let entry = self.load_page(cx, current_page).await?;
 
             // Guard: detect is_table vs actual page-type mismatch early.
             // If the cursor was opened with is_table=false but the page is
@@ -4335,8 +4442,9 @@ impl<P: PageReader> BtCursor<P> {
             }
 
             if entry.header.page_type.is_leaf() {
-                let result =
-                    self.binary_search_index_leaf_with_bias(cx, &entry, target_key, bias)?;
+                let result = self
+                    .binary_search_index_leaf_with_bias(cx, &entry, target_key, bias)
+                    .await?;
                 match result {
                     BinarySearchResult::Found(idx) => {
                         let mut entry = entry;
@@ -4381,8 +4489,9 @@ impl<P: PageReader> BtCursor<P> {
             }
 
             // Interior index page: binary search to find which child to descend.
-            let search_result =
-                self.binary_search_index_interior_with_bias(cx, &entry, target_key, bias)?;
+            let search_result = self
+                .binary_search_index_interior_with_bias(cx, &entry, target_key, bias)
+                .await?;
             match search_result {
                 BinarySearchResult::Found(idx) => {
                     let mut entry = entry;
@@ -4412,7 +4521,7 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// Read the full payload for a cell into the provided buffer.
-    fn read_cell_payload_into(
+    async fn read_cell_payload_into(
         &self,
         cx: &Cx,
         entry: &StackEntry,
@@ -4422,18 +4531,16 @@ impl<P: PageReader> BtCursor<P> {
         let local = cell.local_payload(entry.page_data.as_bytes());
 
         if let Some(first_overflow) = cell.overflow_page {
-            overflow::read_overflow_chain_into(
+            overflow::read_overflow_chain_into_async(
+                cx,
                 local,
                 first_overflow,
                 cell.payload_size,
                 self.usable_size,
-                &mut |pgno| {
-                    self.pager
-                        .read_btree_page_data(cx, pgno)
-                        .map(PageData::into_vec)
-                },
+                &self.pager,
                 out,
             )
+            .await
         } else {
             out.clear();
             instrumentation::record_local_payload_copy(local.len());
@@ -4443,7 +4550,7 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// Read only a prefix of a cell payload into the provided buffer.
-    fn read_cell_payload_prefix_into(
+    async fn read_cell_payload_prefix_into(
         &self,
         cx: &Cx,
         entry: &StackEntry,
@@ -4461,19 +4568,17 @@ impl<P: PageReader> BtCursor<P> {
         }
 
         if let Some(first_overflow) = cell.overflow_page {
-            overflow::read_overflow_chain_prefix_into(
+            overflow::read_overflow_chain_prefix_into_async(
+                cx,
                 local,
                 first_overflow,
                 cell.payload_size,
                 self.usable_size,
                 target_size,
-                &mut |pgno| {
-                    self.pager
-                        .read_btree_page_data(cx, pgno)
-                        .map(PageData::into_vec)
-                },
+                &self.pager,
                 out,
             )
+            .await
         } else {
             out.clear();
             let local_copy_len = local.len().min(target_size);
@@ -4484,8 +4589,8 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// Read the full payload for a cell (resolving overflow if needed).
-    fn read_cell_payload<'a>(
-        &self,
+    async fn read_cell_payload<'a>(
+        &'a self,
         cx: &Cx,
         entry: &'a StackEntry,
         cell: &CellRef,
@@ -4496,22 +4601,27 @@ impl<P: PageReader> BtCursor<P> {
             ));
         }
 
-        instrumentation::record_owned_payload_materialization(
-            usize::try_from(cell.payload_size).unwrap_or(usize::MAX),
-        );
-        let mut payload = Vec::new();
-        self.read_cell_payload_into(cx, entry, cell, &mut payload)?;
-        Ok(Cow::Owned(payload))
+        Ok(Cow::Owned(
+            overflow::read_overflow_chain_async(
+                cx,
+                cell.local_payload(entry.page_data.as_bytes()),
+                cell.overflow_page
+                    .ok_or_else(|| FrankenError::internal("missing overflow page"))?,
+                cell.payload_size,
+                self.usable_size,
+                &self.pager,
+            )
+            .await?,
+        ))
     }
 
-    fn binary_search_index_leaf_with_bias(
+    async fn binary_search_index_leaf_with_bias(
         &self,
         cx: &Cx,
         entry: &StackEntry,
         target: &[u8],
         bias: IndexSeekBias,
     ) -> Result<BinarySearchResult> {
-        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
         let count = entry.header.cell_count;
         if count == 0 {
             return Ok(BinarySearchResult::NotFound(0));
@@ -4525,13 +4635,17 @@ impl<P: PageReader> BtCursor<P> {
             observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
             let cell = self.parse_cell_at(entry, mid)?;
-            let key = self.read_cell_payload(cx, entry, &cell)?;
-            let ord = self.compare_index_key_bytes_with_bias(
-                key.as_ref(),
-                target,
-                parsed_target.as_deref(),
-                bias,
-            );
+            let key = self.read_cell_payload(cx, entry, &cell).await?;
+            let ord = {
+                let _record_profile_scope =
+                    enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+                self.compare_index_key_bytes_with_bias(
+                    key.as_ref(),
+                    target,
+                    parsed_target.as_deref(),
+                    bias,
+                )
+            };
 
             match ord {
                 std::cmp::Ordering::Equal => return Ok(BinarySearchResult::Found(mid)),
@@ -4544,23 +4658,23 @@ impl<P: PageReader> BtCursor<P> {
 
     /// Binary search an interior index page to find which child to descend.
     #[cfg(test)]
-    fn binary_search_index_interior(
+    async fn binary_search_index_interior(
         &self,
         cx: &Cx,
         entry: &StackEntry,
         target: &[u8],
     ) -> Result<BinarySearchResult> {
         self.binary_search_index_interior_with_bias(cx, entry, target, IndexSeekBias::LowerBound)
+            .await
     }
 
-    fn binary_search_index_interior_with_bias(
+    async fn binary_search_index_interior_with_bias(
         &self,
         cx: &Cx,
         entry: &StackEntry,
         target: &[u8],
         bias: IndexSeekBias,
     ) -> Result<BinarySearchResult> {
-        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
         let count = entry.header.cell_count;
         if count == 0 {
             return Ok(BinarySearchResult::NotFound(0));
@@ -4574,13 +4688,17 @@ impl<P: PageReader> BtCursor<P> {
             observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
             let cell = self.parse_cell_at(entry, mid)?;
-            let key = self.read_cell_payload(cx, entry, &cell)?;
-            let ord = self.compare_index_key_bytes_with_bias(
-                key.as_ref(),
-                target,
-                parsed_target.as_deref(),
-                bias,
-            );
+            let key = self.read_cell_payload(cx, entry, &cell).await?;
+            let ord = {
+                let _record_profile_scope =
+                    enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+                self.compare_index_key_bytes_with_bias(
+                    key.as_ref(),
+                    target,
+                    parsed_target.as_deref(),
+                    bias,
+                )
+            };
 
             // Note: target vs key comparison direction
             match ord {
@@ -4713,7 +4831,7 @@ impl<P: PageReader> BtCursor<P> {
     /// the function for legitimate "before-first" recovery (after `prev()`
     /// falls off the start, `next()` re-positions at row 1), but it is
     /// never re-entered from within the loop body.
-    fn advance_next_impl(&mut self, cx: &Cx, record_leaf_witness: bool) -> Result<bool> {
+    async fn advance_next_impl(&mut self, cx: &Cx, record_leaf_witness: bool) -> Result<bool> {
         observe_cursor_cancellation(cx)?;
 
         if self.at_eof {
@@ -4723,7 +4841,9 @@ impl<P: PageReader> BtCursor<P> {
             // SQLite-style before-first recovery: `prev()` past the first
             // row leaves the stack empty with `at_eof = false`. The next
             // `next()` call must re-position at row 1.
-            return self.move_to_leftmost_leaf(cx, self.root_page, record_leaf_witness);
+            return self
+                .move_to_leftmost_leaf(cx, self.root_page, record_leaf_witness)
+                .await;
         }
 
         let depth = self.stack.len();
@@ -4789,7 +4909,9 @@ impl<P: PageReader> BtCursor<P> {
                     // including this parent frame).
                     let resume_stack = self.stack.clone();
                     self.issue_prefetch_hint(cx, child);
-                    let found = self.move_to_leftmost_leaf(cx, child, record_leaf_witness)?;
+                    let found = self
+                        .move_to_leftmost_leaf(cx, child, record_leaf_witness)
+                        .await?;
                     if found {
                         return Ok(true);
                     }
@@ -4842,13 +4964,10 @@ impl<P: PageReader> BtCursor<P> {
                 let depth = self.stack.len();
                 let top = &self.stack[depth - 1];
                 if top.header.page_type.is_leaf() {
-                    // Defensive: an interior-page ascent should land on
-                    // another interior page, but if state is anomalous,
-                    // recurse via `advance_next_impl` to re-enter the
-                    // leaf-exhausted recovery. This is bounded by the
-                    // tree depth, not by data size, so it cannot spin.
-                    self.at_eof = false;
-                    return self.advance_next_impl(cx, record_leaf_witness);
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "index interior ascent unexpectedly landed on a leaf page"
+                            .to_owned(),
+                    });
                 }
                 cell_idx = top.cell_idx;
                 cell_count = top.header.cell_count;
@@ -4866,7 +4985,7 @@ impl<P: PageReader> BtCursor<P> {
                 .cell_idx = next_child_idx;
             let resume_stack = self.stack.clone();
             self.issue_prefetch_hint(cx, child);
-            let found = self.move_to_leftmost_leaf(cx, child, false)?;
+            let found = self.move_to_leftmost_leaf(cx, child, false).await?;
             if found {
                 return Ok(true);
             }
@@ -4890,8 +5009,8 @@ impl<P: PageReader> BtCursor<P> {
         Ok(false)
     }
 
-    fn advance_next(&mut self, cx: &Cx) -> Result<bool> {
-        self.advance_next_impl(cx, true)
+    async fn advance_next(&mut self, cx: &Cx) -> Result<bool> {
+        self.advance_next_impl(cx, true).await
     }
 
     /// Move to the previous entry. Returns false if at the beginning.
@@ -4912,13 +5031,13 @@ impl<P: PageReader> BtCursor<P> {
     /// invariant that every iteration either returns a row, pops a stack
     /// frame, or strictly decrements `parent.cell_idx` on the current stack
     /// top.
-    fn advance_prev(&mut self, cx: &Cx) -> Result<bool> {
+    async fn advance_prev(&mut self, cx: &Cx) -> Result<bool> {
         observe_cursor_cancellation(cx)?;
 
         if self.at_eof {
             // Recover from an after-last state (e.g., next() from last row).
             if self.stack.is_empty() {
-                return self.move_to_rightmost_leaf(cx, self.root_page, true);
+                return self.move_to_rightmost_leaf(cx, self.root_page, true).await;
             }
 
             // Recover from a seek-past-end EOF sentinel while preserving leaf context.
@@ -4939,7 +5058,7 @@ impl<P: PageReader> BtCursor<P> {
             }
 
             // Fallback to canonical rightmost positioning for any odd interior/empty state.
-            return self.move_to_rightmost_leaf(cx, self.root_page, true);
+            return self.move_to_rightmost_leaf(cx, self.root_page, true).await;
         }
 
         if self.stack.is_empty() {
@@ -5002,7 +5121,7 @@ impl<P: PageReader> BtCursor<P> {
                     // including this parent frame).
                     let resume_stack = self.stack.clone();
                     self.issue_prefetch_hint(cx, child);
-                    let found = self.move_to_rightmost_leaf(cx, child, true)?;
+                    let found = self.move_to_rightmost_leaf(cx, child, true).await?;
                     if found {
                         return Ok(true);
                     }
@@ -5067,7 +5186,7 @@ impl<P: PageReader> BtCursor<P> {
         // descent into this child subtree finds nothing.
         let resume_stack = self.stack.clone();
         self.issue_prefetch_hint(cx, child);
-        let found = self.move_to_rightmost_leaf(cx, child, false)?;
+        let found = self.move_to_rightmost_leaf(cx, child, false).await?;
         if found {
             return Ok(true);
         }
@@ -5203,34 +5322,22 @@ impl IndexSeekBias {
 }
 
 impl<P: PageWriter> BtCursor<P> {
-    /// Recursively free all pages in the B-tree rooted at `page_no`,
+    /// Free all pages in the B-tree rooted at `page_no`,
     /// including `page_no` itself, any overflow chains attached to cells,
     /// and all child subtrees. Used by DROP TABLE / DROP INDEX to return
     /// every page of the dropped object to the pager freelist.
-    pub fn free_subtree_pages(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-        let page_data = self.pager.read_btree_page_data(cx, page_no)?;
-        let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
-        let header_offset = cell::header_offset_for_page(page_no);
-        let ptrs = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
+    pub async fn free_subtree_pages(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+        let mut pending = vec![page_no];
+        while let Some(current_page) = pending.pop() {
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            let page_data = self.pager.read_btree_page_data(cx, current_page).await?;
+            let header = cell::parse_page_header(page_data.as_bytes(), current_page)?;
+            let header_offset = cell::header_offset_for_page(current_page);
+            let ptrs = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
 
-        // Free overflow chains on ALL cells (both interior and leaf).
-        // Interior cells of index B-trees carry key payloads that can overflow;
-        // table B-tree interior cells only carry rowids (no overflow possible)
-        // but checking is harmless since overflow_page will be None.
-        for ptr in &ptrs {
-            let cell = CellRef::parse(
-                page_data.as_bytes(),
-                usize::from(*ptr),
-                header.page_type,
-                self.usable_size,
-            )?;
-            if let Some(first_overflow) = cell.overflow_page {
-                self.free_overflow_chain(cx, first_overflow)?;
-            }
-        }
-
-        // For interior pages, recursively free child subtrees.
-        if header.page_type.is_interior() {
+            // Free overflow chains on ALL cells (both interior and leaf).
+            // Interior cells of index B-trees carry key payloads that can
+            // overflow; table B-tree interior cells only carry rowids.
             for ptr in &ptrs {
                 let cell = CellRef::parse(
                     page_data.as_bytes(),
@@ -5238,32 +5345,51 @@ impl<P: PageWriter> BtCursor<P> {
                     header.page_type,
                     self.usable_size,
                 )?;
-                let left_child = cell
-                    .left_child
-                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "interior page {} cell is missing left child",
-                            page_no.get()
-                        ),
-                    })?;
-                self.free_subtree_pages(cx, left_child)?;
+                if let Some(first_overflow) = cell.overflow_page {
+                    self.free_overflow_chain(cx, first_overflow).await?;
+                }
             }
 
-            let right_child = header
-                .right_child
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: format!("interior page {} is missing right child", page_no.get()),
-                })?;
-            self.free_subtree_pages(cx, right_child)?;
-        }
+            if header.page_type.is_interior() {
+                for ptr in &ptrs {
+                    let cell = CellRef::parse(
+                        page_data.as_bytes(),
+                        usize::from(*ptr),
+                        header.page_type,
+                        self.usable_size,
+                    )?;
+                    let left_child =
+                        cell.left_child
+                            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "interior page {} cell is missing left child",
+                                    current_page.get()
+                                ),
+                            })?;
+                    pending.push(left_child);
+                }
 
-        self.pager.free_page(cx, page_no)
+                let right_child =
+                    header
+                        .right_child
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "interior page {} is missing right child",
+                                current_page.get()
+                            ),
+                        })?;
+                pending.push(right_child);
+            }
+
+            self.pager.free_page(cx, current_page).await?;
+        }
+        Ok(())
     }
 
-    fn seed_empty_root_leaf_cursor(&mut self, cx: &Cx) -> Result<bool> {
-        self.collapse_empty_table_root_if_needed(cx)?;
+    async fn seed_empty_root_leaf_cursor(&mut self, cx: &Cx) -> Result<bool> {
+        self.collapse_empty_table_root_if_needed(cx).await?;
 
-        let mut root_entry = self.load_page(cx, self.root_page)?;
+        let mut root_entry = self.load_page(cx, self.root_page).await?;
         if !root_entry.header.page_type.is_leaf() || root_entry.header.cell_count != 0 {
             return Ok(false);
         }
@@ -5275,13 +5401,13 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(true)
     }
 
-    fn collapse_empty_table_root_if_needed(&mut self, cx: &Cx) -> Result<()> {
+    async fn collapse_empty_table_root_if_needed(&mut self, cx: &Cx) -> Result<()> {
         if !self.is_table {
             return Ok(());
         }
 
-        let root_entry = self.reload_page_fresh(cx, self.root_page)?;
-        if root_entry.header.page_type.is_leaf() || self.count_all_rows_iterative(cx)? != 0 {
+        let root_entry = self.reload_page_fresh(cx, self.root_page).await?;
+        if root_entry.header.page_type.is_leaf() || self.count_all_rows_iterative(cx).await? != 0 {
             return Ok(());
         }
 
@@ -5300,7 +5426,7 @@ impl<P: PageWriter> BtCursor<P> {
                         self.root_page.get()
                     ),
                 })?;
-            self.free_subtree_pages(cx, left_child)?;
+            self.free_subtree_pages(cx, left_child).await?;
         }
         let right_child =
             root_entry
@@ -5312,7 +5438,7 @@ impl<P: PageWriter> BtCursor<P> {
                         self.root_page.get()
                     ),
                 })?;
-        self.free_subtree_pages(cx, right_child)?;
+        self.free_subtree_pages(cx, right_child).await?;
 
         let header_offset = cell::header_offset_for_page(self.root_page);
         let mut page = vec![0u8; self.page_size as usize];
@@ -5331,7 +5457,8 @@ impl<P: PageWriter> BtCursor<P> {
         };
         header.write(&mut page, header_offset);
         self.pager
-            .write_page_data(cx, self.root_page, PageData::from_vec(page))?;
+            .write_page_data(cx, self.root_page, PageData::from_vec(page))
+            .await?;
         self.stack.clear();
         self.at_eof = true;
         Ok(())
@@ -5627,7 +5754,7 @@ impl<P: PageWriter> BtCursor<P> {
     /// that need overflow pages, duplicate rowids, non-table trees, or a
     /// non-empty root return `Ok(false)` so callers can replay through the
     /// normal insertion path.
-    pub fn table_bulk_load_empty_root_sorted_records<R: AsRef<[u8]>>(
+    pub async fn table_bulk_load_empty_root_sorted_records<R: AsRef<[u8]>>(
         &mut self,
         cx: &Cx,
         records: &[(i64, R)],
@@ -5639,7 +5766,7 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         }
 
-        let root_data = self.pager.read_btree_page_data(cx, self.root_page)?;
+        let root_data = self.pager.read_btree_page_data(cx, self.root_page).await?;
         let root_header = cell::parse_page_header(root_data.as_bytes(), self.root_page)?;
         if root_header.page_type != BtreePageType::LeafTable || root_header.cell_count != 0 {
             return Ok(false);
@@ -5660,7 +5787,9 @@ impl<P: PageWriter> BtCursor<P> {
                 self.build_bulk_table_leaf_page(self.root_page, root_prefix, records)?;
             instrumentation::record_bulk_table_leaf_page_build(leaf_build_start);
             let leaf_write_start = instrumentation::profile_start();
-            self.pager.write_page_data(cx, self.root_page, root_page)?;
+            self.pager
+                .write_page_data(cx, self.root_page, root_page)
+                .await?;
             instrumentation::record_bulk_table_leaf_page_write(leaf_write_start);
             self.stack.clear();
             self.at_eof = true;
@@ -5681,13 +5810,14 @@ impl<P: PageWriter> BtCursor<P> {
         instrumentation::record_bulk_table_grouping(leaf_grouping_start);
         let mut current_level = Vec::with_capacity(leaf_groups.len());
         for group in leaf_groups {
-            let page_no = self.pager.allocate_page(cx)?;
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            let page_no = self.pager.allocate_page(cx).await?;
             let leaf_build_start = instrumentation::profile_start();
             let page =
                 self.build_bulk_table_leaf_page(page_no, None, &records[group.start..group.end])?;
             instrumentation::record_bulk_table_leaf_page_build(leaf_build_start);
             let leaf_write_start = instrumentation::profile_start();
-            self.pager.write_page_data(cx, page_no, page)?;
+            self.pager.write_page_data(cx, page_no, page).await?;
             instrumentation::record_bulk_table_leaf_page_write(leaf_write_start);
             current_level.push(BulkTableChild {
                 page_no,
@@ -5711,7 +5841,9 @@ impl<P: PageWriter> BtCursor<P> {
                 )?;
                 instrumentation::record_bulk_table_interior_page_build(interior_build_start);
                 let interior_write_start = instrumentation::profile_start();
-                self.pager.write_page_data(cx, self.root_page, root_page)?;
+                self.pager
+                    .write_page_data(cx, self.root_page, root_page)
+                    .await?;
                 instrumentation::record_bulk_table_interior_page_write(interior_write_start);
                 self.stack.clear();
                 self.at_eof = true;
@@ -5731,13 +5863,14 @@ impl<P: PageWriter> BtCursor<P> {
             instrumentation::record_bulk_table_grouping(interior_grouping_start);
             let mut next_level = Vec::with_capacity(interior_groups.len());
             for group in interior_groups {
-                let page_no = self.pager.allocate_page(cx)?;
+                cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+                let page_no = self.pager.allocate_page(cx).await?;
                 let group_children = &current_level[group.start..group.end];
                 let interior_build_start = instrumentation::profile_start();
                 let page = self.build_bulk_table_interior_page(page_no, None, group_children)?;
                 instrumentation::record_bulk_table_interior_page_build(interior_build_start);
                 let interior_write_start = instrumentation::profile_start();
-                self.pager.write_page_data(cx, page_no, page)?;
+                self.pager.write_page_data(cx, page_no, page).await?;
                 instrumentation::record_bulk_table_interior_page_write(interior_write_start);
                 next_level.push(BulkTableChild {
                     page_no,
@@ -5751,7 +5884,7 @@ impl<P: PageWriter> BtCursor<P> {
 
     /// Return whether one new right-edge table record matches the narrow
     /// depth-2 bulk-append shape.
-    pub fn table_can_bulk_append_depth2_right_edge_record(
+    pub async fn table_can_bulk_append_depth2_right_edge_record(
         &mut self,
         cx: &Cx,
         rowid: i64,
@@ -5765,7 +5898,7 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         }
 
-        let root_data = self.pager.read_btree_page_data(cx, self.root_page)?;
+        let root_data = self.pager.read_btree_page_data(cx, self.root_page).await?;
         let root_header = cell::parse_page_header(root_data.as_bytes(), self.root_page)?;
         if root_header.page_type != BtreePageType::InteriorTable || root_header.cell_count == 0 {
             return Ok(false);
@@ -5777,7 +5910,7 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         };
 
-        let old_right_data = self.pager.read_btree_page_data(cx, old_right_child)?;
+        let old_right_data = self.pager.read_btree_page_data(cx, old_right_child).await?;
         let old_right_header = cell::parse_page_header(old_right_data.as_bytes(), old_right_child)?;
         if old_right_header.page_type != BtreePageType::LeafTable
             || old_right_header.cell_count == 0
@@ -5824,7 +5957,7 @@ impl<P: PageWriter> BtCursor<P> {
     /// rightmost leaf and the root has enough free space for the new child
     /// separators. Deeper trees, root splits, overflow payloads, and unordered
     /// rows return `Ok(false)` so callers can fall back to normal append logic.
-    pub fn table_bulk_append_depth2_right_edge_sorted_records<R: AsRef<[u8]>>(
+    pub async fn table_bulk_append_depth2_right_edge_sorted_records<R: AsRef<[u8]>>(
         &mut self,
         cx: &Cx,
         records: &[(i64, R)],
@@ -5836,7 +5969,7 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         }
 
-        let root_data = self.pager.read_btree_page_data(cx, self.root_page)?;
+        let root_data = self.pager.read_btree_page_data(cx, self.root_page).await?;
         let root_header = cell::parse_page_header(root_data.as_bytes(), self.root_page)?;
         if root_header.page_type != BtreePageType::InteriorTable || root_header.cell_count == 0 {
             return Ok(false);
@@ -5848,7 +5981,7 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         };
 
-        let old_right_data = self.pager.read_btree_page_data(cx, old_right_child)?;
+        let old_right_data = self.pager.read_btree_page_data(cx, old_right_child).await?;
         let old_right_header = cell::parse_page_header(old_right_data.as_bytes(), old_right_child)?;
         if old_right_header.page_type != BtreePageType::LeafTable
             || old_right_header.cell_count == 0
@@ -5911,13 +6044,14 @@ impl<P: PageWriter> BtCursor<P> {
 
         let mut new_children = Vec::with_capacity(leaf_groups.len());
         for group in &leaf_groups {
-            let page_no = self.pager.allocate_page(cx)?;
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            let page_no = self.pager.allocate_page(cx).await?;
             let leaf_build_start = instrumentation::profile_start();
             let page =
                 self.build_bulk_table_leaf_page(page_no, None, &records[group.start..group.end])?;
             instrumentation::record_bulk_table_leaf_page_build(leaf_build_start);
             let leaf_write_start = instrumentation::profile_start();
-            self.pager.write_page_data(cx, page_no, page)?;
+            self.pager.write_page_data(cx, page_no, page).await?;
             instrumentation::record_bulk_table_leaf_page_write(leaf_write_start);
             new_children.push(BulkTableChild {
                 page_no,
@@ -5980,7 +6114,8 @@ impl<P: PageWriter> BtCursor<P> {
         instrumentation::record_bulk_table_interior_page_build(interior_build_start);
         let interior_write_start = instrumentation::profile_start();
         self.pager
-            .write_page_data(cx, self.root_page, PageData::from_vec(root_page))?;
+            .write_page_data(cx, self.root_page, PageData::from_vec(root_page))
+            .await?;
         instrumentation::record_bulk_table_interior_page_write(interior_write_start);
 
         self.stack.clear();
@@ -5994,7 +6129,11 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(true)
     }
 
-    fn refresh_rightmost_leaf_cache_after_insert(&mut self, cx: &Cx, rowid: i64) -> Result<()> {
+    async fn refresh_rightmost_leaf_cache_after_insert(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+    ) -> Result<()> {
         if let Some(cached) = self
             .rightmost_leaf_cache
             .as_ref()
@@ -6036,7 +6175,7 @@ impl<P: PageWriter> BtCursor<P> {
                 .stack
                 .last()
                 .is_some_and(|entry| entry.header.page_type == cell::BtreePageType::LeafTable)
-            && self.rowid(cx)? == rowid
+            && self.rowid(cx).await? == rowid
         {
             let parent_page = self.current_parent_page_hint_from_stack();
             if let Some(cache_entry) = self.stack.last().map(|entry| RightmostLeafCacheEntry {
@@ -6053,7 +6192,7 @@ impl<P: PageWriter> BtCursor<P> {
             }
         }
 
-        if self.last(cx)? {
+        if self.last(cx).await? {
             let cache_entry = self
                 .stack
                 .last()
@@ -6088,89 +6227,24 @@ impl<P: PageWriter> BtCursor<P> {
         })
     }
 
-    fn write_overflow_chain_for_insert(
+    async fn write_overflow_chain_for_insert(
         &mut self,
         cx: &Cx,
         overflow_data: &[u8],
     ) -> Result<PageNumber> {
-        if overflow_data.is_empty() {
-            return Err(FrankenError::internal(
-                "overflow writer called with empty payload",
-            ));
-        }
-        if self.usable_size <= 4 {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "invalid usable page size {} for overflow chain",
-                    self.usable_size
-                ),
-            });
-        }
-
-        #[allow(clippy::cast_possible_truncation)]
-        let bytes_per_page = self.usable_size.saturating_sub(4) as usize;
-        if bytes_per_page == 0 {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: "usable page size too small for overflow pages".to_owned(),
-            });
-        }
-        #[allow(clippy::cast_possible_truncation)]
-        let page_size = self.page_size as usize;
-        let num_pages = overflow_data.len().div_ceil(bytes_per_page);
-        if num_pages > overflow::MAX_OVERFLOW_CHAIN {
-            return Err(FrankenError::TooBig);
-        }
-
-        let mut pages = Vec::with_capacity(num_pages);
-        for _ in 0..num_pages {
-            match self.pager.allocate_page(cx) {
-                Ok(pgno) => pages.push(pgno),
-                Err(err) => {
-                    for leaked in pages {
-                        let _ = self.pager.free_page(cx, leaked);
-                    }
-                    return Err(err);
-                }
-            }
-        }
-
-        let mut page_buf = vec![0u8; page_size];
-        for (idx, &pgno) in pages.iter().enumerate() {
-            let data_start = idx * bytes_per_page;
-            let data_end = ((idx + 1) * bytes_per_page).min(overflow_data.len());
-            let chunk = &overflow_data[data_start..data_end];
-
-            let next = if idx + 1 < pages.len() {
-                pages[idx + 1].get()
-            } else {
-                0
-            };
-
-            page_buf[0..4].copy_from_slice(&next.to_be_bytes());
-            page_buf[4..4 + chunk.len()].copy_from_slice(chunk);
-            if chunk.len() < bytes_per_page {
-                // Ensure tail is zeroed if the chunk didn't fill the space.
-                page_buf[4 + chunk.len()..].fill(0);
-            }
-            let owned_page = std::mem::replace(&mut page_buf, vec![0_u8; page_size]);
-            if let Err(err) = self
-                .pager
-                .write_page_data(cx, pgno, PageData::from_vec(owned_page))
-            {
-                // Best-effort cleanup: any overflow pages allocated for this
-                // cell must be released if chain materialization fails midway.
-                for leaked in pages.iter().copied() {
-                    let _ = self.pager.free_page(cx, leaked);
-                }
-                return Err(err);
-            }
-        }
-
-        Ok(pages[0])
+        overflow::write_overflow_chain_async(
+            cx,
+            overflow_data,
+            self.usable_size,
+            self.page_size,
+            &mut self.pager,
+        )
+        .await
     }
 
-    fn free_overflow_chain(&mut self, cx: &Cx, first: PageNumber) -> Result<()> {
-        let _mask = cx.masked();
+    async fn free_overflow_chain(&mut self, cx: &Cx, first: PageNumber) -> Result<()> {
+        let cleanup_cx = cx.create_child();
+        let _mask = cleanup_cx.masked();
         let mut current = Some(first);
         let mut visited = 0usize;
 
@@ -6187,7 +6261,7 @@ impl<P: PageWriter> BtCursor<P> {
                 });
             }
 
-            let page = self.pager.read_btree_page_data(cx, pgno)?;
+            let page = self.pager.read_page_data(&cleanup_cx, pgno).await?;
             let page_bytes = page.as_bytes();
             if page_bytes.len() < 4 {
                 warn!(
@@ -6203,7 +6277,7 @@ impl<P: PageWriter> BtCursor<P> {
             let next =
                 u32::from_be_bytes([page_bytes[0], page_bytes[1], page_bytes[2], page_bytes[3]]);
             current = PageNumber::new(next);
-            self.pager.free_page(cx, pgno)?;
+            self.pager.free_page(&cleanup_cx, pgno).await?;
         }
 
         Ok(())
@@ -6215,7 +6289,7 @@ impl<P: PageWriter> BtCursor<P> {
     /// The buffer is cleared and reused across calls so repeated inserts
     /// reuse the same heap allocation.
     #[inline]
-    fn encode_table_leaf_cell_into(
+    async fn encode_table_leaf_cell_into(
         &mut self,
         cx: &Cx,
         rowid: i64,
@@ -6242,8 +6316,9 @@ impl<P: PageWriter> BtCursor<P> {
         out.extend_from_slice(&payload[..local_size]);
 
         if local_size < payload.len() {
-            let first_overflow =
-                self.write_overflow_chain_for_insert(cx, &payload[local_size..])?;
+            let first_overflow = self
+                .write_overflow_chain_for_insert(cx, &payload[local_size..])
+                .await?;
             out.extend_from_slice(&first_overflow.get().to_be_bytes());
             instrumentation::record_table_leaf_cell_assembly(out.len());
             Ok(Some(first_overflow))
@@ -6255,20 +6330,22 @@ impl<P: PageWriter> BtCursor<P> {
 
     /// Backwards-compatible wrapper — allocates a fresh Vec per call.
     #[allow(dead_code)]
-    fn encode_table_leaf_cell(
+    async fn encode_table_leaf_cell(
         &mut self,
         cx: &Cx,
         rowid: i64,
         payload: &[u8],
     ) -> Result<(Vec<u8>, Option<PageNumber>)> {
         let mut out = Vec::with_capacity(24 + payload.len().min(self.usable_size as usize) + 4);
-        let overflow = self.encode_table_leaf_cell_into(cx, rowid, payload, &mut out)?;
+        let overflow = self
+            .encode_table_leaf_cell_into(cx, rowid, payload, &mut out)
+            .await?;
         Ok((out, overflow))
     }
 
     /// Encode an index leaf cell into the provided buffer, returning the
     /// overflow head page (if any).
-    fn encode_index_leaf_cell_into(
+    async fn encode_index_leaf_cell_into(
         &mut self,
         cx: &Cx,
         key: &[u8],
@@ -6290,7 +6367,9 @@ impl<P: PageWriter> BtCursor<P> {
         out.extend_from_slice(&key[..local_size]);
 
         if local_size < key.len() {
-            let first_overflow = self.write_overflow_chain_for_insert(cx, &key[local_size..])?;
+            let first_overflow = self
+                .write_overflow_chain_for_insert(cx, &key[local_size..])
+                .await?;
             out.extend_from_slice(&first_overflow.get().to_be_bytes());
             instrumentation::record_index_leaf_cell_assembly(out.len());
             Ok(Some(first_overflow))
@@ -6302,13 +6381,13 @@ impl<P: PageWriter> BtCursor<P> {
 
     /// Backwards-compatible wrapper — allocates a fresh Vec per call.
     #[allow(dead_code)]
-    fn encode_index_leaf_cell(
+    async fn encode_index_leaf_cell(
         &mut self,
         cx: &Cx,
         key: &[u8],
     ) -> Result<(Vec<u8>, Option<PageNumber>)> {
         let mut out = Vec::with_capacity(16 + key.len().min(self.usable_size as usize) + 4);
-        let overflow = self.encode_index_leaf_cell_into(cx, key, &mut out)?;
+        let overflow = self.encode_index_leaf_cell_into(cx, key, &mut out).await?;
         Ok((out, overflow))
     }
 
@@ -6321,7 +6400,7 @@ impl<P: PageWriter> BtCursor<P> {
     }
 
     #[allow(dead_code)] // Retained for future compaction-before-balance optimization
-    fn compact_current_table_leaf(&mut self, cx: &Cx) -> Result<bool> {
+    async fn compact_current_table_leaf(&mut self, cx: &Cx) -> Result<bool> {
         if !self.current_table_leaf_needs_compaction() {
             return Ok(false);
         }
@@ -6401,9 +6480,10 @@ impl<P: PageWriter> BtCursor<P> {
         cell::write_cell_pointers(&mut compacted, header_offset, &header, &new_ptrs);
 
         self.pager
-            .write_page_data(cx, page_no, PageData::from_vec(compacted))?;
+            .write_page_data(cx, page_no, PageData::from_vec(compacted))
+            .await?;
 
-        let mut refreshed = self.reload_page_fresh(cx, page_no)?;
+        let mut refreshed = self.reload_page_fresh(cx, page_no).await?;
         if refreshed.header.cell_count == 0 {
             refreshed.cell_idx = 0;
         } else {
@@ -6545,7 +6625,12 @@ impl<P: PageWriter> BtCursor<P> {
     /// Try to insert a cell directly onto the leaf page at the top of the
     /// cursor stack. Returns `Ok(true)` if the cell was inserted, or
     /// `Ok(false)` if the page is full and balance is needed.
-    fn try_insert_on_leaf(&mut self, cx: &Cx, insert_idx: u16, cell_data: &[u8]) -> Result<bool> {
+    async fn try_insert_on_leaf(
+        &mut self,
+        cx: &Cx,
+        insert_idx: u16,
+        cell_data: &[u8],
+    ) -> Result<bool> {
         observe_cursor_cancellation(cx)?;
         let (leaf_page_no, staged_page, insert_at) = {
             let entry = self
@@ -6655,7 +6740,9 @@ impl<P: PageWriter> BtCursor<P> {
             (leaf_page_no, entry.page_data.clone(), insert_at)
         };
 
-        self.pager.write_page_data(cx, leaf_page_no, staged_page)?;
+        self.pager
+            .write_page_data(cx, leaf_page_no, staged_page)
+            .await?;
         self.at_eof = false;
         trace!(
             page_number = leaf_page_no.get(),
@@ -6671,19 +6758,21 @@ impl<P: PageWriter> BtCursor<P> {
     /// loaded and validated in the same function. That lets us reuse the
     /// cached page/header directly and avoid a second pager read plus a full
     /// cell-pointer-array decode/reload cycle on the hot append case.
-    fn try_append_on_current_leaf(&mut self, cx: &Cx, cell_data: &[u8]) -> Result<bool> {
+    async fn try_append_on_current_leaf(&mut self, cx: &Cx, cell_data: &[u8]) -> Result<bool> {
         let mut entry = self
             .stack
             .pop()
             .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
         let leaf_page_no = entry.page_no;
-        let append_result = self.try_append_leaf_page_in_place(
-            cx,
-            leaf_page_no,
-            &mut entry.page_data,
-            &mut entry.header,
-            cell_data,
-        );
+        let append_result = self
+            .try_append_leaf_page_in_place(
+                cx,
+                leaf_page_no,
+                &mut entry.page_data,
+                &mut entry.header,
+                cell_data,
+            )
+            .await;
         let (insert_idx, new_cell_offset) = match append_result {
             Ok(Some(result)) => result,
             Ok(None) => {
@@ -6705,7 +6794,7 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(true)
     }
 
-    fn try_append_payload_on_current_leaf_with_writer<W>(
+    async fn try_append_payload_on_current_leaf_with_writer<W>(
         &mut self,
         cx: &Cx,
         rowid: i64,
@@ -6720,15 +6809,17 @@ impl<P: PageWriter> BtCursor<P> {
             .pop()
             .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
         let leaf_page_no = entry.page_no;
-        let append_result = self.try_append_table_leaf_payload_in_place_no_overflow_with_writer(
-            cx,
-            leaf_page_no,
-            &mut entry.page_data,
-            &mut entry.header,
-            rowid,
-            payload_len,
-            writer,
-        );
+        let append_result = self
+            .try_append_table_leaf_payload_in_place_no_overflow_with_writer(
+                cx,
+                leaf_page_no,
+                &mut entry.page_data,
+                &mut entry.header,
+                rowid,
+                payload_len,
+                writer,
+            )
+            .await;
         let (insert_idx, new_cell_offset) = match append_result {
             Ok(Some(result)) => result,
             Ok(None) => {
@@ -6751,7 +6842,7 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(true)
     }
 
-    fn try_append_leaf_page_in_place(
+    async fn try_append_leaf_page_in_place(
         &mut self,
         cx: &Cx,
         leaf_page_no: PageNumber,
@@ -6815,7 +6906,9 @@ impl<P: PageWriter> BtCursor<P> {
 
         let staged_page = page_data.clone();
         let stage_start = instrumentation::profile_start();
-        self.pager.write_page_data(cx, leaf_page_no, staged_page)?;
+        self.pager
+            .write_page_data(cx, leaf_page_no, staged_page)
+            .await?;
         instrumentation::record_fast_table_leaf_full_cell_append_stage(stage_start);
         Ok(Some((insert_idx, new_cell_offset)))
     }
@@ -6906,7 +6999,7 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(Some((insert_idx, new_cell_offset)))
     }
 
-    fn try_append_table_leaf_payload_in_place_no_overflow(
+    async fn try_append_table_leaf_payload_in_place_no_overflow(
         &mut self,
         cx: &Cx,
         leaf_page_no: PageNumber,
@@ -6929,7 +7022,9 @@ impl<P: PageWriter> BtCursor<P> {
         };
         let staged_page = page_data.clone();
         let stage_start = instrumentation::profile_start();
-        self.pager.write_page_data(cx, leaf_page_no, staged_page)?;
+        self.pager
+            .write_page_data(cx, leaf_page_no, staged_page)
+            .await?;
         instrumentation::record_fast_table_leaf_payload_append_stage(stage_start);
         Ok(Some((insert_idx, new_cell_offset)))
     }
@@ -7057,7 +7152,7 @@ impl<P: PageWriter> BtCursor<P> {
     /// contract; this wrapper additionally stages the mutated page image
     /// through the pager.
     #[allow(clippy::too_many_arguments)]
-    fn try_append_table_leaf_payload_in_place_no_overflow_with_writer<W>(
+    async fn try_append_table_leaf_payload_in_place_no_overflow_with_writer<W>(
         &mut self,
         cx: &Cx,
         leaf_page_no: PageNumber,
@@ -7085,7 +7180,9 @@ impl<P: PageWriter> BtCursor<P> {
         };
         let staged_page = page_data.clone();
         let stage_start = instrumentation::profile_start();
-        self.pager.write_page_data(cx, leaf_page_no, staged_page)?;
+        self.pager
+            .write_page_data(cx, leaf_page_no, staged_page)
+            .await?;
         instrumentation::record_fast_table_leaf_payload_append_stage(stage_start);
         Ok(Some((insert_idx, new_cell_offset)))
     }
@@ -7094,7 +7191,12 @@ impl<P: PageWriter> BtCursor<P> {
     ///
     /// `cell_data` is the cell that didn't fit. `insert_idx` is where within
     /// the leaf's cell array it should be placed.
-    fn balance_for_insert(&mut self, cx: &Cx, cell_data: &[u8], insert_idx: u16) -> Result<()> {
+    async fn balance_for_insert(
+        &mut self,
+        cx: &Cx,
+        cell_data: &[u8],
+        insert_idx: u16,
+    ) -> Result<()> {
         let depth = self.stack.len();
         if depth == 0 {
             return Err(FrankenError::internal("cursor stack empty during balance"));
@@ -7125,7 +7227,8 @@ impl<P: PageWriter> BtCursor<P> {
                 self.root_page,
                 self.usable_size,
                 self.page_size,
-            )?;
+            )
+            .await?;
             self.note_split_event();
             // Root is now an interior page with 1 child at index 0.
             let outcome = balance::balance_nonroot(
@@ -7138,7 +7241,8 @@ impl<P: PageWriter> BtCursor<P> {
                 self.usable_size,
                 self.page_size,
                 true,
-            )?;
+            )
+            .await?;
             if matches!(outcome, balance::BalanceResult::Split { .. }) {
                 return Err(FrankenError::internal(
                     "root balance unexpectedly returned split requiring parent update",
@@ -7184,7 +7288,9 @@ impl<P: PageWriter> BtCursor<P> {
                             divider_rowid,
                             self.usable_size,
                             self.page_size,
-                        ) {
+                        )
+                        .await
+                        {
                             Ok(Some(result)) => {
                                 instrumentation::record_quick_balance_attempt(
                                     quick_balance_start,
@@ -7230,7 +7336,9 @@ impl<P: PageWriter> BtCursor<P> {
                     self.usable_size,
                     self.page_size,
                     parent_is_root,
-                )? {
+                )
+                .await?
+                {
                     Some(outcome) => {
                         instrumentation::record_local_split_attempt(local_split_start, true);
                         self.note_split_event();
@@ -7249,7 +7357,8 @@ impl<P: PageWriter> BtCursor<P> {
                             self.usable_size,
                             self.page_size,
                             parent_is_root,
-                        )?;
+                        )
+                        .await?;
                         instrumentation::record_nonroot_balance(nonroot_start);
                         outcome
                     }
@@ -7266,7 +7375,8 @@ impl<P: PageWriter> BtCursor<P> {
                     self.usable_size,
                     self.page_size,
                     parent_is_root,
-                )?;
+                )
+                .await?;
                 instrumentation::record_nonroot_balance(nonroot_start);
                 outcome
             };
@@ -7290,11 +7400,10 @@ impl<P: PageWriter> BtCursor<P> {
                 }
 
                 let ancestor_page_no = self.stack[parent_level - 1].page_no;
-                let ancestor_child_idx = usize::from(self.find_child_slot_by_page_no(
-                    cx,
-                    ancestor_page_no,
-                    split_page_no,
-                )?);
+                let ancestor_child_idx = usize::from(
+                    self.find_child_slot_by_page_no(cx, ancestor_page_no, split_page_no)
+                        .await?,
+                );
                 let ancestor_is_root = ancestor_page_no == self.root_page;
 
                 outcome = balance::apply_child_replacement(
@@ -7308,7 +7417,8 @@ impl<P: PageWriter> BtCursor<P> {
                     &new_pgnos,
                     &new_dividers,
                     ancestor_is_root,
-                )?;
+                )
+                .await?;
 
                 split_page_no = ancestor_page_no;
                 parent_level -= 1;
@@ -7332,7 +7442,7 @@ impl<P: PageWriter> BtCursor<P> {
     /// `apply_child_replacement` triggers `balance_shallower` which
     /// copies the sole remaining child into the root page, reducing the
     /// tree depth by one (the inverse of `balance_deeper`).
-    fn balance_for_delete(&mut self, cx: &Cx) -> Result<()> {
+    async fn balance_for_delete(&mut self, cx: &Cx) -> Result<()> {
         let depth = self.stack.len();
         if depth == 0 {
             return Err(FrankenError::internal(
@@ -7388,7 +7498,8 @@ impl<P: PageWriter> BtCursor<P> {
                 self.usable_size,
                 self.page_size,
                 parent_is_root,
-            )?;
+            )
+            .await?;
 
             // If balancing split the parent page, propagate the split up the
             // cursor stack by updating each ancestor in turn.
@@ -7409,11 +7520,10 @@ impl<P: PageWriter> BtCursor<P> {
                 }
 
                 let ancestor_page_no = self.stack[split_level - 1].page_no;
-                let ancestor_child_idx = usize::from(self.find_child_slot_by_page_no(
-                    cx,
-                    ancestor_page_no,
-                    split_page_no,
-                )?);
+                let ancestor_child_idx = usize::from(
+                    self.find_child_slot_by_page_no(cx, ancestor_page_no, split_page_no)
+                        .await?,
+                );
                 let ancestor_is_root = ancestor_page_no == self.root_page;
 
                 outcome = balance::apply_child_replacement(
@@ -7427,7 +7537,8 @@ impl<P: PageWriter> BtCursor<P> {
                     &new_pgnos,
                     &new_dividers,
                     ancestor_is_root,
-                )?;
+                )
+                .await?;
 
                 split_page_no = ancestor_page_no;
                 split_level -= 1;
@@ -7442,7 +7553,7 @@ impl<P: PageWriter> BtCursor<P> {
 
             // Check whether the parent now has zero cells — if so, it
             // needs to be merged with its siblings at the next level up.
-            let parent_data = self.pager.read_btree_page_data(cx, parent_page_no)?;
+            let parent_data = self.pager.read_btree_page_data(cx, parent_page_no).await?;
             let parent_header = cell::parse_page_header(parent_data.as_bytes(), parent_page_no)?;
 
             if parent_header.cell_count == 0 && parent_header.page_type.is_interior() {
@@ -7458,7 +7569,7 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(())
     }
 
-    fn replace_interior_cell(&mut self, cx: &Cx, new_payload: &[u8]) -> Result<bool> {
+    async fn replace_interior_cell(&mut self, cx: &Cx, new_payload: &[u8]) -> Result<bool> {
         if self.stack.is_empty() || self.at_eof {
             return Err(FrankenError::internal(
                 "cursor at EOF during interior replace",
@@ -7493,8 +7604,9 @@ impl<P: PageWriter> BtCursor<P> {
 
         new_cell.extend_from_slice(&new_payload[..local_size]);
         let new_overflow_head = if local_size < new_payload.len() {
-            let first_overflow =
-                self.write_overflow_chain_for_insert(cx, &new_payload[local_size..])?;
+            let first_overflow = self
+                .write_overflow_chain_for_insert(cx, &new_payload[local_size..])
+                .await?;
             new_cell.extend_from_slice(&first_overflow.get().to_be_bytes());
             Some(first_overflow)
         } else {
@@ -7503,7 +7615,7 @@ impl<P: PageWriter> BtCursor<P> {
         instrumentation::record_interior_cell_rebuild(new_cell.len());
 
         // Remove old cell from page and try to insert new cell.
-        let mut page_data = self.pager.read_btree_page_data(cx, page_no)?;
+        let mut page_data = self.pager.read_btree_page_data(cx, page_no).await?;
         let header_offset = cell::header_offset_for_page(page_no);
         let mut header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
         let mut ptrs = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
@@ -7599,15 +7711,15 @@ impl<P: PageWriter> BtCursor<P> {
                 cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
             }
 
-            self.pager.write_page_data(cx, page_no, page_data)?;
-            let mut refreshed = self.reload_page_fresh(cx, page_no)?;
+            self.pager.write_page_data(cx, page_no, page_data).await?;
+            let mut refreshed = self.reload_page_fresh(cx, page_no).await?;
             refreshed.cell_idx = cell_idx;
             if let Some(top) = self.stack.last_mut() {
                 *top = refreshed;
             }
             self.at_eof = false;
             if let Some(first) = old_overflow {
-                self.free_overflow_chain(cx, first)?;
+                self.free_overflow_chain(cx, first).await?;
             }
             return Ok(false);
         }
@@ -7627,13 +7739,13 @@ impl<P: PageWriter> BtCursor<P> {
             cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
         }
 
-        self.pager.write_page_data(cx, page_no, page_data)?;
+        self.pager.write_page_data(cx, page_no, page_data).await?;
 
         // Now we must insert `new_cell` at `cell_idx`, which will trigger a structural rebalance.
-        let balance_result = self.balance_for_insert(cx, &new_cell, cell_idx);
+        let balance_result = self.balance_for_insert(cx, &new_cell, cell_idx).await;
         if balance_result.is_err() {
             if let Some(first) = new_overflow_head {
-                let _ = self.free_overflow_chain(cx, first);
+                let _ = self.free_overflow_chain(cx, first).await;
             }
         }
         balance_result?;
@@ -7643,7 +7755,7 @@ impl<P: PageWriter> BtCursor<P> {
         // chain before `balance_for_insert` commits would let an error return
         // with pages freed while the old cell is still the rollback source.
         if let Some(first) = old_overflow {
-            self.free_overflow_chain(cx, first)?;
+            self.free_overflow_chain(cx, first).await?;
         }
 
         Ok(true)
@@ -7833,7 +7945,7 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(())
     }
 
-    fn remove_table_cell_from_leaf_deferred(&mut self, cx: &Cx) -> Result<(PageNumber, u16)> {
+    async fn remove_table_cell_from_leaf_deferred(&mut self, cx: &Cx) -> Result<(PageNumber, u16)> {
         let depth = self.stack.len();
         if depth == 0 || self.at_eof {
             return Err(FrankenError::internal("cursor at EOF during remove"));
@@ -8173,7 +8285,10 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         let refreshed_page_data = page_data.clone();
-        let write_result = self.pager.write_page_data(cx, leaf_page_no, page_data);
+        let write_result = self
+            .pager
+            .write_page_data(cx, leaf_page_no, page_data)
+            .await;
         if let Err(error) = write_result {
             recycle_cell_pointers(ptrs);
             return Err(error);
@@ -8198,7 +8313,7 @@ impl<P: PageWriter> BtCursor<P> {
             self.at_eof = false;
             self.stack[depth - 1] = refreshed;
             let eof_insert_stack = self.stack.clone();
-            if !self.advance_next(cx)? {
+            if !self.advance_next(cx).await? {
                 self.stack = eof_insert_stack;
                 self.at_eof = true;
             }
@@ -8209,13 +8324,13 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         if let Some(first) = overflow_head {
-            self.free_overflow_chain(cx, first)?;
+            self.free_overflow_chain(cx, first).await?;
         }
 
         Ok((leaf_page_no, new_count))
     }
 
-    fn remove_cell_from_leaf(&mut self, cx: &Cx) -> Result<(PageNumber, u16)> {
+    async fn remove_cell_from_leaf(&mut self, cx: &Cx) -> Result<(PageNumber, u16)> {
         let depth = self.stack.len();
         if depth == 0 || self.at_eof {
             return Err(FrankenError::internal("cursor at EOF during remove"));
@@ -8247,7 +8362,7 @@ impl<P: PageWriter> BtCursor<P> {
         // If we update the leaf first and then fail to free the chain, we leak
         // pages but preserve database integrity. Leaks are recoverable (VACUUM);
         // corruption is not.
-        let mut page_data = self.pager.read_btree_page_data(cx, leaf_page_no)?;
+        let mut page_data = self.pager.read_btree_page_data(cx, leaf_page_no).await?;
         let header_offset = cell::header_offset_for_page(leaf_page_no);
         let mut header = cell::parse_page_header(page_data.as_bytes(), leaf_page_no)?;
         // OPT-A4: reuse the cursor-owned defrag scratch buffers so repeated
@@ -8364,13 +8479,16 @@ impl<P: PageWriter> BtCursor<P> {
             header.write(page_bytes, header_offset);
             cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
         }
-        let write_result = self.pager.write_page_data(cx, leaf_page_no, page_data);
+        let write_result = self
+            .pager
+            .write_page_data(cx, leaf_page_no, page_data)
+            .await;
         self.defrag_ptrs_scratch = ptrs;
         self.defrag_cells_scratch = cells_to_move;
         write_result?;
 
         // Refresh the stack entry.
-        let mut refreshed = self.reload_page_fresh(cx, leaf_page_no)?;
+        let mut refreshed = self.reload_page_fresh(cx, leaf_page_no).await?;
         let new_count = refreshed.header.cell_count;
         if new_count == 0 {
             refreshed.cell_idx = 0;
@@ -8380,7 +8498,7 @@ impl<P: PageWriter> BtCursor<P> {
             refreshed.cell_idx = new_count - 1;
             self.at_eof = false;
             self.stack[depth - 1] = refreshed;
-            self.advance_next(cx)?;
+            self.advance_next(cx).await?;
         } else {
             #[allow(clippy::cast_possible_truncation)]
             {
@@ -8392,7 +8510,7 @@ impl<P: PageWriter> BtCursor<P> {
 
         // Now it is safe to free the overflow chain.
         if let Some(first) = overflow_head {
-            self.free_overflow_chain(cx, first)?;
+            self.free_overflow_chain(cx, first).await?;
         }
 
         Ok((leaf_page_no, new_count))
@@ -8453,14 +8571,14 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(Some((separator.page_no, separator.cell_idx, new_rowid)))
     }
 
-    fn replace_table_interior_separator_rowid(
+    async fn replace_table_interior_separator_rowid(
         &mut self,
         cx: &Cx,
         page_no: PageNumber,
         separator_idx: u16,
         new_rowid: i64,
     ) -> Result<()> {
-        let entry = self.reload_page_fresh(cx, page_no)?;
+        let entry = self.reload_page_fresh(cx, page_no).await?;
         if entry.header.page_type != cell::BtreePageType::InteriorTable {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -8496,7 +8614,7 @@ impl<P: PageWriter> BtCursor<P> {
 
         let page_no = entry.page_no;
         let header_offset = cell::header_offset_for_page(page_no);
-        let mut page_data = self.pager.read_btree_page_data(cx, page_no)?;
+        let mut page_data = self.pager.read_btree_page_data(cx, page_no).await?;
         let mut header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
         let mut ptrs = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
         if separator_idx_usize >= ptrs.len() {
@@ -8593,9 +8711,9 @@ impl<P: PageWriter> BtCursor<P> {
             cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
         }
 
-        self.pager.write_page_data(cx, page_no, page_data)?;
+        self.pager.write_page_data(cx, page_no, page_data).await?;
 
-        let refreshed = self.reload_page_fresh(cx, page_no)?;
+        let refreshed = self.reload_page_fresh(cx, page_no).await?;
         for stack_entry in &mut self.stack {
             if stack_entry.page_no == page_no {
                 let mut updated = refreshed.clone();
@@ -8606,21 +8724,22 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(())
     }
 
-    fn table_insert_from_current_position(
+    async fn table_insert_from_current_position(
         &mut self,
         cx: &Cx,
         rowid: i64,
         data: &[u8],
     ) -> Result<()> {
-        if self.stack.is_empty() && !self.seed_empty_root_leaf_cursor(cx)? {
+        if self.stack.is_empty() && !self.seed_empty_root_leaf_cursor(cx).await? {
             return Err(FrankenError::internal("cursor stack is empty"));
         }
 
         // A read fast path may leave only the landing leaf on the stack. The
         // shared helper restores the root-to-leaf path before any mutation can
         // reach balancing, where depth one means the page is the actual root.
-        if let Some(reseek) =
-            self.ensure_full_mutation_path(cx, MutationPathTarget::TableInsert(rowid))?
+        if let Some(reseek) = self
+            .ensure_full_mutation_path(cx, MutationPathTarget::TableInsert(rowid))
+            .await?
         {
             if reseek.is_found() {
                 return Err(FrankenError::DatabaseCorrupt {
@@ -8645,7 +8764,9 @@ impl<P: PageWriter> BtCursor<P> {
 
         // Take cell_buf for reuse so repeated inserts preserve allocation capacity.
         let mut cell_data = std::mem::take(&mut self.cell_buf);
-        let overflow_head = match self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)
+        let overflow_head = match self
+            .encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)
+            .await
         {
             Ok(head) => head,
             Err(error) => {
@@ -8654,7 +8775,7 @@ impl<P: PageWriter> BtCursor<P> {
             }
         };
         if self.at_eof {
-            match self.try_append_on_current_leaf(cx, &cell_data) {
+            match self.try_append_on_current_leaf(cx, &cell_data).await {
                 Ok(true) => {
                     self.cell_buf = cell_data;
                     self.last_insert_rowid = Some(rowid);
@@ -8664,13 +8785,13 @@ impl<P: PageWriter> BtCursor<P> {
                 Err(error) => {
                     self.cell_buf = cell_data;
                     if let Some(first) = overflow_head {
-                        let _ = self.free_overflow_chain(cx, first);
+                        let _ = self.free_overflow_chain(cx, first).await;
                     }
                     return Err(error);
                 }
             }
         }
-        match self.try_insert_on_leaf(cx, insert_idx, &cell_data) {
+        match self.try_insert_on_leaf(cx, insert_idx, &cell_data).await {
             Ok(true) => {
                 self.cell_buf = cell_data;
                 self.last_insert_rowid = Some(rowid);
@@ -8678,26 +8799,26 @@ impl<P: PageWriter> BtCursor<P> {
             }
             Ok(false) => {
                 instrumentation::record_conservative_reload_fallback();
-                let balance_result = self.balance_for_insert(cx, &cell_data, insert_idx);
+                let balance_result = self.balance_for_insert(cx, &cell_data, insert_idx).await;
                 self.cell_buf = cell_data;
                 if balance_result.is_ok() {
                     self.last_insert_rowid = Some(rowid);
                 } else if let Some(first) = overflow_head {
-                    let _ = self.free_overflow_chain(cx, first);
+                    let _ = self.free_overflow_chain(cx, first).await;
                 }
                 balance_result
             }
             Err(error) => {
                 self.cell_buf = cell_data;
                 if let Some(first) = overflow_head {
-                    let _ = self.free_overflow_chain(cx, first);
+                    let _ = self.free_overflow_chain(cx, first).await;
                 }
                 Err(error)
             }
         }
     }
 
-    fn index_insert_from_current_position(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
+    async fn index_insert_from_current_position(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
         let insert_idx = {
             let top = self
                 .stack
@@ -8716,7 +8837,10 @@ impl<P: PageWriter> BtCursor<P> {
         };
 
         let mut cell_data = std::mem::take(&mut self.cell_buf);
-        let overflow_head = match self.encode_index_leaf_cell_into(cx, key, &mut cell_data) {
+        let overflow_head = match self
+            .encode_index_leaf_cell_into(cx, key, &mut cell_data)
+            .await
+        {
             Ok(head) => head,
             Err(error) => {
                 self.cell_buf = cell_data;
@@ -8724,18 +8848,18 @@ impl<P: PageWriter> BtCursor<P> {
             }
         };
 
-        match self.try_insert_on_leaf(cx, insert_idx, &cell_data) {
+        match self.try_insert_on_leaf(cx, insert_idx, &cell_data).await {
             Ok(true) => {
                 self.cell_buf = cell_data;
                 Ok(())
             }
             Ok(false) => {
                 instrumentation::record_conservative_reload_fallback();
-                let balance_result = self.balance_for_insert(cx, &cell_data, insert_idx);
+                let balance_result = self.balance_for_insert(cx, &cell_data, insert_idx).await;
                 self.cell_buf = cell_data;
                 if balance_result.is_err() {
                     if let Some(first) = overflow_head {
-                        let _ = self.free_overflow_chain(cx, first);
+                        let _ = self.free_overflow_chain(cx, first).await;
                     }
                 }
                 balance_result
@@ -8743,7 +8867,7 @@ impl<P: PageWriter> BtCursor<P> {
             Err(error) => {
                 self.cell_buf = cell_data;
                 if let Some(first) = overflow_head {
-                    let _ = self.free_overflow_chain(cx, first);
+                    let _ = self.free_overflow_chain(cx, first).await;
                 }
                 Err(error)
             }
@@ -8758,7 +8882,7 @@ impl<P: PageWriter> BtCursor<P> {
     /// `stack.len() == 1` is reserved for a tree whose root is itself a leaf.
     /// Re-seek from the root while mutation is still reversible, then let the
     /// insert/delete caller validate whether the target was expected to exist.
-    fn ensure_full_mutation_path(
+    async fn ensure_full_mutation_path(
         &mut self,
         cx: &Cx,
         target: MutationPathTarget,
@@ -8774,9 +8898,9 @@ impl<P: PageWriter> BtCursor<P> {
 
         self.clear_seek_cache();
         let result = match target {
-            MutationPathTarget::TableInsert(rowid) => self.table_seek_for_insert(cx, rowid)?,
-            MutationPathTarget::ExactTableRowid(rowid) => self.table_seek(cx, rowid)?,
-            MutationPathTarget::ExactIndexKey(key) => self.index_seek(cx, &key)?,
+            MutationPathTarget::TableInsert(rowid) => self.table_seek_for_insert(cx, rowid).await?,
+            MutationPathTarget::ExactTableRowid(rowid) => self.table_seek(cx, rowid).await?,
+            MutationPathTarget::ExactIndexKey(key) => self.index_seek(cx, &key).await?,
         };
 
         let rebuilt_first = self
@@ -8802,7 +8926,7 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(Some(result))
     }
 
-    fn try_append_on_cached_rightmost_leaf(
+    async fn try_append_on_cached_rightmost_leaf(
         &mut self,
         cx: &Cx,
         rowid: i64,
@@ -8824,7 +8948,8 @@ impl<P: PageWriter> BtCursor<P> {
                 &mut cached.header,
                 rowid,
                 data,
-            )?
+            )
+            .await?
         {
             self.last_insert_rowid = Some(rowid);
             self.last_known_depth = Some(cached.tree_depth);
@@ -8848,7 +8973,9 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         let mut cell_data = std::mem::take(&mut self.cell_buf);
-        let overflow_head = match self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)
+        let overflow_head = match self
+            .encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)
+            .await
         {
             Ok(overflow_head) => overflow_head,
             Err(error) => {
@@ -8857,13 +8984,15 @@ impl<P: PageWriter> BtCursor<P> {
                 return Err(error);
             }
         };
-        let append_result = self.try_append_leaf_page_in_place(
-            cx,
-            cached.page_no,
-            &mut cached.page_data,
-            &mut cached.header,
-            &cell_data,
-        );
+        let append_result = self
+            .try_append_leaf_page_in_place(
+                cx,
+                cached.page_no,
+                &mut cached.page_data,
+                &mut cached.header,
+                &cell_data,
+            )
+            .await;
         match append_result {
             Ok(Some((insert_idx, new_cell_offset))) => {
                 self.cell_buf = cell_data;
@@ -8890,7 +9019,7 @@ impl<P: PageWriter> BtCursor<P> {
             Ok(None) => {
                 self.cell_buf = cell_data;
                 if let Some(first) = overflow_head {
-                    self.free_overflow_chain(cx, first)?;
+                    self.free_overflow_chain(cx, first).await?;
                 }
                 self.stack.clear();
                 self.at_eof = true;
@@ -8900,7 +9029,7 @@ impl<P: PageWriter> BtCursor<P> {
             Err(error) => {
                 self.cell_buf = cell_data;
                 if let Some(first) = overflow_head {
-                    let _ = self.free_overflow_chain(cx, first);
+                    let _ = self.free_overflow_chain(cx, first).await;
                 }
                 self.stack.clear();
                 self.at_eof = true;
@@ -8910,7 +9039,7 @@ impl<P: PageWriter> BtCursor<P> {
         }
     }
 
-    fn try_table_append_on_hinted_leaf(
+    async fn try_table_append_on_hinted_leaf(
         &mut self,
         cx: &Cx,
         hinted_leaf_page: PageNumber,
@@ -8922,7 +9051,7 @@ impl<P: PageWriter> BtCursor<P> {
         self.stack.clear();
         self.at_eof = true;
 
-        let mut entry = match self.load_page(cx, hinted_leaf_page) {
+        let mut entry = match self.load_page(cx, hinted_leaf_page).await {
             Ok(entry) => entry,
             Err(_) => {
                 self.clear_rightmost_leaf_cache();
@@ -8948,10 +9077,10 @@ impl<P: PageWriter> BtCursor<P> {
             if cached.page_no == hinted_leaf_page {
                 cached.rowid
             } else {
-                self.rowid(cx)?
+                self.rowid(cx).await?
             }
         } else {
-            self.rowid(cx)?
+            self.rowid(cx).await?
         };
         if rowid <= last_rowid {
             self.stack.clear();
@@ -8962,7 +9091,9 @@ impl<P: PageWriter> BtCursor<P> {
 
         self.at_eof = true;
         let mut cell_data = std::mem::take(&mut self.cell_buf);
-        let overflow_head = match self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)
+        let overflow_head = match self
+            .encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)
+            .await
         {
             Ok(head) => head,
             Err(error) => {
@@ -8971,7 +9102,7 @@ impl<P: PageWriter> BtCursor<P> {
             }
         };
 
-        match self.try_append_on_current_leaf(cx, &cell_data) {
+        match self.try_append_on_current_leaf(cx, &cell_data).await {
             Ok(true) => {
                 self.cell_buf = cell_data;
                 self.last_insert_rowid = Some(rowid);
@@ -8994,7 +9125,7 @@ impl<P: PageWriter> BtCursor<P> {
             Ok(false) => {
                 self.cell_buf = cell_data;
                 if let Some(first) = overflow_head {
-                    self.free_overflow_chain(cx, first)?;
+                    self.free_overflow_chain(cx, first).await?;
                 }
                 self.stack.clear();
                 self.at_eof = true;
@@ -9004,7 +9135,7 @@ impl<P: PageWriter> BtCursor<P> {
             Err(error) => {
                 self.cell_buf = cell_data;
                 if let Some(first) = overflow_head {
-                    let _ = self.free_overflow_chain(cx, first);
+                    let _ = self.free_overflow_chain(cx, first).await;
                 }
                 self.stack.clear();
                 self.at_eof = true;
@@ -9014,7 +9145,7 @@ impl<P: PageWriter> BtCursor<P> {
         }
     }
 
-    fn try_table_append_on_hinted_leaf_with_known_last_rowid(
+    async fn try_table_append_on_hinted_leaf_with_known_last_rowid(
         &mut self,
         cx: &Cx,
         hinted_leaf_page: PageNumber,
@@ -9033,7 +9164,7 @@ impl<P: PageWriter> BtCursor<P> {
         self.stack.clear();
         self.at_eof = true;
 
-        let mut page_data = match self.pager.read_btree_page_data(cx, hinted_leaf_page) {
+        let mut page_data = match self.pager.read_btree_page_data(cx, hinted_leaf_page).await {
             Ok(page_data) => page_data,
             Err(_) => {
                 self.clear_rightmost_leaf_cache();
@@ -9101,7 +9232,8 @@ impl<P: PageWriter> BtCursor<P> {
                 &mut header,
                 rowid,
                 data,
-            )?
+            )
+            .await?
         {
             self.last_insert_rowid = Some(rowid);
             self.last_known_depth = Some(hinted_tree_depth);
@@ -9152,7 +9284,9 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         let mut cell_data = std::mem::take(&mut self.cell_buf);
-        let overflow_head = match self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)
+        let overflow_head = match self
+            .encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)
+            .await
         {
             Ok(head) => head,
             Err(error) => {
@@ -9160,13 +9294,15 @@ impl<P: PageWriter> BtCursor<P> {
                 return Err(error);
             }
         };
-        let append_result = self.try_append_leaf_page_in_place(
-            cx,
-            hinted_leaf_page,
-            &mut page_data,
-            &mut header,
-            &cell_data,
-        );
+        let append_result = self
+            .try_append_leaf_page_in_place(
+                cx,
+                hinted_leaf_page,
+                &mut page_data,
+                &mut header,
+                &cell_data,
+            )
+            .await;
         match append_result {
             Ok(Some((insert_idx, new_cell_offset))) => {
                 self.cell_buf = cell_data;
@@ -9219,7 +9355,7 @@ impl<P: PageWriter> BtCursor<P> {
             Ok(None) => {
                 self.cell_buf = cell_data;
                 if let Some(first) = overflow_head {
-                    self.free_overflow_chain(cx, first)?;
+                    self.free_overflow_chain(cx, first).await?;
                 }
                 self.clear_rightmost_leaf_cache();
                 Ok(None)
@@ -9227,7 +9363,7 @@ impl<P: PageWriter> BtCursor<P> {
             Err(error) => {
                 self.cell_buf = cell_data;
                 if let Some(first) = overflow_head {
-                    let _ = self.free_overflow_chain(cx, first);
+                    let _ = self.free_overflow_chain(cx, first).await;
                 }
                 self.clear_rightmost_leaf_cache();
                 Err(error)
@@ -9235,7 +9371,7 @@ impl<P: PageWriter> BtCursor<P> {
         }
     }
 
-    fn try_append_on_external_rightmost_leaf_hint(
+    async fn try_append_on_external_rightmost_leaf_hint(
         &mut self,
         cx: &Cx,
         hint: &mut TableAppendHint,
@@ -9282,13 +9418,15 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         if let Some(mut page_data) = hint.page_data.take() {
-            let result = self.try_append_on_external_rightmost_leaf_hint_page_data(
-                cx,
-                hint,
-                rowid,
-                data,
-                &mut page_data,
-            );
+            let result = self
+                .try_append_on_external_rightmost_leaf_hint_page_data(
+                    cx,
+                    hint,
+                    rowid,
+                    data,
+                    &mut page_data,
+                )
+                .await;
             if hint.page_data.is_none() {
                 hint.page_data = Some(page_data);
             }
@@ -9304,11 +9442,13 @@ impl<P: PageWriter> BtCursor<P> {
                     &mut hint.header,
                     rowid,
                     data,
-                )?
+                )
+                .await?
                 .is_some()
             {
                 self.pager
-                    .restore_staged_page_data(cx, hint.leaf_page, page_data)?;
+                    .restore_staged_page_data(cx, hint.leaf_page, page_data)
+                    .await?;
                 self.last_insert_rowid = Some(rowid);
                 self.last_known_depth = Some(hint.tree_depth);
                 hint.last_rowid = rowid;
@@ -9317,30 +9457,36 @@ impl<P: PageWriter> BtCursor<P> {
             }
 
             let mut cell_data = std::mem::take(&mut self.cell_buf);
-            let overflow_head =
-                match self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data) {
-                    Ok(head) => head,
-                    Err(error) => {
-                        self.cell_buf = cell_data;
-                        self.pager
-                            .restore_staged_page_data(cx, hint.leaf_page, page_data)?;
-                        return Err(error);
-                    }
-                };
-            let append_result = self.try_append_leaf_page_in_place(
-                cx,
-                hint.leaf_page,
-                &mut page_data,
-                &mut hint.header,
-                &cell_data,
-            );
+            let overflow_head = match self
+                .encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)
+                .await
+            {
+                Ok(head) => head,
+                Err(error) => {
+                    self.cell_buf = cell_data;
+                    self.pager
+                        .restore_staged_page_data(cx, hint.leaf_page, page_data)
+                        .await?;
+                    return Err(error);
+                }
+            };
+            let append_result = self
+                .try_append_leaf_page_in_place(
+                    cx,
+                    hint.leaf_page,
+                    &mut page_data,
+                    &mut hint.header,
+                    &cell_data,
+                )
+                .await;
             if let Err(error) = self
                 .pager
                 .restore_staged_page_data(cx, hint.leaf_page, page_data)
+                .await
             {
                 self.cell_buf = cell_data;
                 if let Some(first) = overflow_head {
-                    let _ = self.free_overflow_chain(cx, first);
+                    let _ = self.free_overflow_chain(cx, first).await;
                 }
                 return Err(error);
             }
@@ -9357,19 +9503,20 @@ impl<P: PageWriter> BtCursor<P> {
                     let quick_balance_result = self
                         .try_quick_balance_on_external_rightmost_leaf_hint(
                             cx, hint, rowid, &cell_data,
-                        );
+                        )
+                        .await;
                     self.cell_buf = cell_data;
                     match quick_balance_result {
                         Ok(true) => return Ok(true),
                         Ok(false) => {
                             if let Some(first) = overflow_head {
-                                self.free_overflow_chain(cx, first)?;
+                                self.free_overflow_chain(cx, first).await?;
                             }
                             return Ok(false);
                         }
                         Err(error) => {
                             if let Some(first) = overflow_head {
-                                let _ = self.free_overflow_chain(cx, first);
+                                let _ = self.free_overflow_chain(cx, first).await;
                             }
                             return Err(error);
                         }
@@ -9378,7 +9525,7 @@ impl<P: PageWriter> BtCursor<P> {
                 Err(error) => {
                     self.cell_buf = cell_data;
                     if let Some(first) = overflow_head {
-                        let _ = self.free_overflow_chain(cx, first);
+                        let _ = self.free_overflow_chain(cx, first).await;
                     }
                     return Err(error);
                 }
@@ -9482,7 +9629,7 @@ impl<P: PageWriter> BtCursor<P> {
         }
     }
 
-    fn try_append_on_external_rightmost_leaf_hint_page_data(
+    async fn try_append_on_external_rightmost_leaf_hint_page_data(
         &mut self,
         cx: &Cx,
         hint: &mut TableAppendHint,
@@ -9498,7 +9645,8 @@ impl<P: PageWriter> BtCursor<P> {
                 &mut hint.header,
                 rowid,
                 data,
-            )?
+            )
+            .await?
             .is_some()
         {
             self.last_insert_rowid = Some(rowid);
@@ -9511,7 +9659,9 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(true);
         }
         let mut cell_data = std::mem::take(&mut self.cell_buf);
-        let overflow_head = match self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)
+        let overflow_head = match self
+            .encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)
+            .await
         {
             Ok(head) => head,
             Err(error) => {
@@ -9519,13 +9669,15 @@ impl<P: PageWriter> BtCursor<P> {
                 return Err(error);
             }
         };
-        let append_result = self.try_append_leaf_page_in_place(
-            cx,
-            hint.leaf_page,
-            page_data,
-            &mut hint.header,
-            &cell_data,
-        );
+        let append_result = self
+            .try_append_leaf_page_in_place(
+                cx,
+                hint.leaf_page,
+                page_data,
+                &mut hint.header,
+                &cell_data,
+            )
+            .await;
         match append_result {
             Ok(Some(_)) => {
                 self.cell_buf = cell_data;
@@ -9538,21 +9690,24 @@ impl<P: PageWriter> BtCursor<P> {
                 Ok(true)
             }
             Ok(None) => {
-                let fallback_result = (|| {
-                    if self.try_quick_balance_on_external_rightmost_leaf_hint(
-                        cx, hint, rowid, &cell_data,
-                    )? {
+                let fallback_result: Result<bool> = async {
+                    if self
+                        .try_quick_balance_on_external_rightmost_leaf_hint(
+                            cx, hint, rowid, &cell_data,
+                        )
+                        .await?
+                    {
                         return Ok(true);
                     }
-                    let has_last = self.last(cx)?;
+                    let has_last = self.last(cx).await?;
                     if has_last {
-                        let last_rowid = self.rowid(cx)?;
+                        let last_rowid = self.rowid(cx).await?;
                         if rowid <= last_rowid {
                             return Ok(false);
                         }
                     }
                     self.at_eof = true;
-                    match self.try_append_on_current_leaf(cx, &cell_data) {
+                    match self.try_append_on_current_leaf(cx, &cell_data).await {
                         Ok(true) => {
                             self.last_insert_rowid = Some(rowid);
                         }
@@ -9568,30 +9723,32 @@ impl<P: PageWriter> BtCursor<P> {
                                 })?
                                 .header
                                 .cell_count;
-                            self.balance_for_insert(cx, &cell_data, insert_idx)?;
+                            self.balance_for_insert(cx, &cell_data, insert_idx).await?;
                             self.last_insert_rowid = Some(rowid);
                         }
                         Err(error) => return Err(error),
                     }
-                    self.refresh_rightmost_leaf_cache_after_insert(cx, rowid)?;
+                    self.refresh_rightmost_leaf_cache_after_insert(cx, rowid)
+                        .await?;
                     *hint = self.table_cached_rightmost_leaf_hint().ok_or_else(|| {
                         FrankenError::internal(
                             "cached rightmost-leaf fallback did not refresh retained hint state",
                         )
                     })?;
                     Ok(true)
-                })();
+                }
+                .await;
                 self.cell_buf = cell_data;
                 match fallback_result {
                     Ok(inserted) => {
                         if !inserted && let Some(first) = overflow_head {
-                            self.free_overflow_chain(cx, first)?;
+                            self.free_overflow_chain(cx, first).await?;
                         }
                         Ok(inserted)
                     }
                     Err(error) => {
                         if let Some(first) = overflow_head {
-                            let _ = self.free_overflow_chain(cx, first);
+                            let _ = self.free_overflow_chain(cx, first).await;
                         }
                         Err(error)
                     }
@@ -9600,14 +9757,14 @@ impl<P: PageWriter> BtCursor<P> {
             Err(error) => {
                 self.cell_buf = cell_data;
                 if let Some(first) = overflow_head {
-                    let _ = self.free_overflow_chain(cx, first);
+                    let _ = self.free_overflow_chain(cx, first).await;
                 }
                 Err(error)
             }
         }
     }
 
-    fn try_quick_balance_on_external_rightmost_leaf_hint(
+    async fn try_quick_balance_on_external_rightmost_leaf_hint(
         &mut self,
         cx: &Cx,
         hint: &mut TableAppendHint,
@@ -9628,7 +9785,9 @@ impl<P: PageWriter> BtCursor<P> {
             hint.last_rowid,
             self.usable_size,
             self.page_size,
-        ) {
+        )
+        .await
+        {
             Ok(Some(result)) => {
                 instrumentation::record_quick_balance_attempt(quick_balance_start, true);
                 self.note_split_event();
@@ -9667,16 +9826,17 @@ impl<P: PageWriter> BtCursor<P> {
     /// second full B-tree seek before the insert. The VDBE `Insert` path uses
     /// this as its `USESEEKRESULT`-style successor-position reuse primitive.
     #[doc(hidden)]
-    pub fn table_insert_prechecked_absent(
+    pub async fn table_insert_prechecked_absent(
         &mut self,
         cx: &Cx,
         rowid: i64,
         data: &[u8],
     ) -> Result<()> {
-        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+        let result = self
+            .with_btree_op(cx, BtreeOpType::Insert, async |cursor| {
             if !cursor.current_position_admits_table_insert(rowid)? {
                 cursor.clear_seek_cache();
-                let seek = cursor.table_seek_for_insert(cx, rowid)?;
+                let seek = cursor.table_seek_for_insert(cx, rowid).await?;
                 if seek.is_found() {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -9685,8 +9845,11 @@ impl<P: PageWriter> BtCursor<P> {
                     });
                 }
             }
-            cursor.table_insert_from_current_position(cx, rowid, data)
-        });
+            cursor
+                .table_insert_from_current_position(cx, rowid, data)
+                .await
+        })
+            .await;
         if result.is_ok() {
             self.bump_row_image_epoch();
         }
@@ -9699,14 +9862,17 @@ impl<P: PageWriter> BtCursor<P> {
     /// This keeps repeated append callers on the zero-seek path without forcing
     /// them to re-descend from the root just to reseed the hint.
     #[doc(hidden)]
-    pub fn table_refresh_rightmost_leaf_cache_after_insert(
+    pub async fn table_refresh_rightmost_leaf_cache_after_insert(
         &mut self,
         cx: &Cx,
         rowid: i64,
     ) -> Result<()> {
-        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
-            cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)
+        self.with_btree_op(cx, BtreeOpType::Insert, async |cursor| {
+            cursor
+                .refresh_rightmost_leaf_cache_after_insert(cx, rowid)
+                .await
         })
+        .await
     }
 
     /// Fast append path for callers that already positioned the cursor on the
@@ -9715,31 +9881,39 @@ impl<P: PageWriter> BtCursor<P> {
     /// This reuses the current right-edge cursor stack instead of descending
     /// from the root again.
     #[doc(hidden)]
-    pub fn table_append_after_last_position(
+    pub async fn table_append_after_last_position(
         &mut self,
         cx: &Cx,
         rowid: i64,
         data: &[u8],
     ) -> Result<()> {
-        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
-            if !cursor.is_on_rightmost_insert_edge() {
-                let has_last = cursor.last(cx)?;
-                if has_last {
-                    let last_rowid = cursor.rowid(cx)?;
-                    if rowid <= last_rowid {
-                        cursor.clear_rightmost_leaf_cache();
-                        let seek = cursor.table_seek_for_insert(cx, rowid)?;
-                        if seek.is_found() {
-                            return Err(FrankenError::PrimaryKeyViolation);
+        let result = self
+            .with_btree_op(cx, BtreeOpType::Insert, async |cursor| {
+                if !cursor.is_on_rightmost_insert_edge() {
+                    let has_last = cursor.last(cx).await?;
+                    if has_last {
+                        let last_rowid = cursor.rowid(cx).await?;
+                        if rowid <= last_rowid {
+                            cursor.clear_rightmost_leaf_cache();
+                            let seek = cursor.table_seek_for_insert(cx, rowid).await?;
+                            if seek.is_found() {
+                                return Err(FrankenError::PrimaryKeyViolation);
+                            }
+                            return cursor
+                                .table_insert_from_current_position(cx, rowid, data)
+                                .await;
                         }
-                        return cursor.table_insert_from_current_position(cx, rowid, data);
                     }
                 }
-            }
-            cursor.at_eof = true;
-            cursor.table_insert_from_current_position(cx, rowid, data)?;
-            cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)
-        });
+                cursor.at_eof = true;
+                cursor
+                    .table_insert_from_current_position(cx, rowid, data)
+                    .await?;
+                cursor
+                    .refresh_rightmost_leaf_cache_after_insert(cx, rowid)
+                    .await
+            })
+            .await;
         if result.is_ok() {
             self.bump_row_image_epoch();
         }
@@ -9754,7 +9928,7 @@ impl<P: PageWriter> BtCursor<P> {
     /// rowid is no longer an append, or when the payload would need overflow
     /// pages.
     #[doc(hidden)]
-    pub fn table_append_after_last_position_with_writer<W>(
+    pub async fn table_append_after_last_position_with_writer<W>(
         &mut self,
         cx: &Cx,
         rowid: i64,
@@ -9764,32 +9938,34 @@ impl<P: PageWriter> BtCursor<P> {
     where
         W: FnOnce(&mut [u8]) -> Result<()>,
     {
-        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
-            if !cursor.is_on_rightmost_insert_edge() {
-                let has_last = cursor.last(cx)?;
-                if has_last {
-                    let last_rowid = cursor.rowid(cx)?;
-                    if rowid <= last_rowid {
-                        cursor.clear_rightmost_leaf_cache();
-                        return Ok(false);
+        let result = self
+            .with_btree_op(cx, BtreeOpType::Insert, async |cursor| {
+                if !cursor.is_on_rightmost_insert_edge() {
+                    let has_last = cursor.last(cx).await?;
+                    if has_last {
+                        let last_rowid = cursor.rowid(cx).await?;
+                        if rowid <= last_rowid {
+                            cursor.clear_rightmost_leaf_cache();
+                            return Ok(false);
+                        }
                     }
                 }
-            }
-            cursor.at_eof = true;
-            if cursor.stack.is_empty() && !cursor.seed_empty_root_leaf_cursor(cx)? {
-                return Ok(false);
-            }
-            if !cursor.try_append_payload_on_current_leaf_with_writer(
-                cx,
-                rowid,
-                payload_len,
-                writer,
-            )? {
-                return Ok(false);
-            }
-            cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)?;
-            Ok(true)
-        });
+                cursor.at_eof = true;
+                if cursor.stack.is_empty() && !cursor.seed_empty_root_leaf_cursor(cx).await? {
+                    return Ok(false);
+                }
+                if !cursor
+                    .try_append_payload_on_current_leaf_with_writer(cx, rowid, payload_len, writer)
+                    .await?
+                {
+                    return Ok(false);
+                }
+                cursor
+                    .refresh_rightmost_leaf_cache_after_insert(cx, rowid)
+                    .await?;
+                Ok(true)
+            })
+            .await;
         if matches!(result, Ok(true)) {
             self.bump_row_image_epoch();
         }
@@ -9802,10 +9978,12 @@ impl<P: PageWriter> BtCursor<P> {
     /// This reuses the current successor/EOF position instead of performing a
     /// second full B-tree seek before the insert.
     #[doc(hidden)]
-    pub fn index_insert_prechecked_absent(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
-        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
-            cursor.index_insert_from_current_position(cx, key)
-        });
+    pub async fn index_insert_prechecked_absent(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
+        let result = self
+            .with_btree_op(cx, BtreeOpType::Insert, async |cursor| {
+                cursor.index_insert_from_current_position(cx, key).await
+            })
+            .await;
         if result.is_ok() {
             self.bump_row_image_epoch();
         }
@@ -9816,24 +9994,37 @@ impl<P: PageWriter> BtCursor<P> {
     /// rowid stream and want to try the rightmost-leaf append path before
     /// falling back to a full seek.
     #[doc(hidden)]
-    pub fn table_insert_rightmost_hint(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
-        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
-            let has_last = cursor.last(cx)?;
-            if has_last {
-                let last_rowid = cursor.rowid(cx)?;
-                if rowid <= last_rowid {
-                    cursor.clear_rightmost_leaf_cache();
-                    let seek = cursor.table_seek_for_insert(cx, rowid)?;
-                    if seek.is_found() {
-                        return Err(FrankenError::PrimaryKeyViolation);
+    pub async fn table_insert_rightmost_hint(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        data: &[u8],
+    ) -> Result<()> {
+        let result = self
+            .with_btree_op(cx, BtreeOpType::Insert, async |cursor| {
+                let has_last = cursor.last(cx).await?;
+                if has_last {
+                    let last_rowid = cursor.rowid(cx).await?;
+                    if rowid <= last_rowid {
+                        cursor.clear_rightmost_leaf_cache();
+                        let seek = cursor.table_seek_for_insert(cx, rowid).await?;
+                        if seek.is_found() {
+                            return Err(FrankenError::PrimaryKeyViolation);
+                        }
+                        return cursor
+                            .table_insert_from_current_position(cx, rowid, data)
+                            .await;
                     }
-                    return cursor.table_insert_from_current_position(cx, rowid, data);
+                    cursor.at_eof = true;
                 }
-                cursor.at_eof = true;
-            }
-            cursor.table_insert_from_current_position(cx, rowid, data)?;
-            cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)
-        });
+                cursor
+                    .table_insert_from_current_position(cx, rowid, data)
+                    .await?;
+                cursor
+                    .refresh_rightmost_leaf_cache_after_insert(cx, rowid)
+                    .await
+            })
+            .await;
         if result.is_ok() {
             self.bump_row_image_epoch();
         }
@@ -9847,34 +10038,45 @@ impl<P: PageWriter> BtCursor<P> {
     /// ordered before `rowid`, this falls back to the normal rightmost-hint
     /// insert path.
     #[doc(hidden)]
-    pub fn table_insert_rightmost_leaf_hint(
+    pub async fn table_insert_rightmost_leaf_hint(
         &mut self,
         cx: &Cx,
         hinted_leaf_page: PageNumber,
         rowid: i64,
         data: &[u8],
     ) -> Result<()> {
-        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
-            if cursor.try_table_append_on_hinted_leaf(cx, hinted_leaf_page, rowid, data)? {
-                return Ok(());
-            }
-
-            let has_last = cursor.last(cx)?;
-            if has_last {
-                let last_rowid = cursor.rowid(cx)?;
-                if rowid <= last_rowid {
-                    cursor.clear_rightmost_leaf_cache();
-                    let seek = cursor.table_seek_for_insert(cx, rowid)?;
-                    if seek.is_found() {
-                        return Err(FrankenError::PrimaryKeyViolation);
-                    }
-                    return cursor.table_insert_from_current_position(cx, rowid, data);
+        let result = self
+            .with_btree_op(cx, BtreeOpType::Insert, async |cursor| {
+                if cursor
+                    .try_table_append_on_hinted_leaf(cx, hinted_leaf_page, rowid, data)
+                    .await?
+                {
+                    return Ok(());
                 }
-                cursor.at_eof = true;
-            }
-            cursor.table_insert_from_current_position(cx, rowid, data)?;
-            cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)
-        });
+
+                let has_last = cursor.last(cx).await?;
+                if has_last {
+                    let last_rowid = cursor.rowid(cx).await?;
+                    if rowid <= last_rowid {
+                        cursor.clear_rightmost_leaf_cache();
+                        let seek = cursor.table_seek_for_insert(cx, rowid).await?;
+                        if seek.is_found() {
+                            return Err(FrankenError::PrimaryKeyViolation);
+                        }
+                        return cursor
+                            .table_insert_from_current_position(cx, rowid, data)
+                            .await;
+                    }
+                    cursor.at_eof = true;
+                }
+                cursor
+                    .table_insert_from_current_position(cx, rowid, data)
+                    .await?;
+                cursor
+                    .refresh_rightmost_leaf_cache_after_insert(cx, rowid)
+                    .await
+            })
+            .await;
         if result.is_ok() {
             self.bump_row_image_epoch();
         }
@@ -9890,7 +10092,7 @@ impl<P: PageWriter> BtCursor<P> {
     /// leaf accepted the append directly and `Ok(None)` when the caller should
     /// fall back to the normal insert path.
     #[doc(hidden)]
-    pub fn table_try_append_rightmost_leaf_hint_known_last_rowid(
+    pub async fn table_try_append_rightmost_leaf_hint_known_last_rowid(
         &mut self,
         cx: &Cx,
         hinted_leaf_page: PageNumber,
@@ -9898,23 +10100,29 @@ impl<P: PageWriter> BtCursor<P> {
         rowid: i64,
         data: &[u8],
     ) -> Result<Option<PageNumber>> {
-        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
-            if cursor.rightmost_leaf_cache.as_ref().is_some_and(|cached| {
-                cached.page_no == hinted_leaf_page && cached.rowid == hinted_last_rowid
-            }) && cursor.try_append_on_cached_rightmost_leaf(cx, rowid, data)?
-            {
-                return Ok(Some(hinted_leaf_page));
-            }
-            let hint = cursor.try_table_append_on_hinted_leaf_with_known_last_rowid(
-                cx,
-                hinted_leaf_page,
-                hinted_last_rowid,
-                rowid,
-                data,
-                true,
-            )?;
-            Ok(hint.map(|value| value.leaf_page()))
-        });
+        let result = self
+            .with_btree_op(cx, BtreeOpType::Insert, async |cursor| {
+                if cursor.rightmost_leaf_cache.as_ref().is_some_and(|cached| {
+                    cached.page_no == hinted_leaf_page && cached.rowid == hinted_last_rowid
+                }) && cursor
+                    .try_append_on_cached_rightmost_leaf(cx, rowid, data)
+                    .await?
+                {
+                    return Ok(Some(hinted_leaf_page));
+                }
+                let hint = cursor
+                    .try_table_append_on_hinted_leaf_with_known_last_rowid(
+                        cx,
+                        hinted_leaf_page,
+                        hinted_last_rowid,
+                        rowid,
+                        data,
+                        true,
+                    )
+                    .await?;
+                Ok(hint.map(|value| value.leaf_page()))
+            })
+            .await;
         if result.as_ref().is_ok_and(|page| page.is_some()) {
             self.bump_row_image_epoch();
         }
@@ -9924,7 +10132,7 @@ impl<P: PageWriter> BtCursor<P> {
     /// Same as [`Self::table_try_append_rightmost_leaf_hint_known_last_rowid`]
     /// but returns the refreshed retained leaf image on success.
     #[doc(hidden)]
-    pub fn table_try_append_rightmost_leaf_hint_known_last_rowid_with_state(
+    pub async fn table_try_append_rightmost_leaf_hint_known_last_rowid_with_state(
         &mut self,
         cx: &Cx,
         hinted_leaf_page: PageNumber,
@@ -9932,25 +10140,31 @@ impl<P: PageWriter> BtCursor<P> {
         rowid: i64,
         data: &[u8],
     ) -> Result<Option<TableAppendHint>> {
-        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
-            if cursor.rightmost_leaf_cache.as_ref().is_some_and(|cached| {
-                cached.page_no == hinted_leaf_page && cached.rowid == hinted_last_rowid
-            }) && cursor.try_append_on_cached_rightmost_leaf(cx, rowid, data)?
-            {
-                return Ok(cursor
-                    .rightmost_leaf_cache
-                    .as_ref()
-                    .map(TableAppendHint::from));
-            }
-            cursor.try_table_append_on_hinted_leaf_with_known_last_rowid(
-                cx,
-                hinted_leaf_page,
-                hinted_last_rowid,
-                rowid,
-                data,
-                false,
-            )
-        });
+        let result = self
+            .with_btree_op(cx, BtreeOpType::Insert, async |cursor| {
+                if cursor.rightmost_leaf_cache.as_ref().is_some_and(|cached| {
+                    cached.page_no == hinted_leaf_page && cached.rowid == hinted_last_rowid
+                }) && cursor
+                    .try_append_on_cached_rightmost_leaf(cx, rowid, data)
+                    .await?
+                {
+                    return Ok(cursor
+                        .rightmost_leaf_cache
+                        .as_ref()
+                        .map(TableAppendHint::from));
+                }
+                cursor
+                    .try_table_append_on_hinted_leaf_with_known_last_rowid(
+                        cx,
+                        hinted_leaf_page,
+                        hinted_last_rowid,
+                        rowid,
+                        data,
+                        false,
+                    )
+                    .await
+            })
+            .await;
         if result.as_ref().is_ok_and(|hint| hint.is_some()) {
             self.bump_row_image_epoch();
         }
@@ -9959,16 +10173,20 @@ impl<P: PageWriter> BtCursor<P> {
 
     /// Reuse a retained rightmost-leaf image captured by a prior append.
     #[doc(hidden)]
-    pub fn table_try_append_cached_rightmost_leaf_hint(
+    pub async fn table_try_append_cached_rightmost_leaf_hint(
         &mut self,
         cx: &Cx,
         hint: &mut TableAppendHint,
         rowid: i64,
         data: &[u8],
     ) -> Result<bool> {
-        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
-            cursor.try_append_on_external_rightmost_leaf_hint(cx, hint, rowid, data)
-        });
+        let result = self
+            .with_btree_op(cx, BtreeOpType::Insert, async |cursor| {
+                cursor
+                    .try_append_on_external_rightmost_leaf_hint(cx, hint, rowid, data)
+                    .await
+            })
+            .await;
         if matches!(result, Ok(true)) {
             self.bump_row_image_epoch();
         }
@@ -9984,7 +10202,7 @@ impl<P: PageWriter> BtCursor<P> {
     /// fit check. Callers should fall back to the byte-slice API when this
     /// returns `Ok(false)`.
     #[doc(hidden)]
-    pub fn table_try_append_cached_rightmost_leaf_hint_with_writer<W>(
+    pub async fn table_try_append_cached_rightmost_leaf_hint_with_writer<W>(
         &mut self,
         cx: &Cx,
         hint: &mut TableAppendHint,
@@ -9995,15 +10213,17 @@ impl<P: PageWriter> BtCursor<P> {
     where
         W: FnOnce(&mut [u8]) -> Result<()>,
     {
-        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
-            cursor.try_append_on_external_rightmost_leaf_hint_with_writer(
-                cx,
-                hint,
-                rowid,
-                payload_len,
-                writer,
-            )
-        });
+        let result = self
+            .with_btree_op(cx, BtreeOpType::Insert, async |cursor| {
+                cursor.try_append_on_external_rightmost_leaf_hint_with_writer(
+                    cx,
+                    hint,
+                    rowid,
+                    payload_len,
+                    writer,
+                )
+            })
+            .await;
         if matches!(result, Ok(true)) {
             self.bump_row_image_epoch();
         }
@@ -10029,15 +10249,19 @@ impl<P: PageWriter> BtCursor<P> {
     /// back to delete+insert whenever the record size changes or overflow is
     /// involved.
     #[doc(hidden)]
-    pub fn table_overwrite_current_payload_same_size_no_overflow(
+    pub async fn table_overwrite_current_payload_same_size_no_overflow(
         &mut self,
         cx: &Cx,
         rowid: i64,
         payload: &[u8],
     ) -> Result<bool> {
-        let result = self.with_btree_op(cx, BtreeOpType::Delete, |cursor| {
-            cursor.overwrite_current_table_payload_same_size_no_overflow(cx, rowid, payload)
-        });
+        let result = self
+            .with_btree_op(cx, BtreeOpType::Delete, async |cursor| {
+                cursor
+                    .overwrite_current_table_payload_same_size_no_overflow(cx, rowid, payload)
+                    .await
+            })
+            .await;
         if matches!(result, Ok(true)) {
             self.bump_row_image_epoch();
         }
@@ -10116,14 +10340,14 @@ impl<P: PageWriter> BtCursor<P> {
 
     /// Publish a same-leaf payload patch run as one page write.
     #[doc(hidden)]
-    pub fn flush_table_leaf_payload_patch_run(
+    pub async fn flush_table_leaf_payload_patch_run(
         &mut self,
         cx: &Cx,
         run: TableLeafPayloadPatchRun,
     ) -> Result<()> {
         observe_cursor_cancellation(cx)?;
         let (leaf_page, page_data) = run.into_page();
-        self.pager.write_page_data(cx, leaf_page, page_data)?;
+        self.pager.write_page_data(cx, leaf_page, page_data).await?;
         self.stack.clear();
         self.at_eof = true;
         self.clear_rightmost_leaf_cache();
@@ -10135,17 +10359,18 @@ impl<P: PageWriter> BtCursor<P> {
 
     /// Publish a same-leaf delete run as one page write.
     #[doc(hidden)]
-    pub fn flush_table_leaf_delete_run(
+    pub async fn flush_table_leaf_delete_run(
         &mut self,
         cx: &Cx,
         mut run: TableLeafDeleteRun,
     ) -> Result<()> {
         self.flush_table_leaf_delete_run_in_place(cx, &mut run)
+            .await
     }
 
     /// Publish a same-leaf delete run without consuming it.
     #[doc(hidden)]
-    pub fn flush_table_leaf_delete_run_in_place(
+    pub async fn flush_table_leaf_delete_run_in_place(
         &mut self,
         cx: &Cx,
         run: &mut TableLeafDeleteRun,
@@ -10158,7 +10383,8 @@ impl<P: PageWriter> BtCursor<P> {
             instrumentation::record_delete_leaf_run_materialize(materialize_start);
             let write_start = instrumentation::profile_start();
             self.pager
-                .write_page_data(cx, leaf_page, run.entry.page_data.clone())?;
+                .write_page_data(cx, leaf_page, run.entry.page_data.clone())
+                .await?;
             instrumentation::record_delete_leaf_run_write(write_start);
             run.dirty = false;
         }
@@ -10182,7 +10408,7 @@ impl<P: PageWriter> BtCursor<P> {
         std::mem::swap(&mut self.cell_buf, scratch);
     }
 
-    fn overwrite_current_table_payload_same_size_no_overflow(
+    async fn overwrite_current_table_payload_same_size_no_overflow(
         &mut self,
         cx: &Cx,
         rowid: i64,
@@ -10231,7 +10457,9 @@ impl<P: PageWriter> BtCursor<P> {
             entry.mutation_counter = Self::page_mutation_counter(&entry.page_data);
             entry.page_data.clone()
         };
-        self.pager.write_page_data(cx, leaf_page_no, staged_page)?;
+        self.pager
+            .write_page_data(cx, leaf_page_no, staged_page)
+            .await?;
         self.at_eof = false;
         Ok(true)
     }
@@ -10373,25 +10601,28 @@ impl<P: PageWriter> BtCursor<P> {
     /// seed a same-statement monotonic append hint; correctness never depends
     /// on receiving `true`.
     #[doc(hidden)]
-    pub fn index_insert_unique_with_rightmost_report(
+    pub async fn index_insert_unique_with_rightmost_report(
         &mut self,
         cx: &Cx,
         key: &[u8],
         n_unique_cols: usize,
         columns_label: &str,
     ) -> Result<bool> {
-        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
         // Parse only the indexed column prefix. The trailing rowid suffix is
         // irrelevant to UNIQUE checks and can dominate hot ingest probes.
-        let new_fields = match parse_record_prefix(key, n_unique_cols) {
+        let parsed_new_fields = {
+            let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+            parse_record_prefix(key, n_unique_cols)
+        };
+        let new_fields = match parsed_new_fields {
             Some(f) => f,
             None => {
-                self.index_insert(cx, key)?;
+                self.index_insert(cx, key).await?;
                 return Ok(false);
             }
         };
         if new_fields.len() < n_unique_cols {
-            self.index_insert(cx, key)?;
+            self.index_insert(cx, key).await?;
             return Ok(false);
         }
         // Check that all indexed columns are non-NULL — if any is NULL,
@@ -10401,7 +10632,7 @@ impl<P: PageWriter> BtCursor<P> {
             .take(n_unique_cols)
             .any(|v| matches!(v, fsqlite_types::SqliteValue::Null));
         if any_null {
-            self.index_insert(cx, key)?;
+            self.index_insert(cx, key).await?;
             return Ok(false);
         }
 
@@ -10412,23 +10643,28 @@ impl<P: PageWriter> BtCursor<P> {
         // prefix matches. We check the current entry and the predecessor.
         // Because the full key includes the rowid suffix, two records with the
         // same indexed columns but different rowids sort adjacently.
-        self.with_btree_op(cx, BtreeOpType::Seek, |cursor| {
-            let _seek = cursor.index_seek(cx, key)?;
+        self.with_btree_op(cx, BtreeOpType::Seek, async |cursor| {
+            let _seek = cursor.index_seek(cx, key).await?;
             let restore_eof = cursor.at_eof;
             inserted_after_existing_rightmost = restore_eof;
 
             let mut to_check = Vec::with_capacity(2);
 
             if !cursor.at_eof {
-                to_check.push(cursor.payload(cx)?);
+                to_check.push(cursor.payload(cx).await?);
             }
 
-            if cursor.prev(cx)? {
-                to_check.push(cursor.payload(cx)?);
+            if cursor.prev(cx).await? {
+                to_check.push(cursor.payload(cx).await?);
             }
 
             for existing_key in to_check {
-                if let Some(existing_fields) = parse_record_prefix(&existing_key, n_unique_cols) {
+                let existing_fields = {
+                    let _record_profile_scope =
+                        enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+                    parse_record_prefix(&existing_key, n_unique_cols)
+                };
+                if let Some(existing_fields) = existing_fields {
                     if existing_fields.len() >= n_unique_cols && new_prefix == existing_fields {
                         return Err(FrankenError::UniqueViolation {
                             columns: columns_label.to_owned(),
@@ -10440,10 +10676,11 @@ impl<P: PageWriter> BtCursor<P> {
             if restore_eof {
                 cursor.at_eof = true;
             } else {
-                cursor.next(cx)?;
+                cursor.next(cx).await?;
             }
             Ok(())
-        })?;
+        })
+        .await?;
 
         // The uniqueness probe already positioned the cursor at the insertion
         // successor/EOF. Reuse that position only when it is still a leaf; a
@@ -10454,9 +10691,9 @@ impl<P: PageWriter> BtCursor<P> {
             .last()
             .is_some_and(|top| top.header.page_type.is_leaf())
         {
-            self.index_insert_prechecked_absent(cx, key)?;
+            self.index_insert_prechecked_absent(cx, key).await?;
         } else {
-            self.index_insert(cx, key)?;
+            self.index_insert(cx, key).await?;
         }
         Ok(inserted_after_existing_rightmost)
     }
@@ -10468,19 +10705,21 @@ impl<P: PageWriter> BtCursor<P> {
     /// rightmost insert edge; if not, it returns `Ok(false)` and leaves the
     /// canonical insert path to the caller.
     #[doc(hidden)]
-    pub fn index_append_after_current_rightmost_position(
+    pub async fn index_append_after_current_rightmost_position(
         &mut self,
         cx: &Cx,
         key: &[u8],
     ) -> Result<bool> {
-        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
-            if !cursor.is_on_rightmost_insert_edge() {
-                return Ok(false);
-            }
-            cursor.at_eof = true;
-            cursor.index_insert_from_current_position(cx, key)?;
-            Ok(true)
-        });
+        let result = self
+            .with_btree_op(cx, BtreeOpType::Insert, async |cursor| {
+                if !cursor.is_on_rightmost_insert_edge() {
+                    return Ok(false);
+                }
+                cursor.at_eof = true;
+                cursor.index_insert_from_current_position(cx, key).await?;
+                Ok(true)
+            })
+            .await;
         if matches!(result, Ok(true)) {
             self.bump_row_image_epoch();
         }
@@ -10496,144 +10735,157 @@ impl<P: PageWriter> sealed::Sealed for BtCursor<P> {}
 
 #[allow(clippy::missing_errors_doc)]
 impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
-    fn index_move_to(&mut self, cx: &Cx, key: &[u8]) -> Result<SeekResult> {
-        self.with_btree_op(cx, BtreeOpType::Seek, |cursor| cursor.index_seek(cx, key))
+    async fn index_move_to(&mut self, cx: &Cx, key: &[u8]) -> Result<SeekResult> {
+        self.with_btree_op(cx, BtreeOpType::Seek, async |cursor| {
+            cursor.index_seek(cx, key).await
+        })
+        .await
     }
 
-    fn index_move_to_upper_bound(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
-        self.with_btree_op(cx, BtreeOpType::Seek, |cursor| {
-            cursor.index_seek_upper_bound(cx, key)?;
+    async fn index_move_to_upper_bound(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
+        self.with_btree_op(cx, BtreeOpType::Seek, async |cursor| {
+            cursor.index_seek_upper_bound(cx, key).await?;
             Ok(())
         })
+        .await
     }
 
-    fn table_move_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult> {
-        self.with_btree_op(cx, BtreeOpType::Seek, |cursor| cursor.table_seek(cx, rowid))
+    async fn table_move_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult> {
+        self.with_btree_op(cx, BtreeOpType::Seek, async |cursor| {
+            cursor.table_seek(cx, rowid).await
+        })
+        .await
     }
 
-    fn first(&mut self, cx: &Cx) -> Result<bool> {
+    async fn first(&mut self, cx: &Cx) -> Result<bool> {
         observe_cursor_cancellation(cx)?;
         self.stack.clear();
         self.at_eof = true;
-        self.move_to_leftmost_leaf(cx, self.root_page, true)
+        self.move_to_leftmost_leaf(cx, self.root_page, true).await
     }
 
-    fn last(&mut self, cx: &Cx) -> Result<bool> {
+    async fn last(&mut self, cx: &Cx) -> Result<bool> {
         observe_cursor_cancellation(cx)?;
         self.stack.clear();
         self.at_eof = true;
-        self.move_to_rightmost_leaf(cx, self.root_page, true)
+        self.move_to_rightmost_leaf(cx, self.root_page, true).await
     }
 
-    fn next(&mut self, cx: &Cx) -> Result<bool> {
-        self.advance_next(cx)
+    async fn next(&mut self, cx: &Cx) -> Result<bool> {
+        self.advance_next(cx).await
     }
 
-    fn prev(&mut self, cx: &Cx) -> Result<bool> {
-        self.advance_prev(cx)
+    async fn prev(&mut self, cx: &Cx) -> Result<bool> {
+        self.advance_prev(cx).await
     }
 
-    fn index_insert(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
-        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
-            let seek = cursor.index_seek_for_insert(cx, key)?;
-            let (is_leaf, cell_idx) = {
-                let top = cursor
-                    .stack
-                    .last()
-                    .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
-                (top.header.page_type.is_leaf(), top.cell_idx)
-            };
-
-            let mut insert_idx;
-
-            if !is_leaf {
-                if seek.is_found() {
-                    // Matched exactly on an interior page. Descend to the right child's leftmost leaf.
-                    let right_child = {
-                        let top = cursor
-                            .stack
-                            .last()
-                            .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
-                        Self::child_page_at(top, cell_idx + 1)?
-                    };
-                    cursor.move_to_leftmost_leaf(cx, right_child, false)?;
-
-                    insert_idx = 0; // The new key goes at the very beginning of the right subtree.
-                } else {
-                    // Successor on an interior page. The key belongs in the LEFT child's rightmost leaf.
-                    let left_child = {
-                        let top = cursor
-                            .stack
-                            .last()
-                            .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
-                        Self::child_page_at(top, cell_idx)?
-                    };
-                    cursor.move_to_rightmost_leaf(cx, left_child, false)?;
+    async fn index_insert(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
+        let result = self
+            .with_btree_op(cx, BtreeOpType::Insert, async |cursor| {
+                let seek = cursor.index_seek_for_insert(cx, key).await?;
+                let (is_leaf, cell_idx) = {
                     let top = cursor
                         .stack
                         .last()
                         .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
-                    insert_idx = top.header.cell_count; // Append at the end of the left child.
-                }
-            } else {
-                let top = cursor
-                    .stack
-                    .last()
-                    .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
-                insert_idx = if cursor.at_eof {
-                    top.header.cell_count
-                } else {
-                    top.cell_idx
+                    (top.header.page_type.is_leaf(), top.cell_idx)
                 };
-                if seek.is_found() {
-                    // Duplicate key on a leaf; place after the existing one.
-                    insert_idx = insert_idx.saturating_add(1);
-                }
-            }
 
-            // Take cell_buf for reuse — same pattern as table_insert.
-            let mut cell_data = std::mem::take(&mut cursor.cell_buf);
-            let overflow_head = match cursor.encode_index_leaf_cell_into(cx, key, &mut cell_data) {
-                Ok(head) => head,
-                Err(error) => {
-                    cursor.cell_buf = cell_data;
-                    return Err(error);
-                }
-            };
+                let mut insert_idx;
 
-            match cursor.try_insert_on_leaf(cx, insert_idx, &cell_data) {
-                Ok(true) => {
-                    cursor.cell_buf = cell_data;
-                    Ok(())
+                if !is_leaf {
+                    if seek.is_found() {
+                        // Matched exactly on an interior page. Descend to the right child's leftmost leaf.
+                        let right_child = {
+                            let top = cursor
+                                .stack
+                                .last()
+                                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+                            Self::child_page_at(top, cell_idx + 1)?
+                        };
+                        cursor.move_to_leftmost_leaf(cx, right_child, false).await?;
+
+                        insert_idx = 0; // The new key goes at the very beginning of the right subtree.
+                    } else {
+                        // Successor on an interior page. The key belongs in the LEFT child's rightmost leaf.
+                        let left_child = {
+                            let top = cursor
+                                .stack
+                                .last()
+                                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+                            Self::child_page_at(top, cell_idx)?
+                        };
+                        cursor.move_to_rightmost_leaf(cx, left_child, false).await?;
+                        let top = cursor
+                            .stack
+                            .last()
+                            .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+                        insert_idx = top.header.cell_count; // Append at the end of the left child.
+                    }
+                } else {
+                    let top = cursor
+                        .stack
+                        .last()
+                        .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+                    insert_idx = if cursor.at_eof {
+                        top.header.cell_count
+                    } else {
+                        top.cell_idx
+                    };
+                    if seek.is_found() {
+                        // Duplicate key on a leaf; place after the existing one.
+                        insert_idx = insert_idx.saturating_add(1);
+                    }
                 }
-                Ok(false) => {
-                    // Page full — balance and redistribute.
-                    instrumentation::record_conservative_reload_fallback();
-                    let balance_result = cursor.balance_for_insert(cx, &cell_data, insert_idx);
-                    cursor.cell_buf = cell_data;
-                    if balance_result.is_err() {
-                        if let Some(first) = overflow_head {
-                            let _ = cursor.free_overflow_chain(cx, first);
+
+                // Take cell_buf for reuse — same pattern as table_insert.
+                let mut cell_data = std::mem::take(&mut cursor.cell_buf);
+                let overflow_head = match cursor
+                    .encode_index_leaf_cell_into(cx, key, &mut cell_data)
+                    .await
+                {
+                    Ok(head) => head,
+                    Err(error) => {
+                        cursor.cell_buf = cell_data;
+                        return Err(error);
+                    }
+                };
+
+                match cursor.try_insert_on_leaf(cx, insert_idx, &cell_data).await {
+                    Ok(true) => {
+                        cursor.cell_buf = cell_data;
+                        Ok(())
+                    }
+                    Ok(false) => {
+                        // Page full — balance and redistribute.
+                        instrumentation::record_conservative_reload_fallback();
+                        let balance_result =
+                            cursor.balance_for_insert(cx, &cell_data, insert_idx).await;
+                        cursor.cell_buf = cell_data;
+                        if balance_result.is_err() {
+                            if let Some(first) = overflow_head {
+                                let _ = cursor.free_overflow_chain(cx, first).await;
+                            }
                         }
+                        balance_result
                     }
-                    balance_result
-                }
-                Err(error) => {
-                    cursor.cell_buf = cell_data;
-                    if let Some(first) = overflow_head {
-                        let _ = cursor.free_overflow_chain(cx, first);
+                    Err(error) => {
+                        cursor.cell_buf = cell_data;
+                        if let Some(first) = overflow_head {
+                            let _ = cursor.free_overflow_chain(cx, first).await;
+                        }
+                        Err(error)
                     }
-                    Err(error)
                 }
-            }
-        });
+            })
+            .await;
         if result.is_ok() {
             self.bump_row_image_epoch();
         }
         result
     }
 
-    fn index_insert_unique(
+    async fn index_insert_unique(
         &mut self,
         cx: &Cx,
         key: &[u8],
@@ -10641,59 +10893,71 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         columns_label: &str,
     ) -> Result<()> {
         self.index_insert_unique_with_rightmost_report(cx, key, n_unique_cols, columns_label)
+            .await
             .map(|_| ())
     }
 
-    fn table_insert(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
-        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
-            if let Some((cached_page_no, cached_rowid)) = cursor
-                .rightmost_leaf_cache
-                .as_ref()
-                .map(|cached| (cached.page_no, cached.rowid))
-            {
-                if rowid > cached_rowid {
-                    if cursor.try_append_on_cached_rightmost_leaf(cx, rowid, data)? {
-                        return Ok(());
+    async fn table_insert(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
+        let result = self
+            .with_btree_op(cx, BtreeOpType::Insert, async |cursor| {
+                if let Some((cached_page_no, cached_rowid)) = cursor
+                    .rightmost_leaf_cache
+                    .as_ref()
+                    .map(|cached| (cached.page_no, cached.rowid))
+                {
+                    if rowid > cached_rowid {
+                        if cursor
+                            .try_append_on_cached_rightmost_leaf(cx, rowid, data)
+                            .await?
+                        {
+                            return Ok(());
+                        }
+                        if cursor
+                            .try_table_append_on_hinted_leaf_with_known_last_rowid(
+                                cx,
+                                cached_page_no,
+                                cached_rowid,
+                                rowid,
+                                data,
+                                true,
+                            )
+                            .await?
+                            .is_some()
+                        {
+                            return Ok(());
+                        }
+                    } else {
+                        // A midstream insert can rebalance the right edge, so drop
+                        // the append hint before taking the general path.
+                        cursor.clear_rightmost_leaf_cache();
                     }
-                    if cursor
-                        .try_table_append_on_hinted_leaf_with_known_last_rowid(
-                            cx,
-                            cached_page_no,
-                            cached_rowid,
-                            rowid,
-                            data,
-                            true,
-                        )?
-                        .is_some()
-                    {
-                        return Ok(());
-                    }
-                } else {
-                    // A midstream insert can rebalance the right edge, so drop
-                    // the append hint before taking the general path.
-                    cursor.clear_rightmost_leaf_cache();
                 }
-            }
 
-            let seek = cursor.table_seek_for_insert(cx, rowid)?;
-            if seek.is_found() {
-                return Err(FrankenError::PrimaryKeyViolation);
-            }
-            let rightmost_insert = cursor.at_eof;
-            cursor.table_insert_from_current_position(cx, rowid, data)?;
-            if rightmost_insert {
-                cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)?;
-            }
-            Ok(())
-        });
+                let seek = cursor.table_seek_for_insert(cx, rowid).await?;
+                if seek.is_found() {
+                    return Err(FrankenError::PrimaryKeyViolation);
+                }
+                let rightmost_insert = cursor.at_eof;
+                cursor
+                    .table_insert_from_current_position(cx, rowid, data)
+                    .await?;
+                if rightmost_insert {
+                    cursor
+                        .refresh_rightmost_leaf_cache_after_insert(cx, rowid)
+                        .await?;
+                }
+                Ok(())
+            })
+            .await;
         if result.is_ok() {
             self.bump_row_image_epoch();
         }
         result
     }
 
-    fn delete(&mut self, cx: &Cx) -> Result<()> {
-        let result = self.with_btree_op(cx, BtreeOpType::Delete, |cursor| {
+    async fn delete(&mut self, cx: &Cx) -> Result<()> {
+        let result = self
+            .with_btree_op(cx, BtreeOpType::Delete, async |cursor| {
             cursor.clear_rightmost_leaf_cache();
             // Delete may rebalance and then re-seek internally to restore
             // cursor position. Any cache entries from the caller's prior seek
@@ -10725,11 +10989,13 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 .is_some_and(|entry| entry.page_no != cursor.root_page)
             {
                 let path_target = if cursor.is_table {
-                    MutationPathTarget::ExactTableRowid(cursor.rowid(cx)?)
+                    MutationPathTarget::ExactTableRowid(cursor.rowid(cx).await?)
                 } else {
-                    MutationPathTarget::ExactIndexKey(cursor.payload(cx)?)
+                    MutationPathTarget::ExactIndexKey(cursor.payload(cx).await?)
                 };
-                if let Some(reseek) = cursor.ensure_full_mutation_path(cx, path_target)?
+                if let Some(reseek) = cursor
+                    .ensure_full_mutation_path(cx, path_target)
+                    .await?
                     && !reseek.is_found()
                 {
                     return Err(FrankenError::DatabaseCorrupt {
@@ -10750,19 +11016,19 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 // Interior node deletion (index B-trees):
                 // 1) identify successor payload, 2) replace interior key,
                 // 3) remove duplicate successor from leaf.
-                let original_key = cursor.payload(cx)?;
+                let original_key = cursor.payload(cx).await?;
 
                 // Advance to the successor in the right subtree.
-                let advanced = cursor.advance_next(cx)?;
+                let advanced = cursor.advance_next(cx).await?;
                 if !advanced || cursor.at_eof {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: "no successor for interior node".to_owned(),
                     });
                 }
-                let successor_key = cursor.payload(cx)?;
+                let successor_key = cursor.payload(cx).await?;
 
                 // Re-seek the original key to perform in-place interior replacement.
-                let seek_res = cursor.index_seek(cx, &original_key)?;
+                let seek_res = cursor.index_seek(cx, &original_key).await?;
                 if !seek_res.is_found() {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: "original key disappeared during interior delete".to_owned(),
@@ -10781,13 +11047,15 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 }
 
                 // Replace the interior key first so failures do not lose both keys.
-                let rebalanced = cursor.replace_interior_cell(cx, &successor_key)?;
+                let rebalanced = cursor
+                    .replace_interior_cell(cx, &successor_key)
+                    .await?;
 
                 if rebalanced {
                     // The replacement triggered a rebalance on the interior node, which
                     // invalidated the cursor stack. We must re-seek to the successor key
                     // to find the duplicate leaf entry.
-                    let seek_res = cursor.index_seek(cx, &successor_key)?;
+                    let seek_res = cursor.index_seek(cx, &successor_key).await?;
                     if !seek_res.is_found() {
                         return Err(FrankenError::DatabaseCorrupt {
                             detail: "duplicate successor missing after interior rebalance"
@@ -10805,7 +11073,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                     if !top_after_seek.header.page_type.is_leaf() {
                         // The seek found the interior node separator we just inserted.
                         // We must advance to the next logical entry to reach the duplicate in the leaf.
-                        let successor_found = cursor.advance_next(cx)?;
+                        let successor_found = cursor.advance_next(cx).await?;
                         if !successor_found || cursor.at_eof {
                             return Err(FrankenError::DatabaseCorrupt {
                                 detail: "duplicate leaf successor missing after interior rebalance"
@@ -10818,14 +11086,14 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                     // in the right subtree. Walk there from the interior replacement
                     // site instead of re-seeking, which would land back on the new
                     // interior separator.
-                    let successor_found = cursor.advance_next(cx)?;
+                    let successor_found = cursor.advance_next(cx).await?;
                     if !successor_found || cursor.at_eof {
                         return Err(FrankenError::DatabaseCorrupt {
                             detail: "duplicate successor missing after interior replacement"
                                 .to_owned(),
                         });
                     }
-                    let duplicate_successor = cursor.payload(cx)?;
+                    let duplicate_successor = cursor.payload(cx).await?;
                     if duplicate_successor != successor_key {
                         return Err(FrankenError::DatabaseCorrupt {
                             detail: "interior delete advanced to wrong successor duplicate"
@@ -10835,13 +11103,13 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 }
 
                 // Remove the duplicate leaf successor.
-                let (_leaf_pgno, new_count) = cursor.remove_cell_from_leaf(cx)?;
+                let (_leaf_pgno, new_count) = cursor.remove_cell_from_leaf(cx).await?;
                 if new_count == 0 {
-                    cursor.balance_for_delete(cx)?;
+                    cursor.balance_for_delete(cx).await?;
                 }
 
                 // Delete contract: position cursor at the next logical entry.
-                let _ = cursor.index_seek(cx, &successor_key)?;
+                let _ = cursor.index_seek(cx, &successor_key).await?;
                 return Ok(());
             }
 
@@ -10859,18 +11127,19 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             }
             let anchor = if needs_anchor {
                 if cursor.is_table {
-                    Some(Anchor::Rowid(cursor.rowid(cx)?))
+                    Some(Anchor::Rowid(cursor.rowid(cx).await?))
                 } else {
-                    Some(Anchor::Key(cursor.payload(cx)?))
+                    Some(Anchor::Key(cursor.payload(cx).await?))
                 }
             } else {
                 None
             };
 
             if cursor.is_table {
-                let (_leaf_page_no, new_count) = cursor.remove_table_cell_from_leaf_deferred(cx)?;
+                let (_leaf_page_no, new_count) =
+                    cursor.remove_table_cell_from_leaf_deferred(cx).await?;
                 if new_count == 0 {
-                    cursor.balance_for_delete(cx)?;
+                    cursor.balance_for_delete(cx).await?;
 
                     // If we balanced, the stack was cleared. Re-seek to the
                     // deleted rowid anchor; the seek lands on the successor
@@ -10878,10 +11147,10 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                     if let Some(anc) = anchor {
                         match anc {
                             Anchor::Rowid(r) => {
-                                cursor.table_move_to(cx, r)?;
+                                cursor.table_move_to(cx, r).await?;
                             }
                             Anchor::Key(k) => {
-                                cursor.index_move_to(cx, &k)?;
+                                cursor.index_move_to(cx, &k).await?;
                             }
                         }
                     }
@@ -10891,16 +11160,17 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                         page_no,
                         separator_idx,
                         new_max_rowid,
-                    )?;
+                    )
+                    .await?;
                 }
             } else {
                 // Remove the cell from the leaf. This handles overflow chain
                 // cleanup and refreshes the stack entry.
-                let (_leaf_page_no, new_count) = cursor.remove_cell_from_leaf(cx)?;
+                let (_leaf_page_no, new_count) = cursor.remove_cell_from_leaf(cx).await?;
 
                 // Trigger structural rebalance only when a non-root leaf drains.
                 if new_count == 0 {
-                    cursor.balance_for_delete(cx)?;
+                    cursor.balance_for_delete(cx).await?;
 
                     // If we balanced, the stack was cleared. Re-seek to the anchor.
                     // Since the anchor key was just deleted, the seek will land on
@@ -10908,10 +11178,10 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                     if let Some(anc) = anchor {
                         match anc {
                             Anchor::Rowid(r) => {
-                                cursor.table_move_to(cx, r)?;
+                                cursor.table_move_to(cx, r).await?;
                             }
                             Anchor::Key(k) => {
-                                cursor.index_move_to(cx, &k)?;
+                                cursor.index_move_to(cx, &k).await?;
                             }
                         }
                     }
@@ -10919,14 +11189,15 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             }
 
             Ok(())
-        });
+        })
+            .await;
         if result.is_ok() {
             self.bump_row_image_epoch();
         }
         result
     }
 
-    fn payload(&self, cx: &Cx) -> Result<Vec<u8>> {
+    async fn payload(&self, cx: &Cx) -> Result<Vec<u8>> {
         if self.at_eof || self.stack.is_empty() {
             return Err(FrankenError::internal("cursor at EOF"));
         }
@@ -10939,7 +11210,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             return Ok(payload.to_vec());
         }
         let cell = self.parse_cell_at(top, top.cell_idx)?;
-        match self.read_cell_payload(cx, top, &cell)? {
+        match self.read_cell_payload(cx, top, &cell).await? {
             Cow::Borrowed(bytes) => {
                 instrumentation::record_owned_payload_materialization(bytes.len());
                 Ok(bytes.to_vec())
@@ -10948,7 +11219,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         }
     }
 
-    fn payload_into(&self, cx: &Cx, buf: &mut Vec<u8>) -> Result<()> {
+    async fn payload_into(&self, cx: &Cx, buf: &mut Vec<u8>) -> Result<()> {
         if self.at_eof || self.stack.is_empty() {
             return Err(FrankenError::internal("cursor at EOF"));
         }
@@ -10961,11 +11232,11 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         }
         let cell = self.parse_cell_at(top, top.cell_idx)?;
 
-        self.read_cell_payload_into(cx, top, &cell, buf)
+        self.read_cell_payload_into(cx, top, &cell, buf).await
     }
 
-    fn rowid_and_payload_into(&self, cx: &Cx, buf: &mut Vec<u8>) -> Result<i64> {
-        let (rowid, payload) = self.rowid_and_payload_cow(cx)?;
+    async fn rowid_and_payload_into(&self, cx: &Cx, buf: &mut Vec<u8>) -> Result<i64> {
+        let (rowid, payload) = self.rowid_and_payload_cow(cx).await?;
         buf.clear();
         match payload {
             Cow::Borrowed(bytes) => {
@@ -10979,8 +11250,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         Ok(rowid)
     }
 
-    fn rowid_and_payload_cow<'a>(&'a self, cx: &Cx) -> Result<(i64, Cow<'a, [u8]>)> {
-        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+    async fn rowid_and_payload_cow<'a>(&'a self, cx: &'a Cx) -> Result<(i64, Cow<'a, [u8]>)> {
         if self.at_eof || self.stack.is_empty() {
             return Err(FrankenError::internal("cursor at EOF"));
         }
@@ -10991,8 +11261,11 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         if let Some(row) = self.local_leaf_table_rowid_and_payload(top, top.cell_idx)? {
             return Ok(row);
         }
-        let cell = self.parse_cell_at_uncached(top, top.cell_idx)?;
-        let payload = self.read_cell_payload(cx, top, &cell)?;
+        let cell = {
+            let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+            self.parse_cell_at_uncached(top, top.cell_idx)?
+        };
+        let payload = self.read_cell_payload(cx, top, &cell).await?;
         if let Some(rowid) = cell.rowid {
             return Ok((rowid, payload));
         }
@@ -11000,10 +11273,13 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         // Index cursor fallback: match rowid() semantics, but reuse the
         // payload bytes already materialized above instead of reading them a
         // second time.
-        let key_values =
-            parse_record(payload.as_ref()).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                detail: "malformed index key record while extracting rowid".to_owned(),
-            })?;
+        let key_values = {
+            let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+            parse_record(payload.as_ref())
+        }
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "malformed index key record while extracting rowid".to_owned(),
+        })?;
         let rowid = key_values
             .last()
             .and_then(fsqlite_types::SqliteValue::as_integer)
@@ -11013,7 +11289,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         Ok((rowid, payload))
     }
 
-    fn payload_prefix_into(
+    async fn payload_prefix_into(
         &self,
         cx: &Cx,
         max_prefix_bytes: usize,
@@ -11032,10 +11308,10 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         let cell = self.parse_cell_at(top, top.cell_idx)?;
 
         self.read_cell_payload_prefix_into(cx, top, &cell, max_prefix_bytes, buf)
+            .await
     }
 
-    fn rowid(&self, cx: &Cx) -> Result<i64> {
-        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+    async fn rowid(&self, cx: &Cx) -> Result<i64> {
         if self.at_eof || self.stack.is_empty() {
             return Err(FrankenError::internal("cursor at EOF"));
         }
@@ -11046,18 +11322,24 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         if top.header.page_type.is_leaf() && top.header.page_type.is_table() {
             return Self::table_leaf_rowid_at(top, top.cell_idx);
         }
-        let cell = self.parse_cell_at(top, top.cell_idx)?;
+        let cell = {
+            let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+            self.parse_cell_at(top, top.cell_idx)?
+        };
         if let Some(rowid) = cell.rowid {
             return Ok(rowid);
         }
 
         // Index cursor: rowid is stored as the trailing field in the
         // serialized key record.
-        let key = self.read_cell_payload(cx, top, &cell)?;
-        let key_values =
-            parse_record(key.as_ref()).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                detail: "malformed index key record while extracting rowid".to_owned(),
-            })?;
+        let key = self.read_cell_payload(cx, top, &cell).await?;
+        let key_values = {
+            let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+            parse_record(key.as_ref())
+        }
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "malformed index key record while extracting rowid".to_owned(),
+        })?;
         key_values
             .last()
             .and_then(fsqlite_types::SqliteValue::as_integer)
@@ -11078,6 +11360,8 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
+    use asupersync::runtime::RuntimeBuilder;
+
     use super::*;
     use crate::instrumentation::{
         btree_leaf_reuse_snapshot, btree_metrics_snapshot, set_btree_metrics_enabled,
@@ -11097,6 +11381,13 @@ mod tests {
     // `use super::*;`.  Tests use `MemPageStore::new(USABLE)` instead of
     // the former `MemPageStore::new(USABLE)`.
     static LEAF_REUSE_CURSOR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn run_async<F: Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("build B-tree cursor test runtime")
+            .block_on(future)
+    }
 
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     struct PrefetchProbeSnapshot {
@@ -11160,27 +11451,36 @@ mod tests {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl PageReader for PrefetchProbeStore {
-        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-            let mut probe = self.probe.borrow_mut();
-            probe.read_pages.push(page_no);
-            let mut counted_prefetch_hit = false;
-            let remove_pending = if let Some(pending) = probe.pending_hints.get_mut(&page_no.get())
-                && *pending > 0
-            {
-                *pending -= 1;
-                counted_prefetch_hit = true;
-                *pending == 0
-            } else {
-                false
-            };
-            if counted_prefetch_hit {
-                probe.prefetch_hit_count = probe.prefetch_hit_count.saturating_add(1);
+        fn read_page<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
+            async move {
+                let mut probe = self.probe.borrow_mut();
+                probe.read_pages.push(page_no);
+                let mut counted_prefetch_hit = false;
+                let remove_pending = if let Some(pending) =
+                    probe.pending_hints.get_mut(&page_no.get())
+                    && *pending > 0
+                {
+                    *pending -= 1;
+                    counted_prefetch_hit = true;
+                    *pending == 0
+                } else {
+                    false
+                };
+                if counted_prefetch_hit {
+                    probe.prefetch_hit_count = probe.prefetch_hit_count.saturating_add(1);
+                }
+                if remove_pending {
+                    probe.pending_hints.remove(&page_no.get());
+                }
+                drop(probe);
+                self.inner.read_page(cx, page_no).await
             }
-            if remove_pending {
-                probe.pending_hints.remove(&page_no.get());
-            }
-            self.inner.read_page(cx, page_no)
         }
 
         fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
@@ -11212,17 +11512,30 @@ mod tests {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl PageWriter for PrefetchProbeStore {
-        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-            self.inner.write_page(cx, page_no, data)
+        fn write_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move { self.inner.write_page(cx, page_no, data).await }
         }
 
-        fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
-            self.inner.allocate_page(cx)
+        fn allocate_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> impl Future<Output = Result<PageNumber>> + 'a {
+            async move { self.inner.allocate_page(cx).await }
         }
 
-        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-            self.inner.free_page(cx, page_no)
+        fn free_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move { self.inner.free_page(cx, page_no).await }
         }
 
         fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
@@ -11254,19 +11567,36 @@ mod tests {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl PageReader for WitnessProbeStore {
-        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-            self.inner.read_page(cx, page_no)
+        fn read_page<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
+            async move { self.inner.read_page(cx, page_no).await }
         }
 
-        fn read_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
-            self.state.borrow_mut().coarse_page_data_reads += 1;
-            self.inner.read_page_data(cx, page_no)
+        fn read_page_data<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<PageData>> + 'a {
+            async move {
+                self.state.borrow_mut().coarse_page_data_reads += 1;
+                self.inner.read_page_data(cx, page_no).await
+            }
         }
 
-        fn read_btree_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
-            self.state.borrow_mut().btree_page_data_reads += 1;
-            self.inner.read_page_data(cx, page_no)
+        fn read_btree_page_data<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<PageData>> + 'a {
+            async move {
+                self.state.borrow_mut().btree_page_data_reads += 1;
+                self.inner.read_page_data(cx, page_no).await
+            }
         }
 
         fn record_read_witness(&self, _cx: &Cx, key: WitnessKey) {
@@ -11274,17 +11604,30 @@ mod tests {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl PageWriter for WitnessProbeStore {
-        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-            self.inner.write_page(cx, page_no, data)
+        fn write_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move { self.inner.write_page(cx, page_no, data).await }
         }
 
-        fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
-            self.inner.allocate_page(cx)
+        fn allocate_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> impl Future<Output = Result<PageNumber>> + 'a {
+            async move { self.inner.allocate_page(cx).await }
         }
 
-        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-            self.inner.free_page(cx, page_no)
+        fn free_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move { self.inner.free_page(cx, page_no).await }
         }
 
         fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
@@ -11313,10 +11656,17 @@ mod tests {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl PageReader for SeekProbeStore {
-        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-            self.read_pages.borrow_mut().push(page_no);
-            self.inner.read_page(cx, page_no)
+        fn read_page<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
+            async move {
+                self.read_pages.borrow_mut().push(page_no);
+                self.inner.read_page(cx, page_no).await
+            }
         }
 
         fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
@@ -11324,17 +11674,30 @@ mod tests {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl PageWriter for SeekProbeStore {
-        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-            self.inner.write_page(cx, page_no, data)
+        fn write_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move { self.inner.write_page(cx, page_no, data).await }
         }
 
-        fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
-            self.inner.allocate_page(cx)
+        fn allocate_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> impl Future<Output = Result<PageNumber>> + 'a {
+            async move { self.inner.allocate_page(cx).await }
         }
 
-        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-            self.inner.free_page(cx, page_no)
+        fn free_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move { self.inner.free_page(cx, page_no).await }
         }
 
         fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
@@ -11351,19 +11714,35 @@ mod tests {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl PageReader for StagedMutationStore {
-        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-            self.inner.read_page(cx, page_no)
+        fn read_page<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
+            async move { self.inner.read_page(cx, page_no).await }
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl PageWriter for StagedMutationStore {
-        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-            self.inner.write_page(cx, page_no, data)
+        fn write_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move { self.inner.write_page(cx, page_no, data).await }
         }
 
-        fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
-            self.inner.write_page_data(cx, page_no, data)
+        fn write_page_data<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+            data: PageData,
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move { self.inner.write_page_data(cx, page_no, data).await }
         }
 
         fn try_take_staged_page_data(&mut self, page_no: PageNumber) -> Option<PageData> {
@@ -11388,21 +11767,28 @@ mod tests {
             true
         }
 
-        fn restore_staged_page_data(
-            &mut self,
-            cx: &Cx,
+        fn restore_staged_page_data<'a>(
+            &'a mut self,
+            cx: &'a Cx,
             page_no: PageNumber,
             data: PageData,
-        ) -> Result<()> {
-            self.inner.write_page_data(cx, page_no, data)
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move { self.inner.write_page_data(cx, page_no, data).await }
         }
 
-        fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
-            self.inner.allocate_page(cx)
+        fn allocate_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> impl Future<Output = Result<PageNumber>> + 'a {
+            async move { self.inner.allocate_page(cx).await }
         }
 
-        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-            self.inner.free_page(cx, page_no)
+        fn free_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move { self.inner.free_page(cx, page_no).await }
         }
 
         fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
@@ -11425,27 +11811,47 @@ mod tests {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl PageReader for FailingOverflowStore {
-        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-            self.inner.borrow().read_page(cx, page_no)
+        fn read_page<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
+            async move { self.inner.borrow().read_page(cx, page_no).await }
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl PageWriter for FailingOverflowStore {
-        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-            self.write_count = self.write_count.saturating_add(1);
-            if self.write_count == self.fail_on_write {
-                return Err(FrankenError::internal("injected write failure"));
+        fn write_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move {
+                self.write_count = self.write_count.saturating_add(1);
+                if self.write_count == self.fail_on_write {
+                    return Err(FrankenError::internal("injected write failure"));
+                }
+                self.inner.borrow_mut().write_page(cx, page_no, data).await
             }
-            self.inner.borrow_mut().write_page(cx, page_no, data)
         }
 
-        fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
-            self.inner.borrow_mut().allocate_page(cx)
+        fn allocate_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> impl Future<Output = Result<PageNumber>> + 'a {
+            async move { self.inner.borrow_mut().allocate_page(cx).await }
         }
 
-        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-            self.inner.borrow_mut().free_page(cx, page_no)
+        fn free_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move { self.inner.borrow_mut().free_page(cx, page_no).await }
         }
 
         fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
@@ -11466,15 +11872,22 @@ mod tests {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl PageReader for CancelAfterReadStore {
-        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-            let page = self.inner.read_page(cx, page_no)?;
-            let mut cancelled = self.cancelled.borrow_mut();
-            if !*cancelled {
-                cx.cancel();
-                *cancelled = true;
+        fn read_page<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
+            async move {
+                let page = self.inner.read_page(cx, page_no).await?;
+                let mut cancelled = self.cancelled.borrow_mut();
+                if !*cancelled {
+                    cx.cancel();
+                    *cancelled = true;
+                }
+                Ok(page)
             }
-            Ok(page)
         }
 
         fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
@@ -11482,17 +11895,30 @@ mod tests {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl PageWriter for CancelAfterReadStore {
-        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-            self.inner.write_page(cx, page_no, data)
+        fn write_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move { self.inner.write_page(cx, page_no, data).await }
         }
 
-        fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
-            self.inner.allocate_page(cx)
+        fn allocate_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> impl Future<Output = Result<PageNumber>> + 'a {
+            async move { self.inner.allocate_page(cx).await }
         }
 
-        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-            self.inner.free_page(cx, page_no)
+        fn free_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move { self.inner.free_page(cx, page_no).await }
         }
 
         fn record_write_witness(&mut self, cx: &Cx, key: WitnessKey) {
@@ -11515,32 +11941,54 @@ mod tests {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl PageReader for CancelAfterFirstOverflowFreeStore {
-        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
-            self.inner.borrow().read_page(cx, page_no)
+        fn read_page<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
+            async move {
+                cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+                self.inner.borrow().read_page(cx, page_no).await
+            }
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl PageWriter for CancelAfterFirstOverflowFreeStore {
-        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-            self.inner.borrow_mut().write_page(cx, page_no, data)
+        fn write_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move { self.inner.borrow_mut().write_page(cx, page_no, data).await }
         }
 
-        fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
-            self.inner.borrow_mut().allocate_page(cx)
+        fn allocate_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> impl Future<Output = Result<PageNumber>> + 'a {
+            async move { self.inner.borrow_mut().allocate_page(cx).await }
         }
 
-        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
-            self.inner.borrow_mut().free_page(cx, page_no)?;
+        fn free_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move {
+                cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+                self.inner.borrow_mut().free_page(cx, page_no).await?;
 
-            let mut cancelled = self.cancelled.borrow_mut();
-            if !*cancelled {
-                cx.cancel();
-                *cancelled = true;
+                let mut cancelled = self.cancelled.borrow_mut();
+                if !*cancelled {
+                    cx.cancel();
+                    *cancelled = true;
+                }
+                Ok(())
             }
-            Ok(())
         }
 
         fn record_write_witness(&mut self, cx: &Cx, key: WitnessKey) {
@@ -11600,17 +12048,17 @@ mod tests {
         collect_reachable_pages(store, right_child, usable_size, out);
     }
 
-    fn validate_table_tree_invariants<P: PageReader>(
+    async fn validate_table_tree_invariants<P: PageReader>(
         pager: &P,
         root: PageNumber,
         usable_size: u32,
     ) -> Result<Option<TableSubtreeBounds>> {
         let cx = Cx::new();
         let mut visited = BTreeSet::new();
-        validate_table_subtree_invariants(pager, &cx, root, usable_size, true, &mut visited)
+        validate_table_subtree_invariants(pager, &cx, root, usable_size, true, &mut visited).await
     }
 
-    fn validate_table_subtree_invariants<P: PageReader>(
+    async fn validate_table_subtree_invariants<P: PageReader>(
         pager: &P,
         cx: &Cx,
         page_no: PageNumber,
@@ -11624,7 +12072,7 @@ mod tests {
             });
         }
 
-        let page = pager.read_page(cx, page_no)?;
+        let page = pager.read_page(cx, page_no).await?;
         let header_offset = cell::header_offset_for_page(page_no);
         let header = BtreePageHeader::parse(&page, header_offset)?;
         if !header.page_type.is_table() {
@@ -11686,14 +12134,15 @@ mod tests {
                         page_no.get()
                     ),
                 })?;
-            return validate_table_subtree_invariants(
+            return Box::pin(validate_table_subtree_invariants(
                 pager,
                 cx,
                 right_child,
                 usable_size,
                 false,
                 visited,
-            );
+            ))
+            .await;
         }
 
         let mut overall_min = None;
@@ -11714,14 +12163,15 @@ mod tests {
                     page_no.get()
                 ),
             })?;
-            let child_bounds = validate_table_subtree_invariants(
+            let child_bounds = Box::pin(validate_table_subtree_invariants(
                 pager,
                 cx,
                 left_child,
                 usable_size,
                 false,
                 visited,
-            )?;
+            ))
+            .await?;
 
             if let Some(prev) = prev_separator {
                 if separator <= prev {
@@ -11771,8 +12221,15 @@ mod tests {
                     page_no.get()
                 ),
             })?;
-        let right_bounds =
-            validate_table_subtree_invariants(pager, cx, right_child, usable_size, false, visited)?;
+        let right_bounds = Box::pin(validate_table_subtree_invariants(
+            pager,
+            cx,
+            right_child,
+            usable_size,
+            false,
+            visited,
+        ))
+        .await?;
 
         if let Some(prev) = prev_separator
             && right_bounds.is_some_and(|bounds| bounds.min_rowid <= prev)
@@ -11814,16 +12271,16 @@ mod tests {
         cursor.compare_index_key_bytes(lhs, rhs, parsed_rhs.as_deref())
     }
 
-    fn validate_index_tree_invariants<P: PageReader>(
+    async fn validate_index_tree_invariants<P: PageReader>(
         cursor: &mut BtCursor<P>,
         root: PageNumber,
     ) -> Result<Option<IndexSubtreeBounds>> {
         let cx = Cx::new();
         let mut visited = BTreeSet::new();
-        validate_index_subtree_invariants(cursor, &cx, root, true, &mut visited)
+        validate_index_subtree_invariants(cursor, &cx, root, true, &mut visited).await
     }
 
-    fn validate_index_subtree_invariants<P: PageReader>(
+    async fn validate_index_subtree_invariants<P: PageReader>(
         cursor: &mut BtCursor<P>,
         cx: &Cx,
         page_no: PageNumber,
@@ -11836,7 +12293,7 @@ mod tests {
             });
         }
 
-        let entry = cursor.load_page(cx, page_no)?;
+        let entry = cursor.load_page(cx, page_no).await?;
         if !entry.header.page_type.is_index() {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -11862,7 +12319,10 @@ mod tests {
             let mut prev_key = None::<Vec<u8>>;
             for idx in 0..entry.header.cell_count {
                 let cell = cursor.parse_cell_at(&entry, idx)?;
-                let key = cursor.read_cell_payload(cx, &entry, &cell)?.into_owned();
+                let key = cursor
+                    .read_cell_payload(cx, &entry, &cell)
+                    .await?
+                    .into_owned();
                 if let Some(prev) = &prev_key
                     && compare_index_test_keys(cursor, prev, &key) != std::cmp::Ordering::Less
                 {
@@ -11902,18 +12362,23 @@ mod tests {
 
         for idx in 0..entry.header.cell_count {
             let left_child = BtCursor::<P>::child_page_at(&entry, idx)?;
-            let left_bounds =
-                validate_index_subtree_invariants(cursor, cx, left_child, false, visited)?
-                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "interior index page {} points to an empty child subtree {}",
-                            page_no.get(),
-                            left_child.get()
-                        ),
-                    })?;
+            let left_bounds = Box::pin(validate_index_subtree_invariants(
+                cursor, cx, left_child, false, visited,
+            ))
+            .await?
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "interior index page {} points to an empty child subtree {}",
+                    page_no.get(),
+                    left_child.get()
+                ),
+            })?;
 
             let cell = cursor.parse_cell_at(&entry, idx)?;
-            let separator_key = cursor.read_cell_payload(cx, &entry, &cell)?.into_owned();
+            let separator_key = cursor
+                .read_cell_payload(cx, &entry, &cell)
+                .await?
+                .into_owned();
 
             if compare_index_test_keys(cursor, &left_bounds.max_key, &separator_key)
                 != std::cmp::Ordering::Less
@@ -11970,15 +12435,21 @@ mod tests {
                         page_no.get()
                     ),
                 })?;
-        let right_bounds =
-            validate_index_subtree_invariants(cursor, cx, right_child, false, visited)?
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "interior index page {} points to an empty right subtree {}",
-                        page_no.get(),
-                        right_child.get()
-                    ),
-                })?;
+        let right_bounds = Box::pin(validate_index_subtree_invariants(
+            cursor,
+            cx,
+            right_child,
+            false,
+            visited,
+        ))
+        .await?
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "interior index page {} points to an empty right subtree {}",
+                page_no.get(),
+                right_child.get()
+            ),
+        })?;
 
         if let Some(prev) = &prev_separator
             && compare_index_test_keys(cursor, prev, &right_bounds.min_key)
@@ -12006,15 +12477,15 @@ mod tests {
         }))
     }
 
-    fn scan_all_index_keys<P: PageWriter>(
+    async fn scan_all_index_keys<P: PageWriter>(
         cursor: &mut BtCursor<P>,
         cx: &Cx,
     ) -> Result<Vec<Vec<u8>>> {
         let mut scanned = Vec::new();
-        if cursor.first(cx)? {
+        if cursor.first(cx).await? {
             loop {
-                scanned.push(cursor.payload(cx)?);
-                if !cursor.next(cx)? {
+                scanned.push(cursor.payload(cx).await?);
+                if !cursor.next(cx).await? {
                     break;
                 }
             }
@@ -12031,270 +12502,294 @@ mod tests {
 
     #[test]
     fn test_btree_observability_operation_totals() {
-        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_btree_metrics_enabled(true);
-        let before = btree_metrics_snapshot();
+        run_async(async {
+            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            set_btree_metrics_enabled(true);
+            let before = btree_metrics_snapshot();
 
-        let cx = Cx::new();
-        let root = PageNumber::new(2).unwrap();
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
+            let cx = Cx::new();
+            let root = PageNumber::new(2).unwrap();
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
 
-        cursor.table_insert(&cx, 7, b"payload").unwrap();
-        assert!(cursor.table_move_to(&cx, 7).unwrap().is_found());
-        cursor.delete(&cx).unwrap();
+            cursor.table_insert(&cx, 7, b"payload").await.unwrap();
+            assert!(cursor.table_move_to(&cx, 7).await.unwrap().is_found());
+            cursor.delete(&cx).await.unwrap();
 
-        let after = btree_metrics_snapshot();
-        set_btree_metrics_enabled(false);
-        assert!(
-            after.fsqlite_btree_operations_total.seek
-                >= before.fsqlite_btree_operations_total.seek.saturating_add(1)
-        );
-        assert!(
-            after.fsqlite_btree_operations_total.insert
-                >= before
-                    .fsqlite_btree_operations_total
-                    .insert
-                    .saturating_add(1)
-        );
-        assert!(
-            after.fsqlite_btree_operations_total.delete
-                >= before
-                    .fsqlite_btree_operations_total
-                    .delete
-                    .saturating_add(1)
-        );
-        assert!(after.fsqlite_btree_depth >= 1);
+            let after = btree_metrics_snapshot();
+            set_btree_metrics_enabled(false);
+            assert!(
+                after.fsqlite_btree_operations_total.seek
+                    >= before.fsqlite_btree_operations_total.seek.saturating_add(1)
+            );
+            assert!(
+                after.fsqlite_btree_operations_total.insert
+                    >= before
+                        .fsqlite_btree_operations_total
+                        .insert
+                        .saturating_add(1)
+            );
+            assert!(
+                after.fsqlite_btree_operations_total.delete
+                    >= before
+                        .fsqlite_btree_operations_total
+                        .delete
+                        .saturating_add(1)
+            );
+            assert!(after.fsqlite_btree_depth >= 1);
+        });
     }
 
     #[test]
     fn test_rowid_and_payload_into_matches_separate_accessors() -> Result<()> {
-        let cx = Cx::new();
+        run_async(async {
+            let cx = Cx::new();
 
-        let table_root = pn(2);
-        let table_store = MemPageStore::with_empty_table(table_root, USABLE);
-        let mut table_cursor = BtCursor::new(table_store, table_root, USABLE, true);
-        table_cursor.table_insert(&cx, 42, b"table-payload")?;
-        assert!(table_cursor.table_move_to(&cx, 42)?.is_found());
+            let table_root = pn(2);
+            let table_store = MemPageStore::with_empty_table(table_root, USABLE);
+            let mut table_cursor = BtCursor::new(table_store, table_root, USABLE, true);
+            table_cursor.table_insert(&cx, 42, b"table-payload").await?;
+            assert!(table_cursor.table_move_to(&cx, 42).await?.is_found());
 
-        let mut payload = Vec::new();
-        let rowid = table_cursor.rowid_and_payload_into(&cx, &mut payload)?;
-        assert_eq!(rowid, table_cursor.rowid(&cx)?);
-        assert_eq!(payload, table_cursor.payload(&cx)?);
+            let mut payload = Vec::new();
+            let rowid = table_cursor
+                .rowid_and_payload_into(&cx, &mut payload)
+                .await?;
+            assert_eq!(rowid, table_cursor.rowid(&cx).await?);
+            assert_eq!(payload, table_cursor.payload(&cx).await?);
 
-        let index_root = pn(3);
-        let index_store = MemPageStore::with_empty_index(index_root, USABLE);
-        let mut index_cursor = BtCursor::new(index_store, index_root, USABLE, false);
-        let key = serialize_record(&[SqliteValue::Text("k".into()), SqliteValue::Integer(99)]);
-        index_cursor.index_insert(&cx, &key)?;
-        assert!(index_cursor.index_move_to(&cx, &key)?.is_found());
+            let index_root = pn(3);
+            let index_store = MemPageStore::with_empty_index(index_root, USABLE);
+            let mut index_cursor = BtCursor::new(index_store, index_root, USABLE, false);
+            let key = serialize_record(&[SqliteValue::Text("k".into()), SqliteValue::Integer(99)]);
+            index_cursor.index_insert(&cx, &key).await?;
+            assert!(index_cursor.index_move_to(&cx, &key).await?.is_found());
 
-        payload.clear();
-        let rowid = index_cursor.rowid_and_payload_into(&cx, &mut payload)?;
-        assert_eq!(rowid, index_cursor.rowid(&cx)?);
-        assert_eq!(payload, index_cursor.payload(&cx)?);
-        Ok(())
+            payload.clear();
+            let rowid = index_cursor
+                .rowid_and_payload_into(&cx, &mut payload)
+                .await?;
+            assert_eq!(rowid, index_cursor.rowid(&cx).await?);
+            assert_eq!(payload, index_cursor.payload(&cx).await?);
+            Ok(())
+        })
     }
 
     #[test]
     fn test_btree_observability_split_counter_and_depth_gauge() {
-        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_btree_metrics_enabled(true);
-        let before = btree_metrics_snapshot();
+        run_async(async {
+            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            set_btree_metrics_enabled(true);
+            let before = btree_metrics_snapshot();
 
-        let cx = Cx::new();
-        let root = PageNumber::new(2).unwrap();
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
+            let cx = Cx::new();
+            let root = PageNumber::new(2).unwrap();
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
 
-        // Use large payloads to force page splits quickly.  With 9KB
-        // payloads on a 4096-byte page, each insert uses overflow pages
-        // and the root splits after just a few rows.
-        let payload = vec![0xAB; 9_000];
-        let mut inserts_done: i64 = 0;
-        for rowid in 1_i64..=500_i64 {
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-            inserts_done = rowid;
+            // Use large payloads to force page splits quickly.  With 9KB
+            // payloads on a 4096-byte page, each insert uses overflow pages
+            // and the root splits after just a few rows.
+            let payload = vec![0xAB; 9_000];
+            let mut inserts_done: i64 = 0;
+            for rowid in 1_i64..=500_i64 {
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+                inserts_done = rowid;
 
-            let root_page = cursor.pager.pages.get(&2).unwrap();
-            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-            if root_header.page_type == cell::BtreePageType::InteriorTable {
-                break;
+                let root_page = cursor.pager.pages.get(&2).unwrap();
+                let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+                if root_header.page_type == cell::BtreePageType::InteriorTable {
+                    break;
+                }
+
+                assert!(
+                    rowid < 1000,
+                    "table root did not split under sustained inserts"
+                );
             }
 
+            let snapshot = btree_metrics_snapshot();
+            set_btree_metrics_enabled(false);
             assert!(
-                rowid < 1000,
-                "table root did not split under sustained inserts"
+                snapshot.fsqlite_btree_page_splits_total > before.fsqlite_btree_page_splits_total,
+                "expected at least one split when loading large rows"
             );
-        }
-
-        let snapshot = btree_metrics_snapshot();
-        set_btree_metrics_enabled(false);
-        assert!(
-            snapshot.fsqlite_btree_page_splits_total > before.fsqlite_btree_page_splits_total,
-            "expected at least one split when loading large rows"
-        );
-        // The insert counter must have increased by at least the number
-        // of rows we actually inserted (the loop may break early when
-        // the root splits).
-        assert!(
-            snapshot.fsqlite_btree_operations_total.insert
-                >= before
-                    .fsqlite_btree_operations_total
-                    .insert
-                    .saturating_add(inserts_done as u64),
-            "insert counter should reflect at least {inserts_done} inserts"
-        );
+            // The insert counter must have increased by at least the number
+            // of rows we actually inserted (the loop may break early when
+            // the root splits).
+            assert!(
+                snapshot.fsqlite_btree_operations_total.insert
+                    >= before
+                        .fsqlite_btree_operations_total
+                        .insert
+                        .saturating_add(inserts_done as u64),
+                "insert counter should reflect at least {inserts_done} inserts"
+            );
+        });
     }
 
     #[test]
     fn test_table_insert_prechecked_absent_reuses_successor_position() {
-        let cx = Cx::new();
-        let root = PageNumber::new(2).unwrap();
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        run_async(async {
+            let cx = Cx::new();
+            let root = PageNumber::new(2).unwrap();
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
 
-        cursor.table_insert(&cx, 10, b"ten").unwrap();
-        cursor.table_insert(&cx, 30, b"thirty").unwrap();
+            cursor.table_insert(&cx, 10, b"ten").await.unwrap();
+            cursor.table_insert(&cx, 30, b"thirty").await.unwrap();
 
-        let seek = cursor.table_move_to(&cx, 20).unwrap();
-        assert_eq!(seek, SeekResult::NotFound);
-        assert!(!cursor.eof(), "seek should land on successor rowid 30");
+            let seek = cursor.table_move_to(&cx, 20).await.unwrap();
+            assert_eq!(seek, SeekResult::NotFound);
+            assert!(!cursor.eof(), "seek should land on successor rowid 30");
 
-        cursor
-            .table_insert_prechecked_absent(&cx, 20, b"twenty")
-            .unwrap();
+            cursor
+                .table_insert_prechecked_absent(&cx, 20, b"twenty")
+                .await
+                .unwrap();
 
-        assert!(cursor.first(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 10);
-        assert_eq!(cursor.payload(&cx).unwrap(), b"ten");
+            assert!(cursor.first(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 10);
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"ten");
 
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 20);
-        assert_eq!(cursor.payload(&cx).unwrap(), b"twenty");
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 20);
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"twenty");
 
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 30);
-        assert_eq!(cursor.payload(&cx).unwrap(), b"thirty");
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 30);
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"thirty");
+        });
     }
 
     #[test]
     fn test_position_stamp_changes_when_same_leaf_slot_is_rewritten() {
-        let cx = Cx::new();
-        let root = PageNumber::new(2).unwrap();
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        run_async(async {
+            let cx = Cx::new();
+            let root = PageNumber::new(2).unwrap();
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
 
-        cursor.table_insert(&cx, 1, b"one").unwrap();
-        cursor.table_insert(&cx, 2, b"two").unwrap();
+            cursor.table_insert(&cx, 1, b"one").await.unwrap();
+            cursor.table_insert(&cx, 2, b"two").await.unwrap();
 
-        assert!(cursor.first(&cx).unwrap());
-        let before = cursor
-            .position_stamp()
-            .expect("cursor should be positioned");
+            assert!(cursor.first(&cx).await.unwrap());
+            let before = cursor
+                .position_stamp()
+                .expect("cursor should be positioned");
 
-        cursor.delete(&cx).unwrap();
-        let after = cursor
-            .position_stamp()
-            .expect("delete should land on successor");
+            cursor.delete(&cx).await.unwrap();
+            let after = cursor
+                .position_stamp()
+                .expect("delete should land on successor");
 
-        assert_eq!(before.page_no(), after.page_no());
-        assert_eq!(before.cell_idx(), after.cell_idx());
-        assert_ne!(
-            before, after,
-            "same-slot successor after delete must advance the row-image epoch"
-        );
+            assert_eq!(before.page_no(), after.page_no());
+            assert_eq!(before.cell_idx(), after.cell_idx());
+            assert_ne!(
+                before, after,
+                "same-slot successor after delete must advance the row-image epoch"
+            );
+        });
     }
 
     #[test]
     fn test_table_insert_prechecked_absent_reuses_eof_position() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[(1, b"one"), (2, b"two"), (3, b"three"), (4, b"four")]),
-        );
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_leaf_table(&[(1, b"one"), (2, b"two"), (3, b"three"), (4, b"four")]),
+            );
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        let seek = cursor.table_move_to(&cx, 99).unwrap();
-        assert_eq!(seek, SeekResult::NotFound);
-        assert!(
-            cursor.eof(),
-            "seek past end should preserve EOF insertion context"
-        );
+            let seek = cursor.table_move_to(&cx, 99).await.unwrap();
+            assert_eq!(seek, SeekResult::NotFound);
+            assert!(
+                cursor.eof(),
+                "seek past end should preserve EOF insertion context"
+            );
 
-        cursor
-            .table_insert_prechecked_absent(&cx, 99, b"tail")
-            .unwrap();
+            cursor
+                .table_insert_prechecked_absent(&cx, 99, b"tail")
+                .await
+                .unwrap();
 
-        assert!(cursor.table_move_to(&cx, 99).unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), b"tail");
+            assert!(cursor.table_move_to(&cx, 99).await.unwrap().is_found());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"tail");
+        });
     }
 
     #[test]
     fn test_table_insert_prechecked_absent_reuses_eof_after_tail_delete() {
-        let cx = Cx::new();
-        let root = PageNumber::new(2).unwrap();
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        run_async(async {
+            let cx = Cx::new();
+            let root = PageNumber::new(2).unwrap();
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
 
-        cursor.table_insert(&cx, 1, b"one").unwrap();
-        cursor.table_insert(&cx, 2, b"two").unwrap();
-        cursor.table_insert(&cx, 3, b"three").unwrap();
+            cursor.table_insert(&cx, 1, b"one").await.unwrap();
+            cursor.table_insert(&cx, 2, b"two").await.unwrap();
+            cursor.table_insert(&cx, 3, b"three").await.unwrap();
 
-        assert!(cursor.table_move_to(&cx, 3).unwrap().is_found());
-        cursor.delete(&cx).unwrap();
-        assert!(
-            cursor.eof(),
-            "tail delete should leave an EOF insertion context"
-        );
+            assert!(cursor.table_move_to(&cx, 3).await.unwrap().is_found());
+            cursor.delete(&cx).await.unwrap();
+            assert!(
+                cursor.eof(),
+                "tail delete should leave an EOF insertion context"
+            );
 
-        cursor
-            .table_insert_prechecked_absent(&cx, 3, b"THREE-updated")
-            .unwrap();
+            cursor
+                .table_insert_prechecked_absent(&cx, 3, b"THREE-updated")
+                .await
+                .unwrap();
 
-        assert!(cursor.table_move_to(&cx, 3).unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), b"THREE-updated");
+            assert!(cursor.table_move_to(&cx, 3).await.unwrap().is_found());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"THREE-updated");
+        });
     }
 
     #[test]
     fn test_table_insert_prechecked_absent_deep_tree_rightmost_10k() {
-        let cx = Cx::new();
-        let root = PageNumber::new(2).unwrap();
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
-        let row_count = 10_000_i64;
+        run_async(async {
+            let cx = Cx::new();
+            let root = PageNumber::new(2).unwrap();
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            let row_count = 10_000_i64;
 
-        for rowid in 0..row_count {
-            let payload = format!("row-{rowid}");
-            let seek = cursor.table_move_to(&cx, rowid).unwrap();
+            for rowid in 0..row_count {
+                let payload = format!("row-{rowid}");
+                let seek = cursor.table_move_to(&cx, rowid).await.unwrap();
+                assert_eq!(
+                    seek,
+                    SeekResult::NotFound,
+                    "monotonic prechecked insert should not find existing rowid {rowid}"
+                );
+                cursor
+                    .table_insert_prechecked_absent(&cx, rowid, payload.as_bytes())
+                    .await
+                    .unwrap();
+            }
+
+            let counted = cursor.count_all_rows(&cx).await.unwrap();
             assert_eq!(
-                seek,
-                SeekResult::NotFound,
-                "monotonic prechecked insert should not find existing rowid {rowid}"
+                counted, row_count,
+                "deep/rightmost prechecked-absent table with {row_count} rows must count exactly"
             );
-            cursor
-                .table_insert_prechecked_absent(&cx, rowid, payload.as_bytes())
-                .unwrap();
-        }
 
-        let counted = cursor.count_all_rows(&cx).unwrap();
-        assert_eq!(
-            counted, row_count,
-            "deep/rightmost prechecked-absent table with {row_count} rows must count exactly"
-        );
-
-        let seek = cursor.table_move_to(&cx, row_count - 1).unwrap();
-        assert_eq!(seek, SeekResult::Found);
-        assert_eq!(
-            cursor.payload(&cx).unwrap(),
-            format!("row-{}", row_count - 1).as_bytes()
-        );
+            let seek = cursor.table_move_to(&cx, row_count - 1).await.unwrap();
+            assert_eq!(seek, SeekResult::Found);
+            assert_eq!(
+                cursor.payload(&cx).await.unwrap(),
+                format!("row-{}", row_count - 1).as_bytes()
+            );
+        });
     }
 
     /// A delete of a singleton leaf may rebalance the tree and position the
@@ -12303,42 +12798,45 @@ mod tests {
     /// wrong side of an interior-table separator.
     #[test]
     fn test_delete_reinsert_keeps_deep_table_rowids_seekable() {
-        let cx = Cx::new();
-        let root = PageNumber::new(2).unwrap();
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        run_async(async {
+            let cx = Cx::new();
+            let root = PageNumber::new(2).unwrap();
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
 
-        const ROW_COUNT: i64 = 700;
-        let payload = vec![0x6D; 3_500];
-        for rowid in 1..=ROW_COUNT {
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-        }
+            const ROW_COUNT: i64 = 700;
+            let payload = vec![0x6D; 3_500];
+            for rowid in 1..=ROW_COUNT {
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            }
 
-        assert!(
-            cursor.measure_tree_depth(&cx).unwrap() >= 3,
-            "the regression needs an ancestor separator above the leaf parent"
-        );
-
-        for rowid in 1..=ROW_COUNT {
-            assert_eq!(
-                cursor.table_move_to(&cx, rowid).unwrap(),
-                SeekResult::Found,
-                "rowid {rowid} must exist before replacement"
+            assert!(
+                cursor.measure_tree_depth(&cx).await.unwrap() >= 3,
+                "the regression needs an ancestor separator above the leaf parent"
             );
-            cursor.delete(&cx).unwrap();
-            cursor
-                .table_insert_prechecked_absent(&cx, rowid, &payload)
-                .unwrap();
-        }
 
-        for rowid in 1..=ROW_COUNT {
-            assert_eq!(
-                cursor.table_move_to(&cx, rowid).unwrap(),
-                SeekResult::Found,
-                "rowid {rowid} must remain reachable through table routing"
-            );
-        }
-        assert_eq!(cursor.count_all_rows(&cx).unwrap(), ROW_COUNT);
+            for rowid in 1..=ROW_COUNT {
+                assert_eq!(
+                    cursor.table_move_to(&cx, rowid).await.unwrap(),
+                    SeekResult::Found,
+                    "rowid {rowid} must exist before replacement"
+                );
+                cursor.delete(&cx).await.unwrap();
+                cursor
+                    .table_insert_prechecked_absent(&cx, rowid, &payload)
+                    .await
+                    .unwrap();
+            }
+
+            for rowid in 1..=ROW_COUNT {
+                assert_eq!(
+                    cursor.table_move_to(&cx, rowid).await.unwrap(),
+                    SeekResult::Found,
+                    "rowid {rowid} must remain reachable through table routing"
+                );
+            }
+            assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), ROW_COUNT);
+        });
     }
 
     /// The revalidation guard must fail loud — not corrupt — when a caller
@@ -12349,34 +12847,40 @@ mod tests {
     /// duplicate or splicing the tree out of order.
     #[test]
     fn test_prechecked_absent_present_row_at_inadmissible_position_fails_loud() {
-        let cx = Cx::new();
-        let root = PageNumber::new(2).unwrap();
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        run_async(async {
+            let cx = Cx::new();
+            let root = PageNumber::new(2).unwrap();
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
 
-        let payload = vec![0x3Cu8; 3600];
-        for rowid in 1..=200_i64 {
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-        }
+            let payload = vec![0x3Cu8; 3600];
+            for rowid in 1..=200_i64 {
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            }
 
-        // Position the cursor far from rowid 7's true slot (EOF context from
-        // seeking past the end), then violate the contract: rowid 7 exists.
-        assert_eq!(
-            cursor.table_move_to(&cx, 10_000).unwrap(),
-            SeekResult::NotFound
-        );
-        assert!(cursor.eof());
-        let err = cursor
-            .table_insert_prechecked_absent(&cx, 7, &payload)
-            .expect_err("present rowid at an inadmissible reused position must fail loud");
-        assert!(
-            matches!(err, FrankenError::DatabaseCorrupt { .. }),
-            "expected DatabaseCorrupt, got {err:?}"
-        );
+            // Position the cursor far from rowid 7's true slot (EOF context from
+            // seeking past the end), then violate the contract: rowid 7 exists.
+            assert_eq!(
+                cursor.table_move_to(&cx, 10_000).await.unwrap(),
+                SeekResult::NotFound
+            );
+            assert!(cursor.eof());
+            let err = cursor
+                .table_insert_prechecked_absent(&cx, 7, &payload)
+                .await
+                .expect_err("present rowid at an inadmissible reused position must fail loud");
+            assert!(
+                matches!(err, FrankenError::DatabaseCorrupt { .. }),
+                "expected DatabaseCorrupt, got {err:?}"
+            );
 
-        // The tree must be unharmed: exactly one rowid 7, full count intact.
-        assert_eq!(cursor.table_move_to(&cx, 7).unwrap(), SeekResult::Found);
-        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 200);
+            // The tree must be unharmed: exactly one rowid 7, full count intact.
+            assert_eq!(
+                cursor.table_move_to(&cx, 7).await.unwrap(),
+                SeekResult::Found
+            );
+            assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), 200);
+        });
     }
 
     /// Helper: build a leaf table page with sorted (rowid, payload) entries.
@@ -12470,188 +12974,228 @@ mod tests {
 
     #[test]
     fn test_cell_slot_cache_invalidation_tracks_page_image_mutation() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(root.get(), build_leaf_table(&[(1, b"one"), (2, b"two")]));
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(root.get(), build_leaf_table(&[(1, b"one"), (2, b"two")]));
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
 
-        let first_entry = cursor.load_page(&cx, root).unwrap();
-        let first_cell = cursor.parse_cell_at(&first_entry, 0).unwrap();
-        assert_eq!(first_cell.rowid, Some(1));
-        let first_counter = first_entry.mutation_counter;
-        assert_eq!(cursor.cell_slot_cache.borrow().entries.len(), 1);
-        assert_eq!(cursor.cell_slot_cache.borrow().entries[0].slots.len(), 1);
+            let first_entry = cursor.load_page(&cx, root).await.unwrap();
+            let first_cell = cursor.parse_cell_at(&first_entry, 0).unwrap();
+            assert_eq!(first_cell.rowid, Some(1));
+            let first_counter = first_entry.mutation_counter;
+            assert_eq!(cursor.cell_slot_cache.borrow().entries.len(), 1);
+            assert_eq!(cursor.cell_slot_cache.borrow().entries[0].slots.len(), 1);
 
-        let second_cell = cursor.parse_cell_at(&first_entry, 1).unwrap();
-        assert_eq!(second_cell.rowid, Some(2));
-        assert_eq!(cursor.cell_slot_cache.borrow().entries.len(), 1);
-        assert_eq!(cursor.cell_slot_cache.borrow().entries[0].slots.len(), 2);
+            let second_cell = cursor.parse_cell_at(&first_entry, 1).unwrap();
+            assert_eq!(second_cell.rowid, Some(2));
+            assert_eq!(cursor.cell_slot_cache.borrow().entries.len(), 1);
+            assert_eq!(cursor.cell_slot_cache.borrow().entries[0].slots.len(), 2);
 
-        cursor
-            .pager
-            .write_page(
-                &cx,
-                root,
-                &build_leaf_table(&[(10, b"ten"), (20, b"twenty")]),
-            )
-            .unwrap();
-        let mutated_entry = cursor.reload_page_fresh(&cx, root).unwrap();
-        assert_ne!(mutated_entry.mutation_counter, first_counter);
-        let mutated_cell = cursor.parse_cell_at(&mutated_entry, 0).unwrap();
-        assert_eq!(mutated_cell.rowid, Some(10));
-        assert_eq!(cursor.cell_slot_cache.borrow().entries.len(), 2);
+            cursor
+                .pager
+                .write_page(
+                    &cx,
+                    root,
+                    &build_leaf_table(&[(10, b"ten"), (20, b"twenty")]),
+                )
+                .await
+                .unwrap();
+            let mutated_entry = cursor.reload_page_fresh(&cx, root).await.unwrap();
+            assert_ne!(mutated_entry.mutation_counter, first_counter);
+            let mutated_cell = cursor.parse_cell_at(&mutated_entry, 0).unwrap();
+            assert_eq!(mutated_cell.rowid, Some(10));
+            assert_eq!(cursor.cell_slot_cache.borrow().entries.len(), 2);
+        });
     }
 
     #[test]
     fn test_table_leaf_rowid_at_rejects_out_of_range_cell_pointer() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let mut page = build_leaf_table(&[(1, b"one"), (2, b"two")]);
-        page[8..10].copy_from_slice(&u16::MAX.to_be_bytes());
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let mut page = build_leaf_table(&[(1, b"one"), (2, b"two")]);
+            page[8..10].copy_from_slice(&u16::MAX.to_be_bytes());
 
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(root.get(), page);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
-        let entry = cursor.load_page(&cx, root).expect("page header loads");
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(root.get(), page);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            let entry = cursor
+                .load_page(&cx, root)
+                .await
+                .expect("page header loads");
 
-        let err = BtCursor::<MemPageStore>::table_leaf_rowid_at(&entry, 0)
-            .expect_err("out-of-range cell pointer must be corruption, not panic");
-        assert!(
-            matches!(&err, FrankenError::DatabaseCorrupt { detail } if detail.contains("points past page end")),
-            "unexpected error: {err:?}"
-        );
+            let err = BtCursor::<MemPageStore>::table_leaf_rowid_at(&entry, 0)
+                .expect_err("out-of-range cell pointer must be corruption, not panic");
+            assert!(
+                matches!(&err, FrankenError::DatabaseCorrupt { detail } if detail.contains("points past page end")),
+                "unexpected error: {err:?}"
+            );
+        });
     }
 
     #[test]
     fn test_table_interior_search_rejects_out_of_range_cell_pointer() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let mut page = build_interior_table(&[(pn(3), 10)], pn(4));
-        page[12..14].copy_from_slice(&u16::MAX.to_be_bytes());
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let mut page = build_interior_table(&[(pn(3), 10)], pn(4));
+            page[12..14].copy_from_slice(&u16::MAX.to_be_bytes());
 
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(root.get(), page);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
-        let entry = cursor.load_page(&cx, root).expect("page header loads");
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(root.get(), page);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            let entry = cursor
+                .load_page(&cx, root)
+                .await
+                .expect("page header loads");
 
-        let err = BtCursor::<MemPageStore>::binary_search_table_interior(&cx, &entry, 5)
-            .expect_err("out-of-range interior pointer must be corruption, not panic");
-        assert!(
-            matches!(&err, FrankenError::DatabaseCorrupt { detail } if detail.contains("points past page end")),
-            "unexpected error: {err:?}"
-        );
+            let err = BtCursor::<MemPageStore>::binary_search_table_interior(&cx, &entry, 5)
+                .expect_err("out-of-range interior pointer must be corruption, not panic");
+            assert!(
+                matches!(&err, FrankenError::DatabaseCorrupt { detail } if detail.contains("points past page end")),
+                "unexpected error: {err:?}"
+            );
+        });
     }
 
     #[test]
     fn test_transaction_page_io_reads_bytes_from_transaction_handle() {
-        let cx = Cx::new();
-        let pager = MockMvccPager;
-        let mut txn = pager
-            .begin(&cx, TransactionMode::Deferred)
-            .expect("mock transaction begin should succeed");
-        let page_no = PageNumber::new(42).expect("page number must be non-zero");
+        run_async(async {
+            let cx = Cx::new();
+            let pager = MockMvccPager;
+            let mut txn = pager
+                .begin(&cx, TransactionMode::Deferred)
+                .await
+                .expect("mock transaction begin should succeed");
+            let page_no = PageNumber::new(42).expect("page number must be non-zero");
 
-        let io = TransactionPageIo::new(&mut txn);
-        let bytes = io
-            .read_page(&cx, page_no)
-            .expect("read_page should forward to transaction handle");
+            let io = TransactionPageIo::new(&mut txn);
+            let bytes = io
+                .read_page(&cx, page_no)
+                .await
+                .expect("read_page should forward to transaction handle");
 
-        assert_eq!(
-            bytes.get(..4),
-            Some(&page_no.get().to_le_bytes()[..]),
-            "TransactionHandle::get_page stamps page number in first 4 bytes"
-        );
+            assert_eq!(
+                bytes.get(..4),
+                Some(&page_no.get().to_le_bytes()[..]),
+                "TransactionHandle::get_page stamps page number in first 4 bytes"
+            );
+        });
     }
 
     #[test]
     fn test_transaction_page_io_writes_owned_page_data_via_transaction_handle() {
-        let cx = Cx::new();
-        let pager = MemoryMockMvccPager;
-        let mut txn = pager
-            .begin(&cx, TransactionMode::Deferred)
-            .expect("mock transaction begin should succeed");
-        let page_no = PageNumber::new(2).expect("page number must be non-zero");
-        let expected = vec![0xAB; 32];
+        run_async(async {
+            let cx = Cx::new();
+            let pager = MemoryMockMvccPager;
+            let mut txn = pager
+                .begin(&cx, TransactionMode::Deferred)
+                .await
+                .expect("mock transaction begin should succeed");
+            let page_no = PageNumber::new(2).expect("page number must be non-zero");
+            let expected = vec![0xAB; 32];
 
-        let mut io = TransactionPageIo::new(&mut txn);
-        io.write_page_data(&cx, page_no, PageData::from_vec(expected.clone()))
-            .expect("write_page_data should forward");
+            let mut io = TransactionPageIo::new(&mut txn);
+            io.write_page_data(&cx, page_no, PageData::from_vec(expected.clone()))
+                .await
+                .expect("write_page_data should forward");
 
-        let bytes = io
-            .read_page(&cx, page_no)
-            .expect("read_page should return the owned bytes");
-        assert_eq!(
-            bytes.len(),
-            fsqlite_types::PageSize::default().as_usize(),
-            "owned-page writes should preserve the page-size invariant"
-        );
-        assert_eq!(&bytes[..expected.len()], expected.as_slice());
-        assert!(
-            bytes[expected.len()..].iter().all(|byte| *byte == 0),
-            "owned-page writes should zero-fill any unwritten tail bytes"
-        );
+            let bytes = io
+                .read_page(&cx, page_no)
+                .await
+                .expect("read_page should return the owned bytes");
+            assert_eq!(
+                bytes.len(),
+                fsqlite_types::PageSize::default().as_usize(),
+                "owned-page writes should preserve the page-size invariant"
+            );
+            assert_eq!(&bytes[..expected.len()], expected.as_slice());
+            assert!(
+                bytes[expected.len()..].iter().all(|byte| *byte == 0),
+                "owned-page writes should zero-fill any unwritten tail bytes"
+            );
+        });
     }
 
     #[test]
     fn test_mem_page_store_write_page_short_buffer_is_zero_filled_to_page_size() {
-        let cx = Cx::new();
-        let page_size = 128_u32;
-        let mut store = MemPageStore::new(page_size);
-        let page_no = PageNumber::new(2).expect("page number must be non-zero");
-        let expected = vec![0xCD; 32];
+        run_async(async {
+            let cx = Cx::new();
+            let page_size = 128_u32;
+            let mut store = MemPageStore::new(page_size);
+            let page_no = PageNumber::new(2).expect("page number must be non-zero");
+            let expected = vec![0xCD; 32];
 
-        store
-            .write_page(&cx, page_no, &expected)
-            .expect("write_page should normalize short buffers");
+            store
+                .write_page(&cx, page_no, &expected)
+                .await
+                .expect("write_page should normalize short buffers");
 
-        let bytes = store
-            .read_page(&cx, page_no)
-            .expect("read_page should return normalized page bytes");
-        assert_eq!(
-            bytes.len(),
-            page_size as usize,
-            "raw write_page should preserve the page-size invariant"
-        );
-        assert_eq!(&bytes[..expected.len()], expected.as_slice());
-        assert!(
-            bytes[expected.len()..].iter().all(|byte| *byte == 0),
-            "raw write_page should zero-fill any unwritten tail bytes"
-        );
+            let bytes = store
+                .read_page(&cx, page_no)
+                .await
+                .expect("read_page should return normalized page bytes");
+            assert_eq!(
+                bytes.len(),
+                page_size as usize,
+                "raw write_page should preserve the page-size invariant"
+            );
+            assert_eq!(&bytes[..expected.len()], expected.as_slice());
+            assert!(
+                bytes[expected.len()..].iter().all(|byte| *byte == 0),
+                "raw write_page should zero-fill any unwritten tail bytes"
+            );
+        });
     }
 
     #[test]
     fn test_transaction_page_io_allocates_pages_via_transaction_handle() {
-        let cx = Cx::new();
-        let pager = MockMvccPager;
-        let mut txn = pager
-            .begin(&cx, TransactionMode::Deferred)
-            .expect("mock transaction begin should succeed");
+        run_async(async {
+            let cx = Cx::new();
+            let pager = MockMvccPager;
+            let mut txn = pager
+                .begin(&cx, TransactionMode::Deferred)
+                .await
+                .expect("mock transaction begin should succeed");
 
-        let mut io = TransactionPageIo::new(&mut txn);
-        let first = io.allocate_page(&cx).expect("allocate_page should forward");
-        let second = io.allocate_page(&cx).expect("allocate_page should forward");
+            let mut io = TransactionPageIo::new(&mut txn);
+            let first = io
+                .allocate_page(&cx)
+                .await
+                .expect("allocate_page should forward");
+            let second = io
+                .allocate_page(&cx)
+                .await
+                .expect("allocate_page should forward");
 
-        assert_eq!(first.get(), 2, "mock allocator starts at page 2");
-        assert_eq!(second.get(), 3, "mock allocator increments page numbers");
+            assert_eq!(first.get(), 2, "mock allocator starts at page 2");
+            assert_eq!(second.get(), 3, "mock allocator increments page numbers");
+        });
     }
 
     #[test]
     fn test_transaction_page_io_writes_and_frees_via_transaction_handle() {
-        let cx = Cx::new();
-        let pager = MockMvccPager;
-        let mut txn = pager
-            .begin(&cx, TransactionMode::Deferred)
-            .expect("mock transaction begin should succeed");
-        let page_no = PageNumber::new(2).expect("page number must be non-zero");
+        run_async(async {
+            let cx = Cx::new();
+            let pager = MockMvccPager;
+            let mut txn = pager
+                .begin(&cx, TransactionMode::Deferred)
+                .await
+                .expect("mock transaction begin should succeed");
+            let page_no = PageNumber::new(2).expect("page number must be non-zero");
 
-        let mut io = TransactionPageIo::new(&mut txn);
-        io.write_page(&cx, page_no, &[0_u8; 32])
-            .expect("write_page should forward");
-        io.free_page(&cx, page_no)
-            .expect("free_page should forward");
+            let mut io = TransactionPageIo::new(&mut txn);
+            io.write_page(&cx, page_no, &[0_u8; 32])
+                .await
+                .expect("write_page should forward");
+            io.free_page(&cx, page_no)
+                .await
+                .expect("free_page should forward");
+        });
     }
 
     /// Helper: build an interior table page.
@@ -12818,11 +13362,12 @@ mod tests {
         payload
     }
 
-    fn build_prefetch_descent_probe_store() -> PrefetchProbeStore {
+    async fn build_prefetch_descent_probe_store() -> PrefetchProbeStore {
         let cx = Cx::new();
         let mut store = MemPageStore::new(USABLE);
         store
             .write_page(&cx, pn(2), &build_interior_table(&[(pn(3), 15)], pn(4)))
+            .await
             .unwrap();
         store
             .write_page(
@@ -12830,9 +13375,11 @@ mod tests {
                 pn(3),
                 &build_interior_table(&[(pn(5), 3), (pn(6), 8)], pn(7)),
             )
+            .await
             .unwrap();
         store
             .write_page(&cx, pn(4), &build_interior_table(&[(pn(8), 25)], pn(9)))
+            .await
             .unwrap();
         store
             .write_page(
@@ -12840,6 +13387,7 @@ mod tests {
                 pn(5),
                 &build_leaf_table(&[(1, b"a"), (2, b"b"), (3, b"c")]),
             )
+            .await
             .unwrap();
         store
             .write_page(
@@ -12847,6 +13395,7 @@ mod tests {
                 pn(6),
                 &build_leaf_table(&[(4, b"d"), (5, b"e"), (8, b"f")]),
             )
+            .await
             .unwrap();
         store
             .write_page(
@@ -12854,6 +13403,7 @@ mod tests {
                 pn(7),
                 &build_leaf_table(&[(9, b"g"), (10, b"h"), (15, b"i")]),
             )
+            .await
             .unwrap();
         store
             .write_page(
@@ -12861,6 +13411,7 @@ mod tests {
                 pn(8),
                 &build_leaf_table(&[(16, b"j"), (20, b"k"), (24, b"l")]),
             )
+            .await
             .unwrap();
         store
             .write_page(
@@ -12868,6 +13419,7 @@ mod tests {
                 pn(9),
                 &build_leaf_table(&[(26, b"m"), (30, b"n"), (40, b"o")]),
             )
+            .await
             .unwrap();
         PrefetchProbeStore::new(store)
     }
@@ -12906,1109 +13458,1245 @@ mod tests {
 
     #[test]
     fn test_cursor_first_last_single_leaf() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[(1, b"alice"), (5, b"bob"), (10, b"charlie")]),
-        );
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_leaf_table(&[(1, b"alice"), (5, b"bob"), (10, b"charlie")]),
+            );
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        assert!(cursor.first(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
-        assert_eq!(cursor.payload(&cx).unwrap(), b"alice");
+            assert!(cursor.first(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 1);
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"alice");
 
-        assert!(cursor.last(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 10);
-        assert_eq!(cursor.payload(&cx).unwrap(), b"charlie");
+            assert!(cursor.last(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 10);
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"charlie");
+        });
     }
 
     #[test]
     fn test_cursor_first_observes_cancelled_context_before_descent() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_leaf_table(&[(1, b"alice"), (5, b"bob")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_leaf_table(&[(1, b"alice"), (5, b"bob")]));
 
-        let cx = Cx::new();
-        cx.cancel();
+            let cx = Cx::new();
+            cx.cancel();
 
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        let err = cursor
-            .first(&cx)
-            .expect_err("cancelled context should abort before leaf descent");
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let err = cursor
+                .first(&cx)
+                .await
+                .expect_err("cancelled context should abort before leaf descent");
 
-        assert!(matches!(err, FrankenError::Abort));
+            assert!(matches!(err, FrankenError::Abort));
+        });
     }
 
     #[test]
     fn test_table_seek_observes_cancellation_during_leaf_binary_search() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[(1, b"alpha"), (5, b"bravo"), (9, b"charlie")]),
-        );
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_leaf_table(&[(1, b"alpha"), (5, b"bravo"), (9, b"charlie")]),
+            );
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(CancelAfterReadStore::new(store), pn(2), USABLE, true);
-        let err = cursor
-            .table_move_to(&cx, 5)
-            .expect_err("binary search should observe cancellation after page load");
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(CancelAfterReadStore::new(store), pn(2), USABLE, true);
+            let err = cursor
+                .table_move_to(&cx, 5)
+                .await
+                .expect_err("binary search should observe cancellation after page load");
 
-        assert!(matches!(err, FrankenError::Abort));
+            assert!(matches!(err, FrankenError::Abort));
+        });
     }
 
     #[test]
     fn test_index_seek_observes_cancellation_during_leaf_binary_search() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_leaf_index(&[b"alpha", b"bravo", b"charlie"]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_leaf_index(&[b"alpha", b"bravo", b"charlie"]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(CancelAfterReadStore::new(store), pn(2), USABLE, false);
-        let err = cursor
-            .index_move_to(&cx, b"bravo")
-            .expect_err("index binary search should observe cancellation after page load");
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(CancelAfterReadStore::new(store), pn(2), USABLE, false);
+            let err = cursor
+                .index_move_to(&cx, b"bravo")
+                .await
+                .expect_err("index binary search should observe cancellation after page load");
 
-        assert!(matches!(err, FrankenError::Abort));
+            assert!(matches!(err, FrankenError::Abort));
+        });
     }
 
     #[test]
     fn test_cursor_seek_exact() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten"), (15, b"fifteen")]),
-        );
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten"), (15, b"fifteen")]),
+            );
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        assert!(cursor.table_move_to(&cx, 5).unwrap().is_found());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 5);
-        assert_eq!(cursor.payload(&cx).unwrap(), b"five");
+            assert!(cursor.table_move_to(&cx, 5).await.unwrap().is_found());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 5);
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"five");
+        });
     }
 
     #[test]
     fn test_cursor_seek_not_found() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten")]),
-        );
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten")]),
+            );
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        // Seek for 3 — should land on 5 (next in sort order).
-        let result = cursor.table_move_to(&cx, 3).unwrap();
-        assert!(!result.is_found());
-        assert!(!cursor.eof());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 5);
+            // Seek for 3 — should land on 5 (next in sort order).
+            let result = cursor.table_move_to(&cx, 3).await.unwrap();
+            assert!(!result.is_found());
+            assert!(!cursor.eof());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 5);
 
-        // Seek for 20 — past the end.
-        let result = cursor.table_move_to(&cx, 20).unwrap();
-        assert!(!result.is_found());
-        assert!(cursor.eof());
+            // Seek for 20 — past the end.
+            let result = cursor.table_move_to(&cx, 20).await.unwrap();
+            assert!(!result.is_found());
+            assert!(cursor.eof());
+        });
     }
 
     #[test]
     fn test_table_seek_cache_uses_four_slot_lru() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_interior_table(&[(pn(3), 20), (pn(4), 40), (pn(5), 60), (pn(6), 80)], pn(7)),
-        );
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(10, b"a"), (20, b"b")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(30, b"c"), (40, b"d")]));
-        store
-            .pages
-            .insert(5, build_leaf_table(&[(50, b"e"), (60, b"f")]));
-        store
-            .pages
-            .insert(6, build_leaf_table(&[(70, b"g"), (80, b"h")]));
-        store
-            .pages
-            .insert(7, build_leaf_table(&[(90, b"i"), (100, b"j")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_interior_table(&[(pn(3), 20), (pn(4), 40), (pn(5), 60), (pn(6), 80)], pn(7)),
+            );
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(10, b"a"), (20, b"b")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(30, b"c"), (40, b"d")]));
+            store
+                .pages
+                .insert(5, build_leaf_table(&[(50, b"e"), (60, b"f")]));
+            store
+                .pages
+                .insert(6, build_leaf_table(&[(70, b"g"), (80, b"h")]));
+            store
+                .pages
+                .insert(7, build_leaf_table(&[(90, b"i"), (100, b"j")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, true);
 
-        for rowid in [10_i64, 30, 50, 70] {
-            assert!(cursor.table_move_to(&cx, rowid).unwrap().is_found());
-        }
+            for rowid in [10_i64, 30, 50, 70] {
+                assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
+            }
 
-        let cache_pages: Vec<PageNumber> = cursor
-            .seek_cache
-            .iter()
-            .flatten()
-            .map(|entry| entry.page_no)
-            .collect();
-        assert_eq!(cache_pages, vec![pn(6), pn(5), pn(4), pn(3)]);
+            let cache_pages: Vec<PageNumber> = cursor
+                .seek_cache
+                .iter()
+                .flatten()
+                .map(|entry| entry.page_no)
+                .collect();
+            assert_eq!(cache_pages, vec![pn(6), pn(5), pn(4), pn(3)]);
 
-        cursor.pager.clear_reads();
-        let result = cursor.table_move_to(&cx, 15).unwrap();
-        assert!(!result.is_found());
-        assert_eq!(cursor.pager.read_pages(), vec![pn(3)]);
-        let cache_pages: Vec<PageNumber> = cursor
-            .seek_cache
-            .iter()
-            .flatten()
-            .map(|entry| entry.page_no)
-            .collect();
-        assert_eq!(cache_pages, vec![pn(3), pn(6), pn(5), pn(4)]);
+            cursor.pager.clear_reads();
+            let result = cursor.table_move_to(&cx, 15).await.unwrap();
+            assert!(!result.is_found());
+            assert_eq!(cursor.pager.read_pages(), vec![pn(3)]);
+            let cache_pages: Vec<PageNumber> = cursor
+                .seek_cache
+                .iter()
+                .flatten()
+                .map(|entry| entry.page_no)
+                .collect();
+            assert_eq!(cache_pages, vec![pn(3), pn(6), pn(5), pn(4)]);
 
-        cursor.pager.clear_reads();
-        assert!(cursor.table_move_to(&cx, 90).unwrap().is_found());
-        assert_eq!(
-            cursor.pager.read_pages(),
-            vec![pn(6), pn(5), pn(4), pn(2), pn(7)]
-        );
-        let cache_pages: Vec<PageNumber> = cursor
-            .seek_cache
-            .iter()
-            .flatten()
-            .map(|entry| entry.page_no)
-            .collect();
-        assert_eq!(cache_pages, vec![pn(7), pn(3), pn(6), pn(5)]);
+            cursor.pager.clear_reads();
+            assert!(cursor.table_move_to(&cx, 90).await.unwrap().is_found());
+            assert_eq!(
+                cursor.pager.read_pages(),
+                vec![pn(6), pn(5), pn(4), pn(2), pn(7)]
+            );
+            let cache_pages: Vec<PageNumber> = cursor
+                .seek_cache
+                .iter()
+                .flatten()
+                .map(|entry| entry.page_no)
+                .collect();
+            assert_eq!(cache_pages, vec![pn(7), pn(3), pn(6), pn(5)]);
 
-        cursor.pager.clear_reads();
-        let result = cursor.table_move_to(&cx, 35).unwrap();
-        assert!(!result.is_found());
-        assert_eq!(cursor.pager.read_pages(), vec![pn(3), pn(2), pn(4)]);
-        let cache_pages: Vec<PageNumber> = cursor
-            .seek_cache
-            .iter()
-            .flatten()
-            .map(|entry| entry.page_no)
-            .collect();
-        assert_eq!(cache_pages, vec![pn(4), pn(7), pn(3), pn(6)]);
+            cursor.pager.clear_reads();
+            let result = cursor.table_move_to(&cx, 35).await.unwrap();
+            assert!(!result.is_found());
+            assert_eq!(cursor.pager.read_pages(), vec![pn(3), pn(2), pn(4)]);
+            let cache_pages: Vec<PageNumber> = cursor
+                .seek_cache
+                .iter()
+                .flatten()
+                .map(|entry| entry.page_no)
+                .collect();
+            assert_eq!(cache_pages, vec![pn(4), pn(7), pn(3), pn(6)]);
 
-        cursor.pager.clear_reads();
-        let result = cursor.table_move_to(&cx, 12).unwrap();
-        assert!(!result.is_found());
-        assert_eq!(cursor.pager.read_pages(), vec![pn(3)]);
+            cursor.pager.clear_reads();
+            let result = cursor.table_move_to(&cx, 12).await.unwrap();
+            assert!(!result.is_found());
+            assert_eq!(cursor.pager.read_pages(), vec![pn(3)]);
+        });
     }
 
     #[test]
     fn test_table_seek_cache_hot_set_avoids_root_descent() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_interior_table(&[(pn(3), 20), (pn(4), 40), (pn(5), 60), (pn(6), 80)], pn(7)),
-        );
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(10, b"a"), (20, b"b")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(30, b"c"), (40, b"d")]));
-        store
-            .pages
-            .insert(5, build_leaf_table(&[(50, b"e"), (60, b"f")]));
-        store
-            .pages
-            .insert(6, build_leaf_table(&[(70, b"g"), (80, b"h")]));
-        store
-            .pages
-            .insert(7, build_leaf_table(&[(90, b"i"), (100, b"j")]));
-
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, true);
-
-        for rowid in [10_i64, 30, 50, 70] {
-            assert!(cursor.table_move_to(&cx, rowid).unwrap().is_found());
-        }
-
-        for (target, expected_leaf) in [(15_i64, pn(3)), (35, pn(4)), (55, pn(5)), (75, pn(6))] {
-            cursor.pager.clear_reads();
-            let result = cursor.table_move_to(&cx, target).unwrap();
-            assert!(!result.is_found());
-            let read_pages = cursor.pager.read_pages();
-            assert_eq!(
-                read_pages.last().copied(),
-                Some(expected_leaf),
-                "cached seek should still land on the expected leaf for target {target}"
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_interior_table(&[(pn(3), 20), (pn(4), 40), (pn(5), 60), (pn(6), 80)], pn(7)),
             );
-            assert!(
-                read_pages.iter().all(|page_no| *page_no != pn(2)),
-                "four-page hot set should satisfy target {target} without revisiting the root: {read_pages:?}"
-            );
-        }
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(10, b"a"), (20, b"b")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(30, b"c"), (40, b"d")]));
+            store
+                .pages
+                .insert(5, build_leaf_table(&[(50, b"e"), (60, b"f")]));
+            store
+                .pages
+                .insert(6, build_leaf_table(&[(70, b"g"), (80, b"h")]));
+            store
+                .pages
+                .insert(7, build_leaf_table(&[(90, b"i"), (100, b"j")]));
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, true);
+
+            for rowid in [10_i64, 30, 50, 70] {
+                assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
+            }
+
+            for (target, expected_leaf) in [(15_i64, pn(3)), (35, pn(4)), (55, pn(5)), (75, pn(6))]
+            {
+                cursor.pager.clear_reads();
+                let result = cursor.table_move_to(&cx, target).await.unwrap();
+                assert!(!result.is_found());
+                let read_pages = cursor.pager.read_pages();
+                assert_eq!(
+                    read_pages.last().copied(),
+                    Some(expected_leaf),
+                    "cached seek should still land on the expected leaf for target {target}"
+                );
+                assert!(
+                    read_pages.iter().all(|page_no| *page_no != pn(2)),
+                    "four-page hot set should satisfy target {target} without revisiting the root: {read_pages:?}"
+                );
+            }
+        });
     }
 
     #[test]
     fn test_table_leaf_interpolation_search_matches_binary_on_sparse_rowids() {
-        let cx = Cx::new();
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[
-                (-4_000, b"a"),
-                (-17, b"b"),
-                (0, b"c"),
-                (275, b"d"),
-                (50_000, b"e"),
-            ]),
-        );
-
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        let entry = cursor.load_page(&cx, pn(2)).unwrap();
-
-        for target in [
-            -9_999, -4_000, -18, -17, -16, 1, 274, 275, 276, 50_000, 99_999,
-        ] {
-            let interpolation =
-                BtCursor::<MemPageStore>::search_integer_key_table_leaf(&cx, &entry, target)
-                    .unwrap();
-            let binary =
-                BtCursor::<MemPageStore>::binary_search_table_leaf(&cx, &entry, target).unwrap();
-            assert_eq!(
-                interpolation, binary,
-                "interpolation search must match binary search for target {target}"
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_leaf_table(&[
+                    (-4_000, b"a"),
+                    (-17, b"b"),
+                    (0, b"c"),
+                    (275, b"d"),
+                    (50_000, b"e"),
+                ]),
             );
-        }
+
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let entry = cursor.load_page(&cx, pn(2)).await.unwrap();
+
+            for target in [
+                -9_999, -4_000, -18, -17, -16, 1, 274, 275, 276, 50_000, 99_999,
+            ] {
+                let interpolation =
+                    BtCursor::<MemPageStore>::search_integer_key_table_leaf(&cx, &entry, target)
+                        .unwrap();
+                let binary =
+                    BtCursor::<MemPageStore>::binary_search_table_leaf(&cx, &entry, target)
+                        .unwrap();
+                assert_eq!(
+                    interpolation, binary,
+                    "interpolation search must match binary search for target {target}"
+                );
+            }
+        });
     }
 
     #[test]
     fn test_table_leaf_interpolation_search_matches_binary_on_sequential_rowids() {
-        let cx = Cx::new();
-        let rowids: Vec<i64> = (1_i64..=128).collect();
-        let payloads: Vec<Vec<u8>> = rowids
-            .iter()
-            .map(|rowid| rowid.to_le_bytes().to_vec())
-            .collect();
-        let entries: Vec<(i64, &[u8])> = rowids
-            .iter()
-            .zip(payloads.iter())
-            .map(|(rowid, payload)| (*rowid, payload.as_slice()))
-            .collect();
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&entries));
+        run_async(async {
+            let cx = Cx::new();
+            let rowids: Vec<i64> = (1_i64..=128).collect();
+            let payloads: Vec<Vec<u8>> = rowids
+                .iter()
+                .map(|rowid| rowid.to_le_bytes().to_vec())
+                .collect();
+            let entries: Vec<(i64, &[u8])> = rowids
+                .iter()
+                .zip(payloads.iter())
+                .map(|(rowid, payload)| (*rowid, payload.as_slice()))
+                .collect();
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&entries));
 
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        let entry = cursor.load_page(&cx, pn(2)).unwrap();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let entry = cursor.load_page(&cx, pn(2)).await.unwrap();
 
-        for target in [0_i64, 1, 2, 31, 64, 65, 127, 128, 129] {
-            let interpolation =
-                BtCursor::<MemPageStore>::search_integer_key_table_leaf(&cx, &entry, target)
-                    .unwrap();
-            let binary =
-                BtCursor::<MemPageStore>::binary_search_table_leaf(&cx, &entry, target).unwrap();
-            assert_eq!(
-                interpolation, binary,
-                "interpolation search must match binary search for sequential target {target}"
-            );
-        }
+            for target in [0_i64, 1, 2, 31, 64, 65, 127, 128, 129] {
+                let interpolation =
+                    BtCursor::<MemPageStore>::search_integer_key_table_leaf(&cx, &entry, target)
+                        .unwrap();
+                let binary =
+                    BtCursor::<MemPageStore>::binary_search_table_leaf(&cx, &entry, target)
+                        .unwrap();
+                assert_eq!(
+                    interpolation, binary,
+                    "interpolation search must match binary search for sequential target {target}"
+                );
+            }
+        });
     }
 
     #[test]
     fn test_index_seek_text_keys_falls_back_to_binary_search_successor_positioning() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_index(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_index(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
 
-        for (text, rowid) in [("alpha", 1_i64), ("charlie", 3_i64), ("echo", 5_i64)] {
-            let key =
-                serialize_record(&[SqliteValue::Text(text.into()), SqliteValue::Integer(rowid)]);
-            cursor.index_insert(&cx, &key).unwrap();
-        }
+            for (text, rowid) in [("alpha", 1_i64), ("charlie", 3_i64), ("echo", 5_i64)] {
+                let key = serialize_record(&[
+                    SqliteValue::Text(text.into()),
+                    SqliteValue::Integer(rowid),
+                ]);
+                cursor.index_insert(&cx, &key).await.unwrap();
+            }
 
-        let between_probe = serialize_record(&[
-            SqliteValue::Text("bravo".into()),
-            SqliteValue::Integer(i64::MIN),
-        ]);
-        let between_seek = cursor.index_move_to(&cx, &between_probe).unwrap();
-        assert!(
-            !between_seek.is_found(),
-            "missing text probe should fall back to successor positioning on index pages"
-        );
-        assert!(
-            !cursor.eof(),
-            "a text probe between existing keys should land on the successor entry"
-        );
-        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
-        let successor_fields = parse_record(&cursor.payload(&cx).unwrap()).unwrap();
-        assert_eq!(
-            successor_fields,
-            vec![SqliteValue::Text("charlie".into()), SqliteValue::Integer(3),],
-            "text-key seek should preserve binary-search successor semantics on index pages"
-        );
+            let between_probe = serialize_record(&[
+                SqliteValue::Text("bravo".into()),
+                SqliteValue::Integer(i64::MIN),
+            ]);
+            let between_seek = cursor.index_move_to(&cx, &between_probe).await.unwrap();
+            assert!(
+                !between_seek.is_found(),
+                "missing text probe should fall back to successor positioning on index pages"
+            );
+            assert!(
+                !cursor.eof(),
+                "a text probe between existing keys should land on the successor entry"
+            );
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 3);
+            let successor_fields = parse_record(&cursor.payload(&cx).await.unwrap()).unwrap();
+            assert_eq!(
+                successor_fields,
+                vec![SqliteValue::Text("charlie".into()), SqliteValue::Integer(3),],
+                "text-key seek should preserve binary-search successor semantics on index pages"
+            );
 
-        let tail_probe = serialize_record(&[
-            SqliteValue::Text("zulu".into()),
-            SqliteValue::Integer(i64::MIN),
-        ]);
-        let tail_seek = cursor.index_move_to(&cx, &tail_probe).unwrap();
-        assert!(
-            !tail_seek.is_found(),
-            "tail text probe should not report a false-positive exact hit"
-        );
-        assert!(
-            cursor.eof(),
-            "text probe beyond the last key should still fall off the right edge"
-        );
+            let tail_probe = serialize_record(&[
+                SqliteValue::Text("zulu".into()),
+                SqliteValue::Integer(i64::MIN),
+            ]);
+            let tail_seek = cursor.index_move_to(&cx, &tail_probe).await.unwrap();
+            assert!(
+                !tail_seek.is_found(),
+                "tail text probe should not report a false-positive exact hit"
+            );
+            assert!(
+                cursor.eof(),
+                "text probe beyond the last key should still fall off the right edge"
+            );
+        });
     }
 
     #[test]
     fn test_cursor_seek_observes_cancellation_during_leaf_binary_search() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten"), (15, b"fifteen")]),
-        );
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten"), (15, b"fifteen")]),
+            );
 
-        let cancelled_cx = Cx::new();
-        let mut cursor = BtCursor::new(CancelAfterReadStore::new(store), pn(2), USABLE, true);
-        let err = cursor
-            .table_move_to(&cancelled_cx, 10)
-            .expect_err("cancellation should interrupt the in-node search loop");
-        assert!(matches!(err, FrankenError::Abort));
+            let cancelled_cx = Cx::new();
+            let mut cursor = BtCursor::new(CancelAfterReadStore::new(store), pn(2), USABLE, true);
+            let err = cursor
+                .table_move_to(&cancelled_cx, 10)
+                .await
+                .expect_err("cancellation should interrupt the in-node search loop");
+            assert!(matches!(err, FrankenError::Abort));
 
-        let recovery_cx = Cx::new();
-        assert!(cursor.table_move_to(&recovery_cx, 10).unwrap().is_found());
-        assert_eq!(cursor.rowid(&recovery_cx).unwrap(), 10);
+            let recovery_cx = Cx::new();
+            assert!(
+                cursor
+                    .table_move_to(&recovery_cx, 10)
+                    .await
+                    .unwrap()
+                    .is_found()
+            );
+            assert_eq!(cursor.rowid(&recovery_cx).await.unwrap(), 10);
+        });
     }
 
     #[test]
     fn test_cursor_first_observes_cancellation_during_descent_and_recovers() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 10)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"one"), (5, b"five")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(10, b"ten"), (15, b"fifteen")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 10)], pn(4)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"one"), (5, b"five")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(10, b"ten"), (15, b"fifteen")]));
 
-        let cancelled_cx = Cx::new();
-        let mut cursor = BtCursor::new(CancelAfterReadStore::new(store), pn(2), USABLE, true);
-        let err = cursor
-            .first(&cancelled_cx)
-            .expect_err("cancellation should interrupt multi-page descent");
-        assert!(matches!(err, FrankenError::Abort));
+            let cancelled_cx = Cx::new();
+            let mut cursor = BtCursor::new(CancelAfterReadStore::new(store), pn(2), USABLE, true);
+            let err = cursor
+                .first(&cancelled_cx)
+                .await
+                .expect_err("cancellation should interrupt multi-page descent");
+            assert!(matches!(err, FrankenError::Abort));
 
-        let recovery_cx = Cx::new();
-        assert!(cursor.first(&recovery_cx).unwrap());
-        assert_eq!(cursor.rowid(&recovery_cx).unwrap(), 1);
+            let recovery_cx = Cx::new();
+            assert!(cursor.first(&recovery_cx).await.unwrap());
+            assert_eq!(cursor.rowid(&recovery_cx).await.unwrap(), 1);
+        });
     }
 
     #[test]
     fn test_cursor_table_insert_single_leaf() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[(1, b"one"), (3, b"three"), (5, b"five"), (7, b"seven")]),
-        );
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_leaf_table(&[(1, b"one"), (3, b"three"), (5, b"five"), (7, b"seven")]),
+            );
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        cursor.table_insert(&cx, 2, b"two").unwrap();
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            cursor.table_insert(&cx, 2, b"two").await.unwrap();
 
-        assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), b"two");
+            assert!(cursor.table_move_to(&cx, 2).await.unwrap().is_found());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"two");
 
-        assert!(cursor.first(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 5);
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 7);
-        assert!(!cursor.next(&cx).unwrap());
+            assert!(cursor.first(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 1);
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 2);
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 3);
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 5);
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 7);
+            assert!(!cursor.next(&cx).await.unwrap());
+        });
     }
 
     #[test]
     fn test_cursor_table_insert_duplicate_rowid() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[(7, b"seven")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[(7, b"seven")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        let err = cursor.table_insert(&cx, 7, b"dupe").unwrap_err();
-        assert!(matches!(err, FrankenError::PrimaryKeyViolation));
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let err = cursor.table_insert(&cx, 7, b"dupe").await.unwrap_err();
+            assert!(matches!(err, FrankenError::PrimaryKeyViolation));
+        });
     }
 
     #[test]
     fn test_balance_choke_points_reject_nonroot_single_entry_paths() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 10)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"one"), (10, b"ten")]));
-        store.pages.insert(4, build_leaf_table(&[(20, b"twenty")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 10)], pn(4)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"one"), (10, b"ten")]));
+            store.pages.insert(4, build_leaf_table(&[(20, b"twenty")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        let root_before = cursor.pager.pages[&2].clone();
-        let leaf_before = cursor.pager.pages[&3].clone();
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let root_before = cursor.pager.pages[&2].clone();
+            let leaf_before = cursor.pager.pages[&3].clone();
 
-        // Model a read fast path that retained only its landing leaf. Neither
-        // balance entry point may reinterpret this non-root page as the root.
-        let mut rootless_leaf = cursor.load_page(&cx, pn(3)).unwrap();
-        rootless_leaf.cell_idx = 0;
-        cursor.stack.push(rootless_leaf);
+            // Model a read fast path that retained only its landing leaf. Neither
+            // balance entry point may reinterpret this non-root page as the root.
+            let mut rootless_leaf = cursor.load_page(&cx, pn(3)).await.unwrap();
+            rootless_leaf.cell_idx = 0;
+            cursor.stack.push(rootless_leaf);
 
-        let insert_error = cursor
-            .balance_for_insert(&cx, b"unused", 0)
-            .expect_err("insert balance must fail closed on a rootless path");
-        assert!(
-            matches!(
-                &insert_error,
-                FrankenError::DatabaseCorrupt { detail }
-                    if detail.contains("insert balance cursor path starts at page 3 instead of root 2")
-            ),
-            "unexpected insert-balance error: {insert_error:?}"
-        );
+            let insert_error = cursor
+                .balance_for_insert(&cx, b"unused", 0)
+                .await
+                .expect_err("insert balance must fail closed on a rootless path");
+            assert!(
+                matches!(
+                    &insert_error,
+                    FrankenError::DatabaseCorrupt { detail }
+                        if detail.contains("insert balance cursor path starts at page 3 instead of root 2")
+                ),
+                "unexpected insert-balance error: {insert_error:?}"
+            );
 
-        let delete_error = cursor
-            .balance_for_delete(&cx)
-            .expect_err("delete balance must fail closed on a rootless path");
-        assert!(
-            matches!(
-                &delete_error,
-                FrankenError::DatabaseCorrupt { detail }
-                    if detail.contains("delete balance cursor path starts at page 3 instead of root 2")
-            ),
-            "unexpected delete-balance error: {delete_error:?}"
-        );
+            let delete_error = cursor
+                .balance_for_delete(&cx)
+                .await
+                .expect_err("delete balance must fail closed on a rootless path");
+            assert!(
+                matches!(
+                    &delete_error,
+                    FrankenError::DatabaseCorrupt { detail }
+                        if detail.contains("delete balance cursor path starts at page 3 instead of root 2")
+                ),
+                "unexpected delete-balance error: {delete_error:?}"
+            );
 
-        assert_eq!(&cursor.pager.pages[&2], &root_before);
-        assert_eq!(&cursor.pager.pages[&3], &leaf_before);
+            assert_eq!(&cursor.pager.pages[&2], &root_before);
+            assert_eq!(&cursor.pager.pages[&3], &leaf_before);
+        });
     }
 
     #[test]
     fn test_ensure_full_mutation_path_rebuilds_from_declared_root() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 10)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"one"), (10, b"ten")]));
-        store.pages.insert(4, build_leaf_table(&[(20, b"twenty")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 10)], pn(4)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"one"), (10, b"ten")]));
+            store.pages.insert(4, build_leaf_table(&[(20, b"twenty")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        let mut rootless_leaf = cursor.load_page(&cx, pn(3)).unwrap();
-        rootless_leaf.cell_idx = 0;
-        cursor.stack.push(rootless_leaf);
-        cursor.at_eof = false;
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let mut rootless_leaf = cursor.load_page(&cx, pn(3)).await.unwrap();
+            rootless_leaf.cell_idx = 0;
+            cursor.stack.push(rootless_leaf);
+            cursor.at_eof = false;
 
-        let result = cursor
-            .ensure_full_mutation_path(&cx, MutationPathTarget::ExactTableRowid(1))
-            .expect("rootless read position should be recoverable")
-            .expect("rootless position should trigger a re-seek");
-        assert!(result.is_found());
-        assert_eq!(cursor.stack.len(), 2);
-        assert_eq!(cursor.stack[0].page_no, pn(2));
-        assert_eq!(cursor.stack[1].page_no, pn(3));
+            let result = cursor
+                .ensure_full_mutation_path(&cx, MutationPathTarget::ExactTableRowid(1))
+                .await
+                .expect("rootless read position should be recoverable")
+                .expect("rootless position should trigger a re-seek");
+            assert!(result.is_found());
+            assert_eq!(cursor.stack.len(), 2);
+            assert_eq!(cursor.stack[0].page_no, pn(2));
+            assert_eq!(cursor.stack[1].page_no, pn(3));
+        });
     }
 
     #[test]
     fn test_cursor_index_insert_single_leaf() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_leaf_index(&[b"apple", b"carrot", b"pear"]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_leaf_index(&[b"apple", b"carrot", b"pear"]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, false);
-        cursor.index_insert(&cx, b"banana").unwrap();
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, false);
+            cursor.index_insert(&cx, b"banana").await.unwrap();
 
-        assert!(cursor.index_move_to(&cx, b"banana").unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), b"banana");
+            assert!(
+                cursor
+                    .index_move_to(&cx, b"banana")
+                    .await
+                    .unwrap()
+                    .is_found()
+            );
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"banana");
+        });
     }
 
     #[test]
     fn test_cursor_index_insert_before_cached_leaf_slot_preserves_order() {
-        let root = pn(2);
-        let store = MemPageStore::with_empty_index(root, 512);
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, root, 512, false);
+        run_async(async {
+            let root = pn(2);
+            let store = MemPageStore::with_empty_index(root, 512);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, root, 512, false);
 
-        let high_key = synthetic_index_key(791);
-        let low_key = synthetic_index_key(357);
+            let high_key = synthetic_index_key(791);
+            let low_key = synthetic_index_key(357);
 
-        cursor.index_insert(&cx, &high_key).unwrap();
-        cursor.index_insert(&cx, &low_key).unwrap();
+            cursor.index_insert(&cx, &high_key).await.unwrap();
+            cursor.index_insert(&cx, &low_key).await.unwrap();
 
-        validate_index_tree_invariants(&mut cursor, root).unwrap();
-        assert_eq!(
-            scan_all_index_keys(&mut cursor, &cx).unwrap(),
-            vec![low_key, high_key]
-        );
+            validate_index_tree_invariants(&mut cursor, root)
+                .await
+                .unwrap();
+            assert_eq!(
+                scan_all_index_keys(&mut cursor, &cx).await.unwrap(),
+                vec![low_key, high_key]
+            );
+        });
     }
 
     #[test]
     fn test_index_insert_prechecked_absent_reuses_successor_position() {
-        let store = MemPageStore::with_empty_index(pn(2), USABLE);
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+        run_async(async {
+            let store = MemPageStore::with_empty_index(pn(2), USABLE);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
 
-        let low_key = serialize_record(&[SqliteValue::Integer(10), SqliteValue::Integer(1)]);
-        let mid_key = serialize_record(&[SqliteValue::Integer(20), SqliteValue::Integer(2)]);
-        let high_key = serialize_record(&[SqliteValue::Integer(30), SqliteValue::Integer(3)]);
+            let low_key = serialize_record(&[SqliteValue::Integer(10), SqliteValue::Integer(1)]);
+            let mid_key = serialize_record(&[SqliteValue::Integer(20), SqliteValue::Integer(2)]);
+            let high_key = serialize_record(&[SqliteValue::Integer(30), SqliteValue::Integer(3)]);
 
-        cursor.index_insert(&cx, &low_key).unwrap();
-        cursor.index_insert(&cx, &high_key).unwrap();
+            cursor.index_insert(&cx, &low_key).await.unwrap();
+            cursor.index_insert(&cx, &high_key).await.unwrap();
 
-        let seek = cursor.index_move_to(&cx, &mid_key).unwrap();
-        assert_eq!(seek, SeekResult::NotFound);
-        assert!(!cursor.eof(), "seek should land on successor key");
+            let seek = cursor.index_move_to(&cx, &mid_key).await.unwrap();
+            assert_eq!(seek, SeekResult::NotFound);
+            assert!(!cursor.eof(), "seek should land on successor key");
 
-        cursor
-            .index_insert_prechecked_absent(&cx, &mid_key)
-            .unwrap();
+            cursor
+                .index_insert_prechecked_absent(&cx, &mid_key)
+                .await
+                .unwrap();
 
-        assert!(cursor.first(&cx).unwrap());
-        assert_eq!(
-            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
-            vec![SqliteValue::Integer(10), SqliteValue::Integer(1)]
-        );
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(
-            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
-            vec![SqliteValue::Integer(20), SqliteValue::Integer(2)]
-        );
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(
-            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
-            vec![SqliteValue::Integer(30), SqliteValue::Integer(3)]
-        );
+            assert!(cursor.first(&cx).await.unwrap());
+            assert_eq!(
+                parse_record(&cursor.payload(&cx).await.unwrap()).unwrap(),
+                vec![SqliteValue::Integer(10), SqliteValue::Integer(1)]
+            );
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(
+                parse_record(&cursor.payload(&cx).await.unwrap()).unwrap(),
+                vec![SqliteValue::Integer(20), SqliteValue::Integer(2)]
+            );
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(
+                parse_record(&cursor.payload(&cx).await.unwrap()).unwrap(),
+                vec![SqliteValue::Integer(30), SqliteValue::Integer(3)]
+            );
+        });
     }
 
     #[test]
     fn test_index_insert_unique_no_conflict_inserts_between_adjacent_prefixes() {
-        let store = MemPageStore::with_empty_index(pn(2), USABLE);
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+        run_async(async {
+            let store = MemPageStore::with_empty_index(pn(2), USABLE);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
 
-        let low_key = serialize_record(&[SqliteValue::Integer(10), SqliteValue::Integer(1)]);
-        let mid_key = serialize_record(&[SqliteValue::Integer(20), SqliteValue::Integer(2)]);
-        let high_key = serialize_record(&[SqliteValue::Integer(30), SqliteValue::Integer(3)]);
+            let low_key = serialize_record(&[SqliteValue::Integer(10), SqliteValue::Integer(1)]);
+            let mid_key = serialize_record(&[SqliteValue::Integer(20), SqliteValue::Integer(2)]);
+            let high_key = serialize_record(&[SqliteValue::Integer(30), SqliteValue::Integer(3)]);
 
-        cursor.index_insert(&cx, &low_key).unwrap();
-        cursor.index_insert(&cx, &high_key).unwrap();
-        cursor.index_insert_unique(&cx, &mid_key, 1, "t.x").unwrap();
+            cursor.index_insert(&cx, &low_key).await.unwrap();
+            cursor.index_insert(&cx, &high_key).await.unwrap();
+            cursor
+                .index_insert_unique(&cx, &mid_key, 1, "t.x")
+                .await
+                .unwrap();
 
-        assert!(cursor.first(&cx).unwrap());
-        assert_eq!(
-            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
-            vec![SqliteValue::Integer(10), SqliteValue::Integer(1)]
-        );
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(
-            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
-            vec![SqliteValue::Integer(20), SqliteValue::Integer(2)]
-        );
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(
-            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
-            vec![SqliteValue::Integer(30), SqliteValue::Integer(3)]
-        );
+            assert!(cursor.first(&cx).await.unwrap());
+            assert_eq!(
+                parse_record(&cursor.payload(&cx).await.unwrap()).unwrap(),
+                vec![SqliteValue::Integer(10), SqliteValue::Integer(1)]
+            );
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(
+                parse_record(&cursor.payload(&cx).await.unwrap()).unwrap(),
+                vec![SqliteValue::Integer(20), SqliteValue::Integer(2)]
+            );
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(
+                parse_record(&cursor.payload(&cx).await.unwrap()).unwrap(),
+                vec![SqliteValue::Integer(30), SqliteValue::Integer(3)]
+            );
+        });
     }
 
     #[test]
     fn test_index_insert_unique_non_leaf_restore_state_falls_back_to_full_insert() {
-        let low_key = serialize_record(&[
-            SqliteValue::Text("alpha@example.com".into()),
-            SqliteValue::Integer(1),
-        ]);
-        let separator_key = serialize_record(&[
-            SqliteValue::Text("mango@example.com".into()),
-            SqliteValue::Integer(2),
-        ]);
-        let high_key = serialize_record(&[
-            SqliteValue::Text("zebra@example.com".into()),
-            SqliteValue::Integer(3),
-        ]);
-        let probe_key = serialize_record(&[
-            SqliteValue::Text("hotel@example.com".into()),
-            SqliteValue::Integer(4),
-        ]);
-
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_index(&[(pn(3), &separator_key)], pn(4)));
-        store.pages.insert(3, build_leaf_index(&[&low_key]));
-        store.pages.insert(4, build_leaf_index(&[&high_key]));
-
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
-
-        let restores_to_non_leaf = cursor
-            .with_btree_op(&cx, BtreeOpType::Seek, |cursor| {
-                let _seek = cursor.index_seek(&cx, &probe_key)?;
-                let restore_eof = cursor.at_eof;
-
-                if !cursor.at_eof {
-                    let _payload = cursor.payload(&cx)?;
-                }
-
-                if cursor.prev(&cx)? {
-                    let _payload = cursor.payload(&cx)?;
-                }
-
-                if restore_eof {
-                    cursor.at_eof = true;
-                } else {
-                    cursor.next(&cx)?;
-                }
-
-                Ok(cursor
-                    .stack
-                    .last()
-                    .is_some_and(|top| !top.header.page_type.is_leaf()))
-            })
-            .unwrap();
-
-        assert!(
-            restores_to_non_leaf,
-            "test requires the uniqueness restore state to sit on an interior separator"
-        );
-
-        cursor
-            .index_insert_unique(&cx, &probe_key, 1, "bench.email")
-            .unwrap();
-
-        assert!(cursor.index_move_to(&cx, &probe_key).unwrap().is_found());
-        assert_eq!(
-            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
-            vec![
+        run_async(async {
+            let low_key = serialize_record(&[
+                SqliteValue::Text("alpha@example.com".into()),
+                SqliteValue::Integer(1),
+            ]);
+            let separator_key = serialize_record(&[
+                SqliteValue::Text("mango@example.com".into()),
+                SqliteValue::Integer(2),
+            ]);
+            let high_key = serialize_record(&[
+                SqliteValue::Text("zebra@example.com".into()),
+                SqliteValue::Integer(3),
+            ]);
+            let probe_key = serialize_record(&[
                 SqliteValue::Text("hotel@example.com".into()),
                 SqliteValue::Integer(4),
-            ]
-        );
+            ]);
+
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_index(&[(pn(3), &separator_key)], pn(4)));
+            store.pages.insert(3, build_leaf_index(&[&low_key]));
+            store.pages.insert(4, build_leaf_index(&[&high_key]));
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+
+            let restores_to_non_leaf = cursor
+                .with_btree_op(&cx, BtreeOpType::Seek, async |cursor| {
+                    let _seek = cursor.index_seek(&cx, &probe_key).await?;
+                    let restore_eof = cursor.at_eof;
+
+                    if !cursor.at_eof {
+                        let _payload = cursor.payload(&cx).await?;
+                    }
+
+                    if cursor.prev(&cx).await? {
+                        let _payload = cursor.payload(&cx).await?;
+                    }
+
+                    if restore_eof {
+                        cursor.at_eof = true;
+                    } else {
+                        cursor.next(&cx).await?;
+                    }
+
+                    Ok(cursor
+                        .stack
+                        .last()
+                        .is_some_and(|top| !top.header.page_type.is_leaf()))
+                })
+                .await
+                .unwrap();
+
+            assert!(
+                restores_to_non_leaf,
+                "test requires the uniqueness restore state to sit on an interior separator"
+            );
+
+            cursor
+                .index_insert_unique(&cx, &probe_key, 1, "bench.email")
+                .await
+                .unwrap();
+
+            assert!(
+                cursor
+                    .index_move_to(&cx, &probe_key)
+                    .await
+                    .unwrap()
+                    .is_found()
+            );
+            assert_eq!(
+                parse_record(&cursor.payload(&cx).await.unwrap()).unwrap(),
+                vec![
+                    SqliteValue::Text("hotel@example.com".into()),
+                    SqliteValue::Integer(4),
+                ]
+            );
+        });
     }
 
     #[test]
     fn test_index_insert_monotonic_unique_email_keys_10k_counts_and_reaches_last_key() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_index(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, false);
-        let row_count = 10_000_i64;
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_index(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, false);
+            let row_count = 10_000_i64;
 
-        for rowid in 1..=row_count {
-            let key = serialize_record(&[
-                SqliteValue::Text(format!("user_{:05}@test.com", rowid - 1).into()),
-                SqliteValue::Integer(rowid),
-            ]);
-            cursor.index_insert(&cx, &key).unwrap();
-        }
+            for rowid in 1..=row_count {
+                let key = serialize_record(&[
+                    SqliteValue::Text(format!("user_{:05}@test.com", rowid - 1).into()),
+                    SqliteValue::Integer(rowid),
+                ]);
+                cursor.index_insert(&cx, &key).await.unwrap();
+            }
 
-        let depth = measure_tree_depth(&cursor.pager, root, USABLE);
-        assert!(
-            depth >= 2,
-            "test requires at least one interior index level, got depth {depth}"
-        );
+            let depth = measure_tree_depth(&cursor.pager, root, USABLE).await;
+            assert!(
+                depth >= 2,
+                "test requires at least one interior index level, got depth {depth}"
+            );
 
-        let last_key = serialize_record(&[
-            SqliteValue::Text(format!("user_{:05}@test.com", row_count - 1).into()),
-            SqliteValue::Integer(row_count),
-        ]);
-        let last_found = cursor.index_move_to(&cx, &last_key).unwrap().is_found();
-        let last_payload = last_found.then(|| parse_record(&cursor.payload(&cx).unwrap()).unwrap());
-        let count = cursor.count_all_rows(&cx).unwrap();
-        assert_eq!(
-            count, row_count,
-            "plain monotonic index_insert should preserve all {row_count} index entries; last_found={last_found} last_payload={last_payload:?}"
-        );
-
-        assert!(
-            last_found,
-            "plain monotonic index_insert should keep the last key reachable"
-        );
-        assert_eq!(
-            last_payload.unwrap(),
-            vec![
+            let last_key = serialize_record(&[
                 SqliteValue::Text(format!("user_{:05}@test.com", row_count - 1).into()),
                 SqliteValue::Integer(row_count),
-            ]
-        );
+            ]);
+            let last_found = cursor
+                .index_move_to(&cx, &last_key)
+                .await
+                .unwrap()
+                .is_found();
+            let last_payload = if last_found {
+                Some(parse_record(&cursor.payload(&cx).await.unwrap()).unwrap())
+            } else {
+                None
+            };
+            let count = cursor.count_all_rows(&cx).await.unwrap();
+            assert_eq!(
+                count, row_count,
+                "plain monotonic index_insert should preserve all {row_count} index entries; last_found={last_found} last_payload={last_payload:?}"
+            );
+
+            assert!(
+                last_found,
+                "plain monotonic index_insert should keep the last key reachable"
+            );
+            assert_eq!(
+                last_payload.unwrap(),
+                vec![
+                    SqliteValue::Text(format!("user_{:05}@test.com", row_count - 1).into()),
+                    SqliteValue::Integer(row_count),
+                ]
+            );
+        });
     }
 
     #[test]
     fn test_index_insert_unique_monotonic_unique_email_keys_10k_counts_and_reaches_last_key() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_index(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, false);
-        let row_count = 10_000_i64;
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_index(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, false);
+            let row_count = 10_000_i64;
 
-        for rowid in 1..=row_count {
-            let key = serialize_record(&[
-                SqliteValue::Text(format!("user_{:05}@test.com", rowid - 1).into()),
-                SqliteValue::Integer(rowid),
-            ]);
-            cursor
-                .index_insert_unique(&cx, &key, 1, "bench.email")
-                .unwrap();
-        }
+            for rowid in 1..=row_count {
+                let key = serialize_record(&[
+                    SqliteValue::Text(format!("user_{:05}@test.com", rowid - 1).into()),
+                    SqliteValue::Integer(rowid),
+                ]);
+                cursor
+                    .index_insert_unique(&cx, &key, 1, "bench.email")
+                    .await
+                    .unwrap();
+            }
 
-        let depth = measure_tree_depth(&cursor.pager, root, USABLE);
-        assert!(
-            depth >= 2,
-            "test requires at least one interior index level, got depth {depth}"
-        );
+            let depth = measure_tree_depth(&cursor.pager, root, USABLE).await;
+            assert!(
+                depth >= 2,
+                "test requires at least one interior index level, got depth {depth}"
+            );
 
-        let last_key = serialize_record(&[
-            SqliteValue::Text(format!("user_{:05}@test.com", row_count - 1).into()),
-            SqliteValue::Integer(row_count),
-        ]);
-        let last_found = cursor.index_move_to(&cx, &last_key).unwrap().is_found();
-        let last_payload = last_found.then(|| parse_record(&cursor.payload(&cx).unwrap()).unwrap());
-        let count = cursor.count_all_rows(&cx).unwrap();
-        assert_eq!(
-            count, row_count,
-            "monotonic unique index_insert_unique should preserve all {row_count} index entries; last_found={last_found} last_payload={last_payload:?}"
-        );
-
-        assert!(
-            last_found,
-            "monotonic unique index_insert_unique should keep the last key reachable"
-        );
-        assert_eq!(
-            last_payload.unwrap(),
-            vec![
+            let last_key = serialize_record(&[
                 SqliteValue::Text(format!("user_{:05}@test.com", row_count - 1).into()),
                 SqliteValue::Integer(row_count),
-            ]
-        );
+            ]);
+            let last_found = cursor
+                .index_move_to(&cx, &last_key)
+                .await
+                .unwrap()
+                .is_found();
+            let last_payload = if last_found {
+                Some(parse_record(&cursor.payload(&cx).await.unwrap()).unwrap())
+            } else {
+                None
+            };
+            let count = cursor.count_all_rows(&cx).await.unwrap();
+            assert_eq!(
+                count, row_count,
+                "monotonic unique index_insert_unique should preserve all {row_count} index entries; last_found={last_found} last_payload={last_payload:?}"
+            );
+
+            assert!(
+                last_found,
+                "monotonic unique index_insert_unique should keep the last key reachable"
+            );
+            assert_eq!(
+                last_payload.unwrap(),
+                vec![
+                    SqliteValue::Text(format!("user_{:05}@test.com", row_count - 1).into()),
+                    SqliteValue::Integer(row_count),
+                ]
+            );
+        });
     }
 
     #[test]
     fn test_index_insert_unique_deep_tree_monotonic_10k_counts_all_rows() {
-        let store = MemPageStore::with_empty_index(pn(2), USABLE);
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
-        let row_count = 10_000_i64;
+        run_async(async {
+            let store = MemPageStore::with_empty_index(pn(2), USABLE);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+            let row_count = 10_000_i64;
 
-        for rowid in 0..row_count {
-            let key = serialize_record(&[
-                SqliteValue::Text(format!("user_{rowid}@test.com").into()),
-                SqliteValue::Integer(rowid),
+            for rowid in 0..row_count {
+                let key = serialize_record(&[
+                    SqliteValue::Text(format!("user_{rowid}@test.com").into()),
+                    SqliteValue::Integer(rowid),
+                ]);
+                cursor
+                    .index_insert_unique(&cx, &key, 1, "bench.email")
+                    .await
+                    .unwrap();
+            }
+
+            let counted = cursor.count_all_rows(&cx).await.unwrap();
+            assert_eq!(
+                counted, row_count,
+                "deep monotonic unique index should contain every inserted entry"
+            );
+
+            let last_key = serialize_record(&[
+                SqliteValue::Text(format!("user_{}@test.com", row_count - 1).into()),
+                SqliteValue::Integer(row_count - 1),
             ]);
-            cursor
-                .index_insert_unique(&cx, &key, 1, "bench.email")
-                .unwrap();
-        }
-
-        let counted = cursor.count_all_rows(&cx).unwrap();
-        assert_eq!(
-            counted, row_count,
-            "deep monotonic unique index should contain every inserted entry"
-        );
-
-        let last_key = serialize_record(&[
-            SqliteValue::Text(format!("user_{}@test.com", row_count - 1).into()),
-            SqliteValue::Integer(row_count - 1),
-        ]);
-        let seek = cursor.index_move_to(&cx, &last_key).unwrap();
-        assert_eq!(seek, SeekResult::Found);
-        assert_eq!(cursor.payload(&cx).unwrap(), last_key);
+            let seek = cursor.index_move_to(&cx, &last_key).await.unwrap();
+            assert_eq!(seek, SeekResult::Found);
+            assert_eq!(cursor.payload(&cx).await.unwrap(), last_key);
+        });
     }
 
     #[test]
     fn test_index_unique_rightmost_append_helper_preserves_count_and_conflicts() {
-        let root = pn(2);
-        let store = MemPageStore::with_empty_index(root, USABLE);
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, root, USABLE, false);
-        let key = |idx: i64, rowid: i64| {
-            serialize_record(&[
-                SqliteValue::Integer(7),
-                SqliteValue::Integer(idx),
-                SqliteValue::Integer(rowid),
-            ])
-        };
+        run_async(async {
+            let root = pn(2);
+            let store = MemPageStore::with_empty_index(root, USABLE);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, root, USABLE, false);
+            let key = |idx: i64, rowid: i64| {
+                serialize_record(&[
+                    SqliteValue::Integer(7),
+                    SqliteValue::Integer(idx),
+                    SqliteValue::Integer(rowid),
+                ])
+            };
 
-        let first = key(0, 100);
-        assert!(
-            cursor
-                .index_insert_unique_with_rightmost_report(&cx, &first, 2, "messages.conv_idx")
-                .unwrap(),
-            "empty-tree insert should report a rightmost insertion"
-        );
+            let first = key(0, 100);
+            assert!(
+                cursor
+                    .index_insert_unique_with_rightmost_report(&cx, &first, 2, "messages.conv_idx")
+                    .await
+                    .unwrap(),
+                "empty-tree insert should report a rightmost insertion"
+            );
 
-        let second = key(1, 101);
-        assert!(
-            cursor
-                .index_append_after_current_rightmost_position(&cx, &second)
-                .unwrap(),
-            "cursor should still be on the right edge after the reported insert"
-        );
+            let second = key(1, 101);
+            assert!(
+                cursor
+                    .index_append_after_current_rightmost_position(&cx, &second)
+                    .await
+                    .unwrap(),
+                "cursor should still be on the right edge after the reported insert"
+            );
 
-        cursor.first(&cx).unwrap();
-        let third = key(2, 102);
-        assert!(
-            !cursor
-                .index_append_after_current_rightmost_position(&cx, &third)
-                .unwrap(),
-            "append helper must reject a cursor no longer positioned at the right edge"
-        );
-        assert!(
-            cursor
-                .index_insert_unique_with_rightmost_report(&cx, &third, 2, "messages.conv_idx")
-                .unwrap(),
-            "canonical fallback should reseed the rightmost hint"
-        );
+            cursor.first(&cx).await.unwrap();
+            let third = key(2, 102);
+            assert!(
+                !cursor
+                    .index_append_after_current_rightmost_position(&cx, &third)
+                    .await
+                    .unwrap(),
+                "append helper must reject a cursor no longer positioned at the right edge"
+            );
+            assert!(
+                cursor
+                    .index_insert_unique_with_rightmost_report(&cx, &third, 2, "messages.conv_idx")
+                    .await
+                    .unwrap(),
+                "canonical fallback should reseed the rightmost hint"
+            );
 
-        let duplicate = key(1, 201);
-        let err = cursor
-            .index_insert_unique_with_rightmost_report(&cx, &duplicate, 2, "messages.conv_idx")
-            .unwrap_err();
-        assert!(matches!(err, FrankenError::UniqueViolation { .. }));
+            let duplicate = key(1, 201);
+            let err = cursor
+                .index_insert_unique_with_rightmost_report(&cx, &duplicate, 2, "messages.conv_idx")
+                .await
+                .unwrap_err();
+            assert!(matches!(err, FrankenError::UniqueViolation { .. }));
 
-        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 3);
-        assert_eq!(
-            scan_all_index_keys(&mut cursor, &cx).unwrap(),
-            vec![first, second, third]
-        );
+            assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), 3);
+            assert_eq!(
+                scan_all_index_keys(&mut cursor, &cx).await.unwrap(),
+                vec![first, second, third]
+            );
+        });
     }
 
     #[test]
     fn test_index_insert_deep_tree_monotonic_10k_counts_all_rows() {
-        let store = MemPageStore::with_empty_index(pn(2), USABLE);
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
-        let row_count = 10_000_i64;
+        run_async(async {
+            let store = MemPageStore::with_empty_index(pn(2), USABLE);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+            let row_count = 10_000_i64;
 
-        for rowid in 0..row_count {
-            let key = serialize_record(&[
-                SqliteValue::Text(format!("user_{rowid}@test.com").into()),
-                SqliteValue::Integer(rowid),
+            for rowid in 0..row_count {
+                let key = serialize_record(&[
+                    SqliteValue::Text(format!("user_{rowid}@test.com").into()),
+                    SqliteValue::Integer(rowid),
+                ]);
+                cursor.index_insert(&cx, &key).await.unwrap();
+            }
+
+            let counted = cursor.count_all_rows(&cx).await.unwrap();
+            assert_eq!(
+                counted, row_count,
+                "deep monotonic plain index should contain every inserted entry"
+            );
+
+            let last_key = serialize_record(&[
+                SqliteValue::Text(format!("user_{}@test.com", row_count - 1).into()),
+                SqliteValue::Integer(row_count - 1),
             ]);
-            cursor.index_insert(&cx, &key).unwrap();
-        }
-
-        let counted = cursor.count_all_rows(&cx).unwrap();
-        assert_eq!(
-            counted, row_count,
-            "deep monotonic plain index should contain every inserted entry"
-        );
-
-        let last_key = serialize_record(&[
-            SqliteValue::Text(format!("user_{}@test.com", row_count - 1).into()),
-            SqliteValue::Integer(row_count - 1),
-        ]);
-        let seek = cursor.index_move_to(&cx, &last_key).unwrap();
-        assert_eq!(seek, SeekResult::Found);
-        assert_eq!(cursor.payload(&cx).unwrap(), last_key);
+            let seek = cursor.index_move_to(&cx, &last_key).await.unwrap();
+            assert_eq!(seek, SeekResult::Found);
+            assert_eq!(cursor.payload(&cx).await.unwrap(), last_key);
+        });
     }
 
     #[test]
     fn test_cursor_index_next_visits_interior_separator_cells() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
-        );
-        store.pages.insert(3, build_leaf_index(&[b"a"]));
-        store.pages.insert(4, build_leaf_index(&[b"c"]));
-        store.pages.insert(5, build_leaf_index(&[b"e", b"f"]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
+            );
+            store.pages.insert(3, build_leaf_index(&[b"a"]));
+            store.pages.insert(4, build_leaf_index(&[b"c"]));
+            store.pages.insert(5, build_leaf_index(&[b"e", b"f"]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, false);
-        assert!(cursor.first(&cx).unwrap());
-        let mut scanned = vec![cursor.payload(&cx).unwrap()];
-        while cursor.next(&cx).unwrap() {
-            scanned.push(cursor.payload(&cx).unwrap());
-        }
-        assert_eq!(
-            scanned,
-            vec![
-                b"a".to_vec(),
-                b"b".to_vec(),
-                b"c".to_vec(),
-                b"d".to_vec(),
-                b"e".to_vec(),
-                b"f".to_vec(),
-            ]
-        );
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, false);
+            assert!(cursor.first(&cx).await.unwrap());
+            let mut scanned = vec![cursor.payload(&cx).await.unwrap()];
+            while cursor.next(&cx).await.unwrap() {
+                scanned.push(cursor.payload(&cx).await.unwrap());
+            }
+            assert_eq!(
+                scanned,
+                vec![
+                    b"a".to_vec(),
+                    b"b".to_vec(),
+                    b"c".to_vec(),
+                    b"d".to_vec(),
+                    b"e".to_vec(),
+                    b"f".to_vec(),
+                ]
+            );
+        });
     }
 
     #[test]
     fn test_cursor_index_prev_visits_interior_separator_cells() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
-        );
-        store.pages.insert(3, build_leaf_index(&[b"a"]));
-        store.pages.insert(4, build_leaf_index(&[b"c"]));
-        store.pages.insert(5, build_leaf_index(&[b"e", b"f"]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
+            );
+            store.pages.insert(3, build_leaf_index(&[b"a"]));
+            store.pages.insert(4, build_leaf_index(&[b"c"]));
+            store.pages.insert(5, build_leaf_index(&[b"e", b"f"]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
 
-        assert!(cursor.last(&cx).unwrap());
-        let mut scanned = vec![cursor.payload(&cx).unwrap()];
-        while cursor.prev(&cx).unwrap() {
-            scanned.push(cursor.payload(&cx).unwrap());
-        }
-        assert_eq!(
-            scanned,
-            vec![
-                b"f".to_vec(),
-                b"e".to_vec(),
-                b"d".to_vec(),
-                b"c".to_vec(),
-                b"b".to_vec(),
-                b"a".to_vec(),
-            ]
-        );
+            assert!(cursor.last(&cx).await.unwrap());
+            let mut scanned = vec![cursor.payload(&cx).await.unwrap()];
+            while cursor.prev(&cx).await.unwrap() {
+                scanned.push(cursor.payload(&cx).await.unwrap());
+            }
+            assert_eq!(
+                scanned,
+                vec![
+                    b"f".to_vec(),
+                    b"e".to_vec(),
+                    b"d".to_vec(),
+                    b"c".to_vec(),
+                    b"b".to_vec(),
+                    b"a".to_vec(),
+                ]
+            );
+        });
     }
 
     #[test]
     fn test_count_all_rows_on_interior_index_includes_separator_cells() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
-        );
-        store.pages.insert(3, build_leaf_index(&[b"a"]));
-        store.pages.insert(4, build_leaf_index(&[b"c"]));
-        store.pages.insert(5, build_leaf_index(&[b"e", b"f"]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
+            );
+            store.pages.insert(3, build_leaf_index(&[b"a"]));
+            store.pages.insert(4, build_leaf_index(&[b"c"]));
+            store.pages.insert(5, build_leaf_index(&[b"e", b"f"]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
-        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 6);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+            assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), 6);
+        });
     }
 
     #[test]
     fn test_cursor_index_rowid_extracted_from_trailing_record_field() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_index(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_index(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        let key = serialize_record(&[SqliteValue::Text("beacon".into()), SqliteValue::Integer(73)]);
+            let key =
+                serialize_record(&[SqliteValue::Text("beacon".into()), SqliteValue::Integer(73)]);
 
-        cursor.index_insert(&cx, &key).unwrap();
-        assert!(cursor.index_move_to(&cx, &key).unwrap().is_found());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 73);
+            cursor.index_insert(&cx, &key).await.unwrap();
+            assert!(cursor.index_move_to(&cx, &key).await.unwrap().is_found());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 73);
+        });
     }
 
     #[test]
     fn test_cursor_index_rowid_with_overflow_key_payload() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_index(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_index(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        let key = serialize_record(&[
-            SqliteValue::Blob(vec![0xAB; 2_500].into()),
-            SqliteValue::Integer(901),
-        ]);
+            let key = serialize_record(&[
+                SqliteValue::Blob(vec![0xAB; 2_500].into()),
+                SqliteValue::Integer(901),
+            ]);
 
-        cursor.index_insert(&cx, &key).unwrap();
-        assert!(cursor.index_move_to(&cx, &key).unwrap().is_found());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 901);
+            cursor.index_insert(&cx, &key).await.unwrap();
+            assert!(cursor.index_move_to(&cx, &key).await.unwrap().is_found());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 901);
+        });
     }
 
     #[test]
     fn test_cursor_index_seek_duplicate_run_walks_all_matching_entries() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_index(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_index(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
 
-        for rowid in [1_i64, 2, 5] {
-            let key = serialize_record(&[SqliteValue::Integer(42), SqliteValue::Integer(rowid)]);
-            cursor.index_insert(&cx, &key).unwrap();
-        }
-        let other_key = serialize_record(&[SqliteValue::Integer(99), SqliteValue::Integer(9)]);
-
-        cursor.index_insert(&cx, &other_key).unwrap();
-
-        let probe = serialize_record(&[SqliteValue::Integer(42), SqliteValue::Integer(i64::MIN)]);
-        let seek = cursor.index_move_to(&cx, &probe).unwrap();
-        assert!(
-            !seek.is_found(),
-            "probe uses a synthetic minimum rowid and should anchor via successor positioning"
-        );
-        assert!(
-            !cursor.eof(),
-            "duplicate-run probe should land on the first matching entry"
-        );
-
-        let mut seen_rowids = Vec::new();
-        loop {
-            let payload = cursor.payload(&cx).unwrap();
-            let fields = parse_record(&payload).unwrap();
-            if fields.first() != Some(&SqliteValue::Integer(42)) {
-                break;
+            for rowid in [1_i64, 2, 5] {
+                let key =
+                    serialize_record(&[SqliteValue::Integer(42), SqliteValue::Integer(rowid)]);
+                cursor.index_insert(&cx, &key).await.unwrap();
             }
-            seen_rowids.push(cursor.rowid(&cx).unwrap());
-            if !cursor.next(&cx).unwrap() {
-                break;
-            }
-        }
+            let other_key = serialize_record(&[SqliteValue::Integer(99), SqliteValue::Integer(9)]);
 
-        assert_eq!(seen_rowids, vec![1, 2, 5]);
+            cursor.index_insert(&cx, &other_key).await.unwrap();
+
+            let probe =
+                serialize_record(&[SqliteValue::Integer(42), SqliteValue::Integer(i64::MIN)]);
+            let seek = cursor.index_move_to(&cx, &probe).await.unwrap();
+            assert!(
+                !seek.is_found(),
+                "probe uses a synthetic minimum rowid and should anchor via successor positioning"
+            );
+            assert!(
+                !cursor.eof(),
+                "duplicate-run probe should land on the first matching entry"
+            );
+
+            let mut seen_rowids = Vec::new();
+            loop {
+                let payload = cursor.payload(&cx).await.unwrap();
+                let fields = parse_record(&payload).unwrap();
+                if fields.first() != Some(&SqliteValue::Integer(42)) {
+                    break;
+                }
+                seen_rowids.push(cursor.rowid(&cx).await.unwrap());
+                if !cursor.next(&cx).await.unwrap() {
+                    break;
+                }
+            }
+
+            assert_eq!(seen_rowids, vec![1, 2, 5]);
+        });
     }
 
     #[test]
     fn test_cursor_index_prefix_upper_bound_skips_duplicate_run_during_descent() {
-        let key_42_1 = serialize_record(&[SqliteValue::Integer(42), SqliteValue::Integer(1)]);
-        let key_42_2 = serialize_record(&[SqliteValue::Integer(42), SqliteValue::Integer(2)]);
-        let separator = serialize_record(&[SqliteValue::Integer(42), SqliteValue::Integer(3)]);
-        let successor = serialize_record(&[SqliteValue::Integer(99), SqliteValue::Integer(9)]);
+        run_async(async {
+            let key_42_1 = serialize_record(&[SqliteValue::Integer(42), SqliteValue::Integer(1)]);
+            let key_42_2 = serialize_record(&[SqliteValue::Integer(42), SqliteValue::Integer(2)]);
+            let separator = serialize_record(&[SqliteValue::Integer(42), SqliteValue::Integer(3)]);
+            let successor = serialize_record(&[SqliteValue::Integer(99), SqliteValue::Integer(9)]);
 
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_interior_index(&[(pn(3), separator.as_slice())], pn(4)),
-        );
-        store.pages.insert(
-            3,
-            build_leaf_index(&[key_42_1.as_slice(), key_42_2.as_slice()]),
-        );
-        store
-            .pages
-            .insert(4, build_leaf_index(&[successor.as_slice()]));
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_interior_index(&[(pn(3), separator.as_slice())], pn(4)),
+            );
+            store.pages.insert(
+                3,
+                build_leaf_index(&[key_42_1.as_slice(), key_42_2.as_slice()]),
+            );
+            store
+                .pages
+                .insert(4, build_leaf_index(&[successor.as_slice()]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, false);
-        let prefix = serialize_record(&[SqliteValue::Integer(42)]);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, false);
+            let prefix = serialize_record(&[SqliteValue::Integer(42)]);
 
-        cursor.index_move_to_upper_bound(&cx, &prefix).unwrap();
-        assert_eq!(
-            cursor.pager.read_pages(),
-            vec![pn(2), pn(4)],
-            "upper-bound descent must bypass the equal-prefix subtree"
-        );
-        assert_eq!(
-            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
-            vec![SqliteValue::Integer(99), SqliteValue::Integer(9)]
-        );
+            cursor
+                .index_move_to_upper_bound(&cx, &prefix)
+                .await
+                .unwrap();
+            assert_eq!(
+                cursor.pager.read_pages(),
+                vec![pn(2), pn(4)],
+                "upper-bound descent must bypass the equal-prefix subtree"
+            );
+            assert_eq!(
+                parse_record(&cursor.payload(&cx).await.unwrap()).unwrap(),
+                vec![SqliteValue::Integer(99), SqliteValue::Integer(9)]
+            );
 
-        assert!(cursor.prev(&cx).unwrap());
-        assert_eq!(
-            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
-            vec![SqliteValue::Integer(42), SqliteValue::Integer(3)]
-        );
+            assert!(cursor.prev(&cx).await.unwrap());
+            assert_eq!(
+                parse_record(&cursor.payload(&cx).await.unwrap()).unwrap(),
+                vec![SqliteValue::Integer(42), SqliteValue::Integer(3)]
+            );
+        });
     }
 
     /// bd-distinct-loose-scan: the loose/skip scan (`first`, then repeated
@@ -14019,1752 +14707,1905 @@ mod tests {
     /// iteration cap converts that hang into a loud failure.
     #[test]
     fn test_cursor_index_prefix_upper_bound_loose_scan_over_multi_leaf_runs() {
-        const DISTINCT: i64 = 8;
-        const PER_VALUE: i64 = 1000;
+        run_async(async {
+            const DISTINCT: i64 = 8;
+            const PER_VALUE: i64 = 1000;
 
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_index(&[]));
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_index(&[]));
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
 
-        // Interleaved insert order (value = i % DISTINCT) mirrors the failing
-        // `SELECT DISTINCT` workload and exercises natural page splits; each
-        // value's run of PER_VALUE entries spans multiple leaves. A leading
-        // NULL run (NULL sorts first in index order) pins the [NULL] prefix
-        // probe — the case the SELECT DISTINCT oracle hangs on.
-        for i in 0..DISTINCT * PER_VALUE {
-            let key = if i % 37 == 0 {
-                serialize_record(&[SqliteValue::Null, SqliteValue::Integer(i)])
-            } else {
-                serialize_record(&[SqliteValue::Integer(i % DISTINCT), SqliteValue::Integer(i)])
-            };
-            cursor.index_insert(&cx, &key).unwrap();
-        }
+            // Interleaved insert order (value = i % DISTINCT) mirrors the failing
+            // `SELECT DISTINCT` workload and exercises natural page splits; each
+            // value's run of PER_VALUE entries spans multiple leaves. A leading
+            // NULL run (NULL sorts first in index order) pins the [NULL] prefix
+            // probe — the case the SELECT DISTINCT oracle hangs on.
+            for i in 0..DISTINCT * PER_VALUE {
+                let key = if i % 37 == 0 {
+                    serialize_record(&[SqliteValue::Null, SqliteValue::Integer(i)])
+                } else {
+                    serialize_record(&[SqliteValue::Integer(i % DISTINCT), SqliteValue::Integer(i)])
+                };
+                cursor.index_insert(&cx, &key).await.unwrap();
+            }
 
-        // --- 1-field prefix probe (the design-intended loose-scan shape). ---
-        assert!(
-            cursor.first(&cx).unwrap(),
-            "populated index has a first row"
-        );
-        let mut seen = Vec::new();
-        for _ in 0..=DISTINCT + 1 {
-            let payload = cursor.payload(&cx).unwrap();
-            let fields = parse_record(&payload).unwrap();
-            let probe = serialize_record(&fields[..1]);
-            match fields[0] {
-                SqliteValue::Integer(v) => seen.push(v),
-                SqliteValue::Null => seen.push(i64::MIN),
-                ref other => panic!("unexpected index key {other:?}"),
+            // --- 1-field prefix probe (the design-intended loose-scan shape). ---
+            assert!(
+                cursor.first(&cx).await.unwrap(),
+                "populated index has a first row"
+            );
+            let mut seen = Vec::new();
+            for _ in 0..=DISTINCT + 1 {
+                let payload = cursor.payload(&cx).await.unwrap();
+                let fields = parse_record(&payload).unwrap();
+                let probe = serialize_record(&fields[..1]);
+                match fields[0] {
+                    SqliteValue::Integer(v) => seen.push(v),
+                    SqliteValue::Null => seen.push(i64::MIN),
+                    ref other => panic!("unexpected index key {other:?}"),
+                }
+                cursor.index_move_to_upper_bound(&cx, &probe).await.unwrap();
+                if cursor.eof() {
+                    break;
+                }
             }
-            cursor.index_move_to_upper_bound(&cx, &probe).unwrap();
-            if cursor.eof() {
-                break;
-            }
-        }
-        let expected: Vec<i64> = std::iter::once(i64::MIN).chain(0..DISTINCT).collect();
-        assert_eq!(
-            seen, expected,
-            "prefix upper-bound loose scan must visit NULL then each distinct value exactly once"
-        );
+            let expected: Vec<i64> = std::iter::once(i64::MIN).chain(0..DISTINCT).collect();
+            assert_eq!(
+                seen, expected,
+                "prefix upper-bound loose scan must visit NULL then each distinct value exactly once"
+            );
 
-        // --- 2-field [value, i64::MAX] sentinel probe (the alternate shape). ---
-        assert!(cursor.first(&cx).unwrap());
-        let mut seen_sentinel = Vec::new();
-        for _ in 0..=DISTINCT + 1 {
-            let payload = cursor.payload(&cx).unwrap();
-            let fields = parse_record(&payload).unwrap();
-            let first = fields[0].clone();
-            match first {
-                SqliteValue::Integer(v) => seen_sentinel.push(v),
-                SqliteValue::Null => seen_sentinel.push(i64::MIN),
-                ref other => panic!("unexpected index key {other:?}"),
+            // --- 2-field [value, i64::MAX] sentinel probe (the alternate shape). ---
+            assert!(cursor.first(&cx).await.unwrap());
+            let mut seen_sentinel = Vec::new();
+            for _ in 0..=DISTINCT + 1 {
+                let payload = cursor.payload(&cx).await.unwrap();
+                let fields = parse_record(&payload).unwrap();
+                let first = fields[0].clone();
+                match first {
+                    SqliteValue::Integer(v) => seen_sentinel.push(v),
+                    SqliteValue::Null => seen_sentinel.push(i64::MIN),
+                    ref other => panic!("unexpected index key {other:?}"),
+                }
+                let probe = serialize_record(&[first, SqliteValue::Integer(i64::MAX)]);
+                cursor.index_move_to_upper_bound(&cx, &probe).await.unwrap();
+                if cursor.eof() {
+                    break;
+                }
             }
-            let probe = serialize_record(&[first, SqliteValue::Integer(i64::MAX)]);
-            cursor.index_move_to_upper_bound(&cx, &probe).unwrap();
-            if cursor.eof() {
-                break;
-            }
-        }
-        assert_eq!(
-            seen_sentinel, expected,
-            "sentinel upper-bound loose scan must visit NULL then each distinct value exactly once"
-        );
+            assert_eq!(
+                seen_sentinel, expected,
+                "sentinel upper-bound loose scan must visit NULL then each distinct value exactly once"
+            );
+        });
     }
 
     #[test]
     fn test_cursor_index_prefix_upper_bound_honors_nocase_collation() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_index(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_index(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
-        cursor.set_index_collation_context(
-            vec![Some("NOCASE".to_owned())],
-            Arc::new(Mutex::new(CollationRegistry::new())),
-        );
-        for (text, rowid) in [("alpha", 1_i64), ("ALPHA", 2), ("beta", 3)] {
-            let key =
-                serialize_record(&[SqliteValue::Text(text.into()), SqliteValue::Integer(rowid)]);
-            cursor.index_insert(&cx, &key).unwrap();
-        }
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+            cursor.set_index_collation_context(
+                vec![Some("NOCASE".to_owned())],
+                Arc::new(Mutex::new(CollationRegistry::new())),
+            );
+            for (text, rowid) in [("alpha", 1_i64), ("ALPHA", 2), ("beta", 3)] {
+                let key = serialize_record(&[
+                    SqliteValue::Text(text.into()),
+                    SqliteValue::Integer(rowid),
+                ]);
+                cursor.index_insert(&cx, &key).await.unwrap();
+            }
 
-        let prefix = serialize_record(&[SqliteValue::Text("aLpHa".into())]);
-        cursor.index_move_to_upper_bound(&cx, &prefix).unwrap();
-        assert_eq!(
-            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
-            vec![SqliteValue::Text("beta".into()), SqliteValue::Integer(3)]
-        );
+            let prefix = serialize_record(&[SqliteValue::Text("aLpHa".into())]);
+            cursor
+                .index_move_to_upper_bound(&cx, &prefix)
+                .await
+                .unwrap();
+            assert_eq!(
+                parse_record(&cursor.payload(&cx).await.unwrap()).unwrap(),
+                vec![SqliteValue::Text("beta".into()), SqliteValue::Integer(3)]
+            );
+        });
     }
 
     #[test]
     fn test_cursor_index_seek_honors_nocase_collation_on_full_record_key() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_index(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_index(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new_with_index_desc(store, pn(2), USABLE, false, Vec::new());
-        cursor.set_index_collation_context(
-            vec![Some("NOCASE".to_owned())],
-            Arc::new(Mutex::new(CollationRegistry::new())),
-        );
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new_with_index_desc(store, pn(2), USABLE, false, Vec::new());
+            cursor.set_index_collation_context(
+                vec![Some("NOCASE".to_owned())],
+                Arc::new(Mutex::new(CollationRegistry::new())),
+            );
 
-        let alpha = serialize_record(&[SqliteValue::Text("alpha".into()), SqliteValue::Integer(1)]);
-        let beta = serialize_record(&[SqliteValue::Text("beta".into()), SqliteValue::Integer(2)]);
-        cursor.index_insert(&cx, &alpha).unwrap();
-        cursor.index_insert(&cx, &beta).unwrap();
+            let alpha =
+                serialize_record(&[SqliteValue::Text("alpha".into()), SqliteValue::Integer(1)]);
+            let beta =
+                serialize_record(&[SqliteValue::Text("beta".into()), SqliteValue::Integer(2)]);
+            cursor.index_insert(&cx, &alpha).await.unwrap();
+            cursor.index_insert(&cx, &beta).await.unwrap();
 
-        let probe = serialize_record(&[SqliteValue::Text("ALPHA".into()), SqliteValue::Integer(1)]);
-        assert!(
-            cursor.index_move_to(&cx, &probe).unwrap().is_found(),
-            "full-record index seek should honor NOCASE collation on the indexed text term"
-        );
-        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
+            let probe =
+                serialize_record(&[SqliteValue::Text("ALPHA".into()), SqliteValue::Integer(1)]);
+            assert!(
+                cursor.index_move_to(&cx, &probe).await.unwrap().is_found(),
+                "full-record index seek should honor NOCASE collation on the indexed text term"
+            );
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 1);
+        });
     }
 
     #[test]
     fn test_cursor_index_iteration_honors_nocase_collation_order() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_index(&[]));
-
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new_with_index_desc(store, pn(2), USABLE, false, Vec::new());
-        cursor.set_index_collation_context(
-            vec![Some("NOCASE".to_owned())],
-            Arc::new(Mutex::new(CollationRegistry::new())),
-        );
-
-        for key in [
-            serialize_record(&[SqliteValue::Text("alpha".into()), SqliteValue::Integer(1)]),
-            serialize_record(&[SqliteValue::Text("ALPHA".into()), SqliteValue::Integer(2)]),
-            serialize_record(&[SqliteValue::Text("beta".into()), SqliteValue::Integer(3)]),
-        ] {
-            cursor.index_insert(&cx, &key).unwrap();
-        }
-
-        let mut seen = Vec::new();
-        if cursor.first(&cx).unwrap() {
-            loop {
-                let fields = parse_record(&cursor.payload(&cx).unwrap()).unwrap();
-                seen.push((fields[0].clone(), cursor.rowid(&cx).unwrap()));
-                if !cursor.next(&cx).unwrap() {
-                    break;
-                }
-            }
-        }
-
-        assert_eq!(
-            seen,
-            vec![
-                (SqliteValue::Text("alpha".into()), 1),
-                (SqliteValue::Text("ALPHA".into()), 2),
-                (SqliteValue::Text("beta".into()), 3),
-            ],
-            "index scan order should follow NOCASE collation with rowid as the tie-breaker"
-        );
-    }
-
-    #[test]
-    fn test_cursor_index_rowid_rejects_record_without_trailing_integer() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_index(&[]));
-
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
-
-        let key = serialize_record(&[SqliteValue::Text("missing-rowid".into())]);
-
-        cursor.index_insert(&cx, &key).unwrap();
-        assert!(cursor.index_move_to(&cx, &key).unwrap().is_found());
-
-        let err = cursor.rowid(&cx).unwrap_err();
-        assert!(matches!(err, FrankenError::DatabaseCorrupt { .. }));
-    }
-
-    #[test]
-    fn test_cursor_table_insert_with_overflow_payload() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
-        let payload: Vec<u8> = (0u8..=255).cycle().take(5000).collect();
-
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        cursor.table_insert(&cx, 42, &payload).unwrap();
-
-        assert!(cursor.table_move_to(&cx, 42).unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), payload);
-    }
-
-    #[test]
-    fn test_cursor_table_seek_past_end_then_insert() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[(1, b"one"), (2, b"two"), (3, b"three"), (4, b"four")]),
-        );
-
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-
-        let seek = cursor.table_move_to(&cx, 99).unwrap();
-        assert!(!seek.is_found());
-        assert!(cursor.eof(), "seek past end should set eof");
-
-        cursor.table_insert(&cx, 99, b"tail").unwrap();
-        assert!(cursor.table_move_to(&cx, 99).unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), b"tail");
-    }
-
-    #[test]
-    fn test_cursor_index_seek_past_end_then_insert() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_index(&[b"alpha", b"mid"]));
-
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
-        let key = b"zz-top";
-
-        let seek = cursor.index_move_to(&cx, key).unwrap();
-        assert!(!seek.is_found());
-        assert!(cursor.eof(), "seek past end should set eof");
-
-        cursor.index_insert(&cx, key).unwrap();
-        assert!(cursor.index_move_to(&cx, key).unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), key);
-    }
-
-    #[test]
-    fn test_cursor_prev_from_seek_past_end_lands_on_last_entry() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[(1, b"one"), (2, b"two"), (3, b"three"), (4, b"four")]),
-        );
-
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-
-        let seek = cursor.table_move_to(&cx, 99).unwrap();
-        assert!(!seek.is_found());
-        assert!(cursor.eof());
-
-        assert!(cursor.prev(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 4);
-    }
-
-    #[test]
-    fn test_cursor_next_after_prev_from_first_recovers() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[(1, b"one"), (2, b"two"), (3, b"three"), (4, b"four")]),
-        );
-
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-
-        assert!(cursor.first(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
-        assert!(!cursor.prev(&cx).unwrap());
-
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
-    }
-
-    #[test]
-    fn test_cursor_prev_after_next_from_last_recovers() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[(1, b"one"), (2, b"two"), (3, b"three"), (4, b"four")]),
-        );
-
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-
-        assert!(cursor.last(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 4);
-        assert!(cursor.prev(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
-        assert!(cursor.prev(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
-        assert!(cursor.prev(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
-        assert!(!cursor.prev(&cx).unwrap());
-    }
-
-    #[test]
-    fn test_cursor_table_insert_overflow_write_failure_frees_allocations() {
-        let cx = Cx::new();
-        let root_page = pn(2);
-        let mut base = MemPageStore::new(USABLE);
-        base.init_leaf_table_root(root_page);
-        let shared = Rc::new(RefCell::new(base));
-
-        // Force a mid-chain overflow write failure.
-        let failing = FailingOverflowStore::new(Rc::clone(&shared), 2);
-        let mut cursor = BtCursor::new(failing, root_page, USABLE, true);
-        let payload = vec![0xCC; 9_000];
-
-        let err = cursor.table_insert(&cx, 1, &payload).unwrap_err();
-        assert!(matches!(err, FrankenError::Internal(_)));
-        assert_eq!(
-            shared.borrow().pages.len(),
-            1,
-            "only the root page should remain after failed overflow write"
-        );
-    }
-
-    #[test]
-    fn test_cursor_delete_masks_overflow_cleanup_cancellation() {
-        let root_page = pn(2);
-        let mut base = MemPageStore::new(USABLE);
-        base.init_leaf_table_root(root_page);
-        let shared = Rc::new(RefCell::new(base));
-
-        let store = CancelAfterFirstOverflowFreeStore::new(Rc::clone(&shared));
-        let mut cursor = BtCursor::new(store, root_page, USABLE, true);
-
-        let insert_cx = Cx::new();
-        let payload = vec![0xAB; 9_000];
-        cursor.table_insert(&insert_cx, 7, &payload).unwrap();
-
-        let pages_before: BTreeSet<u32> = shared.borrow().pages.keys().copied().collect();
-        assert!(
-            pages_before.len() > 2,
-            "test requires a multi-page overflow chain, found pages {pages_before:?}"
-        );
-
-        let delete_cx = Cx::new();
-        assert!(cursor.table_move_to(&delete_cx, 7).unwrap().is_found());
-        cursor
-            .delete(&delete_cx)
-            .expect("overflow cleanup must finish even if cancellation arrives mid-chain");
-        assert!(
-            delete_cx.checkpoint().is_err(),
-            "test store should request cancellation during overflow cleanup"
-        );
-
-        let recovery_cx = Cx::new();
-        assert!(!cursor.first(&recovery_cx).unwrap());
-
-        let remaining_pages: BTreeSet<u32> = shared.borrow().pages.keys().copied().collect();
-        assert_eq!(
-            remaining_pages,
-            BTreeSet::from([root_page.get()]),
-            "masked cleanup must reclaim every overflow page before returning"
-        );
-    }
-
-    #[test]
-    fn test_cursor_table_insert_triggers_root_split() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
-
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-
-        let mut rowid = 1i64;
-        let split_rowid = loop {
-            let payload = vec![b'Z'; 220];
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-
-            let root_page = cursor.pager.inner.pages.get(&2).unwrap();
-            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-            if root_header.page_type == cell::BtreePageType::InteriorTable {
-                break rowid;
-            }
-
-            rowid += 1;
-            assert!(
-                rowid < 1000,
-                "table root did not split under sustained inserts"
-            );
-        };
-
-        let root_page = cursor.pager.inner.pages.get(&2).unwrap();
-        let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-        assert_eq!(root_header.page_type, cell::BtreePageType::InteriorTable);
-
-        assert!(cursor.table_move_to(&cx, split_rowid).unwrap().is_found());
-    }
-
-    #[test]
-    fn test_cursor_index_insert_triggers_root_split() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_index(&[]));
-
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
-        let mut idx = 0usize;
-        let split_key = loop {
-            let key = format!("key-{idx:05}");
-            cursor.index_insert(&cx, key.as_bytes()).unwrap();
-
-            let root_page = cursor.pager.pages.get(&2).unwrap();
-            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-            if root_header.page_type == cell::BtreePageType::InteriorIndex {
-                break key.into_bytes();
-            }
-
-            idx += 1;
-            assert!(
-                idx < 2000,
-                "index root did not split under sustained inserts"
-            );
-        };
-
-        let root_page = cursor.pager.pages.get(&2).unwrap();
-        let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-        assert_eq!(root_header.page_type, cell::BtreePageType::InteriorIndex);
-
-        assert!(cursor.index_move_to(&cx, &split_key).unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), split_key);
-    }
-
-    #[test]
-    fn test_cursor_index_delete_removes_interior_separator_key() {
-        const INDEX_USABLE: u32 = 512;
-
-        let root = pn(2);
-        let store = MemPageStore::with_empty_index(root, INDEX_USABLE);
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, root, INDEX_USABLE, false);
-
-        let mut key_idx = 0usize;
-        let separator_key = loop {
-            let key = format!("key-{key_idx:04}").into_bytes();
-            cursor.index_insert(&cx, &key).unwrap();
-            key_idx += 1;
-
-            let root_page = cursor.pager.pages.get(&root.get()).unwrap();
-            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-            if root_header.page_type == cell::BtreePageType::InteriorIndex {
-                let root_entry = cursor.load_page(&cx, root).unwrap();
-                let divider = cursor.parse_cell_at(&root_entry, 0).unwrap();
-                break cursor
-                    .read_cell_payload(&cx, &root_entry, &divider)
-                    .unwrap()
-                    .into_owned();
-            }
-        };
-
-        let mut expected = Vec::new();
-        if cursor.first(&cx).unwrap() {
-            loop {
-                expected.push(cursor.payload(&cx).unwrap());
-                if !cursor.next(&cx).unwrap() {
-                    break;
-                }
-            }
-        }
-        expected.retain(|key| key.as_slice() != separator_key.as_slice());
-
-        let seek = cursor.index_move_to(&cx, &separator_key).unwrap();
-        assert!(
-            seek.is_found(),
-            "separator key should be seekable before delete"
-        );
-        assert!(
-            !cursor
-                .stack
-                .last()
-                .expect("separator seek should leave a cursor frame")
-                .header
-                .page_type
-                .is_leaf(),
-            "separator key must resolve to an interior frame to exercise interior delete"
-        );
-
-        cursor.delete(&cx).unwrap();
-
-        let seek_after = cursor.index_move_to(&cx, &separator_key).unwrap();
-        assert!(
-            !seek_after.is_found(),
-            "deleted separator key must not remain reachable"
-        );
-
-        let mut scanned = Vec::new();
-        if cursor.first(&cx).unwrap() {
-            loop {
-                scanned.push(cursor.payload(&cx).unwrap());
-                if !cursor.next(&cx).unwrap() {
-                    break;
-                }
-            }
-        }
-        assert_eq!(
-            scanned, expected,
-            "interior delete must remove the separator without leaving a stale logical entry"
-        );
-
-        let bounds = validate_index_tree_invariants(&mut cursor, root)
-            .expect("index invariants should hold after deleting an interior separator");
-        assert_eq!(
-            bounds
-                .expect("non-empty index tree should report bounds")
-                .entry_count,
-            expected.len(),
-            "index invariant harness should count the same logical entries as the scan"
-        );
-    }
-
-    #[test]
-    fn test_replace_interior_overflow_is_not_freed_before_balance_succeeds() {
-        const INDEX_USABLE: u32 = 512;
-
-        let root = pn(2);
-        let cx = Cx::new();
-        let store = MemPageStore::with_empty_index(root, INDEX_USABLE);
-        let mut builder = BtCursor::new(store, root, INDEX_USABLE, false);
-
-        let (replacement_len, replacement_local_len) = (1_usize..=4_096)
-            .map(|payload_len| {
-                let payload_size = u32::try_from(payload_len).unwrap();
-                let local_len = usize::try_from(cell::local_payload_size(
-                    payload_size,
-                    INDEX_USABLE,
-                    BtreePageType::InteriorIndex,
-                ))
-                .unwrap();
-                let mut varint = [0_u8; 9];
-                let varint_len = write_varint(&mut varint, u64::from(payload_size));
-                let overflow_pointer_len = if local_len < payload_len { 4 } else { 0 };
-                let on_page_len = 4 + varint_len + local_len + overflow_pointer_len;
-                (payload_len, local_len, on_page_len)
-            })
-            .max_by_key(|&(_, _, on_page_len)| on_page_len)
-            .map(|(payload_len, local_len, _)| (payload_len, local_len))
-            .unwrap();
-
-        // Build a deterministic, validly encoded root with nine minimal-local
-        // overflow cells. Nine 49-byte cells leave only 41 free bytes; after
-        // removing one separator there are still only 90 bytes available, less
-        // than the maximally sized replacement above. This guarantees the
-        // balance path without relying on organically produced tree density.
-        let mut encoded_cells = Vec::new();
-        let mut target = None;
-        for key_idx in 0_u32..9 {
-            let mut key = vec![0x40_u8; 200];
-            key[..4].copy_from_slice(&key_idx.to_be_bytes());
-            let local_len = usize::try_from(cell::local_payload_size(
-                u32::try_from(key.len()).unwrap(),
-                INDEX_USABLE,
-                BtreePageType::InteriorIndex,
-            ))
-            .unwrap();
-            let overflow_head = builder
-                .write_overflow_chain_for_insert(&cx, &key[local_len..])
-                .unwrap();
-
-            let mut encoded = Vec::new();
-            encoded.extend_from_slice(&pn(10_000 + key_idx).get().to_be_bytes());
-            let mut varint = [0_u8; 9];
-            let varint_len = write_varint(&mut varint, u64::try_from(key.len()).unwrap());
-            encoded.extend_from_slice(&varint[..varint_len]);
-            encoded.extend_from_slice(&key[..local_len]);
-            encoded.extend_from_slice(&overflow_head.get().to_be_bytes());
-            if key_idx == 4 {
-                target = Some((key.clone(), overflow_head));
-            }
-            encoded_cells.push(encoded);
-        }
-
-        let mut root_bytes = vec![0_u8; usize::try_from(INDEX_USABLE).unwrap()];
-        let mut content_offset = root_bytes.len();
-        let mut cell_pointers = Vec::with_capacity(encoded_cells.len());
-        for encoded in &encoded_cells {
-            content_offset = content_offset.checked_sub(encoded.len()).unwrap();
-            root_bytes[content_offset..content_offset + encoded.len()].copy_from_slice(encoded);
-            cell_pointers.push(u16::try_from(content_offset).unwrap());
-        }
-        let root_header = BtreePageHeader {
-            page_type: BtreePageType::InteriorIndex,
-            first_freeblock: 0,
-            cell_count: u16::try_from(cell_pointers.len()).unwrap(),
-            cell_content_offset: u32::try_from(content_offset).unwrap(),
-            fragmented_free_bytes: 0,
-            right_child: Some(pn(20_000)),
-        };
-        root_header.write(&mut root_bytes, 0);
-        cell::write_cell_pointers(&mut root_bytes, 0, &root_header, &cell_pointers);
-        builder.pager.pages.insert(root.get(), root_bytes);
-
-        let (old_key, old_overflow_head) = target.unwrap();
-        let base_store = builder.pager;
-        assert!(base_store.pages.contains_key(&old_overflow_head.get()));
-        let shared = Rc::new(RefCell::new(base_store));
-
-        let overflow_payload_len = replacement_len - replacement_local_len;
-        let new_overflow_pages =
-            overflow_payload_len.div_ceil(usize::try_from(INDEX_USABLE).unwrap() - 4);
-        // Replacement writes: N new-overflow pages, the old-cell-free page,
-        // then the first structural balance write. Fail that balance write.
-        let fail_on_write = new_overflow_pages + 2;
-        let failing = FailingOverflowStore::new(Rc::clone(&shared), fail_on_write);
-        let mut cursor = BtCursor::new(failing, root, INDEX_USABLE, false);
-        assert!(cursor.index_move_to(&cx, &old_key).unwrap().is_found());
-        assert!(
-            !cursor.stack.last().unwrap().header.page_type.is_leaf(),
-            "fixture key must resolve to an interior separator"
-        );
-
-        let replacement = vec![0xA5; replacement_len];
-        let error = cursor
-            .replace_interior_cell(&cx, &replacement)
-            .expect_err("the injected first balance write must fail");
-        assert!(
-            matches!(error, FrankenError::Internal(ref message) if message == "injected write failure"),
-            "expected the injected balance failure, got {error:?}"
-        );
-        assert!(
-            shared.borrow().pages.contains_key(&old_overflow_head.get()),
-            "the old separator must retain ownership of its overflow chain until balance succeeds"
-        );
-    }
-
-    #[test]
-    fn test_cursor_index_delete_updates_nonroot_interior_sequence_in_depth3_tree() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_index(&[(pn(3), b"m")], pn(4)));
-        store.pages.insert(
-            3,
-            build_interior_index(&[(pn(5), b"d"), (pn(6), b"h")], pn(7)),
-        );
-        store
-            .pages
-            .insert(4, build_interior_index(&[(pn(8), b"s")], pn(9)));
-        store.pages.insert(5, build_leaf_index(&[b"a", b"b"]));
-        store.pages.insert(6, build_leaf_index(&[b"e", b"f"]));
-        store.pages.insert(7, build_leaf_index(&[b"i", b"j"]));
-        store.pages.insert(8, build_leaf_index(&[b"n", b"q"]));
-        store.pages.insert(9, build_leaf_index(&[b"t", b"z"]));
-
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
-
-        let scanned_before = scan_all_index_keys(&mut cursor, &cx).unwrap();
-        assert_eq!(
-            scanned_before,
-            vec![
-                b"a".to_vec(),
-                b"b".to_vec(),
-                b"d".to_vec(),
-                b"e".to_vec(),
-                b"f".to_vec(),
-                b"h".to_vec(),
-                b"i".to_vec(),
-                b"j".to_vec(),
-                b"m".to_vec(),
-                b"n".to_vec(),
-                b"q".to_vec(),
-                b"s".to_vec(),
-                b"t".to_vec(),
-                b"z".to_vec(),
-            ]
-        );
-        validate_index_tree_invariants(&mut cursor, pn(2))
-            .expect("hand-built depth-3 index tree should satisfy structural invariants");
-
-        let seek = cursor.index_move_to(&cx, b"h").unwrap();
-        assert!(
-            seek.is_found(),
-            "target separator should exist before delete"
-        );
-        assert!(
-            !cursor
-                .stack
-                .last()
-                .expect("seek should leave a cursor frame")
-                .header
-                .page_type
-                .is_leaf(),
-            "target key must resolve to the non-root interior separator"
-        );
-
-        cursor.delete(&cx).unwrap();
-
-        let scanned_after = scan_all_index_keys(&mut cursor, &cx).unwrap();
-        assert_eq!(
-            scanned_after,
-            vec![
-                b"a".to_vec(),
-                b"b".to_vec(),
-                b"d".to_vec(),
-                b"e".to_vec(),
-                b"f".to_vec(),
-                b"i".to_vec(),
-                b"j".to_vec(),
-                b"m".to_vec(),
-                b"n".to_vec(),
-                b"q".to_vec(),
-                b"s".to_vec(),
-                b"t".to_vec(),
-                b"z".to_vec(),
-            ],
-            "non-root interior delete should preserve a strictly ordered logical sequence"
-        );
-        assert!(!cursor.index_move_to(&cx, b"h").unwrap().is_found());
-
-        let bounds = validate_index_tree_invariants(&mut cursor, pn(2))
-            .expect("index invariants should hold after non-root interior delete");
-        assert_eq!(
-            bounds
-                .expect("non-empty index tree should report bounds")
-                .entry_count,
-            scanned_after.len(),
-        );
-    }
-
-    #[test]
-    fn test_cursor_index_delete_then_reinsert_same_key_preserves_exact_count() {
-        let root = pn(2);
-        let store = MemPageStore::with_empty_index(root, USABLE);
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, root, USABLE, false);
-
-        let provenance_key = serialize_record(&[
-            SqliteValue::Text("local".into()),
-            SqliteValue::Integer(1),
-            SqliteValue::Text("dup-session".into()),
-            SqliteValue::Integer(1),
-        ]);
-        let source_id_key =
-            serialize_record(&[SqliteValue::Text("local".into()), SqliteValue::Integer(1)]);
-
-        for key in [&provenance_key, &source_id_key] {
-            cursor.index_insert(&cx, key).unwrap();
-            assert_eq!(
-                cursor.count_all_rows(&cx).unwrap(),
-                1,
-                "freshly inserted key should count exactly once"
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_index(&[]));
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new_with_index_desc(store, pn(2), USABLE, false, Vec::new());
+            cursor.set_index_collation_context(
+                vec![Some("NOCASE".to_owned())],
+                Arc::new(Mutex::new(CollationRegistry::new())),
             );
 
-            assert!(cursor.index_move_to(&cx, key).unwrap().is_found());
-            cursor.delete(&cx).unwrap();
-            assert_eq!(
-                cursor.count_all_rows(&cx).unwrap(),
-                0,
-                "deleted key should be removed completely"
-            );
+            for key in [
+                serialize_record(&[SqliteValue::Text("alpha".into()), SqliteValue::Integer(1)]),
+                serialize_record(&[SqliteValue::Text("ALPHA".into()), SqliteValue::Integer(2)]),
+                serialize_record(&[SqliteValue::Text("beta".into()), SqliteValue::Integer(3)]),
+            ] {
+                cursor.index_insert(&cx, &key).await.unwrap();
+            }
 
-            cursor.index_insert(&cx, key).unwrap();
-            assert_eq!(
-                cursor.count_all_rows(&cx).unwrap(),
-                1,
-                "reinserting the same key must not leave a duplicate logical entry"
-            );
-
-            let mut scanned = Vec::new();
-            if cursor.first(&cx).unwrap() {
+            let mut seen = Vec::new();
+            if cursor.first(&cx).await.unwrap() {
                 loop {
-                    scanned.push(cursor.payload(&cx).unwrap());
-                    if !cursor.next(&cx).unwrap() {
+                    let fields = parse_record(&cursor.payload(&cx).await.unwrap()).unwrap();
+                    seen.push((fields[0].clone(), cursor.rowid(&cx).await.unwrap()));
+                    if !cursor.next(&cx).await.unwrap() {
                         break;
                     }
                 }
             }
-            assert_eq!(scanned, vec![key.clone()]);
 
-            assert!(cursor.index_move_to(&cx, key).unwrap().is_found());
-            cursor.delete(&cx).unwrap();
-            assert_eq!(cursor.count_all_rows(&cx).unwrap(), 0);
-        }
+            assert_eq!(
+                seen,
+                vec![
+                    (SqliteValue::Text("alpha".into()), 1),
+                    (SqliteValue::Text("ALPHA".into()), 2),
+                    (SqliteValue::Text("beta".into()), 3),
+                ],
+                "index scan order should follow NOCASE collation with rowid as the tie-breaker"
+            );
+        });
+    }
+
+    #[test]
+    fn test_cursor_index_rowid_rejects_record_without_trailing_integer() {
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_index(&[]));
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+
+            let key = serialize_record(&[SqliteValue::Text("missing-rowid".into())]);
+
+            cursor.index_insert(&cx, &key).await.unwrap();
+            assert!(cursor.index_move_to(&cx, &key).await.unwrap().is_found());
+
+            let err = cursor.rowid(&cx).await.unwrap_err();
+            assert!(matches!(err, FrankenError::DatabaseCorrupt { .. }));
+        });
+    }
+
+    #[test]
+    fn test_cursor_table_insert_with_overflow_payload() {
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
+            let payload: Vec<u8> = (0u8..=255).cycle().take(5000).collect();
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            cursor.table_insert(&cx, 42, &payload).await.unwrap();
+
+            assert!(cursor.table_move_to(&cx, 42).await.unwrap().is_found());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), payload);
+        });
+    }
+
+    #[test]
+    fn test_cursor_table_seek_past_end_then_insert() {
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_leaf_table(&[(1, b"one"), (2, b"two"), (3, b"three"), (4, b"four")]),
+            );
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+            let seek = cursor.table_move_to(&cx, 99).await.unwrap();
+            assert!(!seek.is_found());
+            assert!(cursor.eof(), "seek past end should set eof");
+
+            cursor.table_insert(&cx, 99, b"tail").await.unwrap();
+            assert!(cursor.table_move_to(&cx, 99).await.unwrap().is_found());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"tail");
+        });
+    }
+
+    #[test]
+    fn test_cursor_index_seek_past_end_then_insert() {
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_index(&[b"alpha", b"mid"]));
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+            let key = b"zz-top";
+
+            let seek = cursor.index_move_to(&cx, key).await.unwrap();
+            assert!(!seek.is_found());
+            assert!(cursor.eof(), "seek past end should set eof");
+
+            cursor.index_insert(&cx, key).await.unwrap();
+            assert!(cursor.index_move_to(&cx, key).await.unwrap().is_found());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), key);
+        });
+    }
+
+    #[test]
+    fn test_cursor_prev_from_seek_past_end_lands_on_last_entry() {
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_leaf_table(&[(1, b"one"), (2, b"two"), (3, b"three"), (4, b"four")]),
+            );
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+            let seek = cursor.table_move_to(&cx, 99).await.unwrap();
+            assert!(!seek.is_found());
+            assert!(cursor.eof());
+
+            assert!(cursor.prev(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 4);
+        });
+    }
+
+    #[test]
+    fn test_cursor_next_after_prev_from_first_recovers() {
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_leaf_table(&[(1, b"one"), (2, b"two"), (3, b"three"), (4, b"four")]),
+            );
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+            assert!(cursor.first(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 1);
+            assert!(!cursor.prev(&cx).await.unwrap());
+
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 1);
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 2);
+        });
+    }
+
+    #[test]
+    fn test_cursor_prev_after_next_from_last_recovers() {
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_leaf_table(&[(1, b"one"), (2, b"two"), (3, b"three"), (4, b"four")]),
+            );
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+
+            assert!(cursor.last(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 4);
+            assert!(cursor.prev(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 3);
+            assert!(cursor.prev(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 2);
+            assert!(cursor.prev(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 1);
+            assert!(!cursor.prev(&cx).await.unwrap());
+        });
+    }
+
+    #[test]
+    fn test_cursor_table_insert_overflow_write_failure_frees_allocations() {
+        run_async(async {
+            let cx = Cx::new();
+            let root_page = pn(2);
+            let mut base = MemPageStore::new(USABLE);
+            base.init_leaf_table_root(root_page);
+            let shared = Rc::new(RefCell::new(base));
+
+            // Force a mid-chain overflow write failure.
+            let failing = FailingOverflowStore::new(Rc::clone(&shared), 2);
+            let mut cursor = BtCursor::new(failing, root_page, USABLE, true);
+            let payload = vec![0xCC; 9_000];
+
+            let err = cursor.table_insert(&cx, 1, &payload).await.unwrap_err();
+            assert!(matches!(err, FrankenError::Internal(_)));
+            assert_eq!(
+                shared.borrow().pages.len(),
+                1,
+                "only the root page should remain after failed overflow write"
+            );
+        });
+    }
+
+    #[test]
+    fn test_cursor_delete_masks_overflow_cleanup_cancellation() {
+        run_async(async {
+            let root_page = pn(2);
+            let mut base = MemPageStore::new(USABLE);
+            base.init_leaf_table_root(root_page);
+            let shared = Rc::new(RefCell::new(base));
+
+            let store = CancelAfterFirstOverflowFreeStore::new(Rc::clone(&shared));
+            let mut cursor = BtCursor::new(store, root_page, USABLE, true);
+
+            let insert_cx = Cx::new();
+            let payload = vec![0xAB; 9_000];
+            cursor.table_insert(&insert_cx, 7, &payload).await.unwrap();
+
+            let pages_before: BTreeSet<u32> = shared.borrow().pages.keys().copied().collect();
+            assert!(
+                pages_before.len() > 2,
+                "test requires a multi-page overflow chain, found pages {pages_before:?}"
+            );
+
+            let delete_cx = Cx::new();
+            assert!(
+                cursor
+                    .table_move_to(&delete_cx, 7)
+                    .await
+                    .unwrap()
+                    .is_found()
+            );
+            cursor
+                .delete(&delete_cx)
+                .await
+                .expect("overflow cleanup must finish even if cancellation arrives mid-chain");
+            assert!(
+                delete_cx.checkpoint().is_err(),
+                "test store should request cancellation during overflow cleanup"
+            );
+
+            let recovery_cx = Cx::new();
+            assert!(!cursor.first(&recovery_cx).await.unwrap());
+
+            let remaining_pages: BTreeSet<u32> = shared.borrow().pages.keys().copied().collect();
+            assert_eq!(
+                remaining_pages,
+                BTreeSet::from([root_page.get()]),
+                "masked cleanup must reclaim every overflow page before returning"
+            );
+        });
+    }
+
+    #[test]
+    fn test_cursor_table_insert_triggers_root_split() {
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+            let mut rowid = 1i64;
+            let split_rowid = loop {
+                let payload = vec![b'Z'; 220];
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+
+                let root_page = cursor.pager.inner.pages.get(&2).unwrap();
+                let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+                if root_header.page_type == cell::BtreePageType::InteriorTable {
+                    break rowid;
+                }
+
+                rowid += 1;
+                assert!(
+                    rowid < 1000,
+                    "table root did not split under sustained inserts"
+                );
+            };
+
+            let root_page = cursor.pager.inner.pages.get(&2).unwrap();
+            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+            assert_eq!(root_header.page_type, cell::BtreePageType::InteriorTable);
+
+            assert!(
+                cursor
+                    .table_move_to(&cx, split_rowid)
+                    .await
+                    .unwrap()
+                    .is_found()
+            );
+        });
+    }
+
+    #[test]
+    fn test_cursor_index_insert_triggers_root_split() {
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_index(&[]));
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+            let mut idx = 0usize;
+            let split_key = loop {
+                let key = format!("key-{idx:05}");
+                cursor.index_insert(&cx, key.as_bytes()).await.unwrap();
+
+                let root_page = cursor.pager.pages.get(&2).unwrap();
+                let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+                if root_header.page_type == cell::BtreePageType::InteriorIndex {
+                    break key.into_bytes();
+                }
+
+                idx += 1;
+                assert!(
+                    idx < 2000,
+                    "index root did not split under sustained inserts"
+                );
+            };
+
+            let root_page = cursor.pager.pages.get(&2).unwrap();
+            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+            assert_eq!(root_header.page_type, cell::BtreePageType::InteriorIndex);
+
+            assert!(
+                cursor
+                    .index_move_to(&cx, &split_key)
+                    .await
+                    .unwrap()
+                    .is_found()
+            );
+            assert_eq!(cursor.payload(&cx).await.unwrap(), split_key);
+        });
+    }
+
+    #[test]
+    fn test_cursor_index_delete_removes_interior_separator_key() {
+        run_async(async {
+            const INDEX_USABLE: u32 = 512;
+
+            let root = pn(2);
+            let store = MemPageStore::with_empty_index(root, INDEX_USABLE);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, root, INDEX_USABLE, false);
+
+            let mut key_idx = 0usize;
+            let separator_key = loop {
+                let key = format!("key-{key_idx:04}").into_bytes();
+                cursor.index_insert(&cx, &key).await.unwrap();
+                key_idx += 1;
+
+                let root_page = cursor.pager.pages.get(&root.get()).unwrap();
+                let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+                if root_header.page_type == cell::BtreePageType::InteriorIndex {
+                    let root_entry = cursor.load_page(&cx, root).await.unwrap();
+                    let divider = cursor.parse_cell_at(&root_entry, 0).unwrap();
+                    break cursor
+                        .read_cell_payload(&cx, &root_entry, &divider)
+                        .await
+                        .unwrap()
+                        .into_owned();
+                }
+            };
+
+            let mut expected = Vec::new();
+            if cursor.first(&cx).await.unwrap() {
+                loop {
+                    expected.push(cursor.payload(&cx).await.unwrap());
+                    if !cursor.next(&cx).await.unwrap() {
+                        break;
+                    }
+                }
+            }
+            expected.retain(|key| key.as_slice() != separator_key.as_slice());
+
+            let seek = cursor.index_move_to(&cx, &separator_key).await.unwrap();
+            assert!(
+                seek.is_found(),
+                "separator key should be seekable before delete"
+            );
+            assert!(
+                !cursor
+                    .stack
+                    .last()
+                    .expect("separator seek should leave a cursor frame")
+                    .header
+                    .page_type
+                    .is_leaf(),
+                "separator key must resolve to an interior frame to exercise interior delete"
+            );
+
+            cursor.delete(&cx).await.unwrap();
+
+            let seek_after = cursor.index_move_to(&cx, &separator_key).await.unwrap();
+            assert!(
+                !seek_after.is_found(),
+                "deleted separator key must not remain reachable"
+            );
+
+            let mut scanned = Vec::new();
+            if cursor.first(&cx).await.unwrap() {
+                loop {
+                    scanned.push(cursor.payload(&cx).await.unwrap());
+                    if !cursor.next(&cx).await.unwrap() {
+                        break;
+                    }
+                }
+            }
+            assert_eq!(
+                scanned, expected,
+                "interior delete must remove the separator without leaving a stale logical entry"
+            );
+
+            let bounds = validate_index_tree_invariants(&mut cursor, root)
+                .await
+                .expect("index invariants should hold after deleting an interior separator");
+            assert_eq!(
+                bounds
+                    .expect("non-empty index tree should report bounds")
+                    .entry_count,
+                expected.len(),
+                "index invariant harness should count the same logical entries as the scan"
+            );
+        });
+    }
+
+    #[test]
+    fn test_replace_interior_overflow_is_not_freed_before_balance_succeeds() {
+        run_async(async {
+            const INDEX_USABLE: u32 = 512;
+
+            let root = pn(2);
+            let cx = Cx::new();
+            let store = MemPageStore::with_empty_index(root, INDEX_USABLE);
+            let mut builder = BtCursor::new(store, root, INDEX_USABLE, false);
+
+            let (replacement_len, replacement_local_len) = (1_usize..=4_096)
+                .map(|payload_len| {
+                    let payload_size = u32::try_from(payload_len).unwrap();
+                    let local_len = usize::try_from(cell::local_payload_size(
+                        payload_size,
+                        INDEX_USABLE,
+                        BtreePageType::InteriorIndex,
+                    ))
+                    .unwrap();
+                    let mut varint = [0_u8; 9];
+                    let varint_len = write_varint(&mut varint, u64::from(payload_size));
+                    let overflow_pointer_len = if local_len < payload_len { 4 } else { 0 };
+                    let on_page_len = 4 + varint_len + local_len + overflow_pointer_len;
+                    (payload_len, local_len, on_page_len)
+                })
+                .max_by_key(|&(_, _, on_page_len)| on_page_len)
+                .map(|(payload_len, local_len, _)| (payload_len, local_len))
+                .unwrap();
+
+            // Build a deterministic, validly encoded root with nine minimal-local
+            // overflow cells. Nine 49-byte cells leave only 41 free bytes; after
+            // removing one separator there are still only 90 bytes available, less
+            // than the maximally sized replacement above. This guarantees the
+            // balance path without relying on organically produced tree density.
+            let mut encoded_cells = Vec::new();
+            let mut target = None;
+            for key_idx in 0_u32..9 {
+                let mut key = vec![0x40_u8; 200];
+                key[..4].copy_from_slice(&key_idx.to_be_bytes());
+                let local_len = usize::try_from(cell::local_payload_size(
+                    u32::try_from(key.len()).unwrap(),
+                    INDEX_USABLE,
+                    BtreePageType::InteriorIndex,
+                ))
+                .unwrap();
+                let overflow_head = builder
+                    .write_overflow_chain_for_insert(&cx, &key[local_len..])
+                    .await
+                    .unwrap();
+
+                let mut encoded = Vec::new();
+                encoded.extend_from_slice(&pn(10_000 + key_idx).get().to_be_bytes());
+                let mut varint = [0_u8; 9];
+                let varint_len = write_varint(&mut varint, u64::try_from(key.len()).unwrap());
+                encoded.extend_from_slice(&varint[..varint_len]);
+                encoded.extend_from_slice(&key[..local_len]);
+                encoded.extend_from_slice(&overflow_head.get().to_be_bytes());
+                if key_idx == 4 {
+                    target = Some((key.clone(), overflow_head));
+                }
+                encoded_cells.push(encoded);
+            }
+
+            let mut root_bytes = vec![0_u8; usize::try_from(INDEX_USABLE).unwrap()];
+            let mut content_offset = root_bytes.len();
+            let mut cell_pointers = Vec::with_capacity(encoded_cells.len());
+            for encoded in &encoded_cells {
+                content_offset = content_offset.checked_sub(encoded.len()).unwrap();
+                root_bytes[content_offset..content_offset + encoded.len()].copy_from_slice(encoded);
+                cell_pointers.push(u16::try_from(content_offset).unwrap());
+            }
+            let root_header = BtreePageHeader {
+                page_type: BtreePageType::InteriorIndex,
+                first_freeblock: 0,
+                cell_count: u16::try_from(cell_pointers.len()).unwrap(),
+                cell_content_offset: u32::try_from(content_offset).unwrap(),
+                fragmented_free_bytes: 0,
+                right_child: Some(pn(20_000)),
+            };
+            root_header.write(&mut root_bytes, 0);
+            cell::write_cell_pointers(&mut root_bytes, 0, &root_header, &cell_pointers);
+            builder.pager.pages.insert(root.get(), root_bytes);
+
+            let (old_key, old_overflow_head) = target.unwrap();
+            let base_store = builder.pager;
+            assert!(base_store.pages.contains_key(&old_overflow_head.get()));
+            let shared = Rc::new(RefCell::new(base_store));
+
+            let overflow_payload_len = replacement_len - replacement_local_len;
+            let new_overflow_pages =
+                overflow_payload_len.div_ceil(usize::try_from(INDEX_USABLE).unwrap() - 4);
+            // Replacement writes: N new-overflow pages, the old-cell-free page,
+            // then the first structural balance write. Fail that balance write.
+            let fail_on_write = new_overflow_pages + 2;
+            let failing = FailingOverflowStore::new(Rc::clone(&shared), fail_on_write);
+            let mut cursor = BtCursor::new(failing, root, INDEX_USABLE, false);
+            assert!(
+                cursor
+                    .index_move_to(&cx, &old_key)
+                    .await
+                    .unwrap()
+                    .is_found()
+            );
+            assert!(
+                !cursor.stack.last().unwrap().header.page_type.is_leaf(),
+                "fixture key must resolve to an interior separator"
+            );
+
+            let replacement = vec![0xA5; replacement_len];
+            let error = cursor
+                .replace_interior_cell(&cx, &replacement)
+                .await
+                .expect_err("the injected first balance write must fail");
+            assert!(
+                matches!(error, FrankenError::Internal(ref message) if message == "injected write failure"),
+                "expected the injected balance failure, got {error:?}"
+            );
+            assert!(
+                shared.borrow().pages.contains_key(&old_overflow_head.get()),
+                "the old separator must retain ownership of its overflow chain until balance succeeds"
+            );
+        });
+    }
+
+    #[test]
+    fn test_cursor_index_delete_updates_nonroot_interior_sequence_in_depth3_tree() {
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_index(&[(pn(3), b"m")], pn(4)));
+            store.pages.insert(
+                3,
+                build_interior_index(&[(pn(5), b"d"), (pn(6), b"h")], pn(7)),
+            );
+            store
+                .pages
+                .insert(4, build_interior_index(&[(pn(8), b"s")], pn(9)));
+            store.pages.insert(5, build_leaf_index(&[b"a", b"b"]));
+            store.pages.insert(6, build_leaf_index(&[b"e", b"f"]));
+            store.pages.insert(7, build_leaf_index(&[b"i", b"j"]));
+            store.pages.insert(8, build_leaf_index(&[b"n", b"q"]));
+            store.pages.insert(9, build_leaf_index(&[b"t", b"z"]));
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+
+            let scanned_before = scan_all_index_keys(&mut cursor, &cx).await.unwrap();
+            assert_eq!(
+                scanned_before,
+                vec![
+                    b"a".to_vec(),
+                    b"b".to_vec(),
+                    b"d".to_vec(),
+                    b"e".to_vec(),
+                    b"f".to_vec(),
+                    b"h".to_vec(),
+                    b"i".to_vec(),
+                    b"j".to_vec(),
+                    b"m".to_vec(),
+                    b"n".to_vec(),
+                    b"q".to_vec(),
+                    b"s".to_vec(),
+                    b"t".to_vec(),
+                    b"z".to_vec(),
+                ]
+            );
+            validate_index_tree_invariants(&mut cursor, pn(2))
+                .await
+                .expect("hand-built depth-3 index tree should satisfy structural invariants");
+
+            let seek = cursor.index_move_to(&cx, b"h").await.unwrap();
+            assert!(
+                seek.is_found(),
+                "target separator should exist before delete"
+            );
+            assert!(
+                !cursor
+                    .stack
+                    .last()
+                    .expect("seek should leave a cursor frame")
+                    .header
+                    .page_type
+                    .is_leaf(),
+                "target key must resolve to the non-root interior separator"
+            );
+
+            cursor.delete(&cx).await.unwrap();
+
+            let scanned_after = scan_all_index_keys(&mut cursor, &cx).await.unwrap();
+            assert_eq!(
+                scanned_after,
+                vec![
+                    b"a".to_vec(),
+                    b"b".to_vec(),
+                    b"d".to_vec(),
+                    b"e".to_vec(),
+                    b"f".to_vec(),
+                    b"i".to_vec(),
+                    b"j".to_vec(),
+                    b"m".to_vec(),
+                    b"n".to_vec(),
+                    b"q".to_vec(),
+                    b"s".to_vec(),
+                    b"t".to_vec(),
+                    b"z".to_vec(),
+                ],
+                "non-root interior delete should preserve a strictly ordered logical sequence"
+            );
+            assert!(!cursor.index_move_to(&cx, b"h").await.unwrap().is_found());
+
+            let bounds = validate_index_tree_invariants(&mut cursor, pn(2))
+                .await
+                .expect("index invariants should hold after non-root interior delete");
+            assert_eq!(
+                bounds
+                    .expect("non-empty index tree should report bounds")
+                    .entry_count,
+                scanned_after.len(),
+            );
+        });
+    }
+
+    #[test]
+    fn test_cursor_index_delete_then_reinsert_same_key_preserves_exact_count() {
+        run_async(async {
+            let root = pn(2);
+            let store = MemPageStore::with_empty_index(root, USABLE);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, root, USABLE, false);
+
+            let provenance_key = serialize_record(&[
+                SqliteValue::Text("local".into()),
+                SqliteValue::Integer(1),
+                SqliteValue::Text("dup-session".into()),
+                SqliteValue::Integer(1),
+            ]);
+            let source_id_key =
+                serialize_record(&[SqliteValue::Text("local".into()), SqliteValue::Integer(1)]);
+
+            for key in [&provenance_key, &source_id_key] {
+                cursor.index_insert(&cx, key).await.unwrap();
+                assert_eq!(
+                    cursor.count_all_rows(&cx).await.unwrap(),
+                    1,
+                    "freshly inserted key should count exactly once"
+                );
+
+                assert!(cursor.index_move_to(&cx, key).await.unwrap().is_found());
+                cursor.delete(&cx).await.unwrap();
+                assert_eq!(
+                    cursor.count_all_rows(&cx).await.unwrap(),
+                    0,
+                    "deleted key should be removed completely"
+                );
+
+                cursor.index_insert(&cx, key).await.unwrap();
+                assert_eq!(
+                    cursor.count_all_rows(&cx).await.unwrap(),
+                    1,
+                    "reinserting the same key must not leave a duplicate logical entry"
+                );
+
+                let mut scanned = Vec::new();
+                if cursor.first(&cx).await.unwrap() {
+                    loop {
+                        scanned.push(cursor.payload(&cx).await.unwrap());
+                        if !cursor.next(&cx).await.unwrap() {
+                            break;
+                        }
+                    }
+                }
+                assert_eq!(scanned, vec![key.clone()]);
+
+                assert!(cursor.index_move_to(&cx, key).await.unwrap().is_found());
+                cursor.delete(&cx).await.unwrap();
+                assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), 0);
+            }
+        });
     }
 
     #[test]
     fn test_cursor_repeated_root_overflow_does_not_leave_orphan_pages() {
-        const SMALL_USABLE: u32 = 512;
+        run_async(async {
+            const SMALL_USABLE: u32 = 512;
 
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, root, SMALL_USABLE, true);
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, root, SMALL_USABLE, true);
 
-        for rowid in 1_i64..=200_i64 {
-            cursor.table_insert(&cx, rowid, &vec![b'R'; 180]).unwrap();
-        }
+            for rowid in 1_i64..=200_i64 {
+                cursor
+                    .table_insert(&cx, rowid, &vec![b'R'; 180])
+                    .await
+                    .unwrap();
+            }
 
-        let root_page = cursor.pager.pages.get(&root.get()).unwrap();
-        let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-        assert!(
-            root_header.page_type.is_interior(),
-            "test requires an interior root after sustained inserts"
-        );
+            let root_page = cursor.pager.pages.get(&root.get()).unwrap();
+            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+            assert!(
+                root_header.page_type.is_interior(),
+                "test requires an interior root after sustained inserts"
+            );
 
-        let all_pages: BTreeSet<u32> = cursor.pager.pages.keys().copied().collect();
-        assert!(
-            all_pages.len() > 6,
-            "test requires enough pages to exercise repeated root overflow"
-        );
+            let all_pages: BTreeSet<u32> = cursor.pager.pages.keys().copied().collect();
+            assert!(
+                all_pages.len() > 6,
+                "test requires enough pages to exercise repeated root overflow"
+            );
 
-        let mut reachable = BTreeSet::new();
-        collect_reachable_pages(&cursor.pager, root, SMALL_USABLE, &mut reachable);
-        assert_eq!(
-            reachable, all_pages,
-            "repeated root overflow must not leave detached child generations behind"
-        );
+            let mut reachable = BTreeSet::new();
+            collect_reachable_pages(&cursor.pager, root, SMALL_USABLE, &mut reachable);
+            assert_eq!(
+                reachable, all_pages,
+                "repeated root overflow must not leave detached child generations behind"
+            );
+        });
     }
 
     #[test]
     fn test_cursor_table_insert_after_root_split() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        let mut rowid = 1i64;
-        loop {
-            let payload = vec![b'Z'; 220];
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-            let root_page = cursor.pager.inner.pages.get(&2).unwrap();
-            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-            if root_header.page_type == cell::BtreePageType::InteriorTable {
-                break;
+            let mut rowid = 1i64;
+            loop {
+                let payload = vec![b'Z'; 220];
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+                let root_page = cursor.pager.inner.pages.get(&2).unwrap();
+                let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+                if root_header.page_type == cell::BtreePageType::InteriorTable {
+                    break;
+                }
+                rowid += 1;
+                assert!(
+                    rowid < 1000,
+                    "table root did not split under sustained inserts"
+                );
             }
+
+            // Insert after split to exercise multi-level insert path.
             rowid += 1;
-            assert!(
-                rowid < 1000,
-                "table root did not split under sustained inserts"
-            );
-        }
+            cursor
+                .table_insert(&cx, rowid, b"after-split")
+                .await
+                .unwrap();
 
-        // Insert after split to exercise multi-level insert path.
-        rowid += 1;
-        cursor.table_insert(&cx, rowid, b"after-split").unwrap();
-
-        assert!(cursor.table_move_to(&cx, rowid).unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), b"after-split");
+            assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"after-split");
+        });
     }
 
     #[test]
     fn test_cursor_delete_single_leaf() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[(1, b"one"), (2, b"two"), (3, b"three")]),
-        );
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_leaf_table(&[(1, b"one"), (2, b"two"), (3, b"three")]),
+            );
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
-        cursor.delete(&cx).unwrap();
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            assert!(cursor.table_move_to(&cx, 2).await.unwrap().is_found());
+            cursor.delete(&cx).await.unwrap();
 
-        let result = cursor.table_move_to(&cx, 2).unwrap();
-        assert!(!result.is_found());
-        assert!(!cursor.eof());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
+            let result = cursor.table_move_to(&cx, 2).await.unwrap();
+            assert!(!result.is_found());
+            assert!(!cursor.eof());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 3);
 
-        assert!(cursor.first(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
-        assert!(!cursor.next(&cx).unwrap());
+            assert!(cursor.first(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 1);
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 3);
+            assert!(!cursor.next(&cx).await.unwrap());
+        });
     }
 
     #[test]
     fn test_table_delete_rejects_duplicate_compact_leaf_pointer() {
-        let mut page = build_leaf_table(&[(1, b"one"), (2, b"two"), (3, b"three")]);
-        let duplicate_ptr = u16::from_be_bytes([page[10], page[11]]);
-        page[12..14].copy_from_slice(&duplicate_ptr.to_be_bytes());
-        page[5..7].copy_from_slice(&duplicate_ptr.to_be_bytes());
+        run_async(async {
+            let mut page = build_leaf_table(&[(1, b"one"), (2, b"two"), (3, b"three")]);
+            let duplicate_ptr = u16::from_be_bytes([page[10], page[11]]);
+            page[12..14].copy_from_slice(&duplicate_ptr.to_be_bytes());
+            page[5..7].copy_from_slice(&duplicate_ptr.to_be_bytes());
 
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, page);
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, page);
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        assert!(cursor.first(&cx).unwrap());
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            assert!(cursor.first(&cx).await.unwrap());
 
-        let err = cursor
-            .delete(&cx)
-            .expect_err("duplicate compact cell pointers must be rejected as corruption");
-        assert!(
-            matches!(err, FrankenError::DatabaseCorrupt { ref detail } if detail.contains("not monotone")),
-            "unexpected error: {err:?}"
-        );
+            let err = cursor
+                .delete(&cx)
+                .await
+                .expect_err("duplicate compact cell pointers must be rejected as corruption");
+            assert!(
+                matches!(err, FrankenError::DatabaseCorrupt { ref detail } if detail.contains("not monotone")),
+                "unexpected error: {err:?}"
+            );
+        });
     }
 
     #[test]
     fn test_cursor_delete_after_root_split_preserves_right_subtree_rows() {
-        // After commit 5eed5a0a, table-leaf DELETE uses the defragment-on-delete
-        // strategy (instead of maintaining a freeblock chain) for SQLite
-        // `btreeComputeFreeSpace()` compatibility. Deleting every rowid in the
-        // leftmost leaf of a split root may therefore trigger an eager merge
-        // + balance_shallower that collapses the tree back to a single leaf.
-        // The correctness invariant this test protects is that the
-        // surviving right-subtree rows remain reachable and the cursor
-        // positions cleanly on the successor.
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            // After commit 5eed5a0a, table-leaf DELETE uses the defragment-on-delete
+            // strategy (instead of maintaining a freeblock chain) for SQLite
+            // `btreeComputeFreeSpace()` compatibility. Deleting every rowid in the
+            // leftmost leaf of a split root may therefore trigger an eager merge
+            // + balance_shallower that collapses the tree back to a single leaf.
+            // The correctness invariant this test protects is that the
+            // surviving right-subtree rows remain reachable and the cursor
+            // positions cleanly on the successor.
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        let mut max_rowid = 0i64;
-        loop {
-            let payload = vec![b'Q'; 220];
-            cursor.table_insert(&cx, max_rowid, &payload).unwrap();
+            let mut max_rowid = 0i64;
+            loop {
+                let payload = vec![b'Q'; 220];
+                cursor.table_insert(&cx, max_rowid, &payload).await.unwrap();
+                let root_page = cursor.pager.inner.pages.get(&2).unwrap();
+                let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+                if root_header.page_type == cell::BtreePageType::InteriorTable {
+                    break;
+                }
+                max_rowid += 1;
+                assert!(
+                    max_rowid < 1000,
+                    "table root did not split under sustained inserts"
+                );
+            }
+
             let root_page = cursor.pager.inner.pages.get(&2).unwrap();
             let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-            if root_header.page_type == cell::BtreePageType::InteriorTable {
-                break;
+            let root_ptrs = cell::read_cell_pointers(root_page, &root_header, 0).unwrap();
+            let first_divider_cell = CellRef::parse(
+                root_page,
+                usize::from(root_ptrs[0]),
+                root_header.page_type,
+                USABLE,
+            )
+            .unwrap();
+            let leftmost_max_rowid = first_divider_cell.rowid.unwrap();
+            assert!(leftmost_max_rowid >= 1);
+            assert!(leftmost_max_rowid < max_rowid);
+
+            for rowid in 0..=leftmost_max_rowid {
+                let seek = cursor.table_move_to(&cx, rowid).await.unwrap();
+                assert!(seek.is_found(), "rowid {rowid} should exist before delete");
+                cursor.delete(&cx).await.unwrap();
             }
-            max_rowid += 1;
-            assert!(
-                max_rowid < 1000,
-                "table root did not split under sustained inserts"
-            );
-        }
 
-        let root_page = cursor.pager.inner.pages.get(&2).unwrap();
-        let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-        let root_ptrs = cell::read_cell_pointers(root_page, &root_header, 0).unwrap();
-        let first_divider_cell = CellRef::parse(
-            root_page,
-            usize::from(root_ptrs[0]),
-            root_header.page_type,
-            USABLE,
-        )
-        .unwrap();
-        let leftmost_max_rowid = first_divider_cell.rowid.unwrap();
-        assert!(leftmost_max_rowid >= 1);
-        assert!(leftmost_max_rowid < max_rowid);
-
-        for rowid in 0..=leftmost_max_rowid {
-            let seek = cursor.table_move_to(&cx, rowid).unwrap();
-            assert!(seek.is_found(), "rowid {rowid} should exist before delete");
-            cursor.delete(&cx).unwrap();
-        }
-
-        assert!(cursor.first(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), leftmost_max_rowid + 1);
+            assert!(cursor.first(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), leftmost_max_rowid + 1);
+        });
     }
 
     #[test]
     fn test_balance_for_delete_defers_until_leaf_empties() {
-        // bd-yywuv (K2 deferred delete): prove balance_for_delete (the rebalance
-        // fixup) fires ONLY when a leaf empties, not per DELETE. Deleting every
-        // cell of the leftmost leaf EXCEPT the last must trigger zero rebalances;
-        // the final delete that empties the leaf triggers the rebalance.
-        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_btree_metrics_enabled(true);
+        run_async(async {
+            // bd-yywuv (K2 deferred delete): prove balance_for_delete (the rebalance
+            // fixup) fires ONLY when a leaf empties, not per DELETE. Deleting every
+            // cell of the leftmost leaf EXCEPT the last must trigger zero rebalances;
+            // the final delete that empties the leaf triggers the rebalance.
+            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            set_btree_metrics_enabled(true);
 
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        // Insert until the table root splits into a multi-level tree, so the
-        // leftmost leaf is a non-root leaf that balance_for_delete can rebalance.
-        let mut max_rowid = 0i64;
-        loop {
-            let payload = vec![b'Q'; 220];
-            cursor.table_insert(&cx, max_rowid, &payload).unwrap();
+            // Insert until the table root splits into a multi-level tree, so the
+            // leftmost leaf is a non-root leaf that balance_for_delete can rebalance.
+            let mut max_rowid = 0i64;
+            loop {
+                let payload = vec![b'Q'; 220];
+                cursor.table_insert(&cx, max_rowid, &payload).await.unwrap();
+                let root_page = cursor.pager.inner.pages.get(&2).unwrap();
+                let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+                if root_header.page_type == cell::BtreePageType::InteriorTable {
+                    break;
+                }
+                max_rowid += 1;
+                assert!(
+                    max_rowid < 1000,
+                    "table root did not split under sustained inserts"
+                );
+            }
+
+            // Max rowid contained in the leftmost leaf subtree.
             let root_page = cursor.pager.inner.pages.get(&2).unwrap();
             let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-            if root_header.page_type == cell::BtreePageType::InteriorTable {
-                break;
-            }
-            max_rowid += 1;
+            let root_ptrs = cell::read_cell_pointers(root_page, &root_header, 0).unwrap();
+            let first_divider_cell = CellRef::parse(
+                root_page,
+                usize::from(root_ptrs[0]),
+                root_header.page_type,
+                USABLE,
+            )
+            .unwrap();
+            let leftmost_max_rowid = first_divider_cell.rowid.unwrap();
             assert!(
-                max_rowid < 1000,
-                "table root did not split under sustained inserts"
+                leftmost_max_rowid >= 1,
+                "leftmost leaf must hold >= 2 cells for this proof"
             );
-        }
 
-        // Max rowid contained in the leftmost leaf subtree.
-        let root_page = cursor.pager.inner.pages.get(&2).unwrap();
-        let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-        let root_ptrs = cell::read_cell_pointers(root_page, &root_header, 0).unwrap();
-        let first_divider_cell = CellRef::parse(
-            root_page,
-            usize::from(root_ptrs[0]),
-            root_header.page_type,
-            USABLE,
-        )
-        .unwrap();
-        let leftmost_max_rowid = first_divider_cell.rowid.unwrap();
-        assert!(
-            leftmost_max_rowid >= 1,
-            "leftmost leaf must hold >= 2 cells for this proof"
-        );
+            // Phase A: delete every cell of the leftmost leaf EXCEPT the last. The
+            // leaf stays non-empty, so the deferred-delete strategy performs no
+            // rebalance (balance_for_delete is gated on new_count == 0). The balance
+            // counter lives on the leaf-reuse snapshot; the DELETE op total on the
+            // metrics snapshot.
+            let before_balance = btree_leaf_reuse_snapshot();
+            let before_ops = btree_metrics_snapshot();
+            for rowid in 0..leftmost_max_rowid {
+                assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
+                cursor.delete(&cx).await.unwrap();
+            }
+            let after_partial_balance = btree_leaf_reuse_snapshot();
+            let after_partial_ops = btree_metrics_snapshot();
+            assert_eq!(
+                after_partial_balance.balance_for_delete_calls
+                    - before_balance.balance_for_delete_calls,
+                0,
+                "deleting non-emptying cells must defer rebalancing (zero balance_for_delete)"
+            );
+            assert!(
+                after_partial_ops.fsqlite_btree_operations_total.delete
+                    - before_ops.fsqlite_btree_operations_total.delete
+                    >= u64::try_from(leftmost_max_rowid).unwrap(),
+                "Phase A must have performed real DELETEs"
+            );
 
-        // Phase A: delete every cell of the leftmost leaf EXCEPT the last. The
-        // leaf stays non-empty, so the deferred-delete strategy performs no
-        // rebalance (balance_for_delete is gated on new_count == 0). The balance
-        // counter lives on the leaf-reuse snapshot; the DELETE op total on the
-        // metrics snapshot.
-        let before_balance = btree_leaf_reuse_snapshot();
-        let before_ops = btree_metrics_snapshot();
-        for rowid in 0..leftmost_max_rowid {
-            assert!(cursor.table_move_to(&cx, rowid).unwrap().is_found());
-            cursor.delete(&cx).unwrap();
-        }
-        let after_partial_balance = btree_leaf_reuse_snapshot();
-        let after_partial_ops = btree_metrics_snapshot();
-        assert_eq!(
-            after_partial_balance.balance_for_delete_calls
-                - before_balance.balance_for_delete_calls,
-            0,
-            "deleting non-emptying cells must defer rebalancing (zero balance_for_delete)"
-        );
-        assert!(
-            after_partial_ops.fsqlite_btree_operations_total.delete
-                - before_ops.fsqlite_btree_operations_total.delete
-                >= u64::try_from(leftmost_max_rowid).unwrap(),
-            "Phase A must have performed real DELETEs"
-        );
+            // Phase B: delete the final cell of the leftmost leaf -> it empties ->
+            // the deferred rebalance runs exactly now.
+            assert!(
+                cursor
+                    .table_move_to(&cx, leftmost_max_rowid)
+                    .await
+                    .unwrap()
+                    .is_found()
+            );
+            cursor.delete(&cx).await.unwrap();
+            let after_empty_balance = btree_leaf_reuse_snapshot();
+            assert!(
+                after_empty_balance.balance_for_delete_calls
+                    - after_partial_balance.balance_for_delete_calls
+                    >= 1,
+                "emptying a leaf must trigger the deferred rebalance exactly then"
+            );
 
-        // Phase B: delete the final cell of the leftmost leaf -> it empties ->
-        // the deferred rebalance runs exactly now.
-        assert!(
-            cursor
-                .table_move_to(&cx, leftmost_max_rowid)
-                .unwrap()
-                .is_found()
-        );
-        cursor.delete(&cx).unwrap();
-        let after_empty_balance = btree_leaf_reuse_snapshot();
-        assert!(
-            after_empty_balance.balance_for_delete_calls
-                - after_partial_balance.balance_for_delete_calls
-                >= 1,
-            "emptying a leaf must trigger the deferred rebalance exactly then"
-        );
+            set_btree_metrics_enabled(false);
 
-        set_btree_metrics_enabled(false);
-
-        // Behavior preserved: the surviving right-subtree rows remain reachable.
-        assert!(cursor.first(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), leftmost_max_rowid + 1);
+            // Behavior preserved: the surviving right-subtree rows remain reachable.
+            assert!(cursor.first(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), leftmost_max_rowid + 1);
+        });
     }
 
     #[test]
     fn test_cursor_delete_of_empty_leftmost_leaf_keeps_right_subtree_reachable() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        let mut max_rowid = 0i64;
-        loop {
-            let payload = vec![b'P'; 220];
-            cursor.table_insert(&cx, max_rowid, &payload).unwrap();
+            let mut max_rowid = 0i64;
+            loop {
+                let payload = vec![b'P'; 220];
+                cursor.table_insert(&cx, max_rowid, &payload).await.unwrap();
+                let root_page = cursor.pager.inner.pages.get(&2).unwrap();
+                let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+                if root_header.page_type == cell::BtreePageType::InteriorTable {
+                    break;
+                }
+                max_rowid += 1;
+                assert!(
+                    max_rowid < 1000,
+                    "table root did not split under sustained inserts"
+                );
+            }
+
             let root_page = cursor.pager.inner.pages.get(&2).unwrap();
             let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-            if root_header.page_type == cell::BtreePageType::InteriorTable {
-                break;
+            let root_ptrs = cell::read_cell_pointers(root_page, &root_header, 0).unwrap();
+            let first_divider_cell = CellRef::parse(
+                root_page,
+                usize::from(root_ptrs[0]),
+                root_header.page_type,
+                USABLE,
+            )
+            .unwrap();
+            let leftmost_max_rowid = first_divider_cell.rowid.unwrap();
+            assert!(leftmost_max_rowid >= 1);
+            assert!(leftmost_max_rowid < max_rowid);
+
+            for rowid in 0..=leftmost_max_rowid {
+                let seek = cursor.table_move_to(&cx, rowid).await.unwrap();
+                assert!(seek.is_found(), "rowid {rowid} should exist before delete");
+                cursor.delete(&cx).await.unwrap();
             }
-            max_rowid += 1;
-            assert!(
-                max_rowid < 1000,
-                "table root did not split under sustained inserts"
-            );
-        }
 
-        let root_page = cursor.pager.inner.pages.get(&2).unwrap();
-        let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-        let root_ptrs = cell::read_cell_pointers(root_page, &root_header, 0).unwrap();
-        let first_divider_cell = CellRef::parse(
-            root_page,
-            usize::from(root_ptrs[0]),
-            root_header.page_type,
-            USABLE,
-        )
-        .unwrap();
-        let leftmost_max_rowid = first_divider_cell.rowid.unwrap();
-        assert!(leftmost_max_rowid >= 1);
-        assert!(leftmost_max_rowid < max_rowid);
-
-        for rowid in 0..=leftmost_max_rowid {
-            let seek = cursor.table_move_to(&cx, rowid).unwrap();
-            assert!(seek.is_found(), "rowid {rowid} should exist before delete");
-            cursor.delete(&cx).unwrap();
-        }
-
-        // DELETE is now eager (commit 5eed5a0a) — the tree may have collapsed
-        // back to a single leaf if the empty left sibling merged with the
-        // right. The correctness invariant: surviving rowids remain reachable.
-        assert!(cursor.first(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), leftmost_max_rowid + 1);
+            // DELETE is now eager (commit 5eed5a0a) — the tree may have collapsed
+            // back to a single leaf if the empty left sibling merged with the
+            // right. The correctness invariant: surviving rowids remain reachable.
+            assert!(cursor.first(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), leftmost_max_rowid + 1);
+        });
     }
 
     #[test]
     fn test_cursor_delete_updates_nonroot_table_separator_after_leaf_max_delete() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        let mut max_rowid = 0_i64;
-        for rowid in 1..=2_000_i64 {
-            let payload = vec![b'S'; 1_400];
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-            max_rowid = rowid;
+            let mut max_rowid = 0_i64;
+            for rowid in 1..=2_000_i64 {
+                let payload = vec![b'S'; 1_400];
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+                max_rowid = rowid;
 
-            if measure_tree_depth(&cursor.pager, pn(2), USABLE) >= 3 {
-                break;
+                if measure_tree_depth(&cursor.pager, pn(2), USABLE).await >= 3 {
+                    break;
+                }
             }
-        }
 
-        assert!(
-            measure_tree_depth(&cursor.pager, pn(2), USABLE) >= 3,
-            "failed to build a depth-3 table tree (reached rowid {max_rowid})"
-        );
+            assert!(
+                measure_tree_depth(&cursor.pager, pn(2), USABLE).await >= 3,
+                "failed to build a depth-3 table tree (reached rowid {max_rowid})"
+            );
 
-        let root_entry = cursor.load_page(&cx, pn(2)).unwrap();
-        assert_eq!(
-            root_entry.header.page_type,
-            cell::BtreePageType::InteriorTable
-        );
-        let root_separator_before = cursor.parse_cell_at(&root_entry, 0).unwrap().rowid.unwrap();
+            let root_entry = cursor.load_page(&cx, pn(2)).await.unwrap();
+            assert_eq!(
+                root_entry.header.page_type,
+                cell::BtreePageType::InteriorTable
+            );
+            let root_separator_before =
+                cursor.parse_cell_at(&root_entry, 0).unwrap().rowid.unwrap();
 
-        let left_subtree_page = BtCursor::<MemPageStore>::child_page_at(&root_entry, 0).unwrap();
-        let left_subtree_before = cursor.load_page(&cx, left_subtree_page).unwrap();
-        assert_eq!(
-            left_subtree_before.header.page_type,
-            cell::BtreePageType::InteriorTable
-        );
+            let left_subtree_page =
+                BtCursor::<MemPageStore>::child_page_at(&root_entry, 0).unwrap();
+            let left_subtree_before = cursor.load_page(&cx, left_subtree_page).await.unwrap();
+            assert_eq!(
+                left_subtree_before.header.page_type,
+                cell::BtreePageType::InteriorTable
+            );
 
-        let target_rowid = cursor
-            .parse_cell_at(&left_subtree_before, 0)
-            .unwrap()
-            .rowid
-            .unwrap();
-        assert!(
-            target_rowid > 1,
-            "target rowid must leave the leaf non-empty after delete"
-        );
-
-        let seek = cursor.table_move_to(&cx, target_rowid).unwrap();
-        assert!(seek.is_found(), "target rowid should exist before delete");
-        cursor.delete(&cx).unwrap();
-
-        let root_after = cursor.load_page(&cx, pn(2)).unwrap();
-        let root_separator_after = cursor.parse_cell_at(&root_after, 0).unwrap().rowid.unwrap();
-        assert_eq!(
-            root_separator_after, root_separator_before,
-            "deleting a non-root subtree maximum must not perturb the enclosing subtree maximum"
-        );
-
-        let left_subtree_after = cursor.load_page(&cx, left_subtree_page).unwrap();
-        let repaired_separator = cursor
-            .parse_cell_at(&left_subtree_after, 0)
-            .unwrap()
-            .rowid
-            .unwrap();
-        assert_eq!(
-            repaired_separator,
-            target_rowid - 1,
-            "non-root interior separator must shrink to the deleted leaf's new maximum"
-        );
-
-        let seek_after = cursor.table_move_to(&cx, target_rowid).unwrap();
-        assert!(
-            !seek_after.is_found(),
-            "deleted rowid must not remain reachable after separator repair"
-        );
-        assert!(
-            cursor
-                .table_move_to(&cx, target_rowid - 1)
+            let target_rowid = cursor
+                .parse_cell_at(&left_subtree_before, 0)
                 .unwrap()
-                .is_found()
-        );
+                .rowid
+                .unwrap();
+            assert!(
+                target_rowid > 1,
+                "target rowid must leave the leaf non-empty after delete"
+            );
+
+            let seek = cursor.table_move_to(&cx, target_rowid).await.unwrap();
+            assert!(seek.is_found(), "target rowid should exist before delete");
+            cursor.delete(&cx).await.unwrap();
+
+            let root_after = cursor.load_page(&cx, pn(2)).await.unwrap();
+            let root_separator_after = cursor.parse_cell_at(&root_after, 0).unwrap().rowid.unwrap();
+            assert_eq!(
+                root_separator_after, root_separator_before,
+                "deleting a non-root subtree maximum must not perturb the enclosing subtree maximum"
+            );
+
+            let left_subtree_after = cursor.load_page(&cx, left_subtree_page).await.unwrap();
+            let repaired_separator = cursor
+                .parse_cell_at(&left_subtree_after, 0)
+                .unwrap()
+                .rowid
+                .unwrap();
+            assert_eq!(
+                repaired_separator,
+                target_rowid - 1,
+                "non-root interior separator must shrink to the deleted leaf's new maximum"
+            );
+
+            let seek_after = cursor.table_move_to(&cx, target_rowid).await.unwrap();
+            assert!(
+                !seek_after.is_found(),
+                "deleted rowid must not remain reachable after separator repair"
+            );
+            assert!(
+                cursor
+                    .table_move_to(&cx, target_rowid - 1)
+                    .await
+                    .unwrap()
+                    .is_found()
+            );
+        });
     }
 
     #[test]
     fn test_cursor_delete_updates_ancestor_table_separator_for_rightmost_descendant_max() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 15)], pn(4)));
-        store
-            .pages
-            .insert(3, build_interior_table(&[(pn(5), 3), (pn(6), 8)], pn(7)));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(20, b"L20"), (25, b"L25")]));
-        store
-            .pages
-            .insert(5, build_leaf_table(&[(1, b"L1"), (3, b"L3")]));
-        store
-            .pages
-            .insert(6, build_leaf_table(&[(5, b"L5"), (8, b"L8")]));
-        store
-            .pages
-            .insert(7, build_leaf_table(&[(10, b"L10"), (15, b"L15")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 15)], pn(4)));
+            store
+                .pages
+                .insert(3, build_interior_table(&[(pn(5), 3), (pn(6), 8)], pn(7)));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(20, b"L20"), (25, b"L25")]));
+            store
+                .pages
+                .insert(5, build_leaf_table(&[(1, b"L1"), (3, b"L3")]));
+            store
+                .pages
+                .insert(6, build_leaf_table(&[(5, b"L5"), (8, b"L8")]));
+            store
+                .pages
+                .insert(7, build_leaf_table(&[(10, b"L10"), (15, b"L15")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        let root_before = cursor.load_page(&cx, pn(2)).unwrap();
-        let root_separator_before = cursor
-            .parse_cell_at(&root_before, 0)
-            .unwrap()
-            .rowid
-            .unwrap();
-        assert_eq!(root_separator_before, 15);
+            let root_before = cursor.load_page(&cx, pn(2)).await.unwrap();
+            let root_separator_before = cursor
+                .parse_cell_at(&root_before, 0)
+                .unwrap()
+                .rowid
+                .unwrap();
+            assert_eq!(root_separator_before, 15);
 
-        let seek = cursor.table_move_to(&cx, 15).unwrap();
-        assert!(seek.is_found(), "target rowid should exist before delete");
-        cursor.delete(&cx).unwrap();
+            let seek = cursor.table_move_to(&cx, 15).await.unwrap();
+            assert!(seek.is_found(), "target rowid should exist before delete");
+            cursor.delete(&cx).await.unwrap();
 
-        let root_after = cursor.load_page(&cx, pn(2)).unwrap();
-        let root_separator_after = cursor.parse_cell_at(&root_after, 0).unwrap().rowid.unwrap();
-        assert_eq!(
-            root_separator_after, 10,
-            "ancestor separator must shrink when the subtree's rightmost descendant maximum is deleted"
-        );
+            let root_after = cursor.load_page(&cx, pn(2)).await.unwrap();
+            let root_separator_after = cursor.parse_cell_at(&root_after, 0).unwrap().rowid.unwrap();
+            assert_eq!(
+                root_separator_after, 10,
+                "ancestor separator must shrink when the subtree's rightmost descendant maximum is deleted"
+            );
 
-        validate_table_tree_invariants(&cursor.pager, pn(2), USABLE)
-            .expect("table invariants should still hold after ancestor separator repair");
-        assert!(!cursor.table_move_to(&cx, 15).unwrap().is_found());
-        assert!(cursor.table_move_to(&cx, 10).unwrap().is_found());
+            validate_table_tree_invariants(&cursor.pager, pn(2), USABLE)
+                .await
+                .expect("table invariants should still hold after ancestor separator repair");
+            assert!(!cursor.table_move_to(&cx, 15).await.unwrap().is_found());
+            assert!(cursor.table_move_to(&cx, 10).await.unwrap().is_found());
+        });
     }
 
     #[test]
     fn test_table_delete_all_from_left_leaf_preserves_right_subtree() {
-        // DELETE is eager post-5eed5a0a; after deleting every rowid from the
-        // left leaf, the tree may merge + collapse. The correctness check:
-        // right-subtree rows are still reachable and the cursor lands on the
-        // first surviving rowid.
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 10)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"L1"), (5, b"L5"), (10, b"L10")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(20, b"L20"), (25, b"L25")]));
+        run_async(async {
+            // DELETE is eager post-5eed5a0a; after deleting every rowid from the
+            // left leaf, the tree may merge + collapse. The correctness check:
+            // right-subtree rows are still reachable and the cursor lands on the
+            // first surviving rowid.
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 10)], pn(4)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"L1"), (5, b"L5"), (10, b"L10")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(20, b"L20"), (25, b"L25")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        for rowid in [1_i64, 5, 10] {
-            let seek = cursor.table_move_to(&cx, rowid).unwrap();
-            assert!(seek.is_found(), "rowid {rowid} should exist before delete");
-            cursor.delete(&cx).unwrap();
-        }
+            for rowid in [1_i64, 5, 10] {
+                let seek = cursor.table_move_to(&cx, rowid).await.unwrap();
+                assert!(seek.is_found(), "rowid {rowid} should exist before delete");
+                cursor.delete(&cx).await.unwrap();
+            }
 
-        assert!(
-            cursor.first(&cx).unwrap(),
-            "remaining right subtree should still be reachable"
-        );
-        assert_eq!(cursor.rowid(&cx).unwrap(), 20);
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 25);
-        assert!(!cursor.next(&cx).unwrap());
+            assert!(
+                cursor.first(&cx).await.unwrap(),
+                "remaining right subtree should still be reachable"
+            );
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 20);
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 25);
+            assert!(!cursor.next(&cx).await.unwrap());
+        });
     }
 
     #[test]
     fn test_empty_root_collapse_reclaims_detached_child_subtree_pages() {
-        const SMALL_USABLE: u32 = 512;
+        run_async(async {
+            const SMALL_USABLE: u32 = 512;
 
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, root, SMALL_USABLE, true);
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, root, SMALL_USABLE, true);
 
-        for rowid in 1_i64..=200_i64 {
-            cursor.table_insert(&cx, rowid, &vec![b'R'; 180]).unwrap();
-        }
+            for rowid in 1_i64..=200_i64 {
+                cursor
+                    .table_insert(&cx, rowid, &vec![b'R'; 180])
+                    .await
+                    .unwrap();
+            }
 
-        let root_page = cursor.pager.pages.get(&root.get()).unwrap();
-        let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-        assert!(
-            root_header.page_type.is_interior(),
-            "test requires an interior root before delete-all cleanup"
-        );
+            let root_page = cursor.pager.pages.get(&root.get()).unwrap();
+            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+            assert!(
+                root_header.page_type.is_interior(),
+                "test requires an interior root before delete-all cleanup"
+            );
 
-        for rowid in 1_i64..=200_i64 {
-            let seek = cursor.table_move_to(&cx, rowid).unwrap();
-            assert!(seek.is_found(), "row {rowid} should exist before delete");
-            cursor.delete(&cx).unwrap();
-        }
+            for rowid in 1_i64..=200_i64 {
+                let seek = cursor.table_move_to(&cx, rowid).await.unwrap();
+                assert!(seek.is_found(), "row {rowid} should exist before delete");
+                cursor.delete(&cx).await.unwrap();
+            }
 
-        assert!(
-            !cursor.first(&cx).unwrap(),
-            "delete-all cleanup should leave an empty tree"
-        );
+            assert!(
+                !cursor.first(&cx).await.unwrap(),
+                "delete-all cleanup should leave an empty tree"
+            );
 
-        let root_page = cursor.pager.pages.get(&root.get()).unwrap();
-        let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-        assert!(
-            root_header.page_type == cell::BtreePageType::LeafTable,
-            "empty root cleanup should rewrite the root as a leaf"
-        );
+            let root_page = cursor.pager.pages.get(&root.get()).unwrap();
+            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+            assert!(
+                root_header.page_type == cell::BtreePageType::LeafTable,
+                "empty root cleanup should rewrite the root as a leaf"
+            );
 
-        let all_pages: BTreeSet<u32> = cursor.pager.pages.keys().copied().collect();
-        let mut reachable = BTreeSet::new();
-        collect_reachable_pages(&cursor.pager, root, SMALL_USABLE, &mut reachable);
+            let all_pages: BTreeSet<u32> = cursor.pager.pages.keys().copied().collect();
+            let mut reachable = BTreeSet::new();
+            collect_reachable_pages(&cursor.pager, root, SMALL_USABLE, &mut reachable);
 
-        assert_eq!(
-            all_pages,
-            BTreeSet::from([root.get()]),
-            "empty root cleanup should reclaim detached child pages"
-        );
-        assert_eq!(
-            reachable, all_pages,
-            "no unreachable pages should remain after collapsing the empty root"
-        );
+            assert_eq!(
+                all_pages,
+                BTreeSet::from([root.get()]),
+                "empty root cleanup should reclaim detached child pages"
+            );
+            assert_eq!(
+                reachable, all_pages,
+                "no unreachable pages should remain after collapsing the empty root"
+            );
+        });
     }
 
     #[test]
     fn test_table_delete_leaves_compact_leaf_that_insert_fills_back_in() {
-        // DELETE now defragments the leaf immediately (commit 5eed5a0a) for
-        // SQLite `btreeComputeFreeSpace()` compatibility, so the old
-        // freeblock-chain dead-space invariant was intentionally dropped. The
-        // correctness check after a middle-rowid delete is that the leaf is
-        // already compact (no freeblocks, no fragmented bytes) AND a
-        // subsequent insert at the deleted rowid continues to work.
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            // DELETE now defragments the leaf immediately (commit 5eed5a0a) for
+            // SQLite `btreeComputeFreeSpace()` compatibility, so the old
+            // freeblock-chain dead-space invariant was intentionally dropped. The
+            // correctness check after a middle-rowid delete is that the leaf is
+            // already compact (no freeblocks, no fragmented bytes) AND a
+            // subsequent insert at the deleted rowid continues to work.
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        for rowid in 1_i64..=3 {
+            for rowid in 1_i64..=3 {
+                cursor
+                    .table_insert(&cx, rowid, payload_for_rowid(rowid).as_slice())
+                    .await
+                    .unwrap();
+            }
+
+            assert!(cursor.table_move_to(&cx, 2).await.unwrap().is_found());
+            cursor.delete(&cx).await.unwrap();
+
+            let page_before = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+            let header_before = BtreePageHeader::parse(&page_before, 0).unwrap();
+            assert_eq!(
+                header_before.first_freeblock, 0,
+                "eager defrag on DELETE should leave no freeblock chain"
+            );
+            assert_eq!(
+                header_before.fragmented_free_bytes, 0,
+                "eager defrag on DELETE should leave no fragmented bytes"
+            );
+
+            // Re-insert at rowid 2 and confirm the leaf still reaches it. This
+            // guards against a hypothetical regression where defrag corrupts
+            // surrounding cells' offsets.
+            let reclaimed_payload = vec![0x5A; payload_for_rowid(2).len()];
             cursor
-                .table_insert(&cx, rowid, payload_for_rowid(rowid).as_slice())
+                .table_insert(&cx, 2, reclaimed_payload.as_slice())
+                .await
                 .unwrap();
-        }
 
-        assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
-        cursor.delete(&cx).unwrap();
-
-        let page_before = cursor.pager.read_page(&cx, pn(2)).unwrap();
-        let header_before = BtreePageHeader::parse(&page_before, 0).unwrap();
-        assert_eq!(
-            header_before.first_freeblock, 0,
-            "eager defrag on DELETE should leave no freeblock chain"
-        );
-        assert_eq!(
-            header_before.fragmented_free_bytes, 0,
-            "eager defrag on DELETE should leave no fragmented bytes"
-        );
-
-        // Re-insert at rowid 2 and confirm the leaf still reaches it. This
-        // guards against a hypothetical regression where defrag corrupts
-        // surrounding cells' offsets.
-        let reclaimed_payload = vec![0x5A; payload_for_rowid(2).len()];
-        cursor
-            .table_insert(&cx, 2, reclaimed_payload.as_slice())
-            .unwrap();
-
-        let page_after = cursor.pager.read_page(&cx, pn(2)).unwrap();
-        let header_after = BtreePageHeader::parse(&page_after, 0).unwrap();
-        assert_eq!(header_after.first_freeblock, 0);
-        assert_eq!(header_after.fragmented_free_bytes, 0);
-        assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
+            let page_after = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+            let header_after = BtreePageHeader::parse(&page_after, 0).unwrap();
+            assert_eq!(header_after.first_freeblock, 0);
+            assert_eq!(header_after.fragmented_free_bytes, 0);
+            assert!(cursor.table_move_to(&cx, 2).await.unwrap().is_found());
+        });
     }
 
     #[test]
     fn test_table_delete_leaves_no_work_for_explicit_compaction() {
-        // Post-5eed5a0a: DELETE compacts immediately, so
-        // `compact_current_table_leaf` has nothing left to do and returns
-        // `Ok(false)`. Keep the test as a lightweight regression guard that
-        // (a) the leaf is already compact after DELETE, and (b) the cursor
-        // still points at the correct successor rowid.
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            // Post-5eed5a0a: DELETE compacts immediately, so
+            // `compact_current_table_leaf` has nothing left to do and returns
+            // `Ok(false)`. Keep the test as a lightweight regression guard that
+            // (a) the leaf is already compact after DELETE, and (b) the cursor
+            // still points at the correct successor rowid.
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        for rowid in 1_i64..=3 {
-            cursor
-                .table_insert(&cx, rowid, payload_for_rowid(rowid).as_slice())
-                .unwrap();
-        }
+            for rowid in 1_i64..=3 {
+                cursor
+                    .table_insert(&cx, rowid, payload_for_rowid(rowid).as_slice())
+                    .await
+                    .unwrap();
+            }
 
-        assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
-        cursor.delete(&cx).unwrap();
-        assert!(
-            !cursor.compact_current_table_leaf(&cx).unwrap(),
-            "eager delete leaves the leaf already compact; explicit compaction should be a no-op"
-        );
+            assert!(cursor.table_move_to(&cx, 2).await.unwrap().is_found());
+            cursor.delete(&cx).await.unwrap();
+            assert!(
+                !cursor.compact_current_table_leaf(&cx).await.unwrap(),
+                "eager delete leaves the leaf already compact; explicit compaction should be a no-op"
+            );
 
-        let page = cursor.pager.read_page(&cx, pn(2)).unwrap();
-        let header = BtreePageHeader::parse(&page, 0).unwrap();
-        assert_eq!(header.first_freeblock, 0);
-        assert_eq!(header.fragmented_free_bytes, 0);
-        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
+            let page = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+            let header = BtreePageHeader::parse(&page, 0).unwrap();
+            assert_eq!(header.first_freeblock, 0);
+            assert_eq!(header.fragmented_free_bytes, 0);
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 3);
+        });
     }
 
     #[test]
     fn test_cursor_delete_all_after_root_split() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        let mut max_rowid = 0i64;
-        loop {
-            let payload = vec![b'Q'; 220];
-            cursor.table_insert(&cx, max_rowid, &payload).unwrap();
-            let root_page = cursor.pager.inner.pages.get(&2).unwrap();
-            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-            if root_header.page_type == cell::BtreePageType::InteriorTable {
-                break;
+            let mut max_rowid = 0i64;
+            loop {
+                let payload = vec![b'Q'; 220];
+                cursor.table_insert(&cx, max_rowid, &payload).await.unwrap();
+                let root_page = cursor.pager.inner.pages.get(&2).unwrap();
+                let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+                if root_header.page_type == cell::BtreePageType::InteriorTable {
+                    break;
+                }
+                max_rowid += 1;
+                assert!(
+                    max_rowid < 1000,
+                    "table root did not split under sustained inserts"
+                );
             }
-            max_rowid += 1;
+
+            for rowid in 0..=max_rowid {
+                let seek = cursor.table_move_to(&cx, rowid).await.unwrap();
+                assert!(seek.is_found(), "rowid {rowid} should exist before delete");
+                cursor.delete(&cx).await.unwrap();
+            }
+
             assert!(
-                max_rowid < 1000,
-                "table root did not split under sustained inserts"
+                !cursor.first(&cx).await.unwrap(),
+                "tree should be empty after total delete"
             );
-        }
+            assert!(cursor.eof());
 
-        for rowid in 0..=max_rowid {
-            let seek = cursor.table_move_to(&cx, rowid).unwrap();
-            assert!(seek.is_found(), "rowid {rowid} should exist before delete");
-            cursor.delete(&cx).unwrap();
-        }
-
-        assert!(
-            !cursor.first(&cx).unwrap(),
-            "tree should be empty after total delete"
-        );
-        assert!(cursor.eof());
-
-        // The root page should have collapsed to a leaf (depth 1).
-        let root_data = cursor.pager.read_page(&cx, pn(2)).unwrap();
-        let root_header = BtreePageHeader::parse(&root_data, 0).unwrap();
-        assert!(
-            root_header.page_type.is_leaf(),
-            "root should collapse to leaf after all rows deleted, got {:?}",
-            root_header.page_type
-        );
-        assert_eq!(root_header.cell_count, 0);
+            // The root page should have collapsed to a leaf (depth 1).
+            let root_data = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+            let root_header = BtreePageHeader::parse(&root_data, 0).unwrap();
+            assert!(
+                root_header.page_type.is_leaf(),
+                "root should collapse to leaf after all rows deleted, got {:?}",
+                root_header.page_type
+            );
+            assert_eq!(root_header.cell_count, 0);
+        });
     }
 
     #[test]
     fn test_e2e_bd_2kvo() {
-        const TOTAL_ROWS: i64 = 2_000;
-        const DELETE_ROWS: usize = 1_000;
+        run_async(async {
+            const TOTAL_ROWS: i64 = 2_000;
+            const DELETE_ROWS: usize = 1_000;
 
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        let mut expected = BTreeMap::<i64, Vec<u8>>::new();
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let mut expected = BTreeMap::<i64, Vec<u8>>::new();
 
-        for rowid in 1..=TOTAL_ROWS {
-            let payload = payload_for_rowid(rowid);
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-            expected.insert(rowid, payload);
-        }
-
-        for (rowid, payload) in &expected {
-            let seek = cursor.table_move_to(&cx, *rowid).unwrap();
-            assert!(seek.is_found(), "rowid {rowid} not found");
-            let got = cursor.payload(&cx).unwrap();
-            assert_eq!(
-                got.len(),
-                payload.len(),
-                "payload length mismatch at rowid {rowid}"
-            );
-            assert_eq!(&got[..], &payload[..], "payload mismatch at rowid {rowid}");
-        }
-
-        let mut deletion_order: Vec<i64> = expected.keys().copied().collect();
-        deterministic_shuffle(&mut deletion_order, 0x0BAD_5EED);
-
-        for rowid in deletion_order.into_iter().take(DELETE_ROWS) {
-            let seek = cursor.table_move_to(&cx, rowid).unwrap();
-            assert!(seek.is_found(), "rowid {rowid} should exist before delete");
-            cursor.delete(&cx).unwrap();
-            expected.remove(&rowid);
-        }
-
-        if expected.is_empty() {
-            assert!(!cursor.first(&cx).unwrap());
-            assert!(cursor.eof());
-            return;
-        }
-
-        let mut expected_iter = expected.iter();
-        assert!(cursor.first(&cx).unwrap());
-        loop {
-            let rowid = cursor.rowid(&cx).unwrap();
-            let payload = cursor.payload(&cx).unwrap();
-
-            let (expected_rowid, expected_payload) =
-                expected_iter.next().expect("cursor yielded extra row");
-            assert_eq!(rowid, *expected_rowid);
-            assert_eq!(payload.len(), expected_payload.len());
-            assert_eq!(&payload[..], expected_payload);
-
-            if !cursor.next(&cx).unwrap() {
-                break;
+            for rowid in 1..=TOTAL_ROWS {
+                let payload = payload_for_rowid(rowid);
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+                expected.insert(rowid, payload);
             }
-        }
 
-        assert!(
-            expected_iter.next().is_none(),
-            "cursor missed one or more rows during forward scan"
-        );
+            for (rowid, payload) in &expected {
+                let seek = cursor.table_move_to(&cx, *rowid).await.unwrap();
+                assert!(seek.is_found(), "rowid {rowid} not found");
+                let got = cursor.payload(&cx).await.unwrap();
+                assert_eq!(
+                    got.len(),
+                    payload.len(),
+                    "payload length mismatch at rowid {rowid}"
+                );
+                assert_eq!(&got[..], &payload[..], "payload mismatch at rowid {rowid}");
+            }
+
+            let mut deletion_order: Vec<i64> = expected.keys().copied().collect();
+            deterministic_shuffle(&mut deletion_order, 0x0BAD_5EED);
+
+            for rowid in deletion_order.into_iter().take(DELETE_ROWS) {
+                let seek = cursor.table_move_to(&cx, rowid).await.unwrap();
+                assert!(seek.is_found(), "rowid {rowid} should exist before delete");
+                cursor.delete(&cx).await.unwrap();
+                expected.remove(&rowid);
+            }
+
+            if expected.is_empty() {
+                assert!(!cursor.first(&cx).await.unwrap());
+                assert!(cursor.eof());
+                return;
+            }
+
+            let mut expected_iter = expected.iter();
+            assert!(cursor.first(&cx).await.unwrap());
+            loop {
+                let rowid = cursor.rowid(&cx).await.unwrap();
+                let payload = cursor.payload(&cx).await.unwrap();
+
+                let (expected_rowid, expected_payload) =
+                    expected_iter.next().expect("cursor yielded extra row");
+                assert_eq!(rowid, *expected_rowid);
+                assert_eq!(payload.len(), expected_payload.len());
+                assert_eq!(&payload[..], expected_payload);
+
+                if !cursor.next(&cx).await.unwrap() {
+                    break;
+                }
+            }
+
+            assert!(
+                expected_iter.next().is_none(),
+                "cursor missed one or more rows during forward scan"
+            );
+        });
     }
 
     #[test]
     fn test_e2e_btree_prefetch_latency() {
-        const TOTAL_ROWS: i64 = 1_500;
+        run_async(async {
+            const TOTAL_ROWS: i64 = 1_500;
 
-        let mut seed_store = MemPageStore::new(USABLE);
-        seed_store.pages.insert(2, build_leaf_table(&[]));
+            let mut seed_store = MemPageStore::new(USABLE);
+            seed_store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut seed_cursor = BtCursor::new(seed_store, pn(2), USABLE, true);
-        for rowid in 1..=TOTAL_ROWS {
-            let payload = payload_for_rowid(rowid);
-            seed_cursor.table_insert(&cx, rowid, &payload).unwrap();
-        }
+            let cx = Cx::new();
+            let mut seed_cursor = BtCursor::new(seed_store, pn(2), USABLE, true);
+            for rowid in 1..=TOTAL_ROWS {
+                let payload = payload_for_rowid(rowid);
+                seed_cursor
+                    .table_insert(&cx, rowid, &payload)
+                    .await
+                    .unwrap();
+            }
 
-        let baseline_store = seed_cursor.pager.clone();
-        let prefetch_store = PrefetchProbeStore::new(seed_cursor.pager);
+            let baseline_store = seed_cursor.pager.clone();
+            let prefetch_store = PrefetchProbeStore::new(seed_cursor.pager);
 
-        let mut workload: Vec<i64> = (1..=TOTAL_ROWS).collect();
-        deterministic_shuffle(&mut workload, 0x0FEE_D123);
+            let mut workload: Vec<i64> = (1..=TOTAL_ROWS).collect();
+            deterministic_shuffle(&mut workload, 0x0FEE_D123);
 
-        let mut baseline_cursor = BtCursor::new(baseline_store, pn(2), USABLE, true);
-        let baseline_started = Instant::now();
-        let mut baseline_total_bytes = 0usize;
-        for rowid in &workload {
-            let result = baseline_cursor.table_move_to(&cx, *rowid).unwrap();
-            assert!(result.is_found(), "baseline lookup miss for rowid={rowid}");
-            baseline_total_bytes += baseline_cursor.payload(&cx).unwrap().len();
-        }
-        let baseline_elapsed = baseline_started.elapsed();
+            let mut baseline_cursor = BtCursor::new(baseline_store, pn(2), USABLE, true);
+            let baseline_started = Instant::now();
+            let mut baseline_total_bytes = 0usize;
+            for rowid in &workload {
+                let result = baseline_cursor.table_move_to(&cx, *rowid).await.unwrap();
+                assert!(result.is_found(), "baseline lookup miss for rowid={rowid}");
+                baseline_total_bytes += baseline_cursor.payload(&cx).await.unwrap().len();
+            }
+            let baseline_elapsed = baseline_started.elapsed();
 
-        let mut hinted_cursor = BtCursor::new(prefetch_store, pn(2), USABLE, true);
-        let hinted_started = Instant::now();
-        let mut hinted_total_bytes = 0usize;
-        for rowid in &workload {
-            let result = hinted_cursor.table_move_to(&cx, *rowid).unwrap();
-            assert!(result.is_found(), "hinted lookup miss for rowid={rowid}");
-            hinted_total_bytes += hinted_cursor.payload(&cx).unwrap().len();
-        }
-        let hinted_elapsed = hinted_started.elapsed();
+            let mut hinted_cursor = BtCursor::new(prefetch_store, pn(2), USABLE, true);
+            let hinted_started = Instant::now();
+            let mut hinted_total_bytes = 0usize;
+            for rowid in &workload {
+                let result = hinted_cursor.table_move_to(&cx, *rowid).await.unwrap();
+                assert!(result.is_found(), "hinted lookup miss for rowid={rowid}");
+                hinted_total_bytes += hinted_cursor.payload(&cx).await.unwrap().len();
+            }
+            let hinted_elapsed = hinted_started.elapsed();
 
-        assert_eq!(baseline_total_bytes, hinted_total_bytes);
-        assert!(
-            !hinted_cursor.pager.hinted_pages().is_empty(),
-            "prefetch implementation must remain fully safe"
-        );
+            assert_eq!(baseline_total_bytes, hinted_total_bytes);
+            assert!(
+                !hinted_cursor.pager.hinted_pages().is_empty(),
+                "prefetch implementation must remain fully safe"
+            );
 
-        let allowed_regression = baseline_elapsed.saturating_mul(50) + Duration::from_millis(250);
-        assert!(
-            hinted_elapsed <= allowed_regression,
-            "prefetch workload regressed too much: baseline={baseline_elapsed:?}, hinted={hinted_elapsed:?}"
-        );
+            let allowed_regression =
+                baseline_elapsed.saturating_mul(50) + Duration::from_millis(250);
+            assert!(
+                hinted_elapsed <= allowed_regression,
+                "prefetch workload regressed too much: baseline={baseline_elapsed:?}, hinted={hinted_elapsed:?}"
+            );
+        });
     }
 
     #[test]
     fn test_table_seek_prefetches_interior_children_along_descent_path() {
-        let cx = Cx::new();
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .write_page(&cx, pn(2), &build_interior_table(&[(pn(3), 15)], pn(4)))
-            .unwrap();
-        store
-            .write_page(
-                &cx,
-                pn(3),
-                &build_interior_table(&[(pn(5), 3), (pn(6), 8)], pn(7)),
-            )
-            .unwrap();
-        store
-            .write_page(&cx, pn(4), &build_interior_table(&[(pn(8), 25)], pn(9)))
-            .unwrap();
-        store
-            .write_page(
-                &cx,
-                pn(5),
-                &build_leaf_table(&[(1, b"a"), (2, b"b"), (3, b"c")]),
-            )
-            .unwrap();
-        store
-            .write_page(
-                &cx,
-                pn(6),
-                &build_leaf_table(&[(4, b"d"), (5, b"e"), (8, b"f")]),
-            )
-            .unwrap();
-        store
-            .write_page(
-                &cx,
-                pn(7),
-                &build_leaf_table(&[(9, b"g"), (10, b"h"), (15, b"i")]),
-            )
-            .unwrap();
-        store
-            .write_page(
-                &cx,
-                pn(8),
-                &build_leaf_table(&[(16, b"j"), (20, b"k"), (24, b"l")]),
-            )
-            .unwrap();
-        store
-            .write_page(
-                &cx,
-                pn(9),
-                &build_leaf_table(&[(26, b"m"), (30, b"n"), (40, b"o")]),
-            )
-            .unwrap();
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .write_page(&cx, pn(2), &build_interior_table(&[(pn(3), 15)], pn(4)))
+                .await
+                .unwrap();
+            store
+                .write_page(
+                    &cx,
+                    pn(3),
+                    &build_interior_table(&[(pn(5), 3), (pn(6), 8)], pn(7)),
+                )
+                .await
+                .unwrap();
+            store
+                .write_page(&cx, pn(4), &build_interior_table(&[(pn(8), 25)], pn(9)))
+                .await
+                .unwrap();
+            store
+                .write_page(
+                    &cx,
+                    pn(5),
+                    &build_leaf_table(&[(1, b"a"), (2, b"b"), (3, b"c")]),
+                )
+                .await
+                .unwrap();
+            store
+                .write_page(
+                    &cx,
+                    pn(6),
+                    &build_leaf_table(&[(4, b"d"), (5, b"e"), (8, b"f")]),
+                )
+                .await
+                .unwrap();
+            store
+                .write_page(
+                    &cx,
+                    pn(7),
+                    &build_leaf_table(&[(9, b"g"), (10, b"h"), (15, b"i")]),
+                )
+                .await
+                .unwrap();
+            store
+                .write_page(
+                    &cx,
+                    pn(8),
+                    &build_leaf_table(&[(16, b"j"), (20, b"k"), (24, b"l")]),
+                )
+                .await
+                .unwrap();
+            store
+                .write_page(
+                    &cx,
+                    pn(9),
+                    &build_leaf_table(&[(26, b"m"), (30, b"n"), (40, b"o")]),
+                )
+                .await
+                .unwrap();
 
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        let result = cursor.table_move_to(&cx, 20).unwrap();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let result = cursor.table_move_to(&cx, 20).await.unwrap();
 
-        assert_eq!(result, SeekResult::Found);
-        assert_eq!(cursor.pager.hinted_pages(), vec![pn(4), pn(8)]);
+            assert_eq!(result, SeekResult::Found);
+            assert_eq!(cursor.pager.hinted_pages(), vec![pn(4), pn(8)]);
+        });
     }
 
     #[test]
     fn test_prefetch_valid_address() {
-        let cx = Cx::new();
-        let probe_store = build_prefetch_descent_probe_store();
-        probe_store.clear_probe();
+        run_async(async {
+            let cx = Cx::new();
+            let probe_store = build_prefetch_descent_probe_store().await;
+            probe_store.clear_probe();
 
-        for rowid in [2_i64, 5, 10, 20, 24, 26, 35, 41] {
-            let mut cursor = BtCursor::new(probe_store.clone(), pn(2), USABLE, true);
-            cursor
-                .table_seek_for_insert(&cx, rowid)
-                .expect("descent path should remain valid");
-        }
+            for rowid in [2_i64, 5, 10, 20, 24, 26, 35, 41] {
+                let mut cursor = BtCursor::new(probe_store.clone(), pn(2), USABLE, true);
+                cursor
+                    .table_seek_for_insert(&cx, rowid)
+                    .await
+                    .expect("descent path should remain valid");
+            }
 
-        let snapshot = probe_store.snapshot();
-        assert!(
-            snapshot.prefetch_issued_count > 0,
-            "test setup must exercise at least one interior prefetch"
-        );
-        assert!(
-            !snapshot.read_pages.is_empty(),
-            "descent path should read at least one child page after prefetch"
-        );
-        assert_prefetch_snapshot_addresses_are_valid(&probe_store, &snapshot, pn(2));
-        assert_eq!(
-            snapshot.prefetch_hit_count, snapshot.prefetch_issued_count,
-            "insert descent should immediately consume each hinted child page"
-        );
+            let snapshot = probe_store.snapshot();
+            assert!(
+                snapshot.prefetch_issued_count > 0,
+                "test setup must exercise at least one interior prefetch"
+            );
+            assert!(
+                !snapshot.read_pages.is_empty(),
+                "descent path should read at least one child page after prefetch"
+            );
+            assert_prefetch_snapshot_addresses_are_valid(&probe_store, &snapshot, pn(2));
+            assert_eq!(
+                snapshot.prefetch_hit_count, snapshot.prefetch_issued_count,
+                "insert descent should immediately consume each hinted child page"
+            );
+        });
     }
 
     #[test]
     fn test_prefetch_sequential_insert() {
-        let cx = Cx::new();
-        let probe_store = build_prefetch_descent_probe_store();
-        probe_store.clear_probe();
+        run_async(async {
+            let cx = Cx::new();
+            let probe_store = build_prefetch_descent_probe_store().await;
+            probe_store.clear_probe();
 
-        for rowid in 26_i64..=40_i64 {
-            let mut cursor = BtCursor::new(probe_store.clone(), pn(2), USABLE, true);
-            cursor
-                .table_seek_for_insert(&cx, rowid)
-                .expect("right-edge insert descent should succeed");
-        }
+            for rowid in 26_i64..=40_i64 {
+                let mut cursor = BtCursor::new(probe_store.clone(), pn(2), USABLE, true);
+                cursor
+                    .table_seek_for_insert(&cx, rowid)
+                    .await
+                    .expect("right-edge insert descent should succeed");
+            }
 
-        let snapshot = probe_store.snapshot();
-        assert_prefetch_snapshot_addresses_are_valid(&probe_store, &snapshot, pn(2));
-        assert_eq!(
-            snapshot.prefetch_hit_count, snapshot.prefetch_issued_count,
-            "right-edge insert descent should consume every hinted page"
-        );
-        assert!(
-            snapshot
-                .hinted_pages
-                .iter()
-                .all(|page_no| matches!(page_no.get(), 4 | 9)),
-            "sequential insert descent should stay on the rightmost child chain, got {:?}",
-            snapshot.hinted_pages
-        );
-        assert!(
-            snapshot.hinted_pages.contains(&pn(4)) && snapshot.hinted_pages.contains(&pn(9)),
-            "sequential insert descent should prefetch both rightmost interior levels"
-        );
+            let snapshot = probe_store.snapshot();
+            assert_prefetch_snapshot_addresses_are_valid(&probe_store, &snapshot, pn(2));
+            assert_eq!(
+                snapshot.prefetch_hit_count, snapshot.prefetch_issued_count,
+                "right-edge insert descent should consume every hinted page"
+            );
+            assert!(
+                snapshot
+                    .hinted_pages
+                    .iter()
+                    .all(|page_no| matches!(page_no.get(), 4 | 9)),
+                "sequential insert descent should stay on the rightmost child chain, got {:?}",
+                snapshot.hinted_pages
+            );
+            assert!(
+                snapshot.hinted_pages.contains(&pn(4)) && snapshot.hinted_pages.contains(&pn(9)),
+                "sequential insert descent should prefetch both rightmost interior levels"
+            );
+        });
     }
 
     #[test]
     fn test_prefetch_random_insert() {
-        let cx = Cx::new();
-        let probe_store = build_prefetch_descent_probe_store();
-        probe_store.clear_probe();
+        run_async(async {
+            let cx = Cx::new();
+            let probe_store = build_prefetch_descent_probe_store().await;
+            probe_store.clear_probe();
 
-        let mut targets: Vec<i64> = (1_i64..=40_i64).collect();
-        deterministic_shuffle(&mut targets, 0xE2A4_0001_u64);
+            let mut targets: Vec<i64> = (1_i64..=40_i64).collect();
+            deterministic_shuffle(&mut targets, 0xE2A4_0001_u64);
 
-        for rowid in targets.into_iter().take(24) {
-            let mut cursor = BtCursor::new(probe_store.clone(), pn(2), USABLE, true);
-            cursor
-                .table_seek_for_insert(&cx, rowid)
-                .expect("random insert descent should succeed");
-        }
+            for rowid in targets.into_iter().take(24) {
+                let mut cursor = BtCursor::new(probe_store.clone(), pn(2), USABLE, true);
+                cursor
+                    .table_seek_for_insert(&cx, rowid)
+                    .await
+                    .expect("random insert descent should succeed");
+            }
 
-        let snapshot = probe_store.snapshot();
-        assert_prefetch_snapshot_addresses_are_valid(&probe_store, &snapshot, pn(2));
-        assert_eq!(
-            snapshot.prefetch_hit_count, snapshot.prefetch_issued_count,
-            "random insert descent should still consume every hinted child page"
-        );
-        assert!(
-            snapshot.hinted_pages.contains(&pn(3))
-                && snapshot.hinted_pages.contains(&pn(4))
-                && snapshot
-                    .hinted_pages
-                    .iter()
-                    .any(|page_no| matches!(page_no.get(), 6 | 8)),
-            "random insert descent should cover both left/mid and right child paths, got {:?}",
-            snapshot.hinted_pages
-        );
+            let snapshot = probe_store.snapshot();
+            assert_prefetch_snapshot_addresses_are_valid(&probe_store, &snapshot, pn(2));
+            assert_eq!(
+                snapshot.prefetch_hit_count, snapshot.prefetch_issued_count,
+                "random insert descent should still consume every hinted child page"
+            );
+            assert!(
+                snapshot.hinted_pages.contains(&pn(3))
+                    && snapshot.hinted_pages.contains(&pn(4))
+                    && snapshot
+                        .hinted_pages
+                        .iter()
+                        .any(|page_no| matches!(page_no.get(), 6 | 8)),
+                "random insert descent should cover both left/mid and right child paths, got {:?}",
+                snapshot.hinted_pages
+            );
+        });
     }
 
     #[test]
     fn test_prefetch_no_crash_on_evicted() {
-        let cx = Cx::new();
-        let mut inner = MemPageStore::new(USABLE);
-        inner
-            .write_page(&cx, pn(2), &build_leaf_table(&[(1, b"alive")]))
-            .unwrap();
-        inner.free_page(&cx, pn(2)).unwrap();
+        run_async(async {
+            let cx = Cx::new();
+            let mut inner = MemPageStore::new(USABLE);
+            inner
+                .write_page(&cx, pn(2), &build_leaf_table(&[(1, b"alive")]))
+                .await
+                .unwrap();
+            inner.free_page(&cx, pn(2)).await.unwrap();
 
-        let probe_store = PrefetchProbeStore::new(inner);
-        probe_store.prefetch_page_hint(&cx, pn(2));
+            let probe_store = PrefetchProbeStore::new(inner);
+            probe_store.prefetch_page_hint(&cx, pn(2));
 
-        let snapshot = probe_store.snapshot();
-        assert_eq!(snapshot.prefetch_issued_count, 1);
-        assert_eq!(snapshot.slot_prefetch_count, 1);
-        assert_eq!(snapshot.page_prefetch_count, 0);
-        assert_eq!(snapshot.prefetch_hit_count, 0);
-        assert_eq!(snapshot.missing_page_pages, vec![pn(2)]);
+            let snapshot = probe_store.snapshot();
+            assert_eq!(snapshot.prefetch_issued_count, 1);
+            assert_eq!(snapshot.slot_prefetch_count, 1);
+            assert_eq!(snapshot.page_prefetch_count, 0);
+            assert_eq!(snapshot.prefetch_hit_count, 0);
+            assert_eq!(snapshot.missing_page_pages, vec![pn(2)]);
+        });
     }
 
     #[test]
@@ -15791,97 +16632,104 @@ mod tests {
 
     #[test]
     fn test_table_interior_descent_uses_inline_page_pointer_reads() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_interior_table(&[(pn(3), 20), (pn(4), 40), (pn(5), 60)], pn(6)),
-        );
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_interior_table(&[(pn(3), 20), (pn(4), 40), (pn(5), 60)], pn(6)),
+            );
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        let mut entry = cursor.load_page(&cx, pn(2)).unwrap();
-        entry.cell_pointers.clear();
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let mut entry = cursor.load_page(&cx, pn(2)).await.unwrap();
+            entry.cell_pointers.clear();
 
-        let child_idx =
-            BtCursor::<MemPageStore>::binary_search_table_interior(&cx, &entry, 35).unwrap();
-        assert_eq!(child_idx, 1);
-        assert_eq!(
-            BtCursor::<MemPageStore>::read_interior_child_inline(&entry, child_idx).unwrap(),
-            pn(4)
-        );
+            let child_idx =
+                BtCursor::<MemPageStore>::binary_search_table_interior(&cx, &entry, 35).unwrap();
+            assert_eq!(child_idx, 1);
+            assert_eq!(
+                BtCursor::<MemPageStore>::read_interior_child_inline(&entry, child_idx).unwrap(),
+                pn(4)
+            );
+        });
     }
 
     #[test]
     fn test_index_interior_descent_uses_inline_page_pointer_reads() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
-        );
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
+            );
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
-        let mut entry = cursor.load_page(&cx, pn(2)).unwrap();
-        entry.cell_pointers.clear();
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+            let mut entry = cursor.load_page(&cx, pn(2)).await.unwrap();
+            entry.cell_pointers.clear();
 
-        let search = cursor
-            .binary_search_index_interior(&cx, &entry, b"c")
-            .unwrap();
-        assert_eq!(search, BinarySearchResult::NotFound(1));
-        assert_eq!(
-            BtCursor::<MemPageStore>::read_interior_child_inline(&entry, 1).unwrap(),
-            pn(4)
-        );
-        assert_eq!(
-            BtCursor::<MemPageStore>::read_interior_child_inline(&entry, 2).unwrap(),
-            pn(5)
-        );
+            let search = cursor
+                .binary_search_index_interior(&cx, &entry, b"c")
+                .await
+                .unwrap();
+            assert_eq!(search, BinarySearchResult::NotFound(1));
+            assert_eq!(
+                BtCursor::<MemPageStore>::read_interior_child_inline(&entry, 1).unwrap(),
+                pn(4)
+            );
+            assert_eq!(
+                BtCursor::<MemPageStore>::read_interior_child_inline(&entry, 2).unwrap(),
+                pn(5)
+            );
+        });
     }
 
     #[test]
     fn test_btree_insert_delete_5k() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        let mut remaining = BTreeSet::new();
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let mut remaining = BTreeSet::new();
 
-        // Insert 10,000 rows so that deleting 5,000 leaves 5,000 survivors.
-        for i in 1..=10_000_i64 {
-            let payload = payload_for_rowid(i);
-            cursor.table_insert(&cx, i, &payload).unwrap();
-            remaining.insert(i);
-        }
-
-        let mut deletion_order: Vec<i64> = remaining.iter().copied().collect();
-        deterministic_shuffle(&mut deletion_order, 0x00D1_5EA5);
-
-        for rowid in deletion_order.into_iter().take(5_000) {
-            let seek = cursor.table_move_to(&cx, rowid).unwrap();
-            assert!(seek.is_found(), "rowid {rowid} should exist before delete");
-            cursor.delete(&cx).unwrap();
-            remaining.remove(&rowid);
-        }
-
-        assert_eq!(remaining.len(), 5_000);
-        assert!(cursor.first(&cx).unwrap());
-
-        let mut expected_iter = remaining.iter();
-        loop {
-            let rowid = cursor.rowid(&cx).unwrap();
-            let expected = expected_iter.next().expect("cursor yielded extra row");
-            assert_eq!(&rowid, expected);
-
-            if !cursor.next(&cx).unwrap() {
-                break;
+            // Insert 10,000 rows so that deleting 5,000 leaves 5,000 survivors.
+            for i in 1..=10_000_i64 {
+                let payload = payload_for_rowid(i);
+                cursor.table_insert(&cx, i, &payload).await.unwrap();
+                remaining.insert(i);
             }
-        }
 
-        assert!(
-            expected_iter.next().is_none(),
-            "cursor missed one or more rows after delete workload"
-        );
+            let mut deletion_order: Vec<i64> = remaining.iter().copied().collect();
+            deterministic_shuffle(&mut deletion_order, 0x00D1_5EA5);
+
+            for rowid in deletion_order.into_iter().take(5_000) {
+                let seek = cursor.table_move_to(&cx, rowid).await.unwrap();
+                assert!(seek.is_found(), "rowid {rowid} should exist before delete");
+                cursor.delete(&cx).await.unwrap();
+                remaining.remove(&rowid);
+            }
+
+            assert_eq!(remaining.len(), 5_000);
+            assert!(cursor.first(&cx).await.unwrap());
+
+            let mut expected_iter = remaining.iter();
+            loop {
+                let rowid = cursor.rowid(&cx).await.unwrap();
+                let expected = expected_iter.next().expect("cursor yielded extra row");
+                assert_eq!(&rowid, expected);
+
+                if !cursor.next(&cx).await.unwrap() {
+                    break;
+                }
+            }
+
+            assert!(
+                expected_iter.next().is_none(),
+                "cursor missed one or more rows after delete workload"
+            );
+        });
     }
 
     #[test]
@@ -15891,70 +16739,80 @@ mod tests {
 
     #[test]
     fn test_table_insert_rightmost_hint_appends_and_falls_back_for_midstream_key() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        cursor
-            .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
-            .unwrap();
-        cursor
-            .table_insert_rightmost_hint(&cx, 3, payload_for_rowid(3).as_slice())
-            .unwrap();
-        cursor
-            .table_insert_rightmost_hint(&cx, 2, payload_for_rowid(2).as_slice())
-            .unwrap();
-
-        for rowid in 4..=256_i64 {
-            let payload = payload_for_rowid(rowid);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
             cursor
-                .table_insert_rightmost_hint(&cx, rowid, payload.as_slice())
+                .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
+                .await
                 .unwrap();
-        }
+            cursor
+                .table_insert_rightmost_hint(&cx, 3, payload_for_rowid(3).as_slice())
+                .await
+                .unwrap();
+            cursor
+                .table_insert_rightmost_hint(&cx, 2, payload_for_rowid(2).as_slice())
+                .await
+                .unwrap();
 
-        assert!(cursor.first(&cx).unwrap());
-        for expected_rowid in 1..=256_i64 {
-            assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
-            if expected_rowid < 256 {
-                assert!(cursor.next(&cx).unwrap());
+            for rowid in 4..=256_i64 {
+                let payload = payload_for_rowid(rowid);
+                cursor
+                    .table_insert_rightmost_hint(&cx, rowid, payload.as_slice())
+                    .await
+                    .unwrap();
             }
-        }
-        assert!(!cursor.next(&cx).unwrap());
+
+            assert!(cursor.first(&cx).await.unwrap());
+            for expected_rowid in 1..=256_i64 {
+                assert_eq!(cursor.rowid(&cx).await.unwrap(), expected_rowid);
+                if expected_rowid < 256 {
+                    assert!(cursor.next(&cx).await.unwrap());
+                }
+            }
+            assert!(!cursor.next(&cx).await.unwrap());
+        });
     }
 
     #[test]
     fn test_table_insert_rightmost_leaf_hint_reuses_leaf_and_falls_back_after_split() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        cursor
-            .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
-            .unwrap();
-
-        let mut hinted_leaf = cursor
-            .current_page()
-            .expect("first append should leave the cursor on a concrete leaf");
-        for rowid in 2..=256_i64 {
-            let payload = payload_for_rowid(rowid);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
             cursor
-                .table_insert_rightmost_leaf_hint(&cx, hinted_leaf, rowid, payload.as_slice())
+                .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
+                .await
                 .unwrap();
-            if let Some(current_leaf) = cursor.current_page() {
-                hinted_leaf = current_leaf;
-            }
-        }
 
-        assert!(cursor.first(&cx).unwrap());
-        for expected_rowid in 1..=256_i64 {
-            assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
-            if expected_rowid < 256 {
-                assert!(cursor.next(&cx).unwrap());
+            let mut hinted_leaf = cursor
+                .current_page()
+                .expect("first append should leave the cursor on a concrete leaf");
+            for rowid in 2..=256_i64 {
+                let payload = payload_for_rowid(rowid);
+                cursor
+                    .table_insert_rightmost_leaf_hint(&cx, hinted_leaf, rowid, payload.as_slice())
+                    .await
+                    .unwrap();
+                if let Some(current_leaf) = cursor.current_page() {
+                    hinted_leaf = current_leaf;
+                }
             }
-        }
-        assert!(!cursor.next(&cx).unwrap());
+
+            assert!(cursor.first(&cx).await.unwrap());
+            for expected_rowid in 1..=256_i64 {
+                assert_eq!(cursor.rowid(&cx).await.unwrap(), expected_rowid);
+                if expected_rowid < 256 {
+                    assert!(cursor.next(&cx).await.unwrap());
+                }
+            }
+            assert!(!cursor.next(&cx).await.unwrap());
+        });
     }
 
     #[test]
@@ -15966,1846 +16824,2033 @@ mod tests {
     /// caller can retry with the real `table_insert_rightmost_hint` and
     /// produce identical on-disk state to a fresh insert.
     fn test_table_try_append_rightmost_leaf_hint_known_last_rowid_rejects_mismatched_hint() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        // Seed the table with two rows so there IS a "last rowid" to mismatch.
-        cursor
-            .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
-            .unwrap();
-        cursor
-            .table_insert_rightmost_hint(&cx, 2, payload_for_rowid(2).as_slice())
-            .unwrap();
-        let hinted_leaf = cursor
-            .current_page()
-            .expect("append should leave cursor on a concrete leaf");
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            // Seed the table with two rows so there IS a "last rowid" to mismatch.
+            cursor
+                .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
+                .await
+                .unwrap();
+            cursor
+                .table_insert_rightmost_hint(&cx, 2, payload_for_rowid(2).as_slice())
+                .await
+                .unwrap();
+            let hinted_leaf = cursor
+                .current_page()
+                .expect("append should leave cursor on a concrete leaf");
 
-        // Now pass a DELIBERATELY WRONG hinted_last_rowid (1 instead of 2).
-        // The OPT-A3 fast path reads the last cell's rowid from the page
-        // directly and must notice the mismatch, returning Ok(None).
-        let wrong_hinted_last_rowid = 1_i64;
-        let result = cursor
-            .table_try_append_rightmost_leaf_hint_known_last_rowid(
-                &cx,
-                hinted_leaf,
-                wrong_hinted_last_rowid,
-                3,
-                payload_for_rowid(3).as_slice(),
-            )
-            .expect("mismatch path must not error");
-        assert!(
-            result.is_none(),
-            "mismatched hinted_last_rowid should force fallback, got {result:?}"
-        );
+            // Now pass a DELIBERATELY WRONG hinted_last_rowid (1 instead of 2).
+            // The OPT-A3 fast path reads the last cell's rowid from the page
+            // directly and must notice the mismatch, returning Ok(None).
+            let wrong_hinted_last_rowid = 1_i64;
+            let result = cursor
+                .table_try_append_rightmost_leaf_hint_known_last_rowid(
+                    &cx,
+                    hinted_leaf,
+                    wrong_hinted_last_rowid,
+                    3,
+                    payload_for_rowid(3).as_slice(),
+                )
+                .await
+                .expect("mismatch path must not error");
+            assert!(
+                result.is_none(),
+                "mismatched hinted_last_rowid should force fallback, got {result:?}"
+            );
 
-        // Cache should have been cleared on the mismatch.
-        assert!(
-            cursor.rightmost_leaf_cache.is_none(),
-            "mismatched hint should clear the rightmost-leaf cache"
-        );
+            // Cache should have been cleared on the mismatch.
+            assert!(
+                cursor.rightmost_leaf_cache.is_none(),
+                "mismatched hint should clear the rightmost-leaf cache"
+            );
 
-        // The caller can now recover via the generic rightmost-hint path and
-        // observe the same end-state as if the fast path had never been tried.
-        cursor
-            .table_insert_rightmost_hint(&cx, 3, payload_for_rowid(3).as_slice())
-            .unwrap();
+            // The caller can now recover via the generic rightmost-hint path and
+            // observe the same end-state as if the fast path had never been tried.
+            cursor
+                .table_insert_rightmost_hint(&cx, 3, payload_for_rowid(3).as_slice())
+                .await
+                .unwrap();
 
-        assert!(cursor.first(&cx).unwrap());
-        for expected_rowid in 1..=3_i64 {
-            assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
-            if expected_rowid < 3 {
-                assert!(cursor.next(&cx).unwrap());
+            assert!(cursor.first(&cx).await.unwrap());
+            for expected_rowid in 1..=3_i64 {
+                assert_eq!(cursor.rowid(&cx).await.unwrap(), expected_rowid);
+                if expected_rowid < 3 {
+                    assert!(cursor.next(&cx).await.unwrap());
+                }
             }
-        }
-        assert!(!cursor.next(&cx).unwrap());
+            assert!(!cursor.next(&cx).await.unwrap());
+        });
     }
 
     #[test]
     fn test_table_try_append_rightmost_leaf_hint_known_last_rowid_reuses_leaf_and_falls_back() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        cursor
-            .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
-            .unwrap();
-
-        let mut hinted_leaf = cursor
-            .current_page()
-            .expect("first append should leave the cursor on a concrete leaf");
-        let mut hinted_last_rowid = 1_i64;
-        for rowid in 2..=256_i64 {
-            let payload = payload_for_rowid(rowid);
-            if let Some(leaf_page) = cursor
-                .table_try_append_rightmost_leaf_hint_known_last_rowid(
-                    &cx,
-                    hinted_leaf,
-                    hinted_last_rowid,
-                    rowid,
-                    payload.as_slice(),
-                )
-                .unwrap()
-            {
-                hinted_leaf = leaf_page;
-                hinted_last_rowid = rowid;
-                assert_eq!(cursor.current_page(), Some(leaf_page));
-                let cached = cursor
-                    .rightmost_leaf_cache
-                    .as_ref()
-                    .expect("successful helper append should refresh the rightmost-leaf cache");
-                assert_eq!(cached.page_no, leaf_page);
-                assert_eq!(cached.rowid, rowid);
-                continue;
-            }
-
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
             cursor
-                .table_insert_rightmost_hint(&cx, rowid, payload.as_slice())
+                .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
+                .await
                 .unwrap();
-            hinted_leaf = cursor
-                .current_page()
-                .expect("fallback append should leave the cursor on a concrete leaf");
-            hinted_last_rowid = rowid;
-        }
 
-        assert!(cursor.first(&cx).unwrap());
-        for expected_rowid in 1..=256_i64 {
-            assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
-            if expected_rowid < 256 {
-                assert!(cursor.next(&cx).unwrap());
+            let mut hinted_leaf = cursor
+                .current_page()
+                .expect("first append should leave the cursor on a concrete leaf");
+            let mut hinted_last_rowid = 1_i64;
+            for rowid in 2..=256_i64 {
+                let payload = payload_for_rowid(rowid);
+                if let Some(leaf_page) = cursor
+                    .table_try_append_rightmost_leaf_hint_known_last_rowid(
+                        &cx,
+                        hinted_leaf,
+                        hinted_last_rowid,
+                        rowid,
+                        payload.as_slice(),
+                    )
+                    .await
+                    .unwrap()
+                {
+                    hinted_leaf = leaf_page;
+                    hinted_last_rowid = rowid;
+                    assert_eq!(cursor.current_page(), Some(leaf_page));
+                    let cached = cursor
+                        .rightmost_leaf_cache
+                        .as_ref()
+                        .expect("successful helper append should refresh the rightmost-leaf cache");
+                    assert_eq!(cached.page_no, leaf_page);
+                    assert_eq!(cached.rowid, rowid);
+                    continue;
+                }
+
+                cursor
+                    .table_insert_rightmost_hint(&cx, rowid, payload.as_slice())
+                    .await
+                    .unwrap();
+                hinted_leaf = cursor
+                    .current_page()
+                    .expect("fallback append should leave the cursor on a concrete leaf");
+                hinted_last_rowid = rowid;
             }
-        }
-        assert!(!cursor.next(&cx).unwrap());
+
+            assert!(cursor.first(&cx).await.unwrap());
+            for expected_rowid in 1..=256_i64 {
+                assert_eq!(cursor.rowid(&cx).await.unwrap(), expected_rowid);
+                if expected_rowid < 256 {
+                    assert!(cursor.next(&cx).await.unwrap());
+                }
+            }
+            assert!(!cursor.next(&cx).await.unwrap());
+        });
     }
 
     #[test]
     fn test_table_try_append_rightmost_leaf_hint_known_last_rowid_with_state_refreshes_hint() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        cursor
-            .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
-            .unwrap();
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            cursor
+                .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
+                .await
+                .unwrap();
 
-        let hinted_leaf = cursor
-            .current_page()
-            .expect("first append should leave the cursor on a concrete leaf");
-        cursor.clear_rightmost_leaf_cache();
-        cursor.stack.clear();
-        cursor.at_eof = true;
+            let hinted_leaf = cursor
+                .current_page()
+                .expect("first append should leave the cursor on a concrete leaf");
+            cursor.clear_rightmost_leaf_cache();
+            cursor.stack.clear();
+            cursor.at_eof = true;
 
-        let cached_leaf = cursor
-            .table_try_append_rightmost_leaf_hint_known_last_rowid_with_state(
-                &cx,
-                hinted_leaf,
-                1,
-                2,
-                payload_for_rowid(2).as_slice(),
-            )
-            .unwrap()
-            .expect("known-last-rowid helper should append on a fresh cursor");
+            let cached_leaf = cursor
+                .table_try_append_rightmost_leaf_hint_known_last_rowid_with_state(
+                    &cx,
+                    hinted_leaf,
+                    1,
+                    2,
+                    payload_for_rowid(2).as_slice(),
+                )
+                .await
+                .unwrap()
+                .expect("known-last-rowid helper should append on a fresh cursor");
 
-        assert_eq!(cached_leaf.leaf_page(), hinted_leaf);
-        assert_eq!(cached_leaf.last_rowid(), 2);
-        assert!(
-            cached_leaf.retains_page_data(),
-            "with_state helper should return the refreshed retained leaf image"
-        );
-        assert_eq!(
-            cursor.current_page(),
-            None,
-            "with_state helper should not rebuild cursor stack state just to return a retained hint"
-        );
-        assert!(
-            cursor.rightmost_leaf_cache.is_none(),
-            "with_state helper skips internal cache hydration; the returned hint is authoritative"
-        );
+            assert_eq!(cached_leaf.leaf_page(), hinted_leaf);
+            assert_eq!(cached_leaf.last_rowid(), 2);
+            assert!(
+                cached_leaf.retains_page_data(),
+                "with_state helper should return the refreshed retained leaf image"
+            );
+            assert_eq!(
+                cursor.current_page(),
+                None,
+                "with_state helper should not rebuild cursor stack state just to return a retained hint"
+            );
+            assert!(
+                cursor.rightmost_leaf_cache.is_none(),
+                "with_state helper skips internal cache hydration; the returned hint is authoritative"
+            );
+        });
     }
 
     #[test]
     fn test_table_try_append_cached_rightmost_leaf_hint_reuses_retained_leaf_image() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, true);
-        cursor
-            .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
-            .unwrap();
-
-        let mut hint = cursor
-            .table_cached_rightmost_leaf_hint()
-            .expect("first append should seed a retained rightmost-leaf image");
-        for rowid in 2..=256_i64 {
-            let payload = payload_for_rowid(rowid);
-            let previous_leaf = hint.leaf_page();
-            cursor.pager.clear_reads();
-            if cursor
-                .table_try_append_cached_rightmost_leaf_hint(
-                    &cx,
-                    &mut hint,
-                    rowid,
-                    payload.as_slice(),
-                )
-                .unwrap()
-            {
-                assert_eq!(hint.last_rowid(), rowid);
-                let read_pages = cursor.pager.read_pages();
-                if hint.leaf_page() == previous_leaf {
-                    assert!(
-                        read_pages.is_empty(),
-                        "cached retained-leaf append should not re-read the tree when it stays on the same leaf: {read_pages:?}"
-                    );
-                }
-                continue;
-            }
-
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, true);
             cursor
-                .table_insert_rightmost_hint(&cx, rowid, payload.as_slice())
+                .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
+                .await
                 .unwrap();
-            hint = cursor
-                .table_cached_rightmost_leaf_hint()
-                .expect("fallback append should refresh the retained rightmost-leaf image");
-            assert_eq!(hint.last_rowid(), rowid);
-        }
 
-        assert!(cursor.first(&cx).unwrap());
-        for expected_rowid in 1..=256_i64 {
-            assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
-            if expected_rowid < 256 {
-                assert!(cursor.next(&cx).unwrap());
+            let mut hint = cursor
+                .table_cached_rightmost_leaf_hint()
+                .expect("first append should seed a retained rightmost-leaf image");
+            for rowid in 2..=256_i64 {
+                let payload = payload_for_rowid(rowid);
+                let previous_leaf = hint.leaf_page();
+                cursor.pager.clear_reads();
+                if cursor
+                    .table_try_append_cached_rightmost_leaf_hint(
+                        &cx,
+                        &mut hint,
+                        rowid,
+                        payload.as_slice(),
+                    )
+                    .await
+                    .unwrap()
+                {
+                    assert_eq!(hint.last_rowid(), rowid);
+                    let read_pages = cursor.pager.read_pages();
+                    if hint.leaf_page() == previous_leaf {
+                        assert!(
+                            read_pages.is_empty(),
+                            "cached retained-leaf append should not re-read the tree when it stays on the same leaf: {read_pages:?}"
+                        );
+                    }
+                    continue;
+                }
+
+                cursor
+                    .table_insert_rightmost_hint(&cx, rowid, payload.as_slice())
+                    .await
+                    .unwrap();
+                hint = cursor
+                    .table_cached_rightmost_leaf_hint()
+                    .expect("fallback append should refresh the retained rightmost-leaf image");
+                assert_eq!(hint.last_rowid(), rowid);
             }
-        }
-        assert!(!cursor.next(&cx).unwrap());
+
+            assert!(cursor.first(&cx).await.unwrap());
+            for expected_rowid in 1..=256_i64 {
+                assert_eq!(cursor.rowid(&cx).await.unwrap(), expected_rowid);
+                if expected_rowid < 256 {
+                    assert!(cursor.next(&cx).await.unwrap());
+                }
+            }
+            assert!(!cursor.next(&cx).await.unwrap());
+        });
     }
 
     #[test]
     fn test_table_try_append_cached_rightmost_leaf_hint_with_writer_mutates_staged_leaf() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = StagedMutationStore::new(MemPageStore::with_empty_table(root, USABLE));
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
-        cursor.table_insert_rightmost_hint(&cx, 1, b"seed").unwrap();
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = StagedMutationStore::new(MemPageStore::with_empty_table(root, USABLE));
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            cursor
+                .table_insert_rightmost_hint(&cx, 1, b"seed")
+                .await
+                .unwrap();
 
-        let mut hint = cursor
-            .table_cached_rightmost_leaf_hint()
-            .expect("seed append should capture a retained rightmost-leaf image");
-        let payload = b"direct-retained-page-payload";
-        let appended = cursor
-            .table_try_append_cached_rightmost_leaf_hint_with_writer(
-                &cx,
-                &mut hint,
-                2,
-                payload.len(),
-                |dst| {
-                    dst.copy_from_slice(payload);
-                    Ok(())
-                },
-            )
-            .unwrap();
+            let mut hint = cursor
+                .table_cached_rightmost_leaf_hint()
+                .expect("seed append should capture a retained rightmost-leaf image");
+            let payload = b"direct-retained-page-payload";
+            let appended = cursor
+                .table_try_append_cached_rightmost_leaf_hint_with_writer(
+                    &cx,
+                    &mut hint,
+                    2,
+                    payload.len(),
+                    |dst| {
+                        dst.copy_from_slice(payload);
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap();
 
-        assert!(
-            appended,
-            "writer should append directly into the retained rightmost leaf image"
-        );
-        assert_eq!(hint.last_rowid(), 2);
-        assert!(
-            !hint.retains_page_data(),
-            "staged-page writer append should drop the stale retained page image"
-        );
-        assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), payload);
+            assert!(
+                appended,
+                "writer should append directly into the retained rightmost leaf image"
+            );
+            assert_eq!(hint.last_rowid(), 2);
+            assert!(
+                !hint.retains_page_data(),
+                "staged-page writer append should drop the stale retained page image"
+            );
+            assert!(cursor.table_move_to(&cx, 2).await.unwrap().is_found());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), payload);
+        });
     }
 
     #[test]
     fn test_table_try_append_cached_rightmost_leaf_hint_with_writer_updates_retained_page_image() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        cursor.table_insert_rightmost_hint(&cx, 1, b"seed").unwrap();
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            cursor
+                .table_insert_rightmost_hint(&cx, 1, b"seed")
+                .await
+                .unwrap();
 
-        let mut hint = cursor
-            .table_cached_rightmost_leaf_hint()
-            .expect("seed append should capture a retained rightmost-leaf image");
-        let payload = b"direct-retained-page-payload";
-        let appended = cursor
-            .table_try_append_cached_rightmost_leaf_hint_with_writer(
-                &cx,
-                &mut hint,
-                2,
-                payload.len(),
-                |dst| {
-                    dst.copy_from_slice(payload);
-                    Ok(())
-                },
-            )
-            .unwrap();
+            let mut hint = cursor
+                .table_cached_rightmost_leaf_hint()
+                .expect("seed append should capture a retained rightmost-leaf image");
+            let payload = b"direct-retained-page-payload";
+            let appended = cursor
+                .table_try_append_cached_rightmost_leaf_hint_with_writer(
+                    &cx,
+                    &mut hint,
+                    2,
+                    payload.len(),
+                    |dst| {
+                        dst.copy_from_slice(payload);
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap();
 
-        assert!(
-            appended,
-            "writer should append directly into the retained rightmost leaf image"
-        );
-        assert_eq!(hint.last_rowid(), 2);
-        let retained_page = hint
-            .page_data
-            .as_ref()
-            .expect("retained writer append should preserve a hot page image")
-            .as_bytes()
-            .to_vec();
+            assert!(
+                appended,
+                "writer should append directly into the retained rightmost leaf image"
+            );
+            assert_eq!(hint.last_rowid(), 2);
+            let retained_page = hint
+                .page_data
+                .as_ref()
+                .expect("retained writer append should preserve a hot page image")
+                .as_bytes()
+                .to_vec();
 
-        let mut retained_store = MemPageStore::new(USABLE);
-        retained_store
-            .pages
-            .insert(hint.leaf_page().get(), retained_page);
-        let mut retained_cursor = BtCursor::new(retained_store, pn(2), USABLE, true);
-        assert!(retained_cursor.table_move_to(&cx, 2).unwrap().is_found());
-        assert_eq!(retained_cursor.payload(&cx).unwrap(), payload);
+            let mut retained_store = MemPageStore::new(USABLE);
+            retained_store
+                .pages
+                .insert(hint.leaf_page().get(), retained_page);
+            let mut retained_cursor = BtCursor::new(retained_store, pn(2), USABLE, true);
+            assert!(
+                retained_cursor
+                    .table_move_to(&cx, 2)
+                    .await
+                    .unwrap()
+                    .is_found()
+            );
+            assert_eq!(retained_cursor.payload(&cx).await.unwrap(), payload);
+        });
     }
 
     #[test]
     fn test_table_try_append_cached_rightmost_leaf_hint_with_writer_error_does_not_publish_cell() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, true);
-        cursor.table_insert_rightmost_hint(&cx, 1, b"seed").unwrap();
-
-        let mut hint = cursor
-            .table_cached_rightmost_leaf_hint()
-            .expect("seed append should capture a retained rightmost-leaf image");
-        let error = cursor
-            .table_try_append_cached_rightmost_leaf_hint_with_writer(&cx, &mut hint, 2, 8, |dst| {
-                dst.copy_from_slice(b"partial!");
-                Err(FrankenError::internal("forced retained writer failure"))
-            })
-            .unwrap_err();
-
-        assert!(error.to_string().contains("forced retained writer failure"));
-        assert_eq!(hint.last_rowid(), 1);
-        assert!(
-            hint.retains_page_data(),
-            "failed writer should preserve the retained pre-append page image for fallback"
-        );
-        assert!(
-            !cursor.table_move_to(&cx, 2).unwrap().is_found(),
-            "failed retained writer append must not publish a new row"
-        );
-
-        assert!(
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, true);
             cursor
-                .table_try_append_cached_rightmost_leaf_hint(&cx, &mut hint, 2, b"fallback")
-                .unwrap(),
-            "byte-slice fallback should still be able to use the retained hint"
-        );
-        assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), b"fallback");
+                .table_insert_rightmost_hint(&cx, 1, b"seed")
+                .await
+                .unwrap();
+
+            let mut hint = cursor
+                .table_cached_rightmost_leaf_hint()
+                .expect("seed append should capture a retained rightmost-leaf image");
+            let error = cursor
+                .table_try_append_cached_rightmost_leaf_hint_with_writer(
+                    &cx,
+                    &mut hint,
+                    2,
+                    8,
+                    |dst| {
+                        dst.copy_from_slice(b"partial!");
+                        Err(FrankenError::internal("forced retained writer failure"))
+                    },
+                )
+                .await
+                .unwrap_err();
+
+            assert!(error.to_string().contains("forced retained writer failure"));
+            assert_eq!(hint.last_rowid(), 1);
+            assert!(
+                hint.retains_page_data(),
+                "failed writer should preserve the retained pre-append page image for fallback"
+            );
+            assert!(
+                !cursor.table_move_to(&cx, 2).await.unwrap().is_found(),
+                "failed retained writer append must not publish a new row"
+            );
+
+            assert!(
+                cursor
+                    .table_try_append_cached_rightmost_leaf_hint(&cx, &mut hint, 2, b"fallback")
+                    .await
+                    .unwrap(),
+                "byte-slice fallback should still be able to use the retained hint"
+            );
+            assert!(cursor.table_move_to(&cx, 2).await.unwrap().is_found());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"fallback");
+        });
     }
 
     #[test]
     fn test_cached_rightmost_hint_drops_page_data_after_staged_mutation() {
-        const SMALL_USABLE: u32 = 256;
+        run_async(async {
+            const SMALL_USABLE: u32 = 256;
 
-        let cx = Cx::new();
-        let root = pn(2);
-        let payload = vec![b'S'; 120];
-        let store = StagedMutationStore::new(MemPageStore::with_empty_table(root, SMALL_USABLE));
-        let mut cursor = BtCursor::new(store, root, SMALL_USABLE, true);
-        cursor
-            .table_insert_rightmost_hint(&cx, 1, &payload)
-            .expect("seed insert should succeed");
-
-        let mut hint = cursor
-            .table_cached_rightmost_leaf_hint()
-            .expect("seed insert should capture a retained rightmost-leaf image");
-        assert!(
-            hint.retains_page_data(),
-            "seed hint should start with a retained page image"
-        );
-
-        assert!(
+            let cx = Cx::new();
+            let root = pn(2);
+            let payload = vec![b'S'; 120];
+            let store =
+                StagedMutationStore::new(MemPageStore::with_empty_table(root, SMALL_USABLE));
+            let mut cursor = BtCursor::new(store, root, SMALL_USABLE, true);
             cursor
-                .table_try_append_cached_rightmost_leaf_hint(&cx, &mut hint, 2, &payload)
-                .expect("staged-page mutation append should succeed"),
-            "second row should append through the staged-page mutation path"
-        );
-        assert_eq!(hint.last_rowid(), 2);
-        assert!(
-            !hint.retains_page_data(),
-            "a staged-page mutation must drop the stale retained page image"
-        );
+                .table_insert_rightmost_hint(&cx, 1, &payload)
+                .await
+                .expect("seed insert should succeed");
 
-        if !cursor
-            .table_try_append_cached_rightmost_leaf_hint(&cx, &mut hint, 3, &payload)
-            .expect("fallback probe after staged-page mutation should not corrupt state")
-        {
-            cursor
-                .table_insert_rightmost_hint(&cx, 3, &payload)
-                .expect("caller fallback should preserve rows after stale hint bytes are dropped");
-        }
+            let mut hint = cursor
+                .table_cached_rightmost_leaf_hint()
+                .expect("seed insert should capture a retained rightmost-leaf image");
+            assert!(
+                hint.retains_page_data(),
+                "seed hint should start with a retained page image"
+            );
 
-        assert!(cursor.first(&cx).unwrap());
-        for expected_rowid in 1..=3_i64 {
-            assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
-            if expected_rowid < 3 {
-                assert!(cursor.next(&cx).unwrap());
+            assert!(
+                cursor
+                    .table_try_append_cached_rightmost_leaf_hint(&cx, &mut hint, 2, &payload)
+                    .await
+                    .expect("staged-page mutation append should succeed"),
+                "second row should append through the staged-page mutation path"
+            );
+            assert_eq!(hint.last_rowid(), 2);
+            assert!(
+                !hint.retains_page_data(),
+                "a staged-page mutation must drop the stale retained page image"
+            );
+
+            if !cursor
+                .table_try_append_cached_rightmost_leaf_hint(&cx, &mut hint, 3, &payload)
+                .await
+                .expect("fallback probe after staged-page mutation should not corrupt state")
+            {
+                cursor
+                    .table_insert_rightmost_hint(&cx, 3, &payload)
+                    .await
+                    .expect(
+                        "caller fallback should preserve rows after stale hint bytes are dropped",
+                    );
             }
-        }
-        assert!(!cursor.next(&cx).unwrap());
+
+            assert!(cursor.first(&cx).await.unwrap());
+            for expected_rowid in 1..=3_i64 {
+                assert_eq!(cursor.rowid(&cx).await.unwrap(), expected_rowid);
+                if expected_rowid < 3 {
+                    assert!(cursor.next(&cx).await.unwrap());
+                }
+            }
+            assert!(!cursor.next(&cx).await.unwrap());
+        });
     }
 
     #[test]
     fn test_cached_rightmost_hint_overflow_encode_error_retains_cell_buffer() {
-        const SMALL_USABLE: u32 = 256;
-        let inner = Rc::new(RefCell::new(MemPageStore::with_empty_table(
-            pn(2),
-            SMALL_USABLE,
-        )));
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(
-            FailingOverflowStore::new(inner, usize::MAX),
-            pn(2),
-            SMALL_USABLE,
-            true,
-        );
-        cursor
-            .table_insert_rightmost_hint(&cx, 1, b"seed")
-            .expect("seed insert should succeed");
-        let mut hint = cursor
-            .table_cached_rightmost_leaf_hint()
-            .expect("seed insert should capture a retained rightmost-leaf hint");
+        run_async(async {
+            const SMALL_USABLE: u32 = 256;
+            let inner = Rc::new(RefCell::new(MemPageStore::with_empty_table(
+                pn(2),
+                SMALL_USABLE,
+            )));
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(
+                FailingOverflowStore::new(inner, usize::MAX),
+                pn(2),
+                SMALL_USABLE,
+                true,
+            );
+            cursor
+                .table_insert_rightmost_hint(&cx, 1, b"seed")
+                .await
+                .expect("seed insert should succeed");
+            let mut hint = cursor
+                .table_cached_rightmost_leaf_hint()
+                .expect("seed insert should capture a retained rightmost-leaf hint");
 
-        cursor.cell_buf = Vec::with_capacity(4096);
-        let expected_capacity = cursor.cell_buf.capacity();
-        cursor.pager.fail_on_write = cursor.pager.write_count.saturating_add(1);
+            cursor.cell_buf = Vec::with_capacity(4096);
+            let expected_capacity = cursor.cell_buf.capacity();
+            cursor.pager.fail_on_write = cursor.pager.write_count.saturating_add(1);
 
-        let overflow_payload = vec![b'X'; 512];
-        let error = cursor
-            .table_try_append_cached_rightmost_leaf_hint(&cx, &mut hint, 2, &overflow_payload)
-            .expect_err("injected overflow write failure should abort append");
+            let overflow_payload = vec![b'X'; 512];
+            let error = cursor
+                .table_try_append_cached_rightmost_leaf_hint(&cx, &mut hint, 2, &overflow_payload)
+                .await
+                .expect_err("injected overflow write failure should abort append");
 
-        assert!(
-            matches!(&error, FrankenError::Internal(msg) if msg == "injected write failure"),
-            "expected injected write failure, got {error:?}"
-        );
-        assert!(
-            cursor.cell_buf.capacity() >= expected_capacity,
-            "retained-hint overflow encode failure should return the reusable cell buffer"
-        );
+            assert!(
+                matches!(&error, FrankenError::Internal(msg) if msg == "injected write failure"),
+                "expected injected write failure, got {error:?}"
+            );
+            assert!(
+                cursor.cell_buf.capacity() >= expected_capacity,
+                "retained-hint overflow encode failure should return the reusable cell buffer"
+            );
+        });
     }
 
     #[test]
     fn test_table_overwrite_current_payload_same_size_no_overflow_preserves_cell_shape() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[(1, b"aaaaaaaa"), (2, b"bbbbbbbb"), (3, b"cccccccc")]),
-        );
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_leaf_table(&[(1, b"aaaaaaaa"), (2, b"bbbbbbbb"), (3, b"cccccccc")]),
+            );
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            assert!(cursor.table_move_to(&cx, 2).await.unwrap().is_found());
 
-        assert!(
-            cursor
-                .table_overwrite_current_payload_same_size_no_overflow(&cx, 2, b"BBBBBBBB")
-                .unwrap()
-        );
-        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
-        assert_eq!(cursor.payload(&cx).unwrap(), b"BBBBBBBB");
+            assert!(
+                cursor
+                    .table_overwrite_current_payload_same_size_no_overflow(&cx, 2, b"BBBBBBBB")
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 2);
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"BBBBBBBB");
 
-        assert!(
-            !cursor
-                .table_overwrite_current_payload_same_size_no_overflow(&cx, 2, b"too-long!")
-                .unwrap(),
-            "size-changing updates must fall back to delete+insert"
-        );
-        assert_eq!(cursor.payload(&cx).unwrap(), b"BBBBBBBB");
+            assert!(
+                !cursor
+                    .table_overwrite_current_payload_same_size_no_overflow(&cx, 2, b"too-long!")
+                    .await
+                    .unwrap(),
+                "size-changing updates must fall back to delete+insert"
+            );
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"BBBBBBBB");
 
-        assert!(cursor.table_move_to(&cx, 1).unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), b"aaaaaaaa");
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.payload(&cx).unwrap(), b"cccccccc");
+            assert!(cursor.table_move_to(&cx, 1).await.unwrap().is_found());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"aaaaaaaa");
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 2);
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"cccccccc");
+        });
     }
 
     #[test]
     fn test_table_try_append_cached_rightmost_leaf_hint_drops_stale_internal_cache() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        cursor
-            .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
-            .unwrap();
-
-        let mut hint = cursor
-            .table_cached_rightmost_leaf_hint()
-            .expect("seed insert should capture a retained rightmost-leaf hint");
-        assert!(
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
             cursor
-                .table_try_append_cached_rightmost_leaf_hint(
-                    &cx,
-                    &mut hint,
-                    2,
-                    payload_for_rowid(2).as_slice(),
-                )
-                .unwrap(),
-            "retained-hint helper should append directly on the cached leaf"
-        );
-        assert!(
-            cursor.rightmost_leaf_cache.is_none(),
-            "retained-hint appends must not leave a stale internal leaf image behind"
-        );
+                .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
+                .await
+                .unwrap();
 
-        cursor
-            .table_insert(&cx, 3, payload_for_rowid(3).as_slice())
-            .unwrap();
+            let mut hint = cursor
+                .table_cached_rightmost_leaf_hint()
+                .expect("seed insert should capture a retained rightmost-leaf hint");
+            assert!(
+                cursor
+                    .table_try_append_cached_rightmost_leaf_hint(
+                        &cx,
+                        &mut hint,
+                        2,
+                        payload_for_rowid(2).as_slice(),
+                    )
+                    .await
+                    .unwrap(),
+                "retained-hint helper should append directly on the cached leaf"
+            );
+            assert!(
+                cursor.rightmost_leaf_cache.is_none(),
+                "retained-hint appends must not leave a stale internal leaf image behind"
+            );
 
-        assert!(cursor.first(&cx).unwrap());
-        for expected_rowid in 1..=3_i64 {
-            assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
-            if expected_rowid < 3 {
-                assert!(cursor.next(&cx).unwrap());
+            cursor
+                .table_insert(&cx, 3, payload_for_rowid(3).as_slice())
+                .await
+                .unwrap();
+
+            assert!(cursor.first(&cx).await.unwrap());
+            for expected_rowid in 1..=3_i64 {
+                assert_eq!(cursor.rowid(&cx).await.unwrap(), expected_rowid);
+                if expected_rowid < 3 {
+                    assert!(cursor.next(&cx).await.unwrap());
+                }
             }
-        }
-        assert!(!cursor.next(&cx).unwrap());
+            assert!(!cursor.next(&cx).await.unwrap());
+        });
     }
 
     #[test]
     fn test_table_try_append_cached_rightmost_leaf_hint_handles_split_fallback() {
-        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        const SMALL_USABLE: u32 = 256;
+        run_async(async {
+            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            const SMALL_USABLE: u32 = 256;
 
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
-        let payload = vec![b'S'; 120];
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, SMALL_USABLE, true);
-        cursor
-            .table_insert_rightmost_hint(&cx, 1, &payload)
-            .expect("seed insert should succeed");
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
+            let payload = vec![b'S'; 120];
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, SMALL_USABLE, true);
+            cursor
+                .table_insert_rightmost_hint(&cx, 1, &payload)
+                .await
+                .expect("seed insert should succeed");
 
-        let mut hint = cursor
-            .table_cached_rightmost_leaf_hint()
-            .expect("seed insert should capture a retained rightmost-leaf hint");
-        let mut observed_split = false;
-        let mut inserted_through = 1_i64;
+            let mut hint = cursor
+                .table_cached_rightmost_leaf_hint()
+                .expect("seed insert should capture a retained rightmost-leaf hint");
+            let mut observed_split = false;
+            let mut inserted_through = 1_i64;
 
-        for rowid in 2..=32_i64 {
-            let previous_leaf = hint.leaf_page();
-            cursor.stack.clear();
-            cursor.at_eof = true;
-            cursor.clear_rightmost_leaf_cache();
+            for rowid in 2..=32_i64 {
+                let previous_leaf = hint.leaf_page();
+                cursor.stack.clear();
+                cursor.at_eof = true;
+                cursor.clear_rightmost_leaf_cache();
+
+                assert!(
+                    cursor
+                        .table_try_append_cached_rightmost_leaf_hint(
+                            &cx, &mut hint, rowid, &payload
+                        )
+                        .await
+                        .expect("cached rightmost-leaf helper should handle split fallback"),
+                    "helper should not need a second append API when the hinted leaf fills"
+                );
+                inserted_through = rowid;
+
+                if hint.leaf_page() != previous_leaf {
+                    observed_split = true;
+                    break;
+                }
+            }
 
             assert!(
-                cursor
-                    .table_try_append_cached_rightmost_leaf_hint(&cx, &mut hint, rowid, &payload)
-                    .expect("cached rightmost-leaf helper should handle split fallback"),
-                "helper should not need a second append API when the hinted leaf fills"
+                observed_split,
+                "test setup should force at least one cached-hint leaf split"
             );
-            inserted_through = rowid;
 
-            if hint.leaf_page() != previous_leaf {
-                observed_split = true;
-                break;
+            assert!(cursor.first(&cx).await.unwrap());
+            for expected_rowid in 1..=inserted_through {
+                assert_eq!(cursor.rowid(&cx).await.unwrap(), expected_rowid);
+                if expected_rowid < inserted_through {
+                    assert!(cursor.next(&cx).await.unwrap());
+                }
             }
-        }
-
-        assert!(
-            observed_split,
-            "test setup should force at least one cached-hint leaf split"
-        );
-
-        assert!(cursor.first(&cx).unwrap());
-        for expected_rowid in 1..=inserted_through {
-            assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
-            if expected_rowid < inserted_through {
-                assert!(cursor.next(&cx).unwrap());
-            }
-        }
-        assert!(!cursor.next(&cx).unwrap());
+            assert!(!cursor.next(&cx).await.unwrap());
+        });
     }
 
     #[test]
     fn test_table_try_append_cached_rightmost_leaf_hint_split_reads_only_parent_after_root_split() {
-        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        const SMALL_USABLE: u32 = 256;
+        run_async(async {
+            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            const SMALL_USABLE: u32 = 256;
 
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
-        let payload = vec![b'P'; 120];
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, SMALL_USABLE, true);
-        cursor
-            .table_insert_rightmost_hint(&cx, 1, &payload)
-            .expect("seed insert should succeed");
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
+            let payload = vec![b'P'; 120];
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, SMALL_USABLE, true);
+            cursor
+                .table_insert_rightmost_hint(&cx, 1, &payload)
+                .await
+                .expect("seed insert should succeed");
 
-        let mut hint = cursor
-            .table_cached_rightmost_leaf_hint()
-            .expect("seed insert should capture a retained rightmost-leaf hint");
-        let mut observed_post_root_split = false;
+            let mut hint = cursor
+                .table_cached_rightmost_leaf_hint()
+                .expect("seed insert should capture a retained rightmost-leaf hint");
+            let mut observed_post_root_split = false;
 
-        for rowid in 2..=128_i64 {
-            let previous_leaf = hint.leaf_page();
-            let parent_before = hint.parent_page();
-            cursor.stack.clear();
-            cursor.at_eof = true;
-            cursor.clear_rightmost_leaf_cache();
-            cursor.pager.clear_reads();
+            for rowid in 2..=128_i64 {
+                let previous_leaf = hint.leaf_page();
+                let parent_before = hint.parent_page();
+                cursor.stack.clear();
+                cursor.at_eof = true;
+                cursor.clear_rightmost_leaf_cache();
+                cursor.pager.clear_reads();
+
+                assert!(
+                    cursor
+                        .table_try_append_cached_rightmost_leaf_hint(
+                            &cx, &mut hint, rowid, &payload
+                        )
+                        .await
+                        .expect("cached rightmost-leaf helper should handle split fallback"),
+                    "helper should not need a second append API when the hinted leaf fills"
+                );
+
+                if let Some(parent_before) =
+                    parent_before.filter(|_| hint.leaf_page() != previous_leaf)
+                {
+                    observed_post_root_split = true;
+                    assert_eq!(
+                        cursor.pager.read_pages(),
+                        vec![parent_before],
+                        "cached-hint split should read only the parent page once it has a parent hint"
+                    );
+                    break;
+                }
+            }
 
             assert!(
-                cursor
-                    .table_try_append_cached_rightmost_leaf_hint(&cx, &mut hint, rowid, &payload)
-                    .expect("cached rightmost-leaf helper should handle split fallback"),
-                "helper should not need a second append API when the hinted leaf fills"
+                observed_post_root_split,
+                "test setup should reach a cached-hint split after the first root split"
             );
-
-            if let Some(parent_before) = parent_before.filter(|_| hint.leaf_page() != previous_leaf)
-            {
-                observed_post_root_split = true;
-                assert_eq!(
-                    cursor.pager.read_pages(),
-                    vec![parent_before],
-                    "cached-hint split should read only the parent page once it has a parent hint"
-                );
-                break;
-            }
-        }
-
-        assert!(
-            observed_post_root_split,
-            "test setup should reach a cached-hint split after the first root split"
-        );
+        });
     }
 
     #[test]
     fn test_table_insert_reuses_rightmost_leaf_cache_for_sequential_appends() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let payload = vec![b'A'; 180];
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let payload = vec![b'A'; 180];
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
 
-        for rowid in 1..=128_i64 {
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-        }
+            for rowid in 1..=128_i64 {
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            }
 
-        let root_entry = cursor.reload_page_fresh(&cx, root).unwrap();
-        assert!(
-            root_entry.header.page_type.is_interior(),
-            "test requires an interior root so the uncached path would revisit it"
-        );
+            let root_entry = cursor.reload_page_fresh(&cx, root).await.unwrap();
+            assert!(
+                root_entry.header.page_type.is_interior(),
+                "test requires an interior root so the uncached path would revisit it"
+            );
 
-        let cached_before = cursor
-            .rightmost_leaf_cache
-            .clone()
-            .expect("sequential inserts should seed the rightmost-leaf cache");
+            let cached_before = cursor
+                .rightmost_leaf_cache
+                .clone()
+                .expect("sequential inserts should seed the rightmost-leaf cache");
 
-        let mut cell_data = Vec::new();
-        cursor
-            .encode_table_leaf_cell_into(&cx, 129, &payload, &mut cell_data)
-            .unwrap();
-        let rightmost_leaf = cursor.load_page(&cx, cached_before.page_no).unwrap();
-        let header_offset = cell::header_offset_for_page(cached_before.page_no);
-        let content_offset = rightmost_leaf.header.content_offset(cursor.usable_size);
-        let new_content_offset = content_offset
-            .checked_sub(cell_data.len())
-            .expect("test requires free space on the cached rightmost leaf");
-        let ptr_array_end = header_offset
-            + usize::from(rightmost_leaf.header.page_type.header_size())
-            + (usize::from(rightmost_leaf.header.cell_count) + 1) * 2;
-        assert!(
-            ptr_array_end <= new_content_offset,
-            "test setup must leave room for one more append on the cached rightmost leaf"
-        );
+            let mut cell_data = Vec::new();
+            cursor
+                .encode_table_leaf_cell_into(&cx, 129, &payload, &mut cell_data)
+                .await
+                .unwrap();
+            let rightmost_leaf = cursor.load_page(&cx, cached_before.page_no).await.unwrap();
+            let header_offset = cell::header_offset_for_page(cached_before.page_no);
+            let content_offset = rightmost_leaf.header.content_offset(cursor.usable_size);
+            let new_content_offset = content_offset
+                .checked_sub(cell_data.len())
+                .expect("test requires free space on the cached rightmost leaf");
+            let ptr_array_end = header_offset
+                + usize::from(rightmost_leaf.header.page_type.header_size())
+                + (usize::from(rightmost_leaf.header.cell_count) + 1) * 2;
+            assert!(
+                ptr_array_end <= new_content_offset,
+                "test setup must leave room for one more append on the cached rightmost leaf"
+            );
 
-        cursor.pager.clear_reads();
-        cursor.table_insert(&cx, 129, &payload).unwrap();
-        assert!(
-            cursor.pager.read_pages().is_empty(),
-            "cached rightmost-leaf append should not re-read the leaf page"
-        );
+            cursor.pager.clear_reads();
+            cursor.table_insert(&cx, 129, &payload).await.unwrap();
+            assert!(
+                cursor.pager.read_pages().is_empty(),
+                "cached rightmost-leaf append should not re-read the leaf page"
+            );
 
-        let cached_after = cursor
-            .rightmost_leaf_cache
-            .clone()
-            .expect("successful append should refresh the rightmost-leaf cache");
-        assert_eq!(cached_after.page_no, cached_before.page_no);
-        assert_eq!(cached_after.rowid, 129);
+            let cached_after = cursor
+                .rightmost_leaf_cache
+                .clone()
+                .expect("successful append should refresh the rightmost-leaf cache");
+            assert_eq!(cached_after.page_no, cached_before.page_no);
+            assert_eq!(cached_after.rowid, 129);
+        });
     }
 
     #[test]
     fn test_table_insert_reuses_rightmost_leaf_cache_for_multiple_sequential_appends() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let payload = vec![b'M'; 180];
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let payload = vec![b'M'; 180];
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
 
-        for rowid in 1..=128_i64 {
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-        }
-
-        let root_entry = cursor.reload_page_fresh(&cx, root).unwrap();
-        assert!(
-            root_entry.header.page_type.is_interior(),
-            "test requires an interior root so the uncached path would revisit it"
-        );
-
-        // The rightmost-leaf cache has variable headroom after 128 sequential
-        // inserts (depends on split cadence); continue inserting until we
-        // land right after a split so at least 3 appends fit before the next
-        // split. This keeps the test's core claim — "sequential appends land
-        // in the cached leaf with zero page reads" — independent of the
-        // specific split policy and page-packing invariants.
-        let mut next_rowid = 129_i64;
-        while next_rowid < 512 {
-            let mut probe_cell = Vec::new();
-            cursor
-                .encode_table_leaf_cell_into(&cx, next_rowid, &payload, &mut probe_cell)
-                .unwrap();
-            let cached = cursor
-                .rightmost_leaf_cache
-                .clone()
-                .expect("sequential inserts should seed the rightmost-leaf cache");
-            let header_offset = cell::header_offset_for_page(cached.page_no);
-            let content_offset = cached.header.content_offset(cursor.usable_size);
-            let header_size = usize::from(cached.header.page_type.header_size());
-            let cells_needed_for_assert = 3_usize;
-            let has_room = content_offset
-                .checked_sub(probe_cell.len() * cells_needed_for_assert)
-                .is_some_and(|after_three| {
-                    let ptr_array_after = header_offset
-                        + header_size
-                        + (usize::from(cached.header.cell_count) + cells_needed_for_assert) * 2;
-                    ptr_array_after <= after_three
-                });
-            if has_room {
-                break;
-            }
-            cursor.table_insert(&cx, next_rowid, &payload).unwrap();
-            next_rowid += 1;
-        }
-
-        let mut appended = 0_u32;
-        let start_rowid = next_rowid;
-        for rowid in start_rowid..start_rowid + 128 {
-            let cached = cursor
-                .rightmost_leaf_cache
-                .clone()
-                .expect("sequential inserts should seed the rightmost-leaf cache");
-            let mut cell_data = Vec::new();
-            cursor
-                .encode_table_leaf_cell_into(&cx, rowid, &payload, &mut cell_data)
-                .unwrap();
-            let header_offset = cell::header_offset_for_page(cached.page_no);
-            let content_offset = cached.header.content_offset(cursor.usable_size);
-            let Some(new_content_offset) = content_offset.checked_sub(cell_data.len()) else {
-                break;
-            };
-            let ptr_array_end = header_offset
-                + usize::from(cached.header.page_type.header_size())
-                + (usize::from(cached.header.cell_count) + 1) * 2;
-            if ptr_array_end > new_content_offset {
-                break;
+            for rowid in 1..=128_i64 {
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
             }
 
-            cursor.pager.clear_reads();
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
+            let root_entry = cursor.reload_page_fresh(&cx, root).await.unwrap();
             assert!(
-                cursor.pager.read_pages().is_empty(),
-                "cached sequential append should avoid page reloads before the next split (rowid {rowid})"
+                root_entry.header.page_type.is_interior(),
+                "test requires an interior root so the uncached path would revisit it"
             );
-            appended += 1;
-        }
 
-        assert!(
-            appended >= 3,
-            "test setup should admit several zero-read cached appends before the next split, got {appended}"
-        );
-        let cached_after = cursor
-            .rightmost_leaf_cache
-            .as_ref()
-            .expect("successful append should preserve the rightmost-leaf cache");
-        assert_eq!(cached_after.rowid, start_rowid - 1 + i64::from(appended));
+            // The rightmost-leaf cache has variable headroom after 128 sequential
+            // inserts (depends on split cadence); continue inserting until we
+            // land right after a split so at least 3 appends fit before the next
+            // split. This keeps the test's core claim — "sequential appends land
+            // in the cached leaf with zero page reads" — independent of the
+            // specific split policy and page-packing invariants.
+            let mut next_rowid = 129_i64;
+            while next_rowid < 512 {
+                let mut probe_cell = Vec::new();
+                cursor
+                    .encode_table_leaf_cell_into(&cx, next_rowid, &payload, &mut probe_cell)
+                    .await
+                    .unwrap();
+                let cached = cursor
+                    .rightmost_leaf_cache
+                    .clone()
+                    .expect("sequential inserts should seed the rightmost-leaf cache");
+                let header_offset = cell::header_offset_for_page(cached.page_no);
+                let content_offset = cached.header.content_offset(cursor.usable_size);
+                let header_size = usize::from(cached.header.page_type.header_size());
+                let cells_needed_for_assert = 3_usize;
+                let has_room = content_offset
+                    .checked_sub(probe_cell.len() * cells_needed_for_assert)
+                    .is_some_and(|after_three| {
+                        let ptr_array_after = header_offset
+                            + header_size
+                            + (usize::from(cached.header.cell_count) + cells_needed_for_assert) * 2;
+                        ptr_array_after <= after_three
+                    });
+                if has_room {
+                    break;
+                }
+                cursor
+                    .table_insert(&cx, next_rowid, &payload)
+                    .await
+                    .unwrap();
+                next_rowid += 1;
+            }
+
+            let mut appended = 0_u32;
+            let start_rowid = next_rowid;
+            for rowid in start_rowid..start_rowid + 128 {
+                let cached = cursor
+                    .rightmost_leaf_cache
+                    .clone()
+                    .expect("sequential inserts should seed the rightmost-leaf cache");
+                let mut cell_data = Vec::new();
+                cursor
+                    .encode_table_leaf_cell_into(&cx, rowid, &payload, &mut cell_data)
+                    .await
+                    .unwrap();
+                let header_offset = cell::header_offset_for_page(cached.page_no);
+                let content_offset = cached.header.content_offset(cursor.usable_size);
+                let Some(new_content_offset) = content_offset.checked_sub(cell_data.len()) else {
+                    break;
+                };
+                let ptr_array_end = header_offset
+                    + usize::from(cached.header.page_type.header_size())
+                    + (usize::from(cached.header.cell_count) + 1) * 2;
+                if ptr_array_end > new_content_offset {
+                    break;
+                }
+
+                cursor.pager.clear_reads();
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+                assert!(
+                    cursor.pager.read_pages().is_empty(),
+                    "cached sequential append should avoid page reloads before the next split (rowid {rowid})"
+                );
+                appended += 1;
+            }
+
+            assert!(
+                appended >= 3,
+                "test setup should admit several zero-read cached appends before the next split, got {appended}"
+            );
+            let cached_after = cursor
+                .rightmost_leaf_cache
+                .as_ref()
+                .expect("successful append should preserve the rightmost-leaf cache");
+            assert_eq!(cached_after.rowid, start_rowid - 1 + i64::from(appended));
+        });
     }
 
     #[test]
     fn test_table_insert_sequential_fast_path_records_append_metrics_without_reloads() {
-        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        run_async(async {
+            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        crate::instrumentation::reset_btree_copy_profile();
-        crate::instrumentation::set_btree_copy_profile_enabled(true);
+            crate::instrumentation::reset_btree_copy_profile();
+            crate::instrumentation::set_btree_copy_profile_enabled(true);
 
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let payload = vec![b'G'; 180];
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let payload = vec![b'G'; 180];
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
 
-        for rowid in 1..=128_i64 {
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-        }
-
-        let root_entry = cursor.reload_page_fresh(&cx, root).unwrap();
-        assert!(
-            root_entry.header.page_type.is_interior(),
-            "test requires an interior root so the fast path would otherwise revisit it"
-        );
-
-        // See `test_table_insert_reuses_rightmost_leaf_cache_for_multiple_sequential_appends`
-        // for the rationale; keep inserting until the rightmost leaf has room
-        // for at least 3 more cells so this test's metric assertion is not
-        // hostage to split-cadence implementation detail.
-        let mut next_rowid = 129_i64;
-        while next_rowid < 512 {
-            let mut probe_cell = Vec::new();
-            cursor
-                .encode_table_leaf_cell_into(&cx, next_rowid, &payload, &mut probe_cell)
-                .unwrap();
-            let cached = cursor
-                .rightmost_leaf_cache
-                .clone()
-                .expect("sequential inserts should seed the rightmost-leaf cache");
-            let header_offset = cell::header_offset_for_page(cached.page_no);
-            let content_offset = cached.header.content_offset(cursor.usable_size);
-            let header_size = usize::from(cached.header.page_type.header_size());
-            let cells_needed_for_assert = 3_usize;
-            let has_room = content_offset
-                .checked_sub(probe_cell.len() * cells_needed_for_assert)
-                .is_some_and(|after_three| {
-                    let ptr_array_after = header_offset
-                        + header_size
-                        + (usize::from(cached.header.cell_count) + cells_needed_for_assert) * 2;
-                    ptr_array_after <= after_three
-                });
-            if has_room {
-                break;
-            }
-            cursor.table_insert(&cx, next_rowid, &payload).unwrap();
-            next_rowid += 1;
-        }
-
-        let before = crate::instrumentation::btree_leaf_reuse_snapshot();
-        let mut appended = 0_u64;
-        let start_rowid = next_rowid;
-        for rowid in start_rowid..start_rowid + 128 {
-            let cached = cursor
-                .rightmost_leaf_cache
-                .clone()
-                .expect("sequential inserts should seed the rightmost-leaf cache");
-            let mut cell_data = Vec::new();
-            cursor
-                .encode_table_leaf_cell_into(&cx, rowid, &payload, &mut cell_data)
-                .unwrap();
-            let header_offset = cell::header_offset_for_page(cached.page_no);
-            let content_offset = cached.header.content_offset(cursor.usable_size);
-            let Some(new_content_offset) = content_offset.checked_sub(cell_data.len()) else {
-                break;
-            };
-            let ptr_array_end = header_offset
-                + usize::from(cached.header.page_type.header_size())
-                + (usize::from(cached.header.cell_count) + 1) * 2;
-            if ptr_array_end > new_content_offset {
-                break;
+            for rowid in 1..=128_i64 {
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
             }
 
-            cursor.pager.clear_reads();
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
+            let root_entry = cursor.reload_page_fresh(&cx, root).await.unwrap();
             assert!(
-                cursor.pager.read_pages().is_empty(),
-                "fast sequential append should not re-read the rightmost leaf before the next split (rowid {rowid})"
+                root_entry.header.page_type.is_interior(),
+                "test requires an interior root so the fast path would otherwise revisit it"
             );
-            appended = appended.saturating_add(1);
-        }
 
-        let after = crate::instrumentation::btree_leaf_reuse_snapshot();
-        crate::instrumentation::set_btree_copy_profile_enabled(false);
+            // See `test_table_insert_reuses_rightmost_leaf_cache_for_multiple_sequential_appends`
+            // for the rationale; keep inserting until the rightmost leaf has room
+            // for at least 3 more cells so this test's metric assertion is not
+            // hostage to split-cadence implementation detail.
+            let mut next_rowid = 129_i64;
+            while next_rowid < 512 {
+                let mut probe_cell = Vec::new();
+                cursor
+                    .encode_table_leaf_cell_into(&cx, next_rowid, &payload, &mut probe_cell)
+                    .await
+                    .unwrap();
+                let cached = cursor
+                    .rightmost_leaf_cache
+                    .clone()
+                    .expect("sequential inserts should seed the rightmost-leaf cache");
+                let header_offset = cell::header_offset_for_page(cached.page_no);
+                let content_offset = cached.header.content_offset(cursor.usable_size);
+                let header_size = usize::from(cached.header.page_type.header_size());
+                let cells_needed_for_assert = 3_usize;
+                let has_room = content_offset
+                    .checked_sub(probe_cell.len() * cells_needed_for_assert)
+                    .is_some_and(|after_three| {
+                        let ptr_array_after = header_offset
+                            + header_size
+                            + (usize::from(cached.header.cell_count) + cells_needed_for_assert) * 2;
+                        ptr_array_after <= after_three
+                    });
+                if has_room {
+                    break;
+                }
+                cursor
+                    .table_insert(&cx, next_rowid, &payload)
+                    .await
+                    .unwrap();
+                next_rowid += 1;
+            }
 
-        assert!(
-            appended >= 3,
-            "test setup should permit multiple zero-read sequential appends"
-        );
-        let before_fast_appends = before
-            .fast_table_leaf_payload_appends
-            .saturating_add(before.fast_table_leaf_full_cell_appends);
-        let after_fast_appends = after
-            .fast_table_leaf_payload_appends
-            .saturating_add(after.fast_table_leaf_full_cell_appends);
-        assert!(
-            after_fast_appends >= before_fast_appends.saturating_add(appended),
-            "sequential fast-path appends should be reflected in the append metrics: before={before:?} after={after:?} appended={appended}"
-        );
+            let before = crate::instrumentation::btree_leaf_reuse_snapshot();
+            let mut appended = 0_u64;
+            let start_rowid = next_rowid;
+            for rowid in start_rowid..start_rowid + 128 {
+                let cached = cursor
+                    .rightmost_leaf_cache
+                    .clone()
+                    .expect("sequential inserts should seed the rightmost-leaf cache");
+                let mut cell_data = Vec::new();
+                cursor
+                    .encode_table_leaf_cell_into(&cx, rowid, &payload, &mut cell_data)
+                    .await
+                    .unwrap();
+                let header_offset = cell::header_offset_for_page(cached.page_no);
+                let content_offset = cached.header.content_offset(cursor.usable_size);
+                let Some(new_content_offset) = content_offset.checked_sub(cell_data.len()) else {
+                    break;
+                };
+                let ptr_array_end = header_offset
+                    + usize::from(cached.header.page_type.header_size())
+                    + (usize::from(cached.header.cell_count) + 1) * 2;
+                if ptr_array_end > new_content_offset {
+                    break;
+                }
+
+                cursor.pager.clear_reads();
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+                assert!(
+                    cursor.pager.read_pages().is_empty(),
+                    "fast sequential append should not re-read the rightmost leaf before the next split (rowid {rowid})"
+                );
+                appended = appended.saturating_add(1);
+            }
+
+            let after = crate::instrumentation::btree_leaf_reuse_snapshot();
+            crate::instrumentation::set_btree_copy_profile_enabled(false);
+
+            assert!(
+                appended >= 3,
+                "test setup should permit multiple zero-read sequential appends"
+            );
+            let before_fast_appends = before
+                .fast_table_leaf_payload_appends
+                .saturating_add(before.fast_table_leaf_full_cell_appends);
+            let after_fast_appends = after
+                .fast_table_leaf_payload_appends
+                .saturating_add(after.fast_table_leaf_full_cell_appends);
+            assert!(
+                after_fast_appends >= before_fast_appends.saturating_add(appended),
+                "sequential fast-path appends should be reflected in the append metrics: before={before:?} after={after:?} appended={appended}"
+            );
+        });
     }
 
     #[test]
     fn test_table_append_after_last_position_avoids_reseek() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let payload = vec![b'P'; 180];
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let payload = vec![b'P'; 180];
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
 
-        for rowid in 1..=128_i64 {
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-        }
+            for rowid in 1..=128_i64 {
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            }
 
-        assert!(cursor.last(&cx).unwrap());
-        cursor.pager.clear_reads();
-        cursor
-            .table_append_after_last_position(&cx, 129, &payload)
-            .unwrap();
+            assert!(cursor.last(&cx).await.unwrap());
+            cursor.pager.clear_reads();
+            cursor
+                .table_append_after_last_position(&cx, 129, &payload)
+                .await
+                .unwrap();
 
-        assert!(
-            cursor.pager.read_pages().is_empty(),
-            "append-after-last should reuse the current right-edge cursor state"
-        );
-        assert_eq!(cursor.rowid(&cx).unwrap(), 129);
+            assert!(
+                cursor.pager.read_pages().is_empty(),
+                "append-after-last should reuse the current right-edge cursor state"
+            );
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 129);
+        });
     }
 
     #[test]
     fn test_table_append_after_last_position_with_writer_writes_payload_directly() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let payload = b"direct-page-payload";
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let payload = b"direct-page-payload";
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
 
-        cursor.table_insert(&cx, 1, b"seed").unwrap();
-        assert!(cursor.last(&cx).unwrap());
-        cursor.pager.clear_reads();
-        let appended = cursor
-            .table_append_after_last_position_with_writer(&cx, 2, payload.len(), |dst| {
-                dst.copy_from_slice(payload);
-                Ok(())
-            })
-            .unwrap();
+            cursor.table_insert(&cx, 1, b"seed").await.unwrap();
+            assert!(cursor.last(&cx).await.unwrap());
+            cursor.pager.clear_reads();
+            let appended = cursor
+                .table_append_after_last_position_with_writer(&cx, 2, payload.len(), |dst| {
+                    dst.copy_from_slice(payload);
+                    Ok(())
+                })
+                .await
+                .unwrap();
 
-        assert!(
-            appended,
-            "direct writer should append into the rightmost leaf"
-        );
-        assert!(
-            cursor.pager.read_pages().is_empty(),
-            "writer append should reuse the current right-edge cursor state"
-        );
-        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
-        assert_eq!(cursor.payload(&cx).unwrap(), payload);
+            assert!(
+                appended,
+                "direct writer should append into the rightmost leaf"
+            );
+            assert!(
+                cursor.pager.read_pages().is_empty(),
+                "writer append should reuse the current right-edge cursor state"
+            );
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 2);
+            assert_eq!(cursor.payload(&cx).await.unwrap(), payload);
+        });
     }
 
     #[test]
     fn test_table_append_after_last_position_with_writer_error_does_not_publish_cell() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
 
-        cursor.table_insert(&cx, 1, b"seed").unwrap();
-        assert!(cursor.last(&cx).unwrap());
-        let error = cursor
-            .table_append_after_last_position_with_writer(&cx, 2, 8, |dst| {
-                dst.copy_from_slice(b"partial!");
-                Err(FrankenError::internal("forced direct writer failure"))
-            })
-            .unwrap_err();
+            cursor.table_insert(&cx, 1, b"seed").await.unwrap();
+            assert!(cursor.last(&cx).await.unwrap());
+            let error = cursor
+                .table_append_after_last_position_with_writer(&cx, 2, 8, |dst| {
+                    dst.copy_from_slice(b"partial!");
+                    Err(FrankenError::internal("forced direct writer failure"))
+                })
+                .await
+                .unwrap_err();
 
-        assert!(error.to_string().contains("forced direct writer failure"));
-        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
-        assert_eq!(cursor.payload(&cx).unwrap(), b"seed");
-        assert!(
-            !cursor.table_move_to(&cx, 2).unwrap().is_found(),
-            "failed writer append must not publish a new row"
-        );
-        assert!(cursor.table_move_to(&cx, 1).unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), b"seed");
+            assert!(error.to_string().contains("forced direct writer failure"));
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 1);
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"seed");
+            assert!(
+                !cursor.table_move_to(&cx, 2).await.unwrap().is_found(),
+                "failed writer append must not publish a new row"
+            );
+            assert!(cursor.table_move_to(&cx, 1).await.unwrap().is_found());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"seed");
+        });
     }
 
     #[test]
     fn test_table_append_after_last_position_reseeks_when_stack_is_empty() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let payload = vec![b'Q'; 180];
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let payload = vec![b'Q'; 180];
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
 
-        for rowid in 1..=128_i64 {
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-        }
+            for rowid in 1..=128_i64 {
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            }
 
-        cursor.stack.clear();
-        cursor.at_eof = true;
-        cursor
-            .table_append_after_last_position(&cx, 129, &payload)
-            .unwrap();
+            cursor.stack.clear();
+            cursor.at_eof = true;
+            cursor
+                .table_append_after_last_position(&cx, 129, &payload)
+                .await
+                .unwrap();
 
-        assert_eq!(cursor.rowid(&cx).unwrap(), 129);
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 129);
+        });
     }
 
     #[test]
     fn test_table_append_after_last_position_repeated_after_existing_rows_crosses_split() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let payload = vec![b'R'; 180];
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let payload = vec![b'R'; 180];
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
 
-        for rowid in 1_i64..=8_i64 {
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-        }
-        assert!(cursor.last(&cx).unwrap());
+            for rowid in 1_i64..=8_i64 {
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            }
+            assert!(cursor.last(&cx).await.unwrap());
 
-        for rowid in 9_i64..=72_i64 {
-            cursor
-                .table_append_after_last_position(&cx, rowid, &payload)
-                .unwrap();
-        }
+            for rowid in 9_i64..=72_i64 {
+                cursor
+                    .table_append_after_last_position(&cx, rowid, &payload)
+                    .await
+                    .unwrap();
+            }
 
-        for rowid in 1_i64..=72_i64 {
-            let seek = cursor
-                .table_move_to(&cx, rowid)
-                .expect("rowid seek should succeed after repeated append");
-            assert!(seek.is_found(), "rowid {rowid} should remain reachable");
-            assert_eq!(cursor.payload(&cx).unwrap(), payload.as_slice());
-        }
+            for rowid in 1_i64..=72_i64 {
+                let seek = cursor
+                    .table_move_to(&cx, rowid)
+                    .await
+                    .expect("rowid seek should succeed after repeated append");
+                assert!(seek.is_found(), "rowid {rowid} should remain reachable");
+                assert_eq!(cursor.payload(&cx).await.unwrap(), payload.as_slice());
+            }
+        });
     }
 
     #[test]
     fn test_table_insert_refreshes_rightmost_leaf_cache_after_split() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let payload = vec![b'S'; 220];
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let payload = vec![b'S'; 220];
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
 
-        let mut previous_cached_page = None;
-        let split_insert_rowid = loop {
-            let next_rowid = cursor.last_insert_rowid.unwrap_or(0) + 1;
-            cursor.table_insert(&cx, next_rowid, &payload).unwrap();
-            let cached = cursor
+            let mut previous_cached_page = None;
+            let split_insert_rowid = loop {
+                let next_rowid = cursor.last_insert_rowid.unwrap_or(0) + 1;
+                cursor
+                    .table_insert(&cx, next_rowid, &payload)
+                    .await
+                    .unwrap();
+                let cached = cursor
+                    .rightmost_leaf_cache
+                    .as_ref()
+                    .expect("sequential append should maintain a rightmost-leaf cache");
+
+                if let Some(previous_page) = previous_cached_page
+                    && cached.page_no != previous_page
+                {
+                    break next_rowid;
+                }
+
+                previous_cached_page = Some(cached.page_no);
+                assert!(
+                    next_rowid < 512,
+                    "expected a right-edge split that refreshes the cached leaf page"
+                );
+            };
+
+            let _cached_after_split = cursor
                 .rightmost_leaf_cache
-                .as_ref()
-                .expect("sequential append should maintain a rightmost-leaf cache");
-
-            if let Some(previous_page) = previous_cached_page
-                && cached.page_no != previous_page
-            {
-                break next_rowid;
-            }
-
-            previous_cached_page = Some(cached.page_no);
+                .clone()
+                .expect("split should refresh the rightmost-leaf cache");
+            cursor.pager.clear_reads();
+            cursor
+                .table_insert(&cx, split_insert_rowid + 1, &payload)
+                .await
+                .unwrap();
             assert!(
-                next_rowid < 512,
-                "expected a right-edge split that refreshes the cached leaf page"
+                cursor.pager.read_pages().is_empty(),
+                "post-split append should reuse the refreshed cached leaf state"
             );
-        };
-
-        let _cached_after_split = cursor
-            .rightmost_leaf_cache
-            .clone()
-            .expect("split should refresh the rightmost-leaf cache");
-        cursor.pager.clear_reads();
-        cursor
-            .table_insert(&cx, split_insert_rowid + 1, &payload)
-            .unwrap();
-        assert!(
-            cursor.pager.read_pages().is_empty(),
-            "post-split append should reuse the refreshed cached leaf state"
-        );
+        });
     }
 
     #[test]
     fn test_refresh_rightmost_leaf_cache_after_insert_skips_last_when_cache_is_authoritative() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let payload = vec![b'R'; 180];
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let payload = vec![b'R'; 180];
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
 
-        for rowid in 1..=8_i64 {
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-        }
+            for rowid in 1..=8_i64 {
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            }
 
-        let cached = cursor
-            .rightmost_leaf_cache
-            .clone()
-            .expect("sequential inserts should seed the rightmost-leaf cache");
-        cursor.stack.clear();
-        cursor.at_eof = true;
-        cursor.last_known_depth = Some(cached.tree_depth);
-        cursor.rightmost_leaf_cache = Some(cached.clone());
+            let cached = cursor
+                .rightmost_leaf_cache
+                .clone()
+                .expect("sequential inserts should seed the rightmost-leaf cache");
+            cursor.stack.clear();
+            cursor.at_eof = true;
+            cursor.last_known_depth = Some(cached.tree_depth);
+            cursor.rightmost_leaf_cache = Some(cached.clone());
 
-        cursor.pager.clear_reads();
-        cursor
-            .refresh_rightmost_leaf_cache_after_insert(&cx, cached.rowid)
-            .unwrap();
+            cursor.pager.clear_reads();
+            cursor
+                .refresh_rightmost_leaf_cache_after_insert(&cx, cached.rowid)
+                .await
+                .unwrap();
 
-        assert!(
-            cursor.pager.read_pages().is_empty(),
-            "refresh should trust an already-authoritative rightmost-leaf cache instead of calling last()"
-        );
-        let refreshed = cursor
-            .rightmost_leaf_cache
-            .as_ref()
-            .expect("refresh should preserve the rightmost-leaf cache");
-        assert_eq!(refreshed.page_no, cached.page_no);
-        assert_eq!(refreshed.rowid, cached.rowid);
+            assert!(
+                cursor.pager.read_pages().is_empty(),
+                "refresh should trust an already-authoritative rightmost-leaf cache instead of calling last()"
+            );
+            let refreshed = cursor
+                .rightmost_leaf_cache
+                .as_ref()
+                .expect("refresh should preserve the rightmost-leaf cache");
+            assert_eq!(refreshed.page_no, cached.page_no);
+            assert_eq!(refreshed.rowid, cached.rowid);
+        });
     }
 
     #[test]
     fn test_table_insert_from_current_position_reuses_leaf_state_without_reload() {
-        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_btree_metrics_enabled(true);
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+        run_async(async {
+            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            set_btree_metrics_enabled(true);
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
 
-        for rowid in [10_i64, 30, 50] {
-            let payload = payload_for_rowid(rowid);
-            cursor
-                .table_insert(&cx, rowid, payload.as_slice())
-                .expect("seed insert should succeed");
-        }
-
-        let insert_rowid = 40_i64;
-        assert!(
-            !cursor
-                .table_move_to(&cx, insert_rowid)
-                .expect("seek to insertion point should succeed")
-                .is_found(),
-            "test rowid should target a missing insertion point"
-        );
-
-        let before = crate::instrumentation::btree_leaf_reuse_snapshot();
-        cursor.pager.clear_reads();
-        let payload = payload_for_rowid(insert_rowid);
-        cursor
-            .table_insert_from_current_position(&cx, insert_rowid, payload.as_slice())
-            .expect("no-split insert should succeed");
-
-        let snapshot = crate::instrumentation::btree_leaf_reuse_snapshot();
-        set_btree_metrics_enabled(false);
-        assert!(
-            cursor.pager.read_pages().is_empty(),
-            "no-split insert should not re-read the current leaf"
-        );
-        assert!(
-            snapshot.no_split_reuse_hits >= before.no_split_reuse_hits.saturating_add(1),
-            "the no-split reuse counter should advance for an in-place leaf insert"
-        );
-
-        let mut rowids = Vec::new();
-        assert!(cursor.first(&cx).expect("scan should start"));
-        loop {
-            rowids.push(cursor.rowid(&cx).expect("rowid should decode"));
-            if !cursor.next(&cx).expect("scan should advance") {
-                break;
+            for rowid in [10_i64, 30, 50] {
+                let payload = payload_for_rowid(rowid);
+                cursor
+                    .table_insert(&cx, rowid, payload.as_slice())
+                    .await
+                    .expect("seed insert should succeed");
             }
-        }
-        assert_eq!(rowids, vec![10, 30, 40, 50]);
+
+            let insert_rowid = 40_i64;
+            assert!(
+                !cursor
+                    .table_move_to(&cx, insert_rowid)
+                    .await
+                    .expect("seek to insertion point should succeed")
+                    .is_found(),
+                "test rowid should target a missing insertion point"
+            );
+
+            let before = crate::instrumentation::btree_leaf_reuse_snapshot();
+            cursor.pager.clear_reads();
+            let payload = payload_for_rowid(insert_rowid);
+            cursor
+                .table_insert_from_current_position(&cx, insert_rowid, payload.as_slice())
+                .await
+                .expect("no-split insert should succeed");
+
+            let snapshot = crate::instrumentation::btree_leaf_reuse_snapshot();
+            set_btree_metrics_enabled(false);
+            assert!(
+                cursor.pager.read_pages().is_empty(),
+                "no-split insert should not re-read the current leaf"
+            );
+            assert!(
+                snapshot.no_split_reuse_hits >= before.no_split_reuse_hits.saturating_add(1),
+                "the no-split reuse counter should advance for an in-place leaf insert"
+            );
+
+            let mut rowids = Vec::new();
+            assert!(cursor.first(&cx).await.expect("scan should start"));
+            loop {
+                rowids.push(cursor.rowid(&cx).await.expect("rowid should decode"));
+                if !cursor.next(&cx).await.expect("scan should advance") {
+                    break;
+                }
+            }
+            assert_eq!(rowids, vec![10, 30, 40, 50]);
+        });
     }
 
     #[test]
     fn test_table_insert_from_current_position_overflow_encode_error_retains_cell_buffer() {
-        const SMALL_USABLE: u32 = 256;
-        let root = pn(2);
-        let inner = Rc::new(RefCell::new(MemPageStore::with_empty_table(
-            root,
-            SMALL_USABLE,
-        )));
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(
-            FailingOverflowStore::new(inner, usize::MAX),
-            root,
-            SMALL_USABLE,
-            true,
-        );
-        assert!(
-            !cursor
-                .table_move_to(&cx, 1)
-                .expect("seek to insertion point should succeed")
-                .is_found(),
-            "test rowid should be absent before insertion"
-        );
+        run_async(async {
+            const SMALL_USABLE: u32 = 256;
+            let root = pn(2);
+            let inner = Rc::new(RefCell::new(MemPageStore::with_empty_table(
+                root,
+                SMALL_USABLE,
+            )));
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(
+                FailingOverflowStore::new(inner, usize::MAX),
+                root,
+                SMALL_USABLE,
+                true,
+            );
+            assert!(
+                !cursor
+                    .table_move_to(&cx, 1)
+                    .await
+                    .expect("seek to insertion point should succeed")
+                    .is_found(),
+                "test rowid should be absent before insertion"
+            );
 
-        cursor.cell_buf = Vec::with_capacity(4096);
-        let expected_capacity = cursor.cell_buf.capacity();
-        cursor.pager.fail_on_write = cursor.pager.write_count.saturating_add(1);
+            cursor.cell_buf = Vec::with_capacity(4096);
+            let expected_capacity = cursor.cell_buf.capacity();
+            cursor.pager.fail_on_write = cursor.pager.write_count.saturating_add(1);
 
-        let overflow_payload = vec![b'X'; 512];
-        let error = cursor
-            .table_insert_from_current_position(&cx, 1, &overflow_payload)
-            .expect_err("injected overflow write failure should abort insert");
+            let overflow_payload = vec![b'X'; 512];
+            let error = cursor
+                .table_insert_from_current_position(&cx, 1, &overflow_payload)
+                .await
+                .expect_err("injected overflow write failure should abort insert");
 
-        assert!(
-            matches!(&error, FrankenError::Internal(msg) if msg == "injected write failure"),
-            "expected injected write failure, got {error:?}"
-        );
-        assert!(
-            cursor.cell_buf.capacity() >= expected_capacity,
-            "table current-position encode failure should return the reusable cell buffer"
-        );
+            assert!(
+                matches!(&error, FrankenError::Internal(msg) if msg == "injected write failure"),
+                "expected injected write failure, got {error:?}"
+            );
+            assert!(
+                cursor.cell_buf.capacity() >= expected_capacity,
+                "table current-position encode failure should return the reusable cell buffer"
+            );
+        });
     }
 
     #[test]
     fn test_index_insert_from_current_position_reuses_leaf_state_without_reload() {
-        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_btree_metrics_enabled(true);
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_index(root, USABLE);
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, false);
+        run_async(async {
+            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            set_btree_metrics_enabled(true);
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_index(root, USABLE);
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, false);
 
-        for id in [10_i64, 30, 50] {
-            let key = synthetic_index_key(id);
+            for id in [10_i64, 30, 50] {
+                let key = synthetic_index_key(id);
+                cursor
+                    .index_insert(&cx, &key)
+                    .await
+                    .expect("seed index insert should succeed");
+            }
+
+            let inserted_id = 40_i64;
+            let inserted_key = synthetic_index_key(inserted_id);
+            assert!(
+                !cursor
+                    .index_move_to(&cx, &inserted_key)
+                    .await
+                    .expect("seek to insertion point should succeed")
+                    .is_found(),
+                "inserted key should be missing before the test insert"
+            );
+
+            let before = crate::instrumentation::btree_leaf_reuse_snapshot();
+            cursor.pager.clear_reads();
             cursor
-                .index_insert(&cx, &key)
-                .expect("seed index insert should succeed");
-        }
+                .index_insert_from_current_position(&cx, &inserted_key)
+                .await
+                .expect("no-split index insert should succeed");
 
-        let inserted_id = 40_i64;
-        let inserted_key = synthetic_index_key(inserted_id);
-        assert!(
-            !cursor
-                .index_move_to(&cx, &inserted_key)
-                .expect("seek to insertion point should succeed")
-                .is_found(),
-            "inserted key should be missing before the test insert"
-        );
+            let snapshot = crate::instrumentation::btree_leaf_reuse_snapshot();
+            set_btree_metrics_enabled(false);
+            assert!(
+                cursor.pager.read_pages().is_empty(),
+                "no-split index insert should not re-read the current leaf"
+            );
+            assert!(
+                snapshot.no_split_reuse_hits >= before.no_split_reuse_hits.saturating_add(1),
+                "the no-split reuse counter should advance for an in-place index insert"
+            );
 
-        let before = crate::instrumentation::btree_leaf_reuse_snapshot();
-        cursor.pager.clear_reads();
-        cursor
-            .index_insert_from_current_position(&cx, &inserted_key)
-            .expect("no-split index insert should succeed");
-
-        let snapshot = crate::instrumentation::btree_leaf_reuse_snapshot();
-        set_btree_metrics_enabled(false);
-        assert!(
-            cursor.pager.read_pages().is_empty(),
-            "no-split index insert should not re-read the current leaf"
-        );
-        assert!(
-            snapshot.no_split_reuse_hits >= before.no_split_reuse_hits.saturating_add(1),
-            "the no-split reuse counter should advance for an in-place index insert"
-        );
-
-        let scanned = scan_all_index_keys(&mut cursor, &cx).expect("scan should succeed");
-        let mut expected = vec![
-            synthetic_index_key(10),
-            synthetic_index_key(30),
-            synthetic_index_key(40),
-            synthetic_index_key(50),
-        ];
-        expected.sort_by(|lhs, rhs| compare_index_test_keys(&cursor, lhs, rhs));
-        assert_eq!(scanned, expected);
+            let scanned = scan_all_index_keys(&mut cursor, &cx)
+                .await
+                .expect("scan should succeed");
+            let mut expected = vec![
+                synthetic_index_key(10),
+                synthetic_index_key(30),
+                synthetic_index_key(40),
+                synthetic_index_key(50),
+            ];
+            expected.sort_by(|lhs, rhs| compare_index_test_keys(&cursor, lhs, rhs));
+            assert_eq!(scanned, expected);
+        });
     }
 
     #[test]
     fn test_index_insert_from_current_position_overflow_encode_error_retains_cell_buffer() {
-        const SMALL_USABLE: u32 = 256;
-        let root = pn(2);
-        let inner = Rc::new(RefCell::new(MemPageStore::with_empty_index(
-            root,
-            SMALL_USABLE,
-        )));
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(
-            FailingOverflowStore::new(inner, usize::MAX),
-            root,
-            SMALL_USABLE,
-            false,
-        );
-        assert!(
-            !cursor
-                .index_move_to(&cx, b"probe")
-                .expect("seek to insertion point should succeed")
-                .is_found(),
-            "test key should be absent before insertion"
-        );
-
-        cursor.cell_buf = Vec::with_capacity(4096);
-        let expected_capacity = cursor.cell_buf.capacity();
-        cursor.pager.fail_on_write = cursor.pager.write_count.saturating_add(1);
-
-        let overflow_key = vec![b'K'; 512];
-        let error = cursor
-            .index_insert_from_current_position(&cx, &overflow_key)
-            .expect_err(
-                "injected overflow write failure should abort current-position index insert",
+        run_async(async {
+            const SMALL_USABLE: u32 = 256;
+            let root = pn(2);
+            let inner = Rc::new(RefCell::new(MemPageStore::with_empty_index(
+                root,
+                SMALL_USABLE,
+            )));
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(
+                FailingOverflowStore::new(inner, usize::MAX),
+                root,
+                SMALL_USABLE,
+                false,
+            );
+            assert!(
+                !cursor
+                    .index_move_to(&cx, b"probe")
+                    .await
+                    .expect("seek to insertion point should succeed")
+                    .is_found(),
+                "test key should be absent before insertion"
             );
 
-        assert!(
-            matches!(&error, FrankenError::Internal(msg) if msg == "injected write failure"),
-            "expected injected write failure, got {error:?}"
-        );
-        assert!(
-            cursor.cell_buf.capacity() >= expected_capacity,
-            "index current-position encode failure should return the reusable cell buffer"
-        );
+            cursor.cell_buf = Vec::with_capacity(4096);
+            let expected_capacity = cursor.cell_buf.capacity();
+            cursor.pager.fail_on_write = cursor.pager.write_count.saturating_add(1);
+
+            let overflow_key = vec![b'K'; 512];
+            let error = cursor
+                .index_insert_from_current_position(&cx, &overflow_key)
+                .await
+                .expect_err(
+                    "injected overflow write failure should abort current-position index insert",
+                );
+
+            assert!(
+                matches!(&error, FrankenError::Internal(msg) if msg == "injected write failure"),
+                "expected injected write failure, got {error:?}"
+            );
+            assert!(
+                cursor.cell_buf.capacity() >= expected_capacity,
+                "index current-position encode failure should return the reusable cell buffer"
+            );
+        });
     }
 
     #[test]
     fn test_index_insert_overflow_encode_error_retains_cell_buffer() {
-        const SMALL_USABLE: u32 = 256;
-        let root = pn(2);
-        let inner = Rc::new(RefCell::new(MemPageStore::with_empty_index(
-            root,
-            SMALL_USABLE,
-        )));
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(
-            FailingOverflowStore::new(inner, usize::MAX),
-            root,
-            SMALL_USABLE,
-            false,
-        );
+        run_async(async {
+            const SMALL_USABLE: u32 = 256;
+            let root = pn(2);
+            let inner = Rc::new(RefCell::new(MemPageStore::with_empty_index(
+                root,
+                SMALL_USABLE,
+            )));
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(
+                FailingOverflowStore::new(inner, usize::MAX),
+                root,
+                SMALL_USABLE,
+                false,
+            );
 
-        cursor.cell_buf = Vec::with_capacity(4096);
-        let expected_capacity = cursor.cell_buf.capacity();
-        cursor.pager.fail_on_write = cursor.pager.write_count.saturating_add(1);
+            cursor.cell_buf = Vec::with_capacity(4096);
+            let expected_capacity = cursor.cell_buf.capacity();
+            cursor.pager.fail_on_write = cursor.pager.write_count.saturating_add(1);
 
-        let overflow_key = vec![b'K'; 512];
-        let error = cursor
-            .index_insert(&cx, &overflow_key)
-            .expect_err("injected overflow write failure should abort generic index insert");
+            let overflow_key = vec![b'K'; 512];
+            let error = cursor
+                .index_insert(&cx, &overflow_key)
+                .await
+                .expect_err("injected overflow write failure should abort generic index insert");
 
-        assert!(
-            matches!(&error, FrankenError::Internal(msg) if msg == "injected write failure"),
-            "expected injected write failure, got {error:?}"
-        );
-        assert!(
-            cursor.cell_buf.capacity() >= expected_capacity,
-            "generic index encode failure should return the reusable cell buffer"
-        );
+            assert!(
+                matches!(&error, FrankenError::Internal(msg) if msg == "injected write failure"),
+                "expected injected write failure, got {error:?}"
+            );
+            assert!(
+                cursor.cell_buf.capacity() >= expected_capacity,
+                "generic index encode failure should return the reusable cell buffer"
+            );
+        });
     }
 
     #[test]
     fn test_table_insert_from_current_position_after_delete_reuses_leaf_state() {
-        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_btree_metrics_enabled(true);
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+        run_async(async {
+            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            set_btree_metrics_enabled(true);
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
 
-        for rowid in [10_i64, 20, 40] {
-            let payload = payload_for_rowid(rowid);
-            cursor
-                .table_insert(&cx, rowid, payload.as_slice())
-                .expect("seed insert should succeed");
-        }
-
-        assert!(
-            cursor
-                .table_move_to(&cx, 20)
-                .expect("seek before delete should succeed")
-                .is_found(),
-            "seed row must exist before delete"
-        );
-        cursor.delete(&cx).expect("delete should succeed");
-
-        let insert_rowid = 30_i64;
-        assert!(
-            !cursor
-                .table_move_to(&cx, insert_rowid)
-                .expect("seek to insertion point should succeed")
-                .is_found(),
-            "deleted-gap rowid should be missing before reinsertion"
-        );
-
-        let before = crate::instrumentation::btree_leaf_reuse_snapshot();
-        cursor.pager.clear_reads();
-        let payload = payload_for_rowid(insert_rowid);
-        cursor
-            .table_insert_from_current_position(&cx, insert_rowid, payload.as_slice())
-            .expect("insert after delete should reuse the retained leaf state");
-
-        let snapshot = crate::instrumentation::btree_leaf_reuse_snapshot();
-        set_btree_metrics_enabled(false);
-        assert!(
-            cursor.pager.read_pages().is_empty(),
-            "insert-after-delete should not force a leaf reload on the retained leaf"
-        );
-        assert!(
-            snapshot.no_split_reuse_hits >= before.no_split_reuse_hits.saturating_add(1),
-            "insert-after-delete should still count as an in-place leaf reuse"
-        );
-
-        let mut rowids = Vec::new();
-        assert!(cursor.first(&cx).expect("scan should start"));
-        loop {
-            rowids.push(cursor.rowid(&cx).expect("rowid should decode"));
-            if !cursor.next(&cx).expect("scan should advance") {
-                break;
+            for rowid in [10_i64, 20, 40] {
+                let payload = payload_for_rowid(rowid);
+                cursor
+                    .table_insert(&cx, rowid, payload.as_slice())
+                    .await
+                    .expect("seed insert should succeed");
             }
-        }
-        assert_eq!(rowids, vec![10, 30, 40]);
+
+            assert!(
+                cursor
+                    .table_move_to(&cx, 20)
+                    .await
+                    .expect("seek before delete should succeed")
+                    .is_found(),
+                "seed row must exist before delete"
+            );
+            cursor.delete(&cx).await.expect("delete should succeed");
+
+            let insert_rowid = 30_i64;
+            assert!(
+                !cursor
+                    .table_move_to(&cx, insert_rowid)
+                    .await
+                    .expect("seek to insertion point should succeed")
+                    .is_found(),
+                "deleted-gap rowid should be missing before reinsertion"
+            );
+
+            let before = crate::instrumentation::btree_leaf_reuse_snapshot();
+            cursor.pager.clear_reads();
+            let payload = payload_for_rowid(insert_rowid);
+            cursor
+                .table_insert_from_current_position(&cx, insert_rowid, payload.as_slice())
+                .await
+                .expect("insert after delete should reuse the retained leaf state");
+
+            let snapshot = crate::instrumentation::btree_leaf_reuse_snapshot();
+            set_btree_metrics_enabled(false);
+            assert!(
+                cursor.pager.read_pages().is_empty(),
+                "insert-after-delete should not force a leaf reload on the retained leaf"
+            );
+            assert!(
+                snapshot.no_split_reuse_hits >= before.no_split_reuse_hits.saturating_add(1),
+                "insert-after-delete should still count as an in-place leaf reuse"
+            );
+
+            let mut rowids = Vec::new();
+            assert!(cursor.first(&cx).await.expect("scan should start"));
+            loop {
+                rowids.push(cursor.rowid(&cx).await.expect("rowid should decode"));
+                if !cursor.next(&cx).await.expect("scan should advance") {
+                    break;
+                }
+            }
+            assert_eq!(rowids, vec![10, 30, 40]);
+        });
     }
 
     #[test]
     fn test_table_insert_from_current_position_records_fallback_when_balance_needed() {
-        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_btree_metrics_enabled(true);
-        const SMALL_USABLE: u32 = 256;
+        run_async(async {
+            let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            set_btree_metrics_enabled(true);
+            const SMALL_USABLE: u32 = 256;
 
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, SMALL_USABLE, true);
-        let payload = vec![b'F'; 120];
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, SMALL_USABLE, true);
+            let payload = vec![b'F'; 120];
 
-        cursor
-            .table_insert(&cx, 10, &payload)
-            .expect("first insert should succeed");
-        cursor
-            .table_insert(&cx, 30, &payload)
-            .expect("second insert should succeed");
+            cursor
+                .table_insert(&cx, 10, &payload)
+                .await
+                .expect("first insert should succeed");
+            cursor
+                .table_insert(&cx, 30, &payload)
+                .await
+                .expect("second insert should succeed");
 
-        assert!(
-            !cursor
-                .table_move_to(&cx, 20)
-                .expect("seek to insertion point should succeed")
-                .is_found(),
-            "middle rowid should be absent before insert"
-        );
+            assert!(
+                !cursor
+                    .table_move_to(&cx, 20)
+                    .await
+                    .expect("seek to insertion point should succeed")
+                    .is_found(),
+                "middle rowid should be absent before insert"
+            );
 
-        let mut cell_data = Vec::new();
-        cursor
-            .encode_table_leaf_cell_into(&cx, 20, &payload, &mut cell_data)
-            .expect("cell encoding should succeed");
-        let top = cursor
-            .stack
-            .last()
-            .expect("seek should leave the leaf on stack");
-        let content_offset = top.header.content_offset(cursor.usable_size);
-        let would_fit = content_offset
-            .checked_sub(cell_data.len())
-            .is_some_and(|new_offset| {
-                let ptr_array_end = cell::header_offset_for_page(top.page_no)
-                    + usize::from(top.header.page_type.header_size())
-                    + (top.cell_pointers.len() + 1) * 2;
-                ptr_array_end <= new_offset
-            });
-        assert!(
-            !would_fit,
-            "test setup must force the balance/reload fallback path"
-        );
+            let mut cell_data = Vec::new();
+            cursor
+                .encode_table_leaf_cell_into(&cx, 20, &payload, &mut cell_data)
+                .await
+                .expect("cell encoding should succeed");
+            let top = cursor
+                .stack
+                .last()
+                .expect("seek should leave the leaf on stack");
+            let content_offset = top.header.content_offset(cursor.usable_size);
+            let would_fit = content_offset
+                .checked_sub(cell_data.len())
+                .is_some_and(|new_offset| {
+                    let ptr_array_end = cell::header_offset_for_page(top.page_no)
+                        + usize::from(top.header.page_type.header_size())
+                        + (top.cell_pointers.len() + 1) * 2;
+                    ptr_array_end <= new_offset
+                });
+            assert!(
+                !would_fit,
+                "test setup must force the balance/reload fallback path"
+            );
 
-        let before = crate::instrumentation::btree_leaf_reuse_snapshot();
-        cursor.pager.clear_reads();
-        cursor
-            .table_insert_from_current_position(&cx, 20, &payload)
-            .expect("fallback insert should still succeed via balance");
+            let before = crate::instrumentation::btree_leaf_reuse_snapshot();
+            cursor.pager.clear_reads();
+            cursor
+                .table_insert_from_current_position(&cx, 20, &payload)
+                .await
+                .expect("fallback insert should still succeed via balance");
 
-        let snapshot = crate::instrumentation::btree_leaf_reuse_snapshot();
-        set_btree_metrics_enabled(false);
-        assert!(
-            snapshot.conservative_reload_fallbacks
-                >= before.conservative_reload_fallbacks.saturating_add(1),
-            "the fallback counter should advance when the insert must rebalance"
-        );
-        assert!(
-            validate_table_tree_invariants(&cursor.pager, root, SMALL_USABLE).is_ok(),
-            "balance fallback must preserve table invariants"
-        );
+            let snapshot = crate::instrumentation::btree_leaf_reuse_snapshot();
+            set_btree_metrics_enabled(false);
+            assert!(
+                snapshot.conservative_reload_fallbacks
+                    >= before.conservative_reload_fallbacks.saturating_add(1),
+                "the fallback counter should advance when the insert must rebalance"
+            );
+            assert!(
+                validate_table_tree_invariants(&cursor.pager, root, SMALL_USABLE)
+                    .await
+                    .is_ok(),
+                "balance fallback must preserve table invariants"
+            );
+        });
     }
 
     #[test]
     fn test_btree_insert_10k_random_keys() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        let mut insertion_order: Vec<i64> = (1_i64..=10_000_i64).collect();
-        deterministic_shuffle(&mut insertion_order, 0x000D_EADB);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let mut insertion_order: Vec<i64> = (1_i64..=10_000_i64).collect();
+            deterministic_shuffle(&mut insertion_order, 0x000D_EADB);
 
-        for rowid in insertion_order {
-            let payload = payload_for_rowid(rowid);
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-        }
+            for rowid in insertion_order {
+                let payload = payload_for_rowid(rowid);
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            }
 
-        for rowid in 1_i64..=10_000_i64 {
-            let seek = cursor.table_move_to(&cx, rowid).unwrap();
-            assert!(seek.is_found(), "missing rowid {rowid} after insert");
-            assert_eq!(cursor.rowid(&cx).unwrap(), rowid);
-            assert_eq!(cursor.payload(&cx).unwrap(), payload_for_rowid(rowid));
-        }
+            for rowid in 1_i64..=10_000_i64 {
+                let seek = cursor.table_move_to(&cx, rowid).await.unwrap();
+                assert!(seek.is_found(), "missing rowid {rowid} after insert");
+                assert_eq!(cursor.rowid(&cx).await.unwrap(), rowid);
+                assert_eq!(cursor.payload(&cx).await.unwrap(), payload_for_rowid(rowid));
+            }
+        });
     }
 
     #[test]
     fn test_rowid_and_payload_cow_reads_local_leaf_table_payload() {
-        let payload = b"small local payload";
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[(7, payload)]));
+        run_async(async {
+            let payload = b"small local payload";
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[(7, payload)]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        assert!(cursor.table_move_to(&cx, 7).unwrap().is_found());
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            assert!(cursor.table_move_to(&cx, 7).await.unwrap().is_found());
 
-        let (rowid, got) = cursor.rowid_and_payload_cow(&cx).unwrap();
-        assert_eq!(rowid, 7);
-        assert_eq!(got.as_ref(), payload);
-        assert!(
-            matches!(got, Cow::Borrowed(_)),
-            "local leaf-table payloads should stay borrowed"
-        );
-        assert!(cursor.cell_slot_cache.borrow().entries.is_empty());
-        assert_eq!(cursor.payload(&cx).unwrap(), payload);
-        assert!(
-            cursor.cell_slot_cache.borrow().entries.is_empty(),
-            "payload() should read local leaf-table cells without populating the cell-slot cache"
-        );
+            let (rowid, got) = cursor.rowid_and_payload_cow(&cx).await.unwrap();
+            assert_eq!(rowid, 7);
+            assert_eq!(got.as_ref(), payload);
+            assert!(
+                matches!(got, Cow::Borrowed(_)),
+                "local leaf-table payloads should stay borrowed"
+            );
+            assert!(cursor.cell_slot_cache.borrow().entries.is_empty());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), payload);
+            assert!(
+                cursor.cell_slot_cache.borrow().entries.is_empty(),
+                "payload() should read local leaf-table cells without populating the cell-slot cache"
+            );
 
-        let mut prefix = Vec::new();
-        cursor
-            .payload_prefix_into(&cx, 5, &mut prefix)
-            .expect("local leaf prefix read should succeed");
-        assert_eq!(prefix, b"small");
+            let mut prefix = Vec::new();
+            cursor
+                .payload_prefix_into(&cx, 5, &mut prefix)
+                .await
+                .expect("local leaf prefix read should succeed");
+            assert_eq!(prefix, b"small");
+        });
     }
 
     #[test]
     fn test_rowid_reads_table_leaf_without_cell_slot_parse() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_leaf_table(&[(7, b"seven"), (9, b"nine")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_leaf_table(&[(7, b"seven"), (9, b"nine")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        assert!(cursor.table_move_to(&cx, 9).unwrap().is_found());
-        assert!(cursor.cell_slot_cache.borrow().entries.is_empty());
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            assert!(cursor.table_move_to(&cx, 9).await.unwrap().is_found());
+            assert!(cursor.cell_slot_cache.borrow().entries.is_empty());
 
-        assert_eq!(cursor.rowid(&cx).unwrap(), 9);
-        assert!(cursor.cell_slot_cache.borrow().entries.is_empty());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 9);
+            assert!(cursor.cell_slot_cache.borrow().entries.is_empty());
+        });
     }
 
     #[test]
     fn test_btree_depth_4_cursor_traversal() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 100)], pn(7)));
-        store
-            .pages
-            .insert(3, build_interior_table(&[(pn(4), 50)], pn(8)));
-        store
-            .pages
-            .insert(4, build_interior_table(&[(pn(5), 25)], pn(6)));
-        store
-            .pages
-            .insert(5, build_leaf_table(&[(10, b"ten"), (20, b"twenty")]));
-        store
-            .pages
-            .insert(6, build_leaf_table(&[(30, b"thirty"), (40, b"forty")]));
-        store
-            .pages
-            .insert(8, build_leaf_table(&[(60, b"sixty"), (80, b"eighty")]));
-        store
-            .pages
-            .insert(7, build_leaf_table(&[(120, b"one20"), (140, b"one40")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 100)], pn(7)));
+            store
+                .pages
+                .insert(3, build_interior_table(&[(pn(4), 50)], pn(8)));
+            store
+                .pages
+                .insert(4, build_interior_table(&[(pn(5), 25)], pn(6)));
+            store
+                .pages
+                .insert(5, build_leaf_table(&[(10, b"ten"), (20, b"twenty")]));
+            store
+                .pages
+                .insert(6, build_leaf_table(&[(30, b"thirty"), (40, b"forty")]));
+            store
+                .pages
+                .insert(8, build_leaf_table(&[(60, b"sixty"), (80, b"eighty")]));
+            store
+                .pages
+                .insert(7, build_leaf_table(&[(120, b"one20"), (140, b"one40")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        let depth = measure_tree_depth(&cursor.pager, pn(2), USABLE);
-        assert_eq!(depth, 4, "expected a manually seeded depth-4 tree");
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let depth = measure_tree_depth(&cursor.pager, pn(2), USABLE).await;
+            assert_eq!(depth, 4, "expected a manually seeded depth-4 tree");
 
-        let expected_rowids = [10_i64, 20, 30, 40, 60, 80, 120, 140];
-        for rowid in expected_rowids {
-            let seek = cursor.table_move_to(&cx, rowid).unwrap();
-            assert!(seek.is_found(), "missing rowid {rowid} in depth-4 tree");
-        }
+            let expected_rowids = [10_i64, 20, 30, 40, 60, 80, 120, 140];
+            for rowid in expected_rowids {
+                let seek = cursor.table_move_to(&cx, rowid).await.unwrap();
+                assert!(seek.is_found(), "missing rowid {rowid} in depth-4 tree");
+            }
 
-        assert!(cursor.first(&cx).unwrap());
-        let mut scanned = vec![cursor.rowid(&cx).unwrap()];
-        while cursor.next(&cx).unwrap() {
-            scanned.push(cursor.rowid(&cx).unwrap());
-        }
-        assert_eq!(scanned, expected_rowids);
+            assert!(cursor.first(&cx).await.unwrap());
+            let mut scanned = vec![cursor.rowid(&cx).await.unwrap()];
+            while cursor.next(&cx).await.unwrap() {
+                scanned.push(cursor.rowid(&cx).await.unwrap());
+            }
+            assert_eq!(scanned, expected_rowids);
+        });
     }
 
     #[test]
     fn test_table_advance_to_reuses_local_and_sibling_leaf_before_full_seek() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 15)], pn(4)));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 15)], pn(4)));
 
-        store
-            .pages
-            .insert(3, build_interior_table(&[(pn(5), 3), (pn(6), 8)], pn(7)));
-        store
-            .pages
-            .insert(4, build_interior_table(&[(pn(8), 25)], pn(9)));
+            store
+                .pages
+                .insert(3, build_interior_table(&[(pn(5), 3), (pn(6), 8)], pn(7)));
+            store
+                .pages
+                .insert(4, build_interior_table(&[(pn(8), 25)], pn(9)));
 
-        store
-            .pages
-            .insert(5, build_leaf_table(&[(1, b"L1"), (3, b"L3")]));
-        store
-            .pages
-            .insert(6, build_leaf_table(&[(5, b"L5"), (8, b"L8")]));
-        store
-            .pages
-            .insert(7, build_leaf_table(&[(10, b"L10"), (15, b"L15")]));
-        store
-            .pages
-            .insert(8, build_leaf_table(&[(20, b"L20"), (25, b"L25")]));
-        store
-            .pages
-            .insert(9, build_leaf_table(&[(30, b"L30"), (40, b"L40")]));
+            store
+                .pages
+                .insert(5, build_leaf_table(&[(1, b"L1"), (3, b"L3")]));
+            store
+                .pages
+                .insert(6, build_leaf_table(&[(5, b"L5"), (8, b"L8")]));
+            store
+                .pages
+                .insert(7, build_leaf_table(&[(10, b"L10"), (15, b"L15")]));
+            store
+                .pages
+                .insert(8, build_leaf_table(&[(20, b"L20"), (25, b"L25")]));
+            store
+                .pages
+                .insert(9, build_leaf_table(&[(30, b"L30"), (40, b"L40")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        assert!(cursor.table_move_to(&cx, 10).unwrap().is_found());
-        let same_leaf = cursor.current_page().unwrap();
-        let same_leaf_seek = cursor.advance_to(&cx, 12).unwrap();
-        assert!(!same_leaf_seek.is_found());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 15);
-        assert_eq!(cursor.current_page().unwrap(), same_leaf);
+            assert!(cursor.table_move_to(&cx, 10).await.unwrap().is_found());
+            let same_leaf = cursor.current_page().unwrap();
+            let same_leaf_seek = cursor.advance_to(&cx, 12).await.unwrap();
+            assert!(!same_leaf_seek.is_found());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 15);
+            assert_eq!(cursor.current_page().unwrap(), same_leaf);
 
-        assert!(cursor.table_move_to(&cx, 8).unwrap().is_found());
-        let left_leaf = cursor.current_page().unwrap();
-        let sibling_seek = cursor.advance_to(&cx, 10).unwrap();
-        assert!(sibling_seek.is_found());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 10);
-        assert_ne!(cursor.current_page().unwrap(), left_leaf);
+            assert!(cursor.table_move_to(&cx, 8).await.unwrap().is_found());
+            let left_leaf = cursor.current_page().unwrap();
+            let sibling_seek = cursor.advance_to(&cx, 10).await.unwrap();
+            assert!(sibling_seek.is_found());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 10);
+            assert_ne!(cursor.current_page().unwrap(), left_leaf);
 
-        assert!(cursor.table_move_to(&cx, 8).unwrap().is_found());
-        let fallback_seek = cursor.advance_to(&cx, 30).unwrap();
-        assert!(fallback_seek.is_found());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 30);
-        assert_eq!(cursor.current_page().unwrap(), pn(9));
-        assert!(
-            cursor
-                .witness_keys()
-                .iter()
-                .all(|key| matches!(key, WitnessKey::Cell { .. })),
-            "advance_to must remain a point probe and avoid page witnesses"
-        );
+            assert!(cursor.table_move_to(&cx, 8).await.unwrap().is_found());
+            let fallback_seek = cursor.advance_to(&cx, 30).await.unwrap();
+            assert!(fallback_seek.is_found());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 30);
+            assert_eq!(cursor.current_page().unwrap(), pn(9));
+            assert!(
+                cursor
+                    .witness_keys()
+                    .iter()
+                    .all(|key| matches!(key, WitnessKey::Cell { .. })),
+                "advance_to must remain a point probe and avoid page witnesses"
+            );
+        });
     }
 
     #[test]
     fn test_point_read_uses_cell_witness() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten")]),
-        );
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten")]),
+            );
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        let result = cursor.table_move_to(&cx, 5).unwrap();
-        assert!(result.is_found());
-        assert_eq!(cursor.witness_keys().len(), 1);
-        assert!(matches!(cursor.witness_keys()[0], WitnessKey::Cell { .. }));
+            let result = cursor.table_move_to(&cx, 5).await.unwrap();
+            assert!(result.is_found());
+            assert_eq!(cursor.witness_keys().len(), 1);
+            assert!(matches!(cursor.witness_keys()[0], WitnessKey::Cell { .. }));
+        });
     }
 
     #[test]
     fn test_btree_page_reads_publish_precise_witness_without_coarse_page_read() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten")]),
-        );
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten")]),
+            );
 
-        let cx = Cx::new();
-        let probe = WitnessProbeStore::new(store);
-        let state = probe.state();
-        let mut cursor = BtCursor::new(probe, pn(2), USABLE, true);
+            let cx = Cx::new();
+            let probe = WitnessProbeStore::new(store);
+            let state = probe.state();
+            let mut cursor = BtCursor::new(probe, pn(2), USABLE, true);
 
-        assert!(cursor.table_move_to(&cx, 5).unwrap().is_found());
+            assert!(cursor.table_move_to(&cx, 5).await.unwrap().is_found());
 
-        let state = state.borrow();
-        assert_eq!(
-            state.coarse_page_data_reads, 0,
-            "B-tree traversal must not register coarse page reads before the cursor emits its logical witness"
-        );
-        assert!(
-            state.btree_page_data_reads > 0,
-            "cursor traversal should still read B-tree pages through the dedicated path"
-        );
-        assert_eq!(state.read_witnesses.as_slice(), cursor.witness_keys());
-        assert!(
-            state
-                .read_witnesses
-                .iter()
-                .all(|key| matches!(key, WitnessKey::Cell { .. })),
-            "point lookup should publish only cell witnesses"
-        );
+            let state = state.borrow();
+            assert_eq!(
+                state.coarse_page_data_reads, 0,
+                "B-tree traversal must not register coarse page reads before the cursor emits its logical witness"
+            );
+            assert!(
+                state.btree_page_data_reads > 0,
+                "cursor traversal should still read B-tree pages through the dedicated path"
+            );
+            assert_eq!(state.read_witnesses.as_slice(), cursor.witness_keys());
+            assert!(
+                state
+                    .read_witnesses
+                    .iter()
+                    .all(|key| matches!(key, WitnessKey::Cell { .. })),
+                "point lookup should publish only cell witnesses"
+            );
+        });
     }
 
     #[test]
     fn test_read_witness_cap_throttles_per_cursor_vec_but_preserves_pager_evidence() {
-        // Regression test for frankensqlite#92 / coding_agent_session_search#252:
-        // a multi-page range scan must not balloon the per-cursor witness vec
-        // when an operator has explicitly opted into a cap, but the canonical
-        // pager-level SSI evidence must still see every read.
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
+        run_async(async {
+            // Regression test for frankensqlite#92 / coding_agent_session_search#252:
+            // a multi-page range scan must not balloon the per-cursor witness vec
+            // when an operator has explicitly opted into a cap, but the canonical
+            // pager-level SSI evidence must still see every read.
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
 
-        let cx = Cx::new();
-        let probe = WitnessProbeStore::new(store);
-        let state = probe.state();
-        let mut cursor = BtCursor::new(probe, pn(2), USABLE, true);
-        // Cap at 1: COUNT visits 3 B-tree pages → expect cap to throttle after 1.
-        cursor.set_read_witness_cap(1);
-        assert_eq!(cursor.read_witness_cap(), 1);
+            let cx = Cx::new();
+            let probe = WitnessProbeStore::new(store);
+            let state = probe.state();
+            let mut cursor = BtCursor::new(probe, pn(2), USABLE, true);
+            // Cap at 1: COUNT visits 3 B-tree pages → expect cap to throttle after 1.
+            cursor.set_read_witness_cap(1);
+            assert_eq!(cursor.read_witness_cap(), 1);
 
-        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 4);
+            assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), 4);
 
-        // Per-cursor witness vec respects the cap: at most 1 entry.
-        assert!(
-            cursor.witness_keys().len() <= 1,
-            "read_witness_cap=1 should throttle per-cursor vec; got {} entries",
-            cursor.witness_keys().len()
-        );
+            // Per-cursor witness vec respects the cap: at most 1 entry.
+            assert!(
+                cursor.witness_keys().len() <= 1,
+                "read_witness_cap=1 should throttle per-cursor vec; got {} entries",
+                cursor.witness_keys().len()
+            );
 
-        // Pager-level SSI evidence is unaffected — every B-tree page read still
-        // got a witness recorded into the pager.
-        let state = state.borrow();
-        assert!(
-            [pn(2), pn(3), pn(4)]
-                .into_iter()
-                .all(|page| state.read_witnesses.contains(&WitnessKey::Page(page))),
-            "pager-level evidence must record every page read regardless of per-cursor cap"
-        );
+            // Pager-level SSI evidence is unaffected — every B-tree page read still
+            // got a witness recorded into the pager.
+            let state = state.borrow();
+            assert!(
+                [pn(2), pn(3), pn(4)]
+                    .into_iter()
+                    .all(|page| state.read_witnesses.contains(&WitnessKey::Page(page))),
+                "pager-level evidence must record every page read regardless of per-cursor cap"
+            );
+        });
     }
 
     #[test]
     fn test_read_witness_cap_zero_is_unbounded_default() {
-        // Default cap = 0 means "unbounded": the historical behavior must be
-        // preserved for callers that rely on full per-cursor witness lists.
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
+        run_async(async {
+            // Default cap = 0 means "unbounded": the historical behavior must be
+            // preserved for callers that rely on full per-cursor witness lists.
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        assert_eq!(
-            cursor.read_witness_cap(),
-            0,
-            "default cap should be 0 (unbounded) when env var is unset"
-        );
-        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 4);
-        assert!(
-            cursor.witness_keys().len() >= 3,
-            "unbounded default must keep all page witnesses; got {}",
-            cursor.witness_keys().len()
-        );
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            assert_eq!(
+                cursor.read_witness_cap(),
+                0,
+                "default cap should be 0 (unbounded) when env var is unset"
+            );
+            assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), 4);
+            assert!(
+                cursor.witness_keys().len() >= 3,
+                "unbounded default must keep all page witnesses; got {}",
+                cursor.witness_keys().len()
+            );
+        });
     }
 
     #[test]
     fn test_clear_witness_keys_resets_warn_flag_and_keeps_cap_active() {
-        // `clear_witness_keys` must reset the one-shot warn flag so the next
-        // descent that hits the cap can re-emit the policy-hit warning, and it
-        // must NOT silently drop the cap (operators that clear witnesses
-        // between queries still want the throttle to apply).
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
+        run_async(async {
+            // `clear_witness_keys` must reset the one-shot warn flag so the next
+            // descent that hits the cap can re-emit the policy-hit warning, and it
+            // must NOT silently drop the cap (operators that clear witnesses
+            // between queries still want the throttle to apply).
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        cursor.set_read_witness_cap(1);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            cursor.set_read_witness_cap(1);
 
-        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 4);
-        let first_len = cursor.witness_keys().len();
-        assert!(first_len <= 1);
-        // Cap fired at least once during the descent → warn flag is now set.
-        assert!(
-            cursor.read_witness_cap_warned,
-            "warn flag should be set after cap throttles"
-        );
+            assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), 4);
+            let first_len = cursor.witness_keys().len();
+            assert!(first_len <= 1);
+            // Cap fired at least once during the descent → warn flag is now set.
+            assert!(
+                cursor.read_witness_cap_warned,
+                "warn flag should be set after cap throttles"
+            );
 
-        cursor.clear_witness_keys();
-        assert!(cursor.witness_keys().is_empty());
-        assert!(
-            !cursor.read_witness_cap_warned,
-            "clear_witness_keys must reset the one-shot warn flag"
-        );
-        // Cap is still active after clear.
-        assert_eq!(cursor.read_witness_cap(), 1);
+            cursor.clear_witness_keys();
+            assert!(cursor.witness_keys().is_empty());
+            assert!(
+                !cursor.read_witness_cap_warned,
+                "clear_witness_keys must reset the one-shot warn flag"
+            );
+            // Cap is still active after clear.
+            assert_eq!(cursor.read_witness_cap(), 1);
+        });
     }
 
     #[test]
@@ -17859,138 +18904,148 @@ mod tests {
 
     #[test]
     fn test_count_all_rows_publishes_page_witnesses_without_coarse_page_read() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
 
-        let cx = Cx::new();
-        let probe = WitnessProbeStore::new(store);
-        let state = probe.state();
-        let mut cursor = BtCursor::new(probe, pn(2), USABLE, true);
+            let cx = Cx::new();
+            let probe = WitnessProbeStore::new(store);
+            let state = probe.state();
+            let mut cursor = BtCursor::new(probe, pn(2), USABLE, true);
 
-        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 4);
+            assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), 4);
 
-        let state = state.borrow();
-        assert_eq!(
-            state.coarse_page_data_reads, 0,
-            "COUNT traversal must not fall back to coarse raw page reads"
-        );
-        assert_eq!(state.btree_page_data_reads, 3);
-        assert!(
-            [pn(2), pn(3), pn(4)]
-                .into_iter()
-                .all(|page| state.read_witnesses.contains(&WitnessKey::Page(page))),
-            "COUNT traversal must publish page witnesses for every counted B-tree page"
-        );
-        assert!(
-            state
-                .read_witnesses
-                .iter()
-                .all(|key| matches!(key, WitnessKey::Page(_))),
-            "COUNT traversal should publish page witnesses rather than point-cell witnesses"
-        );
+            let state = state.borrow();
+            assert_eq!(
+                state.coarse_page_data_reads, 0,
+                "COUNT traversal must not fall back to coarse raw page reads"
+            );
+            assert_eq!(state.btree_page_data_reads, 3);
+            assert!(
+                [pn(2), pn(3), pn(4)]
+                    .into_iter()
+                    .all(|page| state.read_witnesses.contains(&WitnessKey::Page(page))),
+                "COUNT traversal must publish page witnesses for every counted B-tree page"
+            );
+            assert!(
+                state
+                    .read_witnesses
+                    .iter()
+                    .all(|key| matches!(key, WitnessKey::Page(_))),
+                "COUNT traversal should publish page witnesses rather than point-cell witnesses"
+            );
+        });
     }
 
     #[test]
     fn test_descent_pages_not_witnessed() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"a"), (2, b"b")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"a"), (2, b"b")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        let result = cursor.table_move_to(&cx, 10).unwrap();
-        assert!(result.is_found());
-        assert!(
-            cursor
-                .witness_keys()
-                .iter()
-                .all(|key| matches!(key, WitnessKey::Cell { .. }))
-        );
+            let result = cursor.table_move_to(&cx, 10).await.unwrap();
+            assert!(result.is_found());
+            assert!(
+                cursor
+                    .witness_keys()
+                    .iter()
+                    .all(|key| matches!(key, WitnessKey::Cell { .. }))
+            );
+        });
     }
 
     #[test]
     fn test_negative_read_uses_cell_witness() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten")]),
-        );
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten")]),
+            );
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        let result = cursor.table_move_to(&cx, 7).unwrap();
-        assert!(!result.is_found());
-        assert_eq!(cursor.witness_keys().len(), 1);
-        assert!(matches!(cursor.witness_keys()[0], WitnessKey::Cell { .. }));
+            let result = cursor.table_move_to(&cx, 7).await.unwrap();
+            assert!(!result.is_found());
+            assert_eq!(cursor.witness_keys().len(), 1);
+            assert!(matches!(cursor.witness_keys()[0], WitnessKey::Cell { .. }));
+        });
     }
 
     #[test]
     fn test_range_scan_uses_page_witness() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
 
-        assert!(cursor.first(&cx).unwrap());
-        assert!(cursor.next(&cx).unwrap());
-        assert!(cursor.next(&cx).unwrap());
-        assert!(
-            cursor
-                .witness_keys()
-                .iter()
-                .any(|key| matches!(key, WitnessKey::Page(_)))
-        );
+            assert!(cursor.first(&cx).await.unwrap());
+            assert!(cursor.next(&cx).await.unwrap());
+            assert!(cursor.next(&cx).await.unwrap());
+            assert!(
+                cursor
+                    .witness_keys()
+                    .iter()
+                    .any(|key| matches!(key, WitnessKey::Page(_)))
+            );
+        });
     }
 
     #[test]
     fn test_range_page_witness_dedups_consecutive_leaf() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_leaf_table(&[(1, b"a"), (5, b"b"), (10, b"c")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_leaf_table(&[(1, b"a"), (5, b"b"), (10, b"c")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
 
-        assert!(cursor.first(&cx).unwrap());
-        assert!(cursor.next(&cx).unwrap());
-        assert!(cursor.next(&cx).unwrap());
+            assert!(cursor.first(&cx).await.unwrap());
+            assert!(cursor.next(&cx).await.unwrap());
+            assert!(cursor.next(&cx).await.unwrap());
 
-        let page_witnesses = cursor
-            .witness_keys()
-            .iter()
-            .filter(|key| matches!(key, WitnessKey::Page(page) if *page == pn(2)))
-            .count();
-        assert_eq!(
-            page_witnesses, 1,
-            "one page witness is enough for repeated range steps on the same leaf"
-        );
+            let page_witnesses = cursor
+                .witness_keys()
+                .iter()
+                .filter(|key| matches!(key, WitnessKey::Page(page) if *page == pn(2)))
+                .count();
+            assert_eq!(
+                page_witnesses, 1,
+                "one page witness is enough for repeated range steps on the same leaf"
+            );
+        });
     }
 
     #[test]
@@ -18025,397 +19080,432 @@ mod tests {
 
     #[test]
     fn test_e2e_point_ops_use_cell_witnesses() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 50)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(10, b"a"), (50, b"b")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(60, b"c"), (90, b"d")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 50)], pn(4)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(10, b"a"), (50, b"b")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(60, b"c"), (90, b"d")]));
 
-        let cx = Cx::new();
-        let mut point_cursor = BtCursor::new(store.clone(), pn(2), USABLE, true);
-        let mut range_cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut point_cursor = BtCursor::new(store.clone(), pn(2), USABLE, true);
+            let mut range_cursor = BtCursor::new(store, pn(2), USABLE, true);
 
-        // Point workload: one hit and one miss.
-        assert!(point_cursor.table_move_to(&cx, 60).unwrap().is_found());
-        assert!(!point_cursor.table_move_to(&cx, 61).unwrap().is_found());
-        assert!(
-            point_cursor
-                .witness_keys()
-                .iter()
-                .all(|key| matches!(key, WitnessKey::Cell { .. })),
-            "point operations must not emit page-level witnesses"
-        );
+            // Point workload: one hit and one miss.
+            assert!(
+                point_cursor
+                    .table_move_to(&cx, 60)
+                    .await
+                    .unwrap()
+                    .is_found()
+            );
+            assert!(
+                !point_cursor
+                    .table_move_to(&cx, 61)
+                    .await
+                    .unwrap()
+                    .is_found()
+            );
+            assert!(
+                point_cursor
+                    .witness_keys()
+                    .iter()
+                    .all(|key| matches!(key, WitnessKey::Cell { .. })),
+                "point operations must not emit page-level witnesses"
+            );
 
-        // Range workload: traversal witnesses leaves at page granularity.
-        assert!(range_cursor.first(&cx).unwrap());
-        assert!(range_cursor.next(&cx).unwrap());
-        assert!(range_cursor.next(&cx).unwrap());
-        assert!(
-            range_cursor
-                .witness_keys()
-                .iter()
-                .any(|key| matches!(key, WitnessKey::Page(_))),
-            "range operations may emit page-level witnesses"
-        );
+            // Range workload: traversal witnesses leaves at page granularity.
+            assert!(range_cursor.first(&cx).await.unwrap());
+            assert!(range_cursor.next(&cx).await.unwrap());
+            assert!(range_cursor.next(&cx).await.unwrap());
+            assert!(
+                range_cursor
+                    .witness_keys()
+                    .iter()
+                    .any(|key| matches!(key, WitnessKey::Page(_))),
+                "range operations may emit page-level witnesses"
+            );
+        });
     }
 
     #[test]
     fn test_cursor_next_prev() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[(1, b"a"), (2, b"b"), (3, b"c"), (4, b"d")]),
-        );
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_leaf_table(&[(1, b"a"), (2, b"b"), (3, b"c"), (4, b"d")]),
+            );
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        // Forward.
-        assert!(cursor.first(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 4);
-        assert!(!cursor.next(&cx).unwrap());
-        assert!(cursor.eof());
+            // Forward.
+            assert!(cursor.first(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 1);
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 2);
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 3);
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 4);
+            assert!(!cursor.next(&cx).await.unwrap());
+            assert!(cursor.eof());
 
-        // Backward.
-        assert!(cursor.last(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 4);
-        assert!(cursor.prev(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
-        assert!(cursor.prev(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
-        assert!(cursor.prev(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
-        assert!(!cursor.prev(&cx).unwrap());
+            // Backward.
+            assert!(cursor.last(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 4);
+            assert!(cursor.prev(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 3);
+            assert!(cursor.prev(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 2);
+            assert!(cursor.prev(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 1);
+            assert!(!cursor.prev(&cx).await.unwrap());
+        });
     }
 
     #[test]
     fn test_cursor_empty_tree() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        assert!(!cursor.first(&cx).unwrap());
-        assert!(cursor.eof());
+            assert!(!cursor.first(&cx).await.unwrap());
+            assert!(cursor.eof());
+        });
     }
 
     // -- Two-level tree tests --
 
     #[test]
     fn test_cursor_two_level_tree_seek() {
-        // Build a two-level tree:
-        //   Interior page 2: children=[left=3, rowid=5], right=4
-        //   Leaf page 3: (1, "a"), (5, "b")     — rowids <= 5
-        //   Leaf page 4: (10, "c"), (15, "d")    — rowids > 5
-        //
-        // In SQLite intkey trees, the interior cell key is the max rowid
-        // in the left subtree.
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
+        run_async(async {
+            // Build a two-level tree:
+            //   Interior page 2: children=[left=3, rowid=5], right=4
+            //   Leaf page 3: (1, "a"), (5, "b")     — rowids <= 5
+            //   Leaf page 4: (10, "c"), (15, "d")    — rowids > 5
+            //
+            // In SQLite intkey trees, the interior cell key is the max rowid
+            // in the left subtree.
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        // Seek exact matches.
-        assert!(cursor.table_move_to(&cx, 1).unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), b"a");
+            // Seek exact matches.
+            assert!(cursor.table_move_to(&cx, 1).await.unwrap().is_found());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"a");
 
-        assert!(cursor.table_move_to(&cx, 5).unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), b"b");
+            assert!(cursor.table_move_to(&cx, 5).await.unwrap().is_found());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"b");
 
-        assert!(cursor.table_move_to(&cx, 10).unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), b"c");
+            assert!(cursor.table_move_to(&cx, 10).await.unwrap().is_found());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"c");
 
-        assert!(cursor.table_move_to(&cx, 15).unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), b"d");
+            assert!(cursor.table_move_to(&cx, 15).await.unwrap().is_found());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"d");
+        });
     }
 
     #[test]
     fn test_table_seek_fails_closed_when_successor_contains_missed_rowid() {
-        // Mirrors frankensqlite#73: a stale interior separator routes the
-        // equality seek into the left child, while a forward scan reaches the
-        // same rowid in the successor leaf. This must not silently return
-        // NotFound, because UPDATE/DELETE callers would no-op a scan-visible row.
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"a"), (4, b"d")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(5, b"e"), (10, b"j")]));
+        run_async(async {
+            // Mirrors frankensqlite#73: a stale interior separator routes the
+            // equality seek into the left child, while a forward scan reaches the
+            // same rowid in the successor leaf. This must not silently return
+            // NotFound, because UPDATE/DELETE callers would no-op a scan-visible row.
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"a"), (4, b"d")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(5, b"e"), (10, b"j")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        let mut scanned = Vec::new();
-        assert!(cursor.first(&cx).unwrap());
-        loop {
-            scanned.push(cursor.rowid(&cx).unwrap());
-            if !cursor.next(&cx).unwrap() {
-                break;
+            let mut scanned = Vec::new();
+            assert!(cursor.first(&cx).await.unwrap());
+            loop {
+                scanned.push(cursor.rowid(&cx).await.unwrap());
+                if !cursor.next(&cx).await.unwrap() {
+                    break;
+                }
             }
-        }
-        assert_eq!(scanned, vec![1, 4, 5, 10]);
+            assert_eq!(scanned, vec![1, 4, 5, 10]);
 
-        let err = cursor
-            .table_move_to(&cx, 5)
-            .expect_err("stale separator must fail closed");
-        assert!(
-            matches!(
-                err,
-                FrankenError::DatabaseCorrupt { ref detail }
-                    if detail.contains("missed scan-visible rowid 5")
-            ),
-            "unexpected error: {err}"
-        );
+            let err = cursor
+                .table_move_to(&cx, 5)
+                .await
+                .expect_err("stale separator must fail closed");
+            assert!(
+                matches!(
+                    err,
+                    FrankenError::DatabaseCorrupt { ref detail }
+                        if detail.contains("missed scan-visible rowid 5")
+                ),
+                "unexpected error: {err}"
+            );
+        });
     }
 
     #[test]
     fn test_cursor_two_level_tree_traverse() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        // Forward traversal: 1, 5, 10, 15.
-        assert!(cursor.first(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 5);
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 10);
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 15);
-        assert!(!cursor.next(&cx).unwrap());
-        assert!(cursor.eof());
+            // Forward traversal: 1, 5, 10, 15.
+            assert!(cursor.first(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 1);
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 5);
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 10);
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 15);
+            assert!(!cursor.next(&cx).await.unwrap());
+            assert!(cursor.eof());
 
-        // Backward traversal: 15, 10, 5, 1.
-        assert!(cursor.last(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 15);
-        assert!(cursor.prev(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 10);
-        assert!(cursor.prev(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 5);
-        assert!(cursor.prev(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
-        assert!(!cursor.prev(&cx).unwrap());
+            // Backward traversal: 15, 10, 5, 1.
+            assert!(cursor.last(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 15);
+            assert!(cursor.prev(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 10);
+            assert!(cursor.prev(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 5);
+            assert!(cursor.prev(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 1);
+            assert!(!cursor.prev(&cx).await.unwrap());
+        });
     }
 
     // -- Three-level tree test --
 
     #[test]
     fn test_cursor_three_level_tree() {
-        // Build a three-level tree. Interior cell keys are the max rowid
-        // in their left subtree.
-        //
-        //   Root (page 2): interior, children=[(3, 15)], right=4
-        //     → left subtree (page 3) has rowids <= 15
-        //     → right subtree (page 4) has rowids > 15
-        //
-        //   Page 3: interior, children=[(5, 3), (6, 8)], right=7
-        //     → page 5 has rowids <= 3
-        //     → page 6 has rowids in (3, 8]
-        //     → page 7 has rowids in (8, 15]
-        //
-        //   Page 4: interior, children=[(8, 25)], right=9
-        //     → page 8 has rowids in (15, 25]
-        //     → page 9 has rowids > 25
-        //
-        //   Leaf pages:
-        //     5: (1, 3)  6: (5, 8)  7: (10, 15)  8: (20, 25)  9: (30, 40)
-        let mut store = MemPageStore::new(USABLE);
+        run_async(async {
+            // Build a three-level tree. Interior cell keys are the max rowid
+            // in their left subtree.
+            //
+            //   Root (page 2): interior, children=[(3, 15)], right=4
+            //     → left subtree (page 3) has rowids <= 15
+            //     → right subtree (page 4) has rowids > 15
+            //
+            //   Page 3: interior, children=[(5, 3), (6, 8)], right=7
+            //     → page 5 has rowids <= 3
+            //     → page 6 has rowids in (3, 8]
+            //     → page 7 has rowids in (8, 15]
+            //
+            //   Page 4: interior, children=[(8, 25)], right=9
+            //     → page 8 has rowids in (15, 25]
+            //     → page 9 has rowids > 25
+            //
+            //   Leaf pages:
+            //     5: (1, 3)  6: (5, 8)  7: (10, 15)  8: (20, 25)  9: (30, 40)
+            let mut store = MemPageStore::new(USABLE);
 
-        // Root.
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 15)], pn(4)));
+            // Root.
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 15)], pn(4)));
 
-        // Interior pages.
-        store
-            .pages
-            .insert(3, build_interior_table(&[(pn(5), 3), (pn(6), 8)], pn(7)));
-        store
-            .pages
-            .insert(4, build_interior_table(&[(pn(8), 25)], pn(9)));
+            // Interior pages.
+            store
+                .pages
+                .insert(3, build_interior_table(&[(pn(5), 3), (pn(6), 8)], pn(7)));
+            store
+                .pages
+                .insert(4, build_interior_table(&[(pn(8), 25)], pn(9)));
 
-        // Leaves.
-        store
-            .pages
-            .insert(5, build_leaf_table(&[(1, b"L1"), (3, b"L3")]));
-        store
-            .pages
-            .insert(6, build_leaf_table(&[(5, b"L5"), (8, b"L8")]));
-        store
-            .pages
-            .insert(7, build_leaf_table(&[(10, b"L10"), (15, b"L15")]));
-        store
-            .pages
-            .insert(8, build_leaf_table(&[(20, b"L20"), (25, b"L25")]));
-        store
-            .pages
-            .insert(9, build_leaf_table(&[(30, b"L30"), (40, b"L40")]));
+            // Leaves.
+            store
+                .pages
+                .insert(5, build_leaf_table(&[(1, b"L1"), (3, b"L3")]));
+            store
+                .pages
+                .insert(6, build_leaf_table(&[(5, b"L5"), (8, b"L8")]));
+            store
+                .pages
+                .insert(7, build_leaf_table(&[(10, b"L10"), (15, b"L15")]));
+            store
+                .pages
+                .insert(8, build_leaf_table(&[(20, b"L20"), (25, b"L25")]));
+            store
+                .pages
+                .insert(9, build_leaf_table(&[(30, b"L30"), (40, b"L40")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        // Full forward scan.
-        let mut rowids = Vec::new();
-        assert!(cursor.first(&cx).unwrap());
-        loop {
-            rowids.push(cursor.rowid(&cx).unwrap());
-            if !cursor.next(&cx).unwrap() {
-                break;
+            // Full forward scan.
+            let mut rowids = Vec::new();
+            assert!(cursor.first(&cx).await.unwrap());
+            loop {
+                rowids.push(cursor.rowid(&cx).await.unwrap());
+                if !cursor.next(&cx).await.unwrap() {
+                    break;
+                }
             }
-        }
-        assert_eq!(rowids, vec![1, 3, 5, 8, 10, 15, 20, 25, 30, 40]);
+            assert_eq!(rowids, vec![1, 3, 5, 8, 10, 15, 20, 25, 30, 40]);
 
-        // Full backward scan.
-        let mut rowids_rev = Vec::new();
-        assert!(cursor.last(&cx).unwrap());
-        loop {
-            rowids_rev.push(cursor.rowid(&cx).unwrap());
-            if !cursor.prev(&cx).unwrap() {
-                break;
+            // Full backward scan.
+            let mut rowids_rev = Vec::new();
+            assert!(cursor.last(&cx).await.unwrap());
+            loop {
+                rowids_rev.push(cursor.rowid(&cx).await.unwrap());
+                if !cursor.prev(&cx).await.unwrap() {
+                    break;
+                }
             }
-        }
-        assert_eq!(rowids_rev, vec![40, 30, 25, 20, 15, 10, 8, 5, 3, 1]);
+            assert_eq!(rowids_rev, vec![40, 30, 25, 20, 15, 10, 8, 5, 3, 1]);
 
-        // Seek tests.
-        assert!(cursor.table_move_to(&cx, 8).unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), b"L8");
+            // Seek tests.
+            assert!(cursor.table_move_to(&cx, 8).await.unwrap().is_found());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"L8");
 
-        assert!(cursor.table_move_to(&cx, 25).unwrap().is_found());
-        assert_eq!(cursor.payload(&cx).unwrap(), b"L25");
+            assert!(cursor.table_move_to(&cx, 25).await.unwrap().is_found());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"L25");
 
-        // Seek not found: 12 → should land on 15.
-        let r = cursor.table_move_to(&cx, 12).unwrap();
-        assert!(!r.is_found());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 15);
+            // Seek not found: 12 → should land on 15.
+            let r = cursor.table_move_to(&cx, 12).await.unwrap();
+            assert!(!r.is_found());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 15);
+        });
     }
 
     #[test]
     fn test_cursor_seek_then_next() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"one"), (5, b"five")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(10, b"ten"), (20, b"twenty")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"one"), (5, b"five")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(10, b"ten"), (20, b"twenty")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        // Seek to 5, then next should give 10.
-        assert!(cursor.table_move_to(&cx, 5).unwrap().is_found());
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 10);
+            // Seek to 5, then next should give 10.
+            assert!(cursor.table_move_to(&cx, 5).await.unwrap().is_found());
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 10);
+        });
     }
 
     #[test]
     fn test_cursor_next_skips_empty_table_child_subtree_without_restarting_root() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 5), (pn(4), 10)], pn(5)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"one"), (5, b"five")]));
-        store.pages.insert(4, build_leaf_table(&[]));
-        store.pages.insert(
-            5,
-            build_leaf_table(&[(20, b"twenty"), (25, b"twenty-five")]),
-        );
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 5), (pn(4), 10)], pn(5)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"one"), (5, b"five")]));
+            store.pages.insert(4, build_leaf_table(&[]));
+            store.pages.insert(
+                5,
+                build_leaf_table(&[(20, b"twenty"), (25, b"twenty-five")]),
+            );
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        assert!(cursor.first(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 5);
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(
-            cursor.rowid(&cx).unwrap(),
-            20,
-            "next() should skip the empty middle child subtree and continue forward"
-        );
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 25);
-        assert!(!cursor.next(&cx).unwrap());
+            assert!(cursor.first(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 1);
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 5);
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(
+                cursor.rowid(&cx).await.unwrap(),
+                20,
+                "next() should skip the empty middle child subtree and continue forward"
+            );
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 25);
+            assert!(!cursor.next(&cx).await.unwrap());
+        });
     }
 
     #[test]
     fn test_cursor_next_handles_empty_rightmost_table_child_subtree() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"one"), (5, b"five")]));
-        store.pages.insert(4, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"one"), (5, b"five")]));
+            store.pages.insert(4, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        assert!(cursor.first(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 5);
-        assert!(
-            !cursor.next(&cx).unwrap(),
-            "advancing past an empty rightmost child subtree should cleanly reach EOF"
-        );
+            assert!(cursor.first(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 1);
+            assert!(cursor.next(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 5);
+            assert!(
+                !cursor.next(&cx).await.unwrap(),
+                "advancing past an empty rightmost child subtree should cleanly reach EOF"
+            );
+        });
     }
 
     #[test]
     fn test_cursor_eof_at_payload() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[(1, b"x")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[(1, b"x")]));
 
-        let cx = Cx::new();
-        let cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let cx = Cx::new();
+            let cursor = BtCursor::new(store, pn(2), USABLE, true);
 
-        // Before first/last, cursor is at EOF.
-        assert!(cursor.eof());
-        assert!(cursor.payload(&cx).is_err());
-        assert!(cursor.rowid(&cx).is_err());
+            // Before first/last, cursor is at EOF.
+            assert!(cursor.eof());
+            assert!(cursor.payload(&cx).await.is_err());
+            assert!(cursor.rowid(&cx).await.is_err());
+        });
     }
 
     /// Regression test for bd-14lx: sustained deletes that drain all leaf
@@ -18429,58 +19519,60 @@ mod tests {
     /// first()/next() enumeration correctly.
     #[test]
     fn test_depth3_collapse_after_sustained_deletes() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        // Use large payloads (~1400 bytes) so that fewer cells per leaf
-        // forces deeper trees sooner.
-        let mut max_rowid = 0i64;
-        let mut reached_depth_3 = false;
+            // Use large payloads (~1400 bytes) so that fewer cells per leaf
+            // forces deeper trees sooner.
+            let mut max_rowid = 0i64;
+            let mut reached_depth_3 = false;
 
-        for rowid in 1..=2000_i64 {
-            let payload = vec![b'D'; 1400];
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-            max_rowid = rowid;
+            for rowid in 1..=2000_i64 {
+                let payload = vec![b'D'; 1400];
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+                max_rowid = rowid;
 
-            // Check tree depth by descending from root.
-            let depth = measure_tree_depth(&cursor.pager, pn(2), USABLE);
-            if depth >= 3 {
-                reached_depth_3 = true;
-                break;
+                // Check tree depth by descending from root.
+                let depth = measure_tree_depth(&cursor.pager, pn(2), USABLE).await;
+                if depth >= 3 {
+                    reached_depth_3 = true;
+                    break;
+                }
             }
-        }
 
-        assert!(
-            reached_depth_3,
-            "failed to build depth-3 tree (reached rowid {max_rowid})"
-        );
+            assert!(
+                reached_depth_3,
+                "failed to build depth-3 tree (reached rowid {max_rowid})"
+            );
 
-        // Delete every row.
-        for rowid in 1..=max_rowid {
-            let seek = cursor.table_move_to(&cx, rowid).unwrap();
-            assert!(seek.is_found(), "rowid {rowid} should exist before delete");
-            cursor.delete(&cx).unwrap();
-        }
+            // Delete every row.
+            for rowid in 1..=max_rowid {
+                let seek = cursor.table_move_to(&cx, rowid).await.unwrap();
+                assert!(seek.is_found(), "rowid {rowid} should exist before delete");
+                cursor.delete(&cx).await.unwrap();
+            }
 
-        // After deleting everything, the tree must be empty.
-        assert!(
-            !cursor.first(&cx).unwrap(),
-            "tree should be empty after total delete"
-        );
-        assert!(cursor.eof());
+            // After deleting everything, the tree must be empty.
+            assert!(
+                !cursor.first(&cx).await.unwrap(),
+                "tree should be empty after total delete"
+            );
+            assert!(cursor.eof());
 
-        // The root page should have collapsed to a leaf (depth 1).
-        let root_data = cursor.pager.read_page(&cx, pn(2)).unwrap();
-        let root_header = BtreePageHeader::parse(&root_data, 0).unwrap();
-        assert!(
-            root_header.page_type.is_leaf(),
-            "root should collapse to leaf after all rows deleted, got {:?}",
-            root_header.page_type
-        );
-        assert_eq!(root_header.cell_count, 0);
+            // The root page should have collapsed to a leaf (depth 1).
+            let root_data = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+            let root_header = BtreePageHeader::parse(&root_data, 0).unwrap();
+            assert!(
+                root_header.page_type.is_leaf(),
+                "root should collapse to leaf after all rows deleted, got {:?}",
+                root_header.page_type
+            );
+            assert_eq!(root_header.cell_count, 0);
+        });
     }
 
     /// Variant of the depth-3 collapse test that deletes only *some* rows,
@@ -18488,62 +19580,64 @@ mod tests {
     /// rows are still correctly enumerable.
     #[test]
     fn test_depth3_partial_delete_collapse() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        let mut max_rowid = 0i64;
-        for rowid in 1..=2000_i64 {
-            let payload = vec![b'P'; 1400];
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-            max_rowid = rowid;
+            let mut max_rowid = 0i64;
+            for rowid in 1..=2000_i64 {
+                let payload = vec![b'P'; 1400];
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+                max_rowid = rowid;
 
-            let depth = measure_tree_depth(&cursor.pager, pn(2), USABLE);
-            if depth >= 3 {
-                break;
-            }
-        }
-
-        // Delete the first half of rows.
-        let half = max_rowid / 2;
-        for rowid in 1..=half {
-            let seek = cursor.table_move_to(&cx, rowid).unwrap();
-            assert!(seek.is_found(), "rowid {rowid} should exist before delete");
-            cursor.delete(&cx).unwrap();
-        }
-
-        // Verify the remaining rows are intact.
-        let mut seen = 0usize;
-        if cursor.first(&cx).unwrap() {
-            let mut prev = i64::MIN;
-            loop {
-                let rowid = cursor.rowid(&cx).unwrap();
-                assert!(rowid > prev, "out-of-order rowid {rowid} after {prev}");
-                assert!(rowid > half, "deleted rowid {rowid} still present");
-                prev = rowid;
-                seen += 1;
-                if !cursor.next(&cx).unwrap() {
+                let depth = measure_tree_depth(&cursor.pager, pn(2), USABLE).await;
+                if depth >= 3 {
                     break;
                 }
             }
-        }
-        assert_eq!(
-            seen,
-            usize::try_from(max_rowid - half).unwrap(),
-            "wrong number of surviving rows"
-        );
+
+            // Delete the first half of rows.
+            let half = max_rowid / 2;
+            for rowid in 1..=half {
+                let seek = cursor.table_move_to(&cx, rowid).await.unwrap();
+                assert!(seek.is_found(), "rowid {rowid} should exist before delete");
+                cursor.delete(&cx).await.unwrap();
+            }
+
+            // Verify the remaining rows are intact.
+            let mut seen = 0usize;
+            if cursor.first(&cx).await.unwrap() {
+                let mut prev = i64::MIN;
+                loop {
+                    let rowid = cursor.rowid(&cx).await.unwrap();
+                    assert!(rowid > prev, "out-of-order rowid {rowid} after {prev}");
+                    assert!(rowid > half, "deleted rowid {rowid} still present");
+                    prev = rowid;
+                    seen += 1;
+                    if !cursor.next(&cx).await.unwrap() {
+                        break;
+                    }
+                }
+            }
+            assert_eq!(
+                seen,
+                usize::try_from(max_rowid - half).unwrap(),
+                "wrong number of surviving rows"
+            );
+        });
     }
 
     /// Measure tree depth by descending from the root following the
     /// leftmost child at each interior level.
-    fn measure_tree_depth<P: PageReader>(pager: &P, root: PageNumber, _usable: u32) -> usize {
+    async fn measure_tree_depth<P: PageReader>(pager: &P, root: PageNumber, _usable: u32) -> usize {
         let cx = Cx::new();
         let mut pgno = root;
         let mut depth = 1;
         loop {
-            let data = pager.read_page(&cx, pgno).unwrap();
+            let data = pager.read_page(&cx, pgno).await.unwrap();
             let offset = cell::header_offset_for_page(pgno);
             let header = cell::BtreePageHeader::parse(&data, offset).unwrap();
             if header.page_type.is_leaf() {
@@ -18574,90 +19668,99 @@ mod tests {
     /// correctly across multiple overflow pages.
     #[test]
     fn test_btree_multiple_overflow_pages() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        // Insert 10 rows with payloads between 5000 and 10000 bytes,
-        // each requiring multiple overflow pages (page usable = 4096).
-        let payloads: Vec<Vec<u8>> = (0..10)
-            .map(|i| vec![b'A' + (i as u8 % 26); 5000 + i * 500])
-            .collect();
+            // Insert 10 rows with payloads between 5000 and 10000 bytes,
+            // each requiring multiple overflow pages (page usable = 4096).
+            let payloads: Vec<Vec<u8>> = (0..10)
+                .map(|i| vec![b'A' + (i as u8 % 26); 5000 + i * 500])
+                .collect();
 
-        for (i, payload) in payloads.iter().enumerate() {
-            let rowid = i64::try_from(i + 1).unwrap();
-            cursor.table_insert(&cx, rowid, payload).unwrap();
-        }
+            for (i, payload) in payloads.iter().enumerate() {
+                let rowid = i64::try_from(i + 1).unwrap();
+                cursor.table_insert(&cx, rowid, payload).await.unwrap();
+            }
 
-        // Verify every row round-trips exactly.
-        for (i, expected) in payloads.iter().enumerate() {
-            let rowid = i64::try_from(i + 1).unwrap();
-            let seek = cursor.table_move_to(&cx, rowid).unwrap();
-            assert!(seek.is_found(), "rowid {rowid} not found");
-            let got = cursor.payload(&cx).unwrap();
-            assert_eq!(
-                got.len(),
-                expected.len(),
-                "payload length mismatch at rowid {rowid}"
-            );
-            assert_eq!(&got[..], &expected[..], "payload mismatch at rowid {rowid}");
-        }
+            // Verify every row round-trips exactly.
+            for (i, expected) in payloads.iter().enumerate() {
+                let rowid = i64::try_from(i + 1).unwrap();
+                let seek = cursor.table_move_to(&cx, rowid).await.unwrap();
+                assert!(seek.is_found(), "rowid {rowid} not found");
+                let got = cursor.payload(&cx).await.unwrap();
+                assert_eq!(
+                    got.len(),
+                    expected.len(),
+                    "payload length mismatch at rowid {rowid}"
+                );
+                assert_eq!(&got[..], &expected[..], "payload mismatch at rowid {rowid}");
+            }
+        });
     }
 
     #[test]
     fn test_btree_overflow_page_chain_100kb() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        let payload = vec![0xCD_u8; 100 * 1024];
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let payload = vec![0xCD_u8; 100 * 1024];
 
-        cursor.table_insert(&cx, 1, &payload).unwrap();
-        let seek = cursor.table_move_to(&cx, 1).unwrap();
-        assert!(seek.is_found(), "expected rowid 1 to be present");
+            cursor.table_insert(&cx, 1, &payload).await.unwrap();
+            let seek = cursor.table_move_to(&cx, 1).await.unwrap();
+            assert!(seek.is_found(), "expected rowid 1 to be present");
 
-        let roundtrip = cursor.payload(&cx).unwrap();
-        assert_eq!(roundtrip.len(), payload.len());
-        assert_eq!(roundtrip, payload);
+            let roundtrip = cursor.payload(&cx).await.unwrap();
+            assert_eq!(roundtrip.len(), payload.len());
+            assert_eq!(roundtrip, payload);
+        });
     }
 
     /// Phase 3 acceptance: page count must grow as rows are inserted
     /// (proving page splits occur), and sorted order is maintained.
     #[test]
     fn test_btree_page_count_grows_with_inserts() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        // Insert 500 rows with ~200 byte payloads to force multiple splits.
-        for i in 1..=500_i64 {
-            let payload = format!("row-{i:05}-payload-data-{}", "X".repeat(180));
-            cursor.table_insert(&cx, i, payload.as_bytes()).unwrap();
-        }
+            // Insert 500 rows with ~200 byte payloads to force multiple splits.
+            for i in 1..=500_i64 {
+                let payload = format!("row-{i:05}-payload-data-{}", "X".repeat(180));
+                cursor
+                    .table_insert(&cx, i, payload.as_bytes())
+                    .await
+                    .unwrap();
+            }
 
-        // The tree must have split into multiple levels.
-        let depth = measure_tree_depth(&cursor.pager, pn(2), USABLE);
-        assert!(
-            depth > 1,
-            "expected tree depth > 1 after 500 inserts, got {depth}"
-        );
+            // The tree must have split into multiple levels.
+            let depth = measure_tree_depth(&cursor.pager, pn(2), USABLE).await;
+            assert!(
+                depth > 1,
+                "expected tree depth > 1 after 500 inserts, got {depth}"
+            );
 
-        // Full forward scan must yield 500 rows in sorted order.
-        assert!(cursor.first(&cx).unwrap());
-        let mut count = 1u32;
-        let mut prev = cursor.rowid(&cx).unwrap();
-        while cursor.next(&cx).unwrap() {
-            let current = cursor.rowid(&cx).unwrap();
-            assert!(current > prev, "sort violation: {current} followed {prev}");
-            prev = current;
-            count += 1;
-        }
-        assert_eq!(count, 500, "expected 500 rows, saw {count}");
+            // Full forward scan must yield 500 rows in sorted order.
+            assert!(cursor.first(&cx).await.unwrap());
+            let mut count = 1u32;
+            let mut prev = cursor.rowid(&cx).await.unwrap();
+            while cursor.next(&cx).await.unwrap() {
+                let current = cursor.rowid(&cx).await.unwrap();
+                assert!(current > prev, "sort violation: {current} followed {prev}");
+                prev = current;
+                count += 1;
+            }
+            assert_eq!(count, 500, "expected 500 rows, saw {count}");
+        });
     }
 
     proptest::proptest! {
@@ -18674,47 +19777,51 @@ mod tests {
                 1..200
             )
         ) {
-            let mut store = MemPageStore::new(USABLE);
-            store.pages.insert(2, build_leaf_table(&[]));
+            run_async(async {
+                let mut store = MemPageStore::new(USABLE);
+                store.pages.insert(2, build_leaf_table(&[]));
 
-            let cx = Cx::new();
-            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-            let mut live: BTreeSet<i64> = BTreeSet::new();
+                let cx = Cx::new();
+                let mut cursor =
+                    BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+                let mut live: BTreeSet<i64> = BTreeSet::new();
 
-            for (is_insert, rowid, payload) in &ops {
-                if *is_insert && !live.contains(rowid) {
-                    cursor.table_insert(&cx, *rowid, payload).unwrap();
-                    live.insert(*rowid);
-                } else if !*is_insert && live.contains(rowid) {
-                    let seek = cursor.table_move_to(&cx, *rowid).unwrap();
-                    if seek.is_found() {
-                        cursor.delete(&cx).unwrap();
-                        live.remove(rowid);
+                for (is_insert, rowid, payload) in &ops {
+                    if *is_insert && !live.contains(rowid) {
+                        cursor.table_insert(&cx, *rowid, payload).await.unwrap();
+                        live.insert(*rowid);
+                    } else if !*is_insert && live.contains(rowid) {
+                        let seek = cursor.table_move_to(&cx, *rowid).await.unwrap();
+                        if seek.is_found() {
+                            cursor.delete(&cx).await.unwrap();
+                            live.remove(rowid);
+                        }
                     }
                 }
-            }
 
-            // Verify sorted order and correct count.
-            let mut scanned = Vec::new();
-            if cursor.first(&cx).unwrap() {
-                loop {
-                    scanned.push(cursor.rowid(&cx).unwrap());
-                    if !cursor.next(&cx).unwrap() {
-                        break;
+                // Verify sorted order and correct count.
+                let mut scanned = Vec::new();
+                if cursor.first(&cx).await.unwrap() {
+                    loop {
+                        scanned.push(cursor.rowid(&cx).await.unwrap());
+                        if !cursor.next(&cx).await.unwrap() {
+                            break;
+                        }
                     }
                 }
-            }
 
-            // Rowids must be strictly ascending.
-            for window in scanned.windows(2) {
-                proptest::prop_assert!(
-                    window[0] < window[1],
-                    "sort violation: {} >= {}",
-                    window[0],
-                    window[1]
-                );
-            }
-            proptest::prop_assert_eq!(scanned.len(), live.len());
+                // Rowids must be strictly ascending.
+                for window in scanned.windows(2) {
+                    proptest::prop_assert!(
+                        window[0] < window[1],
+                        "sort violation: {} >= {}",
+                        window[0],
+                        window[1]
+                    );
+                }
+                proptest::prop_assert_eq!(scanned.len(), live.len());
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
         }
 
         /// bd-2sm1: B-tree order matches BTreeMap reference after random ops.
@@ -18732,55 +19839,59 @@ mod tests {
                 1..500
             )
         ) {
-            let mut store = MemPageStore::new(USABLE);
-            store.pages.insert(2, build_leaf_table(&[]));
+            run_async(async {
+                let mut store = MemPageStore::new(USABLE);
+                store.pages.insert(2, build_leaf_table(&[]));
 
-            let cx = Cx::new();
-            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-            let mut reference: std::collections::BTreeMap<i64, Vec<u8>> =
-                std::collections::BTreeMap::new();
+                let cx = Cx::new();
+                let mut cursor =
+                    BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+                let mut reference: std::collections::BTreeMap<i64, Vec<u8>> =
+                    std::collections::BTreeMap::new();
 
-            for (is_insert, rowid, payload) in &ops {
-                if *is_insert {
-                    if reference.contains_key(rowid) {
-                        // Duplicate: inserting an existing rowid must fail.
-                        let result = cursor.table_insert(&cx, *rowid, payload);
-                        proptest::prop_assert!(
-                            matches!(result, Err(FrankenError::PrimaryKeyViolation)),
-                            "duplicate rowid {} should produce PrimaryKeyViolation, got {:?}",
-                            rowid,
-                            result,
-                        );
-                    } else {
-                        cursor.table_insert(&cx, *rowid, payload).unwrap();
-                        reference.insert(*rowid, payload.clone());
-                    }
-                } else if reference.contains_key(rowid) {
-                    let seek = cursor.table_move_to(&cx, *rowid).unwrap();
-                    if seek.is_found() {
-                        cursor.delete(&cx).unwrap();
-                        reference.remove(rowid);
-                    }
-                }
-            }
-
-            // Scan and compare with reference.
-            let mut scanned_rowids = Vec::new();
-            if cursor.first(&cx).unwrap() {
-                loop {
-                    scanned_rowids.push(cursor.rowid(&cx).unwrap());
-                    if !cursor.next(&cx).unwrap() {
-                        break;
+                for (is_insert, rowid, payload) in &ops {
+                    if *is_insert {
+                        if reference.contains_key(rowid) {
+                            // Duplicate: inserting an existing rowid must fail.
+                            let result = cursor.table_insert(&cx, *rowid, payload).await;
+                            proptest::prop_assert!(
+                                matches!(result, Err(FrankenError::PrimaryKeyViolation)),
+                                "duplicate rowid {} should produce PrimaryKeyViolation, got {:?}",
+                                rowid,
+                                result,
+                            );
+                        } else {
+                            cursor.table_insert(&cx, *rowid, payload).await.unwrap();
+                            reference.insert(*rowid, payload.clone());
+                        }
+                    } else if reference.contains_key(rowid) {
+                        let seek = cursor.table_move_to(&cx, *rowid).await.unwrap();
+                        if seek.is_found() {
+                            cursor.delete(&cx).await.unwrap();
+                            reference.remove(rowid);
+                        }
                     }
                 }
-            }
 
-            let ref_rowids: Vec<i64> = reference.keys().copied().collect();
-            proptest::prop_assert_eq!(
-                &scanned_rowids,
-                &ref_rowids,
-                "bead_id=bd-2sm1 case=btree_vs_btreemap rowids mismatch"
-            );
+                // Scan and compare with reference.
+                let mut scanned_rowids = Vec::new();
+                if cursor.first(&cx).await.unwrap() {
+                    loop {
+                        scanned_rowids.push(cursor.rowid(&cx).await.unwrap());
+                        if !cursor.next(&cx).await.unwrap() {
+                            break;
+                        }
+                    }
+                }
+
+                let ref_rowids: Vec<i64> = reference.keys().copied().collect();
+                proptest::prop_assert_eq!(
+                    &scanned_rowids,
+                    &ref_rowids,
+                    "bead_id=bd-2sm1 case=btree_vs_btreemap rowids mismatch"
+                );
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
         }
 
         #[test]
@@ -18794,66 +19905,72 @@ mod tests {
                 1..400
             )
         ) {
-            let mut store = MemPageStore::new(USABLE);
-            store.pages.insert(2, build_leaf_table(&[]));
+            run_async(async {
+                let mut store = MemPageStore::new(USABLE);
+                store.pages.insert(2, build_leaf_table(&[]));
 
-            let cx = Cx::new();
-            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-            let mut reference = BTreeMap::<i64, Vec<u8>>::new();
+                let cx = Cx::new();
+                let mut cursor =
+                    BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+                let mut reference = BTreeMap::<i64, Vec<u8>>::new();
 
-            for (step, (is_insert, rowid, payload)) in ops.iter().enumerate() {
-                if *is_insert {
-                    if reference.contains_key(rowid) {
-                        let result = cursor.table_insert(&cx, *rowid, payload);
-                        proptest::prop_assert!(
-                            matches!(result, Err(FrankenError::PrimaryKeyViolation)),
-                            "duplicate rowid {} at step {} should produce PrimaryKeyViolation, got {:?}",
-                            rowid,
-                            step,
-                            result,
-                        );
-                    } else {
-                        cursor.table_insert(&cx, *rowid, payload).unwrap();
-                        reference.insert(*rowid, payload.clone());
+                for (step, (is_insert, rowid, payload)) in ops.iter().enumerate() {
+                    if *is_insert {
+                        if reference.contains_key(rowid) {
+                            let result = cursor.table_insert(&cx, *rowid, payload).await;
+                            proptest::prop_assert!(
+                                matches!(result, Err(FrankenError::PrimaryKeyViolation)),
+                                "duplicate rowid {} at step {} should produce PrimaryKeyViolation, got {:?}",
+                                rowid,
+                                step,
+                                result,
+                            );
+                        } else {
+                            cursor.table_insert(&cx, *rowid, payload).await.unwrap();
+                            reference.insert(*rowid, payload.clone());
+                        }
+                    } else if reference.contains_key(rowid) {
+                        let seek = cursor.table_move_to(&cx, *rowid).await.unwrap();
+                        if seek.is_found() {
+                            cursor.delete(&cx).await.unwrap();
+                            reference.remove(rowid);
+                        }
                     }
-                } else if reference.contains_key(rowid) {
-                    let seek = cursor.table_move_to(&cx, *rowid).unwrap();
-                    if seek.is_found() {
-                        cursor.delete(&cx).unwrap();
-                        reference.remove(rowid);
-                    }
+
+                    let bounds =
+                        validate_table_tree_invariants(&cursor.pager, pn(2), USABLE)
+                            .await
+                            .map_err(|err| {
+                                proptest::test_runner::TestCaseError::fail(format!(
+                                    "table structural invariant failed after step {} ({:?}, {}, payload_len={}): {}",
+                                    step,
+                                    if *is_insert { "insert" } else { "delete" },
+                                    rowid,
+                                    payload.len(),
+                                    err
+                                ))
+                            })?;
+
+                    let expected_bounds = match (
+                        reference.keys().next().copied(),
+                        reference.keys().next_back().copied(),
+                    ) {
+                        (Some(min_rowid), Some(max_rowid)) => Some(TableSubtreeBounds {
+                            min_rowid,
+                            max_rowid,
+                        }),
+                        (None, None) => None,
+                        _ => unreachable!("BTreeMap first/last should agree on emptiness"),
+                    };
+                    proptest::prop_assert_eq!(
+                        bounds,
+                        expected_bounds,
+                        "table subtree bounds diverged from reference after step {}",
+                        step
+                    );
                 }
-
-                let bounds = validate_table_tree_invariants(&cursor.pager, pn(2), USABLE)
-                    .map_err(|err| {
-                        proptest::test_runner::TestCaseError::fail(format!(
-                            "table structural invariant failed after step {} ({:?}, {}, payload_len={}): {}",
-                            step,
-                            if *is_insert { "insert" } else { "delete" },
-                            rowid,
-                            payload.len(),
-                            err
-                        ))
-                    })?;
-
-                let expected_bounds = match (
-                    reference.keys().next().copied(),
-                    reference.keys().next_back().copied(),
-                ) {
-                    (Some(min_rowid), Some(max_rowid)) => Some(TableSubtreeBounds {
-                        min_rowid,
-                        max_rowid,
-                    }),
-                    (None, None) => None,
-                    _ => unreachable!("BTreeMap first/last should agree on emptiness"),
-                };
-                proptest::prop_assert_eq!(
-                    bounds,
-                    expected_bounds,
-                    "table subtree bounds diverged from reference after step {}",
-                    step
-                );
-            }
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
         }
 
         #[test]
@@ -18866,134 +19983,148 @@ mod tests {
                 1..220
             )
         ) {
-            const INDEX_USABLE: u32 = 512;
+            run_async(async {
+                const INDEX_USABLE: u32 = 512;
 
-            let root = pn(2);
-            let store = MemPageStore::with_empty_index(root, INDEX_USABLE);
-            let cx = Cx::new();
-            let mut cursor = BtCursor::new(store, root, INDEX_USABLE, false);
-            let mut reference = BTreeMap::<i64, Vec<u8>>::new();
+                let root = pn(2);
+                let store = MemPageStore::with_empty_index(root, INDEX_USABLE);
+                let cx = Cx::new();
+                let mut cursor = BtCursor::new(store, root, INDEX_USABLE, false);
+                let mut reference = BTreeMap::<i64, Vec<u8>>::new();
 
-            for (step, (is_insert, id)) in ops.iter().enumerate() {
-                let key = synthetic_index_key(*id);
+                for (step, (is_insert, id)) in ops.iter().enumerate() {
+                    let key = synthetic_index_key(*id);
 
-                if *is_insert {
-                    if !reference.contains_key(id) {
-                        cursor.index_insert(&cx, &key).unwrap();
-                        reference.insert(*id, key);
+                    if *is_insert {
+                        if !reference.contains_key(id) {
+                            cursor.index_insert(&cx, &key).await.unwrap();
+                            reference.insert(*id, key);
+                        }
+                    } else if reference.contains_key(id) {
+                        let seek = cursor.index_move_to(&cx, &key).await.unwrap();
+                        if seek.is_found() {
+                            cursor.delete(&cx).await.unwrap();
+                            reference.remove(id);
+                        }
                     }
-                } else if reference.contains_key(id) {
-                    let seek = cursor.index_move_to(&cx, &key).unwrap();
-                    if seek.is_found() {
-                        cursor.delete(&cx).unwrap();
-                        reference.remove(id);
-                    }
+
+                    let bounds = validate_index_tree_invariants(&mut cursor, root)
+                        .await
+                        .map_err(|err| {
+                            proptest::test_runner::TestCaseError::fail(format!(
+                                "index structural invariant failed after step {} ({:?}, {}): {}",
+                                step,
+                                if *is_insert { "insert" } else { "delete" },
+                                id,
+                                err
+                            ))
+                        })?;
+
+                    let mut expected_keys: Vec<Vec<u8>> =
+                        reference.values().cloned().collect();
+                    expected_keys.sort_by(|lhs, rhs| compare_index_test_keys(&cursor, lhs, rhs));
+
+                    let scanned = scan_all_index_keys(&mut cursor, &cx).await.map_err(|err| {
+                        proptest::test_runner::TestCaseError::fail(format!(
+                            "index scan failed after step {} ({:?}, {}): {}",
+                            step,
+                            if *is_insert { "insert" } else { "delete" },
+                            id,
+                            err
+                        ))
+                    })?;
+
+                    let expected_bounds = match (expected_keys.first(), expected_keys.last()) {
+                        (Some(min_key), Some(max_key)) => Some(IndexSubtreeBounds {
+                            min_key: min_key.clone(),
+                            max_key: max_key.clone(),
+                            entry_count: expected_keys.len(),
+                        }),
+                        (None, None) => None,
+                        _ => unreachable!("expected key bounds should agree on emptiness"),
+                    };
+
+                    proptest::prop_assert_eq!(
+                        scanned,
+                        expected_keys,
+                        "index logical sequence diverged from the reference after step {}",
+                        step
+                    );
+                    proptest::prop_assert_eq!(
+                        bounds,
+                        expected_bounds,
+                        "index subtree bounds diverged from the reference after step {}",
+                        step
+                    );
                 }
-
-                let bounds = validate_index_tree_invariants(&mut cursor, root).map_err(|err| {
-                    proptest::test_runner::TestCaseError::fail(format!(
-                        "index structural invariant failed after step {} ({:?}, {}): {}",
-                        step,
-                        if *is_insert { "insert" } else { "delete" },
-                        id,
-                        err
-                    ))
-                })?;
-
-                let mut expected_keys: Vec<Vec<u8>> = reference.values().cloned().collect();
-                expected_keys.sort_by(|lhs, rhs| compare_index_test_keys(&cursor, lhs, rhs));
-
-                let scanned = scan_all_index_keys(&mut cursor, &cx).map_err(|err| {
-                    proptest::test_runner::TestCaseError::fail(format!(
-                        "index scan failed after step {} ({:?}, {}): {}",
-                        step,
-                        if *is_insert { "insert" } else { "delete" },
-                        id,
-                        err
-                    ))
-                })?;
-
-                let expected_bounds = match (expected_keys.first(), expected_keys.last()) {
-                    (Some(min_key), Some(max_key)) => Some(IndexSubtreeBounds {
-                        min_key: min_key.clone(),
-                        max_key: max_key.clone(),
-                        entry_count: expected_keys.len(),
-                    }),
-                    (None, None) => None,
-                    _ => unreachable!("expected key bounds should agree on emptiness"),
-                };
-
-                proptest::prop_assert_eq!(
-                    scanned,
-                    expected_keys,
-                    "index logical sequence diverged from the reference after step {}",
-                    step
-                );
-                proptest::prop_assert_eq!(
-                    bounds,
-                    expected_bounds,
-                    "index subtree bounds diverged from the reference after step {}",
-                    step
-                );
-            }
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
         }
 
         #[test]
         fn prop_table_seek_cache_matches_forced_full_descent(
             workload in proptest::collection::vec(-64_i64..=320_i64, 1..200)
         ) {
-            let cx = Cx::new();
-            let root = pn(2);
-            let store = MemPageStore::with_empty_table(root, USABLE);
-            let mut seed_cursor = BtCursor::new(store, root, USABLE, true);
+            run_async(async {
+                let cx = Cx::new();
+                let root = pn(2);
+                let store = MemPageStore::with_empty_table(root, USABLE);
+                let mut seed_cursor = BtCursor::new(store, root, USABLE, true);
 
-            for rowid in 1_i64..=256_i64 {
-                let payload = vec![b'Q'; 160 + usize::try_from(rowid % 17).unwrap()];
-                seed_cursor.table_insert(&cx, rowid, &payload).unwrap();
-            }
-
-            let mut cached_cursor = BtCursor::new(seed_cursor.pager.clone(), root, USABLE, true);
-            let mut baseline_cursor = BtCursor::new(seed_cursor.pager.clone(), root, USABLE, true);
-
-            for target in workload {
-                baseline_cursor.clear_seek_cache();
-
-                let baseline = baseline_cursor.table_move_to(&cx, target).unwrap();
-                let cached = cached_cursor.table_move_to(&cx, target).unwrap();
-
-                proptest::prop_assert_eq!(
-                    cached.is_found(),
-                    baseline.is_found(),
-                    "seek hit mismatch for rowid {}",
-                    target
-                );
-                proptest::prop_assert_eq!(
-                    cached_cursor.eof(),
-                    baseline_cursor.eof(),
-                    "EOF mismatch for rowid {}",
-                    target
-                );
-
-                if !cached_cursor.eof() {
-                    let cached_rowid = cached_cursor.rowid(&cx).unwrap();
-                    let baseline_rowid = baseline_cursor.rowid(&cx).unwrap();
-                    proptest::prop_assert_eq!(
-                        cached_rowid,
-                        baseline_rowid,
-                        "landing rowid mismatch for target {}",
-                        target
-                    );
-
-                    let cached_payload = cached_cursor.payload(&cx).unwrap();
-                    let baseline_payload = baseline_cursor.payload(&cx).unwrap();
-                    proptest::prop_assert_eq!(
-                        cached_payload,
-                        baseline_payload,
-                        "landing payload mismatch for target {}",
-                        target
-                    );
+                for rowid in 1_i64..=256_i64 {
+                    let payload = vec![b'Q'; 160 + usize::try_from(rowid % 17).unwrap()];
+                    seed_cursor
+                        .table_insert(&cx, rowid, &payload)
+                        .await
+                        .unwrap();
                 }
-            }
+
+                let mut cached_cursor =
+                    BtCursor::new(seed_cursor.pager.clone(), root, USABLE, true);
+                let mut baseline_cursor =
+                    BtCursor::new(seed_cursor.pager.clone(), root, USABLE, true);
+
+                for target in workload {
+                    baseline_cursor.clear_seek_cache();
+
+                    let baseline = baseline_cursor.table_move_to(&cx, target).await.unwrap();
+                    let cached = cached_cursor.table_move_to(&cx, target).await.unwrap();
+
+                    proptest::prop_assert_eq!(
+                        cached.is_found(),
+                        baseline.is_found(),
+                        "seek hit mismatch for rowid {}",
+                        target
+                    );
+                    proptest::prop_assert_eq!(
+                        cached_cursor.eof(),
+                        baseline_cursor.eof(),
+                        "EOF mismatch for rowid {}",
+                        target
+                    );
+
+                    if !cached_cursor.eof() {
+                        let cached_rowid = cached_cursor.rowid(&cx).await.unwrap();
+                        let baseline_rowid = baseline_cursor.rowid(&cx).await.unwrap();
+                        proptest::prop_assert_eq!(
+                            cached_rowid,
+                            baseline_rowid,
+                            "landing rowid mismatch for target {}",
+                            target
+                        );
+
+                        let cached_payload = cached_cursor.payload(&cx).await.unwrap();
+                        let baseline_payload = baseline_cursor.payload(&cx).await.unwrap();
+                        proptest::prop_assert_eq!(
+                            cached_payload,
+                            baseline_payload,
+                            "landing payload mismatch for target {}",
+                            target
+                        );
+                    }
+                }
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
         }
 
         #[test]
@@ -19007,37 +20138,41 @@ mod tests {
                 1..120
             )
         ) {
-            let cx = Cx::new();
-            let root = pn(2);
-            let store = MemPageStore::with_empty_table(root, USABLE);
-            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), root, USABLE, true);
-            let mut reference = BTreeMap::<i64, Vec<u8>>::new();
+            run_async(async {
+                let cx = Cx::new();
+                let root = pn(2);
+                let store = MemPageStore::with_empty_table(root, USABLE);
+                let mut cursor =
+                    BtCursor::new(PrefetchProbeStore::new(store), root, USABLE, true);
+                let mut reference = BTreeMap::<i64, Vec<u8>>::new();
 
-            for (is_insert, rowid, payload) in ops {
-                if is_insert {
-                    if let std::collections::btree_map::Entry::Vacant(entry) =
-                        reference.entry(rowid)
-                    {
-                        cursor.table_insert(&cx, rowid, &payload).unwrap();
-                        entry.insert(payload);
+                for (is_insert, rowid, payload) in ops {
+                    if is_insert {
+                        if let std::collections::btree_map::Entry::Vacant(entry) =
+                            reference.entry(rowid)
+                        {
+                            cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+                            entry.insert(payload);
+                        }
+                    } else if reference.contains_key(&rowid) {
+                        let seek = cursor.table_move_to(&cx, rowid).await.unwrap();
+                        if seek.is_found() {
+                            cursor.delete(&cx).await.unwrap();
+                            reference.remove(&rowid);
+                        }
                     }
-                } else if reference.contains_key(&rowid) {
-                    let seek = cursor.table_move_to(&cx, rowid).unwrap();
-                    if seek.is_found() {
-                        cursor.delete(&cx).unwrap();
-                        reference.remove(&rowid);
+
+                    if let Some(target) = reference.keys().next().copied() {
+                        cursor.table_move_to(&cx, target).await.unwrap();
+                    } else {
+                        cursor.first(&cx).await.unwrap();
                     }
-                }
 
-                if let Some(target) = reference.keys().next().copied() {
-                    cursor.table_move_to(&cx, target).unwrap();
-                } else {
-                    cursor.first(&cx).unwrap();
+                    stack_cell_cache_matches_fresh_parse(&cursor)
+                        .map_err(proptest::test_runner::TestCaseError::fail)?;
                 }
-
-                stack_cell_cache_matches_fresh_parse(&cursor)
-                    .map_err(proptest::test_runner::TestCaseError::fail)?;
-            }
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
         }
 
         #[test]
@@ -19045,35 +20180,39 @@ mod tests {
             rowids in proptest::collection::btree_set(-10_000_i64..=10_000_i64, 0..128),
             target in -12_000_i64..=12_000_i64,
         ) {
-            let cx = Cx::new();
-            let mut store = MemPageStore::new(USABLE);
-            let payloads: Vec<Vec<u8>> = rowids
-                .iter()
-                .map(|rowid| rowid.to_le_bytes().to_vec())
-                .collect();
-            let entries: Vec<(i64, &[u8])> = rowids
-                .iter()
-                .zip(payloads.iter())
-                .map(|(rowid, payload)| (*rowid, payload.as_slice()))
-                .collect();
-            store.pages.insert(2, build_leaf_table(&entries));
+            run_async(async {
+                let cx = Cx::new();
+                let mut store = MemPageStore::new(USABLE);
+                let payloads: Vec<Vec<u8>> = rowids
+                    .iter()
+                    .map(|rowid| rowid.to_le_bytes().to_vec())
+                    .collect();
+                let entries: Vec<(i64, &[u8])> = rowids
+                    .iter()
+                    .zip(payloads.iter())
+                    .map(|(rowid, payload)| (*rowid, payload.as_slice()))
+                    .collect();
+                store.pages.insert(2, build_leaf_table(&entries));
 
-            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-            let entry = cursor.load_page(&cx, pn(2)).unwrap();
+                let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+                let entry = cursor.load_page(&cx, pn(2)).await.unwrap();
 
-            let interpolation =
-                BtCursor::<MemPageStore>::search_integer_key_table_leaf(&cx, &entry, target)
-                    .unwrap();
-            let binary =
-                BtCursor::<MemPageStore>::binary_search_table_leaf(&cx, &entry, target).unwrap();
+                let interpolation =
+                    BtCursor::<MemPageStore>::search_integer_key_table_leaf(&cx, &entry, target)
+                        .unwrap();
+                let binary =
+                    BtCursor::<MemPageStore>::binary_search_table_leaf(&cx, &entry, target)
+                        .unwrap();
 
-            proptest::prop_assert_eq!(
-                interpolation,
-                binary,
-                "interpolation search must match binary search for target {} and rowids {:?}",
-                target,
-                rowids
-            );
+                proptest::prop_assert_eq!(
+                    interpolation,
+                    binary,
+                    "interpolation search must match binary search for target {} and rowids {:?}",
+                    target,
+                    rowids
+                );
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
         }
 
         /// Reverse-direction companion to `prop_btree_vs_btreemap_reference`.
@@ -19098,56 +20237,60 @@ mod tests {
                 1..500
             )
         ) {
-            let mut store = MemPageStore::new(USABLE);
-            store.pages.insert(2, build_leaf_table(&[]));
+            run_async(async {
+                let mut store = MemPageStore::new(USABLE);
+                store.pages.insert(2, build_leaf_table(&[]));
 
-            let cx = Cx::new();
-            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-            let mut reference: std::collections::BTreeMap<i64, Vec<u8>> =
-                std::collections::BTreeMap::new();
+                let cx = Cx::new();
+                let mut cursor =
+                    BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+                let mut reference: std::collections::BTreeMap<i64, Vec<u8>> =
+                    std::collections::BTreeMap::new();
 
-            for (is_insert, rowid, payload) in &ops {
-                if *is_insert {
-                    if reference.contains_key(rowid) {
-                        // Duplicate: must produce PrimaryKeyViolation.
-                        let result = cursor.table_insert(&cx, *rowid, payload);
-                        proptest::prop_assert!(
-                            matches!(result, Err(FrankenError::PrimaryKeyViolation)),
-                            "duplicate rowid {} should produce PrimaryKeyViolation, got {:?}",
-                            rowid,
-                            result,
-                        );
-                    } else {
-                        cursor.table_insert(&cx, *rowid, payload).unwrap();
-                        reference.insert(*rowid, payload.clone());
-                    }
-                } else if reference.contains_key(rowid) {
-                    let seek = cursor.table_move_to(&cx, *rowid).unwrap();
-                    if seek.is_found() {
-                        cursor.delete(&cx).unwrap();
-                        reference.remove(rowid);
-                    }
-                }
-            }
-
-            // Scan in REVERSE using last() + prev() and compare against the
-            // reversed reference sequence.
-            let mut scanned_rev = Vec::new();
-            if cursor.last(&cx).unwrap() {
-                loop {
-                    scanned_rev.push(cursor.rowid(&cx).unwrap());
-                    if !cursor.prev(&cx).unwrap() {
-                        break;
+                for (is_insert, rowid, payload) in &ops {
+                    if *is_insert {
+                        if reference.contains_key(rowid) {
+                            // Duplicate: must produce PrimaryKeyViolation.
+                            let result = cursor.table_insert(&cx, *rowid, payload).await;
+                            proptest::prop_assert!(
+                                matches!(result, Err(FrankenError::PrimaryKeyViolation)),
+                                "duplicate rowid {} should produce PrimaryKeyViolation, got {:?}",
+                                rowid,
+                                result,
+                            );
+                        } else {
+                            cursor.table_insert(&cx, *rowid, payload).await.unwrap();
+                            reference.insert(*rowid, payload.clone());
+                        }
+                    } else if reference.contains_key(rowid) {
+                        let seek = cursor.table_move_to(&cx, *rowid).await.unwrap();
+                        if seek.is_found() {
+                            cursor.delete(&cx).await.unwrap();
+                            reference.remove(rowid);
+                        }
                     }
                 }
-            }
 
-            let expected_rev: Vec<i64> = reference.keys().rev().copied().collect();
-            proptest::prop_assert_eq!(
-                &scanned_rev,
-                &expected_rev,
-                "reverse scan (last+prev) rowids must match BTreeMap::keys().rev()"
-            );
+                // Scan in REVERSE using last() + prev() and compare against the
+                // reversed reference sequence.
+                let mut scanned_rev = Vec::new();
+                if cursor.last(&cx).await.unwrap() {
+                    loop {
+                        scanned_rev.push(cursor.rowid(&cx).await.unwrap());
+                        if !cursor.prev(&cx).await.unwrap() {
+                            break;
+                        }
+                    }
+                }
+
+                let expected_rev: Vec<i64> = reference.keys().rev().copied().collect();
+                proptest::prop_assert_eq!(
+                    &scanned_rev,
+                    &expected_rev,
+                    "reverse scan (last+prev) rowids must match BTreeMap::keys().rev()"
+                );
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
         }
 
         /// Round-trip property: forward scan followed by reverse scan must
@@ -19168,62 +20311,66 @@ mod tests {
                 1..500
             )
         ) {
-            let mut store = MemPageStore::new(USABLE);
-            store.pages.insert(2, build_leaf_table(&[]));
+            run_async(async {
+                let mut store = MemPageStore::new(USABLE);
+                store.pages.insert(2, build_leaf_table(&[]));
 
-            let cx = Cx::new();
-            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-            let mut reference: std::collections::BTreeMap<i64, Vec<u8>> =
-                std::collections::BTreeMap::new();
+                let cx = Cx::new();
+                let mut cursor =
+                    BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+                let mut reference: std::collections::BTreeMap<i64, Vec<u8>> =
+                    std::collections::BTreeMap::new();
 
-            for (is_insert, rowid, payload) in &ops {
-                if *is_insert {
-                    if !reference.contains_key(rowid) {
-                        cursor.table_insert(&cx, *rowid, payload).unwrap();
-                        reference.insert(*rowid, payload.clone());
-                    } else {
-                        // Tolerate PrimaryKeyViolation on duplicates; keep reference consistent.
-                        let _ = cursor.table_insert(&cx, *rowid, payload);
-                    }
-                } else if reference.contains_key(rowid) {
-                    let seek = cursor.table_move_to(&cx, *rowid).unwrap();
-                    if seek.is_found() {
-                        cursor.delete(&cx).unwrap();
-                        reference.remove(rowid);
-                    }
-                }
-            }
-
-            // Forward pass.
-            let mut forward = Vec::new();
-            if cursor.first(&cx).unwrap() {
-                loop {
-                    forward.push(cursor.rowid(&cx).unwrap());
-                    if !cursor.next(&cx).unwrap() {
-                        break;
+                for (is_insert, rowid, payload) in &ops {
+                    if *is_insert {
+                        if !reference.contains_key(rowid) {
+                            cursor.table_insert(&cx, *rowid, payload).await.unwrap();
+                            reference.insert(*rowid, payload.clone());
+                        } else {
+                            // Tolerate PrimaryKeyViolation on duplicates; keep reference consistent.
+                            let _ = cursor.table_insert(&cx, *rowid, payload).await;
+                        }
+                    } else if reference.contains_key(rowid) {
+                        let seek = cursor.table_move_to(&cx, *rowid).await.unwrap();
+                        if seek.is_found() {
+                            cursor.delete(&cx).await.unwrap();
+                            reference.remove(rowid);
+                        }
                     }
                 }
-            }
 
-            // Reverse pass on the same tree.
-            let mut reverse = Vec::new();
-            if cursor.last(&cx).unwrap() {
-                loop {
-                    reverse.push(cursor.rowid(&cx).unwrap());
-                    if !cursor.prev(&cx).unwrap() {
-                        break;
+                // Forward pass.
+                let mut forward = Vec::new();
+                if cursor.first(&cx).await.unwrap() {
+                    loop {
+                        forward.push(cursor.rowid(&cx).await.unwrap());
+                        if !cursor.next(&cx).await.unwrap() {
+                            break;
+                        }
                     }
                 }
-            }
 
-            // The reverse scan must be exactly the mirror of the forward scan.
-            let forward_rev: Vec<i64> = forward.iter().rev().copied().collect();
-            proptest::prop_assert_eq!(
-                &reverse,
-                &forward_rev,
-                "reverse scan must be the exact mirror of forward scan \
-                 (forward.rev() != reverse)"
-            );
+                // Reverse pass on the same tree.
+                let mut reverse = Vec::new();
+                if cursor.last(&cx).await.unwrap() {
+                    loop {
+                        reverse.push(cursor.rowid(&cx).await.unwrap());
+                        if !cursor.prev(&cx).await.unwrap() {
+                            break;
+                        }
+                    }
+                }
+
+                // The reverse scan must be exactly the mirror of the forward scan.
+                let forward_rev: Vec<i64> = forward.iter().rev().copied().collect();
+                proptest::prop_assert_eq!(
+                    &reverse,
+                    &forward_rev,
+                    "reverse scan must be the exact mirror of forward scan \
+                     (forward.rev() != reverse)"
+                );
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
         }
 
         /// Index B-tree traversal property test: walks an index B-tree in
@@ -19245,565 +20392,619 @@ mod tests {
                 1..220
             )
         ) {
-            const INDEX_USABLE: u32 = 512;
+            run_async(async {
+                const INDEX_USABLE: u32 = 512;
 
-            let root = pn(2);
-            let store = MemPageStore::with_empty_index(root, INDEX_USABLE);
-            let cx = Cx::new();
-            let mut cursor = BtCursor::new(store, root, INDEX_USABLE, false);
-            let mut reference = BTreeMap::<i64, Vec<u8>>::new();
+                let root = pn(2);
+                let store = MemPageStore::with_empty_index(root, INDEX_USABLE);
+                let cx = Cx::new();
+                let mut cursor = BtCursor::new(store, root, INDEX_USABLE, false);
+                let mut reference = BTreeMap::<i64, Vec<u8>>::new();
 
-            for (is_insert, id) in &ops {
-                let key = synthetic_index_key(*id);
-                if *is_insert {
-                    if !reference.contains_key(id) {
-                        cursor.index_insert(&cx, &key).unwrap();
-                        reference.insert(*id, key);
-                    }
-                } else if reference.contains_key(id) {
-                    let seek = cursor.index_move_to(&cx, &key).unwrap();
-                    if seek.is_found() {
-                        cursor.delete(&cx).unwrap();
-                        reference.remove(id);
-                    }
-                }
-            }
-
-            // Build expected forward key sequence (same sort order as index).
-            let mut expected_keys: Vec<Vec<u8>> = reference.values().cloned().collect();
-            expected_keys.sort_by(|lhs, rhs| compare_index_test_keys(&cursor, lhs, rhs));
-
-            // Reverse scan: last() + prev().
-            let mut scanned_rev: Vec<Vec<u8>> = Vec::new();
-            if cursor.last(&cx).unwrap() {
-                loop {
-                    scanned_rev.push(cursor.payload(&cx).unwrap());
-                    if !cursor.prev(&cx).unwrap() {
-                        break;
+                for (is_insert, id) in &ops {
+                    let key = synthetic_index_key(*id);
+                    if *is_insert {
+                        if !reference.contains_key(id) {
+                            cursor.index_insert(&cx, &key).await.unwrap();
+                            reference.insert(*id, key);
+                        }
+                    } else if reference.contains_key(id) {
+                        let seek = cursor.index_move_to(&cx, &key).await.unwrap();
+                        if seek.is_found() {
+                            cursor.delete(&cx).await.unwrap();
+                            reference.remove(id);
+                        }
                     }
                 }
-            }
 
-            // Expected reverse = forward list reversed.
-            let expected_rev: Vec<Vec<u8>> = expected_keys.iter().rev().cloned().collect();
-            proptest::prop_assert_eq!(
-                &scanned_rev,
-                &expected_rev,
-                "index reverse scan (last+prev) must match sorted keys reversed"
-            );
+                // Build expected forward key sequence (same sort order as index).
+                let mut expected_keys: Vec<Vec<u8>> = reference.values().cloned().collect();
+                expected_keys.sort_by(|lhs, rhs| compare_index_test_keys(&cursor, lhs, rhs));
+
+                // Reverse scan: last() + prev().
+                let mut scanned_rev: Vec<Vec<u8>> = Vec::new();
+                if cursor.last(&cx).await.unwrap() {
+                    loop {
+                        scanned_rev.push(cursor.payload(&cx).await.unwrap());
+                        if !cursor.prev(&cx).await.unwrap() {
+                            break;
+                        }
+                    }
+                }
+
+                // Expected reverse = forward list reversed.
+                let expected_rev: Vec<Vec<u8>> = expected_keys.iter().rev().cloned().collect();
+                proptest::prop_assert_eq!(
+                    &scanned_rev,
+                    &expected_rev,
+                    "index reverse scan (last+prev) must match sorted keys reversed"
+                );
+                Ok::<(), proptest::test_runner::TestCaseError>(())
+            })?;
         }
     }
 
     #[test]
     fn test_real_cursor_revives_from_eof() {
-        let cx = Cx::new();
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
 
-        // Insert a few records into a leaf
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        cursor.table_insert(&cx, 1, b"one").unwrap();
-        cursor.table_insert(&cx, 2, b"two").unwrap();
+            // Insert a few records into a leaf
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            cursor.table_insert(&cx, 1, b"one").await.unwrap();
+            cursor.table_insert(&cx, 2, b"two").await.unwrap();
 
-        cursor.first(&cx).unwrap();
-        cursor.next(&cx).unwrap(); // at 2
-        assert!(!cursor.next(&cx).unwrap()); // now at EOF
+            cursor.first(&cx).await.unwrap();
+            cursor.next(&cx).await.unwrap(); // at 2
+            assert!(!cursor.next(&cx).await.unwrap()); // now at EOF
 
-        assert!(cursor.eof());
+            assert!(cursor.eof());
 
-        // REVIVE FROM EOF
-        let revived = cursor.prev(&cx).unwrap();
-        assert!(revived, "Real cursor should revive from EOF");
-        assert!(!cursor.eof());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
+            // REVIVE FROM EOF
+            let revived = cursor.prev(&cx).await.unwrap();
+            assert!(revived, "Real cursor should revive from EOF");
+            assert!(!cursor.eof());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 2);
+        });
     }
 
     #[test]
     fn test_table_leaf_delete_run_defragments_multiple_root_leaf_cells() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
-        let payloads: Vec<(i64, Vec<u8>)> = (1_i64..=20_i64)
-            .map(|rowid| {
-                let payload = format!(
-                    "payload-{rowid:02}-{}",
-                    "x".repeat(usize::try_from(rowid % 5 + 1).unwrap())
-                )
-                .into_bytes();
-                (rowid, payload)
-            })
-            .collect();
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            let payloads: Vec<(i64, Vec<u8>)> = (1_i64..=20_i64)
+                .map(|rowid| {
+                    let payload = format!(
+                        "payload-{rowid:02}-{}",
+                        "x".repeat(usize::try_from(rowid % 5 + 1).unwrap())
+                    )
+                    .into_bytes();
+                    (rowid, payload)
+                })
+                .collect();
 
-        for (rowid, payload) in &payloads {
-            cursor.table_insert(&cx, *rowid, payload).unwrap();
-        }
-        assert!(cursor.table_move_to(&cx, 3).unwrap().is_found());
-        let mut run = cursor
-            .table_leaf_delete_run_current(3)
-            .unwrap()
-            .expect("positioned root leaf should admit a delete run");
-        let deleted_rowids = [3_i64, 7, 11];
-        for rowid in deleted_rowids {
-            assert!(
-                run.delete_rowid(&cx, rowid, USABLE).unwrap(),
-                "delete run should accept root-leaf rowid {rowid}"
-            );
-        }
-        cursor.flush_table_leaf_delete_run(&cx, run).unwrap();
+            for (rowid, payload) in &payloads {
+                cursor.table_insert(&cx, *rowid, payload).await.unwrap();
+            }
+            assert!(cursor.table_move_to(&cx, 3).await.unwrap().is_found());
+            let mut run = cursor
+                .table_leaf_delete_run_current(3)
+                .unwrap()
+                .expect("positioned root leaf should admit a delete run");
+            let deleted_rowids = [3_i64, 7, 11];
+            for rowid in deleted_rowids {
+                assert!(
+                    run.delete_rowid(&cx, rowid, USABLE).unwrap(),
+                    "delete run should accept root-leaf rowid {rowid}"
+                );
+            }
+            cursor.flush_table_leaf_delete_run(&cx, run).await.unwrap();
 
-        for deleted in deleted_rowids {
-            assert!(
-                !cursor.table_move_to(&cx, deleted).unwrap().is_found(),
-                "deleted rowid {deleted} should be absent"
-            );
-        }
-        for (rowid, payload) in payloads
-            .iter()
-            .filter(|(rowid, _)| !deleted_rowids.contains(rowid))
-        {
-            assert!(
-                cursor.table_move_to(&cx, *rowid).unwrap().is_found(),
-                "surviving rowid {rowid} should remain reachable"
-            );
-            assert_eq!(cursor.payload(&cx).unwrap().as_slice(), payload.as_slice());
-        }
+            for deleted in deleted_rowids {
+                assert!(
+                    !cursor.table_move_to(&cx, deleted).await.unwrap().is_found(),
+                    "deleted rowid {deleted} should be absent"
+                );
+            }
+            for (rowid, payload) in payloads
+                .iter()
+                .filter(|(rowid, _)| !deleted_rowids.contains(rowid))
+            {
+                assert!(
+                    cursor.table_move_to(&cx, *rowid).await.unwrap().is_found(),
+                    "surviving rowid {rowid} should remain reachable"
+                );
+                assert_eq!(
+                    cursor.payload(&cx).await.unwrap().as_slice(),
+                    payload.as_slice()
+                );
+            }
 
-        let entry = cursor.load_page(&cx, root).unwrap();
-        assert_eq!(entry.header.cell_count, 17);
-        assert_eq!(entry.header.first_freeblock, 0);
-        assert_eq!(entry.header.fragmented_free_bytes, 0);
-        let min_ptr = entry.cell_pointers.iter().copied().min().unwrap();
-        assert_eq!(
-            usize::from(min_ptr),
-            entry.header.content_offset(USABLE),
-            "delete-run flush should leave one compact cell area"
-        );
+            let entry = cursor.load_page(&cx, root).await.unwrap();
+            assert_eq!(entry.header.cell_count, 17);
+            assert_eq!(entry.header.first_freeblock, 0);
+            assert_eq!(entry.header.fragmented_free_bytes, 0);
+            let min_ptr = entry.cell_pointers.iter().copied().min().unwrap();
+            assert_eq!(
+                usize::from(min_ptr),
+                entry.header.content_offset(USABLE),
+                "delete-run flush should leave one compact cell area"
+            );
+        });
     }
 
     #[test]
     fn test_table_leaf_delete_run_handles_out_of_order_duplicate_checks() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
-        let payloads: Vec<(i64, Vec<u8>)> = (1_i64..=20_i64)
-            .map(|rowid| (rowid, format!("payload-{rowid:02}").into_bytes()))
-            .collect();
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            let payloads: Vec<(i64, Vec<u8>)> = (1_i64..=20_i64)
+                .map(|rowid| (rowid, format!("payload-{rowid:02}").into_bytes()))
+                .collect();
 
-        for (rowid, payload) in &payloads {
-            cursor.table_insert(&cx, *rowid, payload).unwrap();
-        }
-        assert!(cursor.table_move_to(&cx, 9).unwrap().is_found());
-        let mut run = cursor
-            .table_leaf_delete_run_current(9)
-            .unwrap()
-            .expect("positioned root leaf should admit a delete run");
-
-        for rowid in [9_i64, 3, 11] {
-            assert_eq!(
-                run.delete_rowid_with_reason(&cx, rowid, USABLE).unwrap(),
-                TableLeafDeleteRunDelete::Deleted,
-                "delete run should accept out-of-order root-leaf rowid {rowid}"
-            );
-        }
-        assert_eq!(
-            run.delete_rowid_with_reason(&cx, 9, USABLE).unwrap(),
-            TableLeafDeleteRunDelete::Miss(TableLeafDeleteRunMissReason::AlreadyDeleted),
-            "out-of-order delete run must still detect duplicate rowids"
-        );
-        cursor.flush_table_leaf_delete_run(&cx, run).unwrap();
-
-        for (rowid, payload) in &payloads {
-            let found = cursor.table_move_to(&cx, *rowid).unwrap().is_found();
-            if [3_i64, 9, 11].contains(rowid) {
-                assert!(!found, "deleted rowid {rowid} should be absent");
-            } else {
-                assert!(found, "surviving rowid {rowid} should remain reachable");
-                assert_eq!(cursor.payload(&cx).unwrap().as_slice(), payload.as_slice());
+            for (rowid, payload) in &payloads {
+                cursor.table_insert(&cx, *rowid, payload).await.unwrap();
             }
-        }
+            assert!(cursor.table_move_to(&cx, 9).await.unwrap().is_found());
+            let mut run = cursor
+                .table_leaf_delete_run_current(9)
+                .unwrap()
+                .expect("positioned root leaf should admit a delete run");
+
+            for rowid in [9_i64, 3, 11] {
+                assert_eq!(
+                    run.delete_rowid_with_reason(&cx, rowid, USABLE).unwrap(),
+                    TableLeafDeleteRunDelete::Deleted,
+                    "delete run should accept out-of-order root-leaf rowid {rowid}"
+                );
+            }
+            assert_eq!(
+                run.delete_rowid_with_reason(&cx, 9, USABLE).unwrap(),
+                TableLeafDeleteRunDelete::Miss(TableLeafDeleteRunMissReason::AlreadyDeleted),
+                "out-of-order delete run must still detect duplicate rowids"
+            );
+            cursor.flush_table_leaf_delete_run(&cx, run).await.unwrap();
+
+            for (rowid, payload) in &payloads {
+                let found = cursor.table_move_to(&cx, *rowid).await.unwrap().is_found();
+                if [3_i64, 9, 11].contains(rowid) {
+                    assert!(!found, "deleted rowid {rowid} should be absent");
+                } else {
+                    assert!(found, "surviving rowid {rowid} should remain reachable");
+                    assert_eq!(
+                        cursor.payload(&cx).await.unwrap().as_slice(),
+                        payload.as_slice()
+                    );
+                }
+            }
+        });
     }
 
     #[test]
     fn test_table_leaf_delete_run_defragments_large_root_leaf_delete_set() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
-        let payloads: Vec<(i64, Vec<u8>)> = (1_i64..=40_i64)
-            .map(|rowid| (rowid, format!("payload-{rowid:02}").into_bytes()))
-            .collect();
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            let payloads: Vec<(i64, Vec<u8>)> = (1_i64..=40_i64)
+                .map(|rowid| (rowid, format!("payload-{rowid:02}").into_bytes()))
+                .collect();
 
-        for (rowid, payload) in &payloads {
-            cursor.table_insert(&cx, *rowid, payload).unwrap();
-        }
-        assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
-        let mut run = cursor
-            .table_leaf_delete_run_current(2)
-            .unwrap()
-            .expect("positioned root leaf should admit a delete run");
-        let deleted_rowids = [2_i64, 4, 6, 8, 10, 12, 14, 16, 18];
-        assert!(
-            deleted_rowids.len() >= COMPACT_DELETE_SINGLE_PASS_MIN,
-            "test must exercise the one-pass delete-run materializer"
-        );
-        for rowid in deleted_rowids {
-            assert!(
-                run.delete_rowid(&cx, rowid, USABLE).unwrap(),
-                "delete run should accept root-leaf rowid {rowid}"
-            );
-        }
-        cursor.flush_table_leaf_delete_run(&cx, run).unwrap();
-
-        for (rowid, payload) in &payloads {
-            let found = cursor.table_move_to(&cx, *rowid).unwrap().is_found();
-            if deleted_rowids.contains(rowid) {
-                assert!(!found, "deleted rowid {rowid} should be absent");
-            } else {
-                assert!(found, "surviving rowid {rowid} should remain reachable");
-                assert_eq!(cursor.payload(&cx).unwrap().as_slice(), payload.as_slice());
+            for (rowid, payload) in &payloads {
+                cursor.table_insert(&cx, *rowid, payload).await.unwrap();
             }
-        }
+            assert!(cursor.table_move_to(&cx, 2).await.unwrap().is_found());
+            let mut run = cursor
+                .table_leaf_delete_run_current(2)
+                .unwrap()
+                .expect("positioned root leaf should admit a delete run");
+            let deleted_rowids = [2_i64, 4, 6, 8, 10, 12, 14, 16, 18];
+            assert!(
+                deleted_rowids.len() >= COMPACT_DELETE_SINGLE_PASS_MIN,
+                "test must exercise the one-pass delete-run materializer"
+            );
+            for rowid in deleted_rowids {
+                assert!(
+                    run.delete_rowid(&cx, rowid, USABLE).unwrap(),
+                    "delete run should accept root-leaf rowid {rowid}"
+                );
+            }
+            cursor.flush_table_leaf_delete_run(&cx, run).await.unwrap();
+
+            for (rowid, payload) in &payloads {
+                let found = cursor.table_move_to(&cx, *rowid).await.unwrap().is_found();
+                if deleted_rowids.contains(rowid) {
+                    assert!(!found, "deleted rowid {rowid} should be absent");
+                } else {
+                    assert!(found, "surviving rowid {rowid} should remain reachable");
+                    assert_eq!(
+                        cursor.payload(&cx).await.unwrap().as_slice(),
+                        payload.as_slice()
+                    );
+                }
+            }
+        });
     }
 
     #[test]
     fn test_table_leaf_delete_run_rejects_nonroot_leaf_max_cell() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 10)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"L1"), (5, b"L5"), (10, b"L10")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(20, b"L20"), (25, b"L25")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 10)], pn(4)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"L1"), (5, b"L5"), (10, b"L10")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(20, b"L20"), (25, b"L25")]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        assert!(cursor.table_move_to(&cx, 10).unwrap().is_found());
-        assert!(
-            cursor.table_leaf_delete_run_current(10).unwrap().is_none(),
-            "non-root leaf maximum deletion must use the ordinary path so the parent separator is repaired"
-        );
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            assert!(cursor.table_move_to(&cx, 10).await.unwrap().is_found());
+            assert!(
+                cursor.table_leaf_delete_run_current(10).unwrap().is_none(),
+                "non-root leaf maximum deletion must use the ordinary path so the parent separator is repaired"
+            );
+        });
     }
 
     #[test]
     fn test_table_leaf_delete_run_honors_cancelled_context_before_search() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
-        for rowid in 1_i64..=8 {
-            cursor.table_insert(&cx, rowid, b"payload").unwrap();
-        }
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            for rowid in 1_i64..=8 {
+                cursor.table_insert(&cx, rowid, b"payload").await.unwrap();
+            }
 
-        assert!(cursor.table_move_to(&cx, 3).unwrap().is_found());
-        let mut run = cursor
-            .table_leaf_delete_run_current(3)
-            .unwrap()
-            .expect("positioned root leaf should admit a delete run");
+            assert!(cursor.table_move_to(&cx, 3).await.unwrap().is_found());
+            let mut run = cursor
+                .table_leaf_delete_run_current(3)
+                .unwrap()
+                .expect("positioned root leaf should admit a delete run");
 
-        let cancelled_cx = Cx::new();
-        cancelled_cx.transition_to_running();
-        cancelled_cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
+            let cancelled_cx = Cx::new();
+            cancelled_cx.transition_to_running();
+            cancelled_cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
 
-        let err = run.delete_rowid(&cancelled_cx, 3, USABLE).unwrap_err();
-        assert!(matches!(err, FrankenError::Abort));
-        assert!(
-            !run.is_dirty(),
-            "cancelled delete-run search must not stage a deletion"
-        );
+            let err = run.delete_rowid(&cancelled_cx, 3, USABLE).unwrap_err();
+            assert!(matches!(err, FrankenError::Abort));
+            assert!(
+                !run.is_dirty(),
+                "cancelled delete-run search must not stage a deletion"
+            );
+        });
     }
 
     #[test]
     fn test_table_move_to_honors_cancelled_context() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_leaf_table(&[(1, b"one"), (2, b"two")]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_leaf_table(&[(1, b"one"), (2, b"two")]));
 
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        let cx = Cx::new();
-        cx.transition_to_running();
-        cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let cx = Cx::new();
+            cx.transition_to_running();
+            cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
 
-        let err = cursor.table_move_to(&cx, 2).unwrap_err();
-        assert!(matches!(err, FrankenError::Abort));
-        assert!(
-            cursor.stack.is_empty(),
-            "cancelled seek should not mutate stack"
-        );
+            let err = cursor.table_move_to(&cx, 2).await.unwrap_err();
+            assert!(matches!(err, FrankenError::Abort));
+            assert!(
+                cursor.stack.is_empty(),
+                "cancelled seek should not mutate stack"
+            );
+        });
     }
 
     #[test]
     fn test_next_honors_cancelled_context() {
-        let cx = Cx::new();
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_leaf_table(&[(1, b"one"), (2, b"two")]));
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_leaf_table(&[(1, b"one"), (2, b"two")]));
 
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        assert!(cursor.first(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            assert!(cursor.first(&cx).await.unwrap());
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 1);
 
-        cx.transition_to_running();
-        cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
+            cx.transition_to_running();
+            cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
 
-        let err = cursor.next(&cx).unwrap_err();
-        assert!(matches!(err, FrankenError::Abort));
-        assert_eq!(
-            cursor.rowid(&Cx::new()).unwrap(),
-            1,
-            "cancelled iteration should preserve the prior cursor position"
-        );
+            let err = cursor.next(&cx).await.unwrap_err();
+            assert!(matches!(err, FrankenError::Abort));
+            let recovery_cx = Cx::new();
+            assert_eq!(
+                cursor.rowid(&recovery_cx).await.unwrap(),
+                1,
+                "cancelled iteration should preserve the prior cursor position"
+            );
+        });
     }
 
     /// bd-wwqen.1: count_all_rows must return the correct count for empty,
     /// root-only (single-leaf), and multi-leaf (interior-node) trees.
     #[test]
     fn test_count_all_rows_empty_root_only_and_multi_leaf() {
-        const USABLE: u32 = 4096;
-        let cx = Cx::new();
-        let root = PageNumber::new(2).unwrap();
+        run_async(async {
+            const USABLE: u32 = 4096;
+            let cx = Cx::new();
+            let root = PageNumber::new(2).unwrap();
 
-        // ── Empty tree: zero rows ──
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
-        assert_eq!(
-            cursor.count_all_rows(&cx).unwrap(),
-            0,
-            "bd-wwqen.1: empty table must return count 0"
-        );
+            // ── Empty tree: zero rows ──
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            assert_eq!(
+                cursor.count_all_rows(&cx).await.unwrap(),
+                0,
+                "bd-wwqen.1: empty table must return count 0"
+            );
 
-        // ── Root-only tree: small number of rows in a single leaf ──
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
-        for i in 1..=5_i64 {
-            cursor
-                .table_insert(&cx, i, format!("row-{i}").as_bytes())
-                .expect("insert should succeed");
-        }
-        assert_eq!(
-            cursor.count_all_rows(&cx).unwrap(),
-            5,
-            "bd-wwqen.1: root-only table with 5 rows must return count 5"
-        );
+            // ── Root-only tree: small number of rows in a single leaf ──
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            for i in 1..=5_i64 {
+                cursor
+                    .table_insert(&cx, i, format!("row-{i}").as_bytes())
+                    .await
+                    .expect("insert should succeed");
+            }
+            assert_eq!(
+                cursor.count_all_rows(&cx).await.unwrap(),
+                5,
+                "bd-wwqen.1: root-only table with 5 rows must return count 5"
+            );
 
-        // ── Multi-leaf tree: enough rows to force page splits ──
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
-        let n = 500;
-        let payload = vec![b'X'; 200]; // ~200 bytes per row → ~20 rows/page → ~25 pages
-        for i in 1..=n {
-            cursor
-                .table_insert(&cx, i, &payload)
-                .expect("insert should succeed");
-        }
-        let count = cursor.count_all_rows(&cx).unwrap();
-        assert_eq!(
-            count, n,
-            "bd-wwqen.1: multi-leaf table with {n} rows must return count {n}, got {count}"
-        );
+            // ── Multi-leaf tree: enough rows to force page splits ──
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            let n = 500;
+            let payload = vec![b'X'; 200]; // ~200 bytes per row → ~20 rows/page → ~25 pages
+            for i in 1..=n {
+                cursor
+                    .table_insert(&cx, i, &payload)
+                    .await
+                    .expect("insert should succeed");
+            }
+            let count = cursor.count_all_rows(&cx).await.unwrap();
+            assert_eq!(
+                count, n,
+                "bd-wwqen.1: multi-leaf table with {n} rows must return count {n}, got {count}"
+            );
 
-        // ── count_all_rows preserves cursor usability ──
-        // After count, cursor should still be usable for a seek.
-        assert!(
-            cursor
-                .table_move_to(&cx, 1)
-                .expect("seek after count should succeed")
-                .is_found(),
-            "bd-wwqen.1: cursor must remain usable after count_all_rows"
-        );
+            // ── count_all_rows preserves cursor usability ──
+            // After count, cursor should still be usable for a seek.
+            assert!(
+                cursor
+                    .table_move_to(&cx, 1)
+                    .await
+                    .expect("seek after count should succeed")
+                    .is_found(),
+                "bd-wwqen.1: cursor must remain usable after count_all_rows"
+            );
+        });
     }
 
     #[test]
     fn test_count_all_rows_deep_tree_rightmost_10k() {
-        const USABLE: u32 = 4096;
-        let cx = Cx::new();
-        let root = PageNumber::new(2).unwrap();
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
-        let row_count = 10_000_i64;
-        let payload = vec![b'R'; 200];
+        run_async(async {
+            const USABLE: u32 = 4096;
+            let cx = Cx::new();
+            let root = PageNumber::new(2).unwrap();
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            let row_count = 10_000_i64;
+            let payload = vec![b'R'; 200];
 
-        for rowid in 1..=row_count {
-            cursor
-                .table_insert(&cx, rowid, &payload)
-                .expect("insert should succeed");
-        }
+            for rowid in 1..=row_count {
+                cursor
+                    .table_insert(&cx, rowid, &payload)
+                    .await
+                    .expect("insert should succeed");
+            }
 
-        let depth = measure_tree_depth(&cursor.pager, root, USABLE);
-        assert!(
-            depth >= 3,
-            "test requires a deeper interior tree, got depth {depth}"
-        );
+            let depth = measure_tree_depth(&cursor.pager, root, USABLE).await;
+            assert!(
+                depth >= 3,
+                "test requires a deeper interior tree, got depth {depth}"
+            );
 
-        let count = cursor.count_all_rows(&cx).unwrap();
-        assert_eq!(
-            count, row_count,
-            "deep/rightmost table with {row_count} rows must count exactly"
-        );
+            let count = cursor.count_all_rows(&cx).await.unwrap();
+            assert_eq!(
+                count, row_count,
+                "deep/rightmost table with {row_count} rows must count exactly"
+            );
 
-        assert!(
-            cursor
-                .table_move_to(&cx, row_count)
-                .expect("seek after deep count should succeed")
-                .is_found(),
-            "rightmost row must remain reachable after count_all_rows"
-        );
+            assert!(
+                cursor
+                    .table_move_to(&cx, row_count)
+                    .await
+                    .expect("seek after deep count should succeed")
+                    .is_found(),
+                "rightmost row must remain reachable after count_all_rows"
+            );
+        });
     }
 
     #[test]
     fn test_table_bulk_load_empty_root_sorted_records_builds_reachable_tree() {
-        const USABLE: u32 = 4096;
-        let cx = Cx::new();
-        let root = PageNumber::new(2).unwrap();
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
-        let records: Vec<(i64, Vec<u8>)> = (1_i64..=10_000_i64)
-            .map(|rowid| {
-                let byte = u8::try_from(rowid % 251).unwrap();
-                (
-                    rowid,
-                    vec![byte; 220 + usize::try_from(rowid % 31).unwrap()],
-                )
-            })
-            .collect();
+        run_async(async {
+            const USABLE: u32 = 4096;
+            let cx = Cx::new();
+            let root = PageNumber::new(2).unwrap();
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            let records: Vec<(i64, Vec<u8>)> = (1_i64..=10_000_i64)
+                .map(|rowid| {
+                    let byte = u8::try_from(rowid % 251).unwrap();
+                    (
+                        rowid,
+                        vec![byte; 220 + usize::try_from(rowid % 31).unwrap()],
+                    )
+                })
+                .collect();
 
-        assert!(
-            cursor
-                .table_bulk_load_empty_root_sorted_records(&cx, &records)
-                .unwrap(),
-            "bulk load should accept sorted no-overflow records for an empty table"
-        );
-        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 10_000);
-        assert!(
-            measure_tree_depth(&cursor.pager, root, USABLE) >= 3,
-            "test data should force at least one interior page split below the root"
-        );
+            assert!(
+                cursor
+                    .table_bulk_load_empty_root_sorted_records(&cx, &records)
+                    .await
+                    .unwrap(),
+                "bulk load should accept sorted no-overflow records for an empty table"
+            );
+            assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), 10_000);
+            assert!(
+                measure_tree_depth(&cursor.pager, root, USABLE).await >= 3,
+                "test data should force at least one interior page split below the root"
+            );
 
-        assert!(cursor.first(&cx).unwrap());
-        for (expected_rowid, expected_payload) in &records {
-            assert_eq!(cursor.rowid(&cx).unwrap(), *expected_rowid);
-            assert_eq!(cursor.payload(&cx).unwrap(), *expected_payload);
-            if *expected_rowid < 10_000 {
-                assert!(cursor.next(&cx).unwrap());
+            assert!(cursor.first(&cx).await.unwrap());
+            for (expected_rowid, expected_payload) in &records {
+                assert_eq!(cursor.rowid(&cx).await.unwrap(), *expected_rowid);
+                assert_eq!(cursor.payload(&cx).await.unwrap(), *expected_payload);
+                if *expected_rowid < 10_000 {
+                    assert!(cursor.next(&cx).await.unwrap());
+                }
             }
-        }
-        assert!(!cursor.next(&cx).unwrap());
+            assert!(!cursor.next(&cx).await.unwrap());
 
-        assert!(
-            !cursor
-                .table_bulk_load_empty_root_sorted_records(&cx, &records)
-                .unwrap(),
-            "bulk load must fall back once the root is no longer an empty leaf"
-        );
+            assert!(
+                !cursor
+                    .table_bulk_load_empty_root_sorted_records(&cx, &records)
+                    .await
+                    .unwrap(),
+                "bulk load must fall back once the root is no longer an empty leaf"
+            );
+        });
     }
 
     #[test]
     fn test_table_bulk_append_depth2_right_edge_sorted_records_extends_tree() {
-        const USABLE: u32 = 4096;
-        let cx = Cx::new();
-        let root = PageNumber::new(2).unwrap();
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
-        let initial: Vec<(i64, Vec<u8>)> = (1_i64..=1_000_i64)
-            .map(|rowid| (rowid, vec![u8::try_from(rowid % 251).unwrap(); 220]))
-            .collect();
-        let appended: Vec<(i64, Vec<u8>)> = (1_001_i64..=2_000_i64)
-            .map(|rowid| (rowid, vec![u8::try_from(rowid % 251).unwrap(); 220]))
-            .collect();
+        run_async(async {
+            const USABLE: u32 = 4096;
+            let cx = Cx::new();
+            let root = PageNumber::new(2).unwrap();
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            let initial: Vec<(i64, Vec<u8>)> = (1_i64..=1_000_i64)
+                .map(|rowid| (rowid, vec![u8::try_from(rowid % 251).unwrap(); 220]))
+                .collect();
+            let appended: Vec<(i64, Vec<u8>)> = (1_001_i64..=2_000_i64)
+                .map(|rowid| (rowid, vec![u8::try_from(rowid % 251).unwrap(); 220]))
+                .collect();
 
-        assert!(
-            cursor
-                .table_bulk_load_empty_root_sorted_records(&cx, &initial)
-                .unwrap(),
-            "initial rows should bulk-load into an empty table"
-        );
-        assert_eq!(measure_tree_depth(&cursor.pager, root, USABLE), 2);
-        assert!(
-            cursor
-                .table_can_bulk_append_depth2_right_edge_record(
-                    &cx,
-                    appended[0].0,
-                    appended[0].1.as_slice()
-                )
-                .unwrap(),
-            "right-edge admission probe should accept the next sorted row"
-        );
-        assert!(
-            cursor
-                .table_bulk_append_depth2_right_edge_sorted_records(&cx, &appended)
-                .unwrap(),
-            "depth-2 right-edge append should accept sorted rows above the old max"
-        );
-        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 2_000);
+            assert!(
+                cursor
+                    .table_bulk_load_empty_root_sorted_records(&cx, &initial)
+                    .await
+                    .unwrap(),
+                "initial rows should bulk-load into an empty table"
+            );
+            assert_eq!(measure_tree_depth(&cursor.pager, root, USABLE).await, 2);
+            assert!(
+                cursor
+                    .table_can_bulk_append_depth2_right_edge_record(
+                        &cx,
+                        appended[0].0,
+                        appended[0].1.as_slice()
+                    )
+                    .await
+                    .unwrap(),
+                "right-edge admission probe should accept the next sorted row"
+            );
+            assert!(
+                cursor
+                    .table_bulk_append_depth2_right_edge_sorted_records(&cx, &appended)
+                    .await
+                    .unwrap(),
+                "depth-2 right-edge append should accept sorted rows above the old max"
+            );
+            assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), 2_000);
 
-        assert!(cursor.first(&cx).unwrap());
-        for (expected_rowid, expected_payload) in initial.iter().chain(appended.iter()) {
-            assert_eq!(cursor.rowid(&cx).unwrap(), *expected_rowid);
-            assert_eq!(cursor.payload(&cx).unwrap(), *expected_payload);
-            if *expected_rowid < 2_000 {
-                assert!(cursor.next(&cx).unwrap());
+            assert!(cursor.first(&cx).await.unwrap());
+            for (expected_rowid, expected_payload) in initial.iter().chain(appended.iter()) {
+                assert_eq!(cursor.rowid(&cx).await.unwrap(), *expected_rowid);
+                assert_eq!(cursor.payload(&cx).await.unwrap(), *expected_payload);
+                if *expected_rowid < 2_000 {
+                    assert!(cursor.next(&cx).await.unwrap());
+                }
             }
-        }
-        assert!(!cursor.next(&cx).unwrap());
-        assert!(
-            !cursor
-                .table_can_bulk_append_depth2_right_edge_record(
-                    &cx,
-                    initial[0].0,
-                    initial[0].1.as_slice()
-                )
-                .unwrap(),
-            "right-edge admission probe must reject records below the old max"
-        );
-        assert!(
-            !cursor
-                .table_bulk_append_depth2_right_edge_sorted_records(&cx, &initial)
-                .unwrap(),
-            "append primitive must reject rows that do not sort after the old max"
-        );
+            assert!(!cursor.next(&cx).await.unwrap());
+            assert!(
+                !cursor
+                    .table_can_bulk_append_depth2_right_edge_record(
+                        &cx,
+                        initial[0].0,
+                        initial[0].1.as_slice()
+                    )
+                    .await
+                    .unwrap(),
+                "right-edge admission probe must reject records below the old max"
+            );
+            assert!(
+                !cursor
+                    .table_bulk_append_depth2_right_edge_sorted_records(&cx, &initial)
+                    .await
+                    .unwrap(),
+                "append primitive must reject rows that do not sort after the old max"
+            );
+        });
     }
 
     #[test]
     fn test_find_child_slot_by_page_no_matches_actual_root_children() {
-        const USABLE: u32 = 4096;
-        let cx = Cx::new();
-        let root = PageNumber::new(2).unwrap();
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let mut cursor = BtCursor::new(store, root, USABLE, true);
-        let payload = vec![b'S'; 200];
+        run_async(async {
+            const USABLE: u32 = 4096;
+            let cx = Cx::new();
+            let root = PageNumber::new(2).unwrap();
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            let payload = vec![b'S'; 200];
 
-        for rowid in 1..=10_000_i64 {
-            cursor
-                .table_insert(&cx, rowid, &payload)
-                .expect("insert should succeed");
-        }
+            for rowid in 1..=10_000_i64 {
+                cursor
+                    .table_insert(&cx, rowid, &payload)
+                    .await
+                    .expect("insert should succeed");
+            }
 
-        let root_entry = cursor
-            .reload_page_fresh(&cx, root)
-            .expect("reload root after inserts");
-        assert!(
-            root_entry.header.page_type.is_interior(),
-            "expected interior root after enough inserts"
-        );
-
-        for child_idx in 0..=root_entry.header.cell_count {
-            let child_page = BtCursor::<MemPageStore>::child_page_at(&root_entry, child_idx)
-                .expect("read child pointer");
-            let found = cursor
-                .find_child_slot_by_page_no(&cx, root, child_page)
-                .expect("find child slot");
-            assert_eq!(
-                found, child_idx,
-                "slot lookup must round-trip for child {} on root page {}",
-                child_page, root
+            let root_entry = cursor
+                .reload_page_fresh(&cx, root)
+                .await
+                .expect("reload root after inserts");
+            assert!(
+                root_entry.header.page_type.is_interior(),
+                "expected interior root after enough inserts"
             );
-        }
+
+            for child_idx in 0..=root_entry.header.cell_count {
+                let child_page = BtCursor::<MemPageStore>::child_page_at(&root_entry, child_idx)
+                    .expect("read child pointer");
+                let found = cursor
+                    .find_child_slot_by_page_no(&cx, root, child_page)
+                    .await
+                    .expect("find child slot");
+                assert_eq!(
+                    found, child_idx,
+                    "slot lookup must round-trip for child {} on root page {}",
+                    child_page, root
+                );
+            }
+        });
     }
 
     // ---- OPT-7: sort_cells_desc_by_ptr correctness + micro-benchmark ----
@@ -20150,75 +21351,78 @@ mod tests {
     #[test]
     #[ignore = "micro-benchmark; run with `--release --ignored --nocapture`"]
     fn bench_child_page_at_interior_table() {
-        const CHILDREN: usize = 128;
-        const WARMUP: u32 = 200_000;
-        const ITERS: u32 = 5_000_000;
+        run_async(async {
+            const CHILDREN: usize = 128;
+            const WARMUP: u32 = 200_000;
+            const ITERS: u32 = 5_000_000;
 
-        // Build a realistic interior-table page: 128 (left_child, rowid)
-        // divider cells + a right_child pointer.
-        let children: Vec<(PageNumber, i64)> = (0..CHILDREN)
-            .map(|i| (pn((i as u32) + 10), (i as i64) * 100 + 1))
-            .collect();
-        let right = pn((CHILDREN as u32) + 200);
-        let page_bytes = build_interior_table(&children, right);
+            // Build a realistic interior-table page: 128 (left_child, rowid)
+            // divider cells + a right_child pointer.
+            let children: Vec<(PageNumber, i64)> = (0..CHILDREN)
+                .map(|i| (pn((i as u32) + 10), (i as i64) * 100 + 1))
+                .collect();
+            let right = pn((CHILDREN as u32) + 200);
+            let page_bytes = build_interior_table(&children, right);
 
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, page_bytes);
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, page_bytes);
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        let entry = cursor.load_page(&cx, pn(2)).unwrap();
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let entry = cursor.load_page(&cx, pn(2)).await.unwrap();
 
-        // Warm-up the cell-slot cache so the legacy path hits its cache.
-        for idx in 0..entry.header.cell_count {
-            let _ = cursor.parse_cell_at(&entry, idx).unwrap();
-        }
-
-        // Fast path — production code.
-        for i in 0..WARMUP {
-            let idx = (i as u16) % entry.header.cell_count;
-            std::hint::black_box(BtCursor::<MemPageStore>::child_page_at(&entry, idx).unwrap());
-        }
-        let t0 = Instant::now();
-        for i in 0..ITERS {
-            let idx = (i as u16) % entry.header.cell_count;
-            std::hint::black_box(BtCursor::<MemPageStore>::child_page_at(&entry, idx).unwrap());
-        }
-        let fast_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
-
-        // Legacy path — parse_cell_at + cell.left_child.ok_or(...)
-        let legacy_child_page = |cursor: &BtCursor<MemPageStore>, idx: u16| -> Result<PageNumber> {
-            if idx >= entry.header.cell_count {
-                entry
-                    .header
-                    .right_child
-                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                        detail: "interior page has no right child".to_owned(),
-                    })
-            } else {
-                let cell = cursor.parse_cell_at(&entry, idx)?;
-                cell.left_child
-                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                        detail: "interior cell has no left child".to_owned(),
-                    })
+            // Warm-up the cell-slot cache so the legacy path hits its cache.
+            for idx in 0..entry.header.cell_count {
+                let _ = cursor.parse_cell_at(&entry, idx).unwrap();
             }
-        };
-        for i in 0..WARMUP {
-            let idx = (i as u16) % entry.header.cell_count;
-            std::hint::black_box(legacy_child_page(&cursor, idx).unwrap());
-        }
-        let t0 = Instant::now();
-        for i in 0..ITERS {
-            let idx = (i as u16) % entry.header.cell_count;
-            std::hint::black_box(legacy_child_page(&cursor, idx).unwrap());
-        }
-        let slow_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
 
-        println!(
-            "[child_page_at interior-table] direct={fast_ns:.3}ns  parse_cell_at={slow_ns:.3}ns  \
-             speedup={:.2}x  (children={CHILDREN}, iters={ITERS})",
-            slow_ns / fast_ns.max(f64::EPSILON)
-        );
+            // Fast path — production code.
+            for i in 0..WARMUP {
+                let idx = (i as u16) % entry.header.cell_count;
+                std::hint::black_box(BtCursor::<MemPageStore>::child_page_at(&entry, idx).unwrap());
+            }
+            let t0 = Instant::now();
+            for i in 0..ITERS {
+                let idx = (i as u16) % entry.header.cell_count;
+                std::hint::black_box(BtCursor::<MemPageStore>::child_page_at(&entry, idx).unwrap());
+            }
+            let fast_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
+
+            // Legacy path — parse_cell_at + cell.left_child.ok_or(...)
+            let legacy_child_page =
+                |cursor: &BtCursor<MemPageStore>, idx: u16| -> Result<PageNumber> {
+                    if idx >= entry.header.cell_count {
+                        entry
+                            .header
+                            .right_child
+                            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                                detail: "interior page has no right child".to_owned(),
+                            })
+                    } else {
+                        let cell = cursor.parse_cell_at(&entry, idx)?;
+                        cell.left_child
+                            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                                detail: "interior cell has no left child".to_owned(),
+                            })
+                    }
+                };
+            for i in 0..WARMUP {
+                let idx = (i as u16) % entry.header.cell_count;
+                std::hint::black_box(legacy_child_page(&cursor, idx).unwrap());
+            }
+            let t0 = Instant::now();
+            for i in 0..ITERS {
+                let idx = (i as u16) % entry.header.cell_count;
+                std::hint::black_box(legacy_child_page(&cursor, idx).unwrap());
+            }
+            let slow_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
+
+            println!(
+                "[child_page_at interior-table] direct={fast_ns:.3}ns  parse_cell_at={slow_ns:.3}ns  \
+                 speedup={:.2}x  (children={CHILDREN}, iters={ITERS})",
+                slow_ns / fast_ns.max(f64::EPSILON)
+            );
+        });
     }
 
     /// bd-yafor.2 cell-slot cache hit-rate audit on the write-append hot path.
@@ -20234,153 +21438,156 @@ mod tests {
     #[test]
     #[ignore = "audit benchmark; run with `--release --ignored --nocapture`"]
     fn audit_cell_slot_cache_hit_rate_write_vs_read() {
-        // bd-9e3xf.5: CellSlotCache hit/miss counters are now gated by the
-        // copy-profile flag (shared with other btree instrumentation) so the
-        // 1-thread write hot path doesn't pay a `lock xadd` per `get`. The
-        // audit needs the gate enabled to observe any counts.
-        crate::instrumentation::set_btree_copy_profile_enabled(true);
-        struct GateGuard;
-        impl Drop for GateGuard {
-            fn drop(&mut self) {
-                crate::instrumentation::set_btree_copy_profile_enabled(false);
+        run_async(async {
+            // bd-9e3xf.5: CellSlotCache hit/miss counters are now gated by the
+            // copy-profile flag (shared with other btree instrumentation) so the
+            // 1-thread write hot path doesn't pay a `lock xadd` per `get`. The
+            // audit needs the gate enabled to observe any counts.
+            crate::instrumentation::set_btree_copy_profile_enabled(true);
+            struct GateGuard;
+            impl Drop for GateGuard {
+                fn drop(&mut self) {
+                    crate::instrumentation::set_btree_copy_profile_enabled(false);
+                }
             }
-        }
-        let _gate_guard = GateGuard;
+            let _gate_guard = GateGuard;
 
-        const ROWS: i64 = 10_000;
-        const PAYLOAD: &[u8] = b"cc_3_audit_payload_0123456789abcdef";
+            const ROWS: i64 = 10_000;
+            const PAYLOAD: &[u8] = b"cc_3_audit_payload_0123456789abcdef";
 
-        fn run_and_report(label: &str, counters: crate::cursor::CellSlotCacheCounters) {
-            let total = counters.total();
-            let misses = counters.misses();
-            println!(
-                "[cell_slot_cache audit] {label}: hits={}  miss_cold={}  miss_invalidated={}  \
+            fn run_and_report(label: &str, counters: crate::cursor::CellSlotCacheCounters) {
+                let total = counters.total();
+                let misses = counters.misses();
+                println!(
+                    "[cell_slot_cache audit] {label}: hits={}  miss_cold={}  miss_invalidated={}  \
                  miss_slot={}  misses={}  total={total}  hit_rate={:.4}",
-                counters.hits,
-                counters.miss_cold,
-                counters.miss_invalidated,
-                counters.miss_slot,
-                misses,
-                counters.hit_rate()
-            );
-        }
-
-        // --- Scenario 1: Monotonic append ---
-        {
-            let cx = Cx::new();
-            let store = MemPageStore::with_empty_table(pn(2), USABLE);
-            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-            reset_cell_slot_cache_counters();
-            for rowid in 1..=ROWS {
-                cursor.table_insert(&cx, rowid, PAYLOAD).unwrap();
+                    counters.hits,
+                    counters.miss_cold,
+                    counters.miss_invalidated,
+                    counters.miss_slot,
+                    misses,
+                    counters.hit_rate()
+                );
             }
-            run_and_report("monotonic_append", cell_slot_cache_counter_snapshot());
-        }
 
-        // --- Scenario 2: Random middle-of-tree inserts ---
-        {
-            let cx = Cx::new();
-            let store = MemPageStore::with_empty_table(pn(2), USABLE);
-            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-            reset_cell_slot_cache_counters();
-            let mut state = 0x1234_5678_9abc_def0_u64;
-            let mut inserted = std::collections::HashSet::new();
-            let mut count = 0;
-            while count < ROWS {
-                let raw = lcg_next(&mut state);
-                #[allow(clippy::cast_possible_wrap)]
-                let rowid = ((raw % 100_000) + 1) as i64;
-                if inserted.insert(rowid) {
-                    cursor.table_insert(&cx, rowid, PAYLOAD).unwrap();
-                    count += 1;
+            // --- Scenario 1: Monotonic append ---
+            {
+                let cx = Cx::new();
+                let store = MemPageStore::with_empty_table(pn(2), USABLE);
+                let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+                reset_cell_slot_cache_counters();
+                for rowid in 1..=ROWS {
+                    cursor.table_insert(&cx, rowid, PAYLOAD).await.unwrap();
                 }
+                run_and_report("monotonic_append", cell_slot_cache_counter_snapshot());
             }
-            run_and_report("random_insert", cell_slot_cache_counter_snapshot());
-        }
 
-        // --- Scenario 3: Read-heavy after append ---
-        {
-            let cx = Cx::new();
-            let store = MemPageStore::with_empty_table(pn(2), USABLE);
-            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-            for rowid in 1..=ROWS {
-                cursor.table_insert(&cx, rowid, PAYLOAD).unwrap();
-            }
-            reset_cell_slot_cache_counters();
-            let mut state = 0xdeadbeef_cafebabe_u64;
-            for _ in 0..(ROWS * 4) {
-                let raw = lcg_next(&mut state);
-                #[allow(clippy::cast_possible_wrap)]
-                let target = (raw % (ROWS as u64)) as i64 + 1;
-                let _ = cursor.table_move_to(&cx, target).unwrap();
-            }
-            run_and_report(
-                "read_heavy_after_append",
-                cell_slot_cache_counter_snapshot(),
-            );
-        }
-
-        // --- Scenario 4: Binary search probes within a single append ---
-        // (sanity check — within a single insert the binary search walks mid,
-        // mid/2, mid/4... so the same cell slots ARE re-probed; cache should
-        // hit inside this single search if the entry is fresh)
-        {
-            let cx = Cx::new();
-            let store = MemPageStore::with_empty_table(pn(2), USABLE);
-            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-            // Pre-populate with a full leaf + some interior breadth so binary
-            // search actually does multi-level probing.
-            for rowid in 1..=500_i64 {
-                cursor.table_insert(&cx, rowid, PAYLOAD).unwrap();
-            }
-            reset_cell_slot_cache_counters();
-            for target in (1..=500_i64).rev() {
-                let _ = cursor.table_move_to(&cx, target).unwrap();
-            }
-            run_and_report("reverse_seek_preloaded", cell_slot_cache_counter_snapshot());
-        }
-
-        // --- Scenario 5: Delete-heavy (exercises predecessor_idx / separator_idx) ---
-        // Each delete that empties a leaf rebalances and may call parse_cell_at
-        // for predecessor + separator lookup on an interior page.
-        {
-            let cx = Cx::new();
-            let store = MemPageStore::with_empty_table(pn(2), USABLE);
-            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-            for rowid in 1..=ROWS {
-                cursor.table_insert(&cx, rowid, PAYLOAD).unwrap();
-            }
-            reset_cell_slot_cache_counters();
-            for rowid in 1..=ROWS {
-                if cursor.table_move_to(&cx, rowid).unwrap().is_found() {
-                    cursor.delete(&cx).unwrap();
+            // --- Scenario 2: Random middle-of-tree inserts ---
+            {
+                let cx = Cx::new();
+                let store = MemPageStore::with_empty_table(pn(2), USABLE);
+                let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+                reset_cell_slot_cache_counters();
+                let mut state = 0x1234_5678_9abc_def0_u64;
+                let mut inserted = std::collections::HashSet::new();
+                let mut count = 0;
+                while count < ROWS {
+                    let raw = lcg_next(&mut state);
+                    #[allow(clippy::cast_possible_wrap)]
+                    let rowid = ((raw % 100_000) + 1) as i64;
+                    if inserted.insert(rowid) {
+                        cursor.table_insert(&cx, rowid, PAYLOAD).await.unwrap();
+                        count += 1;
+                    }
                 }
+                run_and_report("random_insert", cell_slot_cache_counter_snapshot());
             }
-            run_and_report(
-                "delete_all_after_append",
-                cell_slot_cache_counter_snapshot(),
-            );
-        }
 
-        // --- Scenario 6: Index btree inserts (exercises binary_search_index_leaf) ---
-        {
-            let cx = Cx::new();
-            let store = MemPageStore::with_empty_index(pn(2), USABLE);
-            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, false);
-            reset_cell_slot_cache_counters();
-            let mut state = 0x0102_0304_0506_0708_u64;
-            for _ in 0..ROWS {
-                let raw = lcg_next(&mut state);
-                let key = serialize_record(&[
+            // --- Scenario 3: Read-heavy after append ---
+            {
+                let cx = Cx::new();
+                let store = MemPageStore::with_empty_table(pn(2), USABLE);
+                let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+                for rowid in 1..=ROWS {
+                    cursor.table_insert(&cx, rowid, PAYLOAD).await.unwrap();
+                }
+                reset_cell_slot_cache_counters();
+                let mut state = 0xdeadbeef_cafebabe_u64;
+                for _ in 0..(ROWS * 4) {
+                    let raw = lcg_next(&mut state);
                     #[allow(clippy::cast_possible_wrap)]
-                    SqliteValue::Integer((raw % 100_000) as i64),
-                    #[allow(clippy::cast_possible_wrap)]
-                    SqliteValue::Integer(raw as i64),
-                ]);
-                let _ = cursor.index_insert(&cx, &key);
+                    let target = (raw % (ROWS as u64)) as i64 + 1;
+                    let _ = cursor.table_move_to(&cx, target).await.unwrap();
+                }
+                run_and_report(
+                    "read_heavy_after_append",
+                    cell_slot_cache_counter_snapshot(),
+                );
             }
-            run_and_report("index_random_insert", cell_slot_cache_counter_snapshot());
-        }
+
+            // --- Scenario 4: Binary search probes within a single append ---
+            // (sanity check — within a single insert the binary search walks mid,
+            // mid/2, mid/4... so the same cell slots ARE re-probed; cache should
+            // hit inside this single search if the entry is fresh)
+            {
+                let cx = Cx::new();
+                let store = MemPageStore::with_empty_table(pn(2), USABLE);
+                let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+                // Pre-populate with a full leaf + some interior breadth so binary
+                // search actually does multi-level probing.
+                for rowid in 1..=500_i64 {
+                    cursor.table_insert(&cx, rowid, PAYLOAD).await.unwrap();
+                }
+                reset_cell_slot_cache_counters();
+                for target in (1..=500_i64).rev() {
+                    let _ = cursor.table_move_to(&cx, target).await.unwrap();
+                }
+                run_and_report("reverse_seek_preloaded", cell_slot_cache_counter_snapshot());
+            }
+
+            // --- Scenario 5: Delete-heavy (exercises predecessor_idx / separator_idx) ---
+            // Each delete that empties a leaf rebalances and may call parse_cell_at
+            // for predecessor + separator lookup on an interior page.
+            {
+                let cx = Cx::new();
+                let store = MemPageStore::with_empty_table(pn(2), USABLE);
+                let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+                for rowid in 1..=ROWS {
+                    cursor.table_insert(&cx, rowid, PAYLOAD).await.unwrap();
+                }
+                reset_cell_slot_cache_counters();
+                for rowid in 1..=ROWS {
+                    if cursor.table_move_to(&cx, rowid).await.unwrap().is_found() {
+                        cursor.delete(&cx).await.unwrap();
+                    }
+                }
+                run_and_report(
+                    "delete_all_after_append",
+                    cell_slot_cache_counter_snapshot(),
+                );
+            }
+
+            // --- Scenario 6: Index btree inserts (exercises binary_search_index_leaf) ---
+            {
+                let cx = Cx::new();
+                let store = MemPageStore::with_empty_index(pn(2), USABLE);
+                let mut cursor =
+                    BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, false);
+                reset_cell_slot_cache_counters();
+                let mut state = 0x0102_0304_0506_0708_u64;
+                for _ in 0..ROWS {
+                    let raw = lcg_next(&mut state);
+                    let key = serialize_record(&[
+                        #[allow(clippy::cast_possible_wrap)]
+                        SqliteValue::Integer((raw % 100_000) as i64),
+                        #[allow(clippy::cast_possible_wrap)]
+                        SqliteValue::Integer(raw as i64),
+                    ]);
+                    let _ = cursor.index_insert(&cx, &key).await;
+                }
+                run_and_report("index_random_insert", cell_slot_cache_counter_snapshot());
+            }
+        });
     }
 
     /// bd-k7zd7.3 microbench: `replace_table_interior_separator_rowid`'s
@@ -20394,69 +21601,71 @@ mod tests {
     #[test]
     #[ignore = "micro-benchmark; run with `--release --ignored --nocapture`"]
     fn bench_replace_separator_inline_vs_parse_cell_at() {
-        const CHILDREN: usize = 128;
-        const WARMUP: u32 = 200_000;
-        const ITERS: u32 = 5_000_000;
+        run_async(async {
+            const CHILDREN: usize = 128;
+            const WARMUP: u32 = 200_000;
+            const ITERS: u32 = 5_000_000;
 
-        let children: Vec<(PageNumber, i64)> = (0..CHILDREN)
-            .map(|i| (pn((i as u32) + 10), (i as i64) * 100 + 1))
-            .collect();
-        let right = pn((CHILDREN as u32) + 200);
-        let page_bytes = build_interior_table(&children, right);
+            let children: Vec<(PageNumber, i64)> = (0..CHILDREN)
+                .map(|i| (pn((i as u32) + 10), (i as i64) * 100 + 1))
+                .collect();
+            let right = pn((CHILDREN as u32) + 200);
+            let page_bytes = build_interior_table(&children, right);
 
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, page_bytes);
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, page_bytes);
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        let entry = cursor.load_page(&cx, pn(2)).unwrap();
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let entry = cursor.load_page(&cx, pn(2)).await.unwrap();
 
-        // Warm cell-slot cache so the legacy path hits it.
-        for idx in 0..entry.header.cell_count {
-            let _ = cursor.parse_cell_at(&entry, idx).unwrap();
-        }
+            // Warm cell-slot cache so the legacy path hits it.
+            for idx in 0..entry.header.cell_count {
+                let _ = cursor.parse_cell_at(&entry, idx).unwrap();
+            }
 
-        // Fast path — production code after bd-k7zd7.3.
-        for i in 0..WARMUP {
-            let idx = (i as u16) % entry.header.cell_count;
-            std::hint::black_box(
-                BtCursor::<MemPageStore>::read_interior_child_inline(&entry, idx).unwrap(),
+            // Fast path — production code after bd-k7zd7.3.
+            for i in 0..WARMUP {
+                let idx = (i as u16) % entry.header.cell_count;
+                std::hint::black_box(
+                    BtCursor::<MemPageStore>::read_interior_child_inline(&entry, idx).unwrap(),
+                );
+            }
+            let t0 = Instant::now();
+            for i in 0..ITERS {
+                let idx = (i as u16) % entry.header.cell_count;
+                std::hint::black_box(
+                    BtCursor::<MemPageStore>::read_interior_child_inline(&entry, idx).unwrap(),
+                );
+            }
+            let fast_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
+
+            // Legacy path — parse_cell_at + separator_cell.left_child.ok_or(...).
+            let legacy = |cursor: &BtCursor<MemPageStore>, idx: u16| -> Result<PageNumber> {
+                let separator_cell = cursor.parse_cell_at(&entry, idx)?;
+                separator_cell
+                    .left_child
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: "interior table separator missing left child".to_owned(),
+                    })
+            };
+            for i in 0..WARMUP {
+                let idx = (i as u16) % entry.header.cell_count;
+                std::hint::black_box(legacy(&cursor, idx).unwrap());
+            }
+            let t0 = Instant::now();
+            for i in 0..ITERS {
+                let idx = (i as u16) % entry.header.cell_count;
+                std::hint::black_box(legacy(&cursor, idx).unwrap());
+            }
+            let slow_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
+
+            println!(
+                "[replace_separator_inline] direct={fast_ns:.3}ns  parse_cell_at={slow_ns:.3}ns  \
+                 speedup={:.2}x  (children={CHILDREN}, iters={ITERS})",
+                slow_ns / fast_ns.max(f64::EPSILON)
             );
-        }
-        let t0 = Instant::now();
-        for i in 0..ITERS {
-            let idx = (i as u16) % entry.header.cell_count;
-            std::hint::black_box(
-                BtCursor::<MemPageStore>::read_interior_child_inline(&entry, idx).unwrap(),
-            );
-        }
-        let fast_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
-
-        // Legacy path — parse_cell_at + separator_cell.left_child.ok_or(...).
-        let legacy = |cursor: &BtCursor<MemPageStore>, idx: u16| -> Result<PageNumber> {
-            let separator_cell = cursor.parse_cell_at(&entry, idx)?;
-            separator_cell
-                .left_child
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: "interior table separator missing left child".to_owned(),
-                })
-        };
-        for i in 0..WARMUP {
-            let idx = (i as u16) % entry.header.cell_count;
-            std::hint::black_box(legacy(&cursor, idx).unwrap());
-        }
-        let t0 = Instant::now();
-        for i in 0..ITERS {
-            let idx = (i as u16) % entry.header.cell_count;
-            std::hint::black_box(legacy(&cursor, idx).unwrap());
-        }
-        let slow_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
-
-        println!(
-            "[replace_separator_inline] direct={fast_ns:.3}ns  parse_cell_at={slow_ns:.3}ns  \
-             speedup={:.2}x  (children={CHILDREN}, iters={ITERS})",
-            slow_ns / fast_ns.max(f64::EPSILON)
-        );
+        });
     }
 
     /// bd-9e3xf.5 microbench: CellSlotCache::get hot-front-entry path with
@@ -20590,58 +21799,60 @@ mod tests {
     /// row exactly once.
     #[test]
     fn test_advance_next_terminates_on_multi_level_with_empty_subtree_frankensqlite_95() {
-        // Hand-crafted depth-3 tree:
-        //   root (interior, page 2): [(page 3, sep=10), (page 4, sep=20)] right_child=page 5
-        //   page 3 (leaf):  [1, 5]
-        //   page 4 (interior, no cells): right_child = page 6 (EMPTY leaf)
-        //   page 5 (leaf):  [30, 40]
-        //   page 6 (leaf):  []   <-- the adversarial empty subtree
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 10), (pn(4), 20)], pn(5)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"one"), (5, b"five")]));
-        store.pages.insert(4, build_interior_table(&[], pn(6)));
-        store
-            .pages
-            .insert(5, build_leaf_table(&[(30, b"thirty"), (40, b"forty")]));
-        store.pages.insert(6, build_leaf_table(&[]));
+        run_async(async {
+            // Hand-crafted depth-3 tree:
+            //   root (interior, page 2): [(page 3, sep=10), (page 4, sep=20)] right_child=page 5
+            //   page 3 (leaf):  [1, 5]
+            //   page 4 (interior, no cells): right_child = page 6 (EMPTY leaf)
+            //   page 5 (leaf):  [30, 40]
+            //   page 6 (leaf):  []   <-- the adversarial empty subtree
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 10), (pn(4), 20)], pn(5)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"one"), (5, b"five")]));
+            store.pages.insert(4, build_interior_table(&[], pn(6)));
+            store
+                .pages
+                .insert(5, build_leaf_table(&[(30, b"thirty"), (40, b"forty")]));
+            store.pages.insert(6, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        let started = Instant::now();
-        let budget = Duration::from_secs(10);
-        let mut observed: Vec<i64> = Vec::new();
+            let started = Instant::now();
+            let budget = Duration::from_secs(10);
+            let mut observed: Vec<i64> = Vec::new();
 
-        assert!(cursor.first(&cx).unwrap());
-        observed.push(cursor.rowid(&cx).unwrap());
-        let mut iterations: usize = 0;
-        loop {
-            iterations += 1;
-            assert!(
-                iterations <= 32,
-                "advance_next called more than 32 times for 4-row tree — \
+            assert!(cursor.first(&cx).await.unwrap());
+            observed.push(cursor.rowid(&cx).await.unwrap());
+            let mut iterations: usize = 0;
+            loop {
+                iterations += 1;
+                assert!(
+                    iterations <= 32,
+                    "advance_next called more than 32 times for 4-row tree — \
                  forward-progress invariant violated (frankensqlite#95)"
-            );
-            assert!(
-                started.elapsed() < budget,
-                "forward scan did not terminate (frankensqlite#95 hang)"
-            );
-            if !cursor.next(&cx).unwrap() {
-                break;
+                );
+                assert!(
+                    started.elapsed() < budget,
+                    "forward scan did not terminate (frankensqlite#95 hang)"
+                );
+                if !cursor.next(&cx).await.unwrap() {
+                    break;
+                }
+                observed.push(cursor.rowid(&cx).await.unwrap());
             }
-            observed.push(cursor.rowid(&cx).unwrap());
-        }
 
-        assert_eq!(
-            observed,
-            vec![1_i64, 5, 30, 40],
-            "forward scan must visit every leaf row exactly once, in order, \
+            assert_eq!(
+                observed,
+                vec![1_i64, 5, 30, 40],
+                "forward scan must visit every leaf row exactly once, in order, \
              even when the tree contains an empty subtree (frankensqlite#95)"
-        );
+            );
+        });
     }
 
     /// Regression test for frankensqlite#95: forward scan of a multi-level
@@ -20667,123 +21878,127 @@ mod tests {
     ///   3. No infinite loop in `advance_next_impl`.
     #[test]
     fn test_advance_next_terminates_on_multi_level_table_btree_frankensqlite_95() {
-        let cx = Cx::new();
-        let root = pn(2);
-        // Small usable size forces page splits at lower row counts, building
-        // a depth >= 3 table B-tree (root interior -> interior -> leaf), which
-        // is the multi-level regime the cass `messages` table reaches at
-        // ~6_000 rows and which the report identifies as the trigger for
-        // frankensqlite#95.
-        const SMALL_USABLE: u32 = 512;
-        let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
-        let mut cursor = BtCursor::new(store, root, SMALL_USABLE, true);
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            // Small usable size forces page splits at lower row counts, building
+            // a depth >= 3 table B-tree (root interior -> interior -> leaf), which
+            // is the multi-level regime the cass `messages` table reaches at
+            // ~6_000 rows and which the report identifies as the trigger for
+            // frankensqlite#95.
+            const SMALL_USABLE: u32 = 512;
+            let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
+            let mut cursor = BtCursor::new(store, root, SMALL_USABLE, true);
 
-        const ROWS: i64 = 6_000;
-        const PAYLOAD_LEN: usize = 200;
-        let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i & 0xFF) as u8).collect();
+            const ROWS: i64 = 6_000;
+            const PAYLOAD_LEN: usize = 200;
+            let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i & 0xFF) as u8).collect();
 
-        for rowid in 1..=ROWS {
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-        }
+            for rowid in 1..=ROWS {
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            }
 
-        // Confirm we actually have a multi-level tree (root must be interior),
-        // and that the depth is at least 3 (root -> interior -> leaf).
-        let mut saw_deeper_interior = false;
-        {
-            let root_page = cursor.pager.pages.get(&root.get()).unwrap();
-            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-            assert_eq!(
-                root_header.page_type,
-                cell::BtreePageType::InteriorTable,
-                "test must build a multi-level B-tree to exercise frankensqlite#95"
-            );
+            // Confirm we actually have a multi-level tree (root must be interior),
+            // and that the depth is at least 3 (root -> interior -> leaf).
+            let mut saw_deeper_interior = false;
+            {
+                let root_page = cursor.pager.pages.get(&root.get()).unwrap();
+                let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+                assert_eq!(
+                    root_header.page_type,
+                    cell::BtreePageType::InteriorTable,
+                    "test must build a multi-level B-tree to exercise frankensqlite#95"
+                );
 
-            // Walk root's children directly from the raw page image
-            // (avoid touching the cursor's stack before the scan starts).
-            let header_offset = cell::header_offset_for_page(root);
-            let mut cell_pointers: Vec<u16> = Vec::new();
-            cell::read_cell_pointers_into(
-                root_page.as_slice(),
-                &root_header,
-                header_offset,
-                &mut cell_pointers,
-            )
-            .unwrap();
-            let total_children = root_header.cell_count + 1;
-            for child_idx in 0..total_children {
-                let child = if child_idx < root_header.cell_count {
-                    let cell_offset = usize::from(cell_pointers[usize::from(child_idx)]);
-                    let bytes = &root_page.as_slice()[cell_offset..cell_offset + 4];
-                    PageNumber::new(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                // Walk root's children directly from the raw page image
+                // (avoid touching the cursor's stack before the scan starts).
+                let header_offset = cell::header_offset_for_page(root);
+                let mut cell_pointers: Vec<u16> = Vec::new();
+                cell::read_cell_pointers_into(
+                    root_page.as_slice(),
+                    &root_header,
+                    header_offset,
+                    &mut cell_pointers,
+                )
+                .unwrap();
+                let total_children = root_header.cell_count + 1;
+                for child_idx in 0..total_children {
+                    let child = if child_idx < root_header.cell_count {
+                        let cell_offset = usize::from(cell_pointers[usize::from(child_idx)]);
+                        let bytes = &root_page.as_slice()[cell_offset..cell_offset + 4];
+                        PageNumber::new(u32::from_be_bytes([
+                            bytes[0], bytes[1], bytes[2], bytes[3],
+                        ]))
                         .unwrap()
-                } else {
-                    root_header.right_child.unwrap()
-                };
-                let cp = cursor.pager.pages.get(&child.get()).unwrap();
-                let ch = BtreePageHeader::parse(cp, 0).unwrap();
-                if matches!(ch.page_type, cell::BtreePageType::InteriorTable) {
-                    saw_deeper_interior = true;
-                    break;
+                    } else {
+                        root_header.right_child.unwrap()
+                    };
+                    let cp = cursor.pager.pages.get(&child.get()).unwrap();
+                    let ch = BtreePageHeader::parse(cp, 0).unwrap();
+                    if matches!(ch.page_type, cell::BtreePageType::InteriorTable) {
+                        saw_deeper_interior = true;
+                        break;
+                    }
                 }
             }
-        }
-        assert!(
-            saw_deeper_interior,
-            "test must build a depth >= 3 B-tree to exercise frankensqlite#95"
-        );
-
-        // Bounded wall-clock budget. A correct O(n) scan of 6_000 rows is
-        // far under 10s even on a slow CI host; an infinite re-read loop
-        // will blow through this immediately.
-        let budget = Duration::from_secs(20);
-        let started = Instant::now();
-        // Bound the number of `next()` calls too, as a belt-and-suspenders
-        // safety net in case `next()` returns true forever without making
-        // progress.
-        let max_iterations = (ROWS as usize) * 4;
-        let mut observed: Vec<i64> = Vec::with_capacity(ROWS as usize);
-
-        assert!(cursor.first(&cx).unwrap(), "tree must be non-empty");
-        observed.push(cursor.rowid(&cx).unwrap());
-
-        let mut iterations = 0usize;
-        loop {
-            iterations += 1;
             assert!(
-                iterations <= max_iterations,
-                "advance_next called more than {} times for {} rows — \
+                saw_deeper_interior,
+                "test must build a depth >= 3 B-tree to exercise frankensqlite#95"
+            );
+
+            // Bounded wall-clock budget. A correct O(n) scan of 6_000 rows is
+            // far under 10s even on a slow CI host; an infinite re-read loop
+            // will blow through this immediately.
+            let budget = Duration::from_secs(20);
+            let started = Instant::now();
+            // Bound the number of `next()` calls too, as a belt-and-suspenders
+            // safety net in case `next()` returns true forever without making
+            // progress.
+            let max_iterations = (ROWS as usize) * 4;
+            let mut observed: Vec<i64> = Vec::with_capacity(ROWS as usize);
+
+            assert!(cursor.first(&cx).await.unwrap(), "tree must be non-empty");
+            observed.push(cursor.rowid(&cx).await.unwrap());
+
+            let mut iterations = 0usize;
+            loop {
+                iterations += 1;
+                assert!(
+                    iterations <= max_iterations,
+                    "advance_next called more than {} times for {} rows — \
                  forward-progress invariant violated (frankensqlite#95)",
-                max_iterations,
+                    max_iterations,
+                    ROWS
+                );
+                assert!(
+                    started.elapsed() < budget,
+                    "forward scan did not terminate within {:?} \
+                 (frankensqlite#95 multi-level B-tree hang)",
+                    budget
+                );
+
+                if !cursor.next(&cx).await.unwrap() {
+                    break;
+                }
+                observed.push(cursor.rowid(&cx).await.unwrap());
+            }
+
+            // The scan must visit every rowid exactly once, in ascending order.
+            assert_eq!(
+                observed.len(),
+                ROWS as usize,
+                "forward scan visited {} rows, expected {}",
+                observed.len(),
                 ROWS
             );
-            assert!(
-                started.elapsed() < budget,
-                "forward scan did not terminate within {:?} \
-                 (frankensqlite#95 multi-level B-tree hang)",
-                budget
-            );
-
-            if !cursor.next(&cx).unwrap() {
-                break;
+            for (i, rowid) in observed.iter().enumerate() {
+                assert_eq!(
+                    *rowid,
+                    (i as i64) + 1,
+                    "rowid mismatch at scan position {i} (frankensqlite#95)"
+                );
             }
-            observed.push(cursor.rowid(&cx).unwrap());
-        }
-
-        // The scan must visit every rowid exactly once, in ascending order.
-        assert_eq!(
-            observed.len(),
-            ROWS as usize,
-            "forward scan visited {} rows, expected {}",
-            observed.len(),
-            ROWS
-        );
-        for (i, rowid) in observed.iter().enumerate() {
-            assert_eq!(
-                *rowid,
-                (i as i64) + 1,
-                "rowid mismatch at scan position {i} (frankensqlite#95)"
-            );
-        }
+        });
     }
 
     /// Symmetric reverse-direction regression for frankensqlite#95:
@@ -20798,55 +22013,57 @@ mod tests {
     /// forward-progress as an invariant of the iterative rewrite.
     #[test]
     fn test_advance_prev_terminates_on_multi_level_with_empty_subtree_frankensqlite_95() {
-        // Mirror of the forward test: depth-3 tree with an empty middle
-        // subtree under page 4 (right-child = page 6, leaf with no cells).
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 10), (pn(4), 20)], pn(5)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"one"), (5, b"five")]));
-        store.pages.insert(4, build_interior_table(&[], pn(6)));
-        store
-            .pages
-            .insert(5, build_leaf_table(&[(30, b"thirty"), (40, b"forty")]));
-        store.pages.insert(6, build_leaf_table(&[]));
+        run_async(async {
+            // Mirror of the forward test: depth-3 tree with an empty middle
+            // subtree under page 4 (right-child = page 6, leaf with no cells).
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 10), (pn(4), 20)], pn(5)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"one"), (5, b"five")]));
+            store.pages.insert(4, build_interior_table(&[], pn(6)));
+            store
+                .pages
+                .insert(5, build_leaf_table(&[(30, b"thirty"), (40, b"forty")]));
+            store.pages.insert(6, build_leaf_table(&[]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        let started = Instant::now();
-        let budget = Duration::from_secs(10);
-        let mut observed: Vec<i64> = Vec::new();
+            let started = Instant::now();
+            let budget = Duration::from_secs(10);
+            let mut observed: Vec<i64> = Vec::new();
 
-        assert!(cursor.last(&cx).unwrap());
-        observed.push(cursor.rowid(&cx).unwrap());
-        let mut iterations: usize = 0;
-        loop {
-            iterations += 1;
-            assert!(
-                iterations <= 32,
-                "advance_prev called more than 32 times for 4-row tree — \
+            assert!(cursor.last(&cx).await.unwrap());
+            observed.push(cursor.rowid(&cx).await.unwrap());
+            let mut iterations: usize = 0;
+            loop {
+                iterations += 1;
+                assert!(
+                    iterations <= 32,
+                    "advance_prev called more than 32 times for 4-row tree — \
                  reverse forward-progress invariant violated (frankensqlite#95)"
-            );
-            assert!(
-                started.elapsed() < budget,
-                "reverse scan did not terminate (frankensqlite#95 hang)"
-            );
-            if !cursor.prev(&cx).unwrap() {
-                break;
+                );
+                assert!(
+                    started.elapsed() < budget,
+                    "reverse scan did not terminate (frankensqlite#95 hang)"
+                );
+                if !cursor.prev(&cx).await.unwrap() {
+                    break;
+                }
+                observed.push(cursor.rowid(&cx).await.unwrap());
             }
-            observed.push(cursor.rowid(&cx).unwrap());
-        }
 
-        assert_eq!(
-            observed,
-            vec![40_i64, 30, 5, 1],
-            "reverse scan must visit every leaf row exactly once, in \
+            assert_eq!(
+                observed,
+                vec![40_i64, 30, 5, 1],
+                "reverse scan must visit every leaf row exactly once, in \
              descending order, even when the tree contains an empty subtree \
              (frankensqlite#95)"
-        );
+            );
+        });
     }
 
     /// Symmetric reverse-direction regression for frankensqlite#95:
@@ -20855,66 +22072,68 @@ mod tests {
     /// test.
     #[test]
     fn test_advance_prev_terminates_on_multi_level_table_btree_frankensqlite_95() {
-        let cx = Cx::new();
-        let root = pn(2);
-        const SMALL_USABLE: u32 = 512;
-        let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
-        let mut cursor = BtCursor::new(store, root, SMALL_USABLE, true);
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            const SMALL_USABLE: u32 = 512;
+            let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
+            let mut cursor = BtCursor::new(store, root, SMALL_USABLE, true);
 
-        const ROWS: i64 = 6_000;
-        const PAYLOAD_LEN: usize = 200;
-        let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i & 0xFF) as u8).collect();
+            const ROWS: i64 = 6_000;
+            const PAYLOAD_LEN: usize = 200;
+            let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i & 0xFF) as u8).collect();
 
-        for rowid in 1..=ROWS {
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-        }
+            for rowid in 1..=ROWS {
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            }
 
-        let budget = Duration::from_secs(20);
-        let started = Instant::now();
-        let max_iterations = (ROWS as usize) * 4;
-        let mut observed: Vec<i64> = Vec::with_capacity(ROWS as usize);
+            let budget = Duration::from_secs(20);
+            let started = Instant::now();
+            let max_iterations = (ROWS as usize) * 4;
+            let mut observed: Vec<i64> = Vec::with_capacity(ROWS as usize);
 
-        assert!(cursor.last(&cx).unwrap(), "tree must be non-empty");
-        observed.push(cursor.rowid(&cx).unwrap());
+            assert!(cursor.last(&cx).await.unwrap(), "tree must be non-empty");
+            observed.push(cursor.rowid(&cx).await.unwrap());
 
-        let mut iterations = 0usize;
-        loop {
-            iterations += 1;
-            assert!(
-                iterations <= max_iterations,
-                "advance_prev called more than {} times for {} rows — \
+            let mut iterations = 0usize;
+            loop {
+                iterations += 1;
+                assert!(
+                    iterations <= max_iterations,
+                    "advance_prev called more than {} times for {} rows — \
                  reverse forward-progress invariant violated (frankensqlite#95)",
-                max_iterations,
+                    max_iterations,
+                    ROWS
+                );
+                assert!(
+                    started.elapsed() < budget,
+                    "reverse scan did not terminate within {:?} \
+                 (frankensqlite#95 multi-level B-tree hang)",
+                    budget
+                );
+
+                if !cursor.prev(&cx).await.unwrap() {
+                    break;
+                }
+                observed.push(cursor.rowid(&cx).await.unwrap());
+            }
+
+            assert_eq!(
+                observed.len(),
+                ROWS as usize,
+                "reverse scan visited {} rows, expected {}",
+                observed.len(),
                 ROWS
             );
-            assert!(
-                started.elapsed() < budget,
-                "reverse scan did not terminate within {:?} \
-                 (frankensqlite#95 multi-level B-tree hang)",
-                budget
-            );
-
-            if !cursor.prev(&cx).unwrap() {
-                break;
+            // Reverse scan should produce rowids in descending order: ROWS, ROWS-1, ..., 1.
+            for (i, rowid) in observed.iter().enumerate() {
+                assert_eq!(
+                    *rowid,
+                    ROWS - (i as i64),
+                    "rowid mismatch at reverse scan position {i} (frankensqlite#95)"
+                );
             }
-            observed.push(cursor.rowid(&cx).unwrap());
-        }
-
-        assert_eq!(
-            observed.len(),
-            ROWS as usize,
-            "reverse scan visited {} rows, expected {}",
-            observed.len(),
-            ROWS
-        );
-        // Reverse scan should produce rowids in descending order: ROWS, ROWS-1, ..., 1.
-        for (i, rowid) in observed.iter().enumerate() {
-            assert_eq!(
-                *rowid,
-                ROWS - (i as i64),
-                "rowid mismatch at reverse scan position {i} (frankensqlite#95)"
-            );
-        }
+        });
     }
 
     /// Adversarial regression test for `BtCursor::advance_prev` interior-page
@@ -20955,57 +22174,59 @@ mod tests {
     /// (return `false`), because nothing in the tree has a key < "b".
     #[test]
     fn test_advance_prev_does_not_replay_after_interior_pop_recurse_frankensqlite_95() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_index(&[(pn(3), b"c")], pn(4)));
-        store
-            .pages
-            .insert(3, build_interior_index(&[(pn(5), b"b")], pn(6)));
-        store.pages.insert(5, build_interior_index(&[], pn(7)));
-        store.pages.insert(7, build_leaf_index(&[]));
-        store.pages.insert(6, build_leaf_index(&[b"bb"]));
-        store.pages.insert(4, build_leaf_index(&[b"d"]));
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_index(&[(pn(3), b"c")], pn(4)));
+            store
+                .pages
+                .insert(3, build_interior_index(&[(pn(5), b"b")], pn(6)));
+            store.pages.insert(5, build_interior_index(&[], pn(7)));
+            store.pages.insert(7, build_leaf_index(&[]));
+            store.pages.insert(6, build_leaf_index(&[b"bb"]));
+            store.pages.insert(4, build_leaf_index(&[b"d"]));
 
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
 
-        let started = Instant::now();
-        let budget = Duration::from_secs(5);
-        let mut observed: Vec<Vec<u8>> = Vec::new();
+            let started = Instant::now();
+            let budget = Duration::from_secs(5);
+            let mut observed: Vec<Vec<u8>> = Vec::new();
 
-        assert!(cursor.last(&cx).unwrap());
-        observed.push(cursor.payload(&cx).unwrap());
+            assert!(cursor.last(&cx).await.unwrap());
+            observed.push(cursor.payload(&cx).await.unwrap());
 
-        let mut iterations: usize = 0;
-        loop {
-            iterations += 1;
-            assert!(
-                iterations <= 32,
-                "advance_prev called more than 32 times for a 4-entry index — \
+            let mut iterations: usize = 0;
+            loop {
+                iterations += 1;
+                assert!(
+                    iterations <= 32,
+                    "advance_prev called more than 32 times for a 4-entry index — \
                  reverse forward-progress invariant violated (frankensqlite#95)"
-            );
-            assert!(
-                started.elapsed() < budget,
-                "reverse scan did not terminate (frankensqlite#95 hang)"
-            );
-            if !cursor.prev(&cx).unwrap() {
-                break;
+                );
+                assert!(
+                    started.elapsed() < budget,
+                    "reverse scan did not terminate (frankensqlite#95 hang)"
+                );
+                if !cursor.prev(&cx).await.unwrap() {
+                    break;
+                }
+                observed.push(cursor.payload(&cx).await.unwrap());
             }
-            observed.push(cursor.payload(&cx).unwrap());
-        }
 
-        // The bug, if present, would either (a) hang (caught by the
-        // iteration cap above), or (b) replay "bb" after "b" and continue
-        // into a second pass — producing more than 4 visits or an
-        // out-of-order sequence.
-        assert_eq!(
-            observed,
-            vec![b"d".to_vec(), b"c".to_vec(), b"bb".to_vec(), b"b".to_vec(),],
-            "reverse scan over a multi-level index B-tree with an empty \
+            // The bug, if present, would either (a) hang (caught by the
+            // iteration cap above), or (b) replay "bb" after "b" and continue
+            // into a second pass — producing more than 4 visits or an
+            // out-of-order sequence.
+            assert_eq!(
+                observed,
+                vec![b"d".to_vec(), b"c".to_vec(), b"bb".to_vec(), b"b".to_vec(),],
+                "reverse scan over a multi-level index B-tree with an empty \
              leftmost-path subtree must visit each entry exactly once in \
              descending order — interior-pop-and-recurse must not re-descend \
              the same subtree (frankensqlite#95)"
-        );
+            );
+        });
     }
 }

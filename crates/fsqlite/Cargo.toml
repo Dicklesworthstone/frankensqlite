@@ -21,6 +21,7 @@ fsqlite-ext-session = { workspace = true, optional = true }
 fsqlite-ext-icu = { workspace = true, optional = true }
 fsqlite-ext-misc = { workspace = true, optional = true }
 fsqlite-parser = { workspace = true }
+tracing = { workspace = true }
 
 [features]
 default = ["native", "linux-asupersync-uring", "json", "fts5", "rtree"]

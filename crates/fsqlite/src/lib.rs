@@ -3,6 +3,11 @@
 //! This crate will grow a stable, ergonomic API surface over time. In early
 //! phases it also re-exports selected internal crates for integration tests.
 
+// The re-exported `Connection` futures from `fsqlite-core` are deeply nested
+// (statement dispatch → DML → triggers → nested statement execution); the
+// default limit overflows while type-checking them here too.
+#![recursion_limit = "512"]
+
 pub use fsqlite_core::connection::{
     Connection, ConnectionEnv, IoPollStrategy, PreparedStatement, Row, RuntimeConfig,
     RuntimeContext, TraceEvent, TraceMask, init_global_runtime,

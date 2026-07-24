@@ -49,6 +49,9 @@ fsqlite-func = { workspace = true }
 fsqlite-pager = { version = "0.1.19", path = "../fsqlite-pager", default-features = false, features = ["wasm"] }
 js-sys = "0.3.102"
 wasm-bindgen = "0.2.125"
+# Required by `wasm_bindgen`'s codegen for `async fn` exports (they lower to
+# JS Promises through `wasm_bindgen_futures::future_to_promise`).
+wasm-bindgen-futures = "0.4"
 
 [target.'cfg(all(not(target_arch = "wasm32"), target_os = "linux"))'.dependencies]
 fsqlite-core = { version = "0.1.19", path = "../fsqlite-core", default-features = false, features = ["linux-asupersync-uring"] }

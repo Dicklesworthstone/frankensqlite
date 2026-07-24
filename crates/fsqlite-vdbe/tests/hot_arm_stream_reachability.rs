@@ -22,6 +22,7 @@
 //! `engine.rs` and failed exactly that way — the same defect as bd-948sd. One test, one
 //! process, no races.
 
+use asupersync::runtime::RuntimeBuilder;
 use fsqlite_types::PageSize;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{Opcode, P4};
@@ -80,38 +81,47 @@ fn hot_arm_bench_streams_dispatch_their_opcodes() {
     set_vdbe_jit_enabled(false);
     set_vdbe_metrics_enabled(true);
 
-    for (op, emit) in HOT_ARM_STREAMS {
-        for op_repeats in EXECUTE_STAGE_OP_REPEATS {
-            let program = stream_program(emit, op_repeats);
-            let execution_cx = Cx::new();
-            let mut engine = VdbeEngine::new_with_execution_cx(
-                program.register_count(),
-                &execution_cx,
-                PageSize::DEFAULT,
-            );
-            engine.set_collect_result_rows(false);
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(1, 1)
+        .build()
+        .expect("hot-arm reachability runtime should build");
+    runtime.block_on(async {
+        for (op, emit) in HOT_ARM_STREAMS {
+            for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+                let program = stream_program(emit, op_repeats);
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
 
-            reset_vdbe_metrics();
-            engine.execute(&program).expect("stream program should run");
+                reset_vdbe_metrics();
+                engine
+                    .execute(&program)
+                    .await
+                    .expect("stream program should run");
 
-            let name = format!("{op:?}");
-            let dispatched = vdbe_metrics_snapshot()
-                .opcode_execution_totals
-                .iter()
-                .find(|entry| entry.opcode == name)
-                .map_or(0, |entry| entry.total);
+                let name = format!("{op:?}");
+                let dispatched = vdbe_metrics_snapshot()
+                    .opcode_execution_totals
+                    .iter()
+                    .find(|entry| entry.opcode == name)
+                    .map_or(0, |entry| entry.total);
 
-            assert_eq!(
-                dispatched,
-                op_repeats as u64,
-                "vdbe_pipeline_execute_{} at {op_repeats} ops dispatched {dispatched} \
-                 {name} ops, expected {op_repeats}. A count of 0 means the ledger's \
-                 hot-dispatch-removal reject for {name} was measured on a stream that \
-                 never reaches the pruned arm, and that do-not-retry row must be reopened.",
-                name.to_ascii_lowercase()
-            );
+                assert_eq!(
+                    dispatched,
+                    op_repeats as u64,
+                    "vdbe_pipeline_execute_{} at {op_repeats} ops dispatched {dispatched} \
+                     {name} ops, expected {op_repeats}. A count of 0 means the ledger's \
+                     hot-dispatch-removal reject for {name} was measured on a stream that \
+                     never reaches the pruned arm, and that do-not-retry row must be reopened.",
+                    name.to_ascii_lowercase()
+                );
+            }
         }
-    }
+    });
 
     set_vdbe_metrics_enabled(false);
 }

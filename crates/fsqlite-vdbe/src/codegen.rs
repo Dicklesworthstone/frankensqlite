@@ -29400,6 +29400,7 @@ mod tests {
     use super::*;
     use crate::ProgramBuilder;
     use crate::engine::{ExecOutcome, MemDatabase, VdbeEngine};
+    use asupersync::runtime::RuntimeBuilder;
     use fsqlite_ast::{
         Assignment, AssignmentTarget, BinaryOp as AstBinaryOp, ColumnRef, DeleteStatement,
         Distinctness, Expr, FromClause, InSet, InsertSource, InsertStatement, JoinClause,
@@ -29537,7 +29538,13 @@ mod tests {
         let mut registry = FunctionRegistry::new();
         register_builtins(&mut registry);
         engine.set_function_registry(std::sync::Arc::new(registry));
-        let outcome = engine.execute(&prog).expect("execution should succeed");
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(1, 2)
+            .build()
+            .expect("build codegen storage-cursor test runtime");
+        let outcome = runtime
+            .block_on(async { engine.execute(&prog).await })
+            .expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
         engine
             .take_results()

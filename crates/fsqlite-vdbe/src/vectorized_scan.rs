@@ -248,7 +248,7 @@ where
     /// Returns an error when cursor I/O fails, row payloads cannot be decoded,
     /// or batch construction fails.
     #[allow(clippy::too_many_lines)]
-    pub fn next_batch(&mut self) -> ScanResult<Option<ScanBatch>> {
+    pub async fn next_batch(&mut self) -> ScanResult<Option<ScanBatch>> {
         let _record_profile_scope =
             enter_record_profile_scope(RecordProfileScope::VdbeVectorizedScan);
         if self.finished {
@@ -257,7 +257,7 @@ where
         if !self.started {
             self.started = true;
             self.cursor.clear_witness_keys();
-            if !self.cursor.first(&self.cx)? {
+            if !self.cursor.first(&self.cx).await? {
                 self.finished = true;
                 return Ok(None);
             }
@@ -279,7 +279,7 @@ where
             let current_page = self.current_page_or_internal_error()?;
             if let Some(morsel) = self.morsel {
                 if current_page < morsel.start_page {
-                    if !self.cursor.next(&self.cx)? {
+                    if !self.cursor.next(&self.cx).await? {
                         self.finished = true;
                         break;
                     }
@@ -288,7 +288,7 @@ where
                 if current_page > morsel.end_page {
                     // Leaf page numbers are not guaranteed to be monotonic in
                     // table scan order, so keep scanning instead of stopping.
-                    if !self.cursor.next(&self.cx)? {
+                    if !self.cursor.next(&self.cx).await? {
                         self.finished = true;
                         break;
                     }
@@ -308,8 +308,10 @@ where
                 last_page_seen = Some(current_page);
             }
 
-            let rowid = self.cursor.rowid(&self.cx)?;
-            self.cursor.payload_into(&self.cx, &mut self.payload_buf)?;
+            let rowid = self.cursor.rowid(&self.cx).await?;
+            self.cursor
+                .payload_into(&self.cx, &mut self.payload_buf)
+                .await?;
             let row = if row_count < self.row_buffers.len() {
                 &mut self.row_buffers[row_count]
             } else {
@@ -334,7 +336,7 @@ where
             }
             row_count += 1;
 
-            if !self.cursor.next(&self.cx)? {
+            if !self.cursor.next(&self.cx).await? {
                 self.finished = true;
                 break;
             }
@@ -503,8 +505,10 @@ fn checked_offset_span(
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeSet;
+    use std::future::Future;
     use std::rc::Rc;
 
+    use asupersync::runtime::RuntimeBuilder;
     use fsqlite_btree::{MemPageStore, PageReader};
     use fsqlite_types::WitnessKey;
     use fsqlite_types::record::{
@@ -518,6 +522,14 @@ mod tests {
     const PAGE_SIZE: u32 = 512;
     const ROOT_PAGE: u32 = 2;
     const BEAD_ID: &str = "bd-14vp7.2";
+
+    fn block_on_test<F: Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .blocking_threads(1, 2)
+            .build()
+            .expect("vectorized-scan test runtime should build")
+            .block_on(future)
+    }
 
     struct RecordProfileThreadOverrideGuard {
         previous: Option<bool>,
@@ -558,9 +570,14 @@ mod tests {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl PageReader for SharedTrackingPageIo {
-        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> fsqlite_error::Result<Vec<u8>> {
-            self.store.borrow().read_page(cx, page_no)
+        fn read_page<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = fsqlite_error::Result<Vec<u8>>> + 'a {
+            async move { self.store.borrow().read_page(cx, page_no).await }
         }
 
         fn prefetch_page_hint(&self, _cx: &Cx, page_no: PageNumber) {
@@ -568,22 +585,30 @@ mod tests {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl fsqlite_btree::PageWriter for SharedTrackingPageIo {
-        fn write_page(
-            &mut self,
-            cx: &Cx,
+        fn write_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
             page_no: PageNumber,
-            data: &[u8],
-        ) -> fsqlite_error::Result<()> {
-            self.store.borrow_mut().write_page(cx, page_no, data)
+            data: &'a [u8],
+        ) -> impl Future<Output = fsqlite_error::Result<()>> + 'a {
+            async move { self.store.borrow_mut().write_page(cx, page_no, data).await }
         }
 
-        fn allocate_page(&mut self, cx: &Cx) -> fsqlite_error::Result<PageNumber> {
-            self.store.borrow_mut().allocate_page(cx)
+        fn allocate_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> impl Future<Output = fsqlite_error::Result<PageNumber>> + 'a {
+            async move { self.store.borrow_mut().allocate_page(cx).await }
         }
 
-        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> fsqlite_error::Result<()> {
-            self.store.borrow_mut().free_page(cx, page_no)
+        fn free_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = fsqlite_error::Result<()>> + 'a {
+            async move { self.store.borrow_mut().free_page(cx, page_no).await }
         }
 
         fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
@@ -616,7 +641,7 @@ mod tests {
         ]
     }
 
-    fn build_fixture(row_count: usize) -> (SharedTrackingPageIo, PageNumber) {
+    async fn build_fixture(row_count: usize) -> (SharedTrackingPageIo, PageNumber) {
         let root_page = PageNumber::new(ROOT_PAGE).expect("root page should be non-zero");
         let io = SharedTrackingPageIo::new(PAGE_SIZE, root_page);
         let mut writer = BtCursor::new(io.clone(), root_page, PAGE_SIZE, true);
@@ -628,13 +653,14 @@ mod tests {
             let payload = serialize_record(&row);
             writer
                 .table_insert(&cx, rowid, &payload)
+                .await
                 .expect("table_insert should succeed");
         }
 
         (io, root_page)
     }
 
-    fn collect_rows_row_at_a_time<F>(
+    async fn collect_rows_row_at_a_time<F>(
         io: SharedTrackingPageIo,
         root_page: PageNumber,
         morsel: Option<PageMorsel>,
@@ -649,7 +675,7 @@ mod tests {
         let mut pages = Vec::new();
         let mut seen_pages = BTreeSet::new();
 
-        if !cursor.first(&cx).expect("first should succeed") {
+        if !cursor.first(&cx).await.expect("first should succeed") {
             return (rows, pages);
         }
 
@@ -663,13 +689,13 @@ mod tests {
                 .expect("cursor at row should have current leaf page");
             if let Some(m) = morsel {
                 if current_page < m.start_page {
-                    if !cursor.next(&cx).expect("next should succeed") {
+                    if !cursor.next(&cx).await.expect("next should succeed") {
                         break;
                     }
                     continue;
                 }
                 if current_page > m.end_page {
-                    if !cursor.next(&cx).expect("next should succeed") {
+                    if !cursor.next(&cx).await.expect("next should succeed") {
                         break;
                     }
                     continue;
@@ -680,14 +706,14 @@ mod tests {
                 pages.push(current_page);
             }
 
-            let rowid = cursor.rowid(&cx).expect("rowid should succeed");
-            let payload = cursor.payload(&cx).expect("payload should succeed");
+            let rowid = cursor.rowid(&cx).await.expect("rowid should succeed");
+            let payload = cursor.payload(&cx).await.expect("payload should succeed");
             let row = parse_record(&payload).expect("payload should decode");
             if predicate(rowid, &row) {
                 rows.push(row);
             }
 
-            if !cursor.next(&cx).expect("next should succeed") {
+            if !cursor.next(&cx).await.expect("next should succeed") {
                 break;
             }
         }
@@ -697,164 +723,193 @@ mod tests {
 
     #[test]
     fn scan_output_matches_row_at_a_time_output() {
-        let (io, root_page) = build_fixture(2_000);
-        let cx = Cx::new();
-        let scan_cursor = BtCursor::new(io.clone(), root_page, PAGE_SIZE, true);
-        let mut scan =
-            VectorizedTableScan::try_new(&cx, scan_cursor, specs(), DEFAULT_BATCH_ROW_CAPACITY)
-                .expect("scan should initialize");
+        block_on_test(async {
+            let (io, root_page) = build_fixture(2_000).await;
+            let cx = Cx::new();
+            let scan_cursor = BtCursor::new(io.clone(), root_page, PAGE_SIZE, true);
+            let mut scan =
+                VectorizedTableScan::try_new(&cx, scan_cursor, specs(), DEFAULT_BATCH_ROW_CAPACITY)
+                    .expect("scan should initialize");
 
-        let mut actual_rows = Vec::new();
-        let mut scanned_pages = BTreeSet::new();
-        while let Some(output) = scan.next_batch().expect("batch should scan successfully") {
-            for page in output.stats.pages_touched {
-                scanned_pages.insert(page);
+            let mut actual_rows = Vec::new();
+            let mut scanned_pages = BTreeSet::new();
+            while let Some(output) = scan
+                .next_batch()
+                .await
+                .expect("batch should scan successfully")
+            {
+                for page in output.stats.pages_touched {
+                    scanned_pages.insert(page);
+                }
+                let selected = materialize_selected_rows(&output.batch)
+                    .expect("selected rows should materialize");
+                actual_rows.extend(selected);
             }
-            let selected =
-                materialize_selected_rows(&output.batch).expect("selected rows should materialize");
-            actual_rows.extend(selected);
-        }
 
-        let (expected_rows, _) =
-            collect_rows_row_at_a_time(io, root_page, None, |_rowid, _row| true);
-        assert_eq!(
-            actual_rows, expected_rows,
-            "bead_id={BEAD_ID} full scan mismatch"
-        );
-        assert!(
-            scanned_pages.len() > 1,
-            "bead_id={BEAD_ID} expected multi-page scan to validate leaf traversal"
-        );
+            let (expected_rows, _) =
+                collect_rows_row_at_a_time(io, root_page, None, |_rowid, _row| true).await;
+            assert_eq!(
+                actual_rows, expected_rows,
+                "bead_id={BEAD_ID} full scan mismatch"
+            );
+            assert!(
+                scanned_pages.len() > 1,
+                "bead_id={BEAD_ID} expected multi-page scan to validate leaf traversal"
+            );
+        });
     }
 
     #[test]
     fn filter_pushdown_updates_selection_vector() {
-        let (io, root_page) = build_fixture(1_500);
-        let cx = Cx::new();
-        let predicate: RowPredicate = Arc::new(|rowid, _row| rowid % 3 == 0);
-        let scan_cursor = BtCursor::new(io.clone(), root_page, PAGE_SIZE, true);
-        let mut scan = VectorizedTableScan::try_new(&cx, scan_cursor, specs(), 256)
-            .expect("scan should initialize")
-            .with_predicate(predicate.clone());
+        block_on_test(async {
+            let (io, root_page) = build_fixture(1_500).await;
+            let cx = Cx::new();
+            let predicate: RowPredicate = Arc::new(|rowid, _row| rowid % 3 == 0);
+            let scan_cursor = BtCursor::new(io.clone(), root_page, PAGE_SIZE, true);
+            let mut scan = VectorizedTableScan::try_new(&cx, scan_cursor, specs(), 256)
+                .expect("scan should initialize")
+                .with_predicate(predicate.clone());
 
-        let mut actual_rows = Vec::new();
-        let mut saw_pushdown = false;
-        while let Some(output) = scan.next_batch().expect("batch should scan successfully") {
-            if output.stats.rows_selected < output.stats.rows_scanned {
-                saw_pushdown = true;
+            let mut actual_rows = Vec::new();
+            let mut saw_pushdown = false;
+            while let Some(output) = scan
+                .next_batch()
+                .await
+                .expect("batch should scan successfully")
+            {
+                if output.stats.rows_selected < output.stats.rows_scanned {
+                    saw_pushdown = true;
+                }
+                actual_rows.extend(
+                    materialize_selected_rows(&output.batch)
+                        .expect("selected rows should materialize"),
+                );
             }
-            actual_rows.extend(
-                materialize_selected_rows(&output.batch).expect("selected rows should materialize"),
-            );
-        }
 
-        let (expected_rows, _) =
-            collect_rows_row_at_a_time(io, root_page, None, |rowid, _row| rowid % 3 == 0);
-        assert_eq!(
-            actual_rows, expected_rows,
-            "bead_id={BEAD_ID} predicate pushdown mismatch"
-        );
-        assert!(
-            saw_pushdown,
-            "bead_id={BEAD_ID} expected at least one filtered batch"
-        );
+            let (expected_rows, _) =
+                collect_rows_row_at_a_time(io, root_page, None, |rowid, _row| rowid % 3 == 0).await;
+            assert_eq!(
+                actual_rows, expected_rows,
+                "bead_id={BEAD_ID} predicate pushdown mismatch"
+            );
+            assert!(
+                saw_pushdown,
+                "bead_id={BEAD_ID} expected at least one filtered batch"
+            );
+        });
     }
 
     #[test]
     fn scan_respects_page_morsel_boundaries() {
-        let (io, root_page) = build_fixture(3_000);
-        let cx = Cx::new();
-        let (_all_rows, all_pages) =
-            collect_rows_row_at_a_time(io.clone(), root_page, None, |_rowid, _row| true);
-        assert!(
-            all_pages.len() >= 3,
-            "bead_id={BEAD_ID} expected at least 3 pages for morsel boundary test"
-        );
-
-        let morsel = PageMorsel::new(all_pages[1], all_pages[2]).expect("morsel should be valid");
-        let scan_cursor = BtCursor::new(io.clone(), root_page, PAGE_SIZE, true);
-        let mut scan = VectorizedTableScan::try_new(&cx, scan_cursor, specs(), 192)
-            .expect("scan should initialize")
-            .with_morsel(morsel);
-
-        let mut actual_rows = Vec::new();
-        let mut touched_pages = BTreeSet::new();
-        while let Some(output) = scan.next_batch().expect("batch should scan successfully") {
-            for page in output.stats.pages_touched {
-                assert!(
-                    morsel.contains(page),
-                    "bead_id={BEAD_ID} page {page} escaped morsel {:?}",
-                    morsel
-                );
-                touched_pages.insert(page);
-            }
-            actual_rows.extend(
-                materialize_selected_rows(&output.batch).expect("selected rows should materialize"),
+        block_on_test(async {
+            let (io, root_page) = build_fixture(3_000).await;
+            let cx = Cx::new();
+            let (_all_rows, all_pages) =
+                collect_rows_row_at_a_time(io.clone(), root_page, None, |_rowid, _row| true).await;
+            assert!(
+                all_pages.len() >= 3,
+                "bead_id={BEAD_ID} expected at least 3 pages for morsel boundary test"
             );
-        }
 
-        let (expected_rows, expected_pages) =
-            collect_rows_row_at_a_time(io, root_page, Some(morsel), |_rowid, _row| true);
-        assert_eq!(
-            actual_rows, expected_rows,
-            "bead_id={BEAD_ID} morsel output mismatch"
-        );
-        let expected_page_set: BTreeSet<PageNumber> = expected_pages.into_iter().collect();
-        assert_eq!(
-            touched_pages, expected_page_set,
-            "bead_id={BEAD_ID} touched page set mismatch"
-        );
+            let morsel =
+                PageMorsel::new(all_pages[1], all_pages[2]).expect("morsel should be valid");
+            let scan_cursor = BtCursor::new(io.clone(), root_page, PAGE_SIZE, true);
+            let mut scan = VectorizedTableScan::try_new(&cx, scan_cursor, specs(), 192)
+                .expect("scan should initialize")
+                .with_morsel(morsel);
+
+            let mut actual_rows = Vec::new();
+            let mut touched_pages = BTreeSet::new();
+            while let Some(output) = scan
+                .next_batch()
+                .await
+                .expect("batch should scan successfully")
+            {
+                for page in output.stats.pages_touched {
+                    assert!(
+                        morsel.contains(page),
+                        "bead_id={BEAD_ID} page {page} escaped morsel {:?}",
+                        morsel
+                    );
+                    touched_pages.insert(page);
+                }
+                actual_rows.extend(
+                    materialize_selected_rows(&output.batch)
+                        .expect("selected rows should materialize"),
+                );
+            }
+
+            let (expected_rows, expected_pages) =
+                collect_rows_row_at_a_time(io, root_page, Some(morsel), |_rowid, _row| true).await;
+            assert_eq!(
+                actual_rows, expected_rows,
+                "bead_id={BEAD_ID} morsel output mismatch"
+            );
+            let expected_page_set: BTreeSet<PageNumber> = expected_pages.into_iter().collect();
+            assert_eq!(
+                touched_pages, expected_page_set,
+                "bead_id={BEAD_ID} touched page set mismatch"
+            );
+        });
     }
 
     #[test]
     fn prefetch_hints_are_emitted_during_scan() {
-        let (io, root_page) = build_fixture(2_500);
-        let cx = Cx::new();
-        let (all_rows, pages) =
-            collect_rows_row_at_a_time(io.clone(), root_page, None, |_rowid, _row| true);
-        assert!(
-            pages.len() >= 2,
-            "bead_id={BEAD_ID} expected at least two pages for prefetch test"
-        );
-        assert!(!all_rows.is_empty(), "fixture should contain rows");
+        block_on_test(async {
+            let (io, root_page) = build_fixture(2_500).await;
+            let cx = Cx::new();
+            let (all_rows, pages) =
+                collect_rows_row_at_a_time(io.clone(), root_page, None, |_rowid, _row| true).await;
+            assert!(
+                pages.len() >= 2,
+                "bead_id={BEAD_ID} expected at least two pages for prefetch test"
+            );
+            assert!(!all_rows.is_empty(), "fixture should contain rows");
 
-        let morsel = PageMorsel::new(pages[0], pages[1]).expect("morsel should be valid");
-        let scan_cursor = BtCursor::new(io.clone(), root_page, PAGE_SIZE, true);
-        let mut scan = VectorizedTableScan::try_new(&cx, scan_cursor, specs(), 128)
-            .expect("scan should initialize")
-            .with_morsel(morsel);
+            let morsel = PageMorsel::new(pages[0], pages[1]).expect("morsel should be valid");
+            let scan_cursor = BtCursor::new(io.clone(), root_page, PAGE_SIZE, true);
+            let mut scan = VectorizedTableScan::try_new(&cx, scan_cursor, specs(), 128)
+                .expect("scan should initialize")
+                .with_morsel(morsel);
 
-        let mut total_hints = 0usize;
-        while let Some(output) = scan.next_batch().expect("batch should scan successfully") {
-            total_hints = total_hints.saturating_add(output.stats.prefetch_hints_issued);
-        }
+            let mut total_hints = 0usize;
+            while let Some(output) = scan
+                .next_batch()
+                .await
+                .expect("batch should scan successfully")
+            {
+                total_hints = total_hints.saturating_add(output.stats.prefetch_hints_issued);
+            }
 
-        let hinted_pages = io.hinted_pages();
-        assert!(
-            total_hints > 0,
-            "bead_id={BEAD_ID} expected scan to issue explicit prefetch hints"
-        );
-        assert!(
-            !hinted_pages.is_empty(),
-            "bead_id={BEAD_ID} expected page-reader prefetch hints"
-        );
+            let hinted_pages = io.hinted_pages();
+            assert!(
+                total_hints > 0,
+                "bead_id={BEAD_ID} expected scan to issue explicit prefetch hints"
+            );
+            assert!(
+                !hinted_pages.is_empty(),
+                "bead_id={BEAD_ID} expected page-reader prefetch hints"
+            );
+        });
     }
 
     #[test]
     fn scan_rejects_batch_capacity_beyond_selection_vector_limit() {
-        let (io, root_page) = build_fixture(1);
-        let cx = Cx::new();
-        let scan_cursor = BtCursor::new(io, root_page, PAGE_SIZE, true);
-        let capacity = MAX_BATCH_CAPACITY.saturating_add(1);
+        block_on_test(async {
+            let (io, root_page) = build_fixture(1).await;
+            let cx = Cx::new();
+            let scan_cursor = BtCursor::new(io, root_page, PAGE_SIZE, true);
+            let capacity = MAX_BATCH_CAPACITY.saturating_add(1);
 
-        let err = match VectorizedTableScan::try_new(&cx, scan_cursor, specs(), capacity) {
-            Ok(_) => panic!("oversized batch capacity should be rejected up front"),
-            Err(err) => err,
-        };
-        assert!(matches!(
-            err,
-            VectorizedScanError::InvalidBatchCapacity(value) if value == capacity
-        ));
+            let err = match VectorizedTableScan::try_new(&cx, scan_cursor, specs(), capacity) {
+                Ok(_) => panic!("oversized batch capacity should be rejected up front"),
+                Err(err) => err,
+            };
+            assert!(matches!(
+                err,
+                VectorizedScanError::InvalidBatchCapacity(value) if value == capacity
+            ));
+        });
     }
 
     #[test]
@@ -881,64 +936,69 @@ mod tests {
 
     #[test]
     fn scan_reuses_decode_scratch_and_avoids_full_record_parse_calls() {
-        let (io, root_page) = build_fixture(257);
-        let _record_profile_guard = RecordProfileThreadOverrideGuard::enabled();
-        reset_record_profile();
+        block_on_test(async {
+            let (io, root_page) = build_fixture(257).await;
+            let _record_profile_guard = RecordProfileThreadOverrideGuard::enabled();
+            reset_record_profile();
 
-        let cx = Cx::new();
-        let scan_cursor = BtCursor::new(io, root_page, PAGE_SIZE, true);
-        let mut scan = VectorizedTableScan::try_new(&cx, scan_cursor, specs(), 64)
-            .expect("scan should initialize");
+            let cx = Cx::new();
+            let scan_cursor = BtCursor::new(io, root_page, PAGE_SIZE, true);
+            let mut scan = VectorizedTableScan::try_new(&cx, scan_cursor, specs(), 64)
+                .expect("scan should initialize");
 
-        let first_batch = scan
-            .next_batch()
-            .expect("first batch should scan successfully")
-            .expect("first batch should exist");
-        assert_eq!(first_batch.stats.rows_scanned, 64);
-        let first_row_buf_ptr = scan.row_buffers[0].as_ptr() as usize;
-        let first_payload_buf_ptr = scan.payload_buf.as_ptr() as usize;
+            let first_batch = scan
+                .next_batch()
+                .await
+                .expect("first batch should scan successfully")
+                .expect("first batch should exist");
+            assert_eq!(first_batch.stats.rows_scanned, 64);
+            let first_row_buf_ptr = scan.row_buffers[0].as_ptr() as usize;
+            let first_payload_buf_ptr = scan.payload_buf.as_ptr() as usize;
 
-        let second_batch = scan
-            .next_batch()
-            .expect("second batch should scan successfully")
-            .expect("second batch should exist");
-        assert_eq!(second_batch.stats.rows_scanned, 64);
-        assert_eq!(
-            scan.row_buffers[0].as_ptr() as usize,
-            first_row_buf_ptr,
-            "bead_id={BEAD_ID} first row buffer should be reused across batches"
-        );
-        assert_eq!(
-            scan.payload_buf.as_ptr() as usize,
-            first_payload_buf_ptr,
-            "bead_id={BEAD_ID} payload buffer should be reused across batches"
-        );
+            let second_batch = scan
+                .next_batch()
+                .await
+                .expect("second batch should scan successfully")
+                .expect("second batch should exist");
+            assert_eq!(second_batch.stats.rows_scanned, 64);
+            assert_eq!(
+                scan.row_buffers[0].as_ptr() as usize,
+                first_row_buf_ptr,
+                "bead_id={BEAD_ID} first row buffer should be reused across batches"
+            );
+            assert_eq!(
+                scan.payload_buf.as_ptr() as usize,
+                first_payload_buf_ptr,
+                "bead_id={BEAD_ID} payload buffer should be reused across batches"
+            );
 
-        let mut total_rows = first_batch.stats.rows_scanned + second_batch.stats.rows_scanned;
-        while let Some(output) = scan
-            .next_batch()
-            .expect("scan should continue successfully")
-        {
-            total_rows += output.stats.rows_scanned;
-        }
+            let mut total_rows = first_batch.stats.rows_scanned + second_batch.stats.rows_scanned;
+            while let Some(output) = scan
+                .next_batch()
+                .await
+                .expect("scan should continue successfully")
+            {
+                total_rows += output.stats.rows_scanned;
+            }
 
-        let snapshot = record_profile_snapshot();
-        assert_eq!(total_rows, 257);
-        assert_eq!(
-            snapshot
-                .callsite_breakdown
-                .vdbe_vectorized_scan
-                .parse_record_calls,
-            0,
-            "bead_id={BEAD_ID} vectorized scan should avoid full parse_record calls"
-        );
-        assert_eq!(
-            snapshot
-                .callsite_breakdown
-                .vdbe_vectorized_scan
-                .parse_record_into_calls,
-            257,
-            "bead_id={BEAD_ID} vectorized scan should decode through reusable parse_record_into scratch"
-        );
+            let snapshot = record_profile_snapshot();
+            assert_eq!(total_rows, 257);
+            assert_eq!(
+                snapshot
+                    .callsite_breakdown
+                    .vdbe_vectorized_scan
+                    .parse_record_calls,
+                0,
+                "bead_id={BEAD_ID} vectorized scan should avoid full parse_record calls"
+            );
+            assert_eq!(
+                snapshot
+                    .callsite_breakdown
+                    .vdbe_vectorized_scan
+                    .parse_record_into_calls,
+                257,
+                "bead_id={BEAD_ID} vectorized scan should decode through reusable parse_record_into scratch"
+            );
+        });
     }
 }

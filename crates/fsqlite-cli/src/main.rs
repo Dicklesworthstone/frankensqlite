@@ -1,7 +1,9 @@
 use std::ffi::OsString;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::io::{self, BufRead, ErrorKind, IsTerminal, Write};
 use std::path::Path;
+use std::pin::Pin;
 
 use fsqlite::{Connection, Row, SqliteValue};
 use fsqlite_core::decode_proofs::{
@@ -171,13 +173,23 @@ fn main() {
         fail_on_error: !interactive_input,
     };
 
-    let exit_code = run_with_shell_options(
+    // The CLI is the top-level consumer, so it owns the async runtime and hands
+    // the resulting `Cx` down into the engine. FrankenSQLite itself never builds
+    // a runtime (AGENTS.md).
+    let runtime = match asupersync::runtime::RuntimeBuilder::current_thread().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = writeln!(stderr, "error: failed to start async runtime: {error}");
+            std::process::exit(1);
+        }
+    };
+    let exit_code = runtime.block_on(run_with_shell_options(
         std::env::args_os(),
         &mut input,
         &mut stdout,
         &mut stderr,
         shell_options,
-    );
+    ));
     drop(input);
     if exit_code != 0 {
         std::process::exit(exit_code);
@@ -185,17 +197,17 @@ fn main() {
 }
 
 #[cfg(test)]
-fn run<I, R, W, E>(args: I, input: &mut R, out: &mut W, err: &mut E) -> i32
+async fn run<I, R, W, E>(args: I, input: &mut R, out: &mut W, err: &mut E) -> i32
 where
     I: IntoIterator<Item = OsString>,
     R: BufRead,
     W: Write,
     E: Write,
 {
-    run_with_shell_options(args, input, out, err, ShellOptions::interactive())
+    run_with_shell_options(args, input, out, err, ShellOptions::interactive()).await
 }
 
-fn run_with_shell_options<I, R, W, E>(
+async fn run_with_shell_options<I, R, W, E>(
     args: I,
     input: &mut R,
     out: &mut W,
@@ -247,7 +259,7 @@ where
         shell_options
     };
     let mut current_db_path = options.db_path.clone();
-    let mut connection = match Connection::open(&options.db_path) {
+    let mut connection = match Connection::open(&options.db_path).await {
         Ok(connection) => connection,
         Err(error) => {
             let _ = writeln!(err, "error: {error}");
@@ -265,7 +277,9 @@ where
             out,
             err,
             shell_options.nested_script(),
-        ) else {
+        )
+        .await
+        else {
             return 1;
         };
         if shell_options.fail_on_error && outcome.had_error {
@@ -284,7 +298,8 @@ where
             &command,
             out,
             err,
-        );
+        )
+        .await;
     }
 
     run_repl(
@@ -296,6 +311,7 @@ where
         err,
         shell_options,
     )
+    .await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -590,7 +606,7 @@ where
     }
 }
 
-fn run_command<W, E>(
+async fn run_command<W, E>(
     connection: &mut Connection,
     current_db_path: &mut String,
     output_options: &mut OutputOptions,
@@ -617,13 +633,15 @@ where
         out,
         err,
         ShellOptions::batch(),
-    ) {
+    )
+    .await
+    {
         Some(outcome) if !outcome.had_error => 0,
         Some(_) | None => 1,
     }
 }
 
-fn run_repl<R, W, E>(
+async fn run_repl<R, W, E>(
     connection: &mut Connection,
     current_db_path: &mut String,
     output_options: &mut OutputOptions,
@@ -645,25 +663,31 @@ where
         out,
         err,
         shell_options,
-    ) {
+    )
+    .await
+    {
         Some(outcome) if !(shell_options.fail_on_error && outcome.had_error) => 0,
         Some(_) | None => 1,
     }
 }
 
-fn execute_script_file<W, E>(
-    path: &str,
-    connection: &mut Connection,
-    current_db_path: &mut String,
-    output_options: &mut OutputOptions,
-    out: &mut W,
-    err: &mut E,
+// `.read FILE` can execute a script that itself contains `.read`, so this sits
+// in a cycle with `run_shell`/`try_execute_dot_command`. Boxing this one future
+// breaks the otherwise-infinite future type.
+fn execute_script_file<'a, W, E>(
+    path: &'a str,
+    connection: &'a mut Connection,
+    current_db_path: &'a mut String,
+    output_options: &'a mut OutputOptions,
+    out: &'a mut W,
+    err: &'a mut E,
     shell_options: ShellOptions,
-) -> Option<ShellOutcome>
+) -> Pin<Box<dyn Future<Output = Option<ShellOutcome>> + 'a>>
 where
     W: Write,
     E: Write,
 {
+    Box::pin(async move {
     let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) => {
@@ -681,9 +705,11 @@ where
         err,
         shell_options,
     )
+    .await
+    })
 }
 
-fn run_shell<R, W, E>(
+async fn run_shell<R, W, E>(
     connection: &mut Connection,
     current_db_path: &mut String,
     output_options: &mut OutputOptions,
@@ -727,7 +753,7 @@ where
         if bytes_read == 0 {
             if !pending_sql.trim().is_empty() {
                 had_error |=
-                    !execute_sql(connection, pending_sql.trim(), *output_options, out, err);
+                    !execute_sql(connection, pending_sql.trim(), *output_options, out, err).await;
             }
             return Some(ShellOutcome {
                 flow: ShellFlow::Continue,
@@ -762,7 +788,9 @@ where
                 err,
                 shell_options,
                 &mut had_error,
-            ) {
+            )
+            .await
+            {
                 DotCommandResult::NotHandled => {}
                 DotCommandResult::Continue => continue,
                 DotCommandResult::Exit => {
@@ -784,7 +812,8 @@ where
         pending_sql.push_str(line);
 
         if statement_complete(&pending_sql) {
-            had_error |= !execute_sql(connection, pending_sql.trim(), *output_options, out, err);
+            had_error |=
+                !execute_sql(connection, pending_sql.trim(), *output_options, out, err).await;
             pending_sql.clear();
         }
     }
@@ -840,7 +869,7 @@ fn prompt_db_label(current_db_path: &str) -> String {
         .to_owned()
 }
 
-fn execute_sql<W, E>(
+async fn execute_sql<W, E>(
     connection: &Connection,
     sql: &str,
     output_options: OutputOptions,
@@ -851,8 +880,8 @@ where
     W: Write,
     E: Write,
 {
-    let column_names = infer_result_column_names(connection, sql);
-    match connection.query(sql) {
+    let column_names = infer_result_column_names(connection, sql).await;
+    match connection.query(sql).await {
         Ok(rows) => {
             if write_rows(&rows, column_names.as_deref(), output_options, out).is_err() {
                 let _ = writeln!(err, "error: failed writing query results");
@@ -1091,9 +1120,9 @@ fn render_csv_field(value: &str) -> String {
     }
 }
 
-fn infer_result_column_names(connection: &Connection, sql: &str) -> Option<Vec<String>> {
+async fn infer_result_column_names(connection: &Connection, sql: &str) -> Option<Vec<String>> {
     let statement = last_sql_statement(sql)?;
-    let prepared = connection.prepare(statement).ok()?;
+    let prepared = connection.prepare(statement).await.ok()?;
     let column_names = prepared.column_names();
     (!column_names.is_empty()).then(|| column_names.to_vec())
 }
@@ -1484,7 +1513,7 @@ fn is_sql_keyword(token: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn try_execute_dot_command<W, E>(
+async fn try_execute_dot_command<W, E>(
     trimmed: &str,
     connection: &mut Connection,
     current_db_path: &mut String,
@@ -1513,7 +1542,9 @@ where
             out,
             err,
             shell_options.nested_script(),
-        ) {
+        )
+        .await
+        {
             Some(outcome) => {
                 *had_error |= outcome.had_error;
                 if outcome.flow == ShellFlow::Exit {
@@ -1534,7 +1565,7 @@ where
             return DotCommandResult::Continue;
         };
 
-        match Connection::open(&path) {
+        match Connection::open(&path).await {
             Ok(new_connection) => {
                 *connection = new_connection;
                 *current_db_path = path;
@@ -1554,7 +1585,9 @@ where
             filter.as_deref(),
             shell_options.colorize_prompts,
             out,
-        ) {
+        )
+        .await
+        {
             let _ = writeln!(err, "error: {error}");
             *had_error = true;
         }
@@ -1568,7 +1601,9 @@ where
             filter.as_deref(),
             shell_options.colorize_prompts,
             out,
-        ) {
+        )
+        .await
+        {
             let _ = writeln!(err, "error: {error}");
             *had_error = true;
         }
@@ -1577,7 +1612,7 @@ where
 
     if let Some(arg) = dot_command_arg(trimmed, ".tables") {
         let filter = parse_optional_quoted_arg(arg);
-        if let Err(error) = write_tables(connection, filter.as_deref(), out) {
+        if let Err(error) = write_tables(connection, filter.as_deref(), out).await {
             let _ = writeln!(err, "error: {error}");
             *had_error = true;
         }
@@ -1668,7 +1703,11 @@ fn parse_on_off(raw: &str) -> Option<bool> {
     }
 }
 
-fn write_tables<W>(connection: &Connection, filter: Option<&str>, out: &mut W) -> Result<(), String>
+async fn write_tables<W>(
+    connection: &Connection,
+    filter: Option<&str>,
+    out: &mut W,
+) -> Result<(), String>
 where
     W: Write,
 {
@@ -1688,9 +1727,11 @@ where
 
     let rows = match filter {
         Some(filter) => {
-            connection.query_with_params(filtered_sql, &[SqliteValue::from(filter.to_owned())])
+            connection
+                .query_with_params(filtered_sql, &[SqliteValue::from(filter.to_owned())])
+                .await
         }
-        None => connection.query(sql),
+        None => connection.query(sql).await,
     }
     .map_err(|error| error.to_string())?;
 
@@ -1705,7 +1746,7 @@ where
     Ok(())
 }
 
-fn write_schema<W>(
+async fn write_schema<W>(
     connection: &Connection,
     filter: Option<&str>,
     colorize_sql: bool,
@@ -1744,9 +1785,11 @@ where
 
     let rows = match filter {
         Some(filter) => {
-            connection.query_with_params(filtered_sql, &[SqliteValue::from(filter.to_owned())])
+            connection
+                .query_with_params(filtered_sql, &[SqliteValue::from(filter.to_owned())])
+                .await
         }
-        None => connection.query(sql),
+        None => connection.query(sql).await,
     }
     .map_err(|error| error.to_string())?;
 
@@ -1760,7 +1803,7 @@ where
     Ok(())
 }
 
-fn write_dump<W>(
+async fn write_dump<W>(
     connection: &Connection,
     filter: Option<&str>,
     colorize_sql: bool,
@@ -1811,9 +1854,12 @@ where
         END, name";
 
     let table_rows = match filter {
-        Some(filter) => connection
-            .query_with_params(filtered_table_sql, &[SqliteValue::from(filter.to_owned())]),
-        None => connection.query(table_sql),
+        Some(filter) => {
+            connection
+                .query_with_params(filtered_table_sql, &[SqliteValue::from(filter.to_owned())])
+                .await
+        }
+        None => connection.query(table_sql).await,
     }
     .map_err(|error| error.to_string())?;
 
@@ -1838,6 +1884,7 @@ where
         let quoted_table = quote_identifier(table_name);
         let rows = connection
             .query(&format!("SELECT * FROM {quoted_table};"))
+            .await
             .map_err(|error| error.to_string())?;
         for row in rows {
             writeln!(
@@ -1853,12 +1900,15 @@ where
         }
     }
 
-    write_sqlite_sequence_dump(connection, filter, colorize_sql, out)?;
+    write_sqlite_sequence_dump(connection, filter, colorize_sql, out).await?;
 
     let object_rows = match filter {
-        Some(filter) => connection
-            .query_with_params(filtered_object_sql, &[SqliteValue::from(filter.to_owned())]),
-        None => connection.query(object_sql),
+        Some(filter) => {
+            connection
+                .query_with_params(filtered_object_sql, &[SqliteValue::from(filter.to_owned())])
+                .await
+        }
+        None => connection.query(object_sql).await,
     }
     .map_err(|error| error.to_string())?;
 
@@ -1873,7 +1923,7 @@ where
     Ok(())
 }
 
-fn write_sqlite_sequence_dump<W>(
+async fn write_sqlite_sequence_dump<W>(
     connection: &Connection,
     filter: Option<&str>,
     colorize_sql: bool,
@@ -1887,6 +1937,7 @@ where
             "SELECT name FROM sqlite_schema \
              WHERE type = 'table' AND name = 'sqlite_sequence'",
         )
+        .await
         .map_err(|error| error.to_string())?;
     if exists.is_empty() {
         return Ok(());
@@ -1900,9 +1951,11 @@ where
         ORDER BY name";
     let rows = match filter {
         Some(filter) => {
-            connection.query_with_params(filtered_sql, &[SqliteValue::from(filter.to_owned())])
+            connection
+                .query_with_params(filtered_sql, &[SqliteValue::from(filter.to_owned())])
+                .await
         }
-        None => connection.query(sql),
+        None => connection.query(sql).await,
     }
     .map_err(|error| error.to_string())?;
     if rows.is_empty() {

@@ -38,6 +38,7 @@ use std::future::Future;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::ops::Range;
+use std::pin::Pin;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 #[cfg(any(feature = "diagnostic-pragmas", not(target_arch = "wasm32")))]
@@ -328,19 +329,24 @@ fn begin_busy_retry_sleep(attempt: u32) -> Duration {
     Duration::from_micros(begin_busy_retry_sleep_micros(attempt))
 }
 
-fn perform_begin_busy_retry_handoff(wait: BeginBusyRetryWait) {
+async fn perform_begin_busy_retry_handoff(wait: BeginBusyRetryWait) {
     for _ in 0..wait.spin_loops {
         std::hint::spin_loop();
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     if !wait.sleep_for.is_zero() {
-        std::thread::sleep(wait.sleep_for);
+        asupersync::time::sleep(asupersync::time::wall_now(), wait.sleep_for).await;
+    } else {
+        asupersync::runtime::yield_now().await;
     }
 }
 
-fn retry_busy_connection_bootstrap<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
-    let mut err = match operation() {
+async fn retry_busy_connection_bootstrap<T, F, Fut>(mut operation: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut err = match operation().await {
         Ok(value) => return Ok(value),
         Err(err @ (FrankenError::Busy | FrankenError::BusyRecovery)) => err,
         Err(err) => return Err(err),
@@ -354,8 +360,8 @@ fn retry_busy_connection_bootstrap<T>(mut operation: impl FnMut() -> Result<T>) 
     let mut handoff = BeginBusyRetryHandoff::default();
 
     while let Some(wait) = handoff.next_wait(started, deadline) {
-        perform_begin_busy_retry_handoff(wait);
-        match operation() {
+        perform_begin_busy_retry_handoff(wait).await;
+        match operation().await {
             Ok(value) => return Ok(value),
             Err(next_err @ (FrankenError::Busy | FrankenError::BusyRecovery)) => {
                 err = next_err;
@@ -2390,15 +2396,15 @@ impl PagerBackend {
     }
 
     /// Propagate busy-timeout to the VFS file for cross-process lock retry.
-    pub fn set_vfs_busy_timeout_ms(&self, ms: u64) {
+    pub async fn set_vfs_busy_timeout_ms(&self, cx: &Cx, ms: u64) {
         match self {
-            Self::Memory(p) => p.set_vfs_busy_timeout_ms(ms),
+            Self::Memory(p) => p.set_vfs_busy_timeout_ms(cx, ms).await,
             #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(p) => p.set_vfs_busy_timeout_ms(ms),
+            Self::IoUring(p) => p.set_vfs_busy_timeout_ms(cx, ms).await,
             #[cfg(all(feature = "native", unix))]
-            Self::Unix(p) => p.set_vfs_busy_timeout_ms(ms),
+            Self::Unix(p) => p.set_vfs_busy_timeout_ms(cx, ms).await,
             #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(p) => p.set_vfs_busy_timeout_ms(ms),
+            Self::Windows(p) => p.set_vfs_busy_timeout_ms(cx, ms).await,
         }
     }
 
@@ -2426,47 +2432,47 @@ impl PagerBackend {
         }
     }
 
-    fn capture_vacuum_source_image(&self, cx: &Cx) -> Result<DatabaseImageReceipt> {
+    async fn capture_vacuum_source_image(&self, cx: &Cx) -> Result<DatabaseImageReceipt> {
         match self {
-            Self::Memory(p) => p.capture_vacuum_source_image(cx),
+            Self::Memory(p) => p.capture_vacuum_source_image(cx).await,
             #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(p) => p.capture_vacuum_source_image(cx),
+            Self::IoUring(p) => p.capture_vacuum_source_image(cx).await,
             #[cfg(all(feature = "native", unix))]
-            Self::Unix(p) => p.capture_vacuum_source_image(cx),
+            Self::Unix(p) => p.capture_vacuum_source_image(cx).await,
             #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(p) => p.capture_vacuum_source_image(cx),
+            Self::Windows(p) => p.capture_vacuum_source_image(cx).await,
         }
     }
 
-    fn inspect_database_image(&self, cx: &Cx, path: &Path) -> Result<DatabaseImageReceipt> {
+    async fn inspect_database_image(&self, cx: &Cx, path: &Path) -> Result<DatabaseImageReceipt> {
         match self {
-            Self::Memory(p) => p.inspect_database_image(cx, path),
+            Self::Memory(p) => p.inspect_database_image(cx, path).await,
             #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(p) => p.inspect_database_image(cx, path),
+            Self::IoUring(p) => p.inspect_database_image(cx, path).await,
             #[cfg(all(feature = "native", unix))]
-            Self::Unix(p) => p.inspect_database_image(cx, path),
+            Self::Unix(p) => p.inspect_database_image(cx, path).await,
             #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(p) => p.inspect_database_image(cx, path),
+            Self::Windows(p) => p.inspect_database_image(cx, path).await,
         }
     }
 
-    fn inspect_self_contained_database_image(
+    async fn inspect_self_contained_database_image(
         &self,
         cx: &Cx,
         path: &Path,
     ) -> Result<DatabaseImageReceipt> {
         match self {
-            Self::Memory(p) => p.inspect_self_contained_database_image(cx, path),
+            Self::Memory(p) => p.inspect_self_contained_database_image(cx, path).await,
             #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(p) => p.inspect_self_contained_database_image(cx, path),
+            Self::IoUring(p) => p.inspect_self_contained_database_image(cx, path).await,
             #[cfg(all(feature = "native", unix))]
-            Self::Unix(p) => p.inspect_self_contained_database_image(cx, path),
+            Self::Unix(p) => p.inspect_self_contained_database_image(cx, path).await,
             #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(p) => p.inspect_self_contained_database_image(cx, path),
+            Self::Windows(p) => p.inspect_self_contained_database_image(cx, path).await,
         }
     }
 
-    fn restore_vacuum_candidate_change_counter(
+    async fn restore_vacuum_candidate_change_counter(
         &self,
         cx: &Cx,
         path: &Path,
@@ -2476,23 +2482,27 @@ impl PagerBackend {
         match self {
             Self::Memory(p) => {
                 p.restore_vacuum_candidate_change_counter(cx, path, expected, change_counter)
+                    .await
             }
             #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => {
                 p.restore_vacuum_candidate_change_counter(cx, path, expected, change_counter)
+                    .await
             }
             #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => {
                 p.restore_vacuum_candidate_change_counter(cx, path, expected, change_counter)
+                    .await
             }
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => {
                 p.restore_vacuum_candidate_change_counter(cx, path, expected, change_counter)
+                    .await
             }
         }
     }
 
-    fn publish_validated_database_image(
+    async fn publish_validated_database_image(
         &self,
         cx: &Cx,
         path: &Path,
@@ -2500,27 +2510,39 @@ impl PagerBackend {
         candidate: &DatabaseImageReceipt,
     ) -> Result<()> {
         match self {
-            Self::Memory(p) => p.publish_validated_database_image(cx, path, source, candidate),
+            Self::Memory(p) => {
+                p.publish_validated_database_image(cx, path, source, candidate)
+                    .await
+            }
             #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(p) => p.publish_validated_database_image(cx, path, source, candidate),
+            Self::IoUring(p) => {
+                p.publish_validated_database_image(cx, path, source, candidate)
+                    .await
+            }
             #[cfg(all(feature = "native", unix))]
-            Self::Unix(p) => p.publish_validated_database_image(cx, path, source, candidate),
+            Self::Unix(p) => {
+                p.publish_validated_database_image(cx, path, source, candidate)
+                    .await
+            }
             #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(p) => p.publish_validated_database_image(cx, path, source, candidate),
+            Self::Windows(p) => {
+                p.publish_validated_database_image(cx, path, source, candidate)
+                    .await
+            }
         }
     }
 
     /// Number of frames currently in the WAL for this pager.
     #[must_use]
-    pub fn wal_frame_count(&self) -> usize {
+    pub async fn wal_frame_count(&self, cx: &Cx) -> usize {
         match self {
-            Self::Memory(p) => p.wal_frame_count(),
+            Self::Memory(p) => p.wal_frame_count(cx).await,
             #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(p) => p.wal_frame_count(),
+            Self::IoUring(p) => p.wal_frame_count(cx).await,
             #[cfg(all(feature = "native", unix))]
-            Self::Unix(p) => p.wal_frame_count(),
+            Self::Unix(p) => p.wal_frame_count(cx).await,
             #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(p) => p.wal_frame_count(),
+            Self::Windows(p) => p.wal_frame_count(cx).await,
         }
     }
 
@@ -2554,31 +2576,31 @@ impl PagerBackend {
 
     /// Refresh the pager publication plane from the latest committed state and
     /// return the resulting snapshot.
-    pub fn refresh_published_snapshot(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
+    pub async fn refresh_published_snapshot(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
         match self {
-            Self::Memory(p) => p.refresh_published_snapshot(cx),
+            Self::Memory(p) => p.refresh_published_snapshot(cx).await,
             #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(p) => p.refresh_published_snapshot(cx),
+            Self::IoUring(p) => p.refresh_published_snapshot(cx).await,
             #[cfg(all(feature = "native", unix))]
-            Self::Unix(p) => p.refresh_published_snapshot(cx),
+            Self::Unix(p) => p.refresh_published_snapshot(cx).await,
             #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(p) => p.refresh_published_snapshot(cx),
+            Self::Windows(p) => p.refresh_published_snapshot(cx).await,
         }
     }
 
     /// Refresh the pager publication plane for a clean WAL-mode read boundary.
-    pub fn refresh_published_snapshot_for_clean_wal_read(
+    pub async fn refresh_published_snapshot_for_clean_wal_read(
         &self,
         cx: &Cx,
     ) -> Result<PagerPublishedSnapshot> {
         match self {
-            Self::Memory(p) => p.refresh_published_snapshot_for_clean_wal_read(cx),
+            Self::Memory(p) => p.refresh_published_snapshot_for_clean_wal_read(cx).await,
             #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(p) => p.refresh_published_snapshot_for_clean_wal_read(cx),
+            Self::IoUring(p) => p.refresh_published_snapshot_for_clean_wal_read(cx).await,
             #[cfg(all(feature = "native", unix))]
-            Self::Unix(p) => p.refresh_published_snapshot_for_clean_wal_read(cx),
+            Self::Unix(p) => p.refresh_published_snapshot_for_clean_wal_read(cx).await,
             #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(p) => p.refresh_published_snapshot_for_clean_wal_read(cx),
+            Self::Windows(p) => p.refresh_published_snapshot_for_clean_wal_read(cx).await,
         }
     }
 
@@ -2624,15 +2646,15 @@ impl PagerBackend {
     }
 
     /// Return the identity of the already-open main database file.
-    pub fn file_identity(&self) -> Result<Option<FileIdentity>> {
+    pub async fn file_identity(&self, cx: &Cx) -> Result<Option<FileIdentity>> {
         match self {
-            Self::Memory(p) => p.file_identity(),
+            Self::Memory(p) => p.file_identity(cx).await,
             #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(p) => p.file_identity(),
+            Self::IoUring(p) => p.file_identity(cx).await,
             #[cfg(all(feature = "native", unix))]
-            Self::Unix(p) => p.file_identity(),
+            Self::Unix(p) => p.file_identity(cx).await,
             #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(p) => p.file_identity(),
+            Self::Windows(p) => p.file_identity(cx).await,
         }
     }
 
@@ -2668,7 +2690,7 @@ impl PagerBackend {
     /// `page_buffer_max` overrides the page-buffer-pool ceiling. `None`
     /// defers to the `FSQLITE_PAGE_BUFFER_MAX` env var, then to
     /// [`DEFAULT_PAGE_BUFFER_MAX`](fsqlite_pager::DEFAULT_PAGE_BUFFER_MAX).
-    fn open_with_page_buffer_max(
+    async fn open_with_page_buffer_max(
         path: &str,
         cx: &Cx,
         page_buffer_max: Option<usize>,
@@ -2682,11 +2704,12 @@ impl PagerBackend {
             page_buffer_max,
             memory_vfs_config,
         )
+        .await
     }
 
     /// Initialize an existing caller-reserved empty file after binding its
     /// open handle to `expected_identity`.
-    fn open_reserved_with_page_buffer_max(
+    async fn open_reserved_with_page_buffer_max(
         path: &str,
         cx: &Cx,
         expected_identity: FileIdentity,
@@ -2701,9 +2724,10 @@ impl PagerBackend {
             page_buffer_max,
             memory_vfs_config,
         )
+        .await
     }
 
-    fn open_with_requested_page_size_and_page_buffer_max(
+    async fn open_with_requested_page_size_and_page_buffer_max(
         path: &str,
         cx: &Cx,
         requested_page_size: PageSize,
@@ -2722,7 +2746,8 @@ impl PagerBackend {
                     requested_page_size,
                     expected_identity,
                     page_buffer_max,
-                )?
+                )
+                .await?
             } else {
                 SimplePager::open_with_cx_and_page_buffer_max(
                     cx,
@@ -2730,7 +2755,8 @@ impl PagerBackend {
                     &db_path,
                     requested_page_size,
                     page_buffer_max,
-                )?
+                )
+                .await?
             };
             let _ = pager.enable_single_connection_cache_fast_path();
             Ok(Self::Memory(Arc::new(pager)))
@@ -2751,7 +2777,8 @@ impl PagerBackend {
                     requested_page_size,
                     page_buffer_max,
                     mode,
-                )?;
+                )
+                .await?;
                 Ok(Self::IoUring(Arc::new(pager)))
             }
             #[cfg(all(feature = "native", unix, not(target_os = "linux")))]
@@ -2770,7 +2797,8 @@ impl PagerBackend {
                     requested_page_size,
                     page_buffer_max,
                     mode,
-                )?;
+                )
+                .await?;
                 Ok(Self::Unix(Arc::new(pager)))
             }
             #[cfg(all(feature = "native", target_os = "windows"))]
@@ -2789,7 +2817,8 @@ impl PagerBackend {
                     requested_page_size,
                     page_buffer_max,
                     mode,
-                )?;
+                )
+                .await?;
                 Ok(Self::Windows(Arc::new(pager)))
             }
             #[cfg(any(not(feature = "native"), not(any(unix, target_os = "windows"))))]
@@ -2803,7 +2832,7 @@ impl PagerBackend {
 
     /// Open an existing file-backed database for reading and writing without
     /// creating or initializing the main database file.
-    fn open_existing_with_page_buffer_max(
+    async fn open_existing_with_page_buffer_max(
         path: &str,
         cx: &Cx,
         expected_identity: Option<FileIdentity>,
@@ -2820,7 +2849,8 @@ impl PagerBackend {
                 PageSize::DEFAULT,
                 page_buffer_max,
                 ConnectionPagerOpenMode::ExistingOnly(expected_identity),
-            )?;
+            )
+            .await?;
             Ok(Self::IoUring(Arc::new(pager)))
         }
         #[cfg(all(feature = "native", unix, not(target_os = "linux")))]
@@ -2834,7 +2864,8 @@ impl PagerBackend {
                 PageSize::DEFAULT,
                 page_buffer_max,
                 ConnectionPagerOpenMode::ExistingOnly(expected_identity),
-            )?;
+            )
+            .await?;
             Ok(Self::Unix(Arc::new(pager)))
         }
         #[cfg(all(feature = "native", target_os = "windows"))]
@@ -2848,7 +2879,8 @@ impl PagerBackend {
                 PageSize::DEFAULT,
                 page_buffer_max,
                 ConnectionPagerOpenMode::ExistingOnly(expected_identity),
-            )?;
+            )
+            .await?;
             Ok(Self::Windows(Arc::new(pager)))
         }
         #[cfg(any(not(feature = "native"), not(any(unix, target_os = "windows"))))]
@@ -2868,7 +2900,7 @@ impl PagerBackend {
     /// `page_buffer_max` overrides the page-buffer-pool ceiling. `None`
     /// defers to the `FSQLITE_PAGE_BUFFER_MAX` env var, then to
     /// [`DEFAULT_PAGE_BUFFER_MAX`](fsqlite_pager::DEFAULT_PAGE_BUFFER_MAX).
-    fn open_readonly_with_page_buffer_max(
+    async fn open_readonly_with_page_buffer_max(
         path: &str,
         cx: &Cx,
         expected_identity: Option<FileIdentity>,
@@ -2881,7 +2913,8 @@ impl PagerBackend {
                     path: PathBuf::from(path),
                 });
             }
-            return Self::open_with_page_buffer_max(path, cx, page_buffer_max, memory_vfs_config);
+            return Self::open_with_page_buffer_max(path, cx, page_buffer_max, memory_vfs_config)
+                .await;
         }
         #[cfg(all(feature = "native", target_os = "linux"))]
         {
@@ -2894,7 +2927,8 @@ impl PagerBackend {
                 PageSize::DEFAULT,
                 page_buffer_max,
                 ConnectionPagerOpenMode::ReadOnly(expected_identity),
-            )?;
+            )
+            .await?;
             let _ = pager.enable_single_connection_cache_fast_path();
             Ok(Self::IoUring(Arc::new(pager)))
         }
@@ -2909,7 +2943,8 @@ impl PagerBackend {
                 PageSize::DEFAULT,
                 page_buffer_max,
                 ConnectionPagerOpenMode::ReadOnly(expected_identity),
-            )?;
+            )
+            .await?;
             let _ = pager.enable_single_connection_cache_fast_path();
             Ok(Self::Unix(Arc::new(pager)))
         }
@@ -2924,7 +2959,8 @@ impl PagerBackend {
                 PageSize::DEFAULT,
                 page_buffer_max,
                 ConnectionPagerOpenMode::ReadOnly(expected_identity),
-            )?;
+            )
+            .await?;
             let _ = pager.enable_single_connection_cache_fast_path();
             Ok(Self::Windows(Arc::new(pager)))
         }
@@ -2938,15 +2974,15 @@ impl PagerBackend {
     }
 
     /// Begin a new transaction.
-    fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<TransactionKind> {
+    async fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<TransactionKind> {
         match self {
-            Self::Memory(p) => Ok(p.begin(cx, mode)?.into()),
+            Self::Memory(p) => Ok(p.begin(cx, mode).await?.into()),
             #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(p) => Ok(p.begin(cx, mode)?.into()),
+            Self::IoUring(p) => Ok(p.begin(cx, mode).await?.into()),
             #[cfg(all(feature = "native", unix))]
-            Self::Unix(p) => Ok(p.begin(cx, mode)?.into()),
+            Self::Unix(p) => Ok(p.begin(cx, mode).await?.into()),
             #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(p) => Ok(p.begin(cx, mode)?.into()),
+            Self::Windows(p) => Ok(p.begin(cx, mode).await?.into()),
         }
     }
 
@@ -2974,45 +3010,45 @@ impl PagerBackend {
         }
     }
 
-    fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
+    async fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
         match self {
-            Self::Memory(p) => p.set_journal_mode(cx, mode),
+            Self::Memory(p) => p.set_journal_mode(cx, mode).await,
             #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(p) => p.set_journal_mode(cx, mode),
+            Self::IoUring(p) => p.set_journal_mode(cx, mode).await,
             #[cfg(all(feature = "native", unix))]
-            Self::Unix(p) => p.set_journal_mode(cx, mode),
+            Self::Unix(p) => p.set_journal_mode(cx, mode).await,
             #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(p) => p.set_journal_mode(cx, mode),
+            Self::Windows(p) => p.set_journal_mode(cx, mode).await,
         }
     }
 
-    fn install_wal_backend(&self, cx: &Cx, db_path: &str) -> Result<()> {
+    async fn install_wal_backend(&self, cx: &Cx, db_path: &str) -> Result<()> {
         self.validate_namespace_binding()?;
         let wal_path = wal_path_for_db_path(db_path);
         match self {
             Self::Memory(p) => {
                 let vfs = p.vfs_handle();
-                install_wal_backend_with_vfs(p, vfs.as_ref().clone(), cx, &wal_path)
+                install_wal_backend_with_vfs(p, vfs.as_ref().clone(), cx, &wal_path).await
             }
             #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => {
                 let vfs = IoUringVfs::new();
-                install_wal_backend_with_vfs(p, vfs, cx, &wal_path)
+                install_wal_backend_with_vfs(p, vfs, cx, &wal_path).await
             }
             #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => {
                 let vfs = UnixVfs::new();
-                install_wal_backend_with_vfs(p, vfs, cx, &wal_path)
+                install_wal_backend_with_vfs(p, vfs, cx, &wal_path).await
             }
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => {
                 let vfs = fsqlite_vfs::WindowsVfs::new();
-                install_wal_backend_with_vfs(p, vfs, cx, &wal_path)
+                install_wal_backend_with_vfs(p, vfs, cx, &wal_path).await
             }
         }
     }
 
-    fn install_existing_wal_backend_with_mode(
+    async fn install_existing_wal_backend_with_mode(
         &self,
         cx: &Cx,
         db_path: &str,
@@ -3030,31 +3066,38 @@ impl PagerBackend {
                     &wal_path,
                     allow_readonly,
                 )
+                .await
             }
             #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => {
                 let vfs = IoUringVfs::new();
-                install_existing_wal_backend_with_vfs(p, vfs, cx, &wal_path, allow_readonly)
+                install_existing_wal_backend_with_vfs(p, vfs, cx, &wal_path, allow_readonly).await
             }
             #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => {
                 let vfs = UnixVfs::new();
-                install_existing_wal_backend_with_vfs(p, vfs, cx, &wal_path, allow_readonly)
+                install_existing_wal_backend_with_vfs(p, vfs, cx, &wal_path, allow_readonly).await
             }
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => {
                 let vfs = fsqlite_vfs::WindowsVfs::new();
-                install_existing_wal_backend_with_vfs(p, vfs, cx, &wal_path, allow_readonly)
+                install_existing_wal_backend_with_vfs(p, vfs, cx, &wal_path, allow_readonly).await
             }
         }
     }
 
-    fn install_existing_wal_backend(&self, cx: &Cx, db_path: &str) -> Result<bool> {
+    async fn install_existing_wal_backend(&self, cx: &Cx, db_path: &str) -> Result<bool> {
         self.install_existing_wal_backend_with_mode(cx, db_path, false)
+            .await
     }
 
-    fn install_existing_wal_backend_allow_readonly(&self, cx: &Cx, db_path: &str) -> Result<bool> {
+    async fn install_existing_wal_backend_allow_readonly(
+        &self,
+        cx: &Cx,
+        db_path: &str,
+    ) -> Result<bool> {
         self.install_existing_wal_backend_with_mode(cx, db_path, true)
+            .await
     }
 
     fn set_wal_commit_sync_policy(&self, policy: WalCommitSyncPolicy) -> Result<()> {
@@ -3111,31 +3154,31 @@ impl PagerBackend {
     }
 
     /// Run a WAL checkpoint.
-    fn checkpoint(
+    async fn checkpoint(
         &self,
         cx: &Cx,
         mode: fsqlite_pager::CheckpointMode,
     ) -> Result<fsqlite_pager::CheckpointResult> {
         match self {
-            Self::Memory(p) => p.checkpoint(cx, mode),
+            Self::Memory(p) => p.checkpoint(cx, mode).await,
             #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(p) => p.checkpoint(cx, mode),
+            Self::IoUring(p) => p.checkpoint(cx, mode).await,
             #[cfg(all(feature = "native", unix))]
-            Self::Unix(p) => p.checkpoint(cx, mode),
+            Self::Unix(p) => p.checkpoint(cx, mode).await,
             #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(p) => p.checkpoint(cx, mode),
+            Self::Windows(p) => p.checkpoint(cx, mode).await,
         }
     }
 
-    fn export_bytes(&self, cx: &Cx) -> Result<Vec<u8>> {
+    async fn export_bytes(&self, cx: &Cx) -> Result<Vec<u8>> {
         match self {
-            Self::Memory(p) => p.export_database_bytes(cx),
+            Self::Memory(p) => p.export_database_bytes(cx).await,
             #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(p) => p.export_database_bytes(cx),
+            Self::IoUring(p) => p.export_database_bytes(cx).await,
             #[cfg(all(feature = "native", unix))]
-            Self::Unix(p) => p.export_database_bytes(cx),
+            Self::Unix(p) => p.export_database_bytes(cx).await,
             #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(p) => p.export_database_bytes(cx),
+            Self::Windows(p) => p.export_database_bytes(cx).await,
         }
     }
 
@@ -3299,16 +3342,16 @@ where
 /// invalid page size, or header-checksum mismatch. A short header read also
 /// classifies as empty. An unsupported format version on a checksum-valid
 /// header stays a hard error and is left to [`WalFile::open`].
-fn wal_sidecar_treated_as_empty<F: VfsFile>(cx: &Cx, file: &F) -> Result<bool> {
+async fn wal_sidecar_treated_as_empty<F: VfsFile>(cx: &Cx, file: &F) -> Result<bool> {
     let mut header_buf = [0_u8; fsqlite_wal::WAL_HEADER_SIZE];
-    let bytes_read = file.read(cx, &mut header_buf, 0)?;
+    let bytes_read = file.read(cx, &mut header_buf, 0).await?;
     if bytes_read < header_buf.len() {
         return Ok(true);
     }
     Ok(fsqlite_wal::wal_header_treated_as_empty(&header_buf))
 }
 
-fn install_wal_backend_with_vfs<V>(
+async fn install_wal_backend_with_vfs<V>(
     pager: &Arc<SimplePager<V>>,
     vfs: V,
     cx: &Cx,
@@ -3322,7 +3365,7 @@ where
         let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
         let (mut file, _) = vfs.open(cx, Some(wal_path), open_flags)?;
         if file.file_size(cx)? >= u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
-            if wal_sidecar_treated_as_empty(cx, &file)? {
+            if wal_sidecar_treated_as_empty(cx, &file).await? {
                 // GH #292: stock SQLite (`walIndexRecover`) treats a WAL whose
                 // header fails magic/page-size/checksum validation as EMPTY —
                 // e.g. a torn or garbage sidecar left by a killed process —
@@ -3337,7 +3380,7 @@ where
                 );
                 let _ = file.close(cx);
             } else {
-                match WalFile::open(cx, file) {
+                match WalFile::open(cx, file).await {
                     Ok(wal) => {
                         return install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true);
                     }
@@ -3353,11 +3396,11 @@ where
     let (file, _) = vfs.open(cx, Some(wal_path), create_flags)?;
     // Random salts (GH #201): a fresh WAL generation must not validate
     // frames from any stale or copied WAL of a previous generation.
-    let wal = WalFile::create(cx, file, pager.page_size().get(), 0, WalSalts::generate())?;
+    let wal = WalFile::create(cx, file, pager.page_size().get(), 0, WalSalts::generate()).await?;
     install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true)
 }
 
-fn install_existing_wal_backend_with_vfs<V>(
+async fn install_existing_wal_backend_with_vfs<V>(
     pager: &Arc<SimplePager<V>>,
     vfs: V,
     cx: &Cx,
@@ -3400,7 +3443,7 @@ where
     // GH #292: mirror stock SQLite — an invalid WAL header means "no WAL",
     // not a corrupt database. Read-only/existing installs proceed against
     // the main database exactly like the missing/short-sidecar cases above.
-    if wal_sidecar_treated_as_empty(cx, &file)? {
+    if wal_sidecar_treated_as_empty(cx, &file).await? {
         tracing::warn!(
             wal_path = %wal_path.display(),
             "WAL header failed validation; treating WAL as empty per stock SQLite semantics (GH #292)"
@@ -3409,7 +3452,7 @@ where
         return Ok(false);
     }
 
-    let wal = WalFile::open(cx, file)?;
+    let wal = WalFile::open(cx, file).await?;
     if allow_readonly {
         install_opened_wal_backend_bare(pager, cx, wal)?;
     } else {
@@ -5524,7 +5567,7 @@ impl PreparedStatement<'_> {
         Ok(Some(rows))
     }
 
-    fn try_query_row_clean_memory_count_star_fast(&self) -> Result<Option<Row>> {
+    async fn try_query_row_clean_memory_count_star_fast(&self) -> Result<Option<Row>> {
         let Some(PreparedQueryFastPath::SimpleCountStar { root_page }) =
             self.prepared_query_fast_path.as_ref()
         else {
@@ -5553,7 +5596,8 @@ impl PreparedStatement<'_> {
                 (count, "skipped_clean_memory_memdb_direct")
             } else if let Some(count) = self
                 .conn
-                .try_clean_memory_storage_count_cached_count(*root_page)?
+                .try_clean_memory_storage_count_cached_count(*root_page)
+                .await?
             {
                 (count, "skipped_clean_memory_storage_count_cache")
             } else {
@@ -5822,8 +5866,10 @@ impl PreparedStatement<'_> {
         (TableExecutionRuntimeRequirements::read_path(), None)
     }
 
-    fn ensure_schema_unchanged(&self, cx: &Cx) -> Result<()> {
-        let _ = self.ensure_schema_unchanged_with_prebound_publication(cx)?;
+    async fn ensure_schema_unchanged(&self, cx: &Cx) -> Result<()> {
+        let _ = self
+            .ensure_schema_unchanged_with_prebound_publication(cx)
+            .await?;
         Ok(())
     }
 
@@ -5873,7 +5919,7 @@ impl PreparedStatement<'_> {
         Ok(())
     }
 
-    fn ensure_schema_unchanged_with_prebound_publication(
+    async fn ensure_schema_unchanged_with_prebound_publication(
         &self,
         cx: &Cx,
     ) -> Result<PreparedDmlEntryProof> {
@@ -5898,7 +5944,8 @@ impl PreparedStatement<'_> {
             self.conn.refresh_prepared_schema_state(
                 cx,
                 self.can_use_lightweight_external_schema_refresh(),
-            )?
+            )
+            .await?
         } else {
             None
         };
@@ -5949,7 +5996,7 @@ impl PreparedStatement<'_> {
             }
     }
 
-    fn execute_table_program_with_reuse(
+    async fn execute_table_program_with_reuse(
         &self,
         op_cx: &Cx,
         params: Option<&[SqliteValue]>,
@@ -5966,9 +6013,10 @@ impl PreparedStatement<'_> {
             prebound_publication,
             false,
         )
+        .await
     }
 
-    fn execute_table_query_with_row_handler(
+    async fn execute_table_query_with_row_handler(
         &self,
         op_cx: &Cx,
         params: Option<&[SqliteValue]>,
@@ -5985,10 +6033,11 @@ impl PreparedStatement<'_> {
             prebound_publication,
             false,
         )
+        .await
         .map(|_| ())
     }
 
-    fn execute_table_program_dml_with_reuse(
+    async fn execute_table_program_dml_with_reuse(
         &self,
         op_cx: &Cx,
         params: Option<&[SqliteValue]>,
@@ -6004,7 +6053,8 @@ impl PreparedStatement<'_> {
                 op_cx,
                 params,
                 track_last_insert_rowid,
-            );
+            )
+            .await;
         }
         if hot_path_profile_enabled() {
             FSQLITE_PREPARED_UPDATE_DELETE_INSTRUMENTED_LANE_HITS
@@ -6020,10 +6070,11 @@ impl PreparedStatement<'_> {
             None,
             true,
         )
+        .await
         .map(|(_, changes, last_insert_rowid)| (changes, last_insert_rowid))
     }
 
-    fn execute_update_delete_table_program_dml_with_reuse_active_txn(
+    async fn execute_update_delete_table_program_dml_with_reuse_active_txn(
         &self,
         op_cx: &Cx,
         params: Option<&[SqliteValue]>,
@@ -6057,10 +6108,14 @@ impl PreparedStatement<'_> {
         let reject_mem = *self.conn.reject_mem_fallback.borrow();
         let (runtime_requirements, static_runtime_inputs) =
             self.prepared_table_program_runtime_inputs();
-        let runtime_inputs = static_runtime_inputs.unwrap_or_else(|| {
-            self.conn
-                .table_execution_runtime_inputs(runtime_requirements)
-        });
+        let runtime_inputs = match static_runtime_inputs {
+            Some(inputs) => inputs,
+            None => {
+                self.conn
+                    .table_execution_runtime_inputs(runtime_requirements)
+                    .await
+            }
+        };
         let cookie = *self.conn.schema_cookie.borrow();
         let txn = self.conn.active_txn.borrow_mut().take().ok_or_else(|| {
             FrankenError::Internal(
@@ -6098,7 +6153,8 @@ impl PreparedStatement<'_> {
             false,
             true,
             cached,
-        );
+        )
+        .await;
         let memdb_count_shortcuts_safe_after_exec = engine_back
             .as_ref()
             .is_some_and(|engine| engine.storage_cursor_memdb_count_shortcuts_safe());
@@ -6160,7 +6216,7 @@ impl PreparedStatement<'_> {
         }
     }
 
-    fn execute_table_query_row_with_row_cap(
+    async fn execute_table_query_row_with_row_cap(
         &self,
         op_cx: &Cx,
         params: Option<&[SqliteValue]>,
@@ -6173,9 +6229,10 @@ impl PreparedStatement<'_> {
             max_collected_result_rows,
             prebound_publication,
         )
+        .await
     }
 
-    fn execute_table_program_query_row_with_reuse_mode(
+    async fn execute_table_program_query_row_with_reuse_mode(
         &self,
         op_cx: &Cx,
         params: Option<&[SqliteValue]>,
@@ -6210,10 +6267,14 @@ impl PreparedStatement<'_> {
         let reject_mem = *self.conn.reject_mem_fallback.borrow();
         let (runtime_requirements, static_runtime_inputs) =
             self.prepared_table_program_runtime_inputs();
-        let runtime_inputs = static_runtime_inputs.unwrap_or_else(|| {
-            self.conn
-                .table_execution_runtime_inputs(runtime_requirements)
-        });
+        let runtime_inputs = match static_runtime_inputs {
+            Some(inputs) => inputs,
+            None => {
+                self.conn
+                    .table_execution_runtime_inputs(runtime_requirements)
+                    .await
+            }
+        };
         let cookie = *self.conn.schema_cookie.borrow();
         let had_active_txn = self.conn.active_txn.borrow().is_some();
         let inherited_implicit_read_txn =
@@ -6250,7 +6311,8 @@ impl PreparedStatement<'_> {
                 max_collected_result_rows,
                 true,
                 cached,
-            );
+            )
+            .await;
             let memdb_count_shortcuts_safe_after_exec = engine_back
                 .as_ref()
                 .is_some_and(|engine| engine.storage_cursor_memdb_count_shortcuts_safe());
@@ -6269,7 +6331,8 @@ impl PreparedStatement<'_> {
                     TransactionMode::ReadOnly,
                     op_cx,
                     prebound_publication,
-                )?
+                )
+                .await?
             };
             let txn = self.conn.active_txn.borrow_mut().take();
             let cached = self.conn.cached_vdbe_engine.borrow_mut().take();
@@ -6298,7 +6361,8 @@ impl PreparedStatement<'_> {
                 max_collected_result_rows,
                 true,
                 cached,
-            );
+            )
+            .await;
             let memdb_count_shortcuts_safe_after_exec = engine_back
                 .as_ref()
                 .is_some_and(|engine| engine.storage_cursor_memdb_count_shortcuts_safe());
@@ -6324,7 +6388,8 @@ impl PreparedStatement<'_> {
                 result.is_ok(),
                 false,
                 op_cx,
-            )?;
+            )
+            .await?;
         }
 
         match result {
@@ -6349,7 +6414,7 @@ impl PreparedStatement<'_> {
     }
 
     #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
-    fn execute_table_program_with_reuse_mode(
+    async fn execute_table_program_with_reuse_mode(
         &self,
         op_cx: &Cx,
         params: Option<&[SqliteValue]>,
@@ -6388,10 +6453,14 @@ impl PreparedStatement<'_> {
         let reject_mem = *self.conn.reject_mem_fallback.borrow();
         let (runtime_requirements, static_runtime_inputs) =
             self.prepared_table_program_runtime_inputs();
-        let runtime_inputs = static_runtime_inputs.unwrap_or_else(|| {
-            self.conn
-                .table_execution_runtime_inputs(runtime_requirements)
-        });
+        let runtime_inputs = match static_runtime_inputs {
+            Some(inputs) => inputs,
+            None => {
+                self.conn
+                    .table_execution_runtime_inputs(runtime_requirements)
+                    .await
+            }
+        };
         let cookie = *self.conn.schema_cookie.borrow();
         let had_active_txn = self.conn.active_txn.borrow().is_some();
         let inherited_implicit_read_txn =
@@ -6431,7 +6500,8 @@ impl PreparedStatement<'_> {
                 invalidate_memdb_count_shortcuts_on_success,
                 true,
                 cached,
-            );
+            )
+            .await;
             let memdb_count_shortcuts_safe_after_exec = engine_back
                 .as_ref()
                 .is_some_and(|engine| engine.storage_cursor_memdb_count_shortcuts_safe());
@@ -6450,7 +6520,8 @@ impl PreparedStatement<'_> {
                     TransactionMode::ReadOnly,
                     op_cx,
                     prebound_publication,
-                )?
+                )
+                .await?
             };
             let txn = self.conn.active_txn.borrow_mut().take();
             let cached = self.conn.cached_vdbe_engine.borrow_mut().take();
@@ -6482,7 +6553,8 @@ impl PreparedStatement<'_> {
                 invalidate_memdb_count_shortcuts_on_success,
                 true,
                 cached,
-            );
+            )
+            .await;
             let memdb_count_shortcuts_safe_after_exec = engine_back
                 .as_ref()
                 .is_some_and(|engine| engine.storage_cursor_memdb_count_shortcuts_safe());
@@ -6512,7 +6584,8 @@ impl PreparedStatement<'_> {
                 result.is_ok(),
                 false,
                 op_cx,
-            )?;
+            )
+            .await?;
         }
 
         match result {
@@ -6554,54 +6627,58 @@ impl PreparedStatement<'_> {
         }
     }
 
-    fn execute_table_query(
+    async fn execute_table_query(
         &self,
         op_cx: &Cx,
         params: Option<&[SqliteValue]>,
         prebound_publication: Option<BoundPagerPublication>,
     ) -> Result<Vec<Row>> {
         self.execute_table_program_with_reuse(op_cx, params, false, prebound_publication)
+            .await
             .map(|(rows, ..)| rows)
     }
 
     /// Execute as a query and return all result rows.
-    pub fn query(&self) -> Result<Vec<Row>> {
+    pub async fn query(&self) -> Result<Vec<Row>> {
         self.conn.background_status()?;
         self.conn
             .query_prepared_with_params_after_background_status(self, &[])
+            .await
     }
 
     /// Execute as a query with bound SQL parameters (`?1`, `?2`, ...).
-    pub fn query_with_params(&self, params: &[SqliteValue]) -> Result<Vec<Row>> {
+    pub async fn query_with_params(&self, params: &[SqliteValue]) -> Result<Vec<Row>> {
         self.conn.background_status()?;
         if let Some(rows) = self.try_query_clean_memory_indexed_equality_fast(params)? {
             return Ok(rows);
         }
         self.conn
             .query_prepared_with_params_after_background_status(self, params)
+            .await
     }
 
     /// Execute as a query with bound SQL parameters, invoking `f` for each row.
-    pub fn query_with_params_for_each<F>(&self, params: &[SqliteValue], f: F) -> Result<()>
+    pub async fn query_with_params_for_each<F>(&self, params: &[SqliteValue], f: F) -> Result<()>
     where
         F: FnMut(&Row) -> Result<()>,
     {
         self.conn.background_status()?;
         self.conn
             .query_prepared_with_params_for_each_after_background_status(self, params, f)
+            .await
     }
 
     /// Execute as a query and return exactly one row.
-    pub fn query_row(&self) -> Result<Row> {
-        self.query_row_internal(None)
+    pub async fn query_row(&self) -> Result<Row> {
+        self.query_row_internal(None).await
     }
 
     /// Execute as a query with parameters and return exactly one row.
-    pub fn query_row_with_params(&self, params: &[SqliteValue]) -> Result<Row> {
-        self.query_row_internal(Some(params))
+    pub async fn query_row_with_params(&self, params: &[SqliteValue]) -> Result<Row> {
+        self.query_row_internal(Some(params)).await
     }
 
-    fn query_row_internal(&self, params: Option<&[SqliteValue]>) -> Result<Row> {
+    async fn query_row_internal(&self, params: Option<&[SqliteValue]>) -> Result<Row> {
         self.conn.background_status()?;
         if let Some(params) = params
             && let Some(row_outcome) = self.try_query_row_clean_memory_rowid_lookup_fast(params)?
@@ -6609,7 +6686,7 @@ impl PreparedStatement<'_> {
             return direct_query_row_outcome_result(row_outcome);
         }
         if params.is_none()
-            && let Some(row) = self.try_query_row_clean_memory_count_star_fast()?
+            && let Some(row) = self.try_query_row_clean_memory_count_star_fast().await?
         {
             return Ok(direct_query_row_result(row));
         }
@@ -6620,6 +6697,7 @@ impl PreparedStatement<'_> {
         }
         self.conn
             .query_prepared_row_after_background_status(self, params)
+            .await
     }
 
     /// Return the number of columns this statement will produce per row.
@@ -6648,11 +6726,11 @@ impl PreparedStatement<'_> {
     /// parent Connection's execution pipeline, which handles triggers,
     /// constraints, and autocommit.  For SELECT statements, this returns
     /// the number of result rows.
-    pub fn execute(&self) -> Result<usize> {
+    pub async fn execute(&self) -> Result<usize> {
         if self.dml_dispatch.is_some() {
-            return self.conn.execute_prepared(self);
+            return self.conn.execute_prepared(self).await;
         }
-        Ok(self.query()?.len())
+        Ok(self.query().await?.len())
     }
 
     /// Execute with bound SQL parameters and return affected/output row count.
@@ -6661,11 +6739,14 @@ impl PreparedStatement<'_> {
     /// parent Connection's execution pipeline, which handles triggers,
     /// constraints, and autocommit.  For SELECT statements, this returns
     /// the number of result rows.
-    pub fn execute_with_params(&self, params: &[SqliteValue]) -> Result<usize> {
+    pub async fn execute_with_params(&self, params: &[SqliteValue]) -> Result<usize> {
         if self.dml_dispatch.is_some() {
-            return self.conn.execute_prepared_with_params(self, params);
+            return self
+                .conn
+                .execute_prepared_with_params(self, params)
+                .await;
         }
-        Ok(self.query_with_params(params)?.len())
+        Ok(self.query_with_params(params).await?.len())
     }
 
     /// Return an EXPLAIN-style disassembly for the compiled program.
@@ -6914,7 +6995,7 @@ fn trigger_event_matches(
 /// Uses the connection-level evaluator so scalar subqueries and EXISTS
 /// predicates honor bound OLD/NEW values instead of conservatively firing on a
 /// join-evaluator fallback.
-fn trigger_when_matches(
+async fn trigger_when_matches(
     connection: &Connection,
     when_clause: Option<&Expr>,
     frame: Option<&TriggerFrame>,
@@ -6930,6 +7011,7 @@ fn trigger_when_matches(
     let col_map: [(String, String, bool); 0] = [];
     connection
         .eval_expr_with_subqueries(&bound_expr, &row, &col_map, None)
+        .await
         .map(|value| is_sqlite_truthy(&value))
 }
 
@@ -9390,14 +9472,100 @@ impl Drop for MemFallbackRejectionOverrideGuard<'_> {
     }
 }
 
+struct BoolCellRestoreGuard<'a> {
+    cell: &'a Cell<bool>,
+    previous: bool,
+}
+
+impl<'a> BoolCellRestoreGuard<'a> {
+    fn new(cell: &'a Cell<bool>, value: bool) -> Self {
+        Self {
+            cell,
+            previous: cell.replace(value),
+        }
+    }
+}
+
+impl Drop for BoolCellRestoreGuard<'_> {
+    fn drop(&mut self) {
+        self.cell.set(self.previous);
+    }
+}
+
+struct BoolRefCellRestoreGuard<'a> {
+    cell: &'a RefCell<bool>,
+    previous: bool,
+}
+
+impl<'a> BoolRefCellRestoreGuard<'a> {
+    fn new(cell: &'a RefCell<bool>, value: bool) -> Self {
+        Self {
+            cell,
+            previous: cell.replace(value),
+        }
+    }
+}
+
+impl Drop for BoolRefCellRestoreGuard<'_> {
+    fn drop(&mut self) {
+        self.cell.replace(self.previous);
+    }
+}
+
+struct MemDatabaseRestoreGuard<'a> {
+    db: &'a RefCell<MemDatabase>,
+    live_db: Option<MemDatabase>,
+}
+
+impl<'a> MemDatabaseRestoreGuard<'a> {
+    fn new(db: &'a RefCell<MemDatabase>, snapshot: MemDatabase) -> Self {
+        Self {
+            db,
+            live_db: Some(db.replace(snapshot)),
+        }
+    }
+}
+
+impl Drop for MemDatabaseRestoreGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(live_db) = self.live_db.take() {
+            self.db.replace(live_db);
+        }
+    }
+}
+
+struct MaterializedTablesCleanupGuard<'a> {
+    conn: &'a Connection,
+    tables: Vec<(String, i32)>,
+}
+
+impl<'a> MaterializedTablesCleanupGuard<'a> {
+    fn new(conn: &'a Connection) -> Self {
+        Self {
+            conn,
+            tables: Vec::new(),
+        }
+    }
+
+    fn from_tables(conn: &'a Connection, tables: Vec<(String, i32)>) -> Self {
+        Self { conn, tables }
+    }
+}
+
+impl Drop for MaterializedTablesCleanupGuard<'_> {
+    fn drop(&mut self) {
+        self.conn.cleanup_cte_tables(&self.tables);
+    }
+}
+
 impl Connection {
     /// Open a connection.
     ///
     /// Creates an empty in-memory database. Expression-only SELECT and
     /// table-backed DML (CREATE TABLE, INSERT, SELECT FROM, UPDATE, DELETE)
     /// are supported.
-    pub fn open(path: impl Into<String>) -> Result<Self> {
-        Self::open_with_env(path, ConnectionEnv::default())
+    pub async fn open(path: impl Into<String>) -> Result<Self> {
+        Self::open_with_env(path, ConnectionEnv::default()).await
     }
 
     /// Open an existing file-backed database for reading and writing.
@@ -9406,8 +9574,8 @@ impl Connection {
     /// database file. Missing and zero-length paths return
     /// [`FrankenError::CannotOpen`], while malformed database images return
     /// [`FrankenError::DatabaseCorrupt`] without changing their contents.
-    pub fn open_existing(path: impl Into<String>) -> Result<Self> {
-        Self::open_existing_with_env(path, ConnectionEnv::default())
+    pub async fn open_existing(path: impl Into<String>) -> Result<Self> {
+        Self::open_existing_with_env(path, ConnectionEnv::default()).await
     }
 
     /// Open an existing file-backed database only if its already-open VFS
@@ -9423,7 +9591,7 @@ impl Connection {
     /// method returns. They must also prevent namespace replacement for the
     /// duration of open and recovery (for example with a cooperative writer
     /// lease in a trusted parent directory).
-    pub fn open_existing_with_expected_identity(
+    pub async fn open_existing_with_expected_identity(
         path: impl Into<String>,
         expected_identity: FileIdentity,
     ) -> Result<Self> {
@@ -9432,6 +9600,7 @@ impl Connection {
             expected_identity,
             ConnectionEnv::default(),
         )
+        .await
     }
 
     /// Initialize a caller-reserved empty database file only if its VFS
@@ -9446,7 +9615,7 @@ impl Connection {
     /// alias, because auxiliary artifacts are derived from this pathname. The
     /// containing namespace must remain protected from replacement throughout
     /// initialization.
-    pub fn open_reserved_with_expected_identity(
+    pub async fn open_reserved_with_expected_identity(
         path: impl Into<String>,
         expected_identity: FileIdentity,
     ) -> Result<Self> {
@@ -9455,6 +9624,7 @@ impl Connection {
             expected_identity,
             ConnectionEnv::default(),
         )
+        .await
     }
 
     /// Open a connection with strict multi-process refusal enabled.
@@ -9470,23 +9640,26 @@ impl Connection {
     /// ```
     ///
     /// See frankensqlite#81 and `ConnectionEnv::set_strict_multi_process`.
-    pub fn open_strict_multi_process(path: impl Into<String>) -> Result<Self> {
+    pub async fn open_strict_multi_process(path: impl Into<String>) -> Result<Self> {
         let mut env = ConnectionEnv::default();
         env.set_strict_multi_process(true);
-        Self::open_with_env(path, env)
+        Self::open_with_env(path, env).await
     }
 
     /// Open a connection while requesting a specific page size for newly created databases.
     ///
     /// Existing database files ignore the requested page size and continue to
     /// use the size encoded in their on-disk header.
-    pub fn open_with_page_size(path: impl Into<String>, page_size_bytes: u32) -> Result<Self> {
-        Self::open_with_page_size_and_env(path, page_size_bytes, ConnectionEnv::default())
+    pub async fn open_with_page_size(
+        path: impl Into<String>,
+        page_size_bytes: u32,
+    ) -> Result<Self> {
+        Self::open_with_page_size_and_env(path, page_size_bytes, ConnectionEnv::default()).await
     }
 
     /// Import a self-contained SQLite database image into a new in-memory connection.
-    pub fn import_bytes(bytes: &[u8]) -> Result<Self> {
-        Self::import_bytes_with_env(bytes, ConnectionEnv::default())
+    pub async fn import_bytes(bytes: &[u8]) -> Result<Self> {
+        Self::import_bytes_with_env(bytes, ConnectionEnv::default()).await
     }
 
     /// Open a connection that loads only the database schema (table
@@ -9507,8 +9680,8 @@ impl Connection {
     /// // Schema is available, queries work through pager-backed cursors.
     /// let rows = conn.query("SELECT count(*) FROM big_table")?;
     /// ```
-    pub fn open_schema_only(path: impl Into<String>) -> Result<Self> {
-        Self::open_schema_only_with_env(path, ConnectionEnv::default())
+    pub async fn open_schema_only(path: impl Into<String>) -> Result<Self> {
+        Self::open_schema_only_with_env(path, ConnectionEnv::default()).await
     }
 
     /// Open an existing file-backed database for reading and writing while
@@ -9517,8 +9690,8 @@ impl Connection {
     /// This combines the bounded-memory behavior of [`Self::open_schema_only`]
     /// with the existing-only, writable contract of [`Self::open_existing`].
     /// The main database file is never created or initialized by this method.
-    pub fn open_existing_schema_only(path: impl Into<String>) -> Result<Self> {
-        Self::open_existing_schema_only_with_env(path, ConnectionEnv::default())
+    pub async fn open_existing_schema_only(path: impl Into<String>) -> Result<Self> {
+        Self::open_existing_schema_only_with_env(path, ConnectionEnv::default()).await
     }
 
     /// Open a schema-only connection only if the read-only VFS handle has
@@ -9532,7 +9705,7 @@ impl Connection {
     /// filesystem identities may be recycled after the last handle closes. The
     /// containing namespace must remain protected from replacement throughout
     /// the open.
-    pub fn open_schema_only_with_expected_identity(
+    pub async fn open_schema_only_with_expected_identity(
         path: impl Into<String>,
         expected_identity: FileIdentity,
     ) -> Result<Self> {
@@ -9541,6 +9714,7 @@ impl Connection {
             expected_identity,
             ConnectionEnv::default(),
         )
+        .await
     }
 
     /// Open a writable, existing-only schema connection if the main database
@@ -9548,7 +9722,7 @@ impl Connection {
     ///
     /// The cooperative-path and no-alias requirements documented on
     /// [`Self::open_existing_with_expected_identity`] apply unchanged.
-    pub fn open_existing_schema_only_with_expected_identity(
+    pub async fn open_existing_schema_only_with_expected_identity(
         path: impl Into<String>,
         expected_identity: FileIdentity,
     ) -> Result<Self> {
@@ -9557,23 +9731,27 @@ impl Connection {
             expected_identity,
             ConnectionEnv::default(),
         )
+        .await
     }
 
     /// Open a schema-only connection with an explicit runtime environment.
     ///
     /// Behaves like [`open_schema_only`](Self::open_schema_only) but allows
     /// specifying a custom [`ConnectionEnv`].
-    pub fn open_schema_only_with_env(path: impl Into<String>, env: ConnectionEnv) -> Result<Self> {
-        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env, false)
+    pub async fn open_schema_only_with_env(
+        path: impl Into<String>,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env, false).await
     }
 
     /// Open a writable, existing-only schema connection with an explicit
     /// runtime environment.
-    pub fn open_existing_schema_only_with_env(
+    pub async fn open_existing_schema_only_with_env(
         path: impl Into<String>,
         env: ConnectionEnv,
     ) -> Result<Self> {
-        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env, true)
+        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env, true).await
     }
 
     /// Open an identity-bound schema-only connection with an explicit runtime
@@ -9581,7 +9759,7 @@ impl Connection {
     ///
     /// The exact cooperative-path and no-alias requirements documented on
     /// [`Self::open_schema_only_with_expected_identity`] also apply here.
-    pub fn open_schema_only_with_expected_identity_and_env(
+    pub async fn open_schema_only_with_expected_identity_and_env(
         path: impl Into<String>,
         expected_identity: FileIdentity,
         env: ConnectionEnv,
@@ -9592,11 +9770,12 @@ impl Connection {
             env,
             false,
         )
+        .await
     }
 
     /// Open an identity-bound, writable, existing-only schema connection with
     /// an explicit runtime environment.
-    pub fn open_existing_schema_only_with_expected_identity_and_env(
+    pub async fn open_existing_schema_only_with_expected_identity_and_env(
         path: impl Into<String>,
         expected_identity: FileIdentity,
         env: ConnectionEnv,
@@ -9607,9 +9786,10 @@ impl Connection {
             env,
             true,
         )
+        .await
     }
 
-    fn open_schema_only_with_optional_expected_identity_and_env(
+    async fn open_schema_only_with_optional_expected_identity_and_env(
         path: impl Into<String>,
         expected_identity: Option<FileIdentity>,
         env: ConnectionEnv,
@@ -9632,15 +9812,18 @@ impl Connection {
                 .create_child()
                 .with_trace_context(next_trace_id(), 0, 0);
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
-        let pager = retry_busy_connection_bootstrap(|| {
-            if writable {
+        let pager = if writable {
+            retry_busy_connection_bootstrap(|| {
                 PagerBackend::open_existing_with_page_buffer_max(
                     &path,
                     &bootstrap_cx,
                     expected_identity,
                     env.page_buffer_max(),
                 )
-            } else {
+            })
+            .await?
+        } else {
+            retry_busy_connection_bootstrap(|| {
                 PagerBackend::open_readonly_with_page_buffer_max(
                     &path,
                     &bootstrap_cx,
@@ -9648,8 +9831,9 @@ impl Connection {
                     env.page_buffer_max(),
                     env.memory_vfs_config(),
                 )
-            }
-        })?;
+            })
+            .await?
+        };
         let shared_mvcc_state = shared_mvcc_state_for_path(&path, Arc::clone(env.runtime()))?;
         let initial_visible_commit_seq = pager.published_snapshot().visible_commit_seq;
         shared_mvcc_state.align_commit_clock_floor(initial_visible_commit_seq);
@@ -9848,22 +10032,23 @@ impl Connection {
             // the invariant.
             fast_path_gate: AtomicU32::new(0),
         };
+        let op_cx = conn.op_cx()?;
         {
             let ms = conn.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
-            conn.pager.set_vfs_busy_timeout_ms(ms);
+            conn.pager.set_vfs_busy_timeout_ms(&op_cx, ms).await;
         }
         conn.register_cache_pages_module();
-        conn.bootstrap_journal_mode_from_storage(false)?;
+        conn.bootstrap_journal_mode_from_storage(false).await?;
         conn.bootstrap_pragma_state_from_storage();
         if writable {
-            conn.apply_current_journal_mode_to_pager()?;
+            conn.apply_current_journal_mode_to_pager().await?;
         } else {
-            conn.apply_current_journal_mode_to_pager_readonly()?;
+            conn.apply_current_journal_mode_to_pager_readonly().await?;
         }
         conn.apply_current_synchronous_to_pager()?;
-        let op_cx = conn.op_cx()?;
         // Explicitly load schema only — never hydrate row data.
-        conn.reload_memdb_from_pager_with_mode(&op_cx, false)?;
+        conn.reload_memdb_from_pager_with_mode(&op_cx, false)
+            .await?;
         conn.align_commit_clock_floor(*conn.memdb_visible_commit_seq.borrow());
         conn.sync_change_tracking_context();
         conn.attach_connection_pool_metrics();
@@ -9878,14 +10063,17 @@ impl Connection {
     ///
     /// The supplied [`ConnectionEnv`] selects the process-global or custom
     /// runtime context whose per-database region this connection joins.
-    pub fn open_with_env(path: impl Into<String>, env: ConnectionEnv) -> Result<Self> {
-        Self::open_with_page_size_and_env(path, PageSize::DEFAULT.get(), env)
+    pub async fn open_with_env(path: impl Into<String>, env: ConnectionEnv) -> Result<Self> {
+        Self::open_with_page_size_and_env(path, PageSize::DEFAULT.get(), env).await
     }
 
     /// Open an existing file-backed database with an explicit runtime
     /// environment, without creating or initializing the main database file.
-    pub fn open_existing_with_env(path: impl Into<String>, env: ConnectionEnv) -> Result<Self> {
-        Self::open_existing_with_optional_expected_identity_and_env(path, None, env)
+    pub async fn open_existing_with_env(
+        path: impl Into<String>,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        Self::open_existing_with_optional_expected_identity_and_env(path, None, env).await
     }
 
     /// Open an existing file-backed database with an explicit runtime
@@ -9894,7 +10082,7 @@ impl Connection {
     ///
     /// The exact cooperative-path and no-alias requirements documented on
     /// [`Self::open_existing_with_expected_identity`] also apply here.
-    pub fn open_existing_with_expected_identity_and_env(
+    pub async fn open_existing_with_expected_identity_and_env(
         path: impl Into<String>,
         expected_identity: FileIdentity,
         env: ConnectionEnv,
@@ -9904,6 +10092,7 @@ impl Connection {
             Some(expected_identity),
             env,
         )
+        .await
     }
 
     /// Initialize an identity-bound caller-reserved empty file with an
@@ -9911,7 +10100,7 @@ impl Connection {
     ///
     /// The exact cooperative-path and no-alias requirements documented on
     /// [`Self::open_reserved_with_expected_identity`] also apply here.
-    pub fn open_reserved_with_expected_identity_and_env(
+    pub async fn open_reserved_with_expected_identity_and_env(
         path: impl Into<String>,
         expected_identity: FileIdentity,
         env: ConnectionEnv,
@@ -9937,11 +10126,12 @@ impl Connection {
                 env.page_buffer_max(),
                 env.memory_vfs_config(),
             )
-        })?;
-        Self::open_with_env_and_pager(path, env, pager, true)
+        })
+        .await?;
+        Self::open_with_env_and_pager(path, env, pager, true).await
     }
 
-    fn open_existing_with_optional_expected_identity_and_env(
+    async fn open_existing_with_optional_expected_identity_and_env(
         path: impl Into<String>,
         expected_identity: Option<FileIdentity>,
         env: ConnectionEnv,
@@ -9966,8 +10156,9 @@ impl Connection {
                 expected_identity,
                 env.page_buffer_max(),
             )
-        })?;
-        Self::open_with_env_and_pager(path, env, pager, false)
+        })
+        .await?;
+        Self::open_with_env_and_pager(path, env, pager, false).await
     }
 
     /// Open a connection with an explicit runtime environment and requested
@@ -9975,7 +10166,7 @@ impl Connection {
     ///
     /// Existing database files keep the page size already encoded in their
     /// header; the request only affects brand-new databases.
-    pub fn open_with_page_size_and_env(
+    pub async fn open_with_page_size_and_env(
         path: impl Into<String>,
         page_size_bytes: u32,
         env: ConnectionEnv,
@@ -10017,13 +10208,14 @@ impl Connection {
                 env.page_buffer_max(),
                 env.memory_vfs_config(),
             )
-        })?;
-        Self::open_with_env_and_pager(path, env, pager, storage_was_empty)
+        })
+        .await?;
+        Self::open_with_env_and_pager(path, env, pager, storage_was_empty).await
     }
 
     /// Import a self-contained SQLite database image into an in-memory connection
     /// using the supplied runtime environment.
-    pub fn import_bytes_with_env(bytes: &[u8], env: ConnectionEnv) -> Result<Self> {
+    pub async fn import_bytes_with_env(bytes: &[u8], env: ConnectionEnv) -> Result<Self> {
         if bytes.is_empty() {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: "database image is empty".to_owned(),
@@ -10042,7 +10234,7 @@ impl Connection {
         let db_path = vfs.full_pathname(&bootstrap_cx, Path::new("/:memory:"))?;
         let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
         let (mut db_file, _) = vfs.open(&bootstrap_cx, Some(&db_path), flags)?;
-        db_file.write(&bootstrap_cx, bytes, 0)?;
+        db_file.write(&bootstrap_cx, bytes, 0).await?;
         db_file.sync(&bootstrap_cx, fsqlite_types::flags::SyncFlags::NORMAL)?;
         db_file.close(&bootstrap_cx)?;
         let mut pager = SimplePager::open_with_cx_and_page_buffer_max(
@@ -10051,13 +10243,14 @@ impl Connection {
             &db_path,
             PageSize::DEFAULT,
             env.page_buffer_max(),
-        )?;
+        )
+        .await?;
         let _ = pager.enable_single_connection_cache_fast_path();
         let pager = PagerBackend::Memory(Arc::new(pager));
-        Self::open_with_env_and_pager(path, env, pager, false)
+        Self::open_with_env_and_pager(path, env, pager, false).await
     }
 
-    fn open_with_env_and_pager(
+    async fn open_with_env_and_pager(
         path: String,
         env: ConnectionEnv,
         pager: PagerBackend,
@@ -10279,14 +10472,16 @@ impl Connection {
             // the invariant.
             fast_path_gate: AtomicU32::new(0),
         };
+        let op_cx = conn.op_cx()?;
         {
             let ms = conn.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
-            conn.pager.set_vfs_busy_timeout_ms(ms);
+            conn.pager.set_vfs_busy_timeout_ms(&op_cx, ms).await;
         }
         conn.register_cache_pages_module();
-        conn.bootstrap_journal_mode_from_storage(storage_was_empty)?;
+        conn.bootstrap_journal_mode_from_storage(storage_was_empty)
+            .await?;
         conn.bootstrap_pragma_state_from_storage();
-        conn.apply_current_journal_mode_to_pager()?;
+        conn.apply_current_journal_mode_to_pager().await?;
         conn.apply_current_synchronous_to_pager()?;
         // 5D.4 (bd-3bsn): Load initial state from pager instead of compat_persist.
         // Fresh private `:memory:` opens start from the same empty MemDatabase
@@ -10294,8 +10489,7 @@ impl Connection {
         // read transaction on the benchmark-critical setup path. Imported
         // memory images pass `storage_was_empty = false` and still hydrate.
         if !pager_is_memory || !storage_was_empty {
-            let op_cx = conn.op_cx()?;
-            conn.reload_memdb_from_pager(&op_cx)?;
+            conn.reload_memdb_from_pager(&op_cx).await?;
         }
         conn.align_commit_clock_floor(*conn.memdb_visible_commit_seq.borrow());
         conn.sync_change_tracking_context();
@@ -10317,11 +10511,12 @@ impl Connection {
     /// This is derived from the VFS's already-open main-file handle, never by
     /// looking up [`Self::path`]. File-backed Unix connections return `Some`;
     /// memory and backends without a stable descriptor identity return `None`.
-    pub fn file_identity(&self) -> Result<Option<FileIdentity>> {
+    pub async fn file_identity(&self) -> Result<Option<FileIdentity>> {
         if matches!(&self.pager, PagerBackend::Memory(_)) {
             return Ok(None);
         }
-        self.pager.file_identity()
+        let cx = self.op_cx()?;
+        self.pager.file_identity(&cx).await
     }
 
     fn attach_connection_pool_metrics(&self) {
@@ -10333,24 +10528,21 @@ impl Connection {
     }
 
     /// Export the current database as a self-contained SQLite database image.
-    pub fn export_bytes(&self) -> Result<Vec<u8>> {
+    pub async fn export_bytes(&self) -> Result<Vec<u8>> {
         let cx = self.op_cx()?;
-        self.quiesce_pager_export_state(&cx)?;
-        self.pager.export_bytes(&cx)
+        self.quiesce_pager_export_state(&cx).await?;
+        self.pager.export_bytes(&cx).await
     }
 
-    fn current_database_header(&self, cx: &Cx) -> Result<DatabaseHeader> {
-        let mut txn = self.begin_pager_txn_with_busy_timeout(
-            &self.pager,
-            cx,
-            TransactionMode::ReadOnly,
-            false,
-        )?;
+    async fn current_database_header(&self, cx: &Cx) -> Result<DatabaseHeader> {
+        let mut txn = self
+            .begin_pager_txn_with_busy_timeout(&self.pager, cx, TransactionMode::ReadOnly, false)
+            .await?;
         let header = {
-            let page1 = txn.get_page(cx, PageNumber::ONE)?;
+            let page1 = txn.get_page(cx, PageNumber::ONE).await?;
             parse_database_header_checked(page1.as_ref())
         }?;
-        let rollback_result = txn.rollback(cx);
+        let rollback_result = txn.rollback(cx).await;
         rollback_result?;
         Ok(header)
     }
@@ -10536,7 +10728,7 @@ impl Connection {
     }
 
     /// Finalize any parked pager state so export/copy operations see a quiescent DB.
-    fn quiesce_pager_export_state(&self, cx: &Cx) -> Result<()> {
+    async fn quiesce_pager_export_state(&self, cx: &Cx) -> Result<()> {
         if self.in_transaction.get()
             || self.active_txn.borrow().is_some()
             || !self.live_vtab_transactions.borrow().is_empty()
@@ -10550,11 +10742,11 @@ impl Connection {
         // retained batch before touching snapshots so the pager sees zero
         // active txns by the time we ask it to copy the file.
         if self.retained_autocommit_txn.borrow().is_some() {
-            self.flush_retained_autocommit_txn(cx)?;
+            self.flush_retained_autocommit_txn(cx).await?;
         }
 
-        self.invalidate_cached_read_snapshot(cx);
-        self.invalidate_cached_write_txn(cx);
+        self.invalidate_cached_read_snapshot(cx).await;
+        self.invalidate_cached_write_txn(cx).await;
         Ok(())
     }
 
@@ -10568,11 +10760,11 @@ impl Connection {
         self.current_last_insert_rowid()
     }
 
-    fn current_btree_cursor_sizes_in_txn<T: TransactionHandle + ?Sized>(
+    async fn current_btree_cursor_sizes_in_txn<T: TransactionHandle + ?Sized>(
         cx: &Cx,
         txn: &T,
     ) -> Result<(u32, u32)> {
-        let page1 = txn.get_page(cx, PageNumber::ONE)?;
+        let page1 = txn.get_page(cx, PageNumber::ONE).await?;
         let page1_bytes = page1.as_ref();
         if page1_bytes.iter().all(|&b| b == 0) || page1_bytes.len() < DATABASE_HEADER_SIZE {
             let default_page_size = PageSize::DEFAULT.get();
@@ -10599,13 +10791,13 @@ impl Connection {
         }
     }
 
-    fn new_pager_btree_cursor<'a, T: TransactionHandle + ?Sized>(
+    async fn new_pager_btree_cursor<'a, T: TransactionHandle + ?Sized>(
         cx: &Cx,
         txn: &'a mut T,
         root_page: PageNumber,
         is_table: bool,
     ) -> Result<fsqlite_btree::BtCursor<TransactionPageIo<'a, T>>> {
-        let (usable_size, page_size) = Self::current_btree_cursor_sizes_in_txn(cx, txn)?;
+        let (usable_size, page_size) = Self::current_btree_cursor_sizes_in_txn(cx, txn).await?;
         let mut cursor = fsqlite_btree::BtCursor::new(
             TransactionPageIo::new(txn),
             root_page,
@@ -10669,6 +10861,22 @@ impl Connection {
             FrankenError::Internal(format!("attached connection missing for schema: {schema}"))
         })?;
         f(conn.as_ref())
+    }
+
+    async fn with_attached_connection_async<T, F>(
+        &self,
+        schema: &str,
+        f: F,
+    ) -> Result<T>
+    where
+        F: std::ops::AsyncFnOnce(&Self) -> Result<T>,
+    {
+        let key = attached_schema_key(schema);
+        let attached_connections = self.attached_connections.borrow();
+        let conn = attached_connections.get(&key).ok_or_else(|| {
+            FrankenError::Internal(format!("attached connection missing for schema: {schema}"))
+        })?;
+        f(conn.as_ref()).await
     }
 
     fn validate_attached_target_schema(
@@ -10756,7 +10964,7 @@ impl Connection {
         }
     }
 
-    fn maybe_execute_attached_select(
+    async fn maybe_execute_attached_select(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -10790,9 +10998,11 @@ impl Connection {
             schema = %attached_schema,
             "delegating attached-schema SELECT to attached connection"
         );
-        self.with_attached_connection(&attached_schema, |conn| {
+        self.with_attached_connection_async(&attached_schema, async |conn| {
             conn.execute_statement(&Statement::Select(rewritten), params)
+                .await
         })
+        .await
         .map(Some)
     }
 
@@ -10863,11 +11073,14 @@ impl Connection {
         self.record_statement_changes(changes);
     }
 
-    fn maybe_execute_attached_target_statement(
-        &self,
-        statement: &Statement,
-        params: Option<&[SqliteValue]>,
-    ) -> Result<Option<Vec<Row>>> {
+    // Delegates to the attached connection's own statement execution, which can
+    // route back here, so the future is boxed to break the recursive type.
+    fn maybe_execute_attached_target_statement<'a>(
+        &'a self,
+        statement: &'a Statement,
+        params: Option<&'a [SqliteValue]>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<Row>>>> + 'a>> {
+        Box::pin(async move {
         if let Statement::Insert(insert) = statement
             && insert.with.is_some()
             && self.attached_target_schema(&insert.table)?.is_some()
@@ -10929,23 +11142,28 @@ impl Connection {
                             "table {table_name} already exists",
                         )));
                     }
-                    let source_rows =
-                        self.materialize_create_table_as_select_source_rows(select_stmt, params)?;
+                    let source_rows = self
+                        .materialize_create_table_as_select_source_rows(select_stmt, params)
+                        .await?;
                     let col_infos =
                         self.infer_create_table_as_select_column_infos(select_stmt, &source_rows);
-                    self.with_attached_connection(&target_schema, move |conn| {
+                    self.with_attached_connection_async(&target_schema, async move |conn| {
                         conn.execute_materialized_create_table_as_select_statement(
                             &rewritten,
                             col_infos,
                             &source_rows,
-                        )?;
+                        )
+                        .await?;
                         Ok(Vec::new())
                     })
+                    .await
                     .map(Some)
                 } else {
-                    self.with_attached_connection(&target_schema, |conn| {
+                    self.with_attached_connection_async(&target_schema, async |conn| {
                         conn.execute_statement(&Statement::CreateTable(rewritten), params)
+                            .await
                     })
+                    .await
                     .map(Some)
                 }
             }
@@ -10969,9 +11187,11 @@ impl Connection {
                     table = %create_index.table,
                     "delegating attached-schema CREATE INDEX to attached connection"
                 );
-                self.with_attached_connection(&target_schema, |conn| {
+                self.with_attached_connection_async(&target_schema, async |conn| {
                     conn.execute_statement(&Statement::CreateIndex(rewritten), params)
+                        .await
                 })
+                .await
                 .map(Some)
             }
             Statement::CreateView(create_view) => {
@@ -10989,9 +11209,11 @@ impl Connection {
                     view = %create_view.name.name,
                     "delegating attached-schema CREATE VIEW target"
                 );
-                self.with_attached_connection(&target_schema, |conn| {
+                self.with_attached_connection_async(&target_schema, async |conn| {
                     conn.execute_statement(&Statement::CreateView(rewritten), params)
+                        .await
                 })
+                .await
                 .map(Some)
             }
             Statement::Insert(insert) => {
@@ -11022,17 +11244,17 @@ impl Connection {
                             source_select = %select_stmt,
                             "materializing INSERT ... SELECT source rows before attached-target dispatch"
                         );
-                        let source_rows = self.materialize_insert_select_source_rows(
-                            insert,
-                            select_stmt,
-                            params,
-                        )?;
-                        let (result, changes, last_insert_rowid) =
-                            self.with_attached_connection(&target_schema, |conn| {
-                                let result = conn.execute_materialized_insert_select_statement(
-                                    &rewritten,
-                                    &source_rows,
-                                );
+                        let source_rows = self
+                            .materialize_insert_select_source_rows(insert, select_stmt, params)
+                            .await?;
+                        let (result, changes, last_insert_rowid) = self
+                            .with_attached_connection_async(&target_schema, async |conn| {
+                                let result = conn
+                                    .execute_materialized_insert_select_statement(
+                                        &rewritten,
+                                        &source_rows,
+                                    )
+                                    .await;
                                 let changes = conn.last_changes.get();
                                 let last_insert_rowid = (changes > 0
                                     && conn.attached_table_supports_last_insert_rowid(
@@ -11040,7 +11262,8 @@ impl Connection {
                                     ))
                                 .then(|| conn.current_last_insert_rowid());
                                 Ok((result, changes, last_insert_rowid))
-                            })?;
+                            })
+                            .await?;
                         match result {
                             Ok(affected) => {
                                 self.apply_attached_insert_tracking(affected, last_insert_rowid);
@@ -11061,10 +11284,11 @@ impl Connection {
                         }
                     }
                     _ => {
-                        let (result, changes, last_insert_rowid) =
-                            self.with_attached_connection(&target_schema, |conn| {
-                                let result =
-                                    conn.execute_statement(&Statement::Insert(rewritten), params);
+                        let (result, changes, last_insert_rowid) = self
+                            .with_attached_connection_async(&target_schema, async |conn| {
+                                let result = conn
+                                    .execute_statement(&Statement::Insert(rewritten), params)
+                                    .await;
                                 let changes = conn.last_changes.get();
                                 let last_insert_rowid = (changes > 0
                                     && conn.attached_table_supports_last_insert_rowid(
@@ -11072,7 +11296,8 @@ impl Connection {
                                     ))
                                 .then(|| conn.current_last_insert_rowid());
                                 Ok((result, changes, last_insert_rowid))
-                            })?;
+                            })
+                            .await?;
                         match result {
                             Ok(rows) => {
                                 self.apply_attached_insert_tracking(changes, last_insert_rowid);
@@ -11120,9 +11345,12 @@ impl Connection {
                 );
                 let preserve_prior_changes_on_constraint_violation =
                     update.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
-                let (result, changes) = self.with_attached_connection(&target_schema, |conn| {
+                let (result, changes) = self
+                    .with_attached_connection_async(&target_schema, async |conn| {
                     let previous_last_insert_rowid = conn.current_last_insert_rowid();
-                    let result = conn.execute_statement(&Statement::Update(rewritten), params);
+                    let result = conn
+                        .execute_statement(&Statement::Update(rewritten), params)
+                        .await;
                     let changes = conn.last_changes.get();
                     if preserve_prior_changes_on_constraint_violation
                         && matches!(
@@ -11135,7 +11363,8 @@ impl Connection {
                         conn.record_last_insert_rowid(previous_last_insert_rowid);
                     }
                     Ok((result, changes))
-                })?;
+                })
+                    .await?;
                 match result {
                     Ok(rows) => {
                         self.apply_attached_statement_tracking(changes);
@@ -11178,10 +11407,14 @@ impl Connection {
                     table = %delete.table.name.name,
                     "delegating attached-schema DELETE target"
                 );
-                let (rows, changes) = self.with_attached_connection(&target_schema, |conn| {
-                    let rows = conn.execute_statement(&Statement::Delete(rewritten), params)?;
-                    Ok((rows, conn.last_changes.get()))
-                })?;
+                let (rows, changes) = self
+                    .with_attached_connection_async(&target_schema, async |conn| {
+                        let rows = conn
+                            .execute_statement(&Statement::Delete(rewritten), params)
+                            .await?;
+                        Ok((rows, conn.last_changes.get()))
+                    })
+                    .await?;
                 self.reset_statement_change_count();
                 self.record_statement_changes(changes);
                 Ok(Some(rows))
@@ -11201,13 +11434,16 @@ impl Connection {
                     object = %drop_stmt.name.name,
                     "delegating attached-schema DROP target"
                 );
-                self.with_attached_connection(&target_schema, |conn| {
+                self.with_attached_connection_async(&target_schema, async |conn| {
                     conn.execute_statement(&Statement::Drop(rewritten), params)
+                        .await
                 })
+                .await
                 .map(Some)
             }
             _ => Ok(None),
         }
+        })
     }
 
     fn has_live_vtab_instance(&self, table_name: &str) -> bool {
@@ -11615,12 +11851,12 @@ impl Connection {
         cleanup_errors
     }
 
-    fn rollback_failed_implicit_savepoint_transaction(&self) -> Option<String> {
+    async fn rollback_failed_implicit_savepoint_transaction(&self) -> Option<String> {
         if !self.in_transaction.get() {
             return None;
         }
         let rollback_stmt = fsqlite_ast::RollbackStatement { to_savepoint: None };
-        self.execute_rollback(&rollback_stmt).err().map(|err| {
+        self.execute_rollback(&rollback_stmt).await.err().map(|err| {
             format!("implicit transaction rollback after SAVEPOINT setup failure failed: {err}")
         })
     }
@@ -11782,7 +12018,7 @@ impl Connection {
 
     /// Execute a scan against a live virtual-table instance using a
     /// previously computed [`LiveVtabScanPlan`].
-    fn scan_live_vtab_rows(
+    async fn scan_live_vtab_rows(
         &self,
         src: &JoinTableSource,
         plan: &LiveVtabScanPlan,
@@ -11807,12 +12043,12 @@ impl Connection {
             if let Some(is_lazy) = lazy_fts5 {
                 if is_lazy {
                     if plan.idx_num == 1 {
-                        return self.scan_lazy_fts5_match(src, plan);
+                        return self.scan_lazy_fts5_match(src, plan).await;
                     }
                     if !self.rootpage_zero_fts5_has_internal_content_shadow(&src.table_name) {
-                        return self.scan_lazy_contentless_fts5_rows(src);
+                        return self.scan_lazy_contentless_fts5_rows(src).await;
                     }
-                    self.promote_lazy_fts5_table(&src.table_name)?;
+                    self.promote_lazy_fts5_table(&src.table_name).await?;
                 }
                 let instances = self.vtab_instances.borrow();
                 let instance = instances.get(&key).ok_or_else(|| {
@@ -12219,10 +12455,10 @@ impl Connection {
     /// This point-reads `_data` id=1 (the averages row) so `COUNT(*)` can stay
     /// cheap without loading all segment leaves into memory.
     #[cfg(feature = "ext-fts5")]
-    fn read_fts5_lazy_doc_count(
+    async fn read_fts5_lazy_doc_count(
         &self,
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         page_size: PageSize,
         reserved_per_page: u8,
         schema: &[TableSchema],
@@ -12258,7 +12494,7 @@ impl Connection {
             resolve("_content")?,
             registry,
         );
-        match reader.read_data_block(FTS5_AVERAGES_ROWID)? {
+        match reader.read_data_block(FTS5_AVERAGES_ROWID).await? {
             Some(block) => Ok(usize::try_from(
                 Fts5AveragesRecord::decode(&block, column_count)?.total_rows,
             )
@@ -12268,10 +12504,10 @@ impl Connection {
     }
 
     #[cfg(feature = "ext-fts5")]
-    fn read_fts5_lazy_has_segments(
+    async fn read_fts5_lazy_has_segments(
         &self,
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         page_size: PageSize,
         reserved_per_page: u8,
         schema: &[TableSchema],
@@ -12299,7 +12535,7 @@ impl Connection {
             None,
             registry,
         );
-        let Some(block) = reader.read_data_block(FTS5_STRUCTURE_ROWID)? else {
+        let Some(block) = reader.read_data_block(FTS5_STRUCTURE_ROWID).await? else {
             return Ok(false);
         };
         Ok(Fts5StructureRecord::decode(&block)?.segment_count() > 0)
@@ -12310,10 +12546,10 @@ impl Connection {
     /// The reader reuses the query's read snapshot, so segment, idx, docsize,
     /// and content point reads stay MVCC-consistent with the surrounding query.
     #[cfg(feature = "ext-fts5")]
-    fn with_lazy_fts5_reader<R>(
+    async fn with_lazy_fts5_reader<R>(
         &self,
         table_name: &str,
-        f: impl FnOnce(&mut Fts5LiveShadowReader) -> Result<R>,
+        f: impl std::ops::AsyncFnOnce(&mut Fts5LiveShadowReader) -> Result<R>,
     ) -> Result<R> {
         let (data_root, idx_root, docsize_root, content_root) = {
             let schema = self.schema.borrow();
@@ -12344,11 +12580,13 @@ impl Connection {
             )
         };
         let registry = Arc::clone(&self.collation_registry);
-        self.with_integrity_txn(|cx, txn| {
-            let page1 = txn.get_page(cx, PageNumber::ONE)?;
+        let cx = self.op_cx()?;
+        let mut active_txn = self.active_txn.borrow_mut();
+        if let Some(txn) = active_txn.as_mut() {
+            let page1 = txn.get_page(&cx, PageNumber::ONE).await?;
             let header = parse_database_header_checked(page1.as_ref())?;
             let mut reader = Fts5LiveShadowReader::with_roots(
-                cx,
+                &cx,
                 txn,
                 header.page_size,
                 header.reserved_per_page,
@@ -12356,16 +12594,44 @@ impl Connection {
                 idx_root,
                 docsize_root,
                 content_root,
-                registry,
+                Arc::clone(&registry),
             );
-            f(&mut reader)
-        })
+            return f(&mut reader).await;
+        }
+        drop(active_txn);
+
+        self.invalidate_cached_write_txn(&cx).await;
+        self.invalidate_cached_read_snapshot(&cx).await;
+        let mut txn = self
+            .begin_pager_txn_with_busy_timeout(
+                &self.pager,
+                &cx,
+                TransactionMode::ReadOnly,
+                false,
+            )
+            .await?;
+        let page1 = txn.get_page(&cx, PageNumber::ONE).await?;
+        let header = parse_database_header_checked(page1.as_ref())?;
+        let mut reader = Fts5LiveShadowReader::with_roots(
+            &cx,
+            &mut txn,
+            header.page_size,
+            header.reserved_per_page,
+            data_root,
+            idx_root,
+            docsize_root,
+            content_root,
+            registry,
+        );
+        let result = f(&mut reader).await;
+        let _ = txn.rollback(&cx).await;
+        result
     }
 
     /// Answer an FTS5 MATCH scan for a lazy table by point-reading persisted
     /// segments and projecting `_content` only for matched rowids.
     #[cfg(feature = "ext-fts5")]
-    fn scan_lazy_fts5_match(
+    async fn scan_lazy_fts5_match(
         &self,
         src: &JoinTableSource,
         plan: &LiveVtabScanPlan,
@@ -12390,19 +12656,25 @@ impl Connection {
         let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
         let weights = vec![1.0_f64; column_count];
 
-        let scored = self.with_lazy_fts5_reader(&src.table_name, |reader| {
+        let fts5 = {
             let instances = self.vtab_instances.borrow();
-            let fts5 = instances
+            instances
                 .get(&key)
                 .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .cloned()
                 .ok_or_else(|| {
                     FrankenError::Internal(format!("virtual table not found: {}", src.table_name))
-                })?;
-            fts5.search_rows_lazy(reader, &query_refs, &weights)
-                .map_err(|error| {
-                    FrankenError::function_error(format!("fts5 query failed: {error}"))
-                })
-        })?;
+                })?
+        };
+        let scored = self
+            .with_lazy_fts5_reader(&src.table_name, async |reader| {
+                fts5.search_rows_lazy(reader, &query_refs, &weights)
+                    .await
+                    .map_err(|error| {
+                        FrankenError::function_error(format!("fts5 query failed: {error}"))
+                    })
+            })
+            .await?;
 
         Ok(scored
             .into_iter()
@@ -12427,7 +12699,7 @@ impl Connection {
     /// lists. `_docsize` contains one row per live document; projected user
     /// columns are NULL by definition, so the scan only needs those rowids.
     #[cfg(feature = "ext-fts5")]
-    fn scan_lazy_contentless_fts5_rows(
+    async fn scan_lazy_contentless_fts5_rows(
         &self,
         src: &JoinTableSource,
     ) -> Result<Vec<Vec<SqliteValue>>> {
@@ -12445,31 +12717,32 @@ impl Connection {
                 ),
             })?;
         let root = page_number_from_schema_root(root_page, &docsize_name, "fts5 docsize shadow")?;
-        self.with_integrity_txn(|cx, txn| {
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+        self.with_integrity_txn(async |cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
             let mut rows = Vec::new();
-            if cursor.first(cx)? {
+            if cursor.first(cx).await? {
                 loop {
-                    let rowid = cursor.rowid(cx)?;
+                    let rowid = cursor.rowid(cx).await?;
                     let mut row = vec![SqliteValue::Null; src.col_names.len()];
                     if src.hidden_rowid_projection.is_some() {
                         row.push(SqliteValue::Integer(rowid));
                     }
                     rows.push(row);
-                    if !cursor.next(cx)? {
+                    if !cursor.next(cx).await? {
                         break;
                     }
                 }
             }
             Ok(rows)
         })
+        .await
     }
 
     /// Promote a lazy on-disk FTS5 table into the in-memory representation for
     /// operations that need materialized rows: full scans, auxiliary scoring,
     /// rebuild, and writes.
     #[cfg(feature = "ext-fts5")]
-    fn promote_lazy_fts5_table(&self, table_name: &str) -> Result<()> {
+    async fn promote_lazy_fts5_table(&self, table_name: &str) -> Result<()> {
         let key = table_name.to_ascii_uppercase();
         {
             let instances = self.vtab_instances.borrow();
@@ -12484,15 +12757,16 @@ impl Connection {
 
         let schema_snapshot: Vec<TableSchema> = self.schema.borrow().clone();
         let alias_snapshot: HashMap<String, usize> = self.rowid_alias_columns.borrow().clone();
-        let content = self.with_integrity_txn(|cx, txn| {
-            let page1 = txn.get_page(cx, PageNumber::ONE)?;
+        let content = self.with_integrity_txn(async |cx, txn| {
+            let page1 = txn.get_page(cx, PageNumber::ONE).await?;
             let header = parse_database_header_checked(page1.as_ref())?;
             let master = Self::read_sqlite_master_rows_in_txn(
                 cx,
                 txn,
                 header.page_size,
                 header.reserved_per_page,
-            )?;
+            )
+            .await?;
             let create_sql = master
                 .iter()
                 .find_map(|row| {
@@ -12524,7 +12798,9 @@ impl Connection {
                 table_name,
                 &args,
             )
-        })?;
+            .await
+        })
+        .await?;
 
         let mut instances = self.vtab_instances.borrow_mut();
         let instance = instances.get_mut(&key).ok_or_else(|| {
@@ -12544,7 +12820,7 @@ impl Connection {
     }
 
     #[cfg(feature = "ext-fts5")]
-    fn build_fts5_aux_context_for_source(
+    async fn build_fts5_aux_context_for_source(
         &self,
         src: &JoinTableSource,
         queries: &[String],
@@ -12563,7 +12839,7 @@ impl Connection {
                     .is_some_and(Fts5Table::is_lazy_on_disk)
             };
             if is_lazy {
-                self.promote_lazy_fts5_table(&src.table_name)?;
+                self.promote_lazy_fts5_table(&src.table_name).await?;
             }
         }
         let instances = self.vtab_instances.borrow();
@@ -13112,7 +13388,7 @@ impl Connection {
                     }))
     }
 
-    fn try_execute_group_by_storage_substrate(
+    async fn try_execute_group_by_storage_substrate(
         &self,
         cx: &Cx,
         select: &SelectStatement,
@@ -13123,7 +13399,7 @@ impl Connection {
             return Ok(None);
         }
 
-        let program = match self.compile_table_select(select) {
+        let program = match self.compile_table_select(select).await {
             Ok(program) => program,
             Err(err) if *self.reject_mem_fallback_strict.borrow() => return Err(err),
             Err(_) => return Ok(None),
@@ -13139,14 +13415,16 @@ impl Connection {
         }
 
         let started = Instant::now();
-        let (rows, _, _) = self.execute_table_program_with_cx(
-            &program,
-            params,
-            false,
-            TableExecutionRuntimeRequirements::read_path(),
-            cx,
-            false,
-        )?;
+        let (rows, _, _) = self
+            .execute_table_program_with_cx(
+                &program,
+                params,
+                false,
+                TableExecutionRuntimeRequirements::read_path(),
+                cx,
+                false,
+            )
+            .await?;
         let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.log_aggregate_window_storage_substrate_complete(
             select,
@@ -13709,7 +13987,7 @@ impl Connection {
     }
 
     #[inline]
-    fn current_memory_autocommit_commit_seq(&self, txn: &dyn TransactionHandle) -> CommitSeq {
+    fn current_memory_autocommit_commit_seq(&self, txn: &TransactionKind) -> CommitSeq {
         txn.published_visible_commit_seq_hint()
             .unwrap_or_else(|| self.pager.published_snapshot().visible_commit_seq)
     }
@@ -13847,7 +14125,7 @@ impl Connection {
     ///
     /// Since data lives in the pager (not the MemDatabase), this reloads the
     /// MemDatabase from the pager before capturing the snapshot.
-    fn capture_time_travel_snapshot(&self, commit_seq: u64) {
+    async fn capture_time_travel_snapshot(&self, commit_seq: u64) {
         if self.path != ":memory:" {
             return;
         }
@@ -13859,7 +14137,7 @@ impl Connection {
         // the mirror as dirty (or when rows are not currently hydrated).
         if self.memdb_requires_active_txn_reload.get() || !self.memdb_rows_loaded.get() {
             if let Ok(cx) = self.op_cx() {
-                if let Err(err) = self.reload_memdb_from_pager(&cx) {
+                if let Err(err) = self.reload_memdb_from_pager(&cx).await {
                     tracing::warn!(
                         target: "fsqlite.time_travel",
                         "failed to reload memdb before capturing time-travel snapshot: {err}"
@@ -13888,7 +14166,7 @@ impl Connection {
         snaps.push(snapshot);
     }
 
-    fn bind_pager_publication(
+    async fn bind_pager_publication(
         &self,
         cx: &Cx,
         scenario_id: &'static str,
@@ -13938,9 +14216,10 @@ impl Connection {
             }
             let snapshot = if scenario_id == "clean_file_backed_memdb_staleness_check" {
                 self.pager
-                    .refresh_published_snapshot_for_clean_wal_read(cx)?
+                    .refresh_published_snapshot_for_clean_wal_read(cx)
+                    .await?
             } else {
-                self.pager.refresh_published_snapshot(cx)?
+                self.pager.refresh_published_snapshot(cx).await?
             };
             BoundPagerPublication {
                 snapshot,
@@ -14048,10 +14327,10 @@ impl Connection {
         )
     }
 
-    fn refresh_concurrent_begin_from_open_txn(
+    async fn refresh_concurrent_begin_from_open_txn(
         &self,
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         snapshot: &mut Snapshot,
         hydrate_rows: bool,
     ) -> Result<()> {
@@ -14070,7 +14349,8 @@ impl Connection {
                 bound_visible_commit_seq,
                 hydrate_rows,
                 false,
-            )?;
+            )
+            .await?;
         }
 
         let opened_snapshot_high = self
@@ -14093,7 +14373,7 @@ impl Connection {
     /// Connections keep a local `MemDatabase` cache for VDBE execution. When other
     /// connections commit, this cache can become stale; before starting a new SQL
     /// transaction we must reload from pager to preserve snapshot correctness.
-    fn refresh_memdb_if_stale_with_publication(
+    async fn refresh_memdb_if_stale_with_publication(
         &self,
         cx: &Cx,
         scenario_id: &'static str,
@@ -14103,9 +14383,10 @@ impl Connection {
             scenario_id,
             self.should_eagerly_hydrate_memdb_rows(),
         )
+        .await
     }
 
-    fn refresh_memdb_if_stale_with_publication_and_mode(
+    async fn refresh_memdb_if_stale_with_publication_and_mode(
         &self,
         cx: &Cx,
         scenario_id: &'static str,
@@ -14117,7 +14398,7 @@ impl Connection {
             return Ok(publication);
         }
 
-        let publication = self.bind_pager_publication(cx, scenario_id)?;
+        let publication = self.bind_pager_publication(cx, scenario_id).await?;
         if publication.snapshot.visible_commit_seq > *self.memdb_visible_commit_seq.borrow()
             || (hydrate_rows && !self.memdb_rows_loaded.get())
         {
@@ -14132,19 +14413,22 @@ impl Connection {
                 cx,
                 &publication,
                 hydrate_rows,
-            )?;
+            )
+            .await?;
         }
         self.remember_autocommit_publication(scenario_id, publication);
         Ok(publication)
     }
 
-    fn refresh_memdb_if_stale(&self, cx: &Cx) -> Result<()> {
-        let _ = self.refresh_memdb_if_stale_with_publication(cx, "memdb_staleness_check")?;
+    async fn refresh_memdb_if_stale(&self, cx: &Cx) -> Result<()> {
+        let _ = self
+            .refresh_memdb_if_stale_with_publication(cx, "memdb_staleness_check")
+            .await?;
         Ok(())
     }
 
-    fn refresh_memdb_from_active_txn_if_dirty(&self, cx: &Cx) -> Result<()> {
-        self.flush_pending_direct_write_runs(cx)?;
+    async fn refresh_memdb_from_active_txn_if_dirty(&self, cx: &Cx) -> Result<()> {
+        self.flush_pending_direct_write_runs(cx).await?;
 
         if !self.pending_memdb_direct_upserts.borrow().is_empty() {
             self.flush_pending_memdb_direct_upserts();
@@ -14164,7 +14448,7 @@ impl Connection {
                     self.memdb_requires_active_txn_reload.set(false);
                     return Ok(());
                 }
-                return self.reload_memdb_from_pager(cx);
+                return self.reload_memdb_from_pager(cx).await;
             }
             return Err(FrankenError::internal(
                 "memdb refresh from active transaction requires active_txn",
@@ -14182,10 +14466,17 @@ impl Connection {
         let txn = active_txn.as_mut().ok_or_else(|| {
             FrankenError::internal("memdb refresh from active transaction requires active_txn")
         })?;
-        self.reload_memdb_from_txn_with_mode(cx, txn, bound_visible_commit_seq, hydrate_rows, false)
+        self.reload_memdb_from_txn_with_mode(
+            cx,
+            txn,
+            bound_visible_commit_seq,
+            hydrate_rows,
+            false,
+        )
+        .await
     }
 
-    fn refresh_memdb_from_cached_write_txn_if_stale(&self, cx: &Cx) -> Result<()> {
+    async fn refresh_memdb_from_cached_write_txn_if_stale(&self, cx: &Cx) -> Result<()> {
         if !self.pager.is_memory() {
             return Ok(());
         }
@@ -14217,7 +14508,8 @@ impl Connection {
                 cx,
                 txn,
                 bound_visible_commit_seq,
-            );
+            )
+            .await;
             if reload_result.is_ok() {
                 self.cached_write_txn_memdb_row_mirror_exact.set(true);
             }
@@ -14235,7 +14527,8 @@ impl Connection {
             bound_visible_commit_seq,
             hydrate_rows,
             false,
-        );
+        )
+        .await;
         if reload_result.is_ok() {
             self.cached_write_txn_memdb_row_mirror_exact
                 .set(hydrate_rows);
@@ -14243,14 +14536,14 @@ impl Connection {
         reload_result
     }
 
-    fn begin_pager_txn_with_busy_timeout(
+    async fn begin_pager_txn_with_busy_timeout(
         &self,
         pager: &PagerBackend,
         cx: &Cx,
         mode: TransactionMode,
         refresh_memdb_during_busy_wait: bool,
     ) -> Result<TransactionKind> {
-        match pager.begin(cx, mode) {
+        match pager.begin(cx, mode).await {
             Ok(txn) => return Ok(txn),
             Err(FrankenError::Busy) => {}
             Err(err) => return Err(err),
@@ -14274,11 +14567,11 @@ impl Connection {
             {
                 return Err(FrankenError::Busy);
             }
-            perform_begin_busy_retry_handoff(wait);
+            perform_begin_busy_retry_handoff(wait).await;
             if refresh_memdb_during_busy_wait {
-                self.refresh_memdb_if_stale(cx)?;
+                self.refresh_memdb_if_stale(cx).await?;
             }
-            match pager.begin(cx, mode) {
+            match pager.begin(cx, mode).await {
                 Ok(txn) => return Ok(txn),
                 Err(FrankenError::Busy) => {}
                 Err(err) => return Err(err),
@@ -14299,7 +14592,7 @@ impl Connection {
         }
     }
 
-    fn refresh_prepared_schema_state(
+    async fn refresh_prepared_schema_state(
         &self,
         cx: &Cx,
         allow_lightweight_refresh: bool,
@@ -14309,13 +14602,16 @@ impl Connection {
         if profile_enabled {
             FSQLITE_PREPARED_SCHEMA_REFRESHES.fetch_add(1, AtomicOrdering::Relaxed);
         }
-        let result = (|| {
+        let result: Result<Option<BoundPagerPublication>> = async {
             // In-memory databases cannot become stale from external connections,
             // so skip the staleness check entirely. Schema changes within the
             // same connection are caught by the schema_generation comparison
             // in ensure_schema_unchanged, not by memdb staleness.
             if self.committed_pager_refresh_allowed() {
-                match self.try_refresh_prepared_metadata_if_stale(cx, allow_lightweight_refresh)? {
+                match self
+                    .try_refresh_prepared_metadata_if_stale(cx, allow_lightweight_refresh)
+                    .await?
+                {
                     PreparedSchemaRefreshResult {
                         outcome: PreparedSchemaRefreshOutcome::Noop,
                         publication,
@@ -14337,7 +14633,8 @@ impl Connection {
                         // bd-db300.4.5.2: Reuse the publication that
                         // try_refresh_prepared_metadata_if_stale already bound,
                         // avoiding a redundant bind_pager_publication call.
-                        self.reload_memdb_from_pager_with_prebound_publication(cx, &publication)?;
+                        self.reload_memdb_from_pager_with_prebound_publication(cx, &publication)
+                            .await?;
                         if profile_enabled {
                             FSQLITE_PREPARED_SCHEMA_FULL_RELOADS
                                 .fetch_add(1, AtomicOrdering::Relaxed);
@@ -14350,17 +14647,20 @@ impl Connection {
                 }
             }
             Ok(None)
-        })();
+        }
+        .await;
         record_hot_path_duration(&FSQLITE_PREPARED_SCHEMA_REFRESH_TIME_NS, start);
         result
     }
 
-    fn try_refresh_prepared_metadata_if_stale(
+    async fn try_refresh_prepared_metadata_if_stale(
         &self,
         cx: &Cx,
         allow_lightweight_refresh: bool,
     ) -> Result<PreparedSchemaRefreshResult> {
-        let publication = self.bind_pager_publication(cx, "prepared_schema_refresh")?;
+        let publication = self
+            .bind_pager_publication(cx, "prepared_schema_refresh")
+            .await?;
         let bound_visible_commit_seq = publication.snapshot.visible_commit_seq;
         if bound_visible_commit_seq <= *self.memdb_visible_commit_seq.borrow() {
             return Ok(PreparedSchemaRefreshResult {
@@ -14382,15 +14682,16 @@ impl Connection {
             cx,
             TransactionMode::ReadOnly,
             false,
-        )?;
+        )
+        .await?;
         let header = {
-            let page1 = txn.get_page(cx, PageNumber::ONE)?;
+            let page1 = txn.get_page(cx, PageNumber::ONE).await?;
             parse_database_header_checked(page1.as_ref())
         };
         let header = match header {
             Ok(header) => header,
             Err(_) => {
-                let _ = txn.rollback(cx);
+                let _ = txn.rollback(cx).await;
                 return Ok(PreparedSchemaRefreshResult {
                     outcome: PreparedSchemaRefreshOutcome::FullReloadRequired,
                     publication,
@@ -14398,7 +14699,7 @@ impl Connection {
             }
         };
         if header.schema_cookie != current_schema_cookie {
-            let _ = txn.rollback(cx);
+            let _ = txn.rollback(cx).await;
             return Ok(PreparedSchemaRefreshResult {
                 outcome: PreparedSchemaRefreshOutcome::FullReloadRequired,
                 publication,
@@ -14406,7 +14707,9 @@ impl Connection {
         }
 
         if !self.autoincrement_tables.borrow().is_empty() {
-            let cache = self.read_sqlite_sequence_cache_in_txn(cx, &mut txn)?;
+            let cache = self
+                .read_sqlite_sequence_cache_in_txn(cx, &mut txn)
+                .await?;
             *self.sqlite_sequence_cache.borrow_mut() = cache;
         }
 
@@ -14421,7 +14724,7 @@ impl Connection {
         // cross-process commit. See
         // `set_memdb_visible_commit_seq_from_publication` for the contract.
         self.set_memdb_visible_commit_seq_from_publication(bound_visible_commit_seq);
-        let _ = txn.rollback(cx);
+        let _ = txn.rollback(cx).await;
         Ok(PreparedSchemaRefreshResult {
             outcome: PreparedSchemaRefreshOutcome::Lightweight,
             publication,
@@ -14434,12 +14737,12 @@ impl Connection {
     /// header (`read_version`/`write_version` == 2). Mirror that behavior,
     /// keep brand-new file databases on FrankenSQLite's WAL default, and use
     /// a sibling `-wal` file only when page 1 is not a valid authority.
-    fn bootstrap_journal_mode_from_storage(&self, storage_was_empty: bool) -> Result<()> {
+    async fn bootstrap_journal_mode_from_storage(&self, storage_was_empty: bool) -> Result<()> {
         if self.path == ":memory:" {
             "memory".clone_into(&mut self.pragma_state.borrow_mut().journal_mode);
             return Ok(());
         }
-        let header = self.pragma_database_header().ok().flatten();
+        let header = self.pragma_database_header().await.ok().flatten();
         let header_requests_wal = header
             .as_ref()
             .is_some_and(|header| header.write_version == 2 || header.read_version == 2);
@@ -14476,8 +14779,8 @@ impl Connection {
     /// 1. Roll back any active transaction.
     /// 2. Run a passive checkpoint (WAL -> DB).
     /// 3. Mark the connection as closed so `Drop` doesn't repeat cleanup.
-    pub fn close(mut self) -> Result<()> {
-        self.close_in_place()
+    pub async fn close(mut self) -> Result<()> {
+        self.close_in_place().await
     }
 
     /// Close the connection without forcing a final WAL checkpoint.
@@ -14486,14 +14789,14 @@ impl Connection {
     /// when the process is about to exit or when a caller explicitly wants to
     /// avoid paying close-time checkpoint latency. Subsequent opens will
     /// recover and publish the WAL contents normally.
-    pub fn close_without_checkpoint(mut self) -> Result<()> {
-        self.close_without_checkpoint_in_place()
+    pub async fn close_without_checkpoint(mut self) -> Result<()> {
+        self.close_without_checkpoint_in_place().await
     }
 
     /// Close the connection in place while retaining the `Connection` value on
     /// error so callers can inspect or retry the handle.
-    pub fn close_in_place(&mut self) -> Result<()> {
-        self.close_internal(false, true)
+    pub async fn close_in_place(&mut self) -> Result<()> {
+        self.close_internal(false, true).await
     }
 
     /// Close the connection in place without forcing a final WAL checkpoint.
@@ -14501,18 +14804,22 @@ impl Connection {
     /// This still rolls back or flushes transaction state and tears down
     /// runtime regions; it only skips the passive checkpoint that `close()`
     /// normally performs in WAL mode.
-    pub fn close_without_checkpoint_in_place(&mut self) -> Result<()> {
-        self.close_internal(false, false)
+    pub async fn close_without_checkpoint_in_place(&mut self) -> Result<()> {
+        self.close_internal(false, false).await
     }
 
     /// Close the connection using the same no-checkpoint best-effort shutdown
     /// path used by `Drop`, but mark it closed so dropping the handle is not
     /// reported as an API misuse.
-    pub fn close_best_effort_in_place(&mut self) {
-        let _ = self.close_internal(true, false);
+    pub async fn close_best_effort_in_place(&mut self) {
+        let _ = self.close_internal(true, false).await;
     }
 
-    fn close_internal(&mut self, best_effort: bool, checkpoint_on_close: bool) -> Result<()> {
+    async fn close_internal(
+        &mut self,
+        best_effort: bool,
+        checkpoint_on_close: bool,
+    ) -> Result<()> {
         if *self.closed.get_mut() {
             return Ok(());
         }
@@ -14522,16 +14829,16 @@ impl Connection {
         let cx = self.teardown_cx();
         // Rollback any cached read-only snapshot before closing.
         if let Some(mut cached) = self.cached_read_snapshot.get_mut().take() {
-            let _ = cached.rollback(&cx);
+            let _ = cached.rollback(&cx).await;
         }
         // :memory: connections are connection-local and disappear on close, so
         // there is no value in flushing parked write transactions into a
         // database that is about to be destroyed. Release them cheaply instead.
         if let Some(mut cached) = self.cached_write_txn.get_mut().take() {
             let result = if close_memory_db {
-                cached.rollback(&cx)
+                cached.rollback(&cx).await
             } else {
-                cached.commit(&cx)
+                cached.commit(&cx).await
             };
             if !best_effort {
                 result?;
@@ -14541,9 +14848,9 @@ impl Connection {
         // Unlike cached_write_txn, retained_autocommit_txn has UNCOMMITTED writes.
         if let Some(mut retained) = self.retained_autocommit_txn.get_mut().take() {
             let result = if close_memory_db {
-                retained.rollback(&cx)
+                retained.rollback(&cx).await
             } else {
-                retained.commit(&cx)
+                retained.commit(&cx).await
             };
             if !best_effort {
                 result?;
@@ -14570,9 +14877,9 @@ impl Connection {
             // borrow so that `self.live_vtab_rollback_all` can borrow below.
             if let Some(txn) = self.active_txn.get_mut().as_mut() {
                 if best_effort {
-                    let _ = txn.rollback(&cx);
+                    let _ = txn.rollback(&cx).await;
                 } else {
-                    txn.rollback(&cx)?;
+                    txn.rollback(&cx).await?;
                 }
             }
             let _ = self.active_txn.get_mut().take();
@@ -14615,9 +14922,12 @@ impl Connection {
             && !self.wal_checkpoint_blocked_by_active_concurrent_txns()
         {
             if best_effort {
-                let _ = self.pager.checkpoint(&cx, CheckpointMode::Passive);
+                let _ = self.pager.checkpoint(&cx, CheckpointMode::Passive).await;
             } else {
-                let _ = self.pager.checkpoint(&cx, CheckpointMode::Passive)?;
+                let _ = self
+                    .pager
+                    .checkpoint(&cx, CheckpointMode::Passive)
+                    .await?;
             }
         }
 
@@ -14869,14 +15179,15 @@ impl Connection {
     }
 
     /// Prepare SQL into a statement.
-    pub fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>> {
+    pub async fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>> {
         self.background_status()?;
-        self.prepare_after_background_status(sql)
+        self.prepare_after_background_status(sql).await
     }
 
-    fn prepare_after_background_status(&self, sql: &str) -> Result<PreparedStatement<'_>> {
+    async fn prepare_after_background_status(&self, sql: &str) -> Result<PreparedStatement<'_>> {
         let op_cx = self.op_cx_after_background_status();
-        self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)?;
+        self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)
+            .await?;
         if self.committed_pager_refresh_allowed() {
             // File-backed autocommit prepares must refresh the committed MemDB
             // image before prepared-cache lookup so any cache hit is keyed
@@ -14886,14 +15197,15 @@ impl Connection {
             // that path may advance `memdb_visible_commit_seq` without
             // hydrating rows, which would make a stale row image look current
             // to file-backed direct row lookup preparation.
-            self.refresh_memdb_from_active_txn_if_dirty(&op_cx)?;
+            self.refresh_memdb_from_active_txn_if_dirty(&op_cx)
+                .await?;
             if !self.memdb_rows_loaded.get() {
-                self.reload_memdb_from_pager(&op_cx)?;
+                self.reload_memdb_from_pager(&op_cx).await?;
             } else {
-                self.refresh_memdb_if_stale(&op_cx)?;
+                self.refresh_memdb_if_stale(&op_cx).await?;
             }
         }
-        let _ = self.refresh_prepared_schema_state(&op_cx, true)?;
+        let _ = self.refresh_prepared_schema_state(&op_cx, true).await?;
         let profile_enabled = hot_path_profile_enabled();
         let lookup_start = profile_enabled.then(Instant::now);
         self.refresh_parse_cache_if_needed(sql);
@@ -14912,7 +15224,7 @@ impl Connection {
             FSQLITE_PREPARED_CACHE_MISSES.fetch_add(1, AtomicOrdering::Relaxed);
         }
         record_hot_path_duration(&FSQLITE_PREPARED_LOOKUP_TIME_NS, lookup_start);
-        let prepared = self.prepare_uncached(sql)?;
+        let prepared = self.prepare_uncached(sql).await?;
         let cache_insert_start = profile_enabled.then(Instant::now);
         self.insert_prepared_cache(key, sql, &prepared);
         self.log_statement_reuse_event("prepared", sql, false, "none", 0, 0, "none");
@@ -14921,7 +15233,7 @@ impl Connection {
         Ok(prepared)
     }
 
-    fn prepare_uncached(&self, sql: &str) -> Result<PreparedStatement<'_>> {
+    async fn prepare_uncached(&self, sql: &str) -> Result<PreparedStatement<'_>> {
         let statement = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                 .then(|| {
@@ -14956,7 +15268,7 @@ impl Connection {
                 FSQLITE_REWRITE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
             }
             let start = profile_enabled.then(Instant::now);
-            let statement = self.rewrite_subquery_statement(&statement, None)?;
+            let statement = self.rewrite_subquery_statement(&statement, None).await?;
             if let Some(start) = start {
                 FSQLITE_REWRITE_TIME_NS.fetch_add(
                     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -14980,7 +15292,7 @@ impl Connection {
                     span
                 });
             let _plan_guard = plan_span.as_ref().map(tracing::Span::enter);
-            self.compile_and_wrap(&canonical_sql, &statement)?
+            self.compile_and_wrap(&canonical_sql, &statement).await?
         } else {
             let plan_span =
                 tracing::enabled!(target: "fsqlite.plan", tracing::Level::TRACE).then(|| {
@@ -14994,7 +15306,7 @@ impl Connection {
                     span
                 });
             let _plan_guard = plan_span.as_ref().map(tracing::Span::enter);
-            self.compile_and_wrap(&canonical_sql, &statement)?
+            self.compile_and_wrap(&canonical_sql, &statement).await?
         };
         Ok(prepared)
     }
@@ -15004,7 +15316,7 @@ impl Connection {
     /// When `sql` contains multiple statements, only the result rows from the
     /// **last** statement are returned. Intermediate statement results are
     /// discarded. This matches common SQL driver semantics (last statement wins).
-    pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
+    pub async fn query(&self, sql: &str) -> Result<Vec<Row>> {
         self.background_status()?;
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
@@ -15024,14 +15336,20 @@ impl Connection {
         };
         let mut rows = Vec::new();
         for statement in statements {
-            rows = self.execute_statement_after_background_status(statement.as_ref(), None)?;
+            rows = self
+                .execute_statement_after_background_status(statement.as_ref(), None)
+                .await?;
             self.note_connection_statement_execution_count(1);
         }
         Ok(rows)
     }
 
     /// Prepare and execute SQL as a query with bound SQL parameters.
-    pub fn query_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
+    pub async fn query_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Vec<Row>> {
         self.background_status()?;
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
@@ -15052,13 +15370,16 @@ impl Connection {
         if statements.len() == 1
             && self.ad_hoc_query_supports_prepared_reuse(statements[0].as_ref())
         {
-            let prepared = self.prepare_after_background_status(sql)?;
-            return self.query_prepared_with_params_after_background_status(&prepared, params);
+            let prepared = self.prepare_after_background_status(sql).await?;
+            return self
+                .query_prepared_with_params_after_background_status(&prepared, params)
+                .await;
         }
         let mut rows = Vec::new();
         for statement in statements {
-            rows =
-                self.execute_statement_after_background_status(statement.as_ref(), Some(params))?;
+            rows = self
+                .execute_statement_after_background_status(statement.as_ref(), Some(params))
+                .await?;
             self.note_connection_statement_execution_count(1);
         }
         Ok(rows)
@@ -15066,7 +15387,7 @@ impl Connection {
 
     /// Prepare and execute SQL as a query with bound SQL parameters, invoking
     /// `f` for each row as it is produced.
-    pub fn query_with_params_for_each<F>(
+    pub async fn query_with_params_for_each<F>(
         &self,
         sql: &str,
         params: &[SqliteValue],
@@ -15095,21 +15416,23 @@ impl Connection {
         if statements.len() == 1
             && self.ad_hoc_query_supports_prepared_reuse(statements[0].as_ref())
         {
-            let prepared = self.prepare_after_background_status(sql)?;
+            let prepared = self.prepare_after_background_status(sql).await?;
             return self
-                .query_prepared_with_params_for_each_after_background_status(&prepared, params, f);
+                .query_prepared_with_params_for_each_after_background_status(&prepared, params, f)
+                .await;
         }
         let mut rows = Vec::new();
         for statement in statements {
-            rows =
-                self.execute_statement_after_background_status(statement.as_ref(), Some(params))?;
+            rows = self
+                .execute_statement_after_background_status(statement.as_ref(), Some(params))
+                .await?;
             self.note_connection_statement_execution_count(1);
         }
         rows.iter().try_for_each(f)
     }
 
     /// Prepare and execute SQL as a query, returning exactly one row.
-    pub fn query_row(&self, sql: &str) -> Result<Row> {
+    pub async fn query_row(&self, sql: &str) -> Result<Row> {
         self.background_status()?;
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
@@ -15130,20 +15453,28 @@ impl Connection {
         if statements.len() == 1
             && self.ad_hoc_query_supports_prepared_reuse(statements[0].as_ref())
         {
-            let prepared = self.prepare_after_background_status(sql)?;
-            return self.query_prepared_row_after_background_status(&prepared, None);
+            let prepared = self.prepare_after_background_status(sql).await?;
+            return self
+                .query_prepared_row_after_background_status(&prepared, None)
+                .await;
         }
 
         let mut rows = Vec::new();
         for statement in statements {
-            rows = self.execute_statement_after_background_status(statement.as_ref(), None)?;
+            rows = self
+                .execute_statement_after_background_status(statement.as_ref(), None)
+                .await?;
             self.note_connection_statement_execution_count(1);
         }
         exactly_one_row_or_error(rows)
     }
 
     /// Prepare and execute SQL as a query with bound SQL parameters, returning exactly one row.
-    pub fn query_row_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Row> {
+    pub async fn query_row_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Row> {
         self.background_status()?;
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
@@ -15164,13 +15495,16 @@ impl Connection {
         if statements.len() == 1
             && self.ad_hoc_query_supports_prepared_reuse(statements[0].as_ref())
         {
-            let prepared = self.prepare_after_background_status(sql)?;
-            return self.query_prepared_row_after_background_status(&prepared, Some(params));
+            let prepared = self.prepare_after_background_status(sql).await?;
+            return self
+                .query_prepared_row_after_background_status(&prepared, Some(params))
+                .await;
         }
         let mut rows = Vec::new();
         for statement in statements {
-            rows =
-                self.execute_statement_after_background_status(statement.as_ref(), Some(params))?;
+            rows = self
+                .execute_statement_after_background_status(statement.as_ref(), Some(params))
+                .await?;
             self.note_connection_statement_execution_count(1);
         }
         exactly_one_row_or_error(rows)
@@ -15181,7 +15515,7 @@ impl Connection {
     /// For DML (INSERT/UPDATE/DELETE) this returns the number of affected
     /// rows.  For SELECT and other statement types it returns the number of
     /// result rows.
-    pub fn execute(&self, sql: &str) -> Result<usize> {
+    pub async fn execute(&self, sql: &str) -> Result<usize> {
         self.background_status()?;
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
@@ -15202,12 +15536,13 @@ impl Connection {
         if statements.len() == 1
             && self.ad_hoc_execute_supports_prepared_reuse(statements[0].as_ref())?
         {
-            let prepared = self.prepare_after_background_status(sql)?;
+            let prepared = self.prepare_after_background_status(sql).await?;
             return self.execute_prepared_with_params_after_background_status(
                 &prepared,
                 &[],
                 false,
-            );
+            )
+            .await;
         }
         let mut last_count = 0;
         for statement in statements {
@@ -15215,7 +15550,9 @@ impl Connection {
                 statement.as_ref(),
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
             );
-            let rows = self.execute_statement_after_background_status(statement.as_ref(), None)?;
+            let rows = self
+                .execute_statement_after_background_status(statement.as_ref(), None)
+                .await?;
             self.note_connection_statement_execution_count(1);
             last_count = if is_dml {
                 self.last_changes.get()
@@ -15230,12 +15567,12 @@ impl Connection {
     ///
     /// Empty batches and batches containing only whitespace, semicolons, or
     /// SQL comments are treated as a no-op, matching SQLite batch semantics.
-    pub fn execute_batch(&self, sql: &str) -> Result<()> {
+    pub async fn execute_batch(&self, sql: &str) -> Result<()> {
         self.background_status()?;
         if batch_is_noop(sql)? {
             return Ok(());
         }
-        self.execute(sql).map(|_| ())
+        self.execute(sql).await.map(|_| ())
     }
 
     /// Begin a transaction without going through SQL parsing/dispatch.
@@ -15243,28 +15580,35 @@ impl Connection {
     /// This follows the same mode selection as plain `BEGIN`: explicit mode is
     /// absent, so `concurrent_mode_default` still controls whether the
     /// transaction auto-promotes to concurrent mode.
-    pub fn begin_transaction(&self) -> Result<()> {
+    pub async fn begin_transaction(&self) -> Result<()> {
         self.background_status()?;
         self.execute_begin(fsqlite_ast::BeginStatement { mode: None })
+            .await
     }
 
     /// Commit the active transaction without reparsing a `COMMIT` statement.
-    pub fn commit_transaction(&self) -> Result<()> {
+    pub async fn commit_transaction(&self) -> Result<()> {
         self.background_status()?;
         let cx = self.op_cx_after_background_status();
-        self.execute_commit_with_cx(&cx)
+        self.execute_commit_with_cx(&cx).await
     }
 
     /// Roll back the active transaction without reparsing a `ROLLBACK` statement.
-    pub fn rollback_transaction(&self) -> Result<()> {
+    pub async fn rollback_transaction(&self) -> Result<()> {
         self.background_status()?;
         let cx = self.op_cx_after_background_status();
         self.execute_rollback_with_cx(&cx, &fsqlite_ast::RollbackStatement { to_savepoint: None })
+            .await
     }
 
     /// Prepare and execute SQL with bound SQL parameters.
-    pub fn execute_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
+    pub async fn execute_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<usize> {
         self.execute_with_params_with_statement_savepoint_policy(sql, params, false)
+            .await
     }
 
     /// Prepare and execute SQL with bound SQL parameters, skipping the
@@ -15276,15 +15620,16 @@ impl Connection {
     /// boundary. If execution fails inside an explicit transaction, callers
     /// must roll back that transaction to discard any partial effects.
     /// Outside an explicit transaction this behaves like `execute_with_params`.
-    pub fn execute_with_params_skip_statement_savepoint_in_explicit_txn(
+    pub async fn execute_with_params_skip_statement_savepoint_in_explicit_txn(
         &self,
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<usize> {
         self.execute_with_params_with_statement_savepoint_policy(sql, params, true)
+            .await
     }
 
-    fn execute_with_params_with_statement_savepoint_policy(
+    async fn execute_with_params_with_statement_savepoint_policy(
         &self,
         sql: &str,
         params: &[SqliteValue],
@@ -15310,12 +15655,13 @@ impl Connection {
         if statements.len() == 1
             && self.ad_hoc_execute_supports_prepared_reuse(statements[0].as_ref())?
         {
-            let prepared = self.prepare_after_background_status(sql)?;
+            let prepared = self.prepare_after_background_status(sql).await?;
             return self.execute_prepared_with_params_after_background_status(
                 &prepared,
                 params,
                 skip_statement_savepoint_in_explicit_txn,
-            );
+            )
+            .await;
         }
         let mut last_count = 0;
         for statement in statements {
@@ -15323,8 +15669,9 @@ impl Connection {
                 statement.as_ref(),
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
             );
-            let rows =
-                self.execute_statement_after_background_status(statement.as_ref(), Some(params))?;
+            let rows = self
+                .execute_statement_after_background_status(statement.as_ref(), Some(params))
+                .await?;
             self.note_connection_statement_execution_count(1);
             last_count = if is_dml {
                 self.last_changes.get()
@@ -15389,26 +15736,30 @@ impl Connection {
     }
 
     /// Execute a prepared DML statement (INSERT/UPDATE/DELETE) with no parameters.
-    pub fn execute_prepared(&self, stmt: &PreparedStatement<'_>) -> Result<usize> {
-        self.execute_prepared_with_params(stmt, &[])
+    pub async fn execute_prepared(&self, stmt: &PreparedStatement<'_>) -> Result<usize> {
+        self.execute_prepared_with_params(stmt, &[]).await
     }
 
     /// Execute a prepared DML statement (INSERT/UPDATE/DELETE) with bound parameters.
-    pub fn execute_prepared_with_params(
+    pub async fn execute_prepared_with_params(
         &self,
         stmt: &PreparedStatement<'_>,
         params: &[SqliteValue],
     ) -> Result<usize> {
         self.background_status()?;
         self.execute_prepared_with_params_after_background_status(stmt, params, false)
+            .await
     }
 
-    fn execute_prepared_with_params_after_background_status(
-        &self,
-        stmt: &PreparedStatement<'_>,
-        params: &[SqliteValue],
+    // Prepared DML re-enters statement execution (triggers, FK cascades), which
+    // can route back here, so the future is boxed to break the recursive type.
+    fn execute_prepared_with_params_after_background_status<'a>(
+        &'a self,
+        stmt: &'a PreparedStatement<'_>,
+        params: &'a [SqliteValue],
         force_skip_statement_savepoint_in_explicit_txn: bool,
-    ) -> Result<usize> {
+    ) -> Pin<Box<dyn Future<Output = Result<usize>> + 'a>> {
+        Box::pin(async move {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
         if !std::ptr::eq(self, stmt.conn) {
             return Err(FrankenError::internal(
@@ -15483,7 +15834,8 @@ impl Connection {
                     microbatch_carry_verified_in_txn: true,
                 }
             } else {
-                stmt.ensure_schema_unchanged_with_prebound_publication(&op_cx)?
+                stmt.ensure_schema_unchanged_with_prebound_publication(&op_cx)
+                    .await?
             };
             record_hot_path_duration(
                 &FSQLITE_PREPARED_DIRECT_INSERT_SCHEMA_VALIDATION_TIME_NS,
@@ -15507,7 +15859,8 @@ impl Connection {
                     entry_proof.publication,
                     p,
                     false,
-                ),
+                )
+                .await,
                 PreparedDmlKind::Update | PreparedDmlKind::Delete => self
                     .execute_precompiled_prepared_update_or_delete(
                         &op_cx,
@@ -15519,7 +15872,8 @@ impl Connection {
                             || force_skip_statement_savepoint_in_explicit_txn,
                         entry_proof,
                         p,
-                    ),
+                    )
+                    .await,
             };
             if result.is_ok() {
                 self.note_connection_statement_execution_count(1);
@@ -15554,11 +15908,13 @@ impl Connection {
                         tracing::Level::INFO
                     );
                 if !has_precompiled_program && !can_use_programless_direct_dispatch {
-                    stmt.ensure_schema_unchanged(&op_cx)?;
+                    stmt.ensure_schema_unchanged(&op_cx).await?;
                     if hot_path_profile_enabled() {
                         FSQLITE_SLOW_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
                     }
-                    let rows = self.execute_statement_impl_after_background_status(dml, p, None)?;
+                    let rows = self
+                        .execute_statement_impl_after_background_status(dml, p, None)
+                        .await?;
                     self.note_connection_statement_execution_count(1);
                     return Ok(
                         if matches!(
@@ -15573,7 +15929,9 @@ impl Connection {
                 }
                 // Fast path: prebind publication so the autocommit begin
                 // path can reuse it instead of double-refreshing.
-                let entry_proof = stmt.ensure_schema_unchanged_with_prebound_publication(&op_cx)?;
+                let entry_proof = stmt
+                    .ensure_schema_unchanged_with_prebound_publication(&op_cx)
+                    .await?;
                 if hot_path_profile_enabled() {
                     FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
                 }
@@ -15585,20 +15943,22 @@ impl Connection {
                         reason = "deferred_dml_direct_dispatch",
                     );
                 }
-                return self.execute_precompiled_prepared_update_or_delete(
-                    &op_cx,
-                    stmt,
-                    fast_path.kind,
-                    fast_path.rollback_on_constraint_violation,
-                    fast_path.preserve_prior_changes_on_constraint_violation,
-                    fast_path.skip_statement_savepoint_in_explicit_txn
-                        || force_skip_statement_savepoint_in_explicit_txn,
-                    entry_proof,
-                    p,
-                );
+                return self
+                    .execute_precompiled_prepared_update_or_delete(
+                        &op_cx,
+                        stmt,
+                        fast_path.kind,
+                        fast_path.rollback_on_constraint_violation,
+                        fast_path.preserve_prior_changes_on_constraint_violation,
+                        fast_path.skip_statement_savepoint_in_explicit_txn
+                            || force_skip_statement_savepoint_in_explicit_txn,
+                        entry_proof,
+                        p,
+                    )
+                    .await;
             }
             // Slow path: validate schema without prebinding publication.
-            stmt.ensure_schema_unchanged(&op_cx)?;
+            stmt.ensure_schema_unchanged(&op_cx).await?;
             // bd-6eyrg.1: SLOW PATH — deferred DML requires full dispatch.
             if hot_path_profile_enabled() {
                 FSQLITE_SLOW_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
@@ -15614,7 +15974,8 @@ impl Connection {
                 dml,
                 p,
                 stmt.dispatch_precompiled_program(),
-            )?;
+            )
+            .await?;
             self.note_connection_statement_execution_count(1);
             let is_dml = matches!(
                 dml,
@@ -15627,12 +15988,14 @@ impl Connection {
             })
         } else {
             Ok(self
-                .query_prepared_with_params_after_background_status(stmt, params)?
+                .query_prepared_with_params_after_background_status(stmt, params)
+                .await?
                 .len())
         }
+        })
     }
 
-    fn query_prepared_with_params_after_background_status(
+    async fn query_prepared_with_params_after_background_status(
         &self,
         stmt: &PreparedStatement<'_>,
         params: &[SqliteValue],
@@ -15658,10 +16021,12 @@ impl Connection {
             .retained_autocommit_overlay_dirty_fast_path(stmt)
             .is_some()
         {
-            let _overlay_entry_proof =
-                stmt.ensure_schema_unchanged_with_prebound_publication(&op_cx)?;
+            let _overlay_entry_proof = stmt
+                .ensure_schema_unchanged_with_prebound_publication(&op_cx)
+                .await?;
             if let Some(mut rows) =
-                self.try_execute_retained_autocommit_query_fast_path(stmt, params, &op_cx)?
+                self.try_execute_retained_autocommit_query_fast_path(stmt, params, &op_cx)
+                    .await?
             {
                 let fast_path =
                     stmt.prepared_query_fast_path_metadata("retained overlay query fast path")?;
@@ -15687,7 +16052,9 @@ impl Connection {
                 return Ok(rows);
             }
         }
-        if self.prepare_clean_memory_prepared_memdb_fast_path(stmt, &op_cx)?
+        if self
+            .prepare_clean_memory_prepared_memdb_fast_path(stmt, &op_cx)
+            .await?
             && let Some(mut rows) = self.try_execute_prepared_query_fast_path(stmt, params)?
         {
             let fast_path =
@@ -15714,7 +16081,9 @@ impl Connection {
             self.note_connection_statement_execution_count(1);
             return Ok(rows);
         }
-        if self.prepare_clean_file_backed_prepared_memdb_fast_path(stmt, &op_cx)?
+        if self
+            .prepare_clean_file_backed_prepared_memdb_fast_path(stmt, &op_cx)
+            .await?
             && let Some(mut rows) = self.try_execute_prepared_query_fast_path(stmt, params)?
         {
             let fast_path =
@@ -15741,14 +16110,23 @@ impl Connection {
             self.note_connection_statement_execution_count(1);
             return Ok(rows);
         }
-        let prepared_auto_read = self.prepare_connection_for_prepared_read(stmt, &op_cx)?;
-        let entry_proof = stmt.ensure_schema_unchanged_with_prebound_publication(&op_cx)?;
+        let prepared_auto_read = self
+            .prepare_connection_for_prepared_read(stmt, &op_cx)
+            .await?;
+        let entry_proof = stmt
+            .ensure_schema_unchanged_with_prebound_publication(&op_cx)
+            .await?;
         if let Some(mut rows) = self.try_execute_prepared_query_fast_path(stmt, params)? {
             let fast_path =
                 match stmt.prepared_query_fast_path_metadata("prepared query fast path outcome") {
                     Ok(fast_path) => fast_path,
                     Err(err) => {
-                        self.finish_prepared_read_autocommit(prepared_auto_read, false, &op_cx)?;
+                        self.finish_prepared_read_autocommit(
+                            prepared_auto_read,
+                            false,
+                            &op_cx,
+                        )
+                        .await?;
                         return Err(err);
                     }
                 };
@@ -15770,7 +16148,8 @@ impl Connection {
             if let Some(limit_clause) = stmt.post_distinct_limit.as_ref() {
                 apply_limit_clause(&mut rows, limit_clause);
             }
-            self.finish_prepared_read_autocommit(prepared_auto_read, true, &op_cx)?;
+            self.finish_prepared_read_autocommit(prepared_auto_read, true, &op_cx)
+                .await?;
             self.note_connection_statement_execution_count(1);
             return Ok(rows);
         }
@@ -15781,7 +16160,8 @@ impl Connection {
             if hot_path_profile_enabled() {
                 FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
             }
-            self.finish_prepared_read_autocommit(prepared_auto_read, true, &op_cx)?;
+            self.finish_prepared_read_autocommit(prepared_auto_read, true, &op_cx)
+                .await?;
             self.note_connection_statement_execution_count(1);
             return Ok(rows);
         }
@@ -15796,9 +16176,11 @@ impl Connection {
                     reason = "deferred_query_statement",
                 );
             }
-            let rows_result =
-                self.execute_statement_after_background_status(statement.as_ref(), Some(params));
-            self.finish_prepared_read_autocommit(prepared_auto_read, rows_result.is_ok(), &op_cx)?;
+            let rows_result = self
+                .execute_statement_after_background_status(statement.as_ref(), Some(params))
+                .await;
+            self.finish_prepared_read_autocommit(prepared_auto_read, rows_result.is_ok(), &op_cx)
+                .await?;
             if rows_result.is_ok() {
                 self.note_connection_statement_execution_count(1);
             }
@@ -15817,6 +16199,7 @@ impl Connection {
         let execute_body_start = hot_path_profile_enabled().then(Instant::now);
         let rows_result = if stmt.db.is_some() {
             stmt.execute_table_query(&op_cx, Some(params), entry_proof.publication)
+                .await
         } else {
             execute_program_with_postprocess(
                 stmt.program.as_ref(),
@@ -15827,9 +16210,11 @@ impl Connection {
                 stmt.expression_postprocess.as_ref(),
                 page_size_from_pragma_state(self.pragma_state.borrow().page_size)?,
             )
+            .await
         };
         record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
-        self.finish_prepared_read_autocommit(prepared_auto_read, rows_result.is_ok(), &op_cx)?;
+        self.finish_prepared_read_autocommit(prepared_auto_read, rows_result.is_ok(), &op_cx)
+            .await?;
         let mut rows = rows_result?;
         if stmt.distinct {
             let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
@@ -15842,7 +16227,7 @@ impl Connection {
         Ok(rows)
     }
 
-    fn query_prepared_with_params_for_each_after_background_status<F>(
+    async fn query_prepared_with_params_for_each_after_background_status<F>(
         &self,
         stmt: &PreparedStatement<'_>,
         params: &[SqliteValue],
@@ -15872,10 +16257,12 @@ impl Connection {
             .is_some()
         {
             let op_cx = self.op_cx_after_background_status();
-            let _overlay_entry_proof =
-                stmt.ensure_schema_unchanged_with_prebound_publication(&op_cx)?;
+            let _overlay_entry_proof = stmt
+                .ensure_schema_unchanged_with_prebound_publication(&op_cx)
+                .await?;
             if let Some(rows) =
-                self.try_execute_retained_autocommit_query_fast_path(stmt, params, &op_cx)?
+                self.try_execute_retained_autocommit_query_fast_path(stmt, params, &op_cx)
+                    .await?
             {
                 let fast_path = stmt.prepared_query_fast_path_metadata(
                     "retained overlay streaming query fast path",
@@ -15905,7 +16292,9 @@ impl Connection {
             && stmt.post_distinct_limit.is_none();
 
         if !can_stream_with_row_handler {
-            let rows = self.query_prepared_with_params_after_background_status(stmt, params)?;
+            let rows = self
+                .query_prepared_with_params_after_background_status(stmt, params)
+                .await?;
             for row in rows {
                 f(&row)?;
             }
@@ -15913,8 +16302,12 @@ impl Connection {
         }
 
         let op_cx = self.op_cx_after_background_status();
-        let prepared_auto_read = self.prepare_connection_for_prepared_read(stmt, &op_cx)?;
-        let entry_proof = stmt.ensure_schema_unchanged_with_prebound_publication(&op_cx)?;
+        let prepared_auto_read = self
+            .prepare_connection_for_prepared_read(stmt, &op_cx)
+            .await?;
+        let entry_proof = stmt
+            .ensure_schema_unchanged_with_prebound_publication(&op_cx)
+            .await?;
         if hot_path_profile_enabled() {
             FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
         }
@@ -15939,14 +16332,16 @@ impl Connection {
             Some(params),
             entry_proof.publication,
             &mut bridging_handler,
-        );
+        )
+        .await;
         record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
         let callback_failed = callback_error.is_some();
         self.finish_prepared_read_autocommit(
             prepared_auto_read,
             raw_rows_result.is_ok() || callback_failed,
             &op_cx,
-        )?;
+        )
+        .await?;
         if raw_rows_result.is_ok() || callback_failed {
             self.note_connection_statement_execution_count(1);
         }
@@ -15960,7 +16355,7 @@ impl Connection {
         }
     }
 
-    fn query_prepared_row_after_background_status(
+    async fn query_prepared_row_after_background_status(
         &self,
         stmt: &PreparedStatement<'_>,
         params: Option<&[SqliteValue]>,
@@ -15986,10 +16381,12 @@ impl Connection {
             .retained_autocommit_overlay_dirty_fast_path(stmt)
             .is_some()
         {
-            let _overlay_entry_proof =
-                stmt.ensure_schema_unchanged_with_prebound_publication(&op_cx)?;
+            let _overlay_entry_proof = stmt
+                .ensure_schema_unchanged_with_prebound_publication(&op_cx)
+                .await?;
             if let Some(row_outcome) =
-                self.try_execute_retained_autocommit_query_row_fast_path(stmt, params, &op_cx)?
+                self.try_execute_retained_autocommit_query_row_fast_path(stmt, params, &op_cx)
+                    .await?
             {
                 let fast_path =
                     stmt.prepared_query_fast_path_metadata("retained overlay query row fast path")?;
@@ -16008,7 +16405,9 @@ impl Connection {
                 return direct_query_row_outcome_result(row_outcome);
             }
         }
-        if self.prepare_clean_memory_prepared_memdb_fast_path(stmt, &op_cx)?
+        if self
+            .prepare_clean_memory_prepared_memdb_fast_path(stmt, &op_cx)
+            .await?
             && let Some(row_outcome) =
                 self.try_execute_prepared_query_row_fast_path(stmt, params)?
         {
@@ -16029,7 +16428,9 @@ impl Connection {
             self.note_connection_statement_execution_count(1);
             return direct_query_row_outcome_result(row_outcome);
         }
-        if self.prepare_clean_file_backed_prepared_memdb_fast_path(stmt, &op_cx)?
+        if self
+            .prepare_clean_file_backed_prepared_memdb_fast_path(stmt, &op_cx)
+            .await?
             && let Some(row_outcome) =
                 self.try_execute_prepared_query_row_fast_path(stmt, params)?
         {
@@ -16050,15 +16451,24 @@ impl Connection {
             self.note_connection_statement_execution_count(1);
             return direct_query_row_outcome_result(row_outcome);
         }
-        let prepared_auto_read = self.prepare_connection_for_prepared_read(stmt, &op_cx)?;
-        let entry_proof = stmt.ensure_schema_unchanged_with_prebound_publication(&op_cx)?;
+        let prepared_auto_read = self
+            .prepare_connection_for_prepared_read(stmt, &op_cx)
+            .await?;
+        let entry_proof = stmt
+            .ensure_schema_unchanged_with_prebound_publication(&op_cx)
+            .await?;
         if let Some(row_outcome) = self.try_execute_prepared_query_row_fast_path(stmt, params)? {
             let fast_path = match stmt
                 .prepared_query_fast_path_metadata("prepared query row fast path outcome")
             {
                 Ok(fast_path) => fast_path,
                 Err(err) => {
-                    self.finish_prepared_read_autocommit(prepared_auto_read, false, &op_cx)?;
+                    self.finish_prepared_read_autocommit(
+                        prepared_auto_read,
+                        false,
+                        &op_cx,
+                    )
+                    .await?;
                     return Err(err);
                 }
             };
@@ -16079,7 +16489,8 @@ impl Connection {
                 prepared_auto_read,
                 query_row_completed_without_engine_failure(&row_result),
                 &op_cx,
-            )?;
+            )
+            .await?;
             return row_result;
         }
         if let Some(statement) = &stmt.deferred_query_statement {
@@ -16093,9 +16504,11 @@ impl Connection {
                     reason = "deferred_query_statement",
                 );
             }
-            let rows_result =
-                self.execute_statement_after_background_status(statement.as_ref(), params);
-            self.finish_prepared_read_autocommit(prepared_auto_read, rows_result.is_ok(), &op_cx)?;
+            let rows_result = self
+                .execute_statement_after_background_status(statement.as_ref(), params)
+                .await;
+            self.finish_prepared_read_autocommit(prepared_auto_read, rows_result.is_ok(), &op_cx)
+                .await?;
             if rows_result.is_ok() {
                 self.note_connection_statement_execution_count(1);
             }
@@ -16123,6 +16536,7 @@ impl Connection {
                     QUERY_ROW_RESULT_ROW_CAP,
                     entry_proof.publication,
                 )
+                .await
             } else {
                 execute_program_exactly_one_row_with_row_cap(
                     stmt.program.as_ref(),
@@ -16133,9 +16547,11 @@ impl Connection {
                     page_size_from_pragma_state(self.pragma_state.borrow().page_size)?,
                     Some(QUERY_ROW_RESULT_ROW_CAP),
                 )
+                .await
             };
             let completed = query_row_completed_without_engine_failure(&row_result);
-            self.finish_prepared_read_autocommit(prepared_auto_read, completed, &op_cx)?;
+            self.finish_prepared_read_autocommit(prepared_auto_read, completed, &op_cx)
+                .await?;
             if completed {
                 self.note_connection_statement_execution_count(1);
                 if let Ok(row) = &row_result {
@@ -16146,6 +16562,7 @@ impl Connection {
         }
         let rows_result = if stmt.db.is_some() {
             stmt.execute_table_query(&op_cx, params, entry_proof.publication)
+                .await
         } else {
             execute_program_with_postprocess(
                 stmt.program.as_ref(),
@@ -16156,8 +16573,10 @@ impl Connection {
                 stmt.expression_postprocess.as_ref(),
                 page_size_from_pragma_state(self.pragma_state.borrow().page_size)?,
             )
+            .await
         };
-        self.finish_prepared_read_autocommit(prepared_auto_read, rows_result.is_ok(), &op_cx)?;
+        self.finish_prepared_read_autocommit(prepared_auto_read, rows_result.is_ok(), &op_cx)
+            .await?;
         let mut rows = rows_result?;
         self.note_connection_statement_execution_count(1);
         if stmt.distinct {
@@ -16302,7 +16721,7 @@ impl Connection {
             && stmt.prepared_query_fast_path.is_some()
     }
 
-    fn prepare_clean_memory_prepared_memdb_fast_path(
+    async fn prepare_clean_memory_prepared_memdb_fast_path(
         &self,
         stmt: &PreparedStatement<'_>,
         cx: &Cx,
@@ -16311,8 +16730,9 @@ impl Connection {
             return Ok(false);
         }
 
-        self.refresh_memdb_from_active_txn_if_dirty(cx)?;
-        self.refresh_memdb_from_cached_write_txn_if_stale(cx)?;
+        self.refresh_memdb_from_active_txn_if_dirty(cx).await?;
+        self.refresh_memdb_from_cached_write_txn_if_stale(cx)
+            .await?;
         if self.pager.is_memory()
             && !self.memdb_rows_loaded.get()
             && !self.memdb_requires_active_txn_reload.get()
@@ -16321,7 +16741,8 @@ impl Connection {
                 cx,
                 "memdb_staleness_check",
                 true,
-            )?;
+            )
+            .await?;
         }
         if !self.clean_memory_prepared_memdb_fast_path_candidate(stmt) {
             return Ok(false);
@@ -16347,7 +16768,7 @@ impl Connection {
                 .is_some_and(PreparedQueryFastPath::can_use_clean_file_backed_memdb)
     }
 
-    fn prepare_clean_file_backed_prepared_memdb_fast_path(
+    async fn prepare_clean_file_backed_prepared_memdb_fast_path(
         &self,
         stmt: &PreparedStatement<'_>,
         cx: &Cx,
@@ -16356,8 +16777,9 @@ impl Connection {
             return Ok(false);
         }
 
-        self.refresh_memdb_from_active_txn_if_dirty(cx)?;
-        self.refresh_memdb_from_cached_write_txn_if_stale(cx)?;
+        self.refresh_memdb_from_active_txn_if_dirty(cx).await?;
+        self.refresh_memdb_from_cached_write_txn_if_stale(cx)
+            .await?;
         if !self.clean_file_backed_prepared_memdb_fast_path_candidate(stmt) {
             return Ok(false);
         }
@@ -16366,7 +16788,8 @@ impl Connection {
             cx,
             "clean_file_backed_memdb_staleness_check",
             true,
-        )?;
+        )
+        .await?;
         stmt.ensure_schema_identity_unchanged_after_local_refresh()?;
         Ok(self.prepared_memdb_query_fast_path_ready(stmt))
     }
@@ -16379,7 +16802,10 @@ impl Connection {
             .cloned()
     }
 
-    fn try_clean_memory_storage_count_cached_count(&self, root_page: i32) -> Result<Option<i64>> {
+    async fn try_clean_memory_storage_count_cached_count(
+        &self,
+        root_page: i32,
+    ) -> Result<Option<i64>> {
         if !self.pager.is_memory()
             || self.in_transaction.get()
             || self.active_txn_is_open_or_borrowed()
@@ -16416,7 +16842,10 @@ impl Connection {
             if let Some(txn) = cached_write_txn.as_mut() {
                 let visible_hint = txn.published_visible_commit_seq_hint();
                 if visible_hint.is_none() || visible_hint == Some(commit_seq) {
-                    Some(self.count_btree_entries_in_txn(&cx, txn, table.root_page, true)?)
+                    Some(
+                        self.count_btree_entries_in_txn(&cx, txn, table.root_page, true)
+                            .await?,
+                    )
                 } else {
                     None
                 }
@@ -16427,14 +16856,18 @@ impl Connection {
         let count = if let Some(count) = cached_txn_count {
             count
         } else {
-            let mut txn = self.begin_pager_txn_with_busy_timeout(
-                &self.pager,
-                &cx,
-                TransactionMode::ReadOnly,
-                false,
-            )?;
-            let count = self.count_btree_entries_in_txn(&cx, &mut txn, table.root_page, true)?;
-            txn.rollback(&cx)?;
+            let mut txn = self
+                .begin_pager_txn_with_busy_timeout(
+                    &self.pager,
+                    &cx,
+                    TransactionMode::ReadOnly,
+                    false,
+                )
+                .await?;
+            let count = self
+                .count_btree_entries_in_txn(&cx, &mut txn, table.root_page, true)
+                .await?;
+            txn.rollback(&cx).await?;
             count
         };
         let count = i64::try_from(count).map_err(|_| {
@@ -16520,7 +16953,7 @@ impl Connection {
         );
     }
 
-    fn decode_table_row_values_from_payload(
+    async fn decode_table_row_values_from_payload(
         &self,
         table: &TableSchema,
         rowid: i64,
@@ -16546,6 +16979,7 @@ impl Connection {
             &values,
             rowid_alias_column_index,
         )
+        .await
     }
 
     fn numeric_column_value_from_sqlite_value(value: SqliteValue) -> NumericColumnValue {
@@ -16557,7 +16991,7 @@ impl Connection {
         }
     }
 
-    fn projected_table_row_numeric_sum_value_from_payload(
+    async fn projected_table_row_numeric_sum_value_from_payload(
         &self,
         table: &TableSchema,
         rowid: i64,
@@ -16634,12 +17068,14 @@ impl Connection {
                     }
                 }
             } else {
-                let values = self.decode_table_row_values_from_payload(
-                    table,
-                    rowid,
-                    payload,
-                    rowid_alias_column_index,
-                )?;
+                let values = self
+                    .decode_table_row_values_from_payload(
+                        table,
+                        rowid,
+                        payload,
+                        rowid_alias_column_index,
+                    )
+                    .await?;
                 let value = memdb_row_value_with_rowid_alias(
                     rowid,
                     &values,
@@ -16674,13 +17110,13 @@ impl Connection {
             .get(column_index)
             .and_then(|column| column.default_value.as_ref())
         {
-            Some(default_sql) => self.evaluate_column_default_value(Some(default_sql))?,
+            Some(default_sql) => self.evaluate_column_default_value(Some(default_sql)).await?,
             None => SqliteValue::Null,
         };
         Ok(Self::numeric_column_value_from_sqlite_value(default_value))
     }
 
-    fn projected_table_row_value_from_payload(
+    async fn projected_table_row_value_from_payload(
         &self,
         table: &TableSchema,
         rowid: i64,
@@ -16755,12 +17191,14 @@ impl Connection {
                     }
                 }
             } else {
-                let values = self.decode_table_row_values_from_payload(
-                    table,
-                    rowid,
-                    payload,
-                    rowid_alias_column_index,
-                )?;
+                let values = self
+                    .decode_table_row_values_from_payload(
+                        table,
+                        rowid,
+                        payload,
+                        rowid_alias_column_index,
+                    )
+                    .await?;
                 return Ok(memdb_row_value_with_rowid_alias(
                     rowid,
                     &values,
@@ -16793,13 +17231,13 @@ impl Connection {
             .get(column_index)
             .and_then(|column| column.default_value.as_ref())
         {
-            Some(default_sql) => self.evaluate_column_default_value(Some(default_sql))?,
+            Some(default_sql) => self.evaluate_column_default_value(Some(default_sql)).await?,
             None => SqliteValue::Null,
         };
         Ok(default_value)
     }
 
-    fn row_from_txn_payload(
+    async fn row_from_txn_payload(
         &self,
         table: &TableSchema,
         rowid: i64,
@@ -16807,16 +17245,18 @@ impl Connection {
         rowid_alias_column_index: Option<usize>,
     ) -> Result<Row> {
         Ok(Row {
-            values: self.decode_table_row_values_from_payload(
-                table,
-                rowid,
-                payload,
-                rowid_alias_column_index,
-            )?,
+            values: self
+                .decode_table_row_values_from_payload(
+                    table,
+                    rowid,
+                    payload,
+                    rowid_alias_column_index,
+                )
+                .await?,
         })
     }
 
-    fn row_from_txn_value_sources(
+    async fn row_from_txn_value_sources(
         &self,
         table: &TableSchema,
         rowid: i64,
@@ -16824,12 +17264,14 @@ impl Connection {
         rowid_alias_column_index: Option<usize>,
         sources: &[PreparedMemValueSource],
     ) -> Result<Row> {
-        let values = self.decode_table_row_values_from_payload(
-            table,
-            rowid,
-            payload,
-            rowid_alias_column_index,
-        )?;
+        let values = self
+            .decode_table_row_values_from_payload(
+                table,
+                rowid,
+                payload,
+                rowid_alias_column_index,
+            )
+            .await?;
         Ok(row_from_memdb_value_sources(
             rowid,
             &values,
@@ -16838,10 +17280,10 @@ impl Connection {
         ))
     }
 
-    fn retained_autocommit_count_star_sum_row_in_txn(
+    async fn retained_autocommit_count_star_sum_row_in_txn(
         &self,
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         table: &TableSchema,
         sum_column_index: usize,
         rowid_alias_column_index: Option<usize>,
@@ -16854,7 +17296,7 @@ impl Connection {
                 0,
             ));
         };
-        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
         let mut count = 0_i64;
         let mut sum_non_null_count = 0_i64;
         let mut int_sum: i64 = 0;
@@ -16865,17 +17307,18 @@ impl Connection {
         let mut has_any_non_null = false;
         let mut needs_fallback = false;
 
-        if cursor.first(cx)? {
+        if cursor.first(cx).await? {
             loop {
                 let value = {
-                    let (rowid, payload) = cursor.rowid_and_payload_cow(cx)?;
+                    let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
                     self.projected_table_row_numeric_sum_value_from_payload(
                         table,
                         rowid,
                         payload.as_ref(),
                         rowid_alias_column_index,
                         sum_column_index,
-                    )?
+                    )
+                    .await?
                 };
                 count = count.checked_add(1).ok_or_else(|| {
                     FrankenError::Internal(format!(
@@ -16911,7 +17354,7 @@ impl Connection {
                         needs_fallback = true;
                     }
                 }
-                if !cursor.next(cx)? {
+                if !cursor.next(cx).await? {
                     break;
                 }
             }
@@ -16920,11 +17363,11 @@ impl Connection {
         let sum = if needs_fallback {
             let mut sum_values: Vec<SqliteValue> = Vec::new();
             let mut column_offsets = Vec::new();
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
-            if cursor.first(cx)? {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
+            if cursor.first(cx).await? {
                 loop {
                     let value = {
-                        let (rowid, payload) = cursor.rowid_and_payload_cow(cx)?;
+                        let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
                         self.projected_table_row_value_from_payload(
                             table,
                             rowid,
@@ -16932,12 +17375,13 @@ impl Connection {
                             rowid_alias_column_index,
                             sum_column_index,
                             &mut column_offsets,
-                        )?
+                        )
+                        .await?
                     };
                     if !value.is_null() {
                         sum_values.push(value);
                     }
-                    if !cursor.next(cx)? {
+                    if !cursor.next(cx).await? {
                         break;
                     }
                 }
@@ -16962,10 +17406,10 @@ impl Connection {
         ))
     }
 
-    fn retained_autocommit_indexed_equality_rows_in_txn(
+    async fn retained_autocommit_indexed_equality_rows_in_txn(
         &self,
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         table: &TableSchema,
         column_index: usize,
         probe_value: &SqliteValue,
@@ -16984,39 +17428,47 @@ impl Connection {
         ) {
             return Ok(rows);
         }
-        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
         let mut rows = Vec::new();
         let mut column_offsets = Vec::new();
-        if cursor.first(cx)? {
+        if cursor.first(cx).await? {
             loop {
-                let rowid = cursor.rowid(cx)?;
-                let payload = cursor.payload(cx)?;
-                let value = self.projected_table_row_value_from_payload(
-                    table,
-                    rowid,
-                    &payload,
-                    rowid_alias_column_index,
-                    column_index,
-                    &mut column_offsets,
-                )?;
+                let rowid = cursor.rowid(cx).await?;
+                let payload = cursor.payload(cx).await?;
+                let value = self
+                    .projected_table_row_value_from_payload(
+                        table,
+                        rowid,
+                        &payload,
+                        rowid_alias_column_index,
+                        column_index,
+                        &mut column_offsets,
+                    )
+                    .await?;
                 if value == *probe_value {
                     rows.push(match projections {
-                        Some(projections) => self.row_from_txn_value_sources(
-                            table,
-                            rowid,
-                            &payload,
-                            rowid_alias_column_index,
-                            projections,
-                        )?,
-                        None => self.row_from_txn_payload(
-                            table,
-                            rowid,
-                            &payload,
-                            rowid_alias_column_index,
-                        )?,
+                        Some(projections) => {
+                            self.row_from_txn_value_sources(
+                                table,
+                                rowid,
+                                &payload,
+                                rowid_alias_column_index,
+                                projections,
+                            )
+                            .await?
+                        }
+                        None => {
+                            self.row_from_txn_payload(
+                                table,
+                                rowid,
+                                &payload,
+                                rowid_alias_column_index,
+                            )
+                            .await?
+                        }
                     });
                 }
-                if !cursor.next(cx)? {
+                if !cursor.next(cx).await? {
                     break;
                 }
             }
@@ -17032,7 +17484,7 @@ impl Connection {
         Ok(rows)
     }
 
-    fn try_execute_retained_autocommit_query_fast_path(
+    async fn try_execute_retained_autocommit_query_fast_path(
         &self,
         stmt: &PreparedStatement<'_>,
         params: &[SqliteValue],
@@ -17055,7 +17507,9 @@ impl Connection {
             })?;
             match overlay {
                 RetainedAutocommitOverlayFastPath::CountStar { .. } => {
-                    let count = self.count_btree_entries_in_txn(cx, txn, table.root_page, true)?;
+                    let count = self
+                        .count_btree_entries_in_txn(cx, txn, table.root_page, true)
+                        .await?;
                     let count = i64::try_from(count).map_err(|_| {
                         FrankenError::Internal(format!(
                             "table row count exceeds i64 for root page {}",
@@ -17085,7 +17539,8 @@ impl Connection {
                                 &table,
                                 sum_column_index,
                                 rowid_alias_column_index,
-                            )?;
+                            )
+                            .await?;
                         self.store_retained_autocommit_count_sum_cache(
                             root_page,
                             sum_column_index,
@@ -17109,17 +17564,20 @@ impl Connection {
                     else {
                         return Ok(Some(Vec::new()));
                     };
-                    let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
-                    if !cursor.table_move_to(cx, rowid)?.is_found() {
+                    let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
+                    if !cursor.table_move_to(cx, rowid).await?.is_found() {
                         Some(Vec::new())
                     } else {
-                        let payload = cursor.payload(cx)?;
-                        Some(vec![self.row_from_txn_payload(
-                            &table,
-                            rowid,
-                            &payload,
-                            rowid_alias_column_index,
-                        )?])
+                        let payload = cursor.payload(cx).await?;
+                        Some(vec![
+                            self.row_from_txn_payload(
+                                &table,
+                                rowid,
+                                &payload,
+                                rowid_alias_column_index,
+                            )
+                            .await?,
+                        ])
                     }
                 }
                 RetainedAutocommitOverlayFastPath::ProjectedRowidLookup {
@@ -17136,18 +17594,21 @@ impl Connection {
                     else {
                         return Ok(Some(Vec::new()));
                     };
-                    let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
-                    if !cursor.table_move_to(cx, rowid)?.is_found() {
+                    let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
+                    if !cursor.table_move_to(cx, rowid).await?.is_found() {
                         Some(Vec::new())
                     } else {
-                        let payload = cursor.payload(cx)?;
-                        Some(vec![self.row_from_txn_value_sources(
-                            &table,
-                            rowid,
-                            &payload,
-                            rowid_alias_column_index,
-                            projections.as_ref(),
-                        )?])
+                        let payload = cursor.payload(cx).await?;
+                        Some(vec![
+                            self.row_from_txn_value_sources(
+                                &table,
+                                rowid,
+                                &payload,
+                                rowid_alias_column_index,
+                                projections.as_ref(),
+                            )
+                            .await?,
+                        ])
                     }
                 }
                 RetainedAutocommitOverlayFastPath::IndexedEqualityLookup {
@@ -17174,7 +17635,8 @@ impl Connection {
                             probe_value,
                             rowid_alias_column_index,
                             projections.as_deref(),
-                        )?)
+                        )
+                        .await?)
                     }
                 }
                 RetainedAutocommitOverlayFastPath::RowidRangeScan {
@@ -17199,22 +17661,26 @@ impl Connection {
                         else {
                             return Ok(Some(Vec::new()));
                         };
-                        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
-                        let _ = cursor.table_move_to(cx, lower)?;
+                        let mut cursor =
+                            Self::new_pager_btree_cursor(cx, txn, root, true).await?;
+                        let _ = cursor.table_move_to(cx, lower).await?;
                         let mut rows = Vec::new();
                         while !cursor.eof() {
-                            let rowid = cursor.rowid(cx)?;
+                            let rowid = cursor.rowid(cx).await?;
                             if rowid >= upper {
                                 break;
                             }
-                            let payload = cursor.payload(cx)?;
-                            rows.push(self.row_from_txn_payload(
-                                &table,
-                                rowid,
-                                &payload,
-                                rowid_alias_column_index,
-                            )?);
-                            if !cursor.next(cx)? {
+                            let payload = cursor.payload(cx).await?;
+                            rows.push(
+                                self.row_from_txn_payload(
+                                    &table,
+                                    rowid,
+                                    &payload,
+                                    rowid_alias_column_index,
+                                )
+                                .await?,
+                            );
+                            if !cursor.next(cx).await? {
                                 break;
                             }
                         }
@@ -17244,11 +17710,12 @@ impl Connection {
                                 values: vec![SqliteValue::Integer(0)],
                             }]));
                         };
-                        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
-                        let _ = cursor.table_move_to(cx, lower)?;
+                        let mut cursor =
+                            Self::new_pager_btree_cursor(cx, txn, root, true).await?;
+                        let _ = cursor.table_move_to(cx, lower).await?;
                         let mut count = 0_i64;
                         while !cursor.eof() {
-                            let rowid = cursor.rowid(cx)?;
+                            let rowid = cursor.rowid(cx).await?;
                             if rowid >= upper {
                                 break;
                             }
@@ -17258,7 +17725,7 @@ impl Connection {
                                     table.root_page
                                 ))
                             })?;
-                            if !cursor.next(cx)? {
+                            if !cursor.next(cx).await? {
                                 break;
                             }
                         }
@@ -17286,7 +17753,7 @@ impl Connection {
         }
     }
 
-    fn try_execute_retained_autocommit_query_row_fast_path(
+    async fn try_execute_retained_autocommit_query_row_fast_path(
         &self,
         stmt: &PreparedStatement<'_>,
         params: Option<&[SqliteValue]>,
@@ -17294,7 +17761,9 @@ impl Connection {
     ) -> Result<Option<QueryRowCollectionOutcome>> {
         let empty_params = [];
         let params = params.unwrap_or(&empty_params);
-        let Some(rows) = self.try_execute_retained_autocommit_query_fast_path(stmt, params, cx)?
+        let Some(rows) = self
+            .try_execute_retained_autocommit_query_fast_path(stmt, params, cx)
+            .await?
         else {
             return Ok(None);
         };
@@ -19013,7 +19482,7 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
-    fn execute_prepared_dml_entry<F>(
+    async fn execute_prepared_dml_entry<F>(
         &self,
         execution_cx: &Cx,
         statement_kind: &'static str,
@@ -19027,7 +19496,7 @@ impl Connection {
         execute_body: F,
     ) -> PreparedDmlEntryExecutionOutcome
     where
-        F: FnOnce() -> Result<usize>,
+        F: std::ops::AsyncFnOnce() -> Result<usize>,
     {
         let direct_insert_autocommit_candidate = hot_path_profile_enabled()
             && autocommit_profile_mode == PreparedDmlAutocommitProfileMode::PreparedDirectInsert
@@ -19036,6 +19505,7 @@ impl Connection {
         let autocommit_begin_start = direct_insert_autocommit_candidate.then(Instant::now);
         let was_auto = match self
             .ensure_autocommit_txn_with_publication_hint(execution_cx, prebound_publication)
+            .await
         {
             Ok(was_auto) => was_auto,
             Err(error) => {
@@ -19066,17 +19536,15 @@ impl Connection {
                 preserve_prior_changes_on_constraint_violation,
             );
         let execute_body_start = hot_path_profile_enabled().then(Instant::now);
-        let mut execute_body = Some(execute_body);
         let result = if use_statement_savepoint {
-            self.with_internal_statement_savepoint_and_cx(execution_cx, statement_kind, || {
-                execute_body
-                    .take()
-                    .expect("prepared DML body should only run once")()
-            })
+            self.with_internal_statement_savepoint_and_cx(
+                execution_cx,
+                statement_kind,
+                execute_body,
+            )
+            .await
         } else {
-            execute_body
-                .take()
-                .expect("prepared DML body should only run once")()
+            execute_body().await
         };
         record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
         let result = match result {
@@ -19092,7 +19560,9 @@ impl Connection {
                     rollback_on_constraint_violation,
                     was_auto,
                     &error,
-                ) {
+                )
+                .await
+                {
                     Ok(()) => Err(error),
                     Err(rollback_error) => Err(rollback_error),
                 }
@@ -19114,7 +19584,8 @@ impl Connection {
             capture_time_travel_snapshot,
             false,
             execution_cx,
-        );
+        )
+        .await;
         if direct_insert_autocommit_candidate && was_auto {
             record_hot_path_duration(
                 &FSQLITE_PREPARED_DIRECT_INSERT_AUTOCOMMIT_RESOLVE_TIME_NS,
@@ -19137,7 +19608,7 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
-    fn execute_precompiled_prepared_insert(
+    async fn execute_precompiled_prepared_insert(
         &self,
         execution_cx: &Cx,
         stmt: &PreparedStatement<'_>,
@@ -19209,7 +19680,8 @@ impl Connection {
                     preserve_prior_changes_on_constraint_violation,
                     params,
                     capture_time_travel_snapshot,
-                );
+                )
+                .await;
             }
             trace_registration.clone()
         };
@@ -19285,7 +19757,8 @@ impl Connection {
                     params,
                 )
             },
-        );
+        )
+        .await;
         if outcome.resolve_succeeded && (statement_reuse_enabled || compat_trace_profile_enabled) {
             let elapsed_ns = execution_started
                 .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
@@ -19326,7 +19799,7 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn try_execute_precompiled_prepared_insert_autocommit_direct_simple_fast(
+    async fn try_execute_precompiled_prepared_insert_autocommit_direct_simple_fast(
         &self,
         execution_cx: &Cx,
         stmt: &PreparedStatement<'_>,
@@ -19358,6 +19831,7 @@ impl Connection {
         let autocommit_begin_start = hot_path_profile_enabled().then(Instant::now);
         let was_auto = match self
             .ensure_autocommit_txn_with_publication_hint(execution_cx, prebound_publication)
+            .await
         {
             Ok(was_auto) => was_auto,
             Err(error) => return Some(Err(error)),
@@ -19381,7 +19855,9 @@ impl Connection {
             table_name,
             direct,
             params,
-        ) {
+        )
+        .await
+        {
             Ok(last_insert_rowid) => {
                 record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
                 let affected = usize::from(last_insert_rowid.is_some());
@@ -19403,7 +19879,9 @@ impl Connection {
                     rollback_on_constraint_violation,
                     was_auto,
                     &error,
-                ) {
+                )
+                .await
+                {
                     Ok(()) => Err(error),
                     Err(rollback_error) => Err(rollback_error),
                 }
@@ -19432,7 +19910,8 @@ impl Connection {
             capture_time_travel_snapshot,
             false,
             execution_cx,
-        );
+        )
+        .await;
         record_hot_path_duration(
             &FSQLITE_PREPARED_DIRECT_INSERT_AUTOCOMMIT_RESOLVE_TIME_NS,
             autocommit_resolve_start,
@@ -19444,7 +19923,7 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
-    fn execute_precompiled_prepared_insert_fast(
+    async fn execute_precompiled_prepared_insert_fast(
         &self,
         execution_cx: &Cx,
         stmt: &PreparedStatement<'_>,
@@ -19480,7 +19959,8 @@ impl Connection {
                     table_name,
                     direct,
                     params,
-                );
+                )
+                .await;
                 match result {
                     Ok(Some(rowid)) => {
                         record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
@@ -19526,6 +20006,7 @@ impl Connection {
                 params,
                 capture_time_travel_snapshot,
             )
+            .await
         {
             return result;
         }
@@ -19560,11 +20041,12 @@ impl Connection {
                     params,
                 )
             },
-        );
+        )
+        .await;
         outcome.result
     }
 
-    fn execute_precompiled_prepared_insert_dispatch(
+    async fn execute_precompiled_prepared_insert_dispatch(
         &self,
         execution_cx: &Cx,
         stmt: &PreparedStatement<'_>,
@@ -19598,14 +20080,17 @@ impl Connection {
                 // Refreshing memdb here caused O(n²) behavior: each INSERT triggered
                 // a full table scan to reload all existing rows into memdb.
                 // The memdb will be lazily refreshed on the next read boundary.
-                stmt.execute_table_program_dml_with_reuse(execution_cx, params, true)?
+                stmt.execute_table_program_dml_with_reuse(execution_cx, params, true)
+                    .await?
             } else {
                 match self.execute_prepared_direct_simple_insert(
                     execution_cx,
                     table_name,
                     direct_simple_insert,
                     params,
-                ) {
+                )
+                .await
+                {
                     Ok(Some(rowid)) => {
                         fk_enforced_by_inner = true;
                         (1, Some(rowid))
@@ -19621,7 +20106,8 @@ impl Connection {
                                 execution_cx,
                                 stmt,
                                 params,
-                            )?;
+                            )
+                            .await?;
                         // The fallback already enforces FK at its own exit
                         // (see s76h fix in
                         // execute_prepared_insert_table_program_after_direct_fallback).
@@ -19634,7 +20120,8 @@ impl Connection {
         } else {
             self.clear_prepared_direct_insert_append_hint();
             // bd-perf: Skip memdb refresh — VDBE uses storage cursors
-            stmt.execute_table_program_dml_with_reuse(execution_cx, params, true)?
+            stmt.execute_table_program_dml_with_reuse(execution_cx, params, true)
+                .await?
         };
         // Gate FK enforcement on a row actually landing: an OR IGNORE PK
         // conflict drops the row (affected == 0) and SQLite does not FK-check a
@@ -19652,19 +20139,20 @@ impl Connection {
                     "prepared INSERT FK enforcement expected canonical INSERT SQL",
                 ));
             };
-            self.enforce_fk_on_insert(&insert, table_name, params)?;
+            self.enforce_fk_on_insert(&insert, table_name, params).await?;
         }
         match post_write_action {
             PreparedInsertPostWriteAction::None => {}
             PreparedInsertPostWriteAction::RefreshSqliteSequenceCache => {
-                self.refresh_sqlite_sequence_cache()?;
+                self.refresh_sqlite_sequence_cache().await?;
             }
             PreparedInsertPostWriteAction::RefreshAutoincrementSequence => {
                 self.refresh_autoincrement_sequence_after_insert(
                     table_name,
                     affected,
                     last_insert_rowid,
-                )?;
+                )
+                .await?;
             }
         }
         if let Some(last_insert_rowid) = last_insert_rowid {
@@ -19683,7 +20171,7 @@ impl Connection {
         Ok(affected)
     }
 
-    fn execute_prepared_insert_table_program_after_direct_fallback(
+    async fn execute_prepared_insert_table_program_after_direct_fallback(
         &self,
         execution_cx: &Cx,
         stmt: &PreparedStatement<'_>,
@@ -19696,14 +20184,17 @@ impl Connection {
             ));
         };
         let sql_key = Self::sql_hash(stmt.sql.as_ref());
-        let program = self.compile_with_cache(sql_key, stmt.sql.as_ref(), |conn| {
-            conn.compile_table_insert(&insert)
-        })?;
+        let program = self
+            .compile_with_cache(sql_key, stmt.sql.as_ref(), async |conn| {
+                conn.compile_table_insert(&insert).await
+            })
+            .await?;
         let fallback_stmt = stmt.clone_with_program(program);
         // bd-perf: Skip memdb refresh — VDBE uses storage cursors and this
         // path only exists as a correctness fallback for the direct lane.
-        let outcome =
-            fallback_stmt.execute_table_program_dml_with_reuse(execution_cx, params, true)?;
+        let outcome = fallback_stmt
+            .execute_table_program_dml_with_reuse(execution_cx, params, true)
+            .await?;
         // s76h fix: this VDBE fallback runs the table program via reuse but
         // does not itself enforce FK. The non-prepared dispatch path enforces
         // FK after the table program (see Statement::Insert handler); mirror
@@ -19722,7 +20213,8 @@ impl Connection {
             && self.fk_enforcement_enabled()
             && self.table_has_outbound_foreign_keys(&insert.table.name)
         {
-            self.enforce_fk_on_insert(&insert, &insert.table.name, params)?;
+            self.enforce_fk_on_insert(&insert, &insert.table.name, params)
+                    .await?;
         }
         Ok(outcome)
     }
@@ -19740,7 +20232,7 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
-    fn execute_prepared_direct_simple_insert_with_cursor<P: PageReader + PageWriter>(
+    async fn execute_prepared_direct_simple_insert_with_cursor<P: PageReader + PageWriter>(
         &self,
         execution_cx: &Cx,
         direct: &PreparedDirectSimpleInsert,
@@ -19767,8 +20259,8 @@ impl Connection {
                     (rowid, true, true)
                 } else if let Some(next_rowid_hint) = memdb_next_rowid_hint {
                     (rowid, rowid >= next_rowid_hint, false)
-                } else if cursor.last(execution_cx)? {
-                    let last_rowid = cursor.rowid(execution_cx)?;
+                } else if cursor.last(execution_cx).await? {
+                    let last_rowid = cursor.rowid(execution_cx).await?;
                     (rowid, rowid > last_rowid, false)
                 } else {
                     (rowid, true, false)
@@ -19782,12 +20274,14 @@ impl Connection {
                 (rowid, true, true)
             } else if let Some(rowid) = memdb_next_rowid_hint {
                 (rowid, true, false)
-            } else if cursor.last(execution_cx)? {
-                let rowid = cursor.rowid(execution_cx)?.checked_add(1).ok_or_else(|| {
-                    FrankenError::VdbeExecutionError {
+            } else if cursor.last(execution_cx).await? {
+                let rowid = cursor
+                    .rowid(execution_cx)
+                    .await?
+                    .checked_add(1)
+                    .ok_or_else(|| FrankenError::VdbeExecutionError {
                         detail: "rowid overflow: maximum rowid reached".to_owned(),
-                    }
-                })?;
+                    })?;
                 (rowid, true, false)
             } else {
                 (1, true, false)
@@ -19859,7 +20353,8 @@ impl Connection {
                     "pending direct insert page-run root changed without preflush",
                 ));
             }
-            self.flush_taken_pending_direct_insert_page_run_with_cursor(execution_cx, cursor, run)?;
+            self.flush_taken_pending_direct_insert_page_run_with_cursor(execution_cx, cursor, run)
+                .await?;
         }
         fsqlite_vdbe::engine::record_external_insert_path_metric(append_fast_path_candidate);
         let buffered_page_run = can_buffer_current_page_run
@@ -19871,7 +20366,8 @@ impl Connection {
                 can_use_prebuilt_constant_record
                     && record_bytes.len() < PREPARED_DIRECT_INSERT_PAGE_RUN_MIN_RECORD_BYTES,
                 cursor,
-            )?;
+            )
+            .await?;
         if buffered_page_run {
             self.clear_prepared_direct_insert_append_hint();
         } else {
@@ -19887,7 +20383,8 @@ impl Connection {
                         cached_leaf,
                         rowid,
                         record_bytes,
-                    )?
+                    )
+                    .await?
                 {
                     append_fast_leaf_page = Some(cached_leaf.leaf_page());
                     Ok(())
@@ -19898,7 +20395,9 @@ impl Connection {
                         append_hint.last_rowid,
                         rowid,
                         record_bytes,
-                    )? {
+                    )
+                    .await?
+                    {
                         Some(cached_leaf) => {
                             append_fast_leaf_page = Some(cached_leaf.leaf_page());
                             append_hint.cached_leaf = Some(
@@ -19910,13 +20409,16 @@ impl Connection {
                             execution_cx,
                             rowid,
                             record_bytes,
-                        ),
+                        )
+                        .await,
                     }
                 }
             } else if append_fast_path_candidate {
-                cursor.table_append_after_last_position(execution_cx, rowid, record_bytes)
+                cursor
+                    .table_append_after_last_position(execution_cx, rowid, record_bytes)
+                    .await
             } else {
-                cursor.table_insert(execution_cx, rowid, record_bytes)
+                cursor.table_insert(execution_cx, rowid, record_bytes).await
             };
             let mut record_append_hint = false;
             let mut append_leaf_page = None;
@@ -19956,11 +20458,17 @@ impl Connection {
                         self.clear_prepared_direct_insert_append_hint_after_path_miss(
                             prepared_append_hint.as_ref(),
                         );
-                        if !cursor.table_move_to(execution_cx, rowid)?.is_found() {
+                        if !cursor
+                            .table_move_to(execution_cx, rowid)
+                            .await?
+                            .is_found()
+                        {
                             return Err(FrankenError::PrimaryKeyViolation);
                         }
-                        cursor.delete(execution_cx)?;
-                        cursor.table_insert(execution_cx, rowid, record_bytes)?;
+                        cursor.delete(execution_cx).await?;
+                        cursor
+                            .table_insert(execution_cx, rowid, record_bytes)
+                            .await?;
                     }
                     fsqlite_ast::ConflictAction::Rollback
                     | fsqlite_ast::ConflictAction::Abort
@@ -20169,7 +20677,7 @@ impl Connection {
             || can_use_prebuilt_constant_record
     }
 
-    fn execute_prepared_direct_simple_insert(
+    async fn execute_prepared_direct_simple_insert(
         &self,
         execution_cx: &Cx,
         table_name: &str,
@@ -20181,8 +20689,10 @@ impl Connection {
         if profile_enabled {
             FSQLITE_PREPARED_DIRECT_INSERT_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
         }
-        self.flush_pending_direct_update_leaf_patch_run(execution_cx)?;
-        self.flush_pending_direct_delete_leaf_run(execution_cx)?;
+        self.flush_pending_direct_update_leaf_patch_run(execution_cx)
+            .await?;
+        self.flush_pending_direct_delete_leaf_run(execution_cx)
+            .await?;
         let direct_insert_requires_fk_check =
             self.fk_enforcement_enabled() && self.table_has_outbound_foreign_keys(table_name);
         let track_memdb_delta = self.should_track_prepared_direct_insert_memdb_delta();
@@ -20322,7 +20832,7 @@ impl Connection {
                         .enumerate()
                     {
                         let raw_value =
-                            self.eval_expr_with_subqueries(expr, empty_row, empty_col_map, params)?;
+                            self.eval_expr_with_subqueries(expr, empty_row, empty_col_map, params).await?;
                         Self::push_prepared_direct_simple_insert_value(
                             table_name,
                             direct,
@@ -20377,7 +20887,8 @@ impl Connection {
             explicit_rowid,
             can_defer_page_run,
         ) {
-            self.flush_pending_direct_insert_page_run(execution_cx)?;
+            self.flush_pending_direct_insert_page_run(execution_cx)
+                .await?;
         }
 
         let preserialized_record = preserialized_record_scratch
@@ -20473,7 +20984,8 @@ impl Connection {
                     profile_enabled,
                     cursor_setup_start,
                     &mut cursor,
-                );
+                )
+                .await;
                 cursor.swap_cell_scratch(&mut cell_scratch);
                 result
             };
@@ -20511,7 +21023,8 @@ impl Connection {
                 profile_enabled,
                 cursor_setup_start,
                 &mut cursor,
-            );
+            )
+            .await;
             cursor.swap_cell_scratch(&mut cell_scratch);
             result
         };
@@ -20539,7 +21052,7 @@ impl Connection {
             {
                 fk_row_values[ipk_idx] = SqliteValue::Integer(*rowid);
             }
-            self.check_fk_parent_exists(table_name, &fk_row_values)?;
+            self.check_fk_parent_exists(table_name, &fk_row_values).await?;
         }
         result
     }
@@ -20548,7 +21061,7 @@ impl Connection {
     ///
     /// Returns `Ok(affected_rows)` on success. If the WHERE rowid does not
     /// exist, returns `Ok(0)` (matches VDBE / SQLite semantics).
-    fn execute_prepared_direct_simple_update(
+    async fn execute_prepared_direct_simple_update(
         &self,
         execution_cx: &Cx,
         direct: &PreparedDirectSimpleUpdate,
@@ -20556,8 +21069,10 @@ impl Connection {
     ) -> Result<usize> {
         let _lookaside_growth = StatementLookasideGrowthGuard::new(self);
         let _statement_scratch_reset = PreparedDirectInsertScratchResetGuard { conn: self };
-        self.flush_pending_direct_delete_leaf_run(execution_cx)?;
-        self.flush_pending_direct_insert_page_run(execution_cx)?;
+        self.flush_pending_direct_delete_leaf_run(execution_cx)
+            .await?;
+        self.flush_pending_direct_insert_page_run(execution_cx)
+            .await?;
 
         // Resolve target rowid. NULL / non-integer params produce a no-op
         // (rowid lookup cannot match).
@@ -20573,7 +21088,8 @@ impl Connection {
                 direct,
                 params,
                 rowid,
-            )?
+            )
+            .await?
         {
             if abandon_memdb {
                 self.clear_prepared_direct_insert_append_hint();
@@ -20622,6 +21138,7 @@ impl Connection {
                     &mut payload_buf,
                     &mut cursor,
                 )
+                .await
             };
             let txn_back = page_io.into_inner()?;
             *self.active_txn.borrow_mut() = Some(txn_back);
@@ -20646,7 +21163,8 @@ impl Connection {
                 &mut new_values,
                 &mut payload_buf,
                 &mut cursor,
-            )?
+            )
+            .await?
         };
 
         // The direct path mutates the btree without touching the MemDatabase
@@ -20664,7 +21182,7 @@ impl Connection {
         Ok(affected)
     }
 
-    fn execute_prepared_direct_simple_update_with_cursor<P: PageReader + PageWriter>(
+    async fn execute_prepared_direct_simple_update_with_cursor<P: PageReader + PageWriter>(
         &self,
         execution_cx: &Cx,
         direct: &PreparedDirectSimpleUpdate,
@@ -20683,7 +21201,7 @@ impl Connection {
         if self.qf_maybe_short_circuit_for_rowid(execution_cx, direct.root_page, rowid, cursor)? {
             return Ok((0, false));
         }
-        let seek = cursor.table_move_to(execution_cx, rowid)?;
+        let seek = cursor.table_move_to(execution_cx, rowid).await?;
         if !seek.is_found() {
             return Ok((0, false));
         }
@@ -20700,7 +21218,8 @@ impl Connection {
                 rowid,
                 payload_buf,
                 cursor,
-            )?
+            )
+            .await?
         {
             return Ok(outcome);
         }
@@ -20709,7 +21228,7 @@ impl Connection {
             new_values.resize(direct.columns.len(), SqliteValue::Null);
             None
         } else {
-            cursor.payload_into(execution_cx, payload_buf)?;
+            cursor.payload_into(execution_cx, payload_buf).await?;
 
             // Decode the on-disk record into the scratch values. IPK columns are
             // stored as NULL in the payload (key is the rowid); we patch them
@@ -20772,8 +21291,10 @@ impl Connection {
             execution_cx,
             rowid,
             record_scratch.as_slice(),
-        )? {
-            cursor.delete(execution_cx)?;
+        )
+        .await?
+        {
+            cursor.delete(execution_cx).await?;
             // `delete()` leaves the cursor at the deleted row's successor (or EOF).
             // The rowid is now known absent, so reuse that position instead of
             // sending the replacement through the general table_insert path, which
@@ -20782,7 +21303,8 @@ impl Connection {
                 execution_cx,
                 rowid,
                 record_scratch.as_slice(),
-            )?;
+            )
+            .await?;
         }
         self.retained_autocommit_count_sum_cache_note_update(
             direct.root_page,
@@ -20814,7 +21336,9 @@ impl Connection {
         Ok(raw_value.apply_affinity(Self::type_affinity_for_direct_insert(column.affinity)))
     }
 
-    fn try_execute_prepared_direct_simple_update_fixed_width_real<P: PageReader + PageWriter>(
+    async fn try_execute_prepared_direct_simple_update_fixed_width_real<
+        P: PageReader + PageWriter,
+    >(
         &self,
         execution_cx: &Cx,
         direct: &PreparedDirectSimpleUpdate,
@@ -20888,7 +21412,7 @@ impl Connection {
             }
         }
 
-        cursor.payload_into(execution_cx, payload_buf)?;
+        cursor.payload_into(execution_cx, payload_buf).await?;
         let projected =
             parse_record_projected_column_offsets(payload_buf, patch.column_index, None)
                 .ok_or_else(|| FrankenError::DatabaseCorrupt {
@@ -20926,9 +21450,13 @@ impl Connection {
             execution_cx,
             rowid,
             payload_buf.as_slice(),
-        )? {
-            cursor.delete(execution_cx)?;
-            cursor.table_insert_prechecked_absent(execution_cx, rowid, payload_buf.as_slice())?;
+        )
+        .await?
+        {
+            cursor.delete(execution_cx).await?;
+            cursor
+                .table_insert_prechecked_absent(execution_cx, rowid, payload_buf.as_slice())
+                .await?;
         }
 
         self.retained_autocommit_count_sum_cache_note_update(direct.root_page, None, None);
@@ -20936,7 +21464,7 @@ impl Connection {
     }
 
     /// Execute an eligible direct-simple DELETE without dispatching to VDBE.
-    fn execute_prepared_direct_simple_delete(
+    async fn execute_prepared_direct_simple_delete(
         &self,
         execution_cx: &Cx,
         direct: &PreparedDirectSimpleDelete,
@@ -20945,10 +21473,13 @@ impl Connection {
         let _lookaside_growth = StatementLookasideGrowthGuard::new(self);
         let profile_direct_delete = hot_path_profile_enabled();
         let preflush_start = profile_direct_delete.then(Instant::now);
-        let preflush_result = (|| -> Result<()> {
-            self.flush_pending_direct_update_leaf_patch_run(execution_cx)?;
+        let preflush_result = async {
+            self.flush_pending_direct_update_leaf_patch_run(execution_cx)
+                .await?;
             self.flush_pending_direct_insert_page_run(execution_cx)
-        })();
+                .await
+        }
+        .await;
         record_hot_path_duration(
             &FSQLITE_PREPARED_DIRECT_DELETE_PREFLUSH_TIME_NS,
             preflush_start,
@@ -20973,7 +21504,8 @@ impl Connection {
             execution_cx,
             direct,
             rowid,
-        );
+        )
+        .await;
         if let Some((affected, abandon_memdb)) = active_leaf_result? {
             return self.finish_prepared_direct_simple_delete(direct, affected, abandon_memdb);
         }
@@ -21011,6 +21543,7 @@ impl Connection {
                     rowid,
                     &mut cursor,
                 )
+                .await
             };
             let txn_back = page_io.into_inner()?;
             *self.active_txn.borrow_mut() = Some(txn_back);
@@ -21041,7 +21574,8 @@ impl Connection {
                 direct,
                 rowid,
                 &mut cursor,
-            )?
+            )
+            .await?
         };
 
         self.finish_prepared_direct_simple_delete(direct, affected, abandon_memdb)
@@ -21084,7 +21618,7 @@ impl Connection {
         Ok(affected)
     }
 
-    fn execute_prepared_direct_simple_delete_with_cursor<P: PageReader + PageWriter>(
+    async fn execute_prepared_direct_simple_delete_with_cursor<P: PageReader + PageWriter>(
         &self,
         execution_cx: &Cx,
         direct: &PreparedDirectSimpleDelete,
@@ -21105,7 +21639,7 @@ impl Connection {
             return Ok((0, false));
         }
         let seek_start = profile_direct_delete.then(Instant::now);
-        let seek_result = cursor.table_move_to(execution_cx, rowid);
+        let seek_result = cursor.table_move_to(execution_cx, rowid).await;
         record_hot_path_duration(&FSQLITE_PREPARED_DIRECT_DELETE_SEEK_TIME_NS, seek_start);
         let seek = seek_result?;
         if !seek.is_found() {
@@ -21156,7 +21690,9 @@ impl Connection {
             let _statement_scratch_reset = PreparedDirectInsertScratchResetGuard { conn: self };
             let mut payload_buf = self.prepared_direct_insert_cell_scratch.borrow_mut();
             payload_buf.clear();
-            cursor.payload_into(execution_cx, &mut payload_buf)?;
+            cursor
+                .payload_into(execution_cx, &mut payload_buf)
+                .await?;
             let mut old_values = self.prepared_direct_update_row_scratch.borrow_mut();
             old_values.clear();
             parse_record_into(&payload_buf, &mut old_values).ok_or_else(|| {
@@ -21174,7 +21710,7 @@ impl Connection {
             None
         };
         let physical_delete_start = profile_direct_delete.then(Instant::now);
-        let delete_result = cursor.delete(execution_cx);
+        let delete_result = cursor.delete(execution_cx).await;
         record_hot_path_duration(
             &FSQLITE_PREPARED_DIRECT_DELETE_PHYSICAL_DELETE_TIME_NS,
             physical_delete_start,
@@ -21226,13 +21762,13 @@ impl Connection {
     /// and the entry is marked `too_large_to_build`. Clears any
     /// partial content before returning.
     #[allow(dead_code)] // build-on-first-consult disabled 4ea55010; retained for re-enablement
-    fn quotient_filter_seed_from_cursor<P: PageReader + PageWriter>(
+    async fn quotient_filter_seed_from_cursor<P: PageReader + PageWriter>(
         entry: &mut QuotientFilterEntry,
         execution_cx: &Cx,
         cursor: &mut fsqlite_btree::BtCursor<P>,
     ) -> Result<bool> {
         entry.filter.clear();
-        let has_any = cursor.first(execution_cx)?;
+        let has_any = cursor.first(execution_cx).await?;
         if !has_any {
             // Empty table — filter is trivially seeded.
             entry.built = true;
@@ -21241,7 +21777,7 @@ impl Connection {
         }
         let mut seen: usize = 0;
         loop {
-            let rowid = cursor.rowid(execution_cx)?;
+            let rowid = cursor.rowid(execution_cx).await?;
             // `insert` only fails past 4x capacity; at that point, the
             // FP rate has degraded past usefulness. Treat it like the
             // row-cap case: disable short-circuiting for this table.
@@ -21262,7 +21798,7 @@ impl Connection {
                 entry.too_large_to_build = true;
                 return Ok(false);
             }
-            if !cursor.next(execution_cx)? {
+            if !cursor.next(execution_cx).await? {
                 break;
             }
         }
@@ -22087,7 +22623,7 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn try_execute_precompiled_prepared_update_delete_autocommit_direct_simple_fast(
+    async fn try_execute_precompiled_prepared_update_delete_autocommit_direct_simple_fast(
         &self,
         execution_cx: &Cx,
         stmt: &PreparedStatement<'_>,
@@ -22123,6 +22659,7 @@ impl Connection {
         // prepared UPDATE/DELETE (bd-db300.5.2.2.4 / T13).
         let was_auto = match self
             .ensure_autocommit_txn_with_publication_hint(execution_cx, prebound_publication)
+            .await
         {
             Ok(was_auto) => was_auto,
             Err(error) => return Some(Err(error)),
@@ -22142,6 +22679,7 @@ impl Connection {
                     FSQLITE_PREPARED_DIRECT_UPDATE_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
                 }
                 self.execute_prepared_direct_simple_update(execution_cx, direct, params)
+                    .await
             }
             PreparedDmlKind::Delete => {
                 let direct = fast_path.direct_simple_delete.as_ref()?;
@@ -22149,6 +22687,7 @@ impl Connection {
                     FSQLITE_PREPARED_DIRECT_DELETE_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
                 }
                 self.execute_prepared_direct_simple_delete(execution_cx, direct, params)
+                    .await
             }
             PreparedDmlKind::Insert => return None,
         };
@@ -22163,7 +22702,9 @@ impl Connection {
                 rollback_on_constraint_violation,
                 was_auto,
                 &error,
-            ) {
+            )
+            .await
+            {
                 Ok(()) => Err(error),
                 Err(rollback_error) => Err(rollback_error),
             },
@@ -22189,7 +22730,8 @@ impl Connection {
             false,
             false,
             execution_cx,
-        );
+        )
+        .await;
         Some(match resolve_result {
             Ok(()) => result,
             Err(error) => Err(error),
@@ -22197,7 +22739,7 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn execute_precompiled_prepared_update_or_delete(
+    async fn execute_precompiled_prepared_update_or_delete(
         &self,
         execution_cx: &Cx,
         stmt: &PreparedStatement<'_>,
@@ -22252,6 +22794,7 @@ impl Connection {
                     entry_proof.publication.take(),
                     params,
                 )
+                .await
         {
             return result;
         }
@@ -22275,7 +22818,9 @@ impl Connection {
                             execution_cx,
                             direct,
                             params,
-                        ) {
+                        )
+                        .await
+                        {
                             Ok(affected) => {
                                 self.record_statement_changes_without_sync(affected);
                                 let _ = entry_proof;
@@ -22299,7 +22844,9 @@ impl Connection {
                             execution_cx,
                             direct,
                             params,
-                        ) {
+                        )
+                        .await
+                        {
                             Ok(affected) => {
                                 self.record_statement_changes_without_sync(affected);
                                 let _ = entry_proof;
@@ -22347,6 +22894,7 @@ impl Connection {
                         )
                     },
                 )
+                .await
                 .result;
         }
         self.clear_table_program_error_state();
@@ -22415,6 +22963,7 @@ impl Connection {
                             )
                         },
                     )
+                    .await
                     .result;
             }
             trace_registration.clone()
@@ -22497,7 +23046,8 @@ impl Connection {
                     params,
                 )
             },
-        );
+        )
+        .await;
         if outcome.resolve_succeeded && (statement_reuse_enabled || compat_trace_profile_enabled) {
             let elapsed_ns = execution_started
                 .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
@@ -22537,7 +23087,7 @@ impl Connection {
         outcome.result
     }
 
-    fn execute_precompiled_prepared_update_or_delete_dispatch(
+    async fn execute_precompiled_prepared_update_or_delete_dispatch(
         &self,
         execution_cx: &Cx,
         stmt: &PreparedStatement<'_>,
@@ -22545,7 +23095,8 @@ impl Connection {
     ) -> Result<usize> {
         self.clear_prepared_direct_insert_append_hint();
         let (affected, _) =
-            stmt.execute_table_program_dml_with_reuse(execution_cx, params, false)?;
+            stmt.execute_table_program_dml_with_reuse(execution_cx, params, false)
+                .await?;
         self.record_statement_changes(affected);
         Ok(affected)
     }
@@ -23210,11 +23761,11 @@ impl Connection {
     /// Compile a statement, using the compiled cache when possible.
     /// The `sql_key` is the hash of the canonical SQL text; `sql` is the
     /// canonical SQL text for collision safety.
-    fn compile_with_cache(
+    async fn compile_with_cache(
         &self,
         sql_key: u64,
         sql: &str,
-        compile_fn: impl FnOnce(&Self) -> Result<VdbeProgram>,
+        compile_fn: impl std::ops::AsyncFnOnce(&Self) -> Result<VdbeProgram>,
     ) -> Result<Arc<VdbeProgram>> {
         let profile_enabled = hot_path_profile_enabled();
         if self.bypass_compiled_cache.get() {
@@ -23222,7 +23773,7 @@ impl Connection {
                 FSQLITE_COMPILED_CACHE_MISSES.fetch_add(1, AtomicOrdering::Relaxed);
             }
             let start = Instant::now();
-            let program = match compile_fn(self) {
+            let program = match compile_fn(self).await {
                 Ok(program) => program,
                 Err(error) => {
                     let compile_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -23275,7 +23826,7 @@ impl Connection {
         // the only reuse.)
         let program = {
             let _fronted = ProgramCacheFrontedGuard::enter();
-            compile_fn(self)
+            compile_fn(self).await
         };
         let program = match program {
             Ok(program) => program,
@@ -23323,7 +23874,7 @@ impl Connection {
         }
     }
 
-    fn maybe_rollback_transaction_for_conflict_action(
+    async fn maybe_rollback_transaction_for_conflict_action(
         &self,
         rollback_on_constraint_violation: bool,
         was_auto: bool,
@@ -23339,28 +23890,35 @@ impl Connection {
             return Ok(());
         }
         let rollback_stmt = fsqlite_ast::RollbackStatement { to_savepoint: None };
-        self.execute_rollback(&rollback_stmt)
+        self.execute_rollback(&rollback_stmt).await
     }
 
-    fn with_internal_statement_savepoint<T>(
+    async fn with_internal_statement_savepoint<T, F>(
         &self,
         purpose: &str,
-        body: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
+        body: F,
+    ) -> Result<T>
+    where
+        F: std::ops::AsyncFnOnce() -> Result<T>,
+    {
         let cx = self.op_cx()?;
         self.with_internal_statement_savepoint_and_cx(&cx, purpose, body)
+            .await
     }
 
-    fn with_internal_statement_savepoint_and_cx<T>(
+    async fn with_internal_statement_savepoint_and_cx<T, F>(
         &self,
         cx: &Cx,
         purpose: &str,
-        body: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
+        body: F,
+    ) -> Result<T>
+    where
+        F: std::ops::AsyncFnOnce() -> Result<T>,
+    {
         // Pending direct-write runs belong to already-successful statements.
         // Flush them before this statement's savepoint so a rollback of `body`
         // cannot undo earlier statement effects.
-        self.flush_pending_direct_write_runs(cx)?;
+        self.flush_pending_direct_write_runs(cx).await?;
         let savepoint_name = self.next_internal_savepoint_name(purpose);
         let snapshot = self.snapshot();
         self.internal_statement_savepoint_depth.set(
@@ -23425,7 +23983,7 @@ impl Connection {
             return Err(error);
         }
 
-        match body() {
+        match body().await {
             Ok(value) => {
                 if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
                     txn.release_savepoint(cx, &savepoint_name)?;
@@ -23494,7 +24052,9 @@ impl Connection {
                     match txn.rollback_to_savepoint(cx, &savepoint_name) {
                         Ok(()) => {
                             pager_rollback_succeeded = true;
-                            if let Err(err) = txn.release_savepoint(cx, &savepoint_name) {
+                            if let Err(err) =
+                                txn.release_savepoint(cx, &savepoint_name)
+                            {
                                 cleanup_errors.push(format!(
                                     "pager release_savepoint('{savepoint_name}') failed: {err}"
                                 ));
@@ -23526,7 +24086,7 @@ impl Connection {
                 if pager_rollback_succeeded {
                     self.txn_metrics_note_rollback();
                     self.clear_prepared_direct_insert_append_hint();
-                    self.restore_snapshot(cx, &snapshot)?;
+                    self.restore_snapshot(cx, &snapshot).await?;
                 }
 
                 if !cleanup_errors.is_empty() {
@@ -23986,34 +24546,47 @@ impl Connection {
 
     /// Execute a parsed statement, handling both DDL (CREATE TABLE) and
     /// DML (SELECT/INSERT/UPDATE/DELETE).
+    // Statement execution re-enters itself (triggers, view INSTEAD OF bodies,
+    // subquery materialization, FK cascades), so the future is boxed to break
+    // the recursive type.
     #[allow(clippy::too_many_lines)]
-    fn execute_statement(
-        &self,
-        statement: &Statement,
-        params: Option<&[SqliteValue]>,
-    ) -> Result<Vec<Row>> {
+    fn execute_statement<'a>(
+        &'a self,
+        statement: &'a Statement,
+        params: Option<&'a [SqliteValue]>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Row>>> + 'a>> {
+        Box::pin(async move {
         if hot_path_profile_enabled() {
             FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES.fetch_add(1, AtomicOrdering::Relaxed);
         }
         self.background_status()?;
         self.execute_statement_after_background_status(statement, params)
+            .await
+        })
     }
 
-    fn execute_statement_after_background_status(
-        &self,
-        statement: &Statement,
-        params: Option<&[SqliteValue]>,
-    ) -> Result<Vec<Row>> {
+    fn execute_statement_after_background_status<'a>(
+        &'a self,
+        statement: &'a Statement,
+        params: Option<&'a [SqliteValue]>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Row>>> + 'a>> {
+        Box::pin(async move {
         self.execute_statement_impl_after_background_status(statement, params, None)
+            .await
+        })
     }
 
     #[allow(clippy::too_many_lines)]
-    fn execute_statement_impl_after_background_status(
-        &self,
-        statement: &Statement,
-        params: Option<&[SqliteValue]>,
-        precompiled: Option<&VdbeProgram>,
-    ) -> Result<Vec<Row>> {
+    // Dispatch re-enters itself (triggers, view INSTEAD OF bodies, subquery
+    // materialization, FK cascades), so the future is boxed to break the
+    // recursive type.
+    fn execute_statement_impl_after_background_status<'a>(
+        &'a self,
+        statement: &'a Statement,
+        params: Option<&'a [SqliteValue]>,
+        precompiled: Option<&'a VdbeProgram>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Row>>> + 'a>> {
+        Box::pin(async move {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
         self.clear_table_program_error_state();
         self.sync_change_tracking_context();
@@ -24108,7 +24681,7 @@ impl Connection {
                 span
             });
             let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
-            self.rewrite_subquery_statement(statement, params)?
+            self.rewrite_subquery_statement(statement, params).await?
         };
         // 5B.5 + 5B.2 (bd-1yi8): autocommit wrapping — ensure a pager
         // transaction is active for data/DDL operations outside an
@@ -24177,16 +24750,18 @@ impl Connection {
         // may be repairing malformed rows. Do not refresh the normal MemDB
         // schema image before the raw edit has had a chance to run.
         if should_refresh_active_txn_memdb && !writable_schema_dml {
-            self.refresh_memdb_from_active_txn_if_dirty(&op_cx)?;
+            self.refresh_memdb_from_active_txn_if_dirty(&op_cx)
+                .await?;
         }
         if !self.skip_statement_memdb_refresh.get() && !is_txn_control && !is_write {
-            self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)?;
+            self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)
+                .await?;
         }
         if !self.skip_statement_memdb_refresh.get()
             && schema_change_boundary
             && self.cached_write_txn.borrow().is_some()
         {
-            self.invalidate_cached_write_txn(&op_cx);
+            self.invalidate_cached_write_txn(&op_cx).await;
         }
         let retained_boundary_flush_required = self.retained_autocommit_txn.borrow().is_some()
             && (schema_change_boundary
@@ -24200,7 +24775,7 @@ impl Connection {
         if retained_boundary_flush_required {
             // Schema/pager boundaries must not reuse a parked retained
             // autocommit batch because they need a fresh durable view.
-            self.flush_retained_autocommit_txn(&op_cx)?;
+            self.flush_retained_autocommit_txn(&op_cx).await?;
         }
         // bd-otbu1 / I1: Flush retained autocommit if read touches dirty tables.
         // This preserves read-after-write semantics for any retained batch.
@@ -24213,14 +24788,16 @@ impl Connection {
                 self.retained_autocommit_has_dirty_overlap(&read_tables)
             })
         {
-            self.flush_retained_autocommit_txn_for_read(&op_cx)?;
+            self.flush_retained_autocommit_txn_for_read(&op_cx)
+                .await?;
         }
         let was_auto = if is_txn_control {
             false // transaction-control manages its own transactions
         } else if is_write {
-            self.ensure_autocommit_txn_with_cx(&op_cx)?
+            self.ensure_autocommit_txn_with_cx(&op_cx).await?
         } else {
-            self.ensure_autocommit_txn_mode_with_cx(TransactionMode::ReadOnly, &op_cx, None)?
+            self.ensure_autocommit_txn_mode_with_cx(TransactionMode::ReadOnly, &op_cx, None)
+                .await?
         };
         if !self.skip_statement_memdb_refresh.get()
             && !writable_schema_dml
@@ -24229,7 +24806,8 @@ impl Connection {
                 || !self.pending_memdb_direct_upserts.borrow().is_empty()
                 || !self.memdb_rows_loaded.get())
         {
-            self.refresh_memdb_from_active_txn_if_dirty(&op_cx)?;
+            self.refresh_memdb_from_active_txn_if_dirty(&op_cx)
+                .await?;
         }
         let previous_total_changes = self.total_changes.get();
         let previous_last_insert_rowid = self.current_last_insert_rowid();
@@ -24264,7 +24842,7 @@ impl Connection {
             statement_rolls_back_transaction_on_constraint(statement.as_ref());
         let execute_body_start = hot_path_profile_enabled().then(Instant::now);
         let result = if use_statement_savepoint {
-            self.with_internal_statement_savepoint_and_cx(&op_cx, statement_kind, || {
+            self.with_internal_statement_savepoint_and_cx(&op_cx, statement_kind, async || {
                 self.execute_statement_dispatch_impl(
                     &op_cx,
                     statement.as_ref(),
@@ -24272,7 +24850,9 @@ impl Connection {
                     precompiled,
                     derived_storage_log_select.as_ref(),
                 )
+                .await
             })
+            .await
         } else {
             self.execute_statement_dispatch_impl(
                 &op_cx,
@@ -24281,6 +24861,7 @@ impl Connection {
                 precompiled,
                 derived_storage_log_select.as_ref(),
             )
+            .await
         };
         record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
         let result = match result {
@@ -24301,7 +24882,9 @@ impl Connection {
                     rollback_on_constraint_violation,
                     was_auto,
                     &error,
-                ) {
+                )
+                .await
+                {
                     Ok(()) => Err(error),
                     Err(rollback_error) => Err(rollback_error),
                 }
@@ -24345,7 +24928,8 @@ impl Connection {
             capture_time_travel_snapshot,
             schema_change_boundary,
             &op_cx,
-        );
+        )
+        .await;
         if armed_full_schema_reload && resolve_result.is_ok() {
             self.force_full_schema_reload_once.set(false);
         }
@@ -24353,7 +24937,7 @@ impl Connection {
         if ok && writable_schema_dml {
             let flush_retained = self.retained_autocommit_txn.borrow().is_some();
             if flush_retained {
-                self.flush_retained_autocommit_txn(&op_cx)?;
+                self.flush_retained_autocommit_txn(&op_cx).await?;
             }
         }
         if statement_reuse_enabled || compat_trace_profile_enabled {
@@ -24396,23 +24980,25 @@ impl Connection {
             }
         }
         result
+        })
     }
 
     /// Inner dispatch for `execute_statement` — separated so that
     /// autocommit wrapping can bracket the entire execution.
     #[allow(clippy::too_many_lines)]
     #[allow(dead_code)]
-    fn execute_statement_dispatch(
+    async fn execute_statement_dispatch(
         &self,
         statement: &Statement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         let op_cx = self.op_cx()?;
         self.execute_statement_dispatch_impl(&op_cx, statement, params, None, None)
+            .await
     }
 
     #[allow(clippy::too_many_lines)]
-    fn execute_statement_dispatch_impl(
+    async fn execute_statement_dispatch_impl(
         &self,
         cx: &Cx,
         statement: &Statement,
@@ -24420,7 +25006,10 @@ impl Connection {
         precompiled: Option<&VdbeProgram>,
         derived_storage_log_select: Option<&SelectStatement>,
     ) -> Result<Vec<Row>> {
-        if let Some(rows) = self.maybe_execute_attached_target_statement(statement, params)? {
+        if let Some(rows) = self
+            .maybe_execute_attached_target_statement(statement, params)
+            .await?
+        {
             return Ok(rows);
         }
         self.reject_unsupported_attached_target_schema(statement)?;
@@ -24457,17 +25046,20 @@ impl Connection {
         // a view with a matching INSTEAD OF trigger to the trigger body instead of
         // normal table DML (which would fail "no such table" — a view has no
         // B-tree). bd-ffkpv.
-        if let Some(rows) = self.maybe_execute_instead_of_view_dml(statement, params)? {
+        if let Some(rows) = self
+            .maybe_execute_instead_of_view_dml(statement, params)
+            .await?
+        {
             return Ok(rows);
         }
         match statement {
             Statement::CreateTable(create) => {
-                self.execute_create_table(create)?;
+                self.execute_create_table(create).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
             Statement::CreateVirtualTable(create_virtual) => {
-                self.execute_create_virtual_table(create_virtual)?;
+                self.execute_create_virtual_table(create_virtual).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
@@ -24488,19 +25080,21 @@ impl Connection {
                 // execute against a historical MemDatabase snapshot (#23).
                 if let Some(target) = extract_temporal_clause(select) {
                     self.log_mem_execution_fallback("select", "time_travel_snapshot")?;
-                    return self.execute_time_travel_select(select, params, &target);
+                    return self
+                        .execute_time_travel_select(select, params, &target)
+                        .await;
                 }
                 // CTE (WITH clause): materialize as temporary tables.
                 if select.with.is_some() {
                     self.log_mem_execution_fallback("select", "with_clause_materialization")?;
-                    return self.execute_with_ctes(select, params);
+                    return self.execute_with_ctes(select, params).await;
                 }
                 // View expansion: materialize referenced views as temp tables.
                 if self.has_view_references(select) {
                     self.log_mem_execution_fallback("select", "view_materialization")?;
-                    return self.execute_with_materialized_views(select, params);
+                    return self.execute_with_materialized_views(select, params).await;
                 }
-                if let Some(rows) = self.maybe_execute_attached_select(select, params)? {
+                if let Some(rows) = self.maybe_execute_attached_select(select, params).await? {
                     return Ok(rows);
                 }
                 // Compound SELECT (UNION/UNION ALL/INTERSECT/EXCEPT) must
@@ -24508,11 +25102,11 @@ impl Connection {
                 // mixed fallback. The fallback executes a single SELECT body
                 // and would otherwise ignore the right-hand compound arms.
                 if !select.body.compounds.is_empty() {
-                    return self.execute_compound_select(select, params);
+                    return self.execute_compound_select(select, params).await;
                 }
                 if self.attached_select_requires_local_fallback(select)? {
                     self.log_mem_execution_fallback("select", "attached_mixed_select_fallback")?;
-                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
@@ -24524,9 +25118,10 @@ impl Connection {
                         || self.has_implicit_aggregation_with_registry(select)
                         || has_ordered_aggregate(select);
                     let mut rows = if needs_aggregation && has_joins(select) {
-                        self.execute_group_by_join_select(cx, &bound, None)?
+                        self.execute_group_by_join_select(cx, &bound, None)
+                            .await?
                     } else {
-                        self.execute_join_select(&bound, None)?
+                        self.execute_join_select(&bound, None).await?
                     };
                     if let Some(limit) = limit_clause {
                         apply_limit_clause(&mut rows, &limit);
@@ -24539,7 +25134,9 @@ impl Connection {
                         "select",
                         "sqlite_schema_virtual_materialization",
                     )?;
-                    return self.execute_with_materialized_sqlite_schema(select, params);
+                    return self
+                        .execute_with_materialized_sqlite_schema(select, params)
+                        .await;
                 }
                 let distinct = is_distinct_select(select);
                 let distinct_collations = if distinct {
@@ -24561,14 +25158,16 @@ impl Connection {
                 // Must be checked before the expression-only path because the
                 // expression-only VDBE codegen cannot handle aggregate functions.
                 if is_expression_only_select(select) && implicit_aggregate {
-                    return self.execute_fromless_aggregate(select, params);
+                    return self.execute_fromless_aggregate(select, params).await;
                 }
                 // Expression-only SELECT with scalar subqueries in result
                 // columns: the VDBE codegen cannot resolve table references
                 // inside subqueries (e.g. CTE temp tables).  Evaluate via the
                 // connection-level path that can call execute_statement.
                 if is_expression_only_select(select) && expression_only_has_subquery(select) {
-                    return self.execute_expression_only_with_subqueries(select, params);
+                    return self
+                    .execute_expression_only_with_subqueries(select, params)
+                    .await;
                 }
                 if let Some(rows) = self.try_execute_plain_live_vtab_count_star(select)? {
                     return Ok(rows);
@@ -24576,7 +25175,7 @@ impl Connection {
                 // Check if this is an expression-only SELECT (no FROM clause).
                 if is_expression_only_select(select) {
                     // Fallback codegen: eagerly rewrite IN subqueries.
-                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
                     let plan_span = tracing::span!(
                         target: "fsqlite.plan",
                         tracing::Level::TRACE,
@@ -24596,7 +25195,8 @@ impl Connection {
                         &op_cx,
                         Some(&build_expression_postprocess(rewritten.as_ref())),
                         page_size_from_pragma_state(self.pragma_state.borrow().page_size)?,
-                    )?;
+                    )
+                    .await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -24607,6 +25207,7 @@ impl Connection {
                     // validated indexed COUNT(*) semijoin fast path applies.
                     self.log_mem_execution_fallback("select", "correlated_exists_fallback")?;
                     self.execute_correlated_subquery_where_fallback(cx, select, params)
+                        .await
                 } else if select_has_correlated_in_subquery_in_where(select) {
                     // bd-zvk68: a correlated `x IN (SELECT ...)` predicate in the
                     // WHERE clause references outer columns and must be evaluated
@@ -24618,6 +25219,7 @@ impl Connection {
                     // already handled in VDBE via emit_scalar_subquery.
                     self.log_mem_execution_fallback("select", "correlated_in_subquery_fallback")?;
                     self.execute_correlated_subquery_where_fallback(cx, select, params)
+                        .await
                 } else if (has_group_by(select) || implicit_aggregate || ordered_aggregate)
                     && (has_joins(select)
                         || has_fallback_from_source(select)
@@ -24628,11 +25230,13 @@ impl Connection {
                     // GROUP BY (or implicit aggregation) + JOIN/non-table source/live vtab:
                     // materialize the join as a temp table, then GROUP BY on that.
                     self.log_mem_execution_fallback("select", "group_by_join_fallback")?;
-                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = self.execute_group_by_join_select(cx, &bound, None)?;
+                    let mut rows = self
+                        .execute_group_by_join_select(cx, &bound, None)
+                        .await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -24642,11 +25246,11 @@ impl Connection {
                     Ok(rows)
                 } else if custom_implicit_aggregate {
                     self.log_mem_execution_fallback("select", "custom_aggregate_fallback")?;
-                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = self.execute_group_by_select(&bound, None)?;
+                    let mut rows = self.execute_group_by_select(&bound, None).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -24661,11 +25265,11 @@ impl Connection {
                     // path returns an arbitrary row, so route to the grouped
                     // interpreter which sources bare columns from that row.
                     self.log_mem_execution_fallback("select", "minmax_bare_tracking_fallback")?;
-                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = self.execute_group_by_select(&bound, None)?;
+                    let mut rows = self.execute_group_by_select(&bound, None).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -24687,11 +25291,11 @@ impl Connection {
                     } else {
                         self.log_mem_execution_fallback("select", "group_by_window_fallback")?;
                     }
-                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = self.execute_group_by_window_select(&bound, None)?;
+                    let mut rows = self.execute_group_by_window_select(&bound, None).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -24704,15 +25308,18 @@ impl Connection {
                 {
                     // Eagerly rewrite IN subqueries before choosing the storage-compatible
                     // grouped-aggregate substrate or the connection-level fallback.
-                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    if let Some(mut rows) = self.try_execute_group_by_storage_substrate(
-                        cx,
-                        &bound,
-                        None,
-                        "group_by_storage_substrate",
-                    )? {
+                    if let Some(mut rows) = self
+                        .try_execute_group_by_storage_substrate(
+                            cx,
+                            &bound,
+                            None,
+                            "group_by_storage_substrate",
+                        )
+                        .await?
+                    {
                         if distinct {
                             dedup_rows_collated(
                                 &mut rows,
@@ -24724,7 +25331,7 @@ impl Connection {
                     }
                     self.log_mem_execution_fallback("select", "group_by_fallback")?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = self.execute_group_by_select(&bound, None)?;
+                    let mut rows = self.execute_group_by_select(&bound, None).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -24743,11 +25350,11 @@ impl Connection {
                     } else {
                         self.log_mem_execution_fallback("select", "window_function_fallback")?;
                     }
-                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = self.execute_window_select(&bound, None)?;
+                    let mut rows = self.execute_window_select(&bound, None).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -24761,11 +25368,11 @@ impl Connection {
                     // scans through the connection fallback, which can drive
                     // the registered vtab instance directly.
                     self.log_mem_execution_fallback("select", "live_vtab_select_fallback")?;
-                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = self.execute_join_select(&bound, None)?;
+                    let mut rows = self.execute_join_select(&bound, None).await?;
                     if let Some(limit) = limit_clause {
                         apply_limit_clause(&mut rows, &limit);
                     }
@@ -24792,7 +25399,7 @@ impl Connection {
 
                     // Fallback path: eagerly rewrite IN subqueries.
                     // Also handles derived tables even without explicit JOINs.
-                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
                     let native_join_dispatch =
                         self.can_execute_join_select_on_real_backend(rewritten.as_ref());
                     if !native_join_dispatch {
@@ -24802,7 +25409,7 @@ impl Connection {
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
                     let started = Instant::now();
-                    let mut rows = self.execute_join_select(&bound, None)?;
+                    let mut rows = self.execute_join_select(&bound, None).await?;
                     if native_join_dispatch {
                         let elapsed_ns =
                             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -24814,11 +25421,11 @@ impl Connection {
                     Ok(rows)
                 } else if has_table_function_source(select) {
                     self.log_mem_execution_fallback("select", "join_or_subquery_fallback")?;
-                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = self.execute_join_select(&bound, None)?;
+                    let mut rows = self.execute_join_select(&bound, None).await?;
                     if let Some(limit) = limit_clause {
                         apply_limit_clause(&mut rows, &limit);
                     }
@@ -24829,11 +25436,11 @@ impl Connection {
                     // (which only opens one table cursor). Route through the
                     // connection-level fallback which can inline-evaluate them.
                     self.log_mem_execution_fallback("select", "correlated_join_subquery_fallback")?;
-                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = self.execute_join_select(&bound, None)?;
+                    let mut rows = self.execute_join_select(&bound, None).await?;
                     if let Some(limit) = limit_clause {
                         apply_limit_clause(&mut rows, &limit);
                     }
@@ -24846,7 +25453,7 @@ impl Connection {
                     } else {
                         // Eagerly rewrite IN-subqueries that the VDBE codegen
                         // cannot handle (e.g. those with GROUP BY / HAVING).
-                        let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                        let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
                         if let Some(rows) =
                             self.try_direct_count_star_in_list(rewritten.as_ref())?
                         {
@@ -24874,9 +25481,11 @@ impl Connection {
                         // cloning the entire AST into a Statement wrapper.
                         let sql_text = compiled_select.to_string();
                         let sql_key = Self::sql_hash(&sql_text);
-                        arc_prog = self.compile_with_cache(sql_key, &sql_text, |conn| {
-                            conn.compile_table_select(compiled_select.as_ref())
-                        })?;
+                        arc_prog = self
+                            .compile_with_cache(sql_key, &sql_text, async |conn| {
+                                conn.compile_table_select(compiled_select.as_ref()).await
+                            })
+                            .await?;
                         &arc_prog
                     };
 
@@ -24894,7 +25503,8 @@ impl Connection {
                         TableExecutionRuntimeRequirements::read_path(),
                         cx,
                         false,
-                    )?;
+                    )
+                    .await?;
                     if let (Some((log_select, decision_reason)), Some(started)) =
                         (vdbe_storage_log_select, vdbe_storage_started)
                     {
@@ -24971,21 +25581,24 @@ impl Connection {
                 if self.pragma_state.borrow().writable_schema
                     && is_sqlite_schema_name(&insert.table.name)
                 {
-                    let affected = self.execute_writable_schema_insert(insert, params)?;
+                    let affected = self.execute_writable_schema_insert(insert, params).await?;
                     self.record_statement_changes(affected);
                     return Ok(Vec::new());
                 }
-                if self.execute_fts5_maintenance_insert(insert)? {
+                if self.execute_fts5_maintenance_insert(insert).await? {
                     return Ok(Vec::new());
                 }
                 #[cfg(feature = "ext-fts5")]
-                if let Some(affected) = self.execute_fts5_magic_delete_insert(insert, params)? {
+                if let Some(affected) = self
+                    .execute_fts5_magic_delete_insert(insert, params)
+                    .await?
+                {
                     self.record_statement_changes(affected);
                     return Ok(Vec::new());
                 }
                 if insert.with.is_some() {
                     self.log_mem_execution_fallback("insert", "with_clause_materialization")?;
-                    return self.execute_insert_with_ctes(insert, params);
+                    return self.execute_insert_with_ctes(insert, params).await;
                 }
 
                 let table_name = &insert.table.name;
@@ -25037,14 +25650,17 @@ impl Connection {
                         )?;
                         if insert.returning.is_empty() {
                             let _ =
-                                self.execute_insert_select_fallback(insert, select_stmt, params)?;
+                                self.execute_insert_select_fallback(insert, select_stmt, params)
+                                .await?;
                             return Ok(Vec::new());
                         }
-                        return self.execute_insert_select_fallback_returning(
-                            insert,
-                            select_stmt,
-                            params,
-                        );
+                        return self
+                            .execute_insert_select_fallback_returning(
+                                insert,
+                                select_stmt,
+                                params,
+                            )
+                            .await;
                     }
                 }
                 if !is_live_vtab
@@ -25057,8 +25673,12 @@ impl Connection {
                         "insert_values",
                         "insert_values_row_by_row_trigger_or_fk_fallback",
                     )?;
-                    let source_rows = self.materialize_insert_values_source_rows(rows, params)?;
-                    let _ = self.execute_insert_select_materialized_rows(insert, &source_rows)?;
+                    let source_rows = self
+                        .materialize_insert_values_source_rows(rows, params)
+                        .await?;
+                    let _ = self
+                            .execute_insert_select_materialized_rows(insert, &source_rows)
+                            .await?;
                     return Ok(Vec::new());
                 }
                 // bd-xb07w: morsel-driven INSERT for large multi-row VALUES
@@ -25075,8 +25695,10 @@ impl Connection {
                     && rows.len() >= MORSEL_INSERT_THRESHOLD
                 {
                     self.log_mem_execution_fallback("insert_values", "morsel_insert_dispatch")?;
-                    let source_rows = self.materialize_insert_values_source_rows(rows, params)?;
-                    let _ = self.execute_morsel_insert(insert, source_rows)?;
+                    let source_rows = self
+                        .materialize_insert_values_source_rows(rows, params)
+                        .await?;
+                    let _ = self.execute_morsel_insert(insert, source_rows).await?;
                     return Ok(Vec::new());
                 }
                 let mut live_insert_rows = if is_live_vtab
@@ -25085,14 +25707,15 @@ impl Connection {
                     && matches!(insert.source, InsertSource::Select(_))
                 {
                     if let Some(affected) =
-                        self.try_execute_streaming_live_vtab_insert_select(insert, params)?
+                        self.try_execute_streaming_live_vtab_insert_select(insert, params)
+                            .await?
                     {
                         self.record_statement_changes(affected);
                         return Ok(Vec::new());
                     }
-                    Some(self.collect_live_vtab_insert_rows(insert, params)?)
+                    Some(self.collect_live_vtab_insert_rows(insert, params).await?)
                 } else if is_live_vtab {
-                    Some(self.collect_live_vtab_insert_rows(insert, params)?)
+                    Some(self.collect_live_vtab_insert_rows(insert, params).await?)
                 } else {
                     None
                 };
@@ -25100,7 +25723,7 @@ impl Connection {
                     if let Some(rows) = live_insert_rows.as_ref() {
                         rows.iter().map(|row| row.values.clone()).collect()
                     } else {
-                        self.collect_insert_trigger_rows(insert, params)?
+                        self.collect_insert_trigger_rows(insert, params).await?
                     }
                 } else {
                     Vec::new()
@@ -25115,7 +25738,9 @@ impl Connection {
                             &insert_event,
                             None,
                             Some(new_values),
-                        )? {
+                        )
+                        .await?
+                        {
                             skip = true;
                             break;
                         }
@@ -25139,8 +25764,9 @@ impl Connection {
                             .get(&key)
                             .is_some_and(|instance| is_rtree_instance(instance.as_ref()))
                     };
-                    let inserted_rowids =
-                        self.execute_live_vtab_insert_rows(table_name, &live_insert_rows)?;
+                    let inserted_rowids = self
+                        .execute_live_vtab_insert_rows(table_name, &live_insert_rows)
+                        .await?;
 
                     if has_after_insert {
                         if patch_first_column_with_rowid {
@@ -25158,7 +25784,8 @@ impl Connection {
                                 &insert_event,
                                 None,
                                 Some(&row.values),
-                            )?;
+                            )
+                            .await?;
                         }
                     }
 
@@ -25192,9 +25819,11 @@ impl Connection {
                     let _plan_guard = plan_span.enter();
                     let sql_text = statement.to_string();
                     let sql_key = Self::sql_hash(&sql_text);
-                    arc_prog = self.compile_with_cache(sql_key, &sql_text, |conn| {
-                        conn.compile_table_insert(insert)
-                    })?;
+                    arc_prog = self
+                        .compile_with_cache(sql_key, &sql_text, async |conn| {
+                            conn.compile_table_insert(insert).await
+                        })
+                        .await?;
                     &arc_prog
                 };
                 let runtime_requirements = self.insert_runtime_requirements(insert)?;
@@ -25205,14 +25834,15 @@ impl Connection {
                     runtime_requirements,
                     cx,
                     true,
-                )?;
+                )
+                .await?;
 
                 // bd-thqgm: FK constraint checking on INSERT.
                 // Skip FK enforcement when no row was written (e.g. an OR IGNORE
                 // PK conflict, affected == 0): SQLite does not FK-check a row it
                 // never inserted (#111).
                 if affected > 0 && self.fk_enforcement_enabled() {
-                    self.enforce_fk_on_insert(insert, table_name, params)?;
+                    self.enforce_fk_on_insert(insert, table_name, params).await?;
                 }
 
                 // Patch trigger NEW rows: fill in auto-assigned INTEGER
@@ -25245,18 +25875,20 @@ impl Connection {
                             &insert_event,
                             None,
                             Some(new_values),
-                        )?;
+                        )
+                        .await?;
                     }
                 }
 
                 if table_name.eq_ignore_ascii_case("sqlite_sequence") {
-                    self.refresh_sqlite_sequence_cache()?;
+                    self.refresh_sqlite_sequence_cache().await?;
                 } else {
                     self.refresh_autoincrement_sequence_after_insert(
                         table_name,
                         affected,
                         last_insert_rowid,
-                    )?;
+                    )
+                    .await?;
                 }
 
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
@@ -25271,7 +25903,7 @@ impl Connection {
                 if self.pragma_state.borrow().writable_schema
                     && is_sqlite_schema_name(&update.table.name.name)
                 {
-                    let affected = self.execute_writable_schema_update(update, params)?;
+                    let affected = self.execute_writable_schema_update(update, params).await?;
                     self.record_statement_changes(affected);
                     return Ok(Vec::new());
                 }
@@ -25279,10 +25911,10 @@ impl Connection {
                 // then execute the UPDATE with the WITH clause stripped.
                 if update.with.is_some() {
                     self.log_mem_execution_fallback("update", "with_clause_materialization")?;
-                    return self.execute_update_with_ctes(update, params);
+                    return self.execute_update_with_ctes(update, params).await;
                 }
                 let (effective_update, _limited_row_count_hint) =
-                    self.materialize_update_limit_scope(update, params)?;
+                    self.materialize_update_limit_scope(update, params).await?;
                 let table_name = &effective_update.table.name.name;
                 // Collect columns being updated for UPDATE OF trigger matching.
                 let update_cols: Vec<String> = effective_update
@@ -25305,7 +25937,8 @@ impl Connection {
                     &update_event,
                 );
                 let trigger_rows = if has_before_update || has_after_update {
-                    self.collect_update_trigger_rows(&effective_update, params)?
+                    self.collect_update_trigger_rows(&effective_update, params)
+                        .await?
                 } else {
                     Vec::new()
                 };
@@ -25319,7 +25952,9 @@ impl Connection {
                             &update_event,
                             Some(old_values),
                             Some(new_values),
-                        )? {
+                        )
+                        .await?
+                        {
                             skip = true;
                             break;
                         }
@@ -25345,22 +25980,24 @@ impl Connection {
                             .map(|(old, new)| (old.clone(), new.clone()))
                             .collect::<Vec<_>>()
                     } else {
-                        self.collect_update_trigger_rows(&effective_update, params)?
+                        self.collect_update_trigger_rows(&effective_update, params)
+                        .await?
                     };
                     for (old_values, new_values) in &rows_to_check {
                         // Parent-side: if this table is referenced by children,
                         // check that changing FK-referenced values doesn't orphan them.
                         // Use ON UPDATE actions (not ON DELETE) for UPDATE statements.
                         let fk_actions =
-                            self.check_fk_on_update(table_name, old_values, new_values)?;
+                            self.check_fk_on_update(table_name, old_values, new_values)
+                                .await?;
                         for action in &fk_actions {
-                            self.execute_fk_update_action(action)?;
+                            self.execute_fk_update_action(action).await?;
                         }
                         // Child-side: validate new FK values against parent tables.
                         // Only check when NOT inside a cascade action, because
                         // the cascade itself is modifying parent data.
                         if self.fk_enforcement_enabled() {
-                            self.check_fk_parent_exists(table_name, new_values)?;
+                            self.check_fk_parent_exists(table_name, new_values).await?;
                         }
                     }
                 }
@@ -25379,9 +26016,11 @@ impl Connection {
                     let _plan_guard = plan_span.enter();
                     let sql_text = effective_update.to_string();
                     let sql_key = Self::sql_hash(&sql_text);
-                    arc_prog = self.compile_with_cache(sql_key, &sql_text, |conn| {
-                        conn.compile_table_update(&effective_update)
-                    })?;
+                    arc_prog = self
+                        .compile_with_cache(sql_key, &sql_text, async |conn| {
+                            conn.compile_table_update(&effective_update)
+                        })
+                        .await?;
                     &arc_prog
                 };
                 let (rows, affected, _) = self.execute_table_program_with_cx(
@@ -25391,7 +26030,8 @@ impl Connection {
                     TableExecutionRuntimeRequirements::read_path(),
                     cx,
                     true,
-                )?;
+                )
+                .await?;
 
                 // Phase 5G.3: Fire AFTER UPDATE triggers.
                 if has_after_update {
@@ -25401,7 +26041,8 @@ impl Connection {
                             &update_event,
                             Some(old_values),
                             Some(new_values),
-                        )?;
+                        )
+                        .await?;
                     }
                 }
 
@@ -25417,7 +26058,7 @@ impl Connection {
                 if self.pragma_state.borrow().writable_schema
                     && is_sqlite_schema_name(&delete.table.name.name)
                 {
-                    let affected = self.execute_writable_schema_delete(delete, params)?;
+                    let affected = self.execute_writable_schema_delete(delete, params).await?;
                     self.record_statement_changes(affected);
                     return Ok(Vec::new());
                 }
@@ -25425,10 +26066,10 @@ impl Connection {
                 // then execute the DELETE with the WITH clause stripped.
                 if delete.with.is_some() {
                     self.log_mem_execution_fallback("delete", "with_clause_materialization")?;
-                    return self.execute_delete_with_ctes(delete, params);
+                    return self.execute_delete_with_ctes(delete, params).await;
                 }
                 let (mut effective_delete, _limited_row_count_hint) =
-                    self.materialize_delete_limit_scope(delete, params)?;
+                    self.materialize_delete_limit_scope(delete, params).await?;
                 // If the DELETE's WHERE contains a correlated EXISTS subquery,
                 // collect matching rowids via connection-level evaluation (which
                 // correctly substitutes outer refs per row) and rewrite the WHERE
@@ -25447,7 +26088,8 @@ impl Connection {
                         self.inline_self_referencing_scalar_subqueries(
                             &mut rewritten,
                             &effective_delete.table.name.name,
-                        )?;
+                        )
+                        .await?;
                         effective_delete.where_clause = Some(rewritten);
                     }
                 }
@@ -25457,13 +26099,15 @@ impl Connection {
                         &effective_delete.table.name.name,
                     )
                 }) {
-                    let matched_rows = self.select_matching_rows(
-                        &effective_delete.table,
-                        effective_delete.where_clause.as_ref(),
-                        &[],
-                        None,
-                        params,
-                    )?;
+                    let matched_rows = self
+                        .select_matching_rows(
+                            &effective_delete.table,
+                            effective_delete.where_clause.as_ref(),
+                            &[],
+                            None,
+                            params,
+                        )
+                        .await?;
                     let rowid_literals: Vec<Expr> = matched_rows
                         .iter()
                         .filter_map(|row| {
@@ -25506,7 +26150,8 @@ impl Connection {
                     &delete_event,
                 );
                 let trigger_old_rows = if has_before_delete || has_after_delete {
-                    self.collect_delete_trigger_rows(&effective_delete, params)?
+                    self.collect_delete_trigger_rows(&effective_delete, params)
+                        .await?
                 } else {
                     Vec::new()
                 };
@@ -25515,12 +26160,15 @@ impl Connection {
                 let skip_dml = if has_before_delete {
                     let mut skip = false;
                     for old_values in &trigger_old_rows {
-                        if self.fire_before_triggers(
-                            table_name,
-                            &delete_event,
-                            Some(old_values),
-                            None,
-                        )? {
+                        if self
+                            .fire_before_triggers(
+                                table_name,
+                                &delete_event,
+                                Some(old_values),
+                                None,
+                            )
+                            .await?
+                        {
                             skip = true;
                             break;
                         }
@@ -25547,11 +26195,12 @@ impl Connection {
                     let rows_to_check = if !trigger_old_rows.is_empty() {
                         trigger_old_rows.clone()
                     } else {
-                        self.collect_delete_trigger_rows(&effective_delete, params)?
+                        self.collect_delete_trigger_rows(&effective_delete, params)
+                        .await?
                     };
                     let mut actions = Vec::new();
                     for row_values in &rows_to_check {
-                        actions.extend(self.check_fk_on_delete(table_name, row_values)?);
+                        actions.extend(self.check_fk_on_delete(table_name, row_values).await?);
                     }
                     actions
                 } else {
@@ -25570,10 +26219,12 @@ impl Connection {
                             "RETURNING is not supported for live virtual-table DELETE".to_owned(),
                         ));
                     }
-                    let affected = self.execute_live_vtab_delete(&effective_delete, params)?;
+                    let affected = self
+                        .execute_live_vtab_delete(&effective_delete, params)
+                        .await?;
 
                     for action in &pending_fk_actions {
-                        self.execute_fk_delete_action(action)?;
+                        self.execute_fk_delete_action(action).await?;
                     }
 
                     // Phase 5G.3: Fire AFTER DELETE triggers.
@@ -25584,7 +26235,8 @@ impl Connection {
                                 &delete_event,
                                 Some(old_values),
                                 None,
-                            )?;
+                            )
+                            .await?;
                         }
                     }
 
@@ -25606,9 +26258,11 @@ impl Connection {
                     let _plan_guard = plan_span.enter();
                     let sql_text = effective_delete.to_string();
                     let sql_key = Self::sql_hash(&sql_text);
-                    arc_prog = self.compile_with_cache(sql_key, &sql_text, |conn| {
-                        conn.compile_table_delete(&effective_delete)
-                    })?;
+                    arc_prog = self
+                        .compile_with_cache(sql_key, &sql_text, async |conn| {
+                            conn.compile_table_delete(&effective_delete)
+                        })
+                        .await?;
                     &arc_prog
                 };
                 let (rows, affected, _) = self.execute_table_program_with_cx(
@@ -25618,10 +26272,11 @@ impl Connection {
                     TableExecutionRuntimeRequirements::read_path(),
                     cx,
                     true,
-                )?;
+                )
+                .await?;
 
                 for action in &pending_fk_actions {
-                    self.execute_fk_delete_action(action)?;
+                    self.execute_fk_delete_action(action).await?;
                 }
 
                 // Phase 5G.3: Fire AFTER DELETE triggers.
@@ -25632,7 +26287,8 @@ impl Connection {
                             &delete_event,
                             Some(old_values),
                             None,
-                        )?;
+                        )
+                        .await?;
                     }
                 }
 
@@ -25645,64 +26301,64 @@ impl Connection {
                 }
             }
             Statement::Begin(begin) => {
-                self.execute_begin(*begin)?;
+                self.execute_begin(*begin).await?;
                 Ok(Vec::new())
             }
             Statement::Commit => {
-                self.execute_commit_with_cx(cx)?;
+                self.execute_commit_with_cx(cx).await?;
                 Ok(Vec::new())
             }
             Statement::Rollback(rb) => {
-                self.execute_rollback_with_cx(cx, rb)?;
+                self.execute_rollback_with_cx(cx, rb).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
             Statement::Savepoint(name) => {
-                self.execute_savepoint_with_cx(cx, name)?;
+                self.execute_savepoint_with_cx(cx, name).await?;
                 Ok(Vec::new())
             }
             Statement::Release(name) => {
-                self.execute_release_with_cx(cx, name)?;
+                self.execute_release_with_cx(cx, name).await?;
                 Ok(Vec::new())
             }
-            Statement::Pragma(pragma) => self.execute_pragma(pragma),
+            Statement::Pragma(pragma) => self.execute_pragma(pragma).await,
             Statement::Drop(drop_stmt) => {
-                self.execute_drop(drop_stmt)?;
+                self.execute_drop(drop_stmt).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
             Statement::AlterTable(alter) => {
-                self.execute_alter_table(alter)?;
+                self.execute_alter_table(alter).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
             Statement::CreateIndex(create_idx) => {
-                self.execute_create_index(create_idx)?;
+                self.execute_create_index(create_idx).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
             Statement::CreateView(create_view) => {
-                self.execute_create_view(create_view)?;
+                self.execute_create_view(create_view).await?;
                 Ok(Vec::new())
             }
             Statement::CreateTrigger(create_trigger) => {
-                self.execute_create_trigger(create_trigger)?;
+                self.execute_create_trigger(create_trigger).await?;
                 Ok(Vec::new())
             }
             Statement::Vacuum(vacuum_stmt) => {
-                self.execute_vacuum(vacuum_stmt, params)?;
+                self.execute_vacuum(vacuum_stmt, params).await?;
                 Ok(Vec::new())
             }
             Statement::Analyze(target) => {
-                self.execute_analyze(target.as_ref())?;
+                self.execute_analyze(target.as_ref()).await?;
                 Ok(Vec::new())
             }
             Statement::Reindex(target) => {
-                self.execute_reindex(target.as_ref())?;
+                self.execute_reindex(target.as_ref()).await?;
                 Ok(Vec::new())
             }
             Statement::Explain { query_plan, stmt } => {
-                self.execute_explain(stmt, *query_plan, params)
+                self.execute_explain(stmt, *query_plan, params).await
             }
             Statement::Attach(attach) => {
                 let path_rows = self.execute_statement(
@@ -25727,7 +26383,8 @@ impl Connection {
                         limit: None,
                     }),
                     params,
-                )?;
+                )
+                .await?;
                 let path = path_rows
                     .first()
                     .and_then(|r| r.values().first())
@@ -25752,9 +26409,12 @@ impl Connection {
                     Box::new(Self::open_schema_only_with_env(
                         path.clone(),
                         self.attach_env.clone(),
-                    )?)
+                    )
+                    .await?)
                 } else {
-                    Box::new(Self::open_with_env(path.clone(), self.attach_env.clone())?)
+                    Box::new(
+                        Self::open_with_env(path.clone(), self.attach_env.clone()).await?,
+                    )
                 };
                 self.attached_schemas
                     .borrow_mut()
@@ -25785,7 +26445,7 @@ impl Connection {
     /// subqueries with GROUP BY/HAVING/windows/compounds/WITH are eagerly
     /// evaluated since VDBE codegen emits NULL for those.  Fallback paths (GROUP BY,
     /// JOIN, expression-only SELECT) apply the IN rewrite separately.
-    fn rewrite_subquery_statement<'a>(
+    async fn rewrite_subquery_statement<'a>(
         &self,
         statement: &'a Statement,
         params: Option<&[SqliteValue]>,
@@ -25838,7 +26498,7 @@ impl Connection {
                 Ok(Cow::Borrowed(statement))
             }
             Statement::Select(select) => {
-                let rewritten = self.rewrite_subqueries(select, params)?;
+                let rewritten = self.rewrite_subqueries(select, params).await?;
                 Ok(Cow::Owned(Statement::Select(rewritten)))
             }
             Statement::Insert(insert) if insert.with.is_some() => Ok(Cow::Borrowed(statement)),
@@ -25849,13 +26509,14 @@ impl Connection {
                     fsqlite_ast::InsertSource::Values(rows) => {
                         for row in rows {
                             for expr in row {
-                                rewrite_dml_in_expr(expr, self, eager_in_subqueries, params)?;
+                                rewrite_dml_in_expr(expr, self, eager_in_subqueries, params).await?;
                             }
                         }
                     }
                     fsqlite_ast::InsertSource::Select(select) => {
                         let rewritten =
-                            self.rewrite_dml_select_source(select, eager_in_subqueries, params)?;
+                            self.rewrite_dml_select_source(select, eager_in_subqueries, params)
+                        .await?;
                         insert.source = fsqlite_ast::InsertSource::Select(Box::new(rewritten));
                     }
                     fsqlite_ast::InsertSource::DefaultValues => {}
@@ -25864,7 +26525,7 @@ impl Connection {
                     if let Some(target) = &mut upsert.target
                         && let Some(where_clause) = &mut target.where_clause
                     {
-                        rewrite_dml_in_expr(where_clause, self, eager_in_subqueries, params)?;
+                        rewrite_dml_in_expr(where_clause, self, eager_in_subqueries, params).await?;
                     }
                     if let fsqlite_ast::UpsertAction::Update {
                         assignments,
@@ -25877,16 +26538,17 @@ impl Connection {
                                 self,
                                 eager_in_subqueries,
                                 params,
-                            )?;
+                            )
+                            .await?;
                         }
                         if let Some(predicate) = where_clause {
-                            rewrite_dml_in_expr(predicate, self, eager_in_subqueries, params)?;
+                            rewrite_dml_in_expr(predicate, self, eager_in_subqueries, params).await?;
                         }
                     }
                 }
                 for column in &mut insert.returning {
                     if let ResultColumn::Expr { expr, .. } = column {
-                        rewrite_dml_in_expr(expr, self, eager_in_subqueries, params)?;
+                        rewrite_dml_in_expr(expr, self, eager_in_subqueries, params).await?;
                     }
                 }
                 Ok(Cow::Owned(Statement::Insert(insert)))
@@ -25917,23 +26579,28 @@ impl Connection {
                 // path receives only local literals instead of outer-table
                 // references it cannot resolve.
                 for assignment in &mut update.assignments {
-                    rewrite_dml_in_expr(&mut assignment.value, self, eager_in_subqueries, params)?;
+                    rewrite_dml_in_expr(&mut assignment.value, self, eager_in_subqueries, params)
+                        .await?;
                 }
                 if let Some(from) = update.from.as_mut() {
-                    self.rewrite_dml_from_clause(from, eager_in_subqueries, params)?;
+                    self.rewrite_dml_from_clause(from, eager_in_subqueries, params)
+                        .await?;
                 }
                 if let Some(where_expr) = update.where_clause.as_mut() {
-                    rewrite_dml_in_expr(where_expr, self, eager_in_subqueries, params)?;
+                    rewrite_dml_in_expr(where_expr, self, eager_in_subqueries, params).await?;
                 }
                 rewrite_dml_result_columns(
                     &mut update.returning,
                     self,
                     eager_in_subqueries,
                     params,
-                )?;
-                rewrite_in_ordering_terms(&mut update.order_by, self, eager_in_subqueries, params)?;
+                )
+                .await?;
+                rewrite_in_ordering_terms(&mut update.order_by, self, eager_in_subqueries, params)
+                    .await?;
                 if let Some(limit_clause) = update.limit.as_mut() {
-                    rewrite_dml_limit_clause(limit_clause, self, eager_in_subqueries, params)?;
+                    rewrite_dml_limit_clause(limit_clause, self, eager_in_subqueries, params)
+                        .await?;
                 }
                 Ok(Cow::Owned(Statement::Update(update)))
             }
@@ -25948,17 +26615,20 @@ impl Connection {
                 // also forces eager IN rewrite so delegation into the attached
                 // child no longer depends on outer-schema visibility.
                 if let Some(where_expr) = delete.where_clause.as_mut() {
-                    rewrite_dml_in_expr(where_expr, self, eager_in_subqueries, params)?;
+                    rewrite_dml_in_expr(where_expr, self, eager_in_subqueries, params).await?;
                 }
                 rewrite_dml_result_columns(
                     &mut delete.returning,
                     self,
                     eager_in_subqueries,
                     params,
-                )?;
-                rewrite_in_ordering_terms(&mut delete.order_by, self, eager_in_subqueries, params)?;
+                )
+                .await?;
+                rewrite_in_ordering_terms(&mut delete.order_by, self, eager_in_subqueries, params)
+                    .await?;
                 if let Some(limit_clause) = delete.limit.as_mut() {
-                    rewrite_dml_limit_clause(limit_clause, self, eager_in_subqueries, params)?;
+                    rewrite_dml_limit_clause(limit_clause, self, eager_in_subqueries, params)
+                        .await?;
                 }
                 Ok(Cow::Owned(Statement::Delete(delete)))
             }
@@ -26010,49 +26680,58 @@ impl Connection {
         }
     }
 
-    fn rewrite_dml_from_clause(
+    async fn rewrite_dml_from_clause(
         &self,
         from: &mut fsqlite_ast::FromClause,
         rewrite_in_subqueries: bool,
         params: Option<&[SqliteValue]>,
     ) -> Result<()> {
-        self.rewrite_dml_table_or_subquery(&mut from.source, rewrite_in_subqueries, params)?;
+        self.rewrite_dml_table_or_subquery(&mut from.source, rewrite_in_subqueries, params)
+            .await?;
         for join in &mut from.joins {
-            self.rewrite_dml_table_or_subquery(&mut join.table, rewrite_in_subqueries, params)?;
+            self.rewrite_dml_table_or_subquery(&mut join.table, rewrite_in_subqueries, params)
+                .await?;
             if let Some(JoinConstraint::On(expr)) = join.constraint.as_mut() {
-                rewrite_dml_in_expr(expr, self, rewrite_in_subqueries, params)?;
+                rewrite_dml_in_expr(expr, self, rewrite_in_subqueries, params).await?;
             }
         }
         Ok(())
     }
 
-    fn rewrite_dml_table_or_subquery(
-        &self,
-        source: &mut TableOrSubquery,
+    // Mutually recursive with `rewrite_dml_from_clause` (a ParenJoin source
+    // contains a FROM clause which can contain further subqueries), so this
+    // side of the cycle returns a boxed future to break the infinite type.
+    fn rewrite_dml_table_or_subquery<'a>(
+        &'a self,
+        source: &'a mut TableOrSubquery,
         rewrite_in_subqueries: bool,
-        params: Option<&[SqliteValue]>,
-    ) -> Result<()> {
-        match source {
-            TableOrSubquery::Table { .. } => Ok(()),
-            TableOrSubquery::Subquery { query, .. } => {
-                let rewritten =
-                    self.rewrite_dml_select_source(query, rewrite_in_subqueries, params)?;
-                **query = rewritten;
-                Ok(())
-            }
-            TableOrSubquery::TableFunction { args, .. } => {
-                for arg in args {
-                    rewrite_dml_in_expr(arg, self, rewrite_in_subqueries, params)?;
+        params: Option<&'a [SqliteValue]>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        Box::pin(async move {
+            match source {
+                TableOrSubquery::Table { .. } => Ok(()),
+                TableOrSubquery::Subquery { query, .. } => {
+                    let rewritten = self
+                        .rewrite_dml_select_source(query, rewrite_in_subqueries, params)
+                        .await?;
+                    **query = rewritten;
+                    Ok(())
                 }
-                Ok(())
+                TableOrSubquery::TableFunction { args, .. } => {
+                    for arg in args {
+                        rewrite_dml_in_expr(arg, self, rewrite_in_subqueries, params).await?;
+                    }
+                    Ok(())
+                }
+                TableOrSubquery::ParenJoin(from_clause) => {
+                    self.rewrite_dml_from_clause(from_clause, rewrite_in_subqueries, params)
+                        .await
+                }
             }
-            TableOrSubquery::ParenJoin(from_clause) => {
-                self.rewrite_dml_from_clause(from_clause, rewrite_in_subqueries, params)
-            }
-        }
+        })
     }
 
-    fn rewrite_dml_select_source(
+    async fn rewrite_dml_select_source(
         &self,
         select: &SelectStatement,
         rewrite_in_subqueries: bool,
@@ -26063,10 +26742,11 @@ impl Connection {
         }
         if rewrite_in_subqueries {
             Ok(self
-                .rewrite_in_subqueries_select(select, params)?
+                .rewrite_in_subqueries_select(select, params)
+                .await?
                 .into_owned())
         } else {
-            self.rewrite_subqueries(select, params)
+            self.rewrite_subqueries(select, params).await
         }
     }
 
@@ -26075,36 +26755,39 @@ impl Connection {
     const INSERT_SELECT_CHUNK_SIZE: i64 = 10_000;
 
     #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
-    fn execute_insert_select_fallback(
+    async fn execute_insert_select_fallback(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         select_stmt: &fsqlite_ast::SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<usize> {
         Ok(self
-            .execute_insert_select_fallback_outcome(insert, select_stmt, params)?
+            .execute_insert_select_fallback_outcome(insert, select_stmt, params)
+            .await?
             .changes)
     }
 
-    fn execute_insert_select_fallback_returning(
+    async fn execute_insert_select_fallback_returning(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         select_stmt: &fsqlite_ast::SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         Ok(self
-            .execute_insert_select_fallback_outcome(insert, select_stmt, params)?
+            .execute_insert_select_fallback_outcome(insert, select_stmt, params)
+            .await?
             .returning_rows)
     }
 
-    fn execute_insert_select_fallback_outcome(
+    async fn execute_insert_select_fallback_outcome(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         select_stmt: &fsqlite_ast::SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<InsertSelectReplayOutcome> {
-        if let Some(changes) =
-            self.try_execute_streaming_insert_select_fallback_outcome(insert, select_stmt, params)?
+        if let Some(changes) = self
+            .try_execute_streaming_insert_select_fallback_outcome(insert, select_stmt, params)
+            .await?
         {
             return Ok(changes);
         }
@@ -26123,9 +26806,12 @@ impl Connection {
             let sources = Self::extract_table_names_from_select(select_stmt);
             sources.iter().any(|s| s.eq_ignore_ascii_case(target))
         } {
-            let source_rows =
-                self.materialize_insert_select_source_rows(insert, select_stmt, params)?;
-            return self.execute_insert_select_materialized_rows_outcome(insert, &source_rows);
+            let source_rows = self
+                .materialize_insert_select_source_rows(insert, select_stmt, params)
+                .await?;
+            return self
+                .execute_insert_select_materialized_rows_outcome(insert, &source_rows)
+                .await;
         }
         // Chunked materialization: wrap the source SELECT with LIMIT/OFFSET
         // and process in bounded batches to avoid OOM on large result sets.
@@ -26148,11 +26834,13 @@ impl Connection {
                     None
                 },
             });
-            let source_rows =
-                self.materialize_insert_select_source_rows(insert, &chunked_select, params)?;
+            let source_rows = self
+                .materialize_insert_select_source_rows(insert, &chunked_select, params)
+                .await?;
             let chunk_len = source_rows.len();
-            let chunk_outcome =
-                self.execute_insert_select_materialized_rows_outcome(insert, &source_rows)?;
+            let chunk_outcome = self
+                .execute_insert_select_materialized_rows_outcome(insert, &source_rows)
+                .await?;
             total_outcome.changes = total_outcome.changes.saturating_add(chunk_outcome.changes);
             total_outcome
                 .returning_rows
@@ -26166,12 +26854,12 @@ impl Connection {
         Ok(total_outcome)
     }
 
-    fn execute_materialized_insert_select_statement(
+    async fn execute_materialized_insert_select_statement(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         source_rows: &[Row],
     ) -> Result<usize> {
-        let was_auto = self.ensure_autocommit_txn()?;
+        let was_auto = self.ensure_autocommit_txn().await?;
         let preserve_prior_changes_on_constraint_violation =
             insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
         let use_statement_savepoint = self.should_use_statement_savepoint(
@@ -26179,11 +26867,14 @@ impl Connection {
             preserve_prior_changes_on_constraint_violation,
         );
         let result = if use_statement_savepoint {
-            self.with_internal_statement_savepoint("insert_select", || {
+            self.with_internal_statement_savepoint("insert_select", async || {
                 self.execute_insert_select_materialized_rows(insert, source_rows)
+                    .await
             })
+            .await
         } else {
             self.execute_insert_select_materialized_rows(insert, source_rows)
+                .await
         };
         let commit_autocommit_on_error = was_auto
             && ((preserve_prior_changes_on_constraint_violation
@@ -26195,11 +26886,12 @@ impl Connection {
                 // by this statement; commit them instead of rolling back.
                 || matches!(result.as_ref(), Err(FrankenError::RaiseFail(_))));
         let ok = result.is_ok() || commit_autocommit_on_error;
-        self.resolve_autocommit_txn_with_capture(was_auto, ok, false)?;
+        self.resolve_autocommit_txn_with_capture(was_auto, ok, false)
+            .await?;
         result
     }
 
-    fn materialize_insert_select_source_rows(
+    async fn materialize_insert_select_source_rows(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         select_stmt: &fsqlite_ast::SelectStatement,
@@ -26215,14 +26907,16 @@ impl Connection {
             select_stmt.clone()
         };
         self.execute_statement(&Statement::Select(effective_select), params)
+            .await
     }
 
-    fn materialize_create_table_as_select_source_rows(
+    async fn materialize_create_table_as_select_source_rows(
         &self,
         select_stmt: &fsqlite_ast::SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         self.execute_statement(&Statement::Select(select_stmt.clone()), params)
+            .await
     }
 
     fn infer_create_table_as_select_column_infos(
@@ -26273,7 +26967,7 @@ impl Connection {
             .collect()
     }
 
-    fn execute_materialized_create_table_as_select_statement(
+    async fn execute_materialized_create_table_as_select_statement(
         &self,
         create: &fsqlite_ast::CreateTableStatement,
         col_infos: Vec<ColumnInfo>,
@@ -26296,7 +26990,7 @@ impl Connection {
         }
 
         let width = col_infos.len();
-        let root_page = self.allocate_root_page()?;
+        let root_page = self.allocate_root_page().await?;
         self.db.borrow_mut().create_table_at(root_page, width);
         let table_schema = TableSchema {
             name: table_name,
@@ -26321,48 +27015,55 @@ impl Connection {
                 .join(", ");
             let insert_sql = format!("INSERT INTO \"{table_name}\" VALUES ({placeholders})");
             for row in rows {
-                self.execute_with_params(&insert_sql, row.values())?;
+                self.execute_with_params(&insert_sql, row.values()).await?;
             }
         }
-        self.insert_sqlite_master_row("table", &table_name, &table_name, root_page, &create_sql)?;
-        self.increment_schema_cookie()?;
+        self.insert_sqlite_master_row("table", &table_name, &table_name, root_page, &create_sql)
+            .await?;
+        self.increment_schema_cookie().await?;
         Ok(())
     }
 
-    fn materialize_insert_values_source_rows(
+    async fn materialize_insert_values_source_rows(
         &self,
         rows: &[Vec<Expr>],
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        rows.iter()
-            .map(|row_exprs| {
-                Ok(Row {
-                    values: self.evaluate_insert_source_row(row_exprs, params)?,
-                })
-            })
-            .collect()
+        let mut out = Vec::with_capacity(rows.len());
+        for row_exprs in rows {
+            out.push(Row {
+                values: self.evaluate_insert_source_row(row_exprs, params).await?,
+            });
+        }
+        Ok(out)
     }
 
-    fn execute_insert_select_materialized_rows(
+    async fn execute_insert_select_materialized_rows(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         source_rows: &[Row],
     ) -> Result<usize> {
         Ok(self
-            .execute_insert_select_materialized_rows_outcome(insert, source_rows)?
+            .execute_insert_select_materialized_rows_outcome(insert, source_rows)
+            .await?
             .changes)
     }
 
-    fn execute_insert_select_materialized_rows_outcome(
-        &self,
-        insert: &fsqlite_ast::InsertStatement,
-        source_rows: &[Row],
-    ) -> Result<InsertSelectReplayOutcome> {
-        self.execute_insert_select_row_stream(insert, |emit_row| {
+    // Row emission re-enters statement execution (per-row INSERT), which can
+    // route back here, so the future is boxed to break the recursive type.
+    fn execute_insert_select_materialized_rows_outcome<'a>(
+        &'a self,
+        insert: &'a fsqlite_ast::InsertStatement,
+        source_rows: &'a [Row],
+    ) -> Pin<Box<dyn Future<Output = Result<InsertSelectReplayOutcome>> + 'a>> {
+        Box::pin(async move {
+        self.execute_insert_select_row_stream(insert, async |emitter| {
             for row in source_rows {
-                emit_row(row.values())?;
+                emitter.emit_row(row.values()).await?;
             }
             Ok(())
+        })
+        .await
         })
     }
 
@@ -26371,7 +27072,7 @@ impl Connection {
     /// through the row-stream replay mechanism. Currently sequential; the
     /// morsel split validates the wiring and prepares for future parallel
     /// worker dispatch via `asupersync`.
-    fn execute_morsel_insert(
+    async fn execute_morsel_insert(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         source_rows: Vec<Row>,
@@ -26389,7 +27090,9 @@ impl Connection {
                     values: values.clone(),
                 })
                 .collect();
-            total_changes += self.execute_insert_select_materialized_rows(insert, &morsel_rows)?;
+            total_changes += self
+                .execute_insert_select_materialized_rows(insert, &morsel_rows)
+                .await?;
         }
         debug_assert_eq!(
             total_changes, total_rows,
@@ -26474,13 +27177,109 @@ impl Connection {
         insert_sql
     }
 
-    fn execute_insert_select_row_stream<F>(
+}
+
+struct InsertSelectReplayEmitter<'conn> {
+    connection: &'conn Connection,
+    source_column_count: usize,
+    prepared: Option<PreparedStatement<'conn>>,
+    returning_statement: Option<Statement>,
+    statement_changes: usize,
+    returning_rows: Vec<Row>,
+    produced_rows: usize,
+    error_state_recorded: bool,
+    previous_total_changes: usize,
+    previous_last_insert_rowid: i64,
+}
+
+impl InsertSelectReplayEmitter<'_> {
+    fn record_error_state(&mut self) {
+        self.error_state_recorded = true;
+        if self.connection.internal_statement_savepoint_depth.get() > 0 {
+            self.connection.restore_change_tracking_state(
+                0,
+                self.previous_total_changes,
+                self.previous_last_insert_rowid,
+            );
+        } else {
+            self.connection
+                .set_statement_change_count(self.statement_changes);
+            self.connection.record_table_program_error_state(
+                self.statement_changes,
+                (self.statement_changes > 0)
+                    .then(|| self.connection.current_last_insert_rowid()),
+            );
+        }
+    }
+
+    async fn emit_row(&mut self, row_values: &[SqliteValue]) -> Result<()> {
+        let row_idx = self.produced_rows;
+        self.produced_rows = self.produced_rows.saturating_add(1);
+        if row_values.len() != self.source_column_count {
+            return Err(FrankenError::Internal(format!(
+                "INSERT ... SELECT column count mismatch: source row {row_idx} has {} values, SELECT produced {}",
+                row_values.len(),
+                self.source_column_count,
+            )));
+        }
+
+        let row_result = if let Some(returning_statement) = self.returning_statement.as_ref() {
+            self.connection
+                .execute_statement_impl_after_background_status(
+                    returning_statement,
+                    Some(row_values),
+                    None,
+                )
+                .await
+                .map(|rows| {
+                    let affected = self.connection.last_changes.get();
+                    self.returning_rows.extend(rows);
+                    affected
+                })
+        } else if let Some(prepared) = self.prepared.as_ref() {
+            self.connection
+                .execute_prepared_with_params_after_background_status(
+                    prepared,
+                    row_values,
+                    false,
+                )
+                .await
+        } else {
+            Err(FrankenError::internal(
+                "INSERT ... SELECT replay missing prepared statement",
+            ))
+        };
+
+        match row_result {
+            Ok(affected) => {
+                self.statement_changes = self.statement_changes.saturating_add(affected);
+                Ok(())
+            }
+            Err(error) => {
+                self.record_error_state();
+                Err(error)
+            }
+        }
+    }
+
+    fn into_outcome(self) -> InsertSelectReplayOutcome {
+        self.connection
+            .set_statement_change_count(self.statement_changes);
+        InsertSelectReplayOutcome {
+            changes: self.statement_changes,
+            returning_rows: self.returning_rows,
+        }
+    }
+}
+
+impl Connection {
+    async fn execute_insert_select_row_stream<F>(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         mut producer: F,
     ) -> Result<InsertSelectReplayOutcome>
     where
-        F: FnMut(&mut dyn FnMut(&[SqliteValue]) -> Result<()>) -> Result<()>,
+        F: std::ops::AsyncFnMut(&mut InsertSelectReplayEmitter<'_>) -> Result<()>,
     {
         let layout = self.resolve_insert_target_layout(insert)?;
         if layout.table_columns.is_empty() {
@@ -26496,92 +27295,39 @@ impl Connection {
             insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
         let previous_total_changes = self.total_changes.get();
         let previous_last_insert_rowid = self.current_last_insert_rowid();
-        let mut execute_rows = || -> Result<InsertSelectReplayOutcome> {
+        let mut execute_rows = async || -> Result<InsertSelectReplayOutcome> {
             let _fk_parent_validation_cache =
                 self.enter_fk_parent_validation_cache_scope(&insert.table.name);
             let prepared = if collect_returning {
                 None
             } else {
-                Some(self.prepare_after_background_status(&insert_sql)?)
+                Some(self.prepare_after_background_status(&insert_sql).await?)
             };
             let returning_statement = if collect_returning {
                 Some(parse_single_statement(&insert_sql)?)
             } else {
                 None
             };
-            let mut statement_changes = 0usize;
-            let mut returning_rows = Vec::new();
-            let mut produced_rows = 0usize;
-            let mut error_state_recorded = false;
-            let record_error_state = |statement_changes: usize| {
-                if self.internal_statement_savepoint_depth.get() > 0 {
-                    self.restore_change_tracking_state(
-                        0,
-                        previous_total_changes,
-                        previous_last_insert_rowid,
-                    );
-                } else {
-                    self.set_statement_change_count(statement_changes);
-                    self.record_table_program_error_state(
-                        statement_changes,
-                        (statement_changes > 0).then(|| self.current_last_insert_rowid()),
-                    );
-                }
+            let mut emitter = InsertSelectReplayEmitter {
+                connection: self,
+                source_column_count,
+                prepared,
+                returning_statement,
+                statement_changes: 0,
+                returning_rows: Vec::new(),
+                produced_rows: 0,
+                error_state_recorded: false,
+                previous_total_changes,
+                previous_last_insert_rowid,
             };
-            let mut emit_row = |row_values: &[SqliteValue]| -> Result<()> {
-                let row_idx = produced_rows;
-                produced_rows = produced_rows.saturating_add(1);
-                if row_values.len() != source_column_count {
-                    return Err(FrankenError::Internal(format!(
-                        "INSERT ... SELECT column count mismatch: source row {row_idx} has {} values, SELECT produced {source_column_count}",
-                        row_values.len()
-                    )));
-                }
-                let row_result = if let Some(returning_statement) = returning_statement.as_ref() {
-                    self.execute_statement_impl_after_background_status(
-                        returning_statement,
-                        Some(row_values),
-                        None,
-                    )
-                    .map(|rows| {
-                        let affected = self.last_changes.get();
-                        returning_rows.extend(rows);
-                        affected
-                    })
-                } else {
-                    self.execute_prepared_with_params_after_background_status(
-                        prepared.as_ref().ok_or_else(|| {
-                            FrankenError::internal(
-                                "INSERT ... SELECT replay missing prepared statement",
-                            )
-                        })?,
-                        row_values,
-                        false,
-                    )
-                };
-                match row_result {
-                    Ok(affected) => {
-                        statement_changes = statement_changes.saturating_add(affected);
-                        Ok(())
-                    }
-                    Err(error) => {
-                        error_state_recorded = true;
-                        record_error_state(statement_changes);
-                        Err(error)
-                    }
-                }
-            };
-            if let Err(error) = producer(&mut emit_row) {
-                if !error_state_recorded {
-                    record_error_state(statement_changes);
+
+            if let Err(error) = producer(&mut emitter).await {
+                if !emitter.error_state_recorded {
+                    emitter.record_error_state();
                 }
                 return Err(error);
             }
-            self.set_statement_change_count(statement_changes);
-            Ok(InsertSelectReplayOutcome {
-                changes: statement_changes,
-                returning_rows,
-            })
+            Ok(emitter.into_outcome())
         };
 
         if !preserve_prior_changes_on_constraint_violation
@@ -26589,12 +27335,13 @@ impl Connection {
             && self.internal_statement_savepoint_depth.get() == 0
         {
             self.with_internal_statement_savepoint("insert_select", execute_rows)
+                .await
         } else {
-            execute_rows()
+            execute_rows().await
         }
     }
 
-    fn try_execute_streaming_insert_select_fallback_outcome(
+    async fn try_execute_streaming_insert_select_fallback_outcome(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         select_stmt: &fsqlite_ast::SelectStatement,
@@ -26604,13 +27351,18 @@ impl Connection {
             return Ok(None);
         }
         let mut streamed = false;
-        let outcome = self.execute_insert_select_row_stream(insert, |emit_row| {
-            streamed =
-                self.try_stream_simple_join_select_rows(select_stmt, params, |source_row| {
-                    emit_row(source_row)
-                })?;
-            Ok(())
-        })?;
+        let outcome = self
+            .execute_insert_select_row_stream(insert, async |emitter| {
+                streamed = self
+                    .try_stream_simple_join_select_rows(
+                        select_stmt,
+                        params,
+                        async |source_row| emitter.emit_row(source_row).await,
+                    )
+                    .await?;
+                Ok(())
+            })
+            .await?;
         if streamed {
             Ok(Some(outcome))
         } else {
@@ -26618,7 +27370,7 @@ impl Connection {
         }
     }
 
-    fn try_stream_simple_join_select_rows_with_scanner<F, S>(
+    async fn try_stream_simple_join_select_rows_with_scanner<F, S>(
         &self,
         select_stmt: &fsqlite_ast::SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -26626,25 +27378,29 @@ impl Connection {
         mut emit_row: F,
     ) -> Result<bool>
     where
-        F: FnMut(&[SqliteValue]) -> Result<()>,
-        S: FnMut(&JoinTableSource) -> Result<Option<Vec<Vec<SqliteValue>>>>,
+        F: std::ops::AsyncFnMut(&[SqliteValue]) -> Result<()>,
+        S: std::ops::AsyncFnMut(&JoinTableSource)
+            -> Result<Option<Vec<Vec<SqliteValue>>>>,
     {
         let prep_cx = self.op_cx_after_background_status();
-        self.prepare_streaming_join_select_read_boundary(select_stmt, &prep_cx)?;
+        self.prepare_streaming_join_select_read_boundary(select_stmt, &prep_cx)
+            .await?;
         let Some(prepared) = self.prepare_simple_join_select_rows_with_scanner(
             select_stmt,
             params,
             scan_source_rows,
             |table_name| self.has_live_vtab_instance(table_name),
-        )?
+        )
+        .await?
         else {
             return Ok(false);
         };
-        self.emit_prepared_simple_join_rows(&prepared, |row| emit_row(row))?;
+        self.emit_prepared_simple_join_rows(&prepared, async |row| emit_row(row).await)
+            .await?;
         Ok(true)
     }
 
-    fn prepare_streaming_join_select_read_boundary(
+    async fn prepare_streaming_join_select_read_boundary(
         &self,
         select_stmt: &fsqlite_ast::SelectStatement,
         cx: &Cx,
@@ -26656,15 +27412,16 @@ impl Connection {
                 || !self.memdb_rows_loaded.get()
                 || !self.memdb_storage_count_shortcuts_safe.get());
         if should_refresh_active_txn_memdb {
-            self.refresh_memdb_from_active_txn_if_dirty(cx)?;
+            self.refresh_memdb_from_active_txn_if_dirty(cx).await?;
         }
 
-        self.refresh_memdb_from_cached_write_txn_if_stale(cx)?;
+        self.refresh_memdb_from_cached_write_txn_if_stale(cx)
+            .await?;
 
         if self.retained_autocommit_txn.borrow().is_some() {
             let read_tables = Self::extract_table_names_from_select(select_stmt);
             if self.retained_autocommit_has_dirty_overlap(&read_tables) {
-                self.flush_retained_autocommit_txn_for_read(cx)?;
+                self.flush_retained_autocommit_txn_for_read(cx).await?;
             }
         }
 
@@ -26687,13 +27444,13 @@ impl Connection {
         }
 
         if !self.memdb_rows_loaded.get() {
-            self.reload_memdb_from_pager(cx)
+            self.reload_memdb_from_pager(cx).await
         } else {
-            self.refresh_memdb_if_stale(cx)
+            self.refresh_memdb_if_stale(cx).await
         }
     }
 
-    fn prepare_simple_join_select_rows_with_scanner<S>(
+    async fn prepare_simple_join_select_rows_with_scanner<S>(
         &self,
         select_stmt: &fsqlite_ast::SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -26701,7 +27458,8 @@ impl Connection {
         mut is_live_vtab: impl FnMut(&str) -> bool,
     ) -> Result<Option<PreparedStreamingJoinRows>>
     where
-        S: FnMut(&JoinTableSource) -> Result<Option<Vec<Vec<SqliteValue>>>>,
+        S: std::ops::AsyncFnMut(&JoinTableSource)
+            -> Result<Option<Vec<Vec<SqliteValue>>>>,
     {
         if select_stmt.with.is_some() {
             return Ok(None);
@@ -26782,7 +27540,7 @@ impl Connection {
         // try_extract_equi_join_indices; infeasible permutations bail out.
         let mut join_order_permutation: Option<Vec<usize>> = None;
         if all_inner_joins && table_sources.len() >= 2 {
-            let row_hints = self.sqlite_stat1_row_counts();
+            let row_hints = self.sqlite_stat1_row_counts().await;
             let refs: Vec<fsqlite_planner::TableRefWithStats> = table_sources
                 .iter()
                 .map(|source| {
@@ -26910,7 +27668,7 @@ impl Connection {
                 table_rows.push(cached.clone());
                 continue;
             }
-            let Some(row_data) = scan_source_rows(source)? else {
+            let Some(row_data) = scan_source_rows(source).await? else {
                 return Ok(None);
             };
             let might_reuse = table_sources[index + 1..]
@@ -27020,16 +27778,16 @@ impl Connection {
         }))
     }
 
-    fn emit_prepared_simple_join_rows<F>(
+    async fn emit_prepared_simple_join_rows<F>(
         &self,
         prepared: &PreparedStreamingJoinRows,
         mut emit_row: F,
     ) -> Result<()>
     where
-        F: FnMut(&[SqliteValue]) -> Result<()>,
+        F: std::ops::AsyncFnMut(&[SqliteValue]) -> Result<()>,
     {
         let mut projected_row = Vec::with_capacity(prepared.projection_indices.len());
-        self.emit_prepared_simple_join_rows_raw(prepared, |joined_row| {
+        self.emit_prepared_simple_join_rows_raw(prepared, async |joined_row| {
             projected_row.clear();
             for &projection_index in &prepared.projection_indices {
                 projected_row.push(
@@ -27039,58 +27797,147 @@ impl Connection {
                         .unwrap_or(SqliteValue::Null),
                 );
             }
-            emit_row(&projected_row)
+            emit_row(&projected_row).await
         })
+        .await
     }
 
-    fn emit_prepared_simple_join_rows_raw<F>(
+    async fn emit_prepared_simple_join_rows_raw<F>(
         &self,
         prepared: &PreparedStreamingJoinRows,
         mut emit_row: F,
     ) -> Result<()>
     where
-        F: FnMut(&[SqliteValue]) -> Result<()>,
+        F: std::ops::AsyncFnMut(&[SqliteValue]) -> Result<()>,
     {
+        struct JoinTraversalFrame<'a> {
+            join_idx: usize,
+            len_before_join: usize,
+            matching_right_rows: Option<&'a [usize]>,
+            emit_left_null: bool,
+            next_candidate: usize,
+        }
+
         let mut current_row = Vec::with_capacity(prepared.total_width);
+        let mut frames = Vec::with_capacity(prepared.join_plans.len());
         for primary_row in &prepared.table_rows[0] {
             current_row.clear();
             current_row.extend_from_slice(&primary_row[..prepared.primary_width]);
-            stream_hash_join_rows(
-                &mut current_row,
-                0,
-                &prepared.join_plans,
-                &prepared.table_rows,
-                &mut |joined_row| emit_row(joined_row),
-            )?;
+            frames.clear();
+            let mut join_idx = 0usize;
+
+            loop {
+                if let Some(plan) = prepared.join_plans.get(join_idx) {
+                    debug_assert_eq!(current_row.len(), plan.left_width);
+                    let probe_key: smallvec::SmallVec<[SqliteValue; 2]> = plan
+                        .equi_pairs
+                        .iter()
+                        .map(|&(left_idx, _)| {
+                            current_row
+                                .get(left_idx)
+                                .cloned()
+                                .unwrap_or(SqliteValue::Null)
+                        })
+                        .collect();
+                    let matching_right_rows = if probe_key
+                        .iter()
+                        .any(|value| matches!(value, SqliteValue::Null))
+                    {
+                        None
+                    } else {
+                        plan.right_index
+                            .get(&HashableJoinKey(probe_key))
+                            .map(Vec::as_slice)
+                    };
+                    let emit_left_null =
+                        matching_right_rows.is_none() && matches!(plan.kind, JoinKind::Left);
+                    let candidate_count = matching_right_rows
+                        .map_or_else(|| usize::from(emit_left_null), <[usize]>::len);
+                    if candidate_count > 0 {
+                        let len_before_join = current_row.len();
+                        let right_row_index = matching_right_rows.map(|rows| rows[0]);
+                        if let Some(right_row_index) = right_row_index {
+                            let right_row = &prepared.table_rows[join_idx + 1][right_row_index];
+                            current_row.extend_from_slice(&right_row[..plan.right_width]);
+                        } else {
+                            current_row
+                                .extend(std::iter::repeat_n(SqliteValue::Null, plan.right_width));
+                        }
+                        frames.push(JoinTraversalFrame {
+                            join_idx,
+                            len_before_join,
+                            matching_right_rows,
+                            emit_left_null,
+                            next_candidate: 1,
+                        });
+                        join_idx = join_idx.saturating_add(1);
+                        continue;
+                    }
+                } else {
+                    emit_row(&current_row).await?;
+                }
+
+                let next_branch = loop {
+                    let Some(frame) = frames.last_mut() else {
+                        break None;
+                    };
+                    current_row.truncate(frame.len_before_join);
+                    let candidate_count = frame.matching_right_rows.map_or_else(
+                        || usize::from(frame.emit_left_null),
+                        <[usize]>::len,
+                    );
+                    if frame.next_candidate < candidate_count {
+                        let right_row_index = frame
+                            .matching_right_rows
+                            .map(|rows| rows[frame.next_candidate]);
+                        frame.next_candidate = frame.next_candidate.saturating_add(1);
+                        break Some((frame.join_idx, right_row_index));
+                    }
+                    frames.pop();
+                };
+                let Some((next_join_idx, right_row_index)) = next_branch else {
+                    break;
+                };
+                let plan = &prepared.join_plans[next_join_idx];
+                if let Some(right_row_index) = right_row_index {
+                    let right_row = &prepared.table_rows[next_join_idx + 1][right_row_index];
+                    current_row.extend_from_slice(&right_row[..plan.right_width]);
+                } else {
+                    current_row
+                        .extend(std::iter::repeat_n(SqliteValue::Null, plan.right_width));
+                }
+                join_idx = next_join_idx.saturating_add(1);
+            }
         }
         Ok(())
     }
 
-    fn try_stream_simple_join_select_rows<F>(
+    async fn try_stream_simple_join_select_rows<F>(
         &self,
         select_stmt: &fsqlite_ast::SelectStatement,
         params: Option<&[SqliteValue]>,
         mut emit_row: F,
     ) -> Result<bool>
     where
-        F: FnMut(&[SqliteValue]) -> Result<()>,
+        F: std::ops::AsyncFnMut(&[SqliteValue]) -> Result<()>,
     {
         self.try_stream_simple_join_select_rows_with_scanner(
             select_stmt,
             params,
-            |source| {
+            async |source| {
                 if let Some(row_data) = self.try_scan_join_source_from_memdb(source) {
                     return Ok(Some(row_data));
                 }
-                if let Some(result) = self.try_scan_join_source_from_pager(source) {
+                if let Some(result) = self.try_scan_join_source_from_pager(source).await {
                     return Ok(Some(result?));
                 }
                 let scan_sql = build_join_scan_sql(source);
-                let rows = self.query(&scan_sql)?;
+                let rows = self.query(&scan_sql).await?;
                 Ok(Some(rows_into_value_vectors(rows)))
             },
-            |row| emit_row(row),
+            async |row| emit_row(row).await,
         )
+        .await
     }
 
     fn validate_insert_target_columns(
@@ -27130,7 +27977,7 @@ impl Connection {
     /// applying conflict resolution directly on the in-memory database.
     #[allow(dead_code)]
     #[allow(clippy::too_many_lines)]
-    fn execute_insert_or_conflict(
+    async fn execute_insert_or_conflict(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         rows: &[Vec<Expr>],
@@ -27196,9 +28043,9 @@ impl Connection {
             let expr_strs: Vec<String> = row_exprs.iter().map(|e| format!("{e}")).collect();
             let select_sql = format!("SELECT {}", expr_strs.join(", "));
             let eval_rows = if let Some(p) = params {
-                self.query_with_params(&select_sql, p)?
+                self.query_with_params(&select_sql, p).await?
             } else {
-                self.query(&select_sql)?
+                self.query(&select_sql).await?
             };
             let values: Vec<SqliteValue> = eval_rows
                 .first()
@@ -27526,7 +28373,11 @@ impl Connection {
     }
 
     /// Compile and wrap a statement into a `PreparedStatement`.
-    fn compile_and_wrap(&self, sql: &str, statement: &Statement) -> Result<PreparedStatement<'_>> {
+    async fn compile_and_wrap(
+        &self,
+        sql: &str,
+        statement: &Statement,
+    ) -> Result<PreparedStatement<'_>> {
         let registry = Some(Arc::clone(&*self.func_registry.borrow()));
         let prepared_column_names = self.prepared_statement_column_names(statement);
         let prepared_query_fast_path = self.prepared_query_fast_path(statement);
@@ -27603,12 +28454,16 @@ impl Connection {
                     unbounded.limit = None;
                     let compiled_sql = unbounded.to_string();
                     let compiled_sql_key = Self::sql_hash(&compiled_sql);
-                    self.compile_with_cache(compiled_sql_key, &compiled_sql, |conn| {
-                        conn.compile_table_select(&unbounded)
-                    })?
+                    self.compile_with_cache(compiled_sql_key, &compiled_sql, async |conn| {
+                        conn.compile_table_select(&unbounded).await
+                    })
+                    .await?
                 } else {
                     let sql_key = Self::sql_hash(sql);
-                    self.compile_with_cache(sql_key, sql, |conn| conn.compile_table_select(select))?
+                    self.compile_with_cache(sql_key, sql, async |conn| {
+                        conn.compile_table_select(select).await
+                    })
+                    .await?
                 };
                 Ok(PreparedStatement {
                     sql: Rc::<str>::from(sql),
@@ -27666,7 +28521,7 @@ impl Connection {
                     let supports_direct_dispatch =
                         self.prepared_insert_supports_direct_dispatch(insert);
                     let direct_simple_insert = if supports_direct_dispatch {
-                        self.prepared_direct_simple_insert_plan(insert)?
+                        self.prepared_direct_simple_insert_plan(insert).await?
                     } else {
                         None
                     };
@@ -27678,9 +28533,10 @@ impl Connection {
                         build_placeholder_program()?
                     } else {
                         let sql_key = Self::sql_hash(sql);
-                        self.compile_with_cache(sql_key, sql, |conn| {
-                            conn.compile_table_insert(insert)
-                        })?
+                        self.compile_with_cache(sql_key, sql, async |conn| {
+                            conn.compile_table_insert(insert).await
+                        })
+                        .await?
                     };
                     Ok(PreparedStatement {
                         sql: Rc::<str>::from(sql),
@@ -27772,15 +28628,16 @@ impl Connection {
                 if Self::prepared_update_supports_precompiled_program(update)
                     && !self.prepared_update_requires_deferred_dispatch(update)?
                 {
-                    let fast_path = self.prepared_update_fast_path_metadata(update);
+                    let fast_path = self.prepared_update_fast_path_metadata(update).await;
                     let (program, db) = if fast_path.has_direct_simple_dispatch() {
                         (build_placeholder_program()?, None)
                     } else {
                         let sql_key = Self::sql_hash(sql);
                         (
-                            self.compile_with_cache(sql_key, sql, |conn| {
+                            self.compile_with_cache(sql_key, sql, async |conn| {
                                 conn.compile_table_update(update)
-                            })?,
+                            })
+                            .await?,
                             Some(Rc::clone(&self.db)),
                         )
                     };
@@ -27848,15 +28705,16 @@ impl Connection {
                 if Self::prepared_delete_supports_precompiled_program(delete)
                     && !self.prepared_delete_requires_deferred_dispatch(delete)?
                 {
-                    let fast_path = self.prepared_delete_fast_path_metadata(delete);
+                    let fast_path = self.prepared_delete_fast_path_metadata(delete).await;
                     let (program, db) = if fast_path.has_direct_simple_dispatch() {
                         (build_placeholder_program()?, None)
                     } else {
                         let sql_key = Self::sql_hash(sql);
                         (
-                            self.compile_with_cache(sql_key, sql, |conn| {
+                            self.compile_with_cache(sql_key, sql, async |conn| {
                                 conn.compile_table_delete(delete)
-                            })?,
+                            })
+                            .await?,
                             Some(Rc::clone(&self.db)),
                         )
                     };
@@ -28018,11 +28876,11 @@ impl Connection {
             .is_none_or(table_schema_may_observe_change_tracking)
     }
 
-    fn prepared_direct_simple_insert_plan(
+    async fn prepared_direct_simple_insert_plan(
         &self,
         insert: &fsqlite_ast::InsertStatement,
     ) -> Result<Option<PreparedDirectSimpleInsert>> {
-        let resolved_insert = self.resolve_insert_values_subqueries(insert)?;
+        let resolved_insert = self.resolve_insert_values_subqueries(insert).await?;
         if !resolved_insert.upsert.is_empty() {
             return Ok(None);
         }
@@ -28128,7 +28986,8 @@ impl Connection {
         let lane =
             Self::classify_prepared_direct_simple_insert_lane(compiled_row_values.as_deref());
         let (cursor_page_size, cursor_reserved_per_page) = self
-            .pragma_database_header()?
+            .pragma_database_header()
+            .await?
             .map(|header| (header.page_size, header.reserved_per_page))
             .unwrap_or((PageSize::DEFAULT, 0));
         Ok(Some(PreparedDirectSimpleInsert {
@@ -28768,7 +29627,7 @@ impl Connection {
         None
     }
 
-    fn prepared_update_fast_path_metadata(
+    async fn prepared_update_fast_path_metadata(
         &self,
         update: &fsqlite_ast::UpdateStatement,
     ) -> PreparedUpdateDeleteFastPath {
@@ -28794,6 +29653,7 @@ impl Connection {
         let foreign_key_work = self.table_has_foreign_key_work(table_name);
         let direct_simple_update = if static_fallback_reason.is_none() && !foreign_key_work {
             self.try_build_prepared_direct_simple_update(update)
+                .await
                 .ok()
                 .flatten()
         } else {
@@ -28818,7 +29678,7 @@ impl Connection {
         }
     }
 
-    fn prepared_delete_fast_path_metadata(
+    async fn prepared_delete_fast_path_metadata(
         &self,
         delete: &fsqlite_ast::DeleteStatement,
     ) -> PreparedUpdateDeleteFastPath {
@@ -28836,6 +29696,7 @@ impl Connection {
         let foreign_key_work = self.table_is_foreign_key_parent(table_name);
         let direct_simple_delete = if static_fallback_reason.is_none() && !foreign_key_work {
             self.try_build_prepared_direct_simple_delete(delete)
+                .await
                 .ok()
                 .flatten()
         } else {
@@ -28863,7 +29724,7 @@ impl Connection {
     /// triggers, no constraints that require validation beyond NOT NULL /
     /// affinity, no assigned indexed columns, and each SET value must be a
     /// numbered placeholder or a literal constant.
-    fn try_build_prepared_direct_simple_update(
+    async fn try_build_prepared_direct_simple_update(
         &self,
         update: &fsqlite_ast::UpdateStatement,
     ) -> Result<Option<PreparedDirectSimpleUpdate>> {
@@ -29004,7 +29865,8 @@ impl Connection {
         });
 
         let (cursor_page_size, cursor_reserved_per_page) = self
-            .pragma_database_header()?
+            .pragma_database_header()
+            .await?
             .map_or((PageSize::DEFAULT, 0), |header| {
                 (header.page_size, header.reserved_per_page)
             });
@@ -29037,7 +29899,7 @@ impl Connection {
 
     /// Build the direct-simple DELETE metadata when the statement shape allows
     /// bypassing VDBE. Mirror of `try_build_prepared_direct_simple_update`.
-    fn try_build_prepared_direct_simple_delete(
+    async fn try_build_prepared_direct_simple_delete(
         &self,
         delete: &fsqlite_ast::DeleteStatement,
     ) -> Result<Option<PreparedDirectSimpleDelete>> {
@@ -29098,7 +29960,8 @@ impl Connection {
         let rowid_param_one_based = rowid_param_zero_based + 1;
 
         let (cursor_page_size, cursor_reserved_per_page) = self
-            .pragma_database_header()?
+            .pragma_database_header()
+            .await?
             .map_or((PageSize::DEFAULT, 0), |header| {
                 (header.page_size, header.reserved_per_page)
             });
@@ -30072,22 +30935,23 @@ impl Connection {
         !self.select_correlated_exists_where_can_use_indexed_count_probe(select)
     }
 
-    fn execute_correlated_subquery_where_fallback(
+    async fn execute_correlated_subquery_where_fallback(
         &self,
         cx: &Cx,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+        let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
         let mut bound = bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
         let limit_clause = bound.limit.take();
         let mut rows = if has_group_by(&bound)
             || has_implicit_aggregation(&bound)
             || has_ordered_aggregate(&bound)
         {
-            self.execute_group_by_join_select(cx, &bound, None)?
+            self.execute_group_by_join_select(cx, &bound, None)
+                .await?
         } else {
-            self.execute_join_select(&bound, None)?
+            self.execute_join_select(&bound, None).await?
         };
         if let Some(limit) = limit_clause {
             apply_limit_clause(&mut rows, &limit);
@@ -32042,7 +32906,7 @@ impl Connection {
     /// Count the number of rows in `table_name` matching an optional WHERE
     /// clause.  Used by UPDATE/DELETE to compute the affected-row count
     /// without modifying the VDBE engine.
-    fn select_matching_rows(
+    async fn select_matching_rows(
         &self,
         table_ref: &fsqlite_ast::QualifiedTableRef,
         where_clause: Option<&Expr>,
@@ -32058,6 +32922,7 @@ impl Connection {
             limit,
         );
         self.execute_statement(&Statement::Select(select), params)
+            .await
     }
 
     /// Pre-evaluate and inline scalar subqueries in `expr` that reference
@@ -32065,18 +32930,22 @@ impl Connection {
     /// literal of the evaluated result. This ensures the subquery runs against
     /// the table's pre-DML state, not the partially-modified state during a
     /// DELETE or UPDATE scan.
-    fn inline_self_referencing_scalar_subqueries(
-        &self,
-        expr: &mut Expr,
-        target_table: &str,
-    ) -> Result<()> {
+    // Recurses into sub-expressions, so it returns a boxed future rather than
+    // using `async fn` sugar.
+    fn inline_self_referencing_scalar_subqueries<'a>(
+        &'a self,
+        expr: &'a mut Expr,
+        target_table: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        Box::pin(async move {
         match expr {
             Expr::Subquery(subquery, _)
                 if !is_correlated_subquery(subquery)
                     && subquery_references_table(subquery, target_table) =>
             {
-                let rows =
-                    self.execute_statement(&Statement::Select(subquery.as_ref().clone()), None)?;
+                let rows = self
+                    .execute_statement(&Statement::Select(subquery.as_ref().clone()), None)
+                    .await?;
                 let value = rows
                     .first()
                     .and_then(|r| r.values().first().cloned())
@@ -32099,32 +32968,37 @@ impl Connection {
                 Ok(())
             }
             Expr::BinaryOp { left, right, .. } => {
-                self.inline_self_referencing_scalar_subqueries(left, target_table)?;
+                self.inline_self_referencing_scalar_subqueries(left, target_table)
+                    .await?;
                 self.inline_self_referencing_scalar_subqueries(right, target_table)
+                    .await
             }
             Expr::UnaryOp { expr: inner, .. }
             | Expr::IsNull { expr: inner, .. }
             | Expr::Cast { expr: inner, .. }
             | Expr::Collate { expr: inner, .. } => {
                 self.inline_self_referencing_scalar_subqueries(inner, target_table)
+                    .await
             }
             Expr::FunctionCall {
                 args: FunctionArgs::List(args),
                 ..
             } => {
                 for arg in args.iter_mut() {
-                    self.inline_self_referencing_scalar_subqueries(arg, target_table)?;
+                    self.inline_self_referencing_scalar_subqueries(arg, target_table)
+                        .await?;
                 }
                 Ok(())
             }
             _ => Ok(()),
         }
+        })
     }
 
     /// Count rows matching UPDATE/DELETE scope using the existing SELECT
     /// helper so affected-row accounting is decoupled from VDBE opcode shape.
     #[allow(dead_code)]
-    fn count_matching_rows(
+    async fn count_matching_rows(
         &self,
         table_ref: &fsqlite_ast::QualifiedTableRef,
         where_clause: Option<&Expr>,
@@ -32133,13 +33007,14 @@ impl Connection {
         params: Option<&[SqliteValue]>,
     ) -> Result<usize> {
         self.select_matching_rows(table_ref, where_clause, order_by, limit, params)
+            .await
             .map(|rows| rows.len())
     }
 
     /// Materialize the target row-set for `UPDATE ... ORDER BY/LIMIT` into a
     /// deterministic key-filter expression so VDBE execution mutates only the
     /// selected rows.
-    fn materialize_update_limit_scope(
+    async fn materialize_update_limit_scope(
         &self,
         update: &fsqlite_ast::UpdateStatement,
         params: Option<&[SqliteValue]>,
@@ -32154,14 +33029,16 @@ impl Connection {
         }
 
         let (key_column, _is_hidden_rowid) = self.resolve_dml_limit_key(&update.table.name.name)?;
-        let selected_keys = self.select_matching_limit_keys(
-            &update.table,
-            update.where_clause.as_ref(),
-            &update.order_by,
-            update.limit.as_ref(),
-            params,
-            &key_column,
-        )?;
+        let selected_keys = self
+            .select_matching_limit_keys(
+                &update.table,
+                update.where_clause.as_ref(),
+                &update.order_by,
+                update.limit.as_ref(),
+                params,
+                &key_column,
+            )
+            .await?;
 
         let mut effective = update.clone();
         effective.where_clause = Some(Self::build_limit_scope_filter_expr(
@@ -32177,7 +33054,7 @@ impl Connection {
     /// Materialize the target row-set for `DELETE ... ORDER BY/LIMIT` into a
     /// deterministic key-filter expression so VDBE execution deletes only the
     /// selected rows.
-    fn materialize_delete_limit_scope(
+    async fn materialize_delete_limit_scope(
         &self,
         delete: &fsqlite_ast::DeleteStatement,
         params: Option<&[SqliteValue]>,
@@ -32187,14 +33064,16 @@ impl Connection {
         }
 
         let (key_column, _is_hidden_rowid) = self.resolve_dml_limit_key(&delete.table.name.name)?;
-        let selected_keys = self.select_matching_limit_keys(
-            &delete.table,
-            delete.where_clause.as_ref(),
-            &delete.order_by,
-            delete.limit.as_ref(),
-            params,
-            &key_column,
-        )?;
+        let selected_keys = self
+            .select_matching_limit_keys(
+                &delete.table,
+                delete.where_clause.as_ref(),
+                &delete.order_by,
+                delete.limit.as_ref(),
+                params,
+                &key_column,
+            )
+            .await?;
 
         let mut effective = delete.clone();
         effective.where_clause = Some(Self::build_limit_scope_filter_expr(
@@ -32246,7 +33125,7 @@ impl Connection {
     /// Select key values for UPDATE/DELETE LIMIT scoping using the statement's
     /// original WHERE/ORDER BY/LIMIT clauses.
     #[allow(clippy::too_many_arguments)]
-    fn select_matching_limit_keys(
+    async fn select_matching_limit_keys(
         &self,
         table_ref: &fsqlite_ast::QualifiedTableRef,
         where_clause: Option<&Expr>,
@@ -32265,7 +33144,9 @@ impl Connection {
             order_by,
             limit,
         );
-        let rows = self.execute_statement(&Statement::Select(select), params)?;
+        let rows = self
+            .execute_statement(&Statement::Select(select), params)
+            .await?;
 
         rows.iter()
             .map(|row| {
@@ -32382,7 +33263,7 @@ impl Connection {
         }
     }
 
-    fn collect_insert_trigger_rows(
+    async fn collect_insert_trigger_rows(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         params: Option<&[SqliteValue]>,
@@ -32409,53 +33290,54 @@ impl Connection {
                 // shared bind_state (statement-level positions matching the bound
                 // params); idempotent for already-Numbered placeholders.
                 let mut bind_state = BindParamState::default();
-                rows.iter()
-                    .enumerate()
-                    .map(|(row_idx, row_exprs)| {
-                        let mut canonical_exprs = row_exprs.clone();
-                        for expr in &mut canonical_exprs {
-                            canonicalize_expr_placeholders(expr, &mut bind_state)?;
-                        }
-                        let source_values =
-                            self.evaluate_insert_source_row(&canonical_exprs, params)?;
-                        let default_row = self.evaluate_default_row_from_sqls(&default_sqls)?;
-                        self.map_insert_source_row_to_table_row(
-                            &default_row,
-                            &layout.targets,
-                            layout.rowid_alias_col_idx,
-                            layout.explicit_rowid_source,
-                            &source_values,
-                            &format!("INSERT VALUES row {}", row_idx + 1),
-                        )
-                    })
-                    .collect()
+                let mut mapped = Vec::with_capacity(rows.len());
+                for (row_idx, row_exprs) in rows.iter().enumerate() {
+                    let mut canonical_exprs = row_exprs.clone();
+                    for expr in &mut canonical_exprs {
+                        canonicalize_expr_placeholders(expr, &mut bind_state)?;
+                    }
+                    let source_values = self
+                        .evaluate_insert_source_row(&canonical_exprs, params)
+                        .await?;
+                    let default_row =
+                        self.evaluate_default_row_from_sqls(&default_sqls).await?;
+                    mapped.push(self.map_insert_source_row_to_table_row(
+                        &default_row,
+                        &layout.targets,
+                        layout.rowid_alias_col_idx,
+                        layout.explicit_rowid_source,
+                        &source_values,
+                        &format!("INSERT VALUES row {}", row_idx + 1),
+                    )?);
+                }
+                Ok(mapped)
             }
             fsqlite_ast::InsertSource::Select(select) => {
                 let source_rows =
-                    self.execute_statement(&Statement::Select(*select.clone()), params)?;
-                source_rows
-                    .iter()
-                    .enumerate()
-                    .map(|(row_idx, row)| {
-                        let default_row = self.evaluate_default_row_from_sqls(&default_sqls)?;
-                        self.map_insert_source_row_to_table_row(
-                            &default_row,
-                            &layout.targets,
-                            layout.rowid_alias_col_idx,
-                            layout.explicit_rowid_source,
-                            row.values(),
-                            &format!("INSERT SELECT row {}", row_idx + 1),
-                        )
-                    })
-                    .collect()
+                    self.execute_statement(&Statement::Select(*select.clone()), params)
+                    .await?;
+                let mut mapped = Vec::with_capacity(source_rows.len());
+                for (row_idx, row) in source_rows.iter().enumerate() {
+                    let default_row =
+                        self.evaluate_default_row_from_sqls(&default_sqls).await?;
+                    mapped.push(self.map_insert_source_row_to_table_row(
+                        &default_row,
+                        &layout.targets,
+                        layout.rowid_alias_col_idx,
+                        layout.explicit_rowid_source,
+                        row.values(),
+                        &format!("INSERT SELECT row {}", row_idx + 1),
+                    )?);
+                }
+                Ok(mapped)
             }
-            fsqlite_ast::InsertSource::DefaultValues => {
-                Ok(vec![self.evaluate_default_row_from_sqls(&default_sqls)?])
-            }
+            fsqlite_ast::InsertSource::DefaultValues => Ok(vec![
+                self.evaluate_default_row_from_sqls(&default_sqls).await?,
+            ]),
         }
     }
 
-    fn evaluate_insert_source_row(
+    async fn evaluate_insert_source_row(
         &self,
         row_exprs: &[Expr],
         params: Option<&[SqliteValue]>,
@@ -32473,10 +33355,14 @@ impl Connection {
         // identically to the projection SELECT, but without the reload.
         let empty_row: &[SqliteValue] = &[];
         let empty_col_map: &[(String, String, bool)] = &[];
-        row_exprs
-            .iter()
-            .map(|expr| self.eval_expr_with_subqueries(expr, empty_row, empty_col_map, params))
-            .collect()
+        let mut values = Vec::with_capacity(row_exprs.len());
+        for expr in row_exprs {
+            values.push(
+                self.eval_expr_with_subqueries(expr, empty_row, empty_col_map, params)
+                    .await?,
+            );
+        }
+        Ok(values)
     }
 
     fn resolve_live_vtab_insert_layout(
@@ -32561,7 +33447,7 @@ impl Connection {
         })
     }
 
-    fn build_live_vtab_insert_row(
+    async fn build_live_vtab_insert_row(
         &self,
         layout: &LiveVtabInsertLayout,
         source_values: &[SqliteValue],
@@ -32588,7 +33474,9 @@ impl Connection {
             });
         }
 
-        let mut row = self.evaluate_default_row_from_sqls(&layout.default_sqls)?;
+        let mut row = self
+            .evaluate_default_row_from_sqls(&layout.default_sqls)
+            .await?;
         let mut explicit_rowid = None;
         let mut filled_columns = vec![false; row.len()];
         for (source_idx, target_idx) in layout.source_targets.iter().copied().enumerate() {
@@ -32609,7 +33497,7 @@ impl Connection {
         })
     }
 
-    fn collect_live_vtab_insert_rows(
+    async fn collect_live_vtab_insert_rows(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         params: Option<&[SqliteValue]>,
@@ -32617,42 +33505,51 @@ impl Connection {
         let layout = self.resolve_live_vtab_insert_layout(insert)?;
 
         match &insert.source {
-            fsqlite_ast::InsertSource::Values(rows) => rows
-                .iter()
-                .enumerate()
-                .map(|(row_idx, row_exprs)| {
-                    let source_values = self.evaluate_insert_source_row(row_exprs, params)?;
-                    self.build_live_vtab_insert_row(
-                        &layout,
-                        &source_values,
-                        &format!("live virtual-table INSERT VALUES row {}", row_idx + 1),
-                    )
-                })
-                .collect(),
+            fsqlite_ast::InsertSource::Values(rows) => {
+                let mut built = Vec::with_capacity(rows.len());
+                for (row_idx, row_exprs) in rows.iter().enumerate() {
+                    let source_values =
+                        self.evaluate_insert_source_row(row_exprs, params).await?;
+                    built.push(
+                        self.build_live_vtab_insert_row(
+                            &layout,
+                            &source_values,
+                            &format!("live virtual-table INSERT VALUES row {}", row_idx + 1),
+                        )
+                        .await?,
+                    );
+                }
+                Ok(built)
+            }
             fsqlite_ast::InsertSource::Select(select) => {
                 let source_rows =
-                    self.execute_statement(&Statement::Select(*select.clone()), params)?;
-                source_rows
-                    .iter()
-                    .enumerate()
-                    .map(|(row_idx, row)| {
+                    self.execute_statement(&Statement::Select(*select.clone()), params)
+                    .await?;
+                let mut built = Vec::with_capacity(source_rows.len());
+                for (row_idx, row) in source_rows.iter().enumerate() {
+                    built.push(
                         self.build_live_vtab_insert_row(
                             &layout,
                             row.values(),
                             &format!("live virtual-table INSERT SELECT row {}", row_idx + 1),
                         )
-                    })
-                    .collect()
+                        .await?,
+                    );
+                }
+                Ok(built)
             }
-            fsqlite_ast::InsertSource::DefaultValues => Ok(vec![self.build_live_vtab_insert_row(
-                &layout,
-                &[],
-                "live virtual-table INSERT DEFAULT VALUES",
-            )?]),
+            fsqlite_ast::InsertSource::DefaultValues => Ok(vec![
+                self.build_live_vtab_insert_row(
+                    &layout,
+                    &[],
+                    "live virtual-table INSERT DEFAULT VALUES",
+                )
+                .await?,
+            ]),
         }
     }
 
-    fn try_execute_streaming_live_vtab_insert_select(
+    async fn try_execute_streaming_live_vtab_insert_select(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         params: Option<&[SqliteValue]>,
@@ -32664,23 +33561,26 @@ impl Connection {
             return Ok(None);
         }
         let prep_cx = self.op_cx_after_background_status();
-        self.prepare_streaming_join_select_read_boundary(select_stmt, &prep_cx)?;
-        let prepared = self.prepare_simple_join_select_rows_with_scanner(
-            select_stmt,
-            params,
-            |source| {
-                if let Some(row_data) = self.try_scan_join_source_from_memdb(source) {
-                    return Ok(Some(row_data));
-                }
-                if let Some(result) = self.try_scan_join_source_from_pager(source) {
-                    return Ok(Some(result?));
-                }
-                let scan_sql = build_join_scan_sql(source);
-                let rows = self.query(&scan_sql)?;
-                Ok(Some(rows_into_value_vectors(rows)))
-            },
-            |table_name| self.has_live_vtab_instance(table_name),
-        )?;
+        self.prepare_streaming_join_select_read_boundary(select_stmt, &prep_cx)
+            .await?;
+        let prepared = self
+            .prepare_simple_join_select_rows_with_scanner(
+                select_stmt,
+                params,
+                async |source| {
+                    if let Some(row_data) = self.try_scan_join_source_from_memdb(source) {
+                        return Ok(Some(row_data));
+                    }
+                    if let Some(result) = self.try_scan_join_source_from_pager(source).await {
+                        return Ok(Some(result?));
+                    }
+                    let scan_sql = build_join_scan_sql(source);
+                    let rows = self.query(&scan_sql).await?;
+                    Ok(Some(rows_into_value_vectors(rows)))
+                },
+                |table_name| self.has_live_vtab_instance(table_name),
+            )
+            .await?;
         let Some(prepared) = prepared else {
             return Ok(None);
         };
@@ -32702,8 +33602,9 @@ impl Connection {
         let key = table_name.to_ascii_uppercase();
         let mut inserted_row_count = 0usize;
         let mut source_row_count = 0usize;
-        let streamed = self.with_pager_write_txn(|cx, txn| {
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+        let streamed = self
+            .with_pager_write_txn(async |cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
             let mut instances = self.vtab_instances.borrow_mut();
             let instance = instances.get_mut(&key).ok_or_else(|| {
                 FrankenError::Internal(format!("virtual table not found: {table_name}"))
@@ -32712,7 +33613,7 @@ impl Connection {
             #[cfg(feature = "ext-fts5")]
             if let Some(fts5) = instance.as_any_mut().downcast_mut::<Fts5Table>()
                 && fts5.is_empty()
-                && !cursor.first(cx)?
+                && !cursor.first(cx).await?
             {
                 fts5.ensure_shadow_rows_materializable_for_mutation()?;
                 let tokenizer = fts5.create_tokenizer_instance();
@@ -32726,7 +33627,7 @@ impl Connection {
                         .iter()
                         .map(|&source_idx| prepared.projection_indices[source_idx])
                         .collect::<Vec<_>>();
-                    self.emit_prepared_simple_join_rows_raw(&prepared, |joined_row| {
+                    self.emit_prepared_simple_join_rows_raw(&prepared, async |joined_row| {
                         source_row_count = source_row_count.saturating_add(1);
                         let rowid = explicit_rowid_projection
                             .and_then(|projection_idx| joined_row.get(projection_idx))
@@ -32736,8 +33637,8 @@ impl Connection {
                             .unwrap_or_else(|| fts5.allocate_rowid());
                         if !seen_rowids.insert(rowid) {
                             fts5.delete_document(rowid);
-                            if cursor.table_move_to(cx, rowid)?.is_found() {
-                                cursor.delete(cx)?;
+                            if cursor.table_move_to(cx, rowid).await?.is_found() {
+                                cursor.delete(cx).await?;
                             }
                         }
                         let persisted_values = value_projection_indices
@@ -32759,20 +33660,23 @@ impl Connection {
                             tokenizer.as_ref(),
                         );
                         let record = serialize_record(&persisted_values);
-                        cursor.table_insert(cx, rowid, &record)?;
+                        cursor.table_insert(cx, rowid, &record).await?;
                         inserted_row_count = inserted_row_count.saturating_add(1);
                         self.record_last_insert_rowid(rowid);
                         Ok(())
-                    })?;
+                    })
+                    .await?;
                     return Ok(true);
                 }
-                self.emit_prepared_simple_join_rows(&prepared, |source_values| {
+                self.emit_prepared_simple_join_rows(&prepared, async |source_values| {
                     source_row_count = source_row_count.saturating_add(1);
-                    let row = self.build_live_vtab_insert_row(
-                        &layout,
-                        source_values,
-                        &format!("live virtual-table INSERT SELECT row {}", source_row_count),
-                    )?;
+                    let row = self
+                        .build_live_vtab_insert_row(
+                            &layout,
+                            source_values,
+                            &format!("live virtual-table INSERT SELECT row {}", source_row_count),
+                        )
+                        .await?;
                     let rowid = row
                         .explicit_rowid
                         .as_ref()
@@ -32782,8 +33686,8 @@ impl Connection {
                         .unwrap_or_else(|| fts5.allocate_rowid());
                     if !seen_rowids.insert(rowid) {
                         fts5.delete_document(rowid);
-                        if cursor.table_move_to(cx, rowid)?.is_found() {
-                            cursor.delete(cx)?;
+                        if cursor.table_move_to(cx, rowid).await?.is_found() {
+                            cursor.delete(cx).await?;
                         }
                     }
                     let persisted_values = row.values;
@@ -32797,21 +33701,24 @@ impl Connection {
                         tokenizer.as_ref(),
                     );
                     let record = serialize_record(&persisted_values);
-                    cursor.table_insert(cx, rowid, &record)?;
+                    cursor.table_insert(cx, rowid, &record).await?;
                     inserted_row_count = inserted_row_count.saturating_add(1);
                     self.record_last_insert_rowid(rowid);
                     Ok(())
-                })?;
+                })
+                .await?;
                 return Ok(true);
             }
             let patch_first_column_with_rowid = is_rtree_instance(instance.as_ref());
-            self.emit_prepared_simple_join_rows(&prepared, |source_values| {
+            self.emit_prepared_simple_join_rows(&prepared, async |source_values| {
                 source_row_count = source_row_count.saturating_add(1);
-                let row = self.build_live_vtab_insert_row(
-                    &layout,
-                    source_values,
-                    &format!("live virtual-table INSERT SELECT row {}", source_row_count),
-                )?;
+                let row = self
+                    .build_live_vtab_insert_row(
+                        &layout,
+                        source_values,
+                        &format!("live virtual-table INSERT SELECT row {}", source_row_count),
+                    )
+                    .await?;
                 let mut args = Vec::with_capacity(row.values.len() + 2);
                 args.push(SqliteValue::Null);
                 let new_rowid = if patch_first_column_with_rowid {
@@ -32835,24 +33742,26 @@ impl Connection {
                 {
                     persisted_values[0] = SqliteValue::Integer(rowid);
                 }
-                if cursor.table_move_to(cx, rowid)?.is_found() {
-                    cursor.delete(cx)?;
+                if cursor.table_move_to(cx, rowid).await?.is_found() {
+                    cursor.delete(cx).await?;
                 }
                 let record = serialize_record(&persisted_values);
-                cursor.table_insert(cx, rowid, &record)?;
+                cursor.table_insert(cx, rowid, &record).await?;
                 inserted_row_count = inserted_row_count.saturating_add(1);
                 self.record_last_insert_rowid(rowid);
                 Ok(())
-            })?;
+            })
+            .await?;
             Ok(true)
-        })?;
+        })
+            .await?;
         if !streamed {
             return Ok(None);
         }
         Ok(Some(inserted_row_count))
     }
 
-    fn execute_live_vtab_insert_rows(
+    async fn execute_live_vtab_insert_rows(
         &self,
         table_name: &str,
         rows: &[LiveVtabInsertRow],
@@ -32874,7 +33783,7 @@ impl Connection {
             let contentless =
                 is_lazy && !self.rootpage_zero_fts5_has_internal_content_shadow(table_name);
             if is_lazy && !contentless {
-                self.promote_lazy_fts5_table(table_name)?;
+                self.promote_lazy_fts5_table(table_name).await?;
             }
             if contentless {
                 let mut rowids = HashSet::with_capacity(rows.len());
@@ -32891,9 +33800,14 @@ impl Connection {
                     if !rowids.insert(rowid) {
                         return Err(FrankenError::PrimaryKeyViolation);
                     }
-                    let exists = self.with_lazy_fts5_reader(table_name, |reader| {
-                        Ok(reader.read_docsize(rowid, column_count)?.is_some())
-                    })?;
+                    let exists = self
+                        .with_lazy_fts5_reader(table_name, async |reader| {
+                            Ok(reader
+                                .read_docsize(rowid, column_count)
+                                .await?
+                                .is_some())
+                        })
+                        .await?;
                     if exists {
                         return Err(FrankenError::PrimaryKeyViolation);
                     }
@@ -32933,7 +33847,10 @@ impl Connection {
         drop(instances);
 
         #[cfg(feature = "ext-fts5")]
-        if self.persist_rootpage_zero_fts5_insert_rows(table_name, rows, &inserted_rowids)? {
+        if self
+            .persist_rootpage_zero_fts5_insert_rows(table_name, rows, &inserted_rowids)
+            .await?
+        {
             if lazy_contentless {
                 let mut instances = self.vtab_instances.borrow_mut();
                 let fts5 = instances
@@ -32954,7 +33871,8 @@ impl Connection {
             rows,
             &inserted_rowids,
             patch_first_column_with_rowid,
-        )?;
+        )
+        .await?;
 
         Ok(inserted_rowids)
     }
@@ -32973,7 +33891,7 @@ impl Connection {
     /// would silently delete the backing records while leaving the live module
     /// instance stale, so a subsequent re-`INSERT` of the same rowid trips the
     /// module's primary-key guard (frankensqlite#94).
-    fn execute_live_vtab_delete(
+    async fn execute_live_vtab_delete(
         &self,
         delete: &fsqlite_ast::DeleteStatement,
         params: Option<&[SqliteValue]>,
@@ -32997,7 +33915,9 @@ impl Connection {
             &[],
             None,
         );
-        let matched = self.execute_statement(&Statement::Select(rowid_select), params)?;
+        let matched = self
+            .execute_statement(&Statement::Select(rowid_select), params)
+            .await?;
         let mut rowids: Vec<i64> = Vec::with_capacity(matched.len());
         for row in &matched {
             match row.values().first() {
@@ -33020,9 +33940,14 @@ impl Connection {
         }
 
         self.execute_live_vtab_delete_rowids(&table_name, &rowids)
+            .await
     }
 
-    fn execute_live_vtab_delete_rowids(&self, table_name: &str, rowids: &[i64]) -> Result<usize> {
+    async fn execute_live_vtab_delete_rowids(
+        &self,
+        table_name: &str,
+        rowids: &[i64],
+    ) -> Result<usize> {
         if rowids.is_empty() {
             return Ok(0);
         }
@@ -33046,7 +33971,7 @@ impl Connection {
                     .is_some_and(Fts5Table::is_lazy_on_disk)
             };
             if is_lazy {
-                self.promote_lazy_fts5_table(table_name)?;
+                self.promote_lazy_fts5_table(table_name).await?;
             }
         }
         #[cfg(feature = "ext-fts5")]
@@ -33066,7 +33991,8 @@ impl Connection {
                 }
                 count
             };
-            self.persist_rootpage_zero_fts5_deleted_rowids(table_name, rowids)?;
+            self.persist_rootpage_zero_fts5_deleted_rowids(table_name, rowids)
+                .await?;
             return Ok(deleted);
         }
         let root = page_number_from_schema_root(root_page, table_name, "table")?;
@@ -33075,8 +34001,8 @@ impl Connection {
         // in-memory index/content/docsize state is updated and any module-level
         // delete rules (e.g. contentless_delete) are enforced. Then remove the
         // backing storage record so the two stay in lockstep.
-        let deleted = self.with_pager_write_txn(|cx, txn| {
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+        let deleted = self.with_pager_write_txn(async |cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
             let mut instances = self.vtab_instances.borrow_mut();
             let instance = instances.get_mut(&key).ok_or_else(|| {
                 FrankenError::Internal(format!("virtual table not found: {table_name}"))
@@ -33086,19 +34012,20 @@ impl Connection {
             for rowid in rowids {
                 // `xUpdate(argc==1)`: a single old-rowid argument is a delete.
                 instance.update(cx, &[SqliteValue::Integer(*rowid)])?;
-                if cursor.table_move_to(cx, *rowid)?.is_found() {
-                    cursor.delete(cx)?;
+                if cursor.table_move_to(cx, *rowid).await?.is_found() {
+                    cursor.delete(cx).await?;
                 }
                 count = count.saturating_add(1);
             }
             Ok(count)
-        })?;
+        })
+        .await?;
 
         Ok(deleted)
     }
 
     #[cfg(feature = "ext-fts5")]
-    fn execute_fts5_magic_delete_insert(
+    async fn execute_fts5_magic_delete_insert(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         params: Option<&[SqliteValue]>,
@@ -33112,7 +34039,7 @@ impl Connection {
         let [row_exprs] = rows.as_slice() else {
             return Ok(None);
         };
-        let source_values = self.evaluate_insert_source_row(row_exprs, params)?;
+        let source_values = self.evaluate_insert_source_row(row_exprs, params).await?;
         let Some(SqliteValue::Text(command)) = source_values.first() else {
             return Ok(None);
         };
@@ -33132,7 +34059,9 @@ impl Connection {
                 expected: "non-NULL FTS5 delete rowid".to_owned(),
                 actual: "null".to_owned(),
             })?;
-        let affected = self.execute_live_vtab_delete_rowids(&insert.table.name, &[rowid])?;
+        let affected = self
+            .execute_live_vtab_delete_rowids(&insert.table.name, &[rowid])
+            .await?;
         Ok(Some(affected))
     }
 
@@ -33153,7 +34082,7 @@ impl Connection {
     }
 
     #[cfg(feature = "ext-fts5")]
-    fn execute_fts5_maintenance_insert(
+    async fn execute_fts5_maintenance_insert(
         &self,
         insert: &fsqlite_ast::InsertStatement,
     ) -> Result<bool> {
@@ -33174,7 +34103,8 @@ impl Connection {
                     .is_some_and(Fts5Table::is_lazy_on_disk)
             };
             if is_lazy {
-                self.promote_lazy_fts5_table(insert.table.name.as_str())?;
+                self.promote_lazy_fts5_table(insert.table.name.as_str())
+                    .await?;
             }
         }
 
@@ -33198,7 +34128,8 @@ impl Connection {
                     }
                 }
                 drop(instances);
-                self.persist_rootpage_zero_fts5_shadow_rows(&insert.table.name)?;
+                self.persist_rootpage_zero_fts5_shadow_rows(&insert.table.name)
+                        .await?;
             }
         }
 
@@ -33207,14 +34138,14 @@ impl Connection {
     }
 
     #[cfg(not(feature = "ext-fts5"))]
-    fn execute_fts5_maintenance_insert(
+    async fn execute_fts5_maintenance_insert(
         &self,
         _insert: &fsqlite_ast::InsertStatement,
     ) -> Result<bool> {
         Ok(false)
     }
 
-    fn persist_materialized_live_vtab_rows(
+    async fn persist_materialized_live_vtab_rows(
         &self,
         table_name: &str,
         rows: &[LiveVtabInsertRow],
@@ -33250,8 +34181,8 @@ impl Connection {
         // `PRAGMA fsqlite.vectorized_makerecord = OFF`.
         let use_vectorized = self.vectorized_makerecord_enabled.get();
 
-        self.with_pager_write_txn(|cx, txn| {
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+        self.with_pager_write_txn(async |cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
 
             if use_vectorized {
                 // Pass 0: materialize the patched values (we need to own the
@@ -33273,12 +34204,12 @@ impl Connection {
                 encode_batch(&row_refs, &mut encoded, &mut offsets)?;
 
                 for (i, rowid) in inserted_rowids.iter().copied().enumerate() {
-                    if cursor.table_move_to(cx, rowid)?.is_found() {
-                        cursor.delete(cx)?;
+                    if cursor.table_move_to(cx, rowid).await?.is_found() {
+                        cursor.delete(cx).await?;
                     }
                     let start = offsets[i];
                     let end = offsets.get(i + 1).copied().unwrap_or(encoded.len());
-                    cursor.table_insert(cx, rowid, &encoded[start..end])?;
+                    cursor.table_insert(cx, rowid, &encoded[start..end]).await?;
                 }
             } else {
                 for (row, rowid) in rows.iter().zip(inserted_rowids.iter().copied()) {
@@ -33288,19 +34219,20 @@ impl Connection {
                     {
                         persisted_values[0] = SqliteValue::Integer(rowid);
                     }
-                    if cursor.table_move_to(cx, rowid)?.is_found() {
-                        cursor.delete(cx)?;
+                    if cursor.table_move_to(cx, rowid).await?.is_found() {
+                        cursor.delete(cx).await?;
                     }
                     let record = serialize_record(&persisted_values);
-                    cursor.table_insert(cx, rowid, &record)?;
+                    cursor.table_insert(cx, rowid, &record).await?;
                 }
             }
             Ok(())
         })
+        .await
     }
 
     #[cfg(feature = "ext-fts5")]
-    fn persist_rootpage_zero_fts5_shadow_rows(&self, table_name: &str) -> Result<bool> {
+    async fn persist_rootpage_zero_fts5_shadow_rows(&self, table_name: &str) -> Result<bool> {
         let root_page = {
             let schema = self.schema.borrow();
             schema
@@ -33341,7 +34273,8 @@ impl Connection {
                     ],
                 )
             }),
-        )?;
+        )
+        .await?;
 
         self.replace_storage_table_rows(
             &format!("{table_name}_idx"),
@@ -33355,7 +34288,8 @@ impl Connection {
                     ],
                 )
             }),
-        )?;
+        )
+        .await?;
 
         self.replace_storage_table_rows(
             &format!("{table_name}_config"),
@@ -33369,7 +34303,8 @@ impl Connection {
                         vec![SqliteValue::Text(row.key.into()), row.value],
                     )
                 }),
-        )?;
+        )
+        .await?;
 
         let content_name = format!("{table_name}_content");
         if self.schema_table_exists(&content_name) {
@@ -33385,7 +34320,8 @@ impl Connection {
                     );
                     (row.rowid, values)
                 }),
-            )?;
+            )
+            .await?;
         }
 
         let docsize_name = format!("{table_name}_docsize");
@@ -33402,14 +34338,15 @@ impl Connection {
                         ],
                     )
                 }),
-            )?;
+            )
+            .await?;
         }
 
         Ok(true)
     }
 
     #[cfg(feature = "ext-fts5")]
-    fn persist_rootpage_zero_fts5_insert_rows(
+    async fn persist_rootpage_zero_fts5_insert_rows(
         &self,
         table_name: &str,
         rows: &[LiveVtabInsertRow],
@@ -33426,15 +34363,18 @@ impl Connection {
             return Ok(false);
         };
         if !layout.has_internal_content_shadow {
-            return self.persist_rootpage_zero_fts5_contentless_incremental_insert(
-                table_name,
-                rows,
-                inserted_rowids,
-                layout.column_count,
-            );
+            return self
+                .persist_rootpage_zero_fts5_contentless_incremental_insert(
+                    table_name,
+                    rows,
+                    inserted_rowids,
+                    layout.column_count,
+                )
+                .await;
         }
 
-        self.reset_rootpage_zero_fts5_segment_metadata(table_name, layout.column_count)?;
+        self.reset_rootpage_zero_fts5_segment_metadata(table_name, layout.column_count)
+            .await?;
 
         let content_name = format!("{table_name}_content");
         if self.schema_table_exists(&content_name) {
@@ -33453,7 +34393,8 @@ impl Connection {
                         );
                         (rowid, values)
                     }),
-            )?;
+            )
+            .await?;
         }
 
         let docsize_name = format!("{table_name}_docsize");
@@ -33497,7 +34438,8 @@ impl Connection {
                             ],
                         )
                     }),
-            )?;
+            )
+            .await?;
         }
 
         Ok(true)
@@ -33520,7 +34462,7 @@ impl Connection {
     /// insert, or runs of empty/all-unindexed rows), it falls back to the full
     /// encode, which also lays down the `_config`/`_idx`/`_docsize` shadows.
     #[cfg(feature = "ext-fts5")]
-    fn persist_rootpage_zero_fts5_contentless_incremental_insert(
+    async fn persist_rootpage_zero_fts5_contentless_incremental_insert(
         &self,
         table_name: &str,
         rows: &[LiveVtabInsertRow],
@@ -33530,37 +34472,45 @@ impl Connection {
         // The incremental append needs an existing `_data` shadow to read the
         // current structure from; without one, fall back to the full encode.
         if !self.schema_table_exists(&format!("{table_name}_data")) {
-            return self.persist_rootpage_zero_fts5_shadow_rows(table_name);
+            return self
+                .persist_rootpage_zero_fts5_shadow_rows(table_name)
+                .await;
         }
 
         // Point-read the current on-disk structure + averages. `with_lazy_fts5_reader`
         // reuses the active write txn when one is open, so these reflect this
         // connection's own prior appends within the same transaction
         // (read-your-writes), keeping `next_segid` collision-free.
-        let (structure, averages) = self.with_lazy_fts5_reader(table_name, |reader| {
-            let structure = match reader.read_data_block(FTS5_STRUCTURE_ROWID)? {
-                Some(block) => Some(Fts5StructureRecord::decode(&block)?),
-                None => None,
-            };
-            let averages = match reader.read_data_block(FTS5_AVERAGES_ROWID)? {
-                Some(block) => Some(Fts5AveragesRecord::decode(&block, column_count)?),
-                None => None,
-            };
-            Ok((structure, averages))
-        })?;
+        let (structure, averages) = self
+            .with_lazy_fts5_reader(table_name, async |reader| {
+                let structure = match reader.read_data_block(FTS5_STRUCTURE_ROWID).await? {
+                    Some(block) => Some(Fts5StructureRecord::decode(&block)?),
+                    None => None,
+                };
+                let averages = match reader.read_data_block(FTS5_AVERAGES_ROWID).await? {
+                    Some(block) => Some(Fts5AveragesRecord::decode(&block, column_count)?),
+                    None => None,
+                };
+                Ok((structure, averages))
+            })
+            .await?;
 
         // No persisted segment yet (fresh table, or only empty rows so far):
         // the full encode lays down the first segment plus the config/idx/docsize
         // shadows. Once a segment exists, every later INSERT appends incrementally.
         let Some(structure) = structure.filter(|s| s.segment_count() > 0) else {
-            return self.persist_rootpage_zero_fts5_shadow_rows(table_name);
+            return self
+                .persist_rootpage_zero_fts5_shadow_rows(table_name)
+                .await;
         };
         // Segments imply at least one tokenised document, so the full encode
         // always wrote a (non-empty) averages row alongside them. If it is
         // somehow missing, the `_data` shadow is inconsistent: rebuild from the
         // in-memory index rather than appending onto undercounted corpus stats.
         let Some(averages) = averages else {
-            return self.persist_rootpage_zero_fts5_shadow_rows(table_name);
+            return self
+                .persist_rootpage_zero_fts5_shadow_rows(table_name)
+                .await;
         };
         let next_segid = structure
             .levels
@@ -33609,7 +34559,8 @@ impl Connection {
                 ],
             ));
         }
-        self.upsert_storage_table_rows(&format!("{table_name}_data"), data_rows)?;
+        self.upsert_storage_table_rows(&format!("{table_name}_data"), data_rows)
+            .await?;
 
         // Append the new documents' docsize rows (read back on reopen for BM25).
         let docsize_name = format!("{table_name}_docsize");
@@ -33626,7 +34577,8 @@ impl Connection {
                         ],
                     )
                 }),
-            )?;
+            )
+            .await?;
         }
 
         tracing::debug!(
@@ -33639,7 +34591,7 @@ impl Connection {
     }
 
     #[cfg(feature = "ext-fts5")]
-    fn persist_rootpage_zero_fts5_deleted_rowids(
+    async fn persist_rootpage_zero_fts5_deleted_rowids(
         &self,
         table_name: &str,
         rowids: &[i64],
@@ -33648,18 +34600,23 @@ impl Connection {
             return Ok(false);
         };
         if !layout.has_internal_content_shadow {
-            return self.persist_rootpage_zero_fts5_shadow_rows(table_name);
+            return self
+                .persist_rootpage_zero_fts5_shadow_rows(table_name)
+                .await;
         }
 
-        self.reset_rootpage_zero_fts5_segment_metadata(table_name, layout.column_count)?;
+        self.reset_rootpage_zero_fts5_segment_metadata(table_name, layout.column_count)
+            .await?;
 
         let content_name = format!("{table_name}_content");
         if self.schema_table_exists(&content_name) {
-            self.delete_storage_table_rowids(&content_name, rowids)?;
+            self.delete_storage_table_rowids(&content_name, rowids)
+                .await?;
         }
         let docsize_name = format!("{table_name}_docsize");
         if self.schema_table_exists(&docsize_name) {
-            self.delete_storage_table_rowids(&docsize_name, rowids)?;
+            self.delete_storage_table_rowids(&docsize_name, rowids)
+                .await?;
         }
         Ok(true)
     }
@@ -33720,7 +34677,7 @@ impl Connection {
     }
 
     #[cfg(feature = "ext-fts5")]
-    fn reset_rootpage_zero_fts5_segment_metadata(
+    async fn reset_rootpage_zero_fts5_segment_metadata(
         &self,
         table_name: &str,
         column_count: usize,
@@ -33728,11 +34685,13 @@ impl Connection {
         self.replace_storage_table_rows(
             &format!("{table_name}_data"),
             empty_fts5_data_storage_rows(column_count),
-        )?;
+        )
+        .await?;
         self.replace_storage_table_rows(
             &format!("{table_name}_idx"),
             std::iter::empty::<(i64, Vec<SqliteValue>)>(),
         )
+        .await
     }
 
     #[cfg(feature = "ext-fts5")]
@@ -33753,7 +34712,7 @@ impl Connection {
     }
 
     #[cfg(feature = "ext-fts5")]
-    fn replace_storage_table_rows<I>(&self, table_name: &str, rows: I) -> Result<()>
+    async fn replace_storage_table_rows<I>(&self, table_name: &str, rows: I) -> Result<()>
     where
         I: IntoIterator<Item = (i64, Vec<SqliteValue>)>,
     {
@@ -33768,7 +34727,7 @@ impl Connection {
         let root = page_number_from_schema_root(root_page, table_name, "table")?;
         let rows = rows.into_iter().collect::<Vec<_>>();
 
-        self.with_pager_write_txn(|cx, txn| {
+        self.with_pager_write_txn(async |cx, txn| {
             // A stock-SQLite-created FTS5 store persists the `%_idx` (and
             // `%_config`) shadows as `WITHOUT ROWID` tables — index-structured
             // b-trees, not rowid tables. They MUST be opened as *index* cursors
@@ -33782,7 +34741,8 @@ impl Connection {
             // FrankenSQLite-created FTS5 stores model these same shadows as
             // rowid tables (`without_rowid == false`), so they keep the table
             // path unchanged.
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, !without_rowid)?;
+            let mut cursor =
+                Self::new_pager_btree_cursor(cx, txn, root, !without_rowid).await?;
             if without_rowid {
                 // Clear every existing key (the leftmost entry shrinks the tree
                 // by one each iteration), then re-insert the full-record keys.
@@ -33791,35 +34751,36 @@ impl Connection {
                 // (segid, term, pgno PRIMARY KEY(segid, term)) and `%_config`
                 // (k PRIMARY KEY, v) the supplied column order already matches,
                 // and the synthetic rowid the caller supplies is irrelevant.
-                while cursor.first(cx)? {
-                    cursor.delete(cx)?;
+                while cursor.first(cx).await? {
+                    cursor.delete(cx).await?;
                 }
                 for (_synthetic_rowid, values) in rows {
                     let record = serialize_record(&values);
-                    cursor.index_insert(cx, &record)?;
+                    cursor.index_insert(cx, &record).await?;
                 }
                 return Ok(());
             }
             let mut existing_rowids = Vec::new();
-            if cursor.first(cx)? {
+            if cursor.first(cx).await? {
                 loop {
-                    existing_rowids.push(cursor.rowid(cx)?);
-                    if !cursor.next(cx)? {
+                    existing_rowids.push(cursor.rowid(cx).await?);
+                    if !cursor.next(cx).await? {
                         break;
                     }
                 }
             }
             for rowid in existing_rowids {
-                if cursor.table_move_to(cx, rowid)?.is_found() {
-                    cursor.delete(cx)?;
+                if cursor.table_move_to(cx, rowid).await?.is_found() {
+                    cursor.delete(cx).await?;
                 }
             }
             for (rowid, values) in rows {
                 let record = serialize_record(&values);
-                cursor.table_insert(cx, rowid, &record)?;
+                cursor.table_insert(cx, rowid, &record).await?;
             }
             Ok(())
         })
+        .await
     }
 
     /// Physically rewrite every row of `table_name`, deleting the record slot at
@@ -33834,7 +34795,7 @@ impl Connection {
     /// Records narrower than `removed_slot` (columns added via ALTER ADD COLUMN
     /// that were never physically materialized) are left untouched — the slot
     /// they would occupy does not exist on disk.
-    fn rewrite_table_records_remove_slot(
+    async fn rewrite_table_records_remove_slot(
         &self,
         table_name: &str,
         removed_slot: usize,
@@ -33869,16 +34830,17 @@ impl Connection {
             )));
         }
         let root = page_number_from_schema_root(root_page, table_name, "table")?;
-        self.with_pager_write_txn(|cx, txn| {
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, !without_rowid)?;
+        self.with_pager_write_txn(async |cx, txn| {
+            let mut cursor =
+                Self::new_pager_btree_cursor(cx, txn, root, !without_rowid).await?;
             if without_rowid {
                 // WITHOUT ROWID tables are index b-trees whose full records are
                 // keys. Collect the rewritten keys, clear the old keys, then
                 // insert the new records through the index-cursor API.
                 let mut rewritten = Vec::new();
-                if cursor.first(cx)? {
+                if cursor.first(cx).await? {
                     loop {
-                        let payload = cursor.payload(cx)?;
+                        let payload = cursor.payload(cx).await?;
                         let mut values = parse_record(&payload).ok_or_else(|| {
                             FrankenError::DatabaseCorrupt {
                                 detail: format!(
@@ -33890,26 +34852,26 @@ impl Connection {
                             values.remove(removed_slot);
                         }
                         rewritten.push(serialize_record(&values));
-                        if !cursor.next(cx)? {
+                        if !cursor.next(cx).await? {
                             break;
                         }
                     }
                 }
-                while cursor.first(cx)? {
-                    cursor.delete(cx)?;
+                while cursor.first(cx).await? {
+                    cursor.delete(cx).await?;
                 }
                 for record in rewritten {
-                    cursor.index_insert(cx, &record)?;
+                    cursor.index_insert(cx, &record).await?;
                 }
                 return Ok(());
             }
             // Collect (rowid, rewritten record) first, then delete+reinsert so we
             // never mutate the tree while iterating it.
             let mut rewritten: Vec<(i64, Vec<u8>)> = Vec::new();
-            if cursor.first(cx)? {
+            if cursor.first(cx).await? {
                 loop {
-                    let rowid = cursor.rowid(cx)?;
-                    let payload = cursor.payload(cx)?;
+                    let rowid = cursor.rowid(cx).await?;
+                    let payload = cursor.payload(cx).await?;
                     let mut values =
                         parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
                             detail: format!(
@@ -33920,25 +34882,26 @@ impl Connection {
                         values.remove(removed_slot);
                     }
                     rewritten.push((rowid, serialize_record(&values)));
-                    if !cursor.next(cx)? {
+                    if !cursor.next(cx).await? {
                         break;
                     }
                 }
             }
             for (rowid, _) in &rewritten {
-                if cursor.table_move_to(cx, *rowid)?.is_found() {
-                    cursor.delete(cx)?;
+                if cursor.table_move_to(cx, *rowid).await?.is_found() {
+                    cursor.delete(cx).await?;
                 }
             }
             for (rowid, record) in &rewritten {
-                cursor.table_insert(cx, *rowid, record)?;
+                cursor.table_insert(cx, *rowid, record).await?;
             }
             Ok(())
         })
+        .await
     }
 
     #[cfg(feature = "ext-fts5")]
-    fn upsert_storage_table_rows<I>(&self, table_name: &str, rows: I) -> Result<()>
+    async fn upsert_storage_table_rows<I>(&self, table_name: &str, rows: I) -> Result<()>
     where
         I: IntoIterator<Item = (i64, Vec<SqliteValue>)>,
     {
@@ -33953,21 +34916,22 @@ impl Connection {
         let root = page_number_from_schema_root(root_page, table_name, "table")?;
         let rows = rows.into_iter().collect::<Vec<_>>();
 
-        self.with_pager_write_txn(|cx, txn| {
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+        self.with_pager_write_txn(async |cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
             for (rowid, values) in rows {
-                if cursor.table_move_to(cx, rowid)?.is_found() {
-                    cursor.delete(cx)?;
+                if cursor.table_move_to(cx, rowid).await?.is_found() {
+                    cursor.delete(cx).await?;
                 }
                 let record = serialize_record(&values);
-                cursor.table_insert(cx, rowid, &record)?;
+                cursor.table_insert(cx, rowid, &record).await?;
             }
             Ok(())
         })
+        .await
     }
 
     #[cfg(feature = "ext-fts5")]
-    fn delete_storage_table_rowids(&self, table_name: &str, rowids: &[i64]) -> Result<()> {
+    async fn delete_storage_table_rowids(&self, table_name: &str, rowids: &[i64]) -> Result<()> {
         let root_page = {
             let schema = self.schema.borrow();
             schema
@@ -33978,19 +34942,20 @@ impl Connection {
         };
         let root = page_number_from_schema_root(root_page, table_name, "table")?;
 
-        self.with_pager_write_txn(|cx, txn| {
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+        self.with_pager_write_txn(async |cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
             for rowid in rowids {
-                if cursor.table_move_to(cx, *rowid)?.is_found() {
-                    cursor.delete(cx)?;
+                if cursor.table_move_to(cx, *rowid).await?.is_found() {
+                    cursor.delete(cx).await?;
                 }
             }
             Ok(())
         })
+        .await
     }
 
     #[cfg(feature = "ext-fts5")]
-    fn create_rootpage_zero_fts5_virtual_table(
+    async fn create_rootpage_zero_fts5_virtual_table(
         &self,
         table_name: &str,
         col_infos: Vec<ColumnInfo>,
@@ -34021,10 +34986,13 @@ impl Connection {
             )));
         }
         self.note_live_vtab_created(table_name);
-        self.insert_sqlite_master_row("table", table_name, table_name, 0, create_sql)?;
-        self.create_fts5_shadow_tables(table_name, args, &col_infos)?;
-        self.persist_rootpage_zero_fts5_shadow_rows(table_name)?;
-        self.increment_schema_cookie()?;
+        self.insert_sqlite_master_row("table", table_name, table_name, 0, create_sql)
+            .await?;
+        self.create_fts5_shadow_tables(table_name, args, &col_infos)
+            .await?;
+        self.persist_rootpage_zero_fts5_shadow_rows(table_name)
+            .await?;
+        self.increment_schema_cookie().await?;
         Ok(())
     }
 
@@ -34045,20 +35013,20 @@ impl Connection {
     }
 
     #[cfg(feature = "ext-fts5")]
-    fn create_fts5_shadow_tables(
+    async fn create_fts5_shadow_tables(
         &self,
         table_name: &str,
         args: &[String],
         fts_columns: &[ColumnInfo],
     ) -> Result<()> {
         for table in fts5_shadow_table_defs(table_name, args, fts_columns) {
-            self.create_fts5_shadow_table(table)?;
+            self.create_fts5_shadow_table(table).await?;
         }
         Ok(())
     }
 
     #[cfg(feature = "ext-fts5")]
-    fn create_fts5_shadow_table(&self, table: Fts5ShadowTableDef) -> Result<()> {
+    async fn create_fts5_shadow_table(&self, table: Fts5ShadowTableDef) -> Result<()> {
         let create = match parse_single_statement(&table.create_sql)? {
             Statement::CreateTable(create) => create,
             _ => {
@@ -34079,7 +35047,7 @@ impl Connection {
         // Besides keeping the parser/schema/catalog representations identical,
         // this is what makes `%_idx` and `%_config` real WITHOUT ROWID b-trees
         // with owned roots and primary-key metadata, exactly like stock SQLite.
-        self.execute_create_table(&create)
+        self.execute_create_table(&create).await
     }
 
     #[allow(clippy::unused_self)]
@@ -34179,17 +35147,28 @@ impl Connection {
         self.column_default_eval_depth.get() > 0
     }
 
-    fn evaluate_default_row_from_sqls(
+    async fn evaluate_default_row_from_sqls(
         &self,
         default_sqls: &[Option<String>],
     ) -> Result<Vec<SqliteValue>> {
-        default_sqls
-            .iter()
-            .map(|default_sql| self.evaluate_column_default_value(default_sql.as_deref()))
-            .collect()
+        let mut values = Vec::with_capacity(default_sqls.len());
+        for default_sql in default_sqls {
+            values.push(
+                self.evaluate_column_default_value(default_sql.as_deref())
+                    .await?,
+            );
+        }
+        Ok(values)
     }
 
-    fn evaluate_column_default_value(&self, default_sql: Option<&str>) -> Result<SqliteValue> {
+    // Evaluating a DEFAULT expression re-enters statement execution, which can
+    // reach this evaluator again, so the future is boxed to break the recursive
+    // type.
+    fn evaluate_column_default_value<'a>(
+        &'a self,
+        default_sql: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<SqliteValue>> + 'a>> {
+        Box::pin(async move {
         let Some(default_sql) = default_sql else {
             return Ok(SqliteValue::Null);
         };
@@ -34234,6 +35213,7 @@ impl Connection {
                     let empty_col_map = [];
                     return self
                         .eval_expr_with_subqueries(expr, &empty_row, &empty_col_map, None)
+                        .await
                         .map_err(|error| {
                             FrankenError::Internal(format!(
                                 "failed to evaluate DEFAULT expression `{trimmed}`: {error}"
@@ -34243,6 +35223,7 @@ impl Connection {
 
                 let rows = self
                     .execute_fromless_aggregate(select, None)
+                    .await
                     .map_err(|error| {
                         FrankenError::Internal(format!(
                             "failed to evaluate DEFAULT expression `{trimmed}`: {error}"
@@ -34262,7 +35243,7 @@ impl Connection {
         }
 
         let _guard = self.suppress_column_default_runtime_inputs();
-        let rows = self.execute_statement(&statement, None).map_err(|error| {
+        let rows = self.execute_statement(&statement, None).await.map_err(|error| {
             FrankenError::Internal(format!(
                 "failed to evaluate DEFAULT expression `{trimmed}`: {error}"
             ))
@@ -34273,20 +35254,23 @@ impl Connection {
             .and_then(|row| row.values().first())
             .cloned()
             .unwrap_or(SqliteValue::Null))
+        })
     }
 
-    fn collect_update_trigger_rows(
+    async fn collect_update_trigger_rows(
         &self,
         update: &fsqlite_ast::UpdateStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<(Vec<SqliteValue>, Vec<SqliteValue>)>> {
-        let matched_rows = self.select_matching_rows(
-            &update.table,
-            update.where_clause.as_ref(),
-            &[],
-            None,
-            params,
-        )?;
+        let matched_rows = self
+            .select_matching_rows(
+                &update.table,
+                update.where_clause.as_ref(),
+                &[],
+                None,
+                params,
+            )
+            .await?;
         if matched_rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -34399,18 +35383,20 @@ impl Connection {
         Ok(trigger_rows)
     }
 
-    fn collect_delete_trigger_rows(
+    async fn collect_delete_trigger_rows(
         &self,
         delete: &fsqlite_ast::DeleteStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Vec<SqliteValue>>> {
-        let matched_rows = self.select_matching_rows(
-            &delete.table,
-            delete.where_clause.as_ref(),
-            &[],
-            None,
-            params,
-        )?;
+        let matched_rows = self
+            .select_matching_rows(
+                &delete.table,
+                delete.where_clause.as_ref(),
+                &[],
+                None,
+                params,
+            )
+            .await?;
         Ok(matched_rows
             .into_iter()
             .map(|row| row.values().to_vec())
@@ -35101,7 +36087,7 @@ impl Connection {
             .write_pressure_frames_per_sec
     }
 
-    fn checkpoint_runtime_snapshot(&self) -> CheckpointRuntimeSnapshot {
+    async fn checkpoint_runtime_snapshot(&self) -> CheckpointRuntimeSnapshot {
         let wal_metrics = fsqlite_wal::GLOBAL_WAL_METRICS.snapshot();
         let local_active_txn_count = u64::from(
             self.txn_lifecycle_metrics
@@ -35117,7 +36103,10 @@ impl Connection {
             u64::try_from(raw).unwrap_or(u64::MAX)
         };
         #[allow(clippy::cast_possible_truncation)]
-        let wal_frames_estimate = self.pager.wal_frame_count() as u64;
+        let wal_frames_estimate = match self.op_cx() {
+            Ok(cx) => self.pager.wal_frame_count(&cx).await as u64,
+            Err(_) => 0,
+        };
 
         let now = Instant::now();
         let mut state = self.checkpoint_advisor_state.borrow_mut();
@@ -35197,8 +36186,8 @@ impl Connection {
     }
 
     #[cfg(feature = "diagnostic-pragmas")]
-    fn checkpoint_stats_rows(&self) -> Vec<Row> {
-        let snapshot = self.checkpoint_runtime_snapshot();
+    async fn checkpoint_stats_rows(&self) -> Vec<Row> {
+        let snapshot = self.checkpoint_runtime_snapshot().await;
         let to_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
         let last_mode = snapshot
             .last_checkpoint_mode
@@ -35331,8 +36320,8 @@ impl Connection {
     }
 
     #[cfg(feature = "diagnostic-pragmas")]
-    fn checkpoint_advisor_rows(&self) -> Vec<Row> {
-        let snapshot = self.checkpoint_runtime_snapshot();
+    async fn checkpoint_advisor_rows(&self) -> Vec<Row> {
+        let snapshot = self.checkpoint_runtime_snapshot().await;
         let to_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
         let mut rows = Vec::new();
         let mut push_row =
@@ -35537,7 +36526,7 @@ impl Connection {
         }
     }
 
-    fn maybe_run_adaptive_autocheckpoint(&self) {
+    async fn maybe_run_adaptive_autocheckpoint(&self) {
         if self.pager.journal_mode() != JournalMode::Wal {
             return;
         }
@@ -35558,7 +36547,7 @@ impl Connection {
             return;
         }
 
-        let snapshot = self.checkpoint_runtime_snapshot();
+        let snapshot = self.checkpoint_runtime_snapshot().await;
         if snapshot.wal_autocheckpoint_pages == 0 {
             return;
         }
@@ -35590,7 +36579,7 @@ impl Connection {
             Err(_) => return,
         };
         let checkpoint_metrics_before = fsqlite_wal::GLOBAL_WAL_METRICS.snapshot();
-        let result = match self.pager.checkpoint(&cx, mode) {
+        let result = match self.pager.checkpoint(&cx, mode).await {
             Ok(result) => result,
             Err(FrankenError::Busy) => {
                 tracing::debug!(
@@ -35658,7 +36647,7 @@ impl Connection {
     /// inside an explicit `BEGIN`, an implicit (autocommit) transaction is
     /// created.  Returns `true` when an implicit transaction was started
     /// (the caller must later call [`resolve_autocommit_txn`]).
-    fn ensure_autocommit_txn(&self) -> Result<bool> {
+    async fn ensure_autocommit_txn(&self) -> Result<bool> {
         let mode = if *self.concurrent_mode_default.borrow() {
             TransactionMode::Concurrent
         } else {
@@ -35666,13 +36655,15 @@ impl Connection {
         };
         let cx = self.op_cx()?;
         self.ensure_autocommit_txn_mode_with_cx(mode, &cx, None)
+            .await
     }
 
-    fn ensure_autocommit_txn_with_cx(&self, cx: &Cx) -> Result<bool> {
+    async fn ensure_autocommit_txn_with_cx(&self, cx: &Cx) -> Result<bool> {
         self.ensure_autocommit_txn_with_publication_hint(cx, None)
+            .await
     }
 
-    fn ensure_autocommit_txn_with_publication_hint(
+    async fn ensure_autocommit_txn_with_publication_hint(
         &self,
         cx: &Cx,
         prebound_publication: Option<BoundPagerPublication>,
@@ -35683,18 +36674,20 @@ impl Connection {
             TransactionMode::Immediate
         };
         self.ensure_autocommit_txn_mode_with_cx(mode, cx, prebound_publication)
+            .await
     }
 
     /// Ensure a pager transaction is active, using the specified mode.
     /// Phase 5B.2 (bd-1yi8): reads also need pager transactions so
     /// they can see data written by prior write-through INSERTs.
     #[cfg_attr(not(test), allow(dead_code))]
-    fn ensure_autocommit_txn_mode(&self, mode: TransactionMode) -> Result<bool> {
+    async fn ensure_autocommit_txn_mode(&self, mode: TransactionMode) -> Result<bool> {
         let cx = self.op_cx()?;
         self.ensure_autocommit_txn_mode_with_cx(mode, &cx, None)
+            .await
     }
 
-    fn ensure_autocommit_txn_mode_with_cx(
+    async fn ensure_autocommit_txn_mode_with_cx(
         &self,
         mode: TransactionMode,
         cx: &Cx,
@@ -35717,7 +36710,7 @@ impl Connection {
             && self.cached_write_txn_cookie.get() == *self.schema_cookie.borrow()
         {
             // Invalidate any stale read snapshot first.
-            self.invalidate_cached_read_snapshot(cx);
+            self.invalidate_cached_read_snapshot(cx).await;
             let txn = self.cached_write_txn.borrow_mut().take().ok_or_else(|| {
                 FrankenError::Internal(
                     "cached write transaction missing despite reuse guard".to_string(),
@@ -35736,7 +36729,7 @@ impl Connection {
         }
 
         // Discard stale cached write transaction if present.
-        self.invalidate_cached_write_txn(cx);
+        self.invalidate_cached_write_txn(cx).await;
 
         // bd-otbu1 / I1: Retained autocommit transaction reuse for batched
         // writes. Unlike cached_write_txn which commits each statement, this
@@ -35746,7 +36739,7 @@ impl Connection {
             && self.retained_autocommit_txn.borrow().is_some()
         {
             // Invalidate any stale read snapshot first.
-            self.invalidate_cached_read_snapshot(cx);
+            self.invalidate_cached_read_snapshot(cx).await;
             let txn = self
                 .retained_autocommit_txn
                 .borrow_mut()
@@ -35772,7 +36765,7 @@ impl Connection {
         // Discard stale retained autocommit transaction if present but not reusable.
         if self.retained_autocommit_txn.borrow().is_some() {
             // Flush rather than discard to preserve uncommitted writes.
-            if let Err(error) = self.flush_retained_autocommit_txn(cx) {
+            if let Err(error) = self.flush_retained_autocommit_txn(cx).await {
                 record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
                 return Err(error);
             }
@@ -35815,7 +36808,7 @@ impl Connection {
         }
 
         // Discard stale cached snapshot if present (mode mismatch or schema change).
-        self.invalidate_cached_read_snapshot(cx);
+        self.invalidate_cached_read_snapshot(cx).await;
 
         // Fast path for isolated :memory: autocommit transactions: these
         // connections cannot observe external commits, so they do not need the
@@ -35839,8 +36832,9 @@ impl Connection {
             } else {
                 mode
             };
-            let txn =
-                self.begin_pager_txn_with_busy_timeout(&self.pager, cx, effective_mode, false)?;
+            let txn = self
+                .begin_pager_txn_with_busy_timeout(&self.pager, cx, effective_mode, false)
+                .await?;
             let concurrent_session: Option<u64> = None;
             *self.active_txn.borrow_mut() = Some(txn);
             *self.concurrent_session_id.borrow_mut() = concurrent_session;
@@ -35865,7 +36859,10 @@ impl Connection {
             let publication = if let Some(publication) = prebound_publication {
                 publication
             } else {
-                match self.refresh_memdb_if_stale_with_publication(cx, "autocommit_begin") {
+                match self
+                    .refresh_memdb_if_stale_with_publication(cx, "autocommit_begin")
+                    .await
+                {
                     Ok(publication) => publication,
                     Err(error) => {
                         record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
@@ -35881,8 +36878,10 @@ impl Connection {
         } else {
             None
         };
-        let mut txn =
-            match self.begin_pager_txn_with_busy_timeout(&self.pager, cx, mode, is_concurrent) {
+        let mut txn = match self
+            .begin_pager_txn_with_busy_timeout(&self.pager, cx, mode, is_concurrent)
+            .await
+        {
                 Ok(txn) => txn,
                 Err(error) => {
                     record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
@@ -35896,8 +36895,9 @@ impl Connection {
                 snapshot,
                 self.should_eagerly_hydrate_memdb_rows(),
             )
+            .await
         {
-            let _ = txn.rollback(cx);
+            let _ = txn.rollback(cx).await;
             record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
             return Err(error);
         }
@@ -35911,8 +36911,9 @@ impl Connection {
                 self.should_eagerly_hydrate_memdb_rows(),
                 false,
             )
+            .await
         {
-            let _ = txn.rollback(cx);
+            let _ = txn.rollback(cx).await;
             record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
             return Err(error);
         }
@@ -35922,7 +36923,7 @@ impl Connection {
             match begin_result {
                 Ok(session_id) => Some(session_id),
                 Err(error) => {
-                    let _ = txn.rollback(cx);
+                    let _ = txn.rollback(cx).await;
                     record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
                     return Err(match error {
                         MvccError::Busy => FrankenError::Busy,
@@ -35959,20 +36960,20 @@ impl Connection {
     }
 
     /// Discard the cached read-only pager snapshot, rolling it back properly.
-    fn invalidate_cached_read_snapshot(&self, cx: &Cx) {
+    async fn invalidate_cached_read_snapshot(&self, cx: &Cx) {
         if let Some(mut txn) = self.cached_read_snapshot.borrow_mut().take() {
-            let _ = txn.rollback(cx);
+            let _ = txn.rollback(cx).await;
         }
         self.cached_read_snapshot_commit_epoch.set(0);
     }
 
     /// Discard the cached write transaction, committing it properly.
-    fn invalidate_cached_write_txn(&self, cx: &Cx) {
+    async fn invalidate_cached_write_txn(&self, cx: &Cx) {
         let invalidated_cached_writer =
             if let Some(mut txn) = self.cached_write_txn.borrow_mut().take() {
                 // The retained transaction has already committed its write-set.
                 // We need to finalize it properly (release writer state in pager).
-                let _ = txn.commit(cx);
+                let _ = txn.commit(cx).await;
                 true
             } else {
                 false
@@ -35987,7 +36988,7 @@ impl Connection {
 
     /// Flush the retained autocommit transaction: commit and clear state.
     /// Called when: adaptive threshold reached, read-after-write, error, connection close.
-    fn flush_retained_autocommit_txn(&self, cx: &Cx) -> Result<()> {
+    async fn flush_retained_autocommit_txn(&self, cx: &Cx) -> Result<()> {
         let Some(txn) = self.retained_autocommit_txn.borrow_mut().take() else {
             return Ok(());
         };
@@ -36003,7 +37004,7 @@ impl Connection {
         }
 
         *self.active_txn.borrow_mut() = Some(txn);
-        let pending_flush_result = self.flush_pending_direct_write_runs(cx);
+        let pending_flush_result = self.flush_pending_direct_write_runs(cx).await;
         let Some(mut txn) = self.active_txn.borrow_mut().take() else {
             return Err(FrankenError::internal(
                 "retained autocommit transaction disappeared during pending write flush",
@@ -36018,15 +37019,15 @@ impl Connection {
         // Commit the accumulated writes. If that fails, match the normal
         // autocommit cleanup path by explicitly rolling the pager txn back and
         // restoring the MemDatabase mirror before we clear connection state.
-        let commit_result = match txn.commit(cx) {
+        let commit_result = match txn.commit(cx).await {
             Ok(()) => Ok(()),
             Err(commit_error) => {
-                let rollback_result = txn.rollback(cx);
+                let rollback_result = txn.rollback(cx).await;
                 let rollback_succeeded = rollback_result.is_ok();
                 match rollback_result {
                     Ok(()) => {
                         let reload_result = if txn_had_pending_writes && rollback_succeeded {
-                            self.reload_memdb_from_pager(cx)
+                            self.reload_memdb_from_pager(cx).await
                         } else {
                             Ok(())
                         };
@@ -36052,7 +37053,9 @@ impl Connection {
         // Advance commit clock if commit succeeded.
         if commit_result.is_ok() {
             if !self.pager.is_memory() && self.pager.journal_mode() == JournalMode::Wal {
-                self.pager.checkpoint(cx, CheckpointMode::Passive)?;
+                self.pager
+                    .checkpoint(cx, CheckpointMode::Passive)
+                    .await?;
             }
             let committed_seq = self.advance_commit_clock_without_memdb_visibility();
             self.finish_commit_clock(committed_seq);
@@ -36065,7 +37068,7 @@ impl Connection {
 
     /// Flush retained autocommit transaction due to read-after-write.
     /// Called before SELECT when dirty tables overlap with tables being read.
-    fn flush_retained_autocommit_txn_for_read(&self, cx: &Cx) -> Result<()> {
+    async fn flush_retained_autocommit_txn_for_read(&self, cx: &Cx) -> Result<()> {
         if self.retained_autocommit_txn.borrow().is_none() {
             return Ok(());
         }
@@ -36073,11 +37076,11 @@ impl Connection {
             FSQLITE_RETAINED_AUTOCOMMIT_READ_AFTER_WRITE_FLUSHES
                 .fetch_add(1, AtomicOrdering::Relaxed);
         }
-        self.flush_retained_autocommit_txn(cx)?;
+        self.flush_retained_autocommit_txn(cx).await?;
         // A read is about to execute against this connection, so eagerly
         // realign the local execution image with the freshly committed pager
         // state instead of depending on a later begin-time staleness check.
-        self.reload_memdb_from_pager(cx)
+        self.reload_memdb_from_pager(cx).await
     }
 
     /// Check if any tables in the read set overlap with the retained dirty set.
@@ -36088,25 +37091,27 @@ impl Connection {
             .any(|t| dirty.contains(&t.to_lowercase()))
     }
 
-    fn finish_prepared_read_autocommit(
+    async fn finish_prepared_read_autocommit(
         &self,
         prepared_auto_read: bool,
         success: bool,
         cx: &Cx,
     ) -> Result<()> {
         if prepared_auto_read {
-            self.resolve_autocommit_txn_with_capture_and_cx(true, success, false, cx)?;
+            self.resolve_autocommit_txn_with_capture_and_cx(true, success, false, cx)
+                .await?;
         }
         Ok(())
     }
 
-    fn prepare_connection_for_prepared_read(
+    async fn prepare_connection_for_prepared_read(
         &self,
         stmt: &PreparedStatement<'_>,
         cx: &Cx,
     ) -> Result<bool> {
-        self.refresh_memdb_from_active_txn_if_dirty(cx)?;
-        self.refresh_memdb_from_cached_write_txn_if_stale(cx)?;
+        self.refresh_memdb_from_active_txn_if_dirty(cx).await?;
+        self.refresh_memdb_from_cached_write_txn_if_stale(cx)
+            .await?;
 
         if self.retained_autocommit_txn.borrow().is_some() {
             // bd-m1nte / I2: Track reads from prepared statements for adaptive threshold.
@@ -36139,7 +37144,7 @@ impl Connection {
                         flush_reason = "dirty_overlap_prepared_read",
                         read_shape,
                     );
-                    self.flush_retained_autocommit_txn_for_read(cx)?;
+                    self.flush_retained_autocommit_txn_for_read(cx).await?;
                 }
             }
         }
@@ -36154,11 +37159,12 @@ impl Connection {
                     cx,
                     "memdb_staleness_check",
                     true,
-                )?;
+                )
+                .await?;
             } else if !self.memdb_rows_loaded.get() {
-                self.reload_memdb_from_pager(cx)?;
+                self.reload_memdb_from_pager(cx).await?;
             } else {
-                self.refresh_memdb_if_stale(cx)?;
+                self.refresh_memdb_if_stale(cx).await?;
             }
         }
 
@@ -36166,6 +37172,7 @@ impl Connection {
         // snapshot after any retained-autocommit flush so prepared reads see
         // the same pager/memdb view as ad-hoc SELECT execution.
         self.ensure_autocommit_txn_mode_with_cx(TransactionMode::ReadOnly, cx, None)
+            .await
     }
 
     /// Mark a table as dirty in the retained autocommit batch.
@@ -36417,19 +37424,23 @@ impl Connection {
         self.clear_pending_direct_delete_leaf_run();
     }
 
-    fn flush_pending_direct_update_leaf_patch_run_with_cursor<P: PageReader + PageWriter>(
+    async fn flush_pending_direct_update_leaf_patch_run_with_cursor<
+        P: PageReader + PageWriter,
+    >(
         &self,
         cx: &Cx,
         cursor: &mut fsqlite_btree::BtCursor<P>,
         run: PendingDirectUpdateLeafPatchRun,
     ) -> Result<()> {
         if run.run.is_dirty() {
-            cursor.flush_table_leaf_payload_patch_run(cx, run.run)?;
+            cursor
+                .flush_table_leaf_payload_patch_run(cx, run.run)
+                .await?;
         }
         Ok(())
     }
 
-    fn flush_pending_direct_update_leaf_patch_run(&self, cx: &Cx) -> Result<()> {
+    async fn flush_pending_direct_update_leaf_patch_run(&self, cx: &Cx) -> Result<()> {
         if !self.pending_direct_update_leaf_patch_run_active.get() {
             return Ok(());
         }
@@ -36488,6 +37499,7 @@ impl Connection {
                         &mut cursor,
                         run,
                     )
+                    .await
                 };
                 match page_io.into_inner() {
                     Ok(txn_back) => {
@@ -36512,6 +37524,7 @@ impl Connection {
                     true,
                 );
                 self.flush_pending_direct_update_leaf_patch_run_with_cursor(cx, &mut cursor, run)
+                    .await
             } else {
                 Err(FrankenError::internal(
                     "pending direct update leaf patch-run missing active transaction",
@@ -36531,13 +37544,15 @@ impl Connection {
         result
     }
 
-    fn flush_pending_direct_delete_leaf_run_with_cursor<P: PageReader + PageWriter>(
+    async fn flush_pending_direct_delete_leaf_run_with_cursor<P: PageReader + PageWriter>(
         &self,
         cx: &Cx,
         cursor: &mut fsqlite_btree::BtCursor<P>,
         run: &mut PendingDirectDeleteLeafRun,
     ) -> Result<()> {
-        cursor.flush_table_leaf_delete_run_in_place(cx, &mut run.run)?;
+        cursor
+            .flush_table_leaf_delete_run_in_place(cx, &mut run.run)
+            .await?;
         Ok(())
     }
 
@@ -36575,7 +37590,7 @@ impl Connection {
         self.pending_direct_delete_leaf_run_active.set(has_pending);
     }
 
-    fn flush_pending_direct_delete_leaf_run(&self, cx: &Cx) -> Result<()> {
+    async fn flush_pending_direct_delete_leaf_run(&self, cx: &Cx) -> Result<()> {
         if !self.pending_direct_delete_leaf_run_active.get() {
             return Ok(());
         }
@@ -36654,7 +37669,8 @@ impl Connection {
                                         cx,
                                         &mut cursor,
                                         run,
-                                    );
+                                    )
+                                    .await;
                                     if result.is_err() {
                                         break;
                                     }
@@ -36696,7 +37712,8 @@ impl Connection {
                                 cx,
                                 &mut cursor,
                                 run,
-                            );
+                            )
+                            .await;
                             if result.is_err() {
                                 break;
                             }
@@ -36741,7 +37758,8 @@ impl Connection {
                                     cx,
                                     &mut cursor,
                                     run,
-                                );
+                                )
+                                .await;
                                 if result.is_err() {
                                     break;
                                 }
@@ -36775,7 +37793,8 @@ impl Connection {
                             cx,
                             &mut cursor,
                             run,
-                        );
+                        )
+                        .await;
                         if result.is_err() {
                             break;
                         }
@@ -36800,17 +37819,19 @@ impl Connection {
         result
     }
 
-    fn flush_pending_direct_write_runs(&self, cx: &Cx) -> Result<()> {
+    async fn flush_pending_direct_write_runs(&self, cx: &Cx) -> Result<()> {
         let profile_flush = hot_path_profile_enabled();
         if profile_flush {
             FSQLITE_DIRECT_WRITE_FLUSH_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
         }
         let flush_start = profile_flush.then(Instant::now);
-        let result = (|| {
-            self.flush_pending_direct_update_leaf_patch_run(cx)?;
-            self.flush_pending_direct_delete_leaf_run(cx)?;
-            self.flush_pending_direct_insert_page_run(cx)
-        })();
+        let result = async {
+            self.flush_pending_direct_update_leaf_patch_run(cx)
+                .await?;
+            self.flush_pending_direct_delete_leaf_run(cx).await?;
+            self.flush_pending_direct_insert_page_run(cx).await
+        }
+        .await;
         record_hot_path_duration(&FSQLITE_DIRECT_WRITE_FLUSH_TIME_NS, flush_start);
         result
     }
@@ -36971,7 +37992,7 @@ impl Connection {
         }
     }
 
-    fn try_execute_prepared_direct_simple_delete_active_leaf_run(
+    async fn try_execute_prepared_direct_simple_delete_active_leaf_run(
         &self,
         execution_cx: &Cx,
         direct: &PreparedDirectSimpleDelete,
@@ -37079,13 +38100,14 @@ impl Connection {
             if can_stage_current_run {
                 self.stage_pending_direct_delete_leaf_run();
             } else if should_flush_runs {
-                self.flush_pending_direct_delete_leaf_run(execution_cx)?;
+                self.flush_pending_direct_delete_leaf_run(execution_cx)
+                    .await?;
             }
             Ok(None)
         }
     }
 
-    fn try_execute_prepared_direct_simple_update_active_leaf_patch_run(
+    async fn try_execute_prepared_direct_simple_update_active_leaf_patch_run(
         &self,
         execution_cx: &Cx,
         direct: &PreparedDirectSimpleUpdate,
@@ -37120,7 +38142,8 @@ impl Connection {
                 FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_MISSES
                     .fetch_add(1, AtomicOrdering::Relaxed);
             }
-            self.flush_pending_direct_update_leaf_patch_run(execution_cx)?;
+            self.flush_pending_direct_update_leaf_patch_run(execution_cx)
+                .await?;
             return Ok(None);
         };
         let (usable_size, _) = Self::btree_cursor_sizes_from_header(
@@ -37171,7 +38194,8 @@ impl Connection {
                 FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_MISSES
                     .fetch_add(1, AtomicOrdering::Relaxed);
             }
-            self.flush_pending_direct_update_leaf_patch_run(execution_cx)?;
+            self.flush_pending_direct_update_leaf_patch_run(execution_cx)
+                .await?;
             Ok(None)
         }
     }
@@ -37202,7 +38226,7 @@ impl Connection {
         }
     }
 
-    fn flush_pending_direct_insert_page_run_with_cursor<P: PageReader + PageWriter>(
+    async fn flush_pending_direct_insert_page_run_with_cursor<P: PageReader + PageWriter>(
         &self,
         cx: &Cx,
         cursor: &mut fsqlite_btree::BtCursor<P>,
@@ -37214,14 +38238,20 @@ impl Connection {
                     return Ok(());
                 }
                 record_prepared_direct_insert_owned_page_run_flush(&records);
-                if cursor.table_bulk_load_empty_root_sorted_records(cx, &records)? {
+                if cursor
+                    .table_bulk_load_empty_root_sorted_records(cx, &records)
+                    .await?
+                {
                     record_hot_path_count(
                         &FSQLITE_PREPARED_DIRECT_INSERT_PAGE_RUN_EMPTY_ROOT_BULK_LOAD_HITS,
                         1,
                     );
                     return Ok(());
                 }
-                if cursor.table_bulk_append_depth2_right_edge_sorted_records(cx, &records)? {
+                if cursor
+                    .table_bulk_append_depth2_right_edge_sorted_records(cx, &records)
+                    .await?
+                {
                     record_hot_path_count(
                         &FSQLITE_PREPARED_DIRECT_INSERT_PAGE_RUN_DEPTH2_BULK_APPEND_HITS,
                         1,
@@ -37237,7 +38267,9 @@ impl Connection {
                     profile_count_from_usize(records.len()),
                 );
                 for (rowid, record) in records {
-                    cursor.table_append_after_last_position(cx, rowid, record.as_slice())?;
+                    cursor
+                        .table_append_after_last_position(cx, rowid, record.as_slice())
+                        .await?;
                 }
             }
             PendingDirectInsertPageRunRecords::Arena {
@@ -37252,14 +38284,20 @@ impl Connection {
                     .iter()
                     .map(|(rowid, range)| (*rowid, &record_bytes[range.clone()]))
                     .collect();
-                if cursor.table_bulk_load_empty_root_sorted_records(cx, &records)? {
+                if cursor
+                    .table_bulk_load_empty_root_sorted_records(cx, &records)
+                    .await?
+                {
                     record_hot_path_count(
                         &FSQLITE_PREPARED_DIRECT_INSERT_PAGE_RUN_EMPTY_ROOT_BULK_LOAD_HITS,
                         1,
                     );
                     return Ok(());
                 }
-                if cursor.table_bulk_append_depth2_right_edge_sorted_records(cx, &records)? {
+                if cursor
+                    .table_bulk_append_depth2_right_edge_sorted_records(cx, &records)
+                    .await?
+                {
                     record_hot_path_count(
                         &FSQLITE_PREPARED_DIRECT_INSERT_PAGE_RUN_DEPTH2_BULK_APPEND_HITS,
                         1,
@@ -37275,7 +38313,9 @@ impl Connection {
                     profile_count_from_usize(records.len()),
                 );
                 for (rowid, record) in records {
-                    cursor.table_append_after_last_position(cx, rowid, record)?;
+                    cursor
+                        .table_append_after_last_position(cx, rowid, record)
+                        .await?;
                 }
             }
             PendingDirectInsertPageRunRecords::Repeated { rowids, record } => {
@@ -37287,14 +38327,20 @@ impl Connection {
                     .iter()
                     .map(|rowid| (*rowid, record.as_slice()))
                     .collect();
-                if cursor.table_bulk_load_empty_root_sorted_records(cx, &records)? {
+                if cursor
+                    .table_bulk_load_empty_root_sorted_records(cx, &records)
+                    .await?
+                {
                     record_hot_path_count(
                         &FSQLITE_PREPARED_DIRECT_INSERT_PAGE_RUN_EMPTY_ROOT_BULK_LOAD_HITS,
                         1,
                     );
                     return Ok(());
                 }
-                if cursor.table_bulk_append_depth2_right_edge_sorted_records(cx, &records)? {
+                if cursor
+                    .table_bulk_append_depth2_right_edge_sorted_records(cx, &records)
+                    .await?
+                {
                     record_hot_path_count(
                         &FSQLITE_PREPARED_DIRECT_INSERT_PAGE_RUN_DEPTH2_BULK_APPEND_HITS,
                         1,
@@ -37310,7 +38356,9 @@ impl Connection {
                     profile_count_from_usize(rowids.len()),
                 );
                 for rowid in rowids {
-                    cursor.table_append_after_last_position(cx, rowid, record.as_slice())?;
+                    cursor
+                        .table_append_after_last_position(cx, rowid, record.as_slice())
+                        .await?;
                 }
             }
         }
@@ -37322,21 +38370,24 @@ impl Connection {
         self.pending_direct_insert_page_run_active.set(true);
     }
 
-    fn flush_taken_pending_direct_insert_page_run_with_cursor<P: PageReader + PageWriter>(
+    async fn flush_taken_pending_direct_insert_page_run_with_cursor<P: PageReader + PageWriter>(
         &self,
         cx: &Cx,
         cursor: &mut fsqlite_btree::BtCursor<P>,
         run: PendingDirectInsertPageRun,
     ) -> Result<()> {
         let restore_on_error = run.clone();
-        if let Err(error) = self.flush_pending_direct_insert_page_run_with_cursor(cx, cursor, run) {
+        if let Err(error) = self
+            .flush_pending_direct_insert_page_run_with_cursor(cx, cursor, run)
+            .await
+        {
             self.restore_pending_direct_insert_page_run(restore_on_error);
             return Err(error);
         }
         Ok(())
     }
 
-    fn flush_pending_direct_insert_page_run(&self, cx: &Cx) -> Result<()> {
+    async fn flush_pending_direct_insert_page_run(&self, cx: &Cx) -> Result<()> {
         if !self.pending_direct_insert_page_run_active.get() {
             return Ok(());
         }
@@ -37385,6 +38436,7 @@ impl Connection {
                         fsqlite_btree::BtCursor::new(page_io.clone(), root, usable_size, true);
                     Self::configure_btree_cursor_page_size(&mut cursor, usable_size, page_size);
                     self.flush_pending_direct_insert_page_run_with_cursor(cx, &mut cursor, run)
+                        .await
                 };
                 match page_io.into_inner() {
                     Ok(txn_back) => {
@@ -37409,6 +38461,7 @@ impl Connection {
                     true,
                 );
                 self.flush_pending_direct_insert_page_run_with_cursor(cx, &mut cursor, run)
+                    .await
             } else {
                 Err(FrankenError::internal(
                     "pending direct insert page-run missing active transaction",
@@ -37424,7 +38477,7 @@ impl Connection {
         result
     }
 
-    fn try_buffer_prepared_direct_insert_page_run_with_cursor<P: PageReader + PageWriter>(
+    async fn try_buffer_prepared_direct_insert_page_run_with_cursor<P: PageReader + PageWriter>(
         &self,
         cx: &Cx,
         direct: &PreparedDirectSimpleInsert,
@@ -37464,21 +38517,25 @@ impl Connection {
                     "pending direct insert page-run root changed without preflush",
                 ));
             }
-            self.flush_taken_pending_direct_insert_page_run_with_cursor(cx, cursor, run)?;
+            self.flush_taken_pending_direct_insert_page_run_with_cursor(cx, cursor, run)
+                .await?;
         }
 
-        if cursor.last(cx)? {
+        if cursor.last(cx).await? {
             if !self.savepoints.borrow().is_empty() {
                 return Ok(false);
             }
-            let last_rowid = cursor.rowid(cx)?;
+            let last_rowid = cursor.rowid(cx).await?;
             if rowid <= last_rowid {
                 return Ok(false);
             }
             if record_bytes.len() >= PREPARED_DIRECT_INSERT_PAGE_RUN_ARENA_MAX_RECORD_BYTES {
                 return Ok(false);
             }
-            if !cursor.table_can_bulk_append_depth2_right_edge_record(cx, rowid, record_bytes)? {
+            if !cursor
+                .table_can_bulk_append_depth2_right_edge_record(cx, rowid, record_bytes)
+                .await?
+            {
                 return Ok(false);
             }
         }
@@ -37590,15 +38647,16 @@ impl Connection {
     /// Finalize an implicit (autocommit) transaction: commit on success,
     /// rollback on error.  No-op when `was_auto` is `false`.
     #[cfg_attr(not(test), allow(dead_code))]
-    fn resolve_autocommit_txn(&self, was_auto: bool, ok: bool) -> Result<()> {
+    async fn resolve_autocommit_txn(&self, was_auto: bool, ok: bool) -> Result<()> {
         self.resolve_autocommit_txn_with_capture(was_auto, ok, true)
+            .await
     }
 
     /// Finalize an implicit (autocommit) transaction: commit on success,
     /// rollback on error. `capture_time_travel_snapshot` controls whether
     /// successful writes retain a `:memory:` historical snapshot for
     /// `FOR SYSTEM_TIME AS OF`.
-    fn resolve_autocommit_txn_with_capture(
+    async fn resolve_autocommit_txn_with_capture(
         &self,
         was_auto: bool,
         ok: bool,
@@ -37611,9 +38669,10 @@ impl Connection {
             capture_time_travel_snapshot,
             &cx,
         )
+        .await
     }
 
-    fn resolve_autocommit_txn_with_capture_and_cx(
+    async fn resolve_autocommit_txn_with_capture_and_cx(
         &self,
         was_auto: bool,
         ok: bool,
@@ -37628,12 +38687,13 @@ impl Connection {
             false,
             cx,
         )
+        .await
     }
 
     // Distinct lifecycle flags; refactoring into an enum would obscure the
     // independent autocommit/ok/capture/schema-boundary axes.
     #[allow(clippy::fn_params_excessive_bools)]
-    fn resolve_autocommit_txn_with_dirty_table_and_capture_and_cx(
+    async fn resolve_autocommit_txn_with_dirty_table_and_capture_and_cx(
         &self,
         was_auto: bool,
         ok: bool,
@@ -37690,7 +38750,7 @@ impl Connection {
             // re-entrant connection-fallback subquery parked its own
             // read snapshot while the outer VDBE was executing).
             if let Some(mut old) = self.cached_read_snapshot.borrow_mut().take() {
-                let _ = old.rollback(cx);
+                let _ = old.rollback(cx).await;
             }
             let cookie = *self.schema_cookie.borrow();
             *self.cached_read_snapshot.borrow_mut() = Some(txn);
@@ -37713,7 +38773,7 @@ impl Connection {
                     self.abort_current_concurrent_session();
                 }
                 self.txn_metrics_note_rollback();
-                let rollback_result = txn.rollback(cx);
+                let rollback_result = txn.rollback(cx).await;
                 let rollback_succeeded = rollback_result.is_ok();
                 let vtab_rollback_result = self.live_vtab_rollback_all(cx);
                 let registry_rollback_result = self.restore_live_vtab_registry_to(cx, 0);
@@ -37722,7 +38782,7 @@ impl Connection {
                 self.txn_metrics_mark_finished();
                 self.clear_prepared_direct_insert_append_hint();
                 if txn_has_pending_writes && rollback_succeeded {
-                    self.reload_memdb_from_pager(cx)?;
+                    self.reload_memdb_from_pager(cx).await?;
                 }
                 vtab_rollback_result?;
                 registry_rollback_result?;
@@ -37751,7 +38811,7 @@ impl Connection {
             *self.concurrent_session_id.borrow_mut() = None;
             self.txn_metrics_mark_finished();
             // Flush the retained batch: commit prior good writes, reset counters.
-            self.flush_retained_autocommit_txn(cx)?;
+            self.flush_retained_autocommit_txn(cx).await?;
             return Ok(());
         }
         // Use the pager's lock-free conservative conflict surface here. Pager
@@ -37794,7 +38854,7 @@ impl Connection {
                         drop(commit_registry_guard.take());
                         self.abort_current_concurrent_session();
                         self.txn_metrics_note_rollback();
-                        let rollback_result = txn.rollback(cx);
+                        let rollback_result = txn.rollback(cx).await;
                         let rollback_succeeded = rollback_result.is_ok();
                         let vtab_rollback_result = self.live_vtab_rollback_all(cx);
                         let registry_rollback_result = self.restore_live_vtab_registry_to(cx, 0);
@@ -37803,7 +38863,7 @@ impl Connection {
                         self.txn_metrics_mark_finished();
                         self.clear_prepared_direct_insert_append_hint();
                         if txn_has_pending_writes && rollback_succeeded {
-                            self.reload_memdb_from_pager(cx)?;
+                            self.reload_memdb_from_pager(cx).await?;
                         }
                         vtab_rollback_result?;
                         registry_rollback_result?;
@@ -37853,7 +38913,7 @@ impl Connection {
                     self.concurrent_txn.set(false);
                     *self.concurrent_session_id.borrow_mut() = None;
                     self.txn_metrics_mark_finished();
-                    self.invalidate_cached_read_snapshot(cx);
+                    self.invalidate_cached_read_snapshot(cx).await;
                     if hot_path_profile_enabled() {
                         FSQLITE_RETAINED_AUTOCOMMIT_PARKS.fetch_add(1, AtomicOrdering::Relaxed);
                     }
@@ -37882,7 +38942,7 @@ impl Connection {
                 && !retained_autocommit_flush_boundary
             {
                 let commit_txn_roundtrip_start = hot_path_profile_enabled().then(Instant::now);
-                match txn.commit_and_retain(cx) {
+                match txn.commit_and_retain(cx).await {
                     Ok(true) => {
                         record_hot_path_duration(
                             &FSQLITE_COMMIT_TXN_ROUNDTRIP_TIME_NS,
@@ -37929,12 +38989,13 @@ impl Connection {
                                 hydrate_rows,
                                 false,
                             )
+                            .await
                         };
                         // Park the retained transaction for the next autocommit.
                         let cookie = *self.schema_cookie.borrow();
                         // Discard any stale cached write transaction.
                         if let Some(mut old) = self.cached_write_txn.borrow_mut().take() {
-                            let _ = old.commit(cx);
+                            let _ = old.commit(cx).await;
                         }
                         let retained_reload_error = retained_reload_result.err();
                         if retained_reload_error.is_none() {
@@ -37947,12 +39008,12 @@ impl Connection {
                         } else {
                             self.cached_write_txn_cookie.set(0);
                             self.cached_write_txn_memdb_row_mirror_exact.set(false);
-                            if let Err(error) = txn.commit(cx) {
+                            if let Err(error) = txn.commit(cx).await {
                                 tracing::warn!(
                                     target: "fsqlite.memdb_refresh",
                                     "retained commit reload failed and retained txn release also failed: {error}"
                                 );
-                            } else if let Err(error) = self.reload_memdb_from_pager(cx) {
+                            } else if let Err(error) = self.reload_memdb_from_pager(cx).await {
                                 tracing::warn!(
                                     target: "fsqlite.memdb_refresh",
                                     "retained commit reload failed and pager reload fallback also failed: {error}"
@@ -37963,7 +39024,7 @@ impl Connection {
                         *self.concurrent_session_id.borrow_mut() = None;
                         self.txn_metrics_mark_finished();
                         // Invalidate read snapshot — it's stale after a write.
-                        self.invalidate_cached_read_snapshot(cx);
+                        self.invalidate_cached_read_snapshot(cx).await;
                         if retained_reload_error.is_none() && hot_path_profile_enabled() {
                             FSQLITE_CACHED_WRITE_TXN_PARKS.fetch_add(1, AtomicOrdering::Relaxed);
                         }
@@ -37989,7 +39050,8 @@ impl Connection {
                             if capture_time_travel_snapshot
                                 && self.time_travel_capture_enabled.get()
                             {
-                                self.capture_time_travel_snapshot(committed_seq.get());
+                                self.capture_time_travel_snapshot(committed_seq.get())
+                                    .await;
                             }
                             record_hot_path_duration(
                                 &FSQLITE_COMMIT_POST_WRITE_MAINTENANCE_TIME_NS,
@@ -38015,7 +39077,7 @@ impl Connection {
                             commit_txn_roundtrip_start,
                         );
                         self.txn_metrics_note_rollback();
-                        let _ = txn.rollback(cx);
+                        let _ = txn.rollback(cx).await;
                         if retained_autocommit_flush_boundary {
                             self.finish_retained_autocommit_count_sum_cache_flush(false);
                         }
@@ -38029,7 +39091,7 @@ impl Connection {
             }
 
             let commit_txn_roundtrip_start = hot_path_profile_enabled().then(Instant::now);
-            match txn.commit(cx) {
+            match txn.commit(cx).await {
                 Ok(()) => {
                     record_hot_path_duration(
                         &FSQLITE_COMMIT_TXN_ROUNDTRIP_TIME_NS,
@@ -38103,7 +39165,7 @@ impl Connection {
                     // physical-write-failure path.
                     drop(commit_registry_guard.take());
                     self.txn_metrics_note_rollback();
-                    let rollback_result = txn.rollback(cx);
+                    let rollback_result = txn.rollback(cx).await;
                     let rollback_succeeded = rollback_result.is_ok();
                     let vtab_rollback_result = self.live_vtab_rollback_all(cx);
                     let registry_rollback_result = self.restore_live_vtab_registry_to(cx, 0);
@@ -38132,7 +39194,7 @@ impl Connection {
                 self.abort_current_concurrent_session();
             }
             self.txn_metrics_note_rollback();
-            let rollback_result = txn.rollback(cx);
+            let rollback_result = txn.rollback(cx).await;
             let rollback_succeeded = rollback_result.is_ok();
             let vtab_rollback_result = self.live_vtab_rollback_all(cx);
             let registry_rollback_result = self.restore_live_vtab_registry_to(cx, 0);
@@ -38165,7 +39227,7 @@ impl Connection {
         }
         if rolled_back_dirty_state {
             self.discard_cached_vdbe_engine();
-            self.reload_memdb_from_pager(cx)?;
+            self.reload_memdb_from_pager(cx).await?;
         }
 
         txn_result?;
@@ -38193,11 +39255,12 @@ impl Connection {
             if let Some(committed_seq) = *self.last_local_commit_seq.borrow() {
                 self.emit_differential_commit_invalidations(committed_seq);
                 if capture_time_travel_snapshot && self.time_travel_capture_enabled.get() {
-                    self.capture_time_travel_snapshot(committed_seq.get());
+                    self.capture_time_travel_snapshot(committed_seq.get())
+                        .await;
                 }
             }
             if !self.should_defer_autocheckpoint_after_concurrent_commit(is_concurrent_txn) {
-                self.maybe_run_adaptive_autocheckpoint();
+                self.maybe_run_adaptive_autocheckpoint().await;
             }
             record_hot_path_duration(
                 &FSQLITE_COMMIT_POST_WRITE_MAINTENANCE_TIME_NS,
@@ -38216,51 +39279,55 @@ impl Connection {
     /// Allocate a fresh page from the pager and initialize it as an empty
     /// B-tree leaf table page (type 0x0D).  Returns the real `PageNumber`.
     #[allow(clippy::cast_possible_wrap)]
-    fn allocate_root_page(&self) -> Result<i32> {
-        self.with_pager_write_txn(|cx, txn| {
-            let page_no = txn.allocate_page(cx)?;
-            let (usable_size, page_size) = Self::current_btree_cursor_sizes_in_txn(cx, txn)?;
+    async fn allocate_root_page(&self) -> Result<i32> {
+        self.with_pager_write_txn(async |cx, txn| {
+            let page_no = txn.allocate_page(cx).await?;
+            let (usable_size, page_size) = Self::current_btree_cursor_sizes_in_txn(cx, txn).await?;
             let mut page = vec![0u8; page_size as usize];
             BTreePageHeader::write_empty_leaf_table(&mut page, 0, usable_size);
-            txn.write_page(cx, page_no, &page)?;
+            txn.write_page(cx, page_no, &page).await?;
             Ok(page_no.get() as i32)
         })
+        .await
     }
 
     /// Allocate a fresh page from the pager and initialize it as an empty
     /// B-tree leaf index page (type 0x0A).  Returns the real `PageNumber`.
     #[allow(clippy::cast_possible_wrap)]
-    fn allocate_index_root_page(&self) -> Result<i32> {
-        self.with_pager_write_txn(|cx, txn| {
-            let page_no = txn.allocate_page(cx)?;
-            let (usable_size, page_size) = Self::current_btree_cursor_sizes_in_txn(cx, txn)?;
+    async fn allocate_index_root_page(&self) -> Result<i32> {
+        self.with_pager_write_txn(async |cx, txn| {
+            let page_no = txn.allocate_page(cx).await?;
+            let (usable_size, page_size) = Self::current_btree_cursor_sizes_in_txn(cx, txn).await?;
             let mut page = vec![0u8; page_size as usize];
             BTreePageHeader::write_empty_leaf_index(&mut page, 0, usable_size);
-            txn.write_page(cx, page_no, &page)?;
+            txn.write_page(cx, page_no, &page).await?;
             Ok(page_no.get() as i32)
         })
+        .await
     }
 
     // ── sqlite_master helpers (bd-1b5e / 5A.2) ─────────────────────────
 
     /// Run a closure with a mutable pager transaction, auto-beginning and
     /// committing when no explicit transaction is active.
-    fn with_pager_write_txn<R>(
-        &self,
-        f: impl FnOnce(&Cx, &mut dyn TransactionHandle) -> Result<R>,
-    ) -> Result<R> {
+    async fn with_pager_write_txn<R, F>(&self, f: F) -> Result<R>
+    where
+        F: std::ops::AsyncFnOnce(&Cx, &mut TransactionKind) -> Result<R>,
+    {
         let cx = self.op_cx()?;
         let auto = self.active_txn.borrow().is_none();
         let mut auto_commit_succeeded = false;
         if auto {
-            self.invalidate_cached_read_snapshot(&cx);
-            self.invalidate_cached_write_txn(&cx);
-            let txn = self.begin_pager_txn_with_busy_timeout(
-                &self.pager,
-                &cx,
-                TransactionMode::Immediate,
-                false,
-            )?;
+            self.invalidate_cached_read_snapshot(&cx).await;
+            self.invalidate_cached_write_txn(&cx).await;
+            let txn = self
+                .begin_pager_txn_with_busy_timeout(
+                    &self.pager,
+                    &cx,
+                    TransactionMode::Immediate,
+                    false,
+                )
+                .await?;
             *self.active_txn.borrow_mut() = Some(txn);
         }
         let result = {
@@ -38268,13 +39335,13 @@ impl Connection {
             let txn = guard
                 .as_mut()
                 .ok_or_else(|| FrankenError::internal("transaction missing after ensure"))?;
-            f(&cx, txn)
+            f(&cx, txn).await
         };
         if auto {
             let mut guard = self.active_txn.borrow_mut();
             let finalize_err = if let Some(txn) = guard.as_mut() {
                 if result.is_ok() {
-                    match txn.commit(&cx) {
+                    match txn.commit(&cx).await {
                         Ok(()) => {
                             let committed_seq = self.advance_commit_clock();
                             self.finish_commit_clock(committed_seq);
@@ -38286,7 +39353,7 @@ impl Connection {
                     }
                 } else {
                     // Best-effort rollback; propagate error only if result was Ok.
-                    let _ = txn.rollback(&cx);
+                    let _ = txn.rollback(&cx).await;
                     None
                 }
             } else {
@@ -38298,13 +39365,13 @@ impl Connection {
             }
         }
         if auto_commit_succeeded {
-            self.maybe_run_adaptive_autocheckpoint();
+            self.maybe_run_adaptive_autocheckpoint().await;
         }
         result
     }
 
     /// Insert a row into the sqlite_master B-tree on page 1.
-    fn insert_sqlite_master_row(
+    async fn insert_sqlite_master_row(
         &self,
         type_: &str,
         name: &str,
@@ -38313,12 +39380,13 @@ impl Connection {
         sql: &str,
     ) -> Result<()> {
         self.insert_sqlite_master_row_with_sql(type_, name, tbl_name, rootpage, Some(sql))
+            .await
     }
 
     /// Insert a sqlite_master row with an optional SQL column value.
     /// Implicit autoindexes (sqlite_autoindex_*) are stored with NULL sql,
     /// matching real SQLite's behavior.
-    fn insert_sqlite_master_row_with_sql(
+    async fn insert_sqlite_master_row_with_sql(
         &self,
         type_: &str,
         name: &str,
@@ -38326,16 +39394,16 @@ impl Connection {
         rootpage: i32,
         sql: Option<&str>,
     ) -> Result<()> {
-        self.with_pager_write_txn(|cx, txn| {
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true)?;
+        self.with_pager_write_txn(async |cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true).await?;
 
             // Defensive allocation: derive a floor from actual sqlite_master
             // rowids so stale in-memory counters can never reissue rowids.
             let mut max_rowid = 0_i64;
-            if cursor.first(cx)? {
+            if cursor.first(cx).await? {
                 loop {
-                    max_rowid = max_rowid.max(cursor.rowid(cx)?);
-                    if !cursor.next(cx)? {
+                    max_rowid = max_rowid.max(cursor.rowid(cx).await?);
+                    if !cursor.next(cx).await? {
                         break;
                     }
                 }
@@ -38355,8 +39423,9 @@ impl Connection {
                 SqliteValue::Integer(i64::from(rootpage)),
                 sql.map_or(SqliteValue::Null, |s| SqliteValue::Text(s.into())),
             ]);
-            cursor.table_insert(cx, rowid, &record)
-        })?;
+            cursor.table_insert(cx, rowid, &record).await
+        })
+        .await?;
         // Cache original DDL text for sqlite_master sql column queries.
         // Triggers are intentionally excluded: SQLite allows trigger names to
         // collide with table/view names, while this cache is keyed by name
@@ -38462,16 +39531,16 @@ impl Connection {
         }
     }
 
-    fn insert_sqlite_master_raw_row(&self, values: &[SqliteValue]) -> Result<()> {
+    async fn insert_sqlite_master_raw_row(&self, values: &[SqliteValue]) -> Result<()> {
         let row = Self::sqlite_master_insert_row_from_values(&[], values)?;
-        self.with_pager_write_txn(|cx, txn| {
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true)?;
+        self.with_pager_write_txn(async |cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true).await?;
 
             let mut max_rowid = 0_i64;
-            if cursor.first(cx)? {
+            if cursor.first(cx).await? {
                 loop {
-                    max_rowid = max_rowid.max(cursor.rowid(cx)?);
-                    if !cursor.next(cx)? {
+                    max_rowid = max_rowid.max(cursor.rowid(cx).await?);
+                    if !cursor.next(cx).await? {
                         break;
                     }
                 }
@@ -38485,60 +39554,68 @@ impl Connection {
             };
 
             let record = serialize_record(&row);
-            cursor.table_insert(cx, rowid, &record)
-        })?;
+            cursor.table_insert(cx, rowid, &record).await
+        })
+        .await?;
         self.cache_original_ddl_from_sqlite_master_row(&row);
         Ok(())
     }
 
-    fn update_sqlite_master_raw_rows(
+    async fn update_sqlite_master_raw_rows(
         &self,
-        mut update_row: impl FnMut(&[SqliteValue]) -> Result<Option<Vec<SqliteValue>>>,
+        mut update_row: impl std::ops::AsyncFnMut(
+            &[SqliteValue],
+        ) -> Result<Option<Vec<SqliteValue>>>,
     ) -> Result<usize> {
         let mut cache_updates = Vec::new();
-        let affected = self.with_pager_write_txn(|cx, txn| {
-            let mut pending_updates = Vec::new();
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true)?;
-            if cursor.first(cx)? {
-                loop {
-                    let rowid = cursor.rowid(cx)?;
-                    let payload = cursor.payload(cx)?;
-                    let values =
-                        parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "sqlite_master row {rowid} payload is not a valid SQLite record"
-                            ),
+        let affected = self
+            .with_pager_write_txn(async |cx, txn| {
+                let mut pending_updates = Vec::new();
+                let mut cursor =
+                    Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true).await?;
+                if cursor.first(cx).await? {
+                    loop {
+                        let rowid = cursor.rowid(cx).await?;
+                        let payload = cursor.payload(cx).await?;
+                        let values = parse_record(&payload).ok_or_else(|| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "sqlite_master row {rowid} payload is not a valid SQLite record"
+                                ),
+                            }
                         })?;
-                    if let Some(updated) = update_row(&values)? {
-                        if updated.len() != 5 {
-                            return Err(FrankenError::Internal(format!(
-                                "sqlite_master UPDATE produced {} columns, expected 5",
-                                updated.len()
-                            )));
+                        if let Some(updated) = update_row(&values).await? {
+                            if updated.len() != 5 {
+                                return Err(FrankenError::Internal(format!(
+                                    "sqlite_master UPDATE produced {} columns, expected 5",
+                                    updated.len()
+                                )));
+                            }
+                            pending_updates.push((rowid, values, updated));
                         }
-                        pending_updates.push((rowid, values, updated));
-                    }
-                    if !cursor.next(cx)? {
-                        break;
+                        if !cursor.next(cx).await? {
+                            break;
+                        }
                     }
                 }
-            }
 
-            let affected = pending_updates.len();
-            for (rowid, old, updated) in pending_updates {
-                let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true)?;
-                if !cursor.table_move_to(cx, rowid)?.is_found() {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: format!("sqlite_master row {rowid} vanished during UPDATE"),
-                    });
+                let affected = pending_updates.len();
+                for (rowid, old, updated) in pending_updates {
+                    let mut cursor =
+                        Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true).await?;
+                    if !cursor.table_move_to(cx, rowid).await?.is_found() {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!("sqlite_master row {rowid} vanished during UPDATE"),
+                        });
+                    }
+                    cursor.delete(cx).await?;
+                    let record = serialize_record(&updated);
+                    cursor.table_insert(cx, rowid, &record).await?;
+                    cache_updates.push((old, updated));
                 }
-                cursor.delete(cx)?;
-                let record = serialize_record(&updated);
-                cursor.table_insert(cx, rowid, &record)?;
-                cache_updates.push((old, updated));
-            }
-            Ok(affected)
-        })?;
+                Ok(affected)
+            })
+            .await?;
 
         for (old, new) in cache_updates {
             self.remove_original_ddl_cache_for_sqlite_master_row(&old);
@@ -38547,46 +39624,51 @@ impl Connection {
         Ok(affected)
     }
 
-    fn delete_sqlite_master_raw_rows(
+    async fn delete_sqlite_master_raw_rows(
         &self,
-        mut should_delete: impl FnMut(&[SqliteValue]) -> Result<bool>,
+        mut should_delete: impl std::ops::AsyncFnMut(&[SqliteValue]) -> Result<bool>,
     ) -> Result<usize> {
         let mut cache_removals = Vec::new();
-        let affected = self.with_pager_write_txn(|cx, txn| {
-            let mut pending_deletes = Vec::new();
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true)?;
-            if cursor.first(cx)? {
-                loop {
-                    let rowid = cursor.rowid(cx)?;
-                    let payload = cursor.payload(cx)?;
-                    let values =
-                        parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "sqlite_master row {rowid} payload is not a valid SQLite record"
-                            ),
+        let affected = self
+            .with_pager_write_txn(async |cx, txn| {
+                let mut pending_deletes = Vec::new();
+                let mut cursor =
+                    Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true).await?;
+                if cursor.first(cx).await? {
+                    loop {
+                        let rowid = cursor.rowid(cx).await?;
+                        let payload = cursor.payload(cx).await?;
+                        let values = parse_record(&payload).ok_or_else(|| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "sqlite_master row {rowid} payload is not a valid SQLite record"
+                                ),
+                            }
                         })?;
-                    if should_delete(&values)? {
-                        pending_deletes.push((rowid, values));
-                    }
-                    if !cursor.next(cx)? {
-                        break;
+                        if should_delete(&values).await? {
+                            pending_deletes.push((rowid, values));
+                        }
+                        if !cursor.next(cx).await? {
+                            break;
+                        }
                     }
                 }
-            }
 
-            let affected = pending_deletes.len();
-            for (rowid, old) in pending_deletes {
-                let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true)?;
-                if !cursor.table_move_to(cx, rowid)?.is_found() {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: format!("sqlite_master row {rowid} vanished during DELETE"),
-                    });
+                let affected = pending_deletes.len();
+                for (rowid, old) in pending_deletes {
+                    let mut cursor =
+                        Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true).await?;
+                    if !cursor.table_move_to(cx, rowid).await?.is_found() {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!("sqlite_master row {rowid} vanished during DELETE"),
+                        });
+                    }
+                    cursor.delete(cx).await?;
+                    cache_removals.push(old);
                 }
-                cursor.delete(cx)?;
-                cache_removals.push(old);
-            }
-            Ok(affected)
-        })?;
+                Ok(affected)
+            })
+            .await?;
 
         for old in cache_removals {
             self.remove_original_ddl_cache_for_sqlite_master_row(&old);
@@ -38594,7 +39676,7 @@ impl Connection {
         Ok(affected)
     }
 
-    fn execute_writable_schema_insert(
+    async fn execute_writable_schema_insert(
         &self,
         insert: &InsertStatement,
         params: Option<&[SqliteValue]>,
@@ -38610,12 +39692,16 @@ impl Connection {
         }
 
         let rows = match &insert.source {
-            InsertSource::Values(rows) => rows
-                .iter()
-                .map(|row| self.evaluate_insert_source_row(row, params))
-                .collect::<Result<Vec<_>>>()?,
+            InsertSource::Values(rows) => {
+                let mut evaluated = Vec::with_capacity(rows.len());
+                for row in rows {
+                    evaluated.push(self.evaluate_insert_source_row(row, params).await?);
+                }
+                evaluated
+            }
             InsertSource::Select(select) => self
-                .execute_statement(&Statement::Select(select.as_ref().clone()), params)?
+                .execute_statement(&Statement::Select(select.as_ref().clone()), params)
+                .await?
                 .into_iter()
                 .map(|row| row.values)
                 .collect(),
@@ -38629,16 +39715,16 @@ impl Connection {
         let mut affected = 0usize;
         for values in rows {
             let row = Self::sqlite_master_insert_row_from_values(&insert.columns, &values)?;
-            self.insert_sqlite_master_raw_row(&row)?;
+            self.insert_sqlite_master_raw_row(&row).await?;
             affected += 1;
         }
         if affected > 0 {
-            self.increment_schema_cookie()?;
+            self.increment_schema_cookie().await?;
         }
         Ok(affected)
     }
 
-    fn execute_writable_schema_update(
+    async fn execute_writable_schema_update(
         &self,
         update: &fsqlite_ast::UpdateStatement,
         params: Option<&[SqliteValue]>,
@@ -38673,32 +39759,35 @@ impl Connection {
             assignments.push((Self::sqlite_master_column_index(column)?, &assignment.value));
         }
 
-        let affected = self.update_sqlite_master_raw_rows(|row| {
-            let matches = if let Some(where_clause) = update.where_clause.as_ref() {
-                let value = self.eval_expr_with_subqueries(where_clause, row, &col_map, params)?;
-                is_sqlite_truthy(&value)
-            } else {
-                true
-            };
-            if !matches {
-                return Ok(None);
-            }
+        let affected = self
+            .update_sqlite_master_raw_rows(async |row| {
+                let matches = if let Some(where_clause) = update.where_clause.as_ref() {
+                    let value =
+                        self.eval_expr_with_subqueries(where_clause, row, &col_map, params).await?;
+                    is_sqlite_truthy(&value)
+                } else {
+                    true
+                };
+                if !matches {
+                    return Ok(None);
+                }
 
-            let mut updated = row.to_vec();
-            updated.resize(5, SqliteValue::Null);
-            updated.truncate(5);
-            for (idx, expr) in &assignments {
-                updated[*idx] = self.eval_expr_with_subqueries(expr, row, &col_map, params)?;
-            }
-            Ok(Some(updated))
-        })?;
+                let mut updated = row.to_vec();
+                updated.resize(5, SqliteValue::Null);
+                updated.truncate(5);
+                for (idx, expr) in &assignments {
+                    updated[*idx] = self.eval_expr_with_subqueries(expr, row, &col_map, params).await?;
+                }
+                Ok(Some(updated))
+            })
+            .await?;
         if affected > 0 {
-            self.increment_schema_cookie()?;
+            self.increment_schema_cookie().await?;
         }
         Ok(affected)
     }
 
-    fn execute_writable_schema_delete(
+    async fn execute_writable_schema_delete(
         &self,
         delete: &fsqlite_ast::DeleteStatement,
         params: Option<&[SqliteValue]>,
@@ -38719,16 +39808,19 @@ impl Connection {
             .as_deref()
             .unwrap_or(&delete.table.name.name);
         let col_map = Self::sqlite_master_eval_col_map(table_name);
-        let affected = self.delete_sqlite_master_raw_rows(|row| {
-            if let Some(where_clause) = delete.where_clause.as_ref() {
-                let value = self.eval_expr_with_subqueries(where_clause, row, &col_map, params)?;
-                Ok(is_sqlite_truthy(&value))
-            } else {
-                Ok(true)
-            }
-        })?;
+        let affected = self
+            .delete_sqlite_master_raw_rows(async |row| {
+                if let Some(where_clause) = delete.where_clause.as_ref() {
+                    let value =
+                        self.eval_expr_with_subqueries(where_clause, row, &col_map, params).await?;
+                    Ok(is_sqlite_truthy(&value))
+                } else {
+                    Ok(true)
+                }
+            })
+            .await?;
         if affected > 0 {
-            self.increment_schema_cookie()?;
+            self.increment_schema_cookie().await?;
         }
         Ok(affected)
     }
@@ -38736,27 +39828,33 @@ impl Connection {
     /// Delete the sqlite_master row whose `name` column matches the given
     /// object name (case-insensitive scan of the page 1 B-tree).
     #[cfg(test)]
-    fn delete_sqlite_master_row(&self, name: &str) -> Result<()> {
-        self.delete_sqlite_master_row_matching(None, name)
+    async fn delete_sqlite_master_row(&self, name: &str) -> Result<()> {
+        self.delete_sqlite_master_row_matching(None, name).await
     }
 
-    fn delete_sqlite_master_typed_row(&self, type_: &str, name: &str) -> Result<()> {
+    async fn delete_sqlite_master_typed_row(&self, type_: &str, name: &str) -> Result<()> {
         self.delete_sqlite_master_row_matching(Some(type_), name)
+            .await
     }
 
-    fn delete_sqlite_master_row_matching(&self, type_: Option<&str>, name: &str) -> Result<()> {
-        self.with_pager_write_txn(|cx, txn| {
+    async fn delete_sqlite_master_row_matching(
+        &self,
+        type_: Option<&str>,
+        name: &str,
+    ) -> Result<()> {
+        self.with_pager_write_txn(async |cx, txn| {
             let mut deleted_any = false;
             loop {
-                let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true)?;
-                if !cursor.first(cx)? {
+                let mut cursor =
+                    Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true).await?;
+                if !cursor.first(cx).await? {
                     break;
                 }
 
                 let mut deleted_this_pass = false;
                 loop {
-                    let rowid = cursor.rowid(cx)?;
-                    let payload = cursor.payload(cx)?;
+                    let rowid = cursor.rowid(cx).await?;
+                    let payload = cursor.payload(cx).await?;
                     let values =
                         parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
                             detail: format!(
@@ -38773,12 +39871,12 @@ impl Connection {
                         && type_matches
                         && row_name.eq_ignore_ascii_case(name)
                     {
-                        cursor.delete(cx)?;
+                        cursor.delete(cx).await?;
                         deleted_any = true;
                         deleted_this_pass = true;
                         break;
                     }
-                    if !cursor.next(cx)? {
+                    if !cursor.next(cx).await? {
                         break;
                     }
                 }
@@ -38796,7 +39894,8 @@ impl Connection {
                     "sqlite_master entry not found: {type_prefix}{name}"
                 )))
             }
-        })?;
+        })
+        .await?;
         if !type_.is_some_and(|type_| type_.eq_ignore_ascii_case("trigger")) {
             self.original_ddl_sql
                 .borrow_mut()
@@ -38805,9 +39904,13 @@ impl Connection {
         Ok(())
     }
 
-    fn sqlite_master_rootpage_for_typed_row(&self, type_: &str, name: &str) -> Result<Option<i64>> {
-        self.with_integrity_txn(|cx, txn| {
-            let page1 = txn.get_page(cx, PageNumber::ONE)?;
+    async fn sqlite_master_rootpage_for_typed_row(
+        &self,
+        type_: &str,
+        name: &str,
+    ) -> Result<Option<i64>> {
+        self.with_integrity_txn(async |cx, txn| {
+            let page1 = txn.get_page(cx, PageNumber::ONE).await?;
             let page1_bytes = page1.as_ref();
             if page1_bytes.iter().all(|&b| b == 0) || page1_bytes.len() < DATABASE_HEADER_SIZE {
                 return Ok(None);
@@ -38819,7 +39922,8 @@ impl Connection {
                 txn,
                 header.page_size,
                 header.reserved_per_page,
-            )?;
+            )
+            .await?;
             for row in rows {
                 let (entry_type, entry_name, _, rootpage) = sqlite_master_signature(&row)?;
                 if entry_type.eq_ignore_ascii_case(type_) && entry_name.eq_ignore_ascii_case(name) {
@@ -38828,19 +39932,25 @@ impl Connection {
             }
             Ok(None)
         })
+        .await
     }
 
-    fn update_sqlite_master_typed_sql(&self, type_: &str, name: &str, new_sql: &str) -> Result<()> {
-        self.with_pager_write_txn(|cx, txn| {
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true)?;
-            if !cursor.first(cx)? {
+    async fn update_sqlite_master_typed_sql(
+        &self,
+        type_: &str,
+        name: &str,
+        new_sql: &str,
+    ) -> Result<()> {
+        self.with_pager_write_txn(async |cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true).await?;
+            if !cursor.first(cx).await? {
                 return Err(FrankenError::Internal(format!(
                     "sqlite_master {type_} entry not found: {name}"
                 )));
             }
             loop {
-                let rowid = cursor.rowid(cx)?;
-                let payload = cursor.payload(cx)?;
+                let rowid = cursor.rowid(cx).await?;
+                let payload = cursor.payload(cx).await?;
                 let values =
                     parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -38860,18 +39970,19 @@ impl Connection {
                     updated[4] = SqliteValue::Text(new_sql.into());
                     let record = serialize_record(&updated);
 
-                    cursor.delete(cx)?;
-                    cursor.table_insert(cx, original_rowid, &record)?;
+                    cursor.delete(cx).await?;
+                    cursor.table_insert(cx, original_rowid, &record).await?;
                     return Ok(());
                 }
-                if !cursor.next(cx)? {
+                if !cursor.next(cx).await? {
                     break;
                 }
             }
             Err(FrankenError::Internal(format!(
                 "sqlite_master {type_} entry not found: {name}"
             )))
-        })?;
+        })
+        .await?;
         if !type_.eq_ignore_ascii_case("trigger") {
             self.original_ddl_sql
                 .borrow_mut()
@@ -38880,23 +39991,23 @@ impl Connection {
         Ok(())
     }
 
-    fn update_sqlite_master_typed_tbl_name_and_sql(
+    async fn update_sqlite_master_typed_tbl_name_and_sql(
         &self,
         type_: &str,
         name: &str,
         new_tbl_name: &str,
         new_sql: Option<&str>,
     ) -> Result<()> {
-        self.with_pager_write_txn(|cx, txn| {
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true)?;
-            if !cursor.first(cx)? {
+        self.with_pager_write_txn(async |cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true).await?;
+            if !cursor.first(cx).await? {
                 return Err(FrankenError::Internal(format!(
                     "sqlite_master entry not found: {name}"
                 )));
             }
             loop {
-                let rowid = cursor.rowid(cx)?;
-                let payload = cursor.payload(cx)?;
+                let rowid = cursor.rowid(cx).await?;
+                let payload = cursor.payload(cx).await?;
                 let values =
                     parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -38918,18 +40029,19 @@ impl Connection {
                         new_sql.map_or(SqliteValue::Null, |sql| SqliteValue::Text(sql.into()));
                     let record = serialize_record(&updated);
 
-                    cursor.delete(cx)?;
-                    cursor.table_insert(cx, original_rowid, &record)?;
+                    cursor.delete(cx).await?;
+                    cursor.table_insert(cx, original_rowid, &record).await?;
                     return Ok(());
                 }
-                if !cursor.next(cx)? {
+                if !cursor.next(cx).await? {
                     break;
                 }
             }
             Err(FrankenError::Internal(format!(
                 "sqlite_master entry not found: {name}"
             )))
-        })?;
+        })
+        .await?;
         if !type_.eq_ignore_ascii_case("trigger") {
             let mut ddl_cache = self.original_ddl_sql.borrow_mut();
             if let Some(sql) = new_sql {
@@ -38941,7 +40053,7 @@ impl Connection {
         Ok(())
     }
 
-    fn update_sqlite_master_typed_name_tbl_name_and_sql(
+    async fn update_sqlite_master_typed_name_tbl_name_and_sql(
         &self,
         type_: &str,
         old_name: &str,
@@ -38949,16 +40061,16 @@ impl Connection {
         new_tbl_name: &str,
         new_sql: &str,
     ) -> Result<()> {
-        self.with_pager_write_txn(|cx, txn| {
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true)?;
-            if !cursor.first(cx)? {
+        self.with_pager_write_txn(async |cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true).await?;
+            if !cursor.first(cx).await? {
                 return Err(FrankenError::Internal(format!(
                     "sqlite_master {type_} entry not found: {old_name}"
                 )));
             }
             loop {
-                let rowid = cursor.rowid(cx)?;
-                let payload = cursor.payload(cx)?;
+                let rowid = cursor.rowid(cx).await?;
+                let payload = cursor.payload(cx).await?;
                 let values =
                     parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -38979,18 +40091,19 @@ impl Connection {
                     updated[4] = SqliteValue::Text(new_sql.into());
                     let record = serialize_record(&updated);
 
-                    cursor.delete(cx)?;
-                    cursor.table_insert(cx, rowid, &record)?;
+                    cursor.delete(cx).await?;
+                    cursor.table_insert(cx, rowid, &record).await?;
                     return Ok(());
                 }
-                if !cursor.next(cx)? {
+                if !cursor.next(cx).await? {
                     break;
                 }
             }
             Err(FrankenError::Internal(format!(
                 "sqlite_master {type_} entry not found: {old_name}"
             )))
-        })?;
+        })
+        .await?;
         if !type_.eq_ignore_ascii_case("trigger") {
             let mut ddl_cache = self.original_ddl_sql.borrow_mut();
             ddl_cache.remove(&old_name.to_ascii_lowercase());
@@ -39020,7 +40133,7 @@ impl Connection {
     /// Without the guard, running `query()` on `sqlite_stat1` would itself
     /// compile through `planner_select_directive_with_cache`, which calls
     /// back into this function and overflows the stack.
-    fn sqlite_stat1_row_counts(&self) -> HashMap<String, u64> {
+    async fn sqlite_stat1_row_counts(&self) -> HashMap<String, u64> {
         thread_local! {
             static STAT1_LOAD_IN_PROGRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         }
@@ -39043,7 +40156,7 @@ impl Connection {
         let _guard = Guard;
 
         let sql = "SELECT tbl, idx, stat FROM sqlite_stat1";
-        let Ok(rows) = self.query(sql) else {
+        let Ok(rows) = self.query(sql).await else {
             return out;
         };
         for row in &rows {
@@ -39079,12 +40192,12 @@ impl Connection {
             .contains(&table_name.to_ascii_lowercase())
     }
 
-    fn ensure_sqlite_sequence_table_exists(&self) -> Result<()> {
+    async fn ensure_sqlite_sequence_table_exists(&self) -> Result<()> {
         if self.sqlite_sequence_root_page().is_some() {
             return Ok(());
         }
 
-        let root_page = self.allocate_root_page()?;
+        let root_page = self.allocate_root_page().await?;
         self.db.borrow_mut().create_table_at(root_page, 2);
         self.schema.borrow_mut().push(TableSchema {
             name: "sqlite_sequence".to_owned(),
@@ -39133,17 +40246,18 @@ impl Connection {
             "sqlite_sequence",
             root_page,
             "CREATE TABLE sqlite_sequence(name,seq)",
-        )?;
+        )
+        .await?;
         tracing::trace!("sqlite_sequence table auto-created");
         Ok(())
     }
 
-    fn ensure_sqlite_stat1_table_exists(&self) -> Result<()> {
+    async fn ensure_sqlite_stat1_table_exists(&self) -> Result<()> {
         if self.sqlite_stat1_root_page().is_some() {
             return Ok(());
         }
 
-        let root_page = self.allocate_root_page()?;
+        let root_page = self.allocate_root_page().await?;
         self.db.borrow_mut().create_table_at(root_page, 3);
         self.schema.borrow_mut().push(TableSchema {
             name: "sqlite_stat1".to_owned(),
@@ -39163,29 +40277,30 @@ impl Connection {
             "sqlite_stat1",
             root_page,
             "CREATE TABLE sqlite_stat1(tbl,idx,stat)",
-        )?;
-        self.increment_schema_cookie()?;
+        )
+        .await?;
+        self.increment_schema_cookie().await?;
         tracing::trace!("sqlite_stat1 table auto-created");
         Ok(())
     }
 
     #[allow(clippy::unused_self)]
-    fn count_btree_entries_in_txn(
+    async fn count_btree_entries_in_txn(
         &self,
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         root_page: i32,
         is_table: bool,
     ) -> Result<u64> {
         let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
             return Ok(0);
         };
-        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, is_table)?;
+        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, is_table).await?;
         let mut count = 0_u64;
-        if cursor.first(cx)? {
+        if cursor.first(cx).await? {
             loop {
                 count = count.saturating_add(1);
-                if !cursor.next(cx)? {
+                if !cursor.next(cx).await? {
                     break;
                 }
             }
@@ -39194,40 +40309,40 @@ impl Connection {
     }
 
     #[allow(clippy::unused_self)]
-    fn clear_btree_entries_in_txn(
+    async fn clear_btree_entries_in_txn(
         &self,
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         root_page: i32,
         is_table: bool,
     ) -> Result<()> {
         let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
             return Ok(());
         };
-        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, is_table)?;
-        while cursor.first(cx)? {
-            cursor.delete(cx)?;
+        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, is_table).await?;
+        while cursor.first(cx).await? {
+            cursor.delete(cx).await?;
         }
         Ok(())
     }
 
-    fn compute_index_stat_string_in_txn(
+    async fn compute_index_stat_string_in_txn(
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         index: &IndexSchema,
     ) -> Result<Option<String>> {
         let Some(root) = PageNumber::new(u32::try_from(index.root_page).unwrap_or(0)) else {
             return Ok(None);
         };
-        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, false)?;
+        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, false).await?;
         let n_key_columns = index.key_term_count();
         let mut row_count = 0_u64;
         let mut distinct_counts = vec![0_u64; n_key_columns];
         let mut prev_fields: Option<Vec<SqliteValue>> = None;
 
-        if cursor.first(cx)? {
+        if cursor.first(cx).await? {
             loop {
-                let payload = cursor.payload(cx)?;
+                let payload = cursor.payload(cx).await?;
                 let fields =
                     parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -39266,7 +40381,7 @@ impl Connection {
                 }
                 prev_fields = Some(fields);
 
-                if !cursor.next(cx)? {
+                if !cursor.next(cx).await? {
                     break;
                 }
             }
@@ -39289,10 +40404,10 @@ impl Connection {
         Ok(Some(stat_parts.join(" ")))
     }
 
-    fn rewrite_sqlite_stat1_rows_in_txn(
+    async fn rewrite_sqlite_stat1_rows_in_txn(
         &self,
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         targets: &[AnalyzeTarget],
         replacement_rows: &[Stat1Row],
     ) -> Result<()> {
@@ -39302,15 +40417,15 @@ impl Connection {
         let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
             return Ok(());
         };
-        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
 
         let mut rowids_to_delete = Vec::new();
         let mut max_rowid = 0_i64;
-        if cursor.first(cx)? {
+        if cursor.first(cx).await? {
             loop {
-                let rowid = cursor.rowid(cx)?;
+                let rowid = cursor.rowid(cx).await?;
                 max_rowid = max_rowid.max(rowid);
-                let payload = cursor.payload(cx)?;
+                let payload = cursor.payload(cx).await?;
                 let values =
                     parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -39348,15 +40463,15 @@ impl Connection {
                     rowids_to_delete.push(rowid);
                 }
 
-                if !cursor.next(cx)? {
+                if !cursor.next(cx).await? {
                     break;
                 }
             }
         }
 
         for rowid in rowids_to_delete {
-            if cursor.table_move_to(cx, rowid)?.is_found() {
-                cursor.delete(cx)?;
+            if cursor.table_move_to(cx, rowid).await?.is_found() {
+                cursor.delete(cx).await?;
             }
         }
 
@@ -39369,16 +40484,16 @@ impl Connection {
                 }),
                 SqliteValue::Text(row.stat.clone().into()),
             ]);
-            cursor.table_insert(cx, max_rowid, &record)?;
+            cursor.table_insert(cx, max_rowid, &record).await?;
         }
 
         Ok(())
     }
 
-    fn read_sqlite_sequence_cache_in_txn(
+    async fn read_sqlite_sequence_cache_in_txn(
         &self,
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
     ) -> Result<HashMap<String, i64>> {
         let mut cache = HashMap::new();
         let Some(root_page) = self.sqlite_sequence_root_page() else {
@@ -39387,12 +40502,12 @@ impl Connection {
         let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
             return Ok(cache);
         };
-        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
         tracing::trace!(root_page, "sqlite_sequence cache refresh begin");
-        if cursor.first(cx)? {
+        if cursor.first(cx).await? {
             loop {
-                let rowid = cursor.rowid(cx)?;
-                let payload = cursor.payload(cx)?;
+                let rowid = cursor.rowid(cx).await?;
+                let payload = cursor.payload(cx).await?;
                 let values =
                     parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -39405,7 +40520,7 @@ impl Connection {
                     let seq = values[1].to_integer();
                     cache.insert(table_name.to_ascii_lowercase(), seq);
                 }
-                if !cursor.next(cx)? {
+                if !cursor.next(cx).await? {
                     break;
                 }
             }
@@ -39414,36 +40529,37 @@ impl Connection {
         Ok(cache)
     }
 
-    fn refresh_sqlite_sequence_cache(&self) -> Result<()> {
-        self.with_pager_write_txn(|cx, txn| {
-            let cache = self.read_sqlite_sequence_cache_in_txn(cx, txn)?;
+    async fn refresh_sqlite_sequence_cache(&self) -> Result<()> {
+        self.with_pager_write_txn(async |cx, txn| {
+            let cache = self.read_sqlite_sequence_cache_in_txn(cx, txn).await?;
             *self.sqlite_sequence_cache.borrow_mut() = cache;
             Ok(())
         })
+        .await
     }
 
     #[allow(clippy::unused_self)]
-    fn table_max_rowid_in_txn(
+    async fn table_max_rowid_in_txn(
         &self,
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         root_page: i32,
     ) -> Result<i64> {
         let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
             return Ok(0);
         };
-        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
-        if cursor.last(cx)? {
-            cursor.rowid(cx)
+        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
+        if cursor.last(cx).await? {
+            cursor.rowid(cx).await
         } else {
             Ok(0)
         }
     }
 
-    fn upsert_sqlite_sequence_in_txn(
+    async fn upsert_sqlite_sequence_in_txn(
         &self,
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         table_name: &str,
         seq: i64,
     ) -> Result<()> {
@@ -39453,15 +40569,15 @@ impl Connection {
         let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
             return Ok(());
         };
-        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
 
         let mut found_rowid = None;
         let mut max_rowid = 0_i64;
-        if cursor.first(cx)? {
+        if cursor.first(cx).await? {
             loop {
-                let rowid = cursor.rowid(cx)?;
+                let rowid = cursor.rowid(cx).await?;
                 max_rowid = max_rowid.max(rowid);
-                let payload = cursor.payload(cx)?;
+                let payload = cursor.payload(cx).await?;
                 let values =
                     parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -39473,15 +40589,15 @@ impl Connection {
                 {
                     found_rowid = Some(rowid);
                 }
-                if !cursor.next(cx)? {
+                if !cursor.next(cx).await? {
                     break;
                 }
             }
         }
 
         let rowid = if let Some(existing_rowid) = found_rowid {
-            if cursor.table_move_to(cx, existing_rowid)?.is_found() {
-                cursor.delete(cx)?;
+            if cursor.table_move_to(cx, existing_rowid).await?.is_found() {
+                cursor.delete(cx).await?;
             }
             existing_rowid
         } else {
@@ -39492,26 +40608,26 @@ impl Connection {
             SqliteValue::Text(table_name.into()),
             SqliteValue::Integer(seq),
         ]);
-        cursor.table_insert(cx, rowid, &record)?;
+        cursor.table_insert(cx, rowid, &record).await?;
         tracing::trace!(table = table_name, seq, rowid, "sqlite_sequence upsert");
         Ok(())
     }
 
-    fn delete_sqlite_sequence_entry(&self, table_name: &str) -> Result<()> {
-        self.with_pager_write_txn(|cx, txn| {
+    async fn delete_sqlite_sequence_entry(&self, table_name: &str) -> Result<()> {
+        self.with_pager_write_txn(async |cx, txn| {
             let Some(root_page) = self.sqlite_sequence_root_page() else {
                 return Ok(());
             };
             let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
                 return Ok(());
             };
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
-            if !cursor.first(cx)? {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
+            if !cursor.first(cx).await? {
                 return Ok(());
             }
             loop {
-                let rowid = cursor.rowid(cx)?;
-                let payload = cursor.payload(cx)?;
+                let rowid = cursor.rowid(cx).await?;
+                let payload = cursor.payload(cx).await?;
                 let values =
                     parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -39522,17 +40638,18 @@ impl Connection {
                     && existing_name.eq_ignore_ascii_case(table_name)
                 {
                     tracing::trace!(table = table_name, "sqlite_sequence delete entry");
-                    return cursor.delete(cx);
+                    return cursor.delete(cx).await;
                 }
-                if !cursor.next(cx)? {
+                if !cursor.next(cx).await? {
                     break;
                 }
             }
             Ok(())
         })
+        .await
     }
 
-    fn rename_sqlite_sequence_entry(&self, old_name: &str, new_name: &str) -> Result<()> {
+    async fn rename_sqlite_sequence_entry(&self, old_name: &str, new_name: &str) -> Result<()> {
         let old_key = old_name.to_ascii_lowercase();
         let new_key = new_name.to_ascii_lowercase();
         let seq = {
@@ -39544,21 +40661,22 @@ impl Connection {
             seq
         };
 
-        self.with_pager_write_txn(|cx, txn| {
-            self.upsert_sqlite_sequence_in_txn(cx, txn, new_name, seq)?;
+        self.with_pager_write_txn(async |cx, txn| {
+            self.upsert_sqlite_sequence_in_txn(cx, txn, new_name, seq)
+                .await?;
             let Some(root_page) = self.sqlite_sequence_root_page() else {
                 return Ok(());
             };
             let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
                 return Ok(());
             };
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
-            if !cursor.first(cx)? {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
+            if !cursor.first(cx).await? {
                 return Ok(());
             }
             loop {
-                let rowid = cursor.rowid(cx)?;
-                let payload = cursor.payload(cx)?;
+                let rowid = cursor.rowid(cx).await?;
+                let payload = cursor.payload(cx).await?;
                 let values =
                     parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -39568,8 +40686,8 @@ impl Connection {
                 if let Some(SqliteValue::Text(existing_name)) = values.first()
                     && existing_name.eq_ignore_ascii_case(old_name)
                 {
-                    if cursor.table_move_to(cx, rowid)?.is_found() {
-                        cursor.delete(cx)?;
+                    if cursor.table_move_to(cx, rowid).await?.is_found() {
+                        cursor.delete(cx).await?;
                     }
                     tracing::trace!(
                         old = old_name,
@@ -39578,15 +40696,16 @@ impl Connection {
                     );
                     break;
                 }
-                if !cursor.next(cx)? {
+                if !cursor.next(cx).await? {
                     break;
                 }
             }
             Ok(())
         })
+        .await
     }
 
-    fn try_fast_path_autoincrement_sequence_after_insert(
+    async fn try_fast_path_autoincrement_sequence_after_insert(
         &self,
         table_name: &str,
         affected: usize,
@@ -39599,7 +40718,7 @@ impl Connection {
             return Ok(false);
         };
 
-        self.ensure_sqlite_sequence_table_exists()?;
+        self.ensure_sqlite_sequence_table_exists().await?;
         let key = table_name.to_ascii_lowercase();
         let current_seq = self
             .sqlite_sequence_cache
@@ -39609,13 +40728,15 @@ impl Connection {
             .unwrap_or(0);
         if inserted_rowid > current_seq {
             let key_for_cache = key.clone();
-            self.with_pager_write_txn(|cx, txn| {
-                self.upsert_sqlite_sequence_in_txn(cx, txn, table_name, inserted_rowid)?;
+            self.with_pager_write_txn(async |cx, txn| {
+                self.upsert_sqlite_sequence_in_txn(cx, txn, table_name, inserted_rowid)
+                    .await?;
                 self.sqlite_sequence_cache
                     .borrow_mut()
                     .insert(key_for_cache, inserted_rowid);
                 Ok(())
-            })?;
+            })
+            .await?;
         }
         if hot_path_profile_enabled() {
             FSQLITE_AUTOINCREMENT_SEQUENCE_FAST_PATH_UPDATES.fetch_add(1, AtomicOrdering::Relaxed);
@@ -39629,7 +40750,7 @@ impl Connection {
         Ok(true)
     }
 
-    fn refresh_autoincrement_sequence_after_insert(
+    async fn refresh_autoincrement_sequence_after_insert(
         &self,
         table_name: &str,
         affected: usize,
@@ -39638,18 +40759,21 @@ impl Connection {
         if !self.is_autoincrement_table(table_name) {
             return Ok(());
         }
-        if self.try_fast_path_autoincrement_sequence_after_insert(
-            table_name,
-            affected,
-            last_insert_rowid,
-        )? {
+        if self
+            .try_fast_path_autoincrement_sequence_after_insert(
+                table_name,
+                affected,
+                last_insert_rowid,
+            )
+            .await?
+        {
             return Ok(());
         }
         if hot_path_profile_enabled() {
             FSQLITE_AUTOINCREMENT_SEQUENCE_SCAN_REFRESHES.fetch_add(1, AtomicOrdering::Relaxed);
         }
-        self.ensure_sqlite_sequence_table_exists()?;
-        self.with_pager_write_txn(|cx, txn| {
+        self.ensure_sqlite_sequence_table_exists().await?;
+        self.with_pager_write_txn(async |cx, txn| {
             let Some(root_page) = self
                 .schema
                 .borrow()
@@ -39659,7 +40783,7 @@ impl Connection {
             else {
                 return Ok(());
             };
-            let max_rowid = self.table_max_rowid_in_txn(cx, txn, root_page)?;
+            let max_rowid = self.table_max_rowid_in_txn(cx, txn, root_page).await?;
             let key = table_name.to_ascii_lowercase();
             let current_seq = self
                 .sqlite_sequence_cache
@@ -39669,7 +40793,8 @@ impl Connection {
                 .unwrap_or(0);
             let new_seq = current_seq.max(max_rowid);
             if new_seq > current_seq {
-                self.upsert_sqlite_sequence_in_txn(cx, txn, table_name, new_seq)?;
+                self.upsert_sqlite_sequence_in_txn(cx, txn, table_name, new_seq)
+                    .await?;
                 self.sqlite_sequence_cache.borrow_mut().insert(key, new_seq);
             }
             tracing::trace!(
@@ -39681,6 +40806,7 @@ impl Connection {
             );
             Ok(())
         })
+        .await
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -39707,7 +40833,7 @@ impl Connection {
             .collect()
     }
 
-    fn table_execution_runtime_inputs(
+    async fn table_execution_runtime_inputs(
         &self,
         requirements: TableExecutionRuntimeRequirements,
     ) -> TableExecutionRuntimeInputs {
@@ -39773,35 +40899,37 @@ impl Connection {
                     })
                     .collect()
             };
-            Arc::new(
-                metadata
-                    .column_default_sql_by_root_page
-                    .iter()
-                    .filter_map(|(root_page, default_sqls)| {
-                        let affinities = affinity_by_root_page.get(root_page);
-                        let defaults: Vec<Option<SqliteValue>> = default_sqls
-                            .iter()
-                            .enumerate()
-                            .map(|(col_idx, default_sql)| {
-                                default_sql.as_deref().and_then(|sql| {
-                                    self.evaluate_column_default_value(Some(sql)).ok().map(
-                                        |value| match affinities
-                                            .and_then(|affs| affs.get(col_idx).copied())
-                                        {
-                                            Some(aff) => value.apply_affinity(aff),
-                                            None => value,
-                                        },
-                                    )
-                                })
-                            })
-                            .collect();
-                        defaults
-                            .iter()
-                            .any(Option::is_some)
-                            .then_some((*root_page, defaults))
-                    })
-                    .collect::<HbHashMap<_, _>>(),
-            )
+            let default_entries: Vec<(i32, Vec<Option<String>>)> = metadata
+                .column_default_sql_by_root_page
+                .iter()
+                .map(|(root_page, default_sqls)| (*root_page, default_sqls.clone()))
+                .collect();
+            let mut built: HbHashMap<i32, Vec<Option<SqliteValue>>> = HbHashMap::new();
+            for (root_page, default_sqls) in default_entries {
+                let affinities = affinity_by_root_page.get(&root_page);
+                let mut defaults: Vec<Option<SqliteValue>> =
+                    Vec::with_capacity(default_sqls.len());
+                for (col_idx, default_sql) in default_sqls.iter().enumerate() {
+                    let value = match default_sql.as_deref() {
+                        Some(sql) => self
+                            .evaluate_column_default_value(Some(sql))
+                            .await
+                            .ok()
+                            .map(|value| {
+                                match affinities.and_then(|affs| affs.get(col_idx).copied()) {
+                                    Some(aff) => value.apply_affinity(aff),
+                                    None => value,
+                                }
+                            }),
+                        None => None,
+                    };
+                    defaults.push(value);
+                }
+                if defaults.iter().any(Option::is_some) {
+                    built.insert(root_page, defaults);
+                }
+            }
+            Arc::new(built)
         };
 
         TableExecutionRuntimeInputs {
@@ -39945,7 +41073,7 @@ impl Connection {
     /// Build evaluated column default values keyed by root page.
     /// Used by the VDBE engine to apply ALTER TABLE ADD COLUMN defaults
     /// when a row's record has fewer columns than the current schema.
-    fn column_defaults_by_root_page(&self) -> HashMap<i32, Vec<Option<SqliteValue>>> {
+    async fn column_defaults_by_root_page(&self) -> HashMap<i32, Vec<Option<SqliteValue>>> {
         let metadata = self.table_execution_metadata();
         if self.is_evaluating_column_default()
             || metadata.column_default_sql_by_root_page.is_empty()
@@ -39980,39 +41108,42 @@ impl Connection {
                 })
                 .collect()
         };
-        metadata
+        let entries: Vec<(i32, Vec<Option<String>>)> = metadata
             .column_default_sql_by_root_page
             .iter()
-            .filter_map(|(root_page, default_sqls)| {
-                let affinities = affinity_by_root_page.get(root_page);
-                let defaults: Vec<Option<SqliteValue>> = default_sqls
-                    .iter()
-                    .enumerate()
-                    .map(|(col_idx, default_sql)| {
-                        default_sql.as_deref().and_then(|sql| {
-                            self.evaluate_column_default_value(Some(sql))
-                                .ok()
-                                .map(|value| {
-                                    match affinities.and_then(|affs| affs.get(col_idx).copied()) {
-                                        Some(aff) => value.apply_affinity(aff),
-                                        None => value,
-                                    }
-                                })
-                        })
-                    })
-                    .collect();
-                defaults
-                    .iter()
-                    .any(Option::is_some)
-                    .then_some((*root_page, defaults))
-            })
-            .collect()
+            .map(|(root_page, default_sqls)| (*root_page, default_sqls.clone()))
+            .collect();
+        let mut out: HashMap<i32, Vec<Option<SqliteValue>>> = HashMap::new();
+        for (root_page, default_sqls) in entries {
+            let affinities = affinity_by_root_page.get(&root_page);
+            let mut defaults: Vec<Option<SqliteValue>> = Vec::with_capacity(default_sqls.len());
+            for (col_idx, default_sql) in default_sqls.iter().enumerate() {
+                let value = match default_sql.as_deref() {
+                    Some(sql) => self
+                        .evaluate_column_default_value(Some(sql))
+                        .await
+                        .ok()
+                        .map(|value| {
+                            match affinities.and_then(|affs| affs.get(col_idx).copied()) {
+                                Some(aff) => value.apply_affinity(aff),
+                                None => value,
+                            }
+                        }),
+                    None => None,
+                };
+                defaults.push(value);
+            }
+            if defaults.iter().any(Option::is_some) {
+                out.insert(root_page, defaults);
+            }
+        }
+        out
     }
 
     /// Process a CREATE TABLE statement: register the schema and create the
     /// in-memory table, and insert a row into sqlite_master on page 1.
     #[allow(clippy::too_many_lines)]
-    fn execute_create_table(&self, create: &fsqlite_ast::CreateTableStatement) -> Result<()> {
+    async fn execute_create_table(&self, create: &fsqlite_ast::CreateTableStatement) -> Result<()> {
         let table_name = create.name.name.clone();
 
         // bd-wjrs0: a `TEMP`/`TEMPORARY` table (or a `temp.<name>` qualifier)
@@ -40405,7 +41536,9 @@ impl Connection {
                         .iter()
                         .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }));
                     if col.unique && !col.is_ipk && !(create.without_rowid && column_primary_key) {
-                        let idx_root = self.allocate_schema_table_root(target_is_temp, 0, true)?;
+                        let idx_root = self
+                            .allocate_schema_table_root(target_is_temp, 0, true)
+                            .await?;
                         // Per-constraint ON CONFLICT declared on the column's
                         // UNIQUE / (non-IPK) PRIMARY KEY clause.
                         let conflict_action =
@@ -40463,8 +41596,9 @@ impl Connection {
                             if all_ipk {
                                 continue;
                             }
-                            let idx_root =
-                                self.allocate_schema_table_root(target_is_temp, 0, true)?;
+                            let idx_root = self
+                                .allocate_schema_table_root(target_is_temp, 0, true)
+                                .await?;
                             // Per-constraint ON CONFLICT declared on the
                             // table-level UNIQUE / PRIMARY KEY constraint.
                             let conflict_action = match &tc.kind {
@@ -40498,11 +41632,9 @@ impl Connection {
                 }
 
                 let num_columns = col_infos.len();
-                let root_page = self.allocate_schema_table_root(
-                    target_is_temp,
-                    num_columns,
-                    create.without_rowid,
-                )?;
+                let root_page = self
+                    .allocate_schema_table_root(target_is_temp, num_columns, create.without_rowid)
+                    .await?;
 
                 // Register UNIQUE column groups with MemTable for in-memory
                 // constraint enforcement. This is needed because MemDatabase
@@ -40674,7 +41806,8 @@ impl Connection {
                         self.schema.borrow_mut().push(table_schema);
                     }
                     self.rebuild_schema_indices();
-                    self.insert_sqlite_master_row("table", &tbl_name, &tbl_name, rp, &create_sql)?;
+                    self.insert_sqlite_master_row("table", &tbl_name, &tbl_name, rp, &create_sql)
+                        .await?;
                     // Persist implicit autoindex entries (sqlite_autoindex_*) to
                     // sqlite_master with NULL sql, matching real SQLite behavior.
                     // Without these rows SQLite reports the database as malformed.
@@ -40685,11 +41818,12 @@ impl Connection {
                             &tbl_name,
                             index.root_page,
                             None,
-                        )?;
+                        )
+                        .await?;
                     }
                 }
                 if is_autoincrement {
-                    self.ensure_sqlite_sequence_table_exists()?;
+                    self.ensure_sqlite_sequence_table_exists().await?;
                     let table_key = tbl_name.to_ascii_lowercase();
                     self.autoincrement_tables
                         .borrow_mut()
@@ -40706,16 +41840,17 @@ impl Connection {
                         "CREATE TABLE ... AS SELECT ... STRICT is not yet supported".to_owned(),
                     ));
                 }
-                let rows =
-                    self.materialize_create_table_as_select_source_rows(select_stmt, None)?;
+                let rows = self
+                    .materialize_create_table_as_select_source_rows(select_stmt, None)
+                    .await?;
                 let col_infos = self.infer_create_table_as_select_column_infos(select_stmt, &rows);
-                return self.execute_materialized_create_table_as_select_statement(
-                    create, col_infos, &rows,
-                );
+                return self
+                    .execute_materialized_create_table_as_select_statement(create, col_infos, &rows)
+                    .await;
             }
         }
 
-        self.increment_schema_cookie()?;
+        self.increment_schema_cookie().await?;
         Ok(())
     }
 
@@ -40724,7 +41859,7 @@ impl Connection {
     /// The current compatibility path materializes FTS5 virtual tables as
     /// regular row tables while preserving the original virtual-table SQL in
     /// `sqlite_master` for schema introspection.
-    fn execute_create_virtual_table(
+    async fn execute_create_virtual_table(
         &self,
         create: &fsqlite_ast::CreateVirtualTableStatement,
     ) -> Result<()> {
@@ -40797,15 +41932,17 @@ impl Connection {
             if module_key.eq_ignore_ascii_case("FTS5")
                 && instance.as_any().downcast_ref::<Fts5Table>().is_some()
             {
-                return self.create_rootpage_zero_fts5_virtual_table(
-                    &table_name,
-                    col_infos,
-                    &create.to_string(),
-                    instance,
-                    &create.args,
-                );
+                return self
+                    .create_rootpage_zero_fts5_virtual_table(
+                        &table_name,
+                        col_infos,
+                        &create.to_string(),
+                        instance,
+                        &create.args,
+                    )
+                    .await;
             }
-            let root_page = self.allocate_root_page()?;
+            let root_page = self.allocate_root_page().await?;
             self.db
                 .borrow_mut()
                 .create_table_at(root_page, col_infos.len());
@@ -40838,8 +41975,9 @@ impl Connection {
                 &table_name,
                 root_page,
                 &create.to_string(),
-            )?;
-            self.increment_schema_cookie()?;
+            )
+            .await?;
+            self.increment_schema_cookie().await?;
             return Ok(());
         }
         drop(modules);
@@ -40853,7 +41991,7 @@ impl Connection {
         }
 
         let col_infos = parse_virtual_table_column_infos(&create.args);
-        let root_page = self.allocate_root_page()?;
+        let root_page = self.allocate_root_page().await?;
         self.db
             .borrow_mut()
             .create_table_at(root_page, col_infos.len());
@@ -40876,8 +42014,9 @@ impl Connection {
             &table_name,
             root_page,
             &create.to_string(),
-        )?;
-        self.increment_schema_cookie()?;
+        )
+        .await?;
+        self.increment_schema_cookie().await?;
         Ok(())
     }
 
@@ -40886,22 +42025,42 @@ impl Connection {
     /// This must be called for every root page of a dropped table/index so
     /// that the pages are returned to the on-disk freelist. Without this,
     /// the pages become orphaned ("Page N: never used" in integrity_check).
-    fn free_btree_pages(&self, root_page_i32: i32, is_table: bool) -> Result<()> {
+    async fn free_btree_pages(&self, root_page_i32: i32, is_table: bool) -> Result<()> {
         // Virtual tables and views have root_page == 0 (no real B-tree).
         // Only free pages for objects that have actual on-disk pages.
         let root_page = match PageNumber::new(root_page_i32 as u32) {
             Some(pg) => pg,
             None => return Ok(()),
         };
-        self.with_pager_write_txn(|cx, txn| {
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root_page, is_table)?;
-            cursor.free_subtree_pages(cx, root_page)
+        self.with_pager_write_txn(async |cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root_page, is_table).await?;
+            cursor.free_subtree_pages(cx, root_page).await
         })
+        .await
     }
 
     /// Execute a DROP statement (TABLE, INDEX, VIEW, TRIGGER).
     #[allow(clippy::too_many_lines)]
-    fn execute_drop(&self, drop_stmt: &fsqlite_ast::DropStatement) -> Result<()> {
+    async fn execute_drop(&self, drop_stmt: &fsqlite_ast::DropStatement) -> Result<()> {
+        let mut pending_drops = vec![drop_stmt.clone()];
+        while let Some(next_drop) = pending_drops.pop() {
+            let mut shadow_names = self.execute_drop_single(&next_drop).await?;
+            shadow_names.reverse();
+            pending_drops.extend(shadow_names.into_iter().map(|shadow_name| {
+                fsqlite_ast::DropStatement {
+                    object_type: DropObjectType::Table,
+                    if_exists: true,
+                    name: fsqlite_ast::QualifiedName::bare(shadow_name),
+                }
+            }));
+        }
+        Ok(())
+    }
+
+    async fn execute_drop_single(
+        &self,
+        drop_stmt: &fsqlite_ast::DropStatement,
+    ) -> Result<Vec<String>> {
         let cx = self.op_cx()?;
         let swallow_missing_master = |err: FrankenError| -> Result<()> {
             if drop_stmt.if_exists && is_sqlite_master_entry_missing(&err) {
@@ -40924,7 +42083,10 @@ impl Connection {
         // not-implemented guard. See frankensqlite#87.
         let pending_shadow_drops: Vec<String> =
             if matches!(drop_stmt.object_type, DropObjectType::Table)
-                && self.sqlite_master_rootpage_for_typed_row("table", obj_name)? == Some(0)
+                && self
+                    .sqlite_master_rootpage_for_typed_row("table", obj_name)
+                    .await?
+                    == Some(0)
             {
                 let ddl_map = self.original_ddl_sql.borrow();
                 let sql_opt = ddl_map.get(&obj_name.to_ascii_lowercase()).cloned();
@@ -40972,8 +42134,8 @@ impl Connection {
                     self.schema.borrow_mut().push(main_table);
                 }
                 self.rebuild_schema_indices();
-                self.increment_schema_cookie()?;
-                return Ok(());
+                self.increment_schema_cookie().await?;
+                return Ok(Vec::new());
             }
         }
         let dropped = match drop_stmt.object_type {
@@ -40997,14 +42159,16 @@ impl Connection {
                         .is_some_and(|sql| is_virtual_table_sql(sql));
                     if !is_virtual && table.root_page > 0 {
                         for index in &table.indexes {
-                            self.free_btree_pages(index.root_page, false)?;
+                            self.free_btree_pages(index.root_page, false).await?;
                         }
-                        self.free_btree_pages(table.root_page, true)?;
+                        self.free_btree_pages(table.root_page, true).await?;
                     }
                     self.db.borrow_mut().destroy_table(table.root_page);
                     for index in &table.indexes {
                         self.db.borrow_mut().destroy_table(index.root_page);
-                        if let Err(err) = self.delete_sqlite_master_typed_row("index", &index.name)
+                        if let Err(err) = self
+                            .delete_sqlite_master_typed_row("index", &index.name)
+                            .await
                         {
                             swallow_missing_master(err)?;
                         }
@@ -41018,7 +42182,7 @@ impl Connection {
                     if obj_name.eq_ignore_ascii_case("sqlite_sequence") {
                         self.sqlite_sequence_cache.borrow_mut().clear();
                     } else {
-                        self.delete_sqlite_sequence_entry(obj_name)?;
+                        self.delete_sqlite_sequence_entry(obj_name).await?;
                     }
 
                     let mut triggers_to_drop = Vec::new();
@@ -41037,8 +42201,9 @@ impl Connection {
                         }
                     }
                     for trigger_name in triggers_to_drop {
-                        if let Err(err) =
-                            self.delete_sqlite_master_typed_row("trigger", &trigger_name)
+                        if let Err(err) = self
+                            .delete_sqlite_master_typed_row("trigger", &trigger_name)
+                            .await
                         {
                             swallow_missing_master(err)?;
                         }
@@ -41051,13 +42216,13 @@ impl Connection {
                         self.stage_dropped_live_vtab(obj_name, instance, &cx)?;
                     }
 
-                    if let Err(err) = self.delete_sqlite_master_typed_row("table", obj_name) {
+                    if let Err(err) = self.delete_sqlite_master_typed_row("table", obj_name).await {
                         swallow_missing_master(err)?;
                     }
                     true
                 } else {
                     if drop_stmt.if_exists {
-                        return Ok(());
+                        return Ok(Vec::new());
                     }
                     return Err(FrankenError::NoSuchTable {
                         name: obj_name.clone(),
@@ -41103,7 +42268,7 @@ impl Connection {
                 drop(temp_names);
                 if !found {
                     if drop_stmt.if_exists {
-                        return Ok(());
+                        return Ok(Vec::new());
                     }
                     return Err(FrankenError::Internal(format!("no such index: {obj_name}")));
                 }
@@ -41112,7 +42277,7 @@ impl Connection {
                     // interpreted as main-pager roots. Persistent indexes are
                     // returned to the pager freelist as usual.
                     if !dropped_temp {
-                        self.free_btree_pages(root_page, false)?;
+                        self.free_btree_pages(root_page, false).await?;
                     }
                     self.db.borrow_mut().destroy_table(root_page);
                 }
@@ -41122,7 +42287,7 @@ impl Connection {
                     }
                 }
                 if !dropped_temp {
-                    if let Err(err) = self.delete_sqlite_master_typed_row("index", obj_name) {
+                    if let Err(err) = self.delete_sqlite_master_typed_row("index", obj_name).await {
                         swallow_missing_master(err)?;
                     }
                 }
@@ -41153,19 +42318,20 @@ impl Connection {
                         }
                     }
                     for trigger_name in triggers_to_drop {
-                        if let Err(err) =
-                            self.delete_sqlite_master_typed_row("trigger", &trigger_name)
+                        if let Err(err) = self
+                            .delete_sqlite_master_typed_row("trigger", &trigger_name)
+                            .await
                         {
                             swallow_missing_master(err)?;
                         }
                     }
 
-                    if let Err(err) = self.delete_sqlite_master_typed_row("view", obj_name) {
+                    if let Err(err) = self.delete_sqlite_master_typed_row("view", obj_name).await {
                         swallow_missing_master(err)?;
                     }
                     true
                 } else if drop_stmt.if_exists {
-                    return Ok(());
+                    return Ok(Vec::new());
                 } else {
                     return Err(FrankenError::Internal(format!("no such view: {obj_name}")));
                 }
@@ -41188,14 +42354,17 @@ impl Connection {
                     let trigger = triggers.remove(idx);
                     drop(triggers);
                     if !trigger.temporary {
-                        if let Err(err) = self.delete_sqlite_master_typed_row("trigger", obj_name) {
+                        if let Err(err) = self
+                            .delete_sqlite_master_typed_row("trigger", obj_name)
+                            .await
+                        {
                             swallow_missing_master(err)?;
                         }
                     }
                     true
                 } else {
                     if drop_stmt.if_exists {
-                        return Ok(());
+                        return Ok(Vec::new());
                     }
                     return Err(FrankenError::Internal(format!(
                         "no such trigger: {obj_name}"
@@ -41211,33 +42380,15 @@ impl Connection {
             }
             self.rebuild_schema_indices();
             self.validate_schema_index();
-            self.increment_schema_cookie()?;
-
-            // Cascade shadow-table drops for legacy rootpage-zero FTS5 /
-            // R-Tree virtual tables. We re-enter `execute_drop` with
-            // `IF EXISTS` semantics because individual shadows may have
-            // been pre-dropped by the caller, or may not exist for the
-            // specific module variant (e.g. FTS5 with `content=` skips
-            // the `_content` shadow). The shadows themselves are NOT
-            // virtual (FTS5 idx is WITHOUT ROWID; R-Tree nodes are
-            // regular tables) so the recursion is bounded:
-            // `pending_shadow_drops` is empty on each re-entry.
-            for shadow_name in pending_shadow_drops {
-                let shadow_drop = fsqlite_ast::DropStatement {
-                    object_type: DropObjectType::Table,
-                    if_exists: true,
-                    name: fsqlite_ast::QualifiedName::bare(shadow_name),
-                };
-                self.execute_drop(&shadow_drop)?;
-            }
+            self.increment_schema_cookie().await?;
         }
-        Ok(())
+        Ok(pending_shadow_drops)
     }
 
     /// Execute an ALTER TABLE statement.
-    fn execute_alter_table(&self, alter: &fsqlite_ast::AlterTableStatement) -> Result<()> {
+    async fn execute_alter_table(&self, alter: &fsqlite_ast::AlterTableStatement) -> Result<()> {
         if !matches!(alter.action, AlterTableAction::DropColumn(_)) {
-            return self.execute_alter_table_impl(alter);
+            return self.execute_alter_table_impl(alter).await;
         }
 
         let table_name_lc = alter.table.name.to_ascii_lowercase();
@@ -41252,8 +42403,22 @@ impl Connection {
                 .borrow()
                 .contains_key(&table_name_lc)
         {
-            return self.execute_alter_drop_on_shadowed_main(alter);
+            return self.execute_alter_drop_on_shadowed_main(alter).await;
         }
+
+        self.execute_visible_alter_drop_column(alter).await
+    }
+
+    async fn execute_visible_alter_drop_column(
+        &self,
+        alter: &fsqlite_ast::AlterTableStatement,
+    ) -> Result<()> {
+        let table_name_lc = alter.table.name.to_ascii_lowercase();
+        let targets_main_explicit = alter
+            .table
+            .schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case("main"));
 
         // DROP COLUMN rewrites physical rows before the catalog update. Keep a
         // connection-local snapshot as a second line of defence around the
@@ -41278,10 +42443,10 @@ impl Connection {
         })
         .flatten();
 
-        let result = self.execute_alter_table_impl(alter);
+        let result = self.execute_alter_table_impl(alter).await;
         if let Err(statement_error) = result {
             let cx = self.op_cx()?;
-            self.restore_snapshot(&cx, &snapshot)?;
+            self.restore_snapshot(&cx, &snapshot).await?;
             if let Some((root_page, table)) = temp_table_snapshot {
                 self.db.borrow_mut().tables.insert(root_page, table);
             }
@@ -41294,10 +42459,49 @@ impl Connection {
     /// the ordinary ALTER machinery can rewrite its pager root and catalog
     /// row. The connection-local TEMP table is restored as the unqualified
     /// binding before this function returns, on both success and failure.
-    fn execute_alter_drop_on_shadowed_main(
+    async fn execute_alter_drop_on_shadowed_main(
         &self,
         alter: &fsqlite_ast::AlterTableStatement,
     ) -> Result<()> {
+        struct ShadowedMainRestore<'a> {
+            connection: &'a Connection,
+            table_name_lc: String,
+            visible_slot: usize,
+            temp_table: Option<TableSchema>,
+            temp_rowid_alias: Option<usize>,
+        }
+
+        impl Drop for ShadowedMainRestore<'_> {
+            fn drop(&mut self) {
+                let Some(temp_table) = self.temp_table.take() else {
+                    return;
+                };
+                let updated_main = {
+                    let mut schema = self.connection.schema.borrow_mut();
+                    std::mem::replace(&mut schema[self.visible_slot], temp_table)
+                };
+                self.connection
+                    .shadowed_main_tables
+                    .borrow_mut()
+                    .insert(self.table_name_lc.clone(), updated_main);
+                self.connection
+                    .rowid_alias_columns
+                    .borrow_mut()
+                    .remove(&self.table_name_lc);
+                if let Some(temp_alias) = self.temp_rowid_alias {
+                    self.connection
+                        .rowid_alias_columns
+                        .borrow_mut()
+                        .insert(self.table_name_lc.clone(), temp_alias);
+                }
+                self.connection
+                    .temp_table_names
+                    .borrow_mut()
+                    .insert(self.table_name_lc.clone());
+                self.connection.rebuild_schema_indices();
+            }
+        }
+
         let table_name_lc = alter.table.name.to_ascii_lowercase();
         let visible_slot = self
             .schema
@@ -41333,27 +42537,20 @@ impl Connection {
         self.temp_table_names.borrow_mut().remove(&table_name_lc);
         self.rebuild_schema_indices();
 
-        let result = self.execute_alter_table(alter);
-
-        let updated_main = {
-            let mut schema = self.schema.borrow_mut();
-            std::mem::replace(&mut schema[visible_slot], temp_table)
+        let _restore = ShadowedMainRestore {
+            connection: self,
+            table_name_lc,
+            visible_slot,
+            temp_table: Some(temp_table),
+            temp_rowid_alias,
         };
-        self.shadowed_main_tables
-            .borrow_mut()
-            .insert(table_name_lc.clone(), updated_main);
-        self.rowid_alias_columns.borrow_mut().remove(&table_name_lc);
-        if let Some(temp_alias) = temp_rowid_alias {
-            self.rowid_alias_columns
-                .borrow_mut()
-                .insert(table_name_lc.clone(), temp_alias);
-        }
-        self.temp_table_names.borrow_mut().insert(table_name_lc);
-        self.rebuild_schema_indices();
-        result
+        self.execute_visible_alter_drop_column(alter).await
     }
 
-    fn execute_alter_table_impl(&self, alter: &fsqlite_ast::AlterTableStatement) -> Result<()> {
+    async fn execute_alter_table_impl(
+        &self,
+        alter: &fsqlite_ast::AlterTableStatement,
+    ) -> Result<()> {
         let table_name = &alter.table.name;
         if matches!(alter.action, AlterTableAction::RenameTo(_))
             && self.has_live_vtab_instance(table_name)
@@ -41659,13 +42856,14 @@ impl Connection {
                 // the stored storage class matches a normal INSERT default (the
                 // read path applies the same coercion). bd-v7y8q. apply_affinity
                 // preserves NULL, so the no-default case stays NULL.
-                let default_for_existing_rows = default_value
-                    .as_deref()
-                    .map_or_else(
-                        || Ok(SqliteValue::Null),
-                        |default_sql| self.evaluate_column_default_value(Some(default_sql)),
-                    )?
-                    .apply_affinity(affinity_char_to_type(affinity));
+                let default_for_existing_rows = match default_value.as_deref() {
+                    Some(default_sql) => {
+                        self.evaluate_column_default_value(Some(default_sql))
+                            .await?
+                    }
+                    None => SqliteValue::Null,
+                }
+                .apply_affinity(affinity_char_to_type(affinity));
                 let mut schema = self.schema.borrow_mut();
                 let table = schema
                     .iter_mut()
@@ -41991,14 +43189,16 @@ impl Connection {
                     }
                 }
                 for idx_name in &dropped_indexes {
-                    self.delete_sqlite_master_typed_row("index", idx_name)?;
+                    self.delete_sqlite_master_typed_row("index", idx_name)
+                        .await?;
                 }
                 // Physically rewrite stored rows to drop the column's record slot
                 // so trailing columns realign on read (the read path decodes by
                 // physical slot index). `col_idx` is the dropped column's position
                 // in the pre-drop schema, which equals its physical record slot.
                 // bd-nb2j9 / bd-w50nr.
-                self.rewrite_table_records_remove_slot(table_name, col_idx)?;
+                self.rewrite_table_records_remove_slot(table_name, col_idx)
+                    .await?;
                 table_clone
             }
         };
@@ -42052,7 +43252,8 @@ impl Connection {
                         .borrow_mut()
                         .insert(new_key.clone(), seq);
                 }
-                self.rename_sqlite_sequence_entry(&old_name, new_name)?;
+                self.rename_sqlite_sequence_entry(&old_name, new_name)
+                    .await?;
             }
         }
 
@@ -42072,19 +43273,22 @@ impl Connection {
                 &new_schema.name,
                 &new_schema.name,
                 &create_sql,
-            )?;
+            )
+            .await?;
 
             // Also update sqlite_master tbl_name for indexes.
             if let AlterTableAction::RenameTo(new_name) = &alter.action {
                 for (old_index_name, new_index_name, root_page) in &renamed_autoindex_master_rows {
-                    self.delete_sqlite_master_typed_row("index", old_index_name)?;
+                    self.delete_sqlite_master_typed_row("index", old_index_name)
+                        .await?;
                     self.insert_sqlite_master_row_with_sql(
                         "index",
                         new_index_name,
                         new_name,
                         *root_page,
                         None,
-                    )?;
+                    )
+                    .await?;
                 }
                 for index in &new_schema.indexes {
                     if self.index_is_implicit_autoindex(&index.name, new_name) {
@@ -42096,7 +43300,8 @@ impl Connection {
                         &index.name,
                         new_name,
                         Some(&idx_sql),
-                    )?;
+                    )
+                    .await?;
                 }
             }
         } else {
@@ -42106,14 +43311,16 @@ impl Connection {
             // expects table entries to appear before their index entries.
             // A delete+reinsert would assign a new (higher) rowid,
             // corrupting the schema for tables that already have indexes.
-            self.update_sqlite_master_typed_sql("table", &old_name, &create_sql)?;
+            self.update_sqlite_master_typed_sql("table", &old_name, &create_sql)
+                .await?;
             if matches!(alter.action, AlterTableAction::RenameColumn { .. }) {
                 for index in &new_schema.indexes {
                     if self.index_is_implicit_autoindex(&index.name, &new_schema.name) {
                         continue;
                     }
                     let idx_sql = render_create_index_sql(index, &new_schema.name);
-                    self.update_sqlite_master_typed_sql("index", &index.name, &idx_sql)?;
+                    self.update_sqlite_master_typed_sql("index", &index.name, &idx_sql)
+                        .await?;
                 }
             }
         }
@@ -42123,10 +43330,12 @@ impl Connection {
                 self.is_autoincrement_table(&dependent_table.name),
                 |index| self.index_is_implicit_autoindex(&index.name, &dependent_table.name),
             );
-            self.update_sqlite_master_typed_sql("table", &dependent_table.name, &create_sql)?;
+            self.update_sqlite_master_typed_sql("table", &dependent_table.name, &create_sql)
+                .await?;
         }
         for (view_name, view_sql) in &dependent_view_sql_updates {
-            self.update_sqlite_master_typed_sql("view", view_name, view_sql)?;
+            self.update_sqlite_master_typed_sql("view", view_name, view_sql)
+                .await?;
         }
         for (trigger_name, table_name, trigger_sql) in &dependent_trigger_sql_updates {
             self.update_sqlite_master_typed_tbl_name_and_sql(
@@ -42134,14 +43343,15 @@ impl Connection {
                 trigger_name,
                 table_name,
                 Some(trigger_sql),
-            )?;
+            )
+            .await?;
         }
 
         // ALTER TABLE may have renamed the table or changed its column list.
         // Refresh the name side-index so subsequent lookups hit the new name.
         self.rebuild_schema_indices();
         self.validate_schema_index();
-        self.increment_schema_cookie()?;
+        self.increment_schema_cookie().await?;
         Ok(())
     }
 
@@ -42618,7 +43828,7 @@ impl Connection {
             .collect())
     }
 
-    fn backfill_index(&self, table: &TableSchema, index: &IndexSchema) -> Result<()> {
+    async fn backfill_index(&self, table: &TableSchema, index: &IndexSchema) -> Result<()> {
         let is_expression_index = index.columns.is_empty() && !index.key_expressions.is_empty();
         let idx_col_positions: Vec<usize> = if is_expression_index {
             Vec::new()
@@ -42665,10 +43875,11 @@ impl Connection {
             where_expr.as_ref(),
         )?;
         self.execute_table_program(&program, None, false)
+            .await
             .map(|_| ())
     }
 
-    fn validate_vacuum_rebuild(
+    async fn validate_vacuum_rebuild(
         &self,
         rebuild_target: &crate::vacuum::VacuumTargetReservation,
     ) -> Result<()> {
@@ -42684,22 +43895,24 @@ impl Connection {
             rebuild_path_text.to_owned(),
             rebuild_target.identity(),
         )
+        .await
         .map_err(|err| {
             FrankenError::Internal(format!(
                 "VACUUM rebuilt image failed identity-bound pre-publication schema reload: {err}"
             ))
         })?;
         #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
-        let validation_conn =
-            Self::open_schema_only(rebuild_path_text.to_owned()).map_err(|err| {
+        let validation_conn = Self::open_schema_only(rebuild_path_text.to_owned())
+            .await
+            .map_err(|err| {
                 FrankenError::Internal(format!(
                     "VACUUM rebuilt image failed pre-publication schema reload: {err}"
                 ))
             })?;
 
-        let validation_result = (|| {
+        let validation_result = async {
             for pragma in ["quick_check", "integrity_check"] {
-                let rows = validation_conn.query(&format!("PRAGMA {pragma};"))?;
+                let rows = validation_conn.query(&format!("PRAGMA {pragma};")).await?;
                 let passed = rows.len() == 1
                     && matches!(
                         rows[0].values().first(),
@@ -42723,8 +43936,9 @@ impl Connection {
                 }
             }
             Ok(())
-        })();
-        let close_result = validation_conn.close();
+        }
+        .await;
+        let close_result = validation_conn.close().await;
         validation_result?;
         close_result?;
 
@@ -42743,7 +43957,7 @@ impl Connection {
     /// operation is no longer optional: exposing stale root-page bindings
     /// after publication is more dangerous than delaying cancellation until
     /// the connection is coherent again.
-    fn rebind_after_committed_vacuum(
+    async fn rebind_after_committed_vacuum(
         &self,
         parent_cx: &Cx,
         restore_hydrated_rows: bool,
@@ -42751,8 +43965,8 @@ impl Connection {
         let rebind_cx = parent_cx.create_child();
         let _rebind_mask = rebind_cx.masked();
         self.clear_compilation_reuse_caches();
-        self.invalidate_cached_read_snapshot(&rebind_cx);
-        self.invalidate_cached_write_txn(&rebind_cx);
+        self.invalidate_cached_read_snapshot(&rebind_cx).await;
+        self.invalidate_cached_write_txn(&rebind_cx).await;
 
         #[cfg(test)]
         let rebind_result = if self.fail_vacuum_rebind_once.replace(false) {
@@ -42761,10 +43975,12 @@ impl Connection {
             ))
         } else {
             self.reload_memdb_from_pager_with_mode(&rebind_cx, restore_hydrated_rows)
+                .await
         };
         #[cfg(not(test))]
         let rebind_result =
-            self.reload_memdb_from_pager_with_mode(&rebind_cx, restore_hydrated_rows);
+            self.reload_memdb_from_pager_with_mode(&rebind_cx, restore_hydrated_rows)
+                .await;
 
         if let Err(error) = rebind_result {
             let detail = error.to_string();
@@ -42776,7 +43992,7 @@ impl Connection {
         Ok(())
     }
 
-    fn execute_vacuum(
+    async fn execute_vacuum(
         &self,
         vacuum_stmt: &fsqlite_ast::VacuumStatement,
         params: Option<&[SqliteValue]>,
@@ -42805,18 +44021,30 @@ impl Connection {
                 has_into = vacuum_stmt.into.is_some(),
                 "delegating attached-schema VACUUM target"
             );
-            return self.with_attached_connection(&attached_schema, |conn| {
-                conn.execute_vacuum(&rewritten, params)
-            });
+            return self
+                .with_attached_connection_async(&attached_schema, async |conn| {
+                    conn.execute_vacuum_main(&rewritten, params).await
+                })
+                .await;
         }
+        self.execute_vacuum_main(vacuum_stmt, params).await
+    }
+
+    async fn execute_vacuum_main(
+        &self,
+        vacuum_stmt: &fsqlite_ast::VacuumStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<()> {
         if self.in_transaction.get() || !self.savepoints.borrow().is_empty() {
             return Err(FrankenError::VacuumWithinTransaction);
         }
 
         let cx = self.op_cx()?;
-        self.quiesce_pager_export_state(&cx)?;
+        self.quiesce_pager_export_state(&cx).await?;
         if self.pager.journal_mode() == JournalMode::Wal {
-            self.pager.checkpoint(&cx, CheckpointMode::Truncate)?;
+            self.pager
+                .checkpoint(&cx, CheckpointMode::Truncate)
+                .await?;
         }
 
         // Evaluate the INTO expression before touching the source, but defer
@@ -42833,29 +44061,29 @@ impl Connection {
             let empty_row: Vec<SqliteValue> = Vec::new();
             let empty_col_map: Vec<(String, String, bool)> = Vec::new();
             let target_value =
-                self.eval_expr_with_subqueries(&bound_expr, &empty_row, &empty_col_map, None)?;
+                self.eval_expr_with_subqueries(&bound_expr, &empty_row, &empty_col_map, None).await?;
             Some(target_value)
         } else {
             None
         };
 
         let source_receipt = if self.path != ":memory:" {
-            Some(self.pager.capture_vacuum_source_image(&cx)?)
+            Some(self.pager.capture_vacuum_source_image(&cx).await?)
         } else {
             None
         };
         let restore_hydrated_rows = self.memdb_rows_loaded.get();
         let source_header = match source_receipt.as_ref() {
             Some(receipt) => receipt.header().clone(),
-            None => self.current_database_header(&cx)?,
+            None => self.current_database_header(&cx).await?,
         };
         #[cfg(test)]
         if let Some(hook) = self.vacuum_after_source_receipt_once.borrow_mut().take() {
             hook();
         }
-        self.reload_memdb_from_pager_with_mode(&cx, true)?;
+        self.reload_memdb_from_pager_with_mode(&cx, true).await?;
         if let Some(source_receipt) = source_receipt.as_ref() {
-            let hydrated_source_receipt = self.pager.capture_vacuum_source_image(&cx)?;
+            let hydrated_source_receipt = self.pager.capture_vacuum_source_image(&cx).await?;
             if hydrated_source_receipt != *source_receipt {
                 return Err(FrankenError::BusySnapshot {
                     conflicting_pages:
@@ -42881,9 +44109,9 @@ impl Connection {
         };
 
         let persistence_result = {
-            let schema = self.schema.borrow();
-            let db = self.db.borrow();
-            let ddl = self.original_ddl_sql.borrow();
+            let schema = self.schema.borrow().clone();
+            let db = self.db.borrow().clone();
+            let ddl = self.original_ddl_sql.borrow().clone();
 
             if let Some(target) = target_reservation.as_ref() {
                 crate::vacuum::persist_compacted_database(
@@ -42895,6 +44123,7 @@ impl Connection {
                     &extra_master_entries,
                     &ddl,
                 )
+                .await
             } else if let Some(rebuild_target) = rebuild_target.as_ref() {
                 let mut rebuilt_header = source_header.clone();
                 rebuilt_header.change_counter =
@@ -42910,6 +44139,7 @@ impl Connection {
                     &extra_master_entries,
                     &ddl,
                 )
+                .await
             } else {
                 Ok(())
             }
@@ -42932,10 +44162,11 @@ impl Connection {
         if let Some(target) = target_reservation.as_ref() {
             match target.kind() {
                 crate::vacuum::VacuumTargetKind::UserOutput => {
-                    let finalization_result = (|| -> Result<DatabaseImageReceipt> {
+                    let finalization_result = async {
                         let persisted_candidate = self
                             .pager
-                            .inspect_self_contained_database_image(&cx, target.path())?;
+                            .inspect_self_contained_database_image(&cx, target.path())
+                            .await?;
                         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
                         if persisted_candidate.identity() != target.identity() {
                             return Err(FrankenError::DatabaseCorrupt {
@@ -42944,7 +44175,7 @@ impl Connection {
                             });
                         }
 
-                        self.validate_vacuum_rebuild(target)?;
+                        self.validate_vacuum_rebuild(target).await?;
                         #[cfg(test)]
                         if let Some(hook) =
                             self.vacuum_after_target_validation_once.borrow_mut().take()
@@ -42954,7 +44185,8 @@ impl Connection {
 
                         let validated_candidate = self
                             .pager
-                            .inspect_self_contained_database_image(&cx, target.path())?;
+                            .inspect_self_contained_database_image(&cx, target.path())
+                            .await?;
                         if validated_candidate != persisted_candidate {
                             return Err(FrankenError::DatabaseCorrupt {
                                 detail: "VACUUM INTO candidate identity or content changed during semantic validation"
@@ -42965,7 +44197,8 @@ impl Connection {
                         target.finish_user_output(&cx)?;
                         let durable_candidate = self
                             .pager
-                            .inspect_self_contained_database_image(&cx, target.path())?;
+                            .inspect_self_contained_database_image(&cx, target.path())
+                            .await?;
                         if durable_candidate != validated_candidate {
                             return Err(FrankenError::DatabaseCorrupt {
                                 detail: "VACUUM INTO candidate identity or content changed across its durability barrier"
@@ -42973,7 +44206,8 @@ impl Connection {
                             });
                         }
                         Ok(durable_candidate)
-                    })();
+                    }
+                    .await;
 
                     let candidate_receipt = match finalization_result {
                         Ok(receipt) => receipt,
@@ -43011,7 +44245,8 @@ impl Connection {
             })?;
             let persisted_candidate = self
                 .pager
-                .inspect_database_image(&cx, rebuild_target.path())?;
+                .inspect_database_image(&cx, rebuild_target.path())
+                .await?;
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             if persisted_candidate.identity() != rebuild_target.identity() {
                 return Err(FrankenError::DatabaseCorrupt {
@@ -43028,11 +44263,13 @@ impl Connection {
                 rebuild_target.path(),
                 &persisted_candidate,
                 expected_change_counter,
-            )?;
-            self.validate_vacuum_rebuild(rebuild_target)?;
+            )
+            .await?;
+            self.validate_vacuum_rebuild(rebuild_target).await?;
             let candidate_receipt = self
                 .pager
-                .inspect_database_image(&cx, rebuild_target.path())?;
+                .inspect_database_image(&cx, rebuild_target.path())
+                .await?;
             if candidate_receipt != restored_candidate {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: "VACUUM rebuilt image changed during semantic validation".to_owned(),
@@ -43054,7 +44291,8 @@ impl Connection {
                 rebuild_target.path(),
                 source_receipt,
                 &candidate_receipt,
-            )?;
+            )
+            .await?;
 
             #[cfg(test)]
             if self.cancel_vacuum_after_publish_once.replace(false) {
@@ -43076,13 +44314,17 @@ impl Connection {
                 ),
             }
             drop(_cleanup_mask);
-            self.rebind_after_committed_vacuum(&cx, restore_hydrated_rows)?;
+            self.rebind_after_committed_vacuum(&cx, restore_hydrated_rows)
+                .await?;
             return Ok(());
         }
 
-        self.invalidate_cached_read_snapshot(&cx);
-        self.invalidate_cached_write_txn(&cx);
-        if let Err(error) = self.reload_memdb_from_pager_with_mode(&cx, restore_hydrated_rows) {
+        self.invalidate_cached_read_snapshot(&cx).await;
+        self.invalidate_cached_write_txn(&cx).await;
+        if let Err(error) = self
+            .reload_memdb_from_pager_with_mode(&cx, restore_hydrated_rows)
+            .await
+        {
             if let Some(target) = target_reservation.as_ref()
                 && let Err(cleanup_error) = target.cleanup_if_owned(&cx)
             {
@@ -43101,7 +44343,8 @@ impl Connection {
             })?;
             let final_receipt = self
                 .pager
-                .inspect_self_contained_database_image(&cx, target.path());
+                .inspect_self_contained_database_image(&cx, target.path())
+                .await;
             match final_receipt {
                 Ok(receipt) if receipt == *expected_receipt => {}
                 Ok(_) => {
@@ -43132,21 +44375,22 @@ impl Connection {
         Ok(())
     }
 
-    fn execute_analyze(&self, target: Option<&QualifiedName>) -> Result<()> {
+    async fn execute_analyze(&self, target: Option<&QualifiedName>) -> Result<()> {
         let plan = self.resolve_analyze_plan(target)?;
         if plan.ensure_stat_table {
-            self.ensure_sqlite_stat1_table_exists()?;
+            self.ensure_sqlite_stat1_table_exists().await?;
         }
         if plan.targets.is_empty() {
             return Ok(());
         }
 
-        self.with_pager_write_txn(|cx, txn| {
+        self.with_pager_write_txn(async |cx, txn| {
             let mut replacement_rows = Vec::new();
             for target in &plan.targets {
                 if target.include_table_row {
-                    let row_count =
-                        self.count_btree_entries_in_txn(cx, txn, target.table.root_page, true)?;
+                    let row_count = self
+                        .count_btree_entries_in_txn(cx, txn, target.table.root_page, true)
+                        .await?;
                     if row_count > 0 {
                         replacement_rows.push(Stat1Row {
                             table_name: target.table.name.clone(),
@@ -43157,7 +44401,9 @@ impl Connection {
                 }
 
                 for index in &target.indexes {
-                    if let Some(stat) = Self::compute_index_stat_string_in_txn(cx, txn, index)? {
+                    if let Some(stat) =
+                        Self::compute_index_stat_string_in_txn(cx, txn, index).await?
+                    {
                         replacement_rows.push(Stat1Row {
                             table_name: target.table.name.clone(),
                             index_name: Some(index.name.clone()),
@@ -43168,27 +44414,31 @@ impl Connection {
             }
 
             self.rewrite_sqlite_stat1_rows_in_txn(cx, txn, &plan.targets, &replacement_rows)
-        })?;
+                .await
+        })
+        .await?;
         self.clear_compilation_reuse_caches();
         Ok(())
     }
 
-    fn execute_reindex(&self, target: Option<&QualifiedName>) -> Result<()> {
+    async fn execute_reindex(&self, target: Option<&QualifiedName>) -> Result<()> {
         let targets = self.resolve_reindex_targets(target)?;
         for target in targets {
-            self.with_pager_write_txn(|cx, txn| {
+            self.with_pager_write_txn(async |cx, txn| {
                 self.clear_btree_entries_in_txn(cx, txn, target.index.root_page, false)
-            })?;
+                    .await
+            })
+            .await?;
             self.db
                 .borrow_mut()
                 .create_table_at(target.index.root_page, 0);
-            self.backfill_index(&target.table, &target.index)?;
+            self.backfill_index(&target.table, &target.index).await?;
         }
         Ok(())
     }
 
     /// Execute a CREATE INDEX statement, allocating a B-tree root page.
-    fn execute_create_index(&self, stmt: &fsqlite_ast::CreateIndexStatement) -> Result<()> {
+    async fn execute_create_index(&self, stmt: &fsqlite_ast::CreateIndexStatement) -> Result<()> {
         let table_name = &stmt.table;
         let index_name = stmt.name.name.clone();
         let target_is_temp = self
@@ -43364,7 +44614,9 @@ impl Connection {
         };
 
         // Phase 3: Allocate index B-tree root page (no borrow held)
-        let root_page = self.allocate_schema_table_root(target_is_temp, 0, true)?;
+        let root_page = self
+            .allocate_schema_table_root(target_is_temp, 0, true)
+            .await?;
 
         // Phase 5: Record index in schema (with mut borrow)
         {
@@ -43412,10 +44664,11 @@ impl Connection {
                 table_name,
                 root_page,
                 &create_sql,
-            )?;
+            )
+            .await?;
         }
 
-        self.increment_schema_cookie()?;
+        self.increment_schema_cookie().await?;
 
         // Phase 7: Backfill existing table rows into the new index.
         // SQLite populates a new index with all current table data during
@@ -43443,7 +44696,7 @@ impl Connection {
                 })?;
             (table, index)
         };
-        self.backfill_index(&table, &index)?;
+        self.backfill_index(&table, &index).await?;
 
         Ok(())
     }
@@ -43589,7 +44842,7 @@ impl Connection {
     }
 
     /// Execute a CREATE VIEW statement (store definition in memory).
-    fn execute_create_view(&self, stmt: &fsqlite_ast::CreateViewStatement) -> Result<()> {
+    async fn execute_create_view(&self, stmt: &fsqlite_ast::CreateViewStatement) -> Result<()> {
         let view_name = &stmt.name.name;
         let views = self.views.borrow();
         if views.iter().any(|v| v.name.eq_ignore_ascii_case(view_name)) {
@@ -43627,14 +44880,18 @@ impl Connection {
         });
         self.rebuild_schema_indices();
 
-        self.insert_sqlite_master_row("view", view_name, view_name, 0, &create_sql)?;
+        self.insert_sqlite_master_row("view", view_name, view_name, 0, &create_sql)
+            .await?;
 
-        self.increment_schema_cookie()?;
+        self.increment_schema_cookie().await?;
         Ok(())
     }
 
     /// Execute a CREATE TRIGGER statement.
-    fn execute_create_trigger(&self, stmt: &fsqlite_ast::CreateTriggerStatement) -> Result<()> {
+    async fn execute_create_trigger(
+        &self,
+        stmt: &fsqlite_ast::CreateTriggerStatement,
+    ) -> Result<()> {
         let trigger_name = &stmt.name.name;
         let table_name = &stmt.table;
 
@@ -43688,10 +44945,11 @@ impl Connection {
 
         // TEMP triggers are connection-local and not persisted to sqlite_master.
         if !stmt.temporary {
-            self.insert_sqlite_master_row("trigger", trigger_name, table_name, 0, &create_sql)?;
+            self.insert_sqlite_master_row("trigger", trigger_name, table_name, 0, &create_sql)
+                .await?;
         }
 
-        self.increment_schema_cookie()?;
+        self.increment_schema_cookie().await?;
         Ok(())
     }
 
@@ -43766,18 +45024,19 @@ impl Connection {
 
     /// Recheck every deferred FK parent-existence constraint accumulated during
     /// the transaction.  Returns the first violation (if any).  Called at COMMIT.
-    fn recheck_deferred_fk_at_commit(&self) -> Result<()> {
+    async fn recheck_deferred_fk_at_commit(&self) -> Result<()> {
         let pending = std::mem::take(&mut *self.deferred_fk_checks.borrow_mut());
         if pending.is_empty() {
             return Ok(());
         }
         self.fk_force_immediate_check.set(true);
-        let result = (|| {
+        let result: Result<()> = async {
             for (table_name, row_values) in &pending {
-                self.check_fk_parent_exists(table_name, row_values)?;
+                self.check_fk_parent_exists(table_name, row_values).await?;
             }
             Ok(())
-        })();
+        }
+        .await;
         self.fk_force_immediate_check.set(false);
         result
     }
@@ -43786,14 +45045,14 @@ impl Connection {
     ///
     /// This resolves inserted row values in table-column order (including
     /// DEFAULT handling) and validates each row against parent FK targets.
-    fn enforce_fk_on_insert(
+    async fn enforce_fk_on_insert(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         table_name: &str,
         params: Option<&[SqliteValue]>,
     ) -> Result<()> {
-        for row_values in self.collect_insert_trigger_rows(insert, params)? {
-            self.check_fk_parent_exists(table_name, &row_values)?;
+        for row_values in self.collect_insert_trigger_rows(insert, params).await? {
+            self.check_fk_parent_exists(table_name, &row_values).await?;
         }
         Ok(())
     }
@@ -43803,7 +45062,11 @@ impl Connection {
     /// `table_name` is the child table being inserted into.
     /// `row_values` are the column values for the inserted row (in storage
     /// order, matching `TableSchema.columns`).
-    fn check_fk_parent_exists(&self, table_name: &str, row_values: &[SqliteValue]) -> Result<()> {
+    async fn check_fk_parent_exists(
+        &self,
+        table_name: &str,
+        row_values: &[SqliteValue],
+    ) -> Result<()> {
         let schema = self.schema.borrow();
         let table = schema
             .iter()
@@ -43909,7 +45172,7 @@ impl Connection {
             // `fk_validation_query` which forces a fresh execution context
             // (bypassing the prepared-statement ad-hoc reuse path and
             // explicitly refreshing stale memdb state before execution).
-            let rows = self.fk_validation_query(&sql, &params)?;
+            let rows = self.fk_validation_query(&sql, &params).await?;
             if rows.is_empty() {
                 if self.fk_should_defer(fk) {
                     if !deferred_recorded {
@@ -44102,7 +45365,7 @@ impl Connection {
     ///    prior operations. This eliminates any possibility of stale
     ///    cursor state from a previous prepared-statement execution
     ///    interfering with the FK validation read.
-    fn fk_validation_query(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
+    async fn fk_validation_query(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
         // Force any pending memdb writes to be visible before the FK check.
         // This is critical after DML operations (INSERT/UPDATE/DELETE) that
         // dirty the memdb within the same transaction. Without this,
@@ -44112,7 +45375,7 @@ impl Connection {
             || !self.pending_memdb_direct_upserts.borrow().is_empty()
         {
             let cx = self.op_cx_after_background_status();
-            self.refresh_memdb_from_active_txn_if_dirty(&cx)?;
+            self.refresh_memdb_from_active_txn_if_dirty(&cx).await?;
         }
 
         // Discard any cached VDBE engine. This ensures the FK validation
@@ -44127,14 +45390,14 @@ impl Connection {
         // Use the normal query path. The memdb refresh above ensures the
         // MemDatabase reflects all in-transaction writes, and the engine
         // discard ensures completely fresh execution context.
-        self.query_with_params(sql, params)
+        self.query_with_params(sql, params).await
     }
 
     /// Verify that no child table references a row being deleted from `table_name`.
     ///
     /// `row_values` are the column values of the row about to be deleted.
     /// Returns `Ok(())` if deletion is allowed, or an error/cascade action.
-    fn check_fk_on_delete(
+    async fn check_fk_on_delete(
         &self,
         table_name: &str,
         row_values: &[SqliteValue],
@@ -44220,7 +45483,7 @@ impl Connection {
                 where_parts.join(" AND ")
             );
             // bd-issue59: Use fk_validation_query for consistent FK checking.
-            let rows = self.fk_validation_query(&sql, &parent_values)?;
+            let rows = self.fk_validation_query(&sql, &parent_values).await?;
             if !rows.is_empty() {
                 // Children exist — action depends on ON DELETE clause.
                 match fk.on_delete {
@@ -44281,7 +45544,7 @@ impl Connection {
     }
 
     /// Execute FK cascade/set-null actions for a DELETE operation.
-    fn execute_fk_delete_action(&self, action: &FkDeleteAction) -> Result<()> {
+    async fn execute_fk_delete_action(&self, action: &FkDeleteAction) -> Result<()> {
         match action {
             FkDeleteAction::Allow => Ok(()),
             FkDeleteAction::Cascade {
@@ -44300,7 +45563,7 @@ impl Connection {
                     where_parts.join(" AND ")
                 );
                 self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
-                let result = self.execute_with_params(&sql, parent_values);
+                let result = self.execute_with_params(&sql, parent_values).await;
                 self.fk_cascade_depth.set(self.fk_cascade_depth.get() - 1);
                 result?;
                 Ok(())
@@ -44326,7 +45589,7 @@ impl Connection {
                     where_parts.join(" AND ")
                 );
                 self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
-                let result = self.execute_with_params(&sql, parent_values);
+                let result = self.execute_with_params(&sql, parent_values).await;
                 self.fk_cascade_depth.set(self.fk_cascade_depth.get() - 1);
                 result?;
                 Ok(())
@@ -44354,7 +45617,7 @@ impl Connection {
                     where_parts.join(" AND ")
                 );
                 self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
-                let result = self.execute_with_params(&sql, parent_values);
+                let result = self.execute_with_params(&sql, parent_values).await;
                 self.fk_cascade_depth.set(self.fk_cascade_depth.get() - 1);
                 result?;
                 Ok(())
@@ -44366,7 +45629,7 @@ impl Connection {
     ///
     /// `old_values` are the column values before the update.
     /// `new_values` are the column values after the update.
-    fn check_fk_on_update(
+    async fn check_fk_on_update(
         &self,
         table_name: &str,
         old_values: &[SqliteValue],
@@ -44470,7 +45733,7 @@ impl Connection {
                 where_parts.join(" AND ")
             );
             // bd-issue59: Use fk_validation_query for consistent FK checking.
-            let rows = self.fk_validation_query(&sql, &old_parent_vals)?;
+            let rows = self.fk_validation_query(&sql, &old_parent_vals).await?;
             if !rows.is_empty() {
                 match fk.on_update {
                     fsqlite_vdbe::codegen::FkActionType::Cascade => {
@@ -44509,7 +45772,7 @@ impl Connection {
     }
 
     /// Execute FK cascade/set-null actions for an UPDATE operation.
-    fn execute_fk_update_action(&self, action: &FkUpdateAction) -> Result<()> {
+    async fn execute_fk_update_action(&self, action: &FkUpdateAction) -> Result<()> {
         match action {
             FkUpdateAction::Allow => Ok(()),
             FkUpdateAction::Cascade {
@@ -44543,7 +45806,7 @@ impl Connection {
                 let mut params = new_parent_values.clone();
                 params.extend_from_slice(old_parent_values);
                 self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
-                let result = self.execute_with_params(&sql, &params);
+                let result = self.execute_with_params(&sql, &params).await;
                 self.fk_cascade_depth.set(self.fk_cascade_depth.get() - 1);
                 result?;
                 Ok(())
@@ -44569,7 +45832,7 @@ impl Connection {
                     where_parts.join(" AND ")
                 );
                 self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
-                let result = self.execute_with_params(&sql, old_parent_values);
+                let result = self.execute_with_params(&sql, old_parent_values).await;
                 self.fk_cascade_depth.set(self.fk_cascade_depth.get() - 1);
                 result?;
                 Ok(())
@@ -44597,7 +45860,7 @@ impl Connection {
                     where_parts.join(" AND ")
                 );
                 self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
-                let result = self.execute_with_params(&sql, old_parent_values);
+                let result = self.execute_with_params(&sql, old_parent_values).await;
                 self.fk_cascade_depth.set(self.fk_cascade_depth.get() - 1);
                 result?;
                 Ok(())
@@ -44619,7 +45882,7 @@ impl Connection {
         })
     }
 
-    fn apply_trigger_raise(
+    async fn apply_trigger_raise(
         &self,
         directive: TriggerRaiseDirective,
     ) -> Result<TriggerStatementOutcome> {
@@ -44651,19 +45914,19 @@ impl Connection {
                     self.in_transaction.get() || self.active_txn_is_open_or_borrowed();
                 if has_active_txn {
                     let rollback_stmt = fsqlite_ast::RollbackStatement { to_savepoint: None };
-                    self.execute_rollback(&rollback_stmt)?;
+                    self.execute_rollback(&rollback_stmt).await?;
                 }
                 Err(FrankenError::TransactionRolledBack { reason })
             }
         }
     }
 
-    fn execute_bound_trigger_statement(
+    async fn execute_bound_trigger_statement(
         &self,
         statement: Statement,
     ) -> Result<TriggerStatementOutcome> {
         if let Some(directive) = trigger_statement_raise_directive(&statement)? {
-            return self.apply_trigger_raise(directive);
+            return self.apply_trigger_raise(directive).await;
         }
         // If trigger_statement_raise_directive returned None for a SELECT
         // whose result column is a RAISE expression, the WHERE condition
@@ -44687,7 +45950,7 @@ impl Connection {
                     .to_owned(),
             });
         }
-        self.execute_statement(&statement, None)?;
+        self.execute_statement(&statement, None).await?;
         Ok(TriggerStatementOutcome::Continue)
     }
 
@@ -44695,7 +45958,7 @@ impl Connection {
     ///
     /// Returns `true` if any trigger executed RAISE(IGNORE), indicating the DML
     /// operation should be skipped entirely.
-    fn fire_before_triggers(
+    async fn fire_before_triggers(
         &self,
         table_name: &str,
         event: &fsqlite_ast::TriggerEvent,
@@ -44751,7 +46014,7 @@ impl Connection {
             frame.trigger_name.clone_from(&trigger.name);
             let _frame_guard = self.push_trigger_frame(frame.clone());
             // Evaluate the bound WHEN predicate against the current OLD/NEW frame.
-            if !trigger_when_matches(self, trigger.when_clause.as_ref(), Some(&frame))? {
+            if !trigger_when_matches(self, trigger.when_clause.as_ref(), Some(&frame)).await? {
                 continue;
             }
 
@@ -44759,7 +46022,7 @@ impl Connection {
             for stmt in &trigger.body {
                 let mut bound_stmt = stmt.clone();
                 bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
-                match self.execute_bound_trigger_statement(bound_stmt)? {
+                match self.execute_bound_trigger_statement(bound_stmt).await? {
                     TriggerStatementOutcome::Continue => {}
                     TriggerStatementOutcome::SkipDml => return Ok(true),
                 }
@@ -44770,7 +46033,7 @@ impl Connection {
     }
 
     /// Fire AFTER triggers for a DML event on a table.
-    fn fire_after_triggers(
+    async fn fire_after_triggers(
         &self,
         table_name: &str,
         event: &fsqlite_ast::TriggerEvent,
@@ -44820,7 +46083,7 @@ impl Connection {
             let mut frame = base_frame.clone();
             frame.trigger_name.clone_from(&trigger.name);
             let _frame_guard = self.push_trigger_frame(frame.clone());
-            if !trigger_when_matches(self, trigger.when_clause.as_ref(), Some(&frame))? {
+            if !trigger_when_matches(self, trigger.when_clause.as_ref(), Some(&frame)).await? {
                 continue;
             }
 
@@ -44828,7 +46091,7 @@ impl Connection {
             for stmt in &trigger.body {
                 let mut bound_stmt = stmt.clone();
                 bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
-                match self.execute_bound_trigger_statement(bound_stmt)? {
+                match self.execute_bound_trigger_statement(bound_stmt).await? {
                     TriggerStatementOutcome::Continue => {}
                     TriggerStatementOutcome::SkipDml => return Ok(()),
                 }
@@ -44842,7 +46105,7 @@ impl Connection {
     /// matching INSTEAD OF trigger, run the trigger body (binding NEW/OLD) and
     /// return `Some(rows)`. Otherwise return `None` so the caller falls through
     /// to normal DML handling. bd-ffkpv.
-    fn maybe_execute_instead_of_view_dml(
+    async fn maybe_execute_instead_of_view_dml(
         &self,
         statement: &Statement,
         params: Option<&[SqliteValue]>,
@@ -44851,9 +46114,15 @@ impl Connection {
             return Ok(None);
         }
         let rows = match statement {
-            Statement::Insert(insert) => self.execute_instead_of_view_insert(insert, params)?,
-            Statement::Update(update) => self.execute_instead_of_view_update(update, params)?,
-            Statement::Delete(delete) => self.execute_instead_of_view_delete(delete, params)?,
+            Statement::Insert(insert) => {
+                self.execute_instead_of_view_insert(insert, params).await?
+            }
+            Statement::Update(update) => {
+                self.execute_instead_of_view_update(update, params).await?
+            }
+            Statement::Delete(delete) => {
+                self.execute_instead_of_view_delete(delete, params).await?
+            }
             _ => return Ok(None),
         };
         Ok(Some(rows))
@@ -44922,14 +46191,16 @@ impl Connection {
 
     /// INSERT INTO <view> with an INSTEAD OF INSERT trigger: build a NEW
     /// pseudo-row per source row (aligned to the view's columns) and fire.
-    fn execute_instead_of_view_insert(
+    async fn execute_instead_of_view_insert(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         let view_name = insert.table.name.clone();
         let column_names = self.view_trigger_column_names(&view_name)?;
-        let new_rows = self.collect_view_insert_new_rows(insert, &column_names, params)?;
+        let new_rows = self
+            .collect_view_insert_new_rows(insert, &column_names, params)
+            .await?;
         let event = fsqlite_ast::TriggerEvent::Insert;
         for new_values in &new_rows {
             self.fire_instead_of_triggers(
@@ -44938,7 +46209,8 @@ impl Connection {
                 &event,
                 None,
                 Some(new_values),
-            )?;
+            )
+            .await?;
         }
         Ok(Vec::new())
     }
@@ -44946,20 +46218,22 @@ impl Connection {
     /// UPDATE <view> with an INSTEAD OF UPDATE trigger: materialize the matched
     /// view rows (OLD), apply the SET assignments to compute NEW, and fire the
     /// trigger once per matched row.
-    fn execute_instead_of_view_update(
+    async fn execute_instead_of_view_update(
         &self,
         update: &fsqlite_ast::UpdateStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         let view_name = update.table.name.name.clone();
         let column_names = self.view_trigger_column_names(&view_name)?;
-        let matched_rows = self.select_matching_rows(
-            &update.table,
-            update.where_clause.as_ref(),
-            &[],
-            None,
-            params,
-        )?;
+        let matched_rows = self
+            .select_matching_rows(
+                &update.table,
+                update.where_clause.as_ref(),
+                &[],
+                None,
+                params,
+            )
+            .await?;
         if matched_rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -45000,21 +46274,22 @@ impl Connection {
                 &event,
                 Some(&old_values),
                 Some(&new_values),
-            )?;
+            )
+            .await?;
         }
         Ok(Vec::new())
     }
 
     /// DELETE FROM <view> with an INSTEAD OF DELETE trigger: materialize the
     /// matched view rows (OLD) and fire the trigger once per matched row.
-    fn execute_instead_of_view_delete(
+    async fn execute_instead_of_view_delete(
         &self,
         delete: &fsqlite_ast::DeleteStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         let view_name = delete.table.name.name.clone();
         let column_names = self.view_trigger_column_names(&view_name)?;
-        let old_rows = self.collect_delete_trigger_rows(delete, params)?;
+        let old_rows = self.collect_delete_trigger_rows(delete, params).await?;
         let event = fsqlite_ast::TriggerEvent::Delete;
         for old_values in &old_rows {
             self.fire_instead_of_triggers(
@@ -45023,7 +46298,8 @@ impl Connection {
                 &event,
                 Some(old_values),
                 None,
-            )?;
+            )
+            .await?;
         }
         Ok(Vec::new())
     }
@@ -45077,7 +46353,7 @@ impl Connection {
     /// Build NEW pseudo-rows (aligned to the view's columns) for an INSTEAD OF
     /// INSERT, taking values from the INSERT's column list / VALUES / SELECT.
     /// View columns not supplied by the INSERT are NULL (views have no defaults).
-    fn collect_view_insert_new_rows(
+    async fn collect_view_insert_new_rows(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         view_columns: &[String],
@@ -45116,14 +46392,15 @@ impl Connection {
                     for expr in &mut canonical {
                         canonicalize_expr_placeholders(expr, &mut bind_state)?;
                     }
-                    let source = self.evaluate_insert_source_row(&canonical, params)?;
+                    let source = self.evaluate_insert_source_row(&canonical, params).await?;
                     new_rows.push(align(&source));
                 }
                 Ok(new_rows)
             }
             fsqlite_ast::InsertSource::Select(select) => {
                 let source_rows =
-                    self.execute_statement(&Statement::Select(*select.clone()), params)?;
+                    self.execute_statement(&Statement::Select(*select.clone()), params)
+                    .await?;
                 Ok(source_rows.iter().map(|row| align(row.values())).collect())
             }
             fsqlite_ast::InsertSource::DefaultValues => {
@@ -45135,7 +46412,7 @@ impl Connection {
     /// Fire all INSTEAD OF triggers on `view_name` matching `event`, binding a
     /// frame with the supplied OLD/NEW rows (indexed by `column_names`).
     /// Mirrors `fire_after_triggers` but uses a view-derived frame (no rowid).
-    fn fire_instead_of_triggers(
+    async fn fire_instead_of_triggers(
         &self,
         view_name: &str,
         column_names: &[String],
@@ -45183,13 +46460,13 @@ impl Connection {
             let mut frame = base_frame.clone();
             frame.trigger_name.clone_from(&trigger.name);
             let _frame_guard = self.push_trigger_frame(frame.clone());
-            if !trigger_when_matches(self, trigger.when_clause.as_ref(), Some(&frame))? {
+            if !trigger_when_matches(self, trigger.when_clause.as_ref(), Some(&frame)).await? {
                 continue;
             }
             for stmt in &trigger.body {
                 let mut bound_stmt = stmt.clone();
                 bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
-                match self.execute_bound_trigger_statement(bound_stmt)? {
+                match self.execute_bound_trigger_statement(bound_stmt).await? {
                     TriggerStatementOutcome::Continue => {}
                     TriggerStatementOutcome::SkipDml => return Ok(()),
                 }
@@ -45244,7 +46521,7 @@ impl Connection {
 
     /// Materialize views referenced by a SELECT as temporary tables, execute
     /// the query, then clean up the temp tables.
-    fn execute_with_materialized_views(
+    async fn execute_with_materialized_views(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -45253,7 +46530,7 @@ impl Connection {
             .disable_mem_fallback_rejection_for_internal_scope("select", "view_materialization")?;
         let result = {
             let view_defs: Vec<ViewDef> = self.views.borrow().clone();
-            let mut materialized: Vec<(String, i32)> = Vec::new();
+            let mut materialized = MaterializedTablesCleanupGuard::new(self);
 
             // Collect view names referenced in FROM/JOIN.
             let schema = self.schema.borrow();
@@ -45279,7 +46556,7 @@ impl Connection {
             }
             drop(schema);
 
-            let exec_result = (|| -> Result<Vec<Row>> {
+            let exec_result = async {
                 // CRITICAL: probe pager-side cleanliness for `referenced.len()`
                 // contiguous root pages before any `create_table()` call below.
                 //
@@ -45302,7 +46579,8 @@ impl Connection {
                 // sqlite_schema fix never extended. UNION queries reach this
                 // path through `execute_compound_select` recursing into each
                 // arm's `execute_statement`.
-                self.reserve_clean_memdb_root_pages(referenced.len())?;
+                self.reserve_clean_memdb_root_pages(referenced.len())
+                    .await?;
 
                 // Materialize each referenced view as a temp table.
                 for ref_name in &referenced {
@@ -45315,8 +46593,9 @@ impl Connection {
                                 ref_name
                             ))
                         })?;
-                    let view_rows =
-                        self.execute_statement(&Statement::Select(view.query.clone()), params)?;
+                    let view_rows = self
+                        .execute_statement(&Statement::Select(view.query.clone()), params)
+                        .await?;
                     // bd-ws183: an explicit `CREATE VIEW v(c1, c2, ...)` column
                     // list renames the view's output columns; only fall back to
                     // the SELECT's own result names when no list was declared.
@@ -45380,7 +46659,9 @@ impl Connection {
                         check_constraints: Vec::new(),
                     });
                     self.rebuild_schema_indices();
-                    materialized.push((view.name.clone(), root_page));
+                    materialized
+                        .tables
+                        .push((view.name.clone(), root_page));
 
                     for (i, row) in view_rows.iter().enumerate() {
                         let vals = row.values().to_vec();
@@ -45392,30 +46673,13 @@ impl Connection {
                     }
                 }
 
-                if !materialized.is_empty() {
+                if !materialized.tables.is_empty() {
                     self.clear_compilation_reuse_caches();
                 }
                 self.execute_statement(&Statement::Select(select.clone()), params)
-            })();
-
-            // Clean up materialized temp tables even if materialization or
-            // execution failed so later queries don't see stale shadow tables.
-            let mut any_removed = false;
-            for (name, root_page) in &materialized {
-                let mut schema = self.schema.borrow_mut();
-                if let Some(idx) = schema
-                    .iter()
-                    .position(|t| t.root_page == *root_page && t.name.eq_ignore_ascii_case(name))
-                {
-                    schema.remove(idx);
-                    drop(schema);
-                    self.db.borrow_mut().destroy_table(*root_page);
-                    any_removed = true;
-                }
+                    .await
             }
-            if any_removed {
-                self.rebuild_schema_indices();
-            }
+            .await;
 
             exec_result
         };
@@ -45463,7 +46727,7 @@ impl Connection {
     /// table), the VDBE would read that stale data instead of our virtual
     /// rows.  We avoid this by probing candidate pages via `get_page` and
     /// advancing `next_root_page` past any non-zero (occupied) pages.
-    fn execute_with_materialized_sqlite_schema(
+    async fn execute_with_materialized_sqlite_schema(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -45472,17 +46736,20 @@ impl Connection {
             "select",
             "sqlite_schema_virtual_materialization",
         )?;
-        let result = (|| -> Result<Vec<Row>> {
+        let result = async {
             let referenced = self.collect_sqlite_schema_references(select);
             if referenced.is_empty() {
-                return self.execute_statement(&Statement::Select(select.clone()), params);
+                return self
+                    .execute_statement(&Statement::Select(select.clone()), params)
+                    .await;
             }
 
             let virtual_rows = self.build_sqlite_master_rows();
             let virtual_columns = sqlite_master_column_infos();
-            let mut materialized: Vec<(String, i32)> = Vec::new();
+            let mut materialized = MaterializedTablesCleanupGuard::new(self);
 
-            self.reserve_clean_memdb_root_pages(referenced.len())?;
+            self.reserve_clean_memdb_root_pages(referenced.len())
+                .await?;
 
             for table_name in referenced {
                 let root_page = self.db.borrow_mut().create_table(virtual_columns.len());
@@ -45507,7 +46774,7 @@ impl Connection {
                     }
                 }
 
-                materialized.push((table_name, root_page));
+                materialized.tables.push((table_name, root_page));
             }
 
             // The materialized sqlite_master table lives at a fresh
@@ -45518,7 +46785,7 @@ impl Connection {
             // current root_page.
             self.clear_compilation_reuse_caches();
 
-            let exec_result = (|| -> Result<Vec<Row>> {
+            let exec_result = async {
                 // Route through connection-level interpreted paths that read from
                 // MemDatabase rather than the full dispatch chain (which reaches
                 // VDBE StorageCursor → pager B-tree where a recycled page may
@@ -45530,10 +46797,10 @@ impl Connection {
                 // (MemDatabase), where the virtual rows were freshly inserted,
                 // rather than calling through the pager and potentially seeing
                 // stale recycled pages.
-                let prev_time_travel = self.time_travel_active.get();
-                self.time_travel_active.set(true);
-                let mut result = (|| -> Result<Vec<Row>> {
-                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                let _time_travel_guard =
+                    BoolCellRestoreGuard::new(&self.time_travel_active, true);
+                let mut result = async {
+                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
                     let bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let is_fromless_select = matches!(
@@ -45542,27 +46809,30 @@ impl Connection {
                     );
                     if is_fromless_select {
                         if has_implicit_aggregation(rewritten.as_ref()) {
-                            self.execute_fromless_aggregate(&bound, None)
+                            self.execute_fromless_aggregate(&bound, None).await
                         } else {
                             self.execute_expression_only_with_subqueries(&bound, None)
+                                .await
                         }
                     } else if matches!(&rewritten.body.select, SelectCore::Values(_)) {
                         // VALUES may contain the same catalog scalar subqueries as
                         // a FROM-less SELECT, but preserves one output row per
                         // VALUES tuple rather than the SELECT path's single row.
                         self.execute_expression_only_with_subqueries(&bound, None)
+                            .await
                     } else if has_group_by(rewritten.as_ref())
                         || has_implicit_aggregation(rewritten.as_ref())
                         || has_ordered_aggregate(rewritten.as_ref())
                     {
                         self.execute_group_by_join_select(&cx, &bound, None)
+                            .await
                     } else if has_window_functions(rewritten.as_ref()) {
-                        self.execute_window_select(&bound, None)
+                        self.execute_window_select(&bound, None).await
                     } else {
-                        self.execute_join_select(&bound, None)
+                        self.execute_join_select(&bound, None).await
                     }
-                })();
-                self.time_travel_active.set(prev_time_travel);
+                }
+                .await;
 
                 // Naked aggregates (COUNT/SUM/etc. without GROUP BY) must always
                 // produce exactly one row, even when the source table is empty.
@@ -45598,27 +46868,12 @@ impl Connection {
                 }
 
                 result
-            })();
-
-            let mut any_removed = false;
-            for (name, root_page) in &materialized {
-                let mut schema = self.schema.borrow_mut();
-                if let Some(idx) = schema
-                    .iter()
-                    .position(|t| t.root_page == *root_page && t.name.eq_ignore_ascii_case(name))
-                {
-                    schema.remove(idx);
-                    any_removed = true;
-                }
-                drop(schema);
-                self.db.borrow_mut().destroy_table(*root_page);
             }
-            if any_removed {
-                self.rebuild_schema_indices();
-            }
+            .await;
 
             exec_result
-        })();
+        }
+        .await;
         result
     }
 
@@ -45629,13 +46884,15 @@ impl Connection {
     /// transaction-backed cursor on a temp-table root page and reads a valid
     /// stale pager B-tree instead of the MemDatabase-only rows we just
     /// materialized there.
-    fn reserve_clean_memdb_root_pages(&self, need: usize) -> Result<()> {
+    async fn reserve_clean_memdb_root_pages(&self, need: usize) -> Result<()> {
         if need == 0 {
             return Ok(());
         }
         let cx = self.op_cx_after_background_status();
         if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-            return self.reserve_clean_memdb_root_pages_with_txn(txn, &cx, need);
+            return self
+                .reserve_clean_memdb_root_pages_with_txn(txn, &cx, need)
+                .await;
         }
 
         let mut txn = self.begin_pager_txn_with_busy_timeout(
@@ -45643,9 +46900,12 @@ impl Connection {
             &cx,
             TransactionMode::ReadOnly,
             false,
-        )?;
-        let reserve_result = self.reserve_clean_memdb_root_pages_with_txn(&txn, &cx, need);
-        let rollback_result = txn.rollback(&cx);
+        )
+        .await?;
+        let reserve_result = self
+            .reserve_clean_memdb_root_pages_with_txn(&txn, &cx, need)
+            .await;
+        let rollback_result = txn.rollback(&cx).await;
         reserve_result?;
         rollback_result
     }
@@ -45658,46 +46918,45 @@ impl Connection {
     /// page: doing so without a matching `sqlite_master` owner leaves an
     /// orphan that stock SQLite reports as "Page N: never used". Their roots
     /// therefore come only from the collision-safe MemDatabase namespace.
-    fn allocate_schema_table_root(
+    async fn allocate_schema_table_root(
         &self,
         temporary: bool,
         num_columns: usize,
         index_btree: bool,
     ) -> Result<i32> {
         if temporary {
-            self.reserve_clean_memdb_root_pages(1)?;
+            self.reserve_clean_memdb_root_pages(1).await?;
             return Ok(self.db.borrow_mut().create_table(num_columns));
         }
 
         let root_page = if index_btree {
-            self.allocate_index_root_page()?
+            self.allocate_index_root_page().await?
         } else {
-            self.allocate_root_page()?
+            self.allocate_root_page().await?
         };
         self.db.borrow_mut().create_table_at(root_page, num_columns);
         Ok(root_page)
     }
 
-    fn reserve_clean_memdb_root_pages_with_txn(
+    async fn reserve_clean_memdb_root_pages_with_txn(
         &self,
-        txn: &dyn TransactionHandle,
+        txn: &TransactionKind,
         cx: &Cx,
         need: usize,
     ) -> Result<()> {
-        let mut db = self.db.borrow_mut();
         let needed = i32::try_from(need).map_err(|_| {
             FrankenError::internal(format!(
                 "requested too many temporary MemDatabase root pages: {need}"
             ))
         })?;
-        let mut start = db.next_root_page();
+        let mut start = self.db.borrow().next_root_page();
         let mut clean = 0_i32;
         while clean < needed {
             let page = start + clean;
             let Some(pgno) = u32::try_from(page).ok().and_then(PageNumber::new) else {
                 break;
             };
-            let is_clean = match txn.get_page(cx, pgno) {
+            let is_clean = match txn.get_page(cx, pgno).await {
                 Ok(data) => data.as_ref().iter().all(|&b| b == 0),
                 Err(_) => true,
             };
@@ -45708,6 +46967,7 @@ impl Connection {
                 clean = 0;
             }
         }
+        let mut db = self.db.borrow_mut();
         if start > db.next_root_page() {
             db.set_next_root_page(start);
         }
@@ -45839,7 +47099,7 @@ impl Connection {
             })
     }
 
-    fn execute_select_via_memdb_fallback(
+    async fn execute_select_via_memdb_fallback(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -45847,16 +47107,15 @@ impl Connection {
         let bound = bind_placeholders_in_select_for_fallback(select, params)?;
         let cx = self.op_cx_after_background_status();
         let implicit_agg = has_implicit_aggregation(select) && !has_group_by(select);
-        let prev_time_travel = self.time_travel_active.get();
-        self.time_travel_active.set(true);
+        let _time_travel_guard = BoolCellRestoreGuard::new(&self.time_travel_active, true);
         let mut result = if has_group_by(select) || implicit_agg || has_ordered_aggregate(select) {
             self.execute_group_by_join_select(&cx, &bound, None)
+                .await
         } else if has_window_functions(select) {
-            self.execute_window_select(&bound, None)
+            self.execute_window_select(&bound, None).await
         } else {
-            self.execute_join_select(&bound, None)
+            self.execute_join_select(&bound, None).await
         };
-        self.time_travel_active.set(prev_time_travel);
 
         if implicit_agg
             && let Ok(ref rows) = result
@@ -45912,7 +47171,7 @@ impl Connection {
     }
 
     /// Restore a snapshot, replacing the current database + schema state.
-    fn restore_snapshot(&self, cx: &Cx, snap: &DbSnapshot) -> Result<()> {
+    async fn restore_snapshot(&self, cx: &Cx, snap: &DbSnapshot) -> Result<()> {
         self.restore_snapshot_state(snap);
         self.restore_live_vtab_registry_to(cx, snap.live_vtab_registry_undo_len)
     }
@@ -45968,7 +47227,7 @@ impl Connection {
     }
 
     /// Handle BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE|CONCURRENT].
-    fn execute_begin(&self, begin: fsqlite_ast::BeginStatement) -> Result<()> {
+    async fn execute_begin(&self, begin: fsqlite_ast::BeginStatement) -> Result<()> {
         if self.in_transaction.get() {
             return Err(FrankenError::Internal(
                 "cannot start a transaction within a transaction".to_owned(),
@@ -45985,12 +47244,12 @@ impl Connection {
         let cx = self.op_cx_after_background_status();
 
         if self.retained_autocommit_txn.borrow().is_some() {
-            self.flush_retained_autocommit_txn(&cx)?;
+            self.flush_retained_autocommit_txn(&cx).await?;
         }
 
         // Invalidate cached snapshots — explicit BEGIN starts a fresh txn.
-        self.invalidate_cached_read_snapshot(&cx);
-        self.invalidate_cached_write_txn(&cx);
+        self.invalidate_cached_read_snapshot(&cx).await;
+        self.invalidate_cached_write_txn(&cx).await;
         // Determine effective mode: explicit mode wins; if absent, promote to
         // Concurrent when `concurrent_mode_default` is enabled.
         let is_concurrent = match begin.mode {
@@ -46021,7 +47280,9 @@ impl Connection {
                     &cx,
                     "explicit_begin",
                     hydrate_rows_at_begin,
-                ) {
+                )
+                .await
+                {
                     Ok(publication) => publication,
                     Err(error) => {
                         record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
@@ -46049,7 +47310,9 @@ impl Connection {
             &cx,
             pager_mode,
             is_concurrent,
-        ) {
+        )
+        .await
+        {
             Ok(txn) => txn,
             Err(error) => {
                 record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
@@ -46063,8 +47326,9 @@ impl Connection {
                 snapshot,
                 hydrate_rows_at_begin,
             )
+            .await
         {
-            let _ = txn.rollback(&cx);
+            let _ = txn.rollback(&cx).await;
             record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
             return Err(error);
         }
@@ -46083,8 +47347,10 @@ impl Connection {
                     bound_visible_commit_seq,
                     hydrate_rows,
                     false,
-                ) {
-                    let _ = txn.rollback(&cx);
+                )
+                .await
+                {
+                    let _ = txn.rollback(&cx).await;
                     record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
                     return Err(error);
                 }
@@ -46117,7 +47383,7 @@ impl Connection {
             let session_id = match session_id {
                 Ok(id) => id,
                 Err(err) => {
-                    let _ = txn.rollback(&cx);
+                    let _ = txn.rollback(&cx).await;
                     record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
                     return Err(err);
                 }
@@ -46799,13 +48065,13 @@ impl Connection {
         }
     }
 
-    fn execute_commit_with_cx(&self, cx: &Cx) -> Result<()> {
+    async fn execute_commit_with_cx(&self, cx: &Cx) -> Result<()> {
         if !self.in_transaction.get() {
             if self.retained_autocommit_txn.borrow().is_some() {
                 self.stmt_microbatch_flush();
                 self.discard_cached_vdbe_engine();
                 self.clear_prepared_direct_insert_append_hint();
-                self.flush_retained_autocommit_txn(cx)?;
+                self.flush_retained_autocommit_txn(cx).await?;
             }
             return Err(FrankenError::Internal(
                 "cannot commit - no transaction is active".to_owned(),
@@ -46815,12 +48081,12 @@ impl Connection {
         self.stmt_microbatch_flush();
         self.discard_cached_vdbe_engine();
         self.clear_prepared_direct_insert_append_hint();
-        self.flush_pending_direct_write_runs(cx)?;
+        self.flush_pending_direct_write_runs(cx).await?;
         // bd-do0d6: validate DEFERRABLE INITIALLY DEFERRED foreign keys that
         // were postponed during the transaction.  A surviving violation fails
         // the COMMIT but, matching SQLite, leaves the transaction ACTIVE (the
         // application must ROLLBACK or resolve the violation and COMMIT again).
-        self.recheck_deferred_fk_at_commit()?;
+        self.recheck_deferred_fk_at_commit().await?;
         let commit_pre_txn_start = hot_path_profile_enabled().then(Instant::now);
         let had_live_vtab_txn = !self.live_vtab_transactions.borrow().is_empty();
         if !self.live_vtab_transactions.borrow().is_empty() {
@@ -46837,7 +48103,7 @@ impl Connection {
 
                 self.txn_metrics_note_rollback();
                 let rollback_result = if let Some(mut txn) = self.active_txn.borrow_mut().take() {
-                    txn.rollback(cx)
+                    txn.rollback(cx).await
                 } else {
                     Ok(())
                 };
@@ -46851,7 +48117,7 @@ impl Connection {
                     self.restore_snapshot_state(&snapshot);
                 }
                 let reload_result = if txn_has_pending_writes && rollback_succeeded {
-                    self.reload_memdb_from_pager(cx)
+                    self.reload_memdb_from_pager(cx).await
                 } else {
                     Ok(())
                 };
@@ -46973,7 +48239,7 @@ impl Connection {
             let mut commit_res = {
                 let mut txn_guard = self.active_txn.borrow_mut();
                 if let Some(txn) = txn_guard.as_mut() {
-                    txn.commit(cx)
+                    txn.commit(cx).await
                 } else {
                     Ok(())
                 }
@@ -47000,11 +48266,11 @@ impl Connection {
                         {
                             break;
                         }
-                        perform_begin_busy_retry_handoff(wait);
+                        perform_begin_busy_retry_handoff(wait).await;
                         commit_res = {
                             let mut txn_guard = self.active_txn.borrow_mut();
                             if let Some(txn) = txn_guard.as_mut() {
-                                txn.commit(cx)
+                                txn.commit(cx).await
                             } else {
                                 Ok(())
                             }
@@ -47193,11 +48459,12 @@ impl Connection {
                 self.reload_memdb_from_pager_with_mode(
                     cx,
                     self.should_eagerly_hydrate_memdb_rows(),
-                )?;
+                )
+                .await?;
             }
             let commit_post_write_maintenance_start = hot_path_profile_enabled().then(Instant::now);
             if !self.should_defer_autocheckpoint_after_concurrent_commit(is_concurrent_txn) {
-                self.maybe_run_adaptive_autocheckpoint();
+                self.maybe_run_adaptive_autocheckpoint().await;
             }
 
             // Capture time-travel snapshot AFTER cleanup so the write transaction
@@ -47205,7 +48472,8 @@ impl Connection {
             if let Some(committed_seq) = *self.last_local_commit_seq.borrow() {
                 self.emit_differential_commit_invalidations(committed_seq);
                 if self.time_travel_capture_enabled.get() {
-                    self.capture_time_travel_snapshot(committed_seq.get());
+                    self.capture_time_travel_snapshot(committed_seq.get())
+                        .await;
                 }
             }
 
@@ -47232,7 +48500,7 @@ impl Connection {
     /// swaps it into `self.db`, executes the stripped SELECT through the
     /// connection-level interpreted path (which reads directly from MemDatabase),
     /// then restores the live database.
-    fn execute_time_travel_select(
+    async fn execute_time_travel_select(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -47263,27 +48531,27 @@ impl Connection {
         // Bind placeholders if present.
         let bound = bind_placeholders_in_select_for_fallback(&stripped, params)?;
 
-        // Swap in the historical snapshot.
-        let live_db = self.db.replace(snapshot_db);
+        // Swap in the historical snapshot. The guard restores the live
+        // database if the query completes, errors, or is cancelled.
+        let _database_guard = MemDatabaseRestoreGuard::new(&self.db, snapshot_db);
 
         // Tell execute_join_select to read from self.db (the historical
         // snapshot) instead of calling self.query() which goes through pager.
-        self.time_travel_active.set(true);
-        let result = self.execute_join_select(&bound, None);
-        self.time_travel_active.set(false);
-
-        // Restore the live database regardless of success/failure.
-        *self.db.borrow_mut() = live_db;
-        result
+        let _time_travel_guard = BoolCellRestoreGuard::new(&self.time_travel_active, true);
+        self.execute_join_select(&bound, None).await
     }
 
     /// Handle ROLLBACK [TO SAVEPOINT name].
-    fn execute_rollback(&self, rb: &fsqlite_ast::RollbackStatement) -> Result<()> {
+    async fn execute_rollback(&self, rb: &fsqlite_ast::RollbackStatement) -> Result<()> {
         let cx = self.op_cx()?;
-        self.execute_rollback_with_cx(&cx, rb)
+        self.execute_rollback_with_cx(&cx, rb).await
     }
 
-    fn execute_rollback_with_cx(&self, cx: &Cx, rb: &fsqlite_ast::RollbackStatement) -> Result<()> {
+    async fn execute_rollback_with_cx(
+        &self,
+        cx: &Cx,
+        rb: &fsqlite_ast::RollbackStatement,
+    ) -> Result<()> {
         // bd-do0d6: a full rollback discards any postponed deferred FK checks.
         if rb.to_savepoint.is_none() {
             self.deferred_fk_checks.borrow_mut().clear();
@@ -47382,7 +48650,7 @@ impl Connection {
             // the next consultation will reseed from the post-
             // savepoint-rollback committed view.
             self.invalidate_qfs_on_rollback();
-            self.restore_snapshot(cx, &snap)?;
+            self.restore_snapshot(cx, &snap).await?;
             // MVCC GC (bd-3bql / 5E.5): After savepoint rollback, trigger GC if scheduler permits.
             self.maybe_gc_tick();
             live_vtab_result?;
@@ -47417,7 +48685,7 @@ impl Connection {
             // release writer locks. After this, the pager reflects the
             // pre-transaction committed state.
             let rollback_result = if let Some(mut txn) = self.active_txn.borrow_mut().take() {
-                txn.rollback(cx)
+                txn.rollback(cx).await
             } else {
                 Ok(())
             };
@@ -47440,7 +48708,7 @@ impl Connection {
             // active-transaction marker first because the active_txn has
             // already been taken and is no longer available for reload.
             self.memdb_requires_active_txn_reload.set(false);
-            let reload_result = self.reload_memdb_from_pager(cx);
+            let reload_result = self.reload_memdb_from_pager(cx).await;
 
             // Clear transaction state.
             *self.txn_snapshot.borrow_mut() = None;
@@ -47475,20 +48743,20 @@ impl Connection {
         Ok(())
     }
 
-    fn execute_savepoint_with_cx(&self, cx: &Cx, name: &str) -> Result<()> {
+    async fn execute_savepoint_with_cx(&self, cx: &Cx, name: &str) -> Result<()> {
         // AAC-P6: savepoint boundary — renew any prepared-DML micro-batch.
         self.stmt_microbatch_flush();
         self.clear_prepared_direct_insert_append_hint();
-        self.flush_pending_direct_write_runs(cx)?;
+        self.flush_pending_direct_write_runs(cx).await?;
         // If no explicit transaction, implicitly begin one.
         let started_implicit_txn = !self.in_transaction.get();
         if started_implicit_txn {
             if self.retained_autocommit_txn.borrow().is_some() {
-                self.flush_retained_autocommit_txn(cx)?;
+                self.flush_retained_autocommit_txn(cx).await?;
             }
             // Discard cached snapshots — implicit transaction starts fresh.
-            self.invalidate_cached_read_snapshot(cx);
-            self.invalidate_cached_write_txn(cx);
+            self.invalidate_cached_read_snapshot(cx).await;
+            self.invalidate_cached_write_txn(cx).await;
             let is_concurrent = *self.concurrent_mode_default.borrow();
             let pager_mode = if is_concurrent {
                 TransactionMode::Concurrent
@@ -47498,13 +48766,16 @@ impl Connection {
             // Bind the implicit transaction snapshot to the pager's published
             // visibility plane before opening the pager txn.
             let concurrent_snapshot = if is_concurrent {
-                let publication = self.bind_pager_publication(cx, "savepoint_implicit_begin")?;
+                let publication = self
+                    .bind_pager_publication(cx, "savepoint_implicit_begin")
+                    .await?;
                 Some(self.concurrent_snapshot_from_publication(publication))
             } else {
                 None
             };
-            let mut txn =
-                self.begin_pager_txn_with_busy_timeout(&self.pager, cx, pager_mode, is_concurrent)?;
+            let mut txn = self
+                .begin_pager_txn_with_busy_timeout(&self.pager, cx, pager_mode, is_concurrent)
+                .await?;
             let concurrent_session = if let Some(snapshot) = concurrent_snapshot {
                 let session_id = lock_unpoisoned(&self.concurrent_registry)
                     .begin_concurrent(snapshot)
@@ -47515,7 +48786,7 @@ impl Connection {
                 let session_id = match session_id {
                     Ok(id) => id,
                     Err(err) => {
-                        let _ = txn.rollback(cx);
+                        let _ = txn.rollback(cx).await;
                         return Err(err);
                     }
                 };
@@ -47552,7 +48823,8 @@ impl Connection {
         if let Err(error) = pager_savepoint_result {
             let mut cleanup_errors = Vec::new();
             if started_implicit_txn
-                && let Some(cleanup_error) = self.rollback_failed_implicit_savepoint_transaction()
+                && let Some(cleanup_error) =
+                    self.rollback_failed_implicit_savepoint_transaction().await
             {
                 cleanup_errors.push(cleanup_error);
             }
@@ -47595,7 +48867,7 @@ impl Connection {
                     };
                     if started_implicit_txn
                         && let Some(cleanup_error) =
-                            self.rollback_failed_implicit_savepoint_transaction()
+                            self.rollback_failed_implicit_savepoint_transaction().await
                     {
                         cleanup_errors.push(cleanup_error);
                     }
@@ -47619,7 +48891,8 @@ impl Connection {
                 self.cleanup_failed_savepoint_setup(cx, name, concurrent_snapshot.as_ref())
             };
             if started_implicit_txn
-                && let Some(cleanup_error) = self.rollback_failed_implicit_savepoint_transaction()
+                && let Some(cleanup_error) =
+                    self.rollback_failed_implicit_savepoint_transaction().await
             {
                 cleanup_errors.push(cleanup_error);
             }
@@ -47632,7 +48905,7 @@ impl Connection {
             return Err(error);
         }
 
-        self.refresh_memdb_from_active_txn_if_dirty(cx)?;
+        self.refresh_memdb_from_active_txn_if_dirty(cx).await?;
         self.savepoints.borrow_mut().push(SavepointEntry {
             name: name.to_owned(),
             snapshot: self.snapshot(),
@@ -47642,11 +48915,11 @@ impl Connection {
         Ok(())
     }
 
-    fn execute_release_with_cx(&self, cx: &Cx, name: &str) -> Result<()> {
+    async fn execute_release_with_cx(&self, cx: &Cx, name: &str) -> Result<()> {
         // AAC-P6: RELEASE is a savepoint boundary — renew the micro-batch.
         self.stmt_microbatch_flush();
         self.clear_prepared_direct_insert_append_hint();
-        self.flush_pending_direct_write_runs(cx)?;
+        self.flush_pending_direct_write_runs(cx).await?;
         let (idx, canonical_name) = {
             let savepoints = self.savepoints.borrow();
             let idx = savepoints
@@ -47661,7 +48934,7 @@ impl Connection {
         // without calling pager release_savepoint first — this avoids leaving
         // the pager savepoint stack out of sync if the commit fails.
         if idx == 0 && self.implicit_txn.get() {
-            return self.execute_commit_with_cx(cx);
+            return self.execute_commit_with_cx(cx).await;
         }
 
         if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
@@ -47679,34 +48952,35 @@ impl Connection {
         Ok(())
     }
 
-    fn with_integrity_txn<R>(
-        &self,
-        f: impl FnOnce(&Cx, &mut dyn TransactionHandle) -> Result<R>,
-    ) -> Result<R> {
+    async fn with_integrity_txn<R, F>(&self, f: F) -> Result<R>
+    where
+        F: std::ops::AsyncFnOnce(&Cx, &mut TransactionKind) -> Result<R>,
+    {
         let cx = self.op_cx()?;
         let mut active_txn = self.active_txn.borrow_mut();
         if let Some(txn) = active_txn.as_mut() {
-            return f(&cx, txn);
+            return f(&cx, txn).await;
         }
         drop(active_txn);
 
         // Release cached write/read transactions so the integrity check
         // can acquire a clean reader without hitting a Busy lock.
-        self.invalidate_cached_write_txn(&cx);
-        self.invalidate_cached_read_snapshot(&cx);
+        self.invalidate_cached_write_txn(&cx).await;
+        self.invalidate_cached_read_snapshot(&cx).await;
 
         let mut txn = self.begin_pager_txn_with_busy_timeout(
             &self.pager,
             &cx,
             TransactionMode::ReadOnly,
             false,
-        )?;
-        let result = f(&cx, &mut txn);
-        let _ = txn.rollback(&cx);
+        )
+        .await?;
+        let result = f(&cx, &mut txn).await;
+        let _ = txn.rollback(&cx).await;
         result
     }
 
-    fn validate_database_integrity(&self, quick: bool) -> Result<()> {
+    async fn validate_database_integrity(&self, quick: bool) -> Result<()> {
         // GH#113: when a write transaction is active, `with_integrity_txn`
         // reuses it, so the integrity walk reads uncommitted btree pages. But
         // frank's on-disk freelist trunk pages and the page-1 header (offsets
@@ -47725,8 +48999,8 @@ impl Connection {
             .borrow()
             .as_ref()
             .map(|txn| (txn.live_freelist_pages(), txn.live_db_size()));
-        self.with_integrity_txn(|cx, txn| {
-            let page1 = txn.get_page(cx, PageNumber::ONE)?;
+        self.with_integrity_txn(async |cx, txn| {
+            let page1 = txn.get_page(cx, PageNumber::ONE).await?;
             let page1_bytes = page1.as_ref();
             if page1_bytes.iter().all(|&b| b == 0) || page1_bytes.len() < DATABASE_HEADER_SIZE {
                 return Ok(());
@@ -47738,7 +49012,7 @@ impl Connection {
             // published snapshot only counts committed pages, so it would flag
             // legitimately in-txn-allocated btree pages as "past the end of the
             // database" (GH#113).
-            let published_db_size = self.pager.refresh_published_snapshot(cx)?.db_size;
+            let published_db_size = self.pager.refresh_published_snapshot(cx).await?.db_size;
             let total_pages = active_state
                 .as_ref()
                 .map_or(published_db_size, |(_, sz)| (*sz).max(published_db_size));
@@ -47747,7 +49021,8 @@ impl Connection {
                 txn,
                 header.page_size,
                 header.reserved_per_page,
-            )?;
+            )
+            .await?;
             self.validate_sqlite_master_rows(&master_rows)?;
             self.validate_schema_btrees_in_txn(
                 cx,
@@ -47761,18 +49036,20 @@ impl Connection {
                 header.freelist_count,
                 header.largest_root_page != 0,
                 active_state.as_ref().map(|(fl, _)| fl.as_slice()),
-            )?;
+            )
+            .await?;
             Ok(())
         })
+        .await
     }
 
-    fn read_sqlite_master_rows_in_txn(
+    async fn read_sqlite_master_rows_in_txn(
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         page_size: PageSize,
         reserved_per_page: u8,
     ) -> Result<Vec<Vec<SqliteValue>>> {
-        let page1 = txn.get_page(cx, PageNumber::ONE)?;
+        let page1 = txn.get_page(cx, PageNumber::ONE).await?;
         let header = BTreePageHeader::parse(page1.as_ref(), page_size, reserved_per_page, true)
             .map_err(|err| FrankenError::DatabaseCorrupt {
                 detail: format!("page 1 b-tree header invalid: {err}"),
@@ -47791,10 +49068,10 @@ impl Connection {
         let mut rows = Vec::new();
         let mut cursor =
             Self::new_header_btree_cursor(txn, PageNumber::ONE, page_size, reserved_per_page, true);
-        if cursor.first(cx)? {
+        if cursor.first(cx).await? {
             loop {
-                let rowid = cursor.rowid(cx)?;
-                let payload = cursor.payload(cx)?;
+                let rowid = cursor.rowid(cx).await?;
+                let payload = cursor.payload(cx).await?;
                 let values =
                     parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -47810,7 +49087,7 @@ impl Connection {
                     });
                 }
                 rows.push(values);
-                if !cursor.next(cx)? {
+                if !cursor.next(cx).await? {
                     break;
                 }
             }
@@ -47885,30 +49162,42 @@ impl Connection {
         )
     }
 
-    fn inflate_table_row_values_for_storage_reload(
-        &self,
-        table: &TableSchema,
+    // Reachable from DEFAULT evaluation (which re-enters statement execution),
+    // so the future is boxed to break the recursive type.
+    fn inflate_table_row_values_for_storage_reload<'a>(
+        &'a self,
+        table: &'a TableSchema,
         rowid: i64,
-        payload_values: &[SqliteValue],
+        payload_values: &'a [SqliteValue],
         rowid_alias_col_idx: Option<usize>,
-    ) -> Result<Vec<SqliteValue>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SqliteValue>>> + 'a>> {
+        Box::pin(async move {
+        // Column DEFAULT evaluation is `async` now, but the shared inflater takes a
+        // synchronous callback. Defaults are only ever consulted for columns the
+        // stored payload does not cover (the ALTER TABLE ADD COLUMN back-fill case),
+        // so pre-evaluate exactly then and keep the full-width hot path allocation-
+        // and evaluation-free.
+        let mut precomputed: Vec<Option<SqliteValue>> = Vec::new();
+        if payload_values.len() < table.columns.len() {
+            precomputed.reserve_exact(table.columns.len());
+            for column in &table.columns {
+                let value = match column.default_value.as_ref() {
+                    Some(default_sql) => {
+                        Some(self.evaluate_column_default_value(Some(default_sql)).await?)
+                    }
+                    None => None,
+                };
+                precomputed.push(value);
+            }
+        }
         Self::inflate_table_row_values_from_payload_values(
             table,
             rowid,
             payload_values,
             rowid_alias_col_idx,
-            |col_idx| {
-                let Some(default_sql) = table
-                    .columns
-                    .get(col_idx)
-                    .and_then(|column| column.default_value.as_ref())
-                else {
-                    return Ok(None);
-                };
-                self.evaluate_column_default_value(Some(default_sql))
-                    .map(Some)
-            },
+            |col_idx| Ok(precomputed.get(col_idx).cloned().flatten()),
         )
+        })
     }
 
     #[cfg(test)]
@@ -48317,9 +49606,9 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn walk_integrity_overflow_chain(
+    async fn walk_integrity_overflow_chain(
         cx: &Cx,
-        txn: &dyn TransactionHandle,
+        txn: &TransactionKind,
         page_size: PageSize,
         reserved_per_page: u8,
         total_pages: u32,
@@ -48370,7 +49659,7 @@ impl Connection {
                 format!("{owner} overflow[{overflow_idx}]"),
             )?;
 
-            let page = txn.get_page(cx, page_no)?;
+            let page = txn.get_page(cx, page_no).await?;
             let page_bytes = page.as_ref();
             if page_bytes.len() < 4 {
                 return Err(FrankenError::DatabaseCorrupt {
@@ -48419,9 +49708,9 @@ impl Connection {
     /// every page's structural integrity but skips the ownership HashMap
     /// and orphan detection — this is the `quick_check` path.
     #[allow(clippy::too_many_arguments)]
-    fn walk_integrity_btree_pages(
+    async fn walk_integrity_btree_pages(
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         page_size: PageSize,
         reserved_per_page: u8,
         total_pages: u32,
@@ -48429,112 +49718,139 @@ impl Connection {
         owner: &str,
         mut owners: Option<&mut HashMap<PageNumber, String>>,
     ) -> Result<()> {
-        Self::record_integrity_page_owner(
-            owners.as_deref_mut(),
-            page_size,
-            page_no,
-            total_pages,
-            owner.to_owned(),
-        )?;
-
-        let page = txn.get_page(cx, page_no)?;
-        let page_bytes = page.as_ref();
-        let header = BTreePageHeader::parse(
-            page_bytes,
-            page_size,
-            reserved_per_page,
-            page_no == PageNumber::ONE,
-        )
-        .map_err(|err| FrankenError::DatabaseCorrupt {
-            detail: format!("{owner}: page {} header invalid: {err}", page_no.get()),
-        })?;
-        let cell_pointers = header
-            .parse_cell_pointers(page_bytes, page_size, reserved_per_page)
-            .map_err(|err| FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "{owner}: page {} cell pointers invalid: {err}",
-                    page_no.get()
-                ),
-            })?;
-        header
-            .parse_freeblocks(page_bytes, page_size, reserved_per_page)
-            .map_err(|err| FrankenError::DatabaseCorrupt {
-                detail: format!("{owner}: page {} freeblocks invalid: {err}", page_no.get()),
-            })?;
-
-        let usable_size = page_size.usable(reserved_per_page);
-        let page_type = fsqlite_btree::BtreePageType::from_flag(page_bytes[header.header_offset])
-            .ok_or_else(|| FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "{owner}: page {} has invalid B-tree page type flag {:#04x}",
-                page_no.get(),
-                page_bytes[header.header_offset]
-            ),
-        })?;
-
-        for (cell_idx, cell_pointer) in cell_pointers.iter().enumerate() {
-            let cell = fsqlite_btree::CellRef::parse(
-                page_bytes,
-                usize::from(*cell_pointer),
-                page_type,
-                usable_size,
-            )
-            .map_err(|err| FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "{owner}: page {} cell {cell_idx} invalid: {err}",
-                    page_no.get()
-                ),
-            })?;
-
-            if let Some(left_child) = cell.left_child {
-                Self::walk_integrity_btree_pages(
-                    cx,
-                    txn,
-                    page_size,
-                    reserved_per_page,
-                    total_pages,
-                    left_child,
-                    &format!("{owner} -> child[{cell_idx}]"),
-                    owners.as_deref_mut(),
-                )?;
-            }
-
-            if let Some(first_overflow) = cell.overflow_page {
-                Self::walk_integrity_overflow_chain(
-                    cx,
-                    txn,
-                    page_size,
-                    reserved_per_page,
-                    total_pages,
-                    first_overflow,
-                    cell.payload_size,
-                    cell.local_size,
-                    &format!("{owner} -> cell[{cell_idx}]"),
-                    owners.as_deref_mut(),
-                )?;
-            }
+        enum WalkTask {
+            Btree {
+                page_no: PageNumber,
+                owner: String,
+            },
+            Overflow {
+                first_overflow: PageNumber,
+                payload_size: u32,
+                local_size: u32,
+                owner: String,
+            },
         }
 
-        if let Some(right_child) = header.right_most_child {
-            Self::walk_integrity_btree_pages(
-                cx,
-                txn,
+        let mut pending = vec![WalkTask::Btree {
+            page_no,
+            owner: owner.to_owned(),
+        }];
+        while let Some(task) = pending.pop() {
+            let (page_no, owner) = match task {
+                WalkTask::Btree { page_no, owner } => (page_no, owner),
+                WalkTask::Overflow {
+                    first_overflow,
+                    payload_size,
+                    local_size,
+                    owner,
+                } => {
+                    Self::walk_integrity_overflow_chain(
+                        cx,
+                        txn,
+                        page_size,
+                        reserved_per_page,
+                        total_pages,
+                        first_overflow,
+                        payload_size,
+                        local_size,
+                        &owner,
+                        owners.as_deref_mut(),
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+
+            Self::record_integrity_page_owner(
+                owners.as_deref_mut(),
+                page_size,
+                page_no,
+                total_pages,
+                owner.clone(),
+            )?;
+
+            let page = txn.get_page(cx, page_no).await?;
+            let page_bytes = page.as_ref();
+            let header = BTreePageHeader::parse(
+                page_bytes,
                 page_size,
                 reserved_per_page,
-                total_pages,
-                right_child,
-                &format!("{owner} -> right_child"),
-                owners,
-            )?;
+                page_no == PageNumber::ONE,
+            )
+            .map_err(|err| FrankenError::DatabaseCorrupt {
+                detail: format!("{owner}: page {} header invalid: {err}", page_no.get()),
+            })?;
+            let cell_pointers = header
+                .parse_cell_pointers(page_bytes, page_size, reserved_per_page)
+                .map_err(|err| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "{owner}: page {} cell pointers invalid: {err}",
+                        page_no.get()
+                    ),
+                })?;
+            header
+                .parse_freeblocks(page_bytes, page_size, reserved_per_page)
+                .map_err(|err| FrankenError::DatabaseCorrupt {
+                    detail: format!("{owner}: page {} freeblocks invalid: {err}", page_no.get()),
+                })?;
+
+            let usable_size = page_size.usable(reserved_per_page);
+            let page_type =
+                fsqlite_btree::BtreePageType::from_flag(page_bytes[header.header_offset])
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "{owner}: page {} has invalid B-tree page type flag {:#04x}",
+                            page_no.get(),
+                            page_bytes[header.header_offset]
+                        ),
+                    })?;
+
+            let mut next_tasks = Vec::new();
+            for (cell_idx, cell_pointer) in cell_pointers.iter().enumerate() {
+                let cell = fsqlite_btree::CellRef::parse(
+                    page_bytes,
+                    usize::from(*cell_pointer),
+                    page_type,
+                    usable_size,
+                )
+                .map_err(|err| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "{owner}: page {} cell {cell_idx} invalid: {err}",
+                        page_no.get()
+                    ),
+                })?;
+
+                if let Some(left_child) = cell.left_child {
+                    next_tasks.push(WalkTask::Btree {
+                        page_no: left_child,
+                        owner: format!("{owner} -> child[{cell_idx}]"),
+                    });
+                }
+                if let Some(first_overflow) = cell.overflow_page {
+                    next_tasks.push(WalkTask::Overflow {
+                        first_overflow,
+                        payload_size: cell.payload_size,
+                        local_size: cell.local_size,
+                        owner: format!("{owner} -> cell[{cell_idx}]"),
+                    });
+                }
+            }
+            if let Some(right_child) = header.right_most_child {
+                next_tasks.push(WalkTask::Btree {
+                    page_no: right_child,
+                    owner: format!("{owner} -> right_child"),
+                });
+            }
+            pending.extend(next_tasks.into_iter().rev());
         }
 
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn validate_page_ownership_in_txn(
+    async fn validate_page_ownership_in_txn(
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         page_size: PageSize,
         reserved_per_page: u8,
         total_pages: u32,
@@ -48558,7 +49874,8 @@ impl Connection {
             PageNumber::ONE,
             "sqlite_master root",
             Some(&mut owners),
-        )?;
+        )
+        .await?;
 
         if let Some(live) = live_freelist {
             // GH#113: a write transaction is active. The on-disk freelist trunk
@@ -48602,7 +49919,7 @@ impl Connection {
                     format!("freelist trunk[{trunk_index}]"),
                 )?;
 
-                let page = txn.get_page(cx, trunk_page)?;
+                let page = txn.get_page(cx, trunk_page).await?;
                 let trunk = fsqlite_btree::freelist::FreelistTrunk::parse(page.as_ref()).map_err(
                     |err| FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -48652,7 +49969,8 @@ impl Connection {
                     table_root,
                     &format!("table `{}` root", table.name),
                     Some(&mut owners),
-                )?;
+                )
+                .await?;
             }
 
             for index in &table.indexes {
@@ -48667,7 +49985,8 @@ impl Connection {
                     index_root,
                     &format!("index `{}` root", index.name),
                     Some(&mut owners),
-                )?;
+                )
+                .await?;
             }
         }
 
@@ -48687,10 +50006,10 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn validate_schema_btrees_in_txn(
+    async fn validate_schema_btrees_in_txn(
         &self,
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         page_size: PageSize,
         reserved_per_page: u8,
         master_rows: &[Vec<SqliteValue>],
@@ -48703,7 +50022,11 @@ impl Connection {
     ) -> Result<()> {
         let schema = self.schema.borrow().clone();
         let rowid_alias_col_by_root_page = (!quick).then(|| self.rowid_alias_column_by_root_page());
-        let column_defaults_by_root_page = (!quick).then(|| self.column_defaults_by_root_page());
+        let column_defaults_by_root_page = if quick {
+            None
+        } else {
+            Some(self.column_defaults_by_root_page().await)
+        };
 
         if !quick {
             Self::validate_page_ownership_in_txn(
@@ -48717,7 +50040,8 @@ impl Connection {
                 auto_vacuum_enabled,
                 &schema,
                 live_freelist,
-            )?;
+            )
+            .await?;
         } else {
             // quick_check: walk every B-tree page to validate headers, cell
             // pointers, and freeblock chains without tracking page ownership
@@ -48733,7 +50057,8 @@ impl Connection {
                 PageNumber::ONE,
                 "sqlite_master root",
                 None,
-            )?;
+            )
+            .await?;
             for table in &schema {
                 if table.root_page <= 0 {
                     continue;
@@ -48750,7 +50075,8 @@ impl Connection {
                         table_root,
                         &format!("table `{}`", table.name),
                         None,
-                    )?;
+                    )
+                    .await?;
                 }
                 for index in &table.indexes {
                     let index_root =
@@ -48764,7 +50090,8 @@ impl Connection {
                         index_root,
                         &format!("index `{}`", index.name),
                         None,
-                    )?;
+                    )
+                    .await?;
                 }
             }
         }
@@ -48784,7 +50111,7 @@ impl Connection {
             }
             let uses_index_btree = without_rowid_tables.contains(&table.name.to_ascii_lowercase());
             let root_page = page_number_from_schema_root(table.root_page, &table.name, "table")?;
-            let page = txn.get_page(cx, root_page)?;
+            let page = txn.get_page(cx, root_page).await?;
             let header = BTreePageHeader::parse(page.as_ref(), page_size, reserved_per_page, false)
                 .map_err(|err| FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -48840,9 +50167,9 @@ impl Connection {
                     reserved_per_page,
                     false,
                 );
-                if cursor.first(cx)? {
+                if cursor.first(cx).await? {
                     loop {
-                        let payload = cursor.payload(cx)?;
+                        let payload = cursor.payload(cx).await?;
                         let values = parse_record(&payload).ok_or_else(|| {
                             FrankenError::DatabaseCorrupt {
                                 detail: format!(
@@ -48861,7 +50188,7 @@ impl Connection {
                                 ),
                             });
                         }
-                        if !cursor.next(cx)? {
+                        if !cursor.next(cx).await? {
                             break;
                         }
                     }
@@ -48924,10 +50251,10 @@ impl Connection {
                     reserved_per_page,
                     true,
                 );
-                if cursor.first(cx)? {
+                if cursor.first(cx).await? {
                     loop {
-                        let rowid = cursor.rowid(cx)?;
-                        let payload = cursor.payload(cx)?;
+                        let rowid = cursor.rowid(cx).await?;
+                        let payload = cursor.payload(cx).await?;
                         let values = parse_record(&payload).ok_or_else(|| {
                             FrankenError::DatabaseCorrupt {
                                 detail: format!(
@@ -48977,7 +50304,7 @@ impl Connection {
                                 expected_keys.insert(rowid, key);
                             }
                         }
-                        if !cursor.next(cx)? {
+                        if !cursor.next(cx).await? {
                             break;
                         }
                     }
@@ -48988,7 +50315,7 @@ impl Connection {
                     let index = index_spec.index;
                     let index_root =
                         page_number_from_schema_root(index.root_page, &index.name, "index")?;
-                    let page = txn.get_page(cx, index_root)?;
+                    let page = txn.get_page(cx, index_root).await?;
                     let header =
                         BTreePageHeader::parse(page.as_ref(), page_size, reserved_per_page, false)
                             .map_err(|err| FrankenError::DatabaseCorrupt {
@@ -49037,9 +50364,9 @@ impl Connection {
                         Arc::clone(&self.collation_registry),
                     );
                     let mut prev_payload: Option<Vec<u8>> = None;
-                    if cursor.first(cx)? {
+                    if cursor.first(cx).await? {
                         loop {
-                            let payload = cursor.payload(cx)?;
+                            let payload = cursor.payload(cx).await?;
                             let payload_values = parse_record(&payload).ok_or_else(|| {
                                 FrankenError::DatabaseCorrupt {
                                     detail: format!(
@@ -49075,7 +50402,7 @@ impl Connection {
                                     });
                                 }
                             }
-                            let rowid = cursor.rowid(cx)?;
+                            let rowid = cursor.rowid(cx).await?;
                             let Some(expected_payload) = expected_keys.get(&rowid) else {
                                 let detail = if table_rowids.contains(&rowid) {
                                     format!(
@@ -49107,7 +50434,7 @@ impl Connection {
                                 });
                             }
                             prev_payload = Some(payload);
-                            if !cursor.next(cx)? {
+                            if !cursor.next(cx).await? {
                                 break;
                             }
                         }
@@ -49133,7 +50460,7 @@ impl Connection {
             for index in &table.indexes {
                 let index_root =
                     page_number_from_schema_root(index.root_page, &index.name, "index")?;
-                let page = txn.get_page(cx, index_root)?;
+                let page = txn.get_page(cx, index_root).await?;
                 let header =
                     BTreePageHeader::parse(page.as_ref(), page_size, reserved_per_page, false)
                         .map_err(|err| FrankenError::DatabaseCorrupt {
@@ -49181,9 +50508,9 @@ impl Connection {
                     Arc::clone(&self.collation_registry),
                 );
                 let mut prev_payload: Option<Vec<u8>> = None;
-                if cursor.first(cx)? {
+                if cursor.first(cx).await? {
                     loop {
-                        let payload = cursor.payload(cx)?;
+                        let payload = cursor.payload(cx).await?;
                         let payload_values = parse_record(&payload).ok_or_else(|| {
                             FrankenError::DatabaseCorrupt {
                                 detail: format!(
@@ -49218,7 +50545,7 @@ impl Connection {
                             }
                         }
                         prev_payload = Some(payload);
-                        if !cursor.next(cx)? {
+                        if !cursor.next(cx).await? {
                             break;
                         }
                     }
@@ -49255,7 +50582,7 @@ impl Connection {
     /// - `PRAGMA fsqlite.jit_stats` / `PRAGMA fsqlite.jit_reset`
     ///   Inspect/reset JIT scaffold metrics and cache state.
     #[allow(clippy::too_many_lines)]
-    fn execute_pragma(&self, pragma: &fsqlite_ast::PragmaStatement) -> Result<Vec<Row>> {
+    async fn execute_pragma(&self, pragma: &fsqlite_ast::PragmaStatement) -> Result<Vec<Row>> {
         // First try connection-level knobs (journal_mode, synchronous, etc.).
         let pragma_name = pragma.name.name.to_ascii_lowercase();
         let maybe_prior_journal_mode = if pragma_name == "journal_mode" && pragma.value.is_some() {
@@ -49290,7 +50617,7 @@ impl Connection {
                 self.normalize_private_memory_journal_mode_output(mode);
             }
             if let fsqlite_vdbe::pragma::PragmaOutput::Text(ref mode) = pragma_out {
-                if let Err(err) = self.apply_journal_mode_to_pager(mode) {
+                if let Err(err) = self.apply_journal_mode_to_pager(mode).await {
                     self.pragma_state.borrow_mut().journal_mode = prior_journal_mode;
                     return Err(err);
                 }
@@ -49316,7 +50643,8 @@ impl Connection {
                             None,
                             Some(user_version as u32),
                             None,
-                        )?;
+                        )
+                        .await?;
                     }
                 }
                 "application_id" => {
@@ -49327,14 +50655,16 @@ impl Connection {
                             None,
                             None,
                             Some(application_id as u32),
-                        )?;
+                        )
+                        .await?;
                     }
                 }
                 "busy_timeout" => {
                     // Propagate busy_timeout to the VFS file so posix_lock
                     // retries with backoff on cross-process lock contention.
                     let ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
-                    self.pager.set_vfs_busy_timeout_ms(ms);
+                    let cx = self.op_cx()?;
+                    self.pager.set_vfs_busy_timeout_ms(&cx, ms).await;
                 }
                 _ => {}
             }
@@ -49362,13 +50692,15 @@ impl Connection {
         // fsqlite-specific: concurrent_mode toggle.
         let name = pragma.name.name.to_ascii_lowercase();
         if matches!(name.as_str(), "quick_check" | "integrity_check") {
-            return Ok(self.pragma_integrity_check_rows(name == "quick_check"));
+            return Ok(self
+                .pragma_integrity_check_rows(name == "quick_check")
+                .await);
         }
         if matches!(
             name.as_str(),
             "page_count" | "freelist_count" | "schema_version" | "encoding"
         ) {
-            let header = self.pragma_database_header()?;
+            let header = self.pragma_database_header().await?;
             let value = match name.as_str() {
                 "page_count" => {
                     SqliteValue::Integer(header.as_ref().map_or(1, |hdr| i64::from(hdr.page_count)))
@@ -49579,7 +50911,7 @@ impl Connection {
                     let enabled = parse_pragma_bool(val)?;
                     if !enabled {
                         let cx = self.op_cx()?;
-                        self.flush_retained_autocommit_txn(&cx)?;
+                        self.flush_retained_autocommit_txn(&cx).await?;
                     }
                     self.autocommit_retain_enabled.set(enabled);
                     Ok(vec![Row {
@@ -49732,7 +51064,7 @@ impl Connection {
                     }
                     if !enabled && self.path != ":memory:" && !self.memdb_rows_loaded.get() {
                         let cx = self.op_cx()?;
-                        self.reload_memdb_from_pager_with_mode(&cx, true)?;
+                        self.reload_memdb_from_pager_with_mode(&cx, true).await?;
                     }
                     Ok(vec![Row {
                         values: vec![SqliteValue::Integer(i64::from(enabled))],
@@ -50449,11 +51781,11 @@ impl Connection {
             // ── Checkpoint scheduling/advisor PRAGMAs (bd-t6sv2.7) ────────
             #[cfg(feature = "diagnostic-pragmas")]
             "fsqlite.checkpoint_stats" | "checkpoint_stats" | "fsqlite_checkpoint_stats" => {
-                Ok(self.checkpoint_stats_rows())
+                Ok(self.checkpoint_stats_rows().await)
             }
             #[cfg(feature = "diagnostic-pragmas")]
             "fsqlite.checkpoint_advisor" | "checkpoint_advisor" | "fsqlite_checkpoint_advisor" => {
-                Ok(self.checkpoint_advisor_rows())
+                Ok(self.checkpoint_advisor_rows().await)
             }
             #[cfg(feature = "diagnostic-pragmas")]
             "fsqlite.checkpoint_schedule"
@@ -50536,7 +51868,7 @@ impl Connection {
                     )
                 })?;
                 let spec = parse_lineage_query(value)?;
-                execute_simple_join_lineage_query(self, &spec)
+                execute_simple_join_lineage_query(self, &spec).await
             }
             // ── SSI decision evidence ledger PRAGMAs (bd-1lsfu.3) ─────────
             #[cfg(feature = "diagnostic-pragmas")]
@@ -50661,7 +51993,7 @@ impl Connection {
                     values: vec![SqliteValue::Text("ok".into())],
                 }])
             }
-            "wal_checkpoint" => self.pragma_wal_checkpoint_rows(pragma),
+            "wal_checkpoint" => self.pragma_wal_checkpoint_rows(pragma).await,
             // PRAGMA table_info(table_name) — return column metadata.
             "table_info" | "table_xinfo" => {
                 let table_name = match pragma.value.as_ref() {
@@ -51008,7 +52340,7 @@ impl Connection {
                         "SELECT {child_q}.rowid FROM {child_q} WHERE {not_null} \
                          AND NOT EXISTS (SELECT 1 FROM {parent_q} AS p WHERE {join_eq})"
                     );
-                    let violating = self.query_with_params(&sql, &[])?;
+                    let violating = self.query_with_params(&sql, &[]).await?;
                     for row in &violating {
                         if let Some(rowid_val) = row.values().first().cloned() {
                             out.push(Row {
@@ -51286,11 +52618,11 @@ impl Connection {
         positions
     }
 
-    fn pragma_database_header(&self) -> Result<Option<DatabaseHeader>> {
+    async fn pragma_database_header(&self) -> Result<Option<DatabaseHeader>> {
         let cx = self.op_cx()?;
 
         if let Some(active_txn) = self.active_txn.borrow_mut().as_mut() {
-            let page1 = active_txn.get_page(&cx, PageNumber::ONE)?;
+            let page1 = active_txn.get_page(&cx, PageNumber::ONE).await?;
             return Ok(parse_database_header(page1.as_ref()));
         }
 
@@ -51299,18 +52631,19 @@ impl Connection {
             &cx,
             TransactionMode::ReadOnly,
             false,
-        )?;
+        )
+        .await?;
         let header = {
-            let page1 = txn.get_page(&cx, PageNumber::ONE)?;
+            let page1 = txn.get_page(&cx, PageNumber::ONE).await?;
             parse_database_header(page1.as_ref())
         };
-        let _ = txn.rollback(&cx);
+        let _ = txn.rollback(&cx).await;
         Ok(header)
     }
 
-    fn apply_current_journal_mode_to_pager(&self) -> Result<()> {
+    async fn apply_current_journal_mode_to_pager(&self) -> Result<()> {
         let journal_mode = self.pragma_state.borrow().journal_mode.clone();
-        self.apply_journal_mode_to_pager(&journal_mode)
+        self.apply_journal_mode_to_pager(&journal_mode).await
     }
 
     /// Build the rows for `PRAGMA fsqlite_concurrency` — a read-only
@@ -51396,7 +52729,7 @@ impl Connection {
         self.apply_synchronous_to_pager(&synchronous)
     }
 
-    fn apply_current_journal_mode_to_pager_readonly(&self) -> Result<()> {
+    async fn apply_current_journal_mode_to_pager_readonly(&self) -> Result<()> {
         let journal_mode = self.pragma_state.borrow().journal_mode.clone();
         let cx = self.op_cx()?;
         if !journal_mode.eq_ignore_ascii_case("wal") {
@@ -51405,14 +52738,20 @@ impl Connection {
 
         let installed_existing_wal = self
             .pager
-            .install_existing_wal_backend_allow_readonly(&cx, &self.path)?;
-        match self.pager.set_journal_mode(&cx, JournalMode::Wal) {
+            .install_existing_wal_backend_allow_readonly(&cx, &self.path)
+            .await?;
+        match self.pager.set_journal_mode(&cx, JournalMode::Wal).await {
             Ok(_) => Ok(()),
             Err(FrankenError::Unsupported) => {
                 if !installed_existing_wal
-                    && self.pager.install_existing_wal_backend(&cx, &self.path)?
+                    && self
+                        .pager
+                        .install_existing_wal_backend(&cx, &self.path)
+                        .await?
                 {
-                    self.pager.set_journal_mode(&cx, JournalMode::Wal)?;
+                    self.pager
+                        .set_journal_mode(&cx, JournalMode::Wal)
+                        .await?;
                 }
                 Ok(())
             }
@@ -51420,7 +52759,7 @@ impl Connection {
         }
     }
 
-    fn apply_journal_mode_to_pager(&self, journal_mode: &str) -> Result<()> {
+    async fn apply_journal_mode_to_pager(&self, journal_mode: &str) -> Result<()> {
         let cx = self.op_cx()?;
         let requested_mode = if journal_mode.eq_ignore_ascii_case("wal") {
             JournalMode::Wal
@@ -51429,11 +52768,13 @@ impl Connection {
         };
 
         if requested_mode == JournalMode::Wal {
-            match self.pager.set_journal_mode(&cx, JournalMode::Wal) {
+            match self.pager.set_journal_mode(&cx, JournalMode::Wal).await {
                 Ok(_) => Ok(()),
                 Err(FrankenError::Unsupported) => {
-                    self.pager.install_wal_backend(&cx, &self.path)?;
-                    self.pager.set_journal_mode(&cx, JournalMode::Wal)?;
+                    self.pager.install_wal_backend(&cx, &self.path).await?;
+                    self.pager
+                        .set_journal_mode(&cx, JournalMode::Wal)
+                        .await?;
                     Ok(())
                 }
                 Err(err) => Err(err),
@@ -51442,9 +52783,13 @@ impl Connection {
             // SQLite checkpoints outstanding WAL frames before leaving WAL mode
             // so the main database remains self-contained for external readers.
             if self.pager.journal_mode() == JournalMode::Wal {
-                self.pager.checkpoint(&cx, CheckpointMode::Truncate)?;
+                self.pager
+                    .checkpoint(&cx, CheckpointMode::Truncate)
+                    .await?;
             }
-            self.pager.set_journal_mode(&cx, JournalMode::Delete)?;
+            self.pager
+                .set_journal_mode(&cx, JournalMode::Delete)
+                .await?;
             Ok(())
         } else {
             Ok(())
@@ -51598,7 +52943,7 @@ impl Connection {
     /// The subscriber receives a snapshot payload at the current committed
     /// `CommitSeq(N)` and will subsequently receive invalidation events
     /// beginning at `N + 1` until table-level differential routing lands.
-    pub fn register_differential_view_subscriber(
+    pub async fn register_differential_view_subscriber(
         &self,
         view_name: &str,
         sender: mpsc::Sender<DifferentialEvent>,
@@ -51617,7 +52962,9 @@ impl Connection {
 
         let view = self.lookup_differential_view(view_name)?;
         let snapshot_seq = self.pager.published_snapshot().visible_commit_seq;
-        let rows = self.execute_statement(&Statement::Select(view.query.clone()), None)?;
+        let rows = self
+            .execute_statement(&Statement::Select(view.query.clone()), None)
+            .await?;
         let stream_begin_seq = CommitSeq::new(snapshot_seq.get().saturating_add(1));
         let subscriber_id = self
             .differential_registry
@@ -52091,7 +53438,7 @@ impl Connection {
         })
     }
 
-    fn planner_select_directive_with_cache(
+    async fn planner_select_directive_with_cache(
         &self,
         select: &SelectStatement,
         canonical_sql: &str,
@@ -52117,7 +53464,7 @@ impl Connection {
         // Building the full map on each cache miss is acceptable: directive
         // caching still absorbs the hot path, and sqlite_stat1 is typically
         // tiny (one row per (table, index)).
-        let stat1_row_counts = self.sqlite_stat1_row_counts();
+        let stat1_row_counts = self.sqlite_stat1_row_counts().await;
         let stat1_arg = if stat1_row_counts.is_empty() {
             None
         } else {
@@ -52298,7 +53645,7 @@ impl Connection {
     }
 
     /// Compile a table-backed SELECT through the VDBE codegen.
-    fn compile_table_select(&self, select: &SelectStatement) -> Result<VdbeProgram> {
+    async fn compile_table_select(&self, select: &SelectStatement) -> Result<VdbeProgram> {
         let prof = hot_path_profile_enabled();
         let t = prof.then(Instant::now);
         let mut canonical_select = canonicalize_select_placeholders(select)?;
@@ -52331,11 +53678,17 @@ impl Connection {
             Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
             record_hot_path_duration(&FSQLITE_COMPILE_SCHEMA_CLONE_NS, t);
             self.compile_canonical_select_with_schema(&canonical_select, &schema)
+                .await
         } else {
             let t = prof.then(Instant::now);
+            // NOTE: this `Ref` is held across the await below. That is sound only
+            // because this branch is selected exactly when no reentrant
+            // `self.query()` can run (no `sqlite_stat1`, no shadowed-main
+            // substitution) — see the comment above `needs_owned_schema`.
             let schema = self.schema.borrow();
             record_hot_path_duration(&FSQLITE_COMPILE_SCHEMA_CLONE_NS, t);
             self.compile_canonical_select_with_schema(&canonical_select, &schema)
+                .await
         }?;
         Ok(Self::route_temp_roots_in_program(program, &temp_roots))
     }
@@ -52346,7 +53699,7 @@ impl Connection {
     /// defensive clone / shadowed-main substitution was required); byte-identical regardless of how
     /// `schema` was obtained. Must not itself mutate `self.schema` (the fast path passes a live
     /// `Ref`); the planner reaches `self.query()` only via `sqlite_stat1`, which is absent there.
-    fn compile_canonical_select_with_schema(
+    async fn compile_canonical_select_with_schema(
         &self,
         canonical_select: &SelectStatement,
         schema: &[TableSchema],
@@ -52363,7 +53716,7 @@ impl Connection {
         let bypass_planner_cache = FSQLITE_PROGRAM_CACHE_FRONTED.with(std::cell::Cell::get)
             && !FSQLITE_FORCE_PLANNER_CACHE_BENCH.with(std::cell::Cell::get);
         let planner_select_directive = if bypass_planner_cache {
-            let stat1_row_counts = self.sqlite_stat1_row_counts();
+            let stat1_row_counts = self.sqlite_stat1_row_counts().await;
             let stat1_arg = (!stat1_row_counts.is_empty()).then_some(&stat1_row_counts);
             let pc = prof.then(Instant::now);
             let directive =
@@ -52380,6 +53733,7 @@ impl Connection {
                 feature_flags,
                 schema,
             )
+            .await
         };
         record_hot_path_duration(&FSQLITE_COMPILE_PLANNER_NS, t);
         let mut builder = ProgramBuilder::new();
@@ -52564,7 +53918,7 @@ impl Connection {
     /// Handle GROUP BY + JOIN by materializing the join first, then applying
     /// GROUP BY aggregation directly on the joined rows.
     #[allow(clippy::too_many_lines)]
-    fn execute_group_by_join_select(
+    async fn execute_group_by_join_select(
         &self,
         cx: &Cx,
         select: &SelectStatement,
@@ -52616,7 +53970,7 @@ impl Connection {
         let prefer_memdb_hash_join_dispatch = self.prefer_memdb_hash_join_dispatch(&join_select);
         let join_rows =
             if select_join_is_vdbe_eligible(&join_select) && !prefer_memdb_hash_join_dispatch {
-                let program = self.compile_table_select(&join_select)?;
+                let program = self.compile_table_select(&join_select).await?;
                 let (rows, _, _) = self.execute_table_program_with_cx(
                     &program,
                     params,
@@ -52624,10 +53978,11 @@ impl Connection {
                     TableExecutionRuntimeRequirements::read_path(),
                     cx,
                     false,
-                )?;
+                )
+                .await?;
                 rows
             } else {
-                self.execute_join_select(&join_select, params)?
+                self.execute_join_select(&join_select, params).await?
             };
 
         // SQLite materializes a join over an un-indexed right table through an
@@ -52906,7 +54261,9 @@ impl Connection {
                             let inlined_expr;
                             let effective: &Expr = if expr_has_any_subquery(expr) {
                                 if let Some(r) = group_rows.first() {
-                                    if let Ok(e) = self.inline_subqueries_in_expr(expr, r, &col_map)
+                                    if let Ok(e) = self
+                                        .inline_subqueries_in_expr(expr, r, &col_map)
+                                        .await
                                     {
                                         inlined_expr = e;
                                         &inlined_expr
@@ -52922,12 +54279,16 @@ impl Connection {
                             let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
                             eval_group_agg_join_expr(effective, &refs, &col_map)?
                         } else if expr_has_any_subquery(expr) {
-                            group_rows.first().map_or(Ok(SqliteValue::Null), |r| {
-                                let inlined = self
-                                    .inline_subqueries_in_expr(expr, r, &col_map)
-                                    .unwrap_or_else(|_| (**expr).clone());
-                                eval_join_expr_with_using(&inlined, r, &col_map, using_skip)
-                            })?
+                            match group_rows.first() {
+                                Some(r) => {
+                                    let inlined = self
+                                        .inline_subqueries_in_expr(expr, r, &col_map)
+                                        .await
+                                        .unwrap_or_else(|_| (**expr).clone());
+                                    eval_join_expr_with_using(&inlined, r, &col_map, using_skip)?
+                                }
+                                None => SqliteValue::Null,
+                            }
                         } else {
                             group_rows.first().map_or(Ok(SqliteValue::Null), |r| {
                                 eval_join_expr_with_using(expr, r, &col_map, using_skip)
@@ -52948,13 +54309,17 @@ impl Connection {
                     } => {
                         // Apply FILTER clause: only include rows where filter is true.
                         let filtered_rows: Vec<&Vec<SqliteValue>> = if let Some(filt) = filter {
-                            group_rows
-                                .iter()
-                                .filter(|r| {
-                                    self.eval_row_expr_allowing_subqueries(filt, r, &col_map)
-                                        .is_ok_and(|v| !v.is_null() && v.to_integer() != 0)
-                                })
-                                .collect()
+                            let mut kept: Vec<&Vec<SqliteValue>> = Vec::new();
+                            for r in group_rows.iter() {
+                                let keep = self
+                                    .eval_row_expr_allowing_subqueries(filt, r, &col_map)
+                                    .await
+                                    .is_ok_and(|v| !v.is_null() && v.to_integer() != 0);
+                                if keep {
+                                    kept.push(r);
+                                }
+                            }
+                            kept
                         } else {
                             group_rows.iter().collect()
                         };
@@ -52973,31 +54338,42 @@ impl Connection {
                                 let val = if let Some(idx) = *arg_col {
                                     row.get(idx).cloned().unwrap_or(SqliteValue::Null)
                                 } else if let Some(expr) = arg_expr {
-                                    self.eval_row_expr_allowing_subqueries(expr, row, &col_map)?
+                                    self.eval_row_expr_allowing_subqueries(expr, row, &col_map)
+                                        .await?
                                 } else {
                                     SqliteValue::Null
                                 };
                                 if matches!(val, SqliteValue::Null) {
                                     continue;
                                 }
-                                let sep = separator.clone().or_else(|| {
-                                    separator_expr.as_ref().map(|expr| {
-                                        let sv = self
-                                            .eval_row_expr_allowing_subqueries(expr, row, &col_map)
-                                            .unwrap_or(SqliteValue::Null);
-                                        if sv.is_null() {
-                                            // C SQLite: NULL separator → no separator (empty).
-                                            String::new()
-                                        } else {
-                                            sqlite_value_to_text(&sv)
+                                let sep = match separator.clone() {
+                                    Some(sep) => Some(sep),
+                                    None => match separator_expr.as_ref() {
+                                        Some(expr) => {
+                                            let sv = self
+                                                .eval_row_expr_allowing_subqueries(
+                                                    expr, row, &col_map,
+                                                )
+                                                .await
+                                                .unwrap_or(SqliteValue::Null);
+                                            Some(if sv.is_null() {
+                                                // C SQLite: NULL separator → no separator (empty).
+                                                String::new()
+                                            } else {
+                                                sqlite_value_to_text(&sv)
+                                            })
                                         }
-                                    })
-                                });
+                                        None => None,
+                                    },
+                                };
                                 let mut keys = Vec::with_capacity(order_by.len());
                                 for term in order_by {
-                                    keys.push(self.eval_row_expr_allowing_subqueries(
-                                        &term.expr, row, &col_map,
-                                    )?);
+                                    keys.push(
+                                        self.eval_row_expr_allowing_subqueries(
+                                            &term.expr, row, &col_map,
+                                        )
+                                        .await?,
+                                    );
                                 }
                                 entries.push((val, sep, keys));
                             }
@@ -53058,12 +54434,14 @@ impl Connection {
                                     .filter(|v| !matches!(v, SqliteValue::Null))
                                     .collect()
                             } else if let Some(expr) = arg_expr {
-                                filtered_rows
-                                    .iter()
-                                    .map(|r| {
+                                let mut evaluated = Vec::with_capacity(filtered_rows.len());
+                                for r in &filtered_rows {
+                                    evaluated.push(
                                         self.eval_row_expr_allowing_subqueries(expr, r, &col_map)
-                                    })
-                                    .collect::<Result<Vec<_>>>()?
+                                            .await?,
+                                    );
+                                }
+                                evaluated
                                     .into_iter()
                                     .filter(|v| !matches!(v, SqliteValue::Null))
                                     .collect()
@@ -53088,7 +54466,8 @@ impl Connection {
                                         matches!(
                                             self.eval_row_expr_allowing_subqueries(
                                                 expr, row, &col_map
-                                            )?,
+                                            )
+                                            .await?,
                                             SqliteValue::Null
                                         )
                                     } else {
@@ -53099,9 +54478,12 @@ impl Connection {
                                     }
                                     let mut keys = Vec::with_capacity(order_by.len());
                                     for term in order_by {
-                                        keys.push(self.eval_row_expr_allowing_subqueries(
-                                            &term.expr, row, &col_map,
-                                        )?);
+                                        keys.push(
+                                            self.eval_row_expr_allowing_subqueries(
+                                                &term.expr, row, &col_map,
+                                            )
+                                            .await?,
+                                        );
                                     }
                                     keyed.push((owned_values[vi].clone(), keys));
                                     vi += 1;
@@ -53138,17 +54520,20 @@ impl Connection {
                                 owned_values = refs.into_iter().cloned().collect();
                             }
                             let agg_values: Vec<&SqliteValue> = owned_values.iter().collect();
-                            let evaluated_separator = separator.clone().or_else(|| {
-                                separator_expr.as_ref().and_then(|expr| {
-                                    group_rows.first().and_then(|r| {
-                                        let val = self
-                                            .eval_row_expr_allowing_subqueries(expr, r, &col_map)
-                                            .ok()?;
-                                        (!matches!(val, SqliteValue::Null))
-                                            .then(|| sqlite_value_to_text(&val))
-                                    })
-                                })
-                            });
+                            let evaluated_separator = match separator.clone() {
+                                Some(sep) => Some(sep),
+                                None => match (separator_expr.as_ref(), group_rows.first()) {
+                                    (Some(expr), Some(r)) => self
+                                        .eval_row_expr_allowing_subqueries(expr, r, &col_map)
+                                        .await
+                                        .ok()
+                                        .and_then(|val| {
+                                            (!matches!(val, SqliteValue::Null))
+                                                .then(|| sqlite_value_to_text(&val))
+                                        }),
+                                    _ => None,
+                                },
+                            };
                             if let Some(result) =
                                 self.compute_custom_aggregate_with_registry(name, &owned_values)?
                             {
@@ -53170,7 +54555,9 @@ impl Connection {
                 let resolved_having;
                 let effective_having = if expr_has_any_subquery(having) {
                     if let Some(rep) = group_rows.first() {
-                        resolved_having = self.resolve_having_subqueries(having, rep, &col_map)?;
+                        resolved_having = self
+                    .resolve_having_subqueries(having, rep, &col_map)
+                    .await?;
                         &resolved_having
                     } else {
                         having
@@ -53228,7 +54615,7 @@ impl Connection {
                         let effective_having = if expr_has_any_subquery(having) {
                             if let Some(rep) = group_rows.first() {
                                 resolved_having =
-                                    self.resolve_having_subqueries(having, rep, &col_map)?;
+                                    self.resolve_having_subqueries(having, rep, &col_map).await?;
                                 &resolved_having
                             } else {
                                 having
@@ -53236,9 +54623,10 @@ impl Connection {
                         } else {
                             having
                         };
-                        let check_vals: Vec<SqliteValue> = result_descriptors
-                            .iter()
-                            .map(|desc| match desc {
+                        let mut check_vals: Vec<SqliteValue> =
+                            Vec::with_capacity(result_descriptors.len());
+                        for desc in &result_descriptors {
+                            let v = match desc {
                                 GroupByColumn::Plain(expr) => {
                                     if expr_contains_agg(expr) {
                                         let refs: Vec<&Vec<SqliteValue>> =
@@ -53246,17 +54634,21 @@ impl Connection {
                                         eval_group_agg_join_expr(expr, &refs, &col_map)
                                             .unwrap_or(SqliteValue::Null)
                                     } else {
-                                        group_rows.first().map_or(SqliteValue::Null, |r| {
-                                            self.eval_row_expr_allowing_subqueries(
-                                                expr, r, &col_map,
-                                            )
-                                            .unwrap_or(SqliteValue::Null)
-                                        })
+                                        match group_rows.first() {
+                                            Some(r) => self
+                                                .eval_row_expr_allowing_subqueries(
+                                                    expr, r, &col_map,
+                                                )
+                                                .await
+                                                .unwrap_or(SqliteValue::Null),
+                                            None => SqliteValue::Null,
+                                        }
                                     }
                                 }
                                 GroupByColumn::Agg { .. } => SqliteValue::Null,
-                            })
-                            .collect();
+                            };
+                            check_vals.push(v);
+                        }
                         if !evaluate_having_predicate(
                             effective_having,
                             &check_vals,
@@ -53278,7 +54670,9 @@ impl Connection {
                             let inlined_expr;
                             let effective: &Expr = if expr_has_any_subquery(expr) {
                                 if let Some(r) = group_rows.first() {
-                                    if let Ok(e) = self.inline_subqueries_in_expr(expr, r, &col_map)
+                                    if let Ok(e) = self
+                                        .inline_subqueries_in_expr(expr, r, &col_map)
+                                        .await
                                     {
                                         inlined_expr = e;
                                         &inlined_expr
@@ -53294,12 +54688,16 @@ impl Connection {
                             let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
                             eval_group_agg_join_expr(effective, &refs, &col_map)?
                         } else if expr_has_any_subquery(expr) {
-                            group_rows.first().map_or(Ok(SqliteValue::Null), |r| {
-                                let inlined = self
-                                    .inline_subqueries_in_expr(expr, r, &col_map)
-                                    .unwrap_or_else(|_| (*expr).clone());
-                                eval_join_expr_with_using(&inlined, r, &col_map, using_skip)
-                            })?
+                            match group_rows.first() {
+                                Some(r) => {
+                                    let inlined = self
+                                        .inline_subqueries_in_expr(expr, r, &col_map)
+                                        .await
+                                        .unwrap_or_else(|_| (*expr).clone());
+                                    eval_join_expr_with_using(&inlined, r, &col_map, using_skip)?
+                                }
+                                None => SqliteValue::Null,
+                            }
                         } else {
                             group_rows.first().map_or(Ok(SqliteValue::Null), |r| {
                                 eval_join_expr_with_using(expr, r, &col_map, using_skip)
@@ -53811,7 +55209,7 @@ impl Connection {
     /// SQLite treats FROM-less SELECTs with aggregates as aggregation over a
     /// single implicit row. `COUNT(*)` returns 1, `COUNT(NULL)` returns 0,
     /// `SUM(NULL)` returns NULL, etc.
-    fn execute_fromless_aggregate(
+    async fn execute_fromless_aggregate(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -53833,7 +55231,7 @@ impl Connection {
         // implicit single row is excluded -- aggregates return empty-set
         // defaults (COUNT→0, SUM/AVG/etc.→NULL, TOTAL→0.0).
         let row_included = if let Some(wh) = where_clause {
-            let val = self.eval_expr_with_subqueries(wh, &empty_row, &empty_col_map, params)?;
+            let val = self.eval_expr_with_subqueries(wh, &empty_row, &empty_col_map, params).await?;
             is_sqlite_truthy(&val)
         } else {
             true
@@ -53886,17 +55284,19 @@ impl Connection {
                             match args {
                                 FunctionArgs::Star => aggregate.step(&mut state, &[])?,
                                 FunctionArgs::List(exprs) => {
-                                    let arg_vals: Vec<SqliteValue> = exprs
-                                        .iter()
-                                        .map(|e| {
+                                    let mut arg_vals: Vec<SqliteValue> =
+                                        Vec::with_capacity(exprs.len());
+                                    for e in exprs {
+                                        arg_vals.push(
                                             self.eval_expr_with_subqueries(
                                                 e,
                                                 &empty_row,
                                                 &empty_col_map,
                                                 params,
                                             )
-                                        })
-                                        .collect::<Result<Vec<_>>>()?;
+                                            .await?,
+                                        );
+                                    }
                                     aggregate.step(&mut state, &arg_vals)?;
                                 }
                             }
@@ -53943,17 +55343,19 @@ impl Connection {
                         }
                         FunctionArgs::List(exprs) => {
                             // Evaluate each argument expression.
-                            let arg_vals: Vec<SqliteValue> = exprs
-                                .iter()
-                                .map(|e| {
+                            let mut arg_vals: Vec<SqliteValue> =
+                                Vec::with_capacity(exprs.len());
+                            for e in exprs {
+                                arg_vals.push(
                                     self.eval_expr_with_subqueries(
                                         e,
                                         &empty_row,
                                         &empty_col_map,
                                         params,
                                     )
-                                })
-                                .collect::<Result<Vec<_>>>()?;
+                                    .await?,
+                                );
+                            }
                             // min/max with 2+ args are SCALAR (NULL-propagating),
                             // not aggregate (NULL-skipping).
                             if (func == "min" || func == "max") && arg_vals.len() >= 2 {
@@ -54003,12 +55405,15 @@ impl Connection {
                 }
                 ResultColumn::Expr { expr, .. } => {
                     if row_included {
-                        values.push(self.eval_expr_with_subqueries(
-                            expr,
-                            &empty_row,
-                            &empty_col_map,
-                            params,
-                        )?);
+                        values.push(
+                            self.eval_expr_with_subqueries(
+                                expr,
+                                &empty_row,
+                                &empty_col_map,
+                                params,
+                            )
+                            .await?,
+                        );
                     } else {
                         values.push(SqliteValue::Null);
                     }
@@ -54020,7 +55425,8 @@ impl Connection {
             }
         }
         let mut rows = vec![Row { values }];
-        self.apply_expression_only_postprocess(&mut rows, select, params)?;
+        self.apply_expression_only_postprocess(&mut rows, select, params)
+            .await?;
         Ok(rows)
     }
 
@@ -54029,7 +55435,7 @@ impl Connection {
     /// cannot resolve table references inside `Expr::Subquery` (e.g. CTE temp
     /// tables), so we evaluate each expression at the connection level where
     /// `execute_statement` has full schema access.
-    fn execute_expression_only_with_subqueries(
+    async fn execute_expression_only_with_subqueries(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -54059,12 +55465,13 @@ impl Connection {
                         detail: "VALUES rows must have matching column counts".to_owned(),
                     });
                 }
-                let values = value_row
-                    .iter()
-                    .map(|expr| {
+                let mut values = Vec::with_capacity(value_row.len());
+                for expr in value_row {
+                    values.push(
                         self.eval_expr_with_subqueries(expr, &empty_row, &empty_col_map, params)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                            .await?,
+                    );
+                }
                 rows.push(Row { values });
             }
 
@@ -54085,22 +55492,28 @@ impl Connection {
         };
         let empty_row: Vec<SqliteValue> = Vec::new();
         let empty_col_map: Vec<(String, String, bool)> = Vec::new();
-        let row_included = where_clause.as_ref().map_or(Ok(true), |predicate| {
-            self.eval_expr_with_subqueries(predicate, &empty_row, &empty_col_map, params)
-                .map(|value| is_sqlite_truthy(&value))
-        })?;
+        let row_included = match where_clause.as_ref() {
+            None => true,
+            Some(predicate) => is_sqlite_truthy(
+                &self
+                    .eval_expr_with_subqueries(predicate, &empty_row, &empty_col_map, params)
+                    .await?,
+            ),
+        };
 
         let mut rows = if row_included {
             let mut values = Vec::with_capacity(columns.len());
             for col in columns {
                 match col {
                     ResultColumn::Expr { expr, .. } => {
-                        let val = self.eval_expr_with_subqueries(
-                            expr,
-                            &empty_row,
-                            &empty_col_map,
-                            params,
-                        )?;
+                        let val = self
+                            .eval_expr_with_subqueries(
+                                expr,
+                                &empty_row,
+                                &empty_col_map,
+                                params,
+                            )
+                            .await?;
                         values.push(val);
                     }
                     ResultColumn::Star | ResultColumn::TableStar(_) => {
@@ -54113,28 +55526,35 @@ impl Connection {
             Vec::new()
         };
 
-        self.apply_expression_only_postprocess(&mut rows, select, params)?;
+        self.apply_expression_only_postprocess(&mut rows, select, params)
+            .await?;
         Ok(rows)
     }
 
-    fn apply_expression_only_postprocess(
+    async fn apply_expression_only_postprocess(
         &self,
         rows: &mut Vec<Row>,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<()> {
         let postprocess = build_expression_postprocess(select);
-        let _resolved_order_terms = self.resolve_expression_only_order_terms(
-            &postprocess.order_by,
-            postprocess.output_width,
-            &postprocess.output_aliases,
-            params,
-        )?;
+        let _resolved_order_terms = self
+            .resolve_expression_only_order_terms(
+                &postprocess.order_by,
+                postprocess.output_width,
+                &postprocess.output_aliases,
+                params,
+            )
+            .await?;
 
         if let Some(limit_clause) = postprocess.limit.as_ref() {
-            let offset = limit_clause.offset.as_ref().map_or(Ok(0_i64), |expr| {
-                self.eval_expression_only_limit_offset_expr(expr, params, "OFFSET")
-            })?;
+            let offset = match limit_clause.offset.as_ref() {
+                Some(expr) => {
+                    self.eval_expression_only_limit_offset_expr(expr, params, "OFFSET")
+                        .await?
+                }
+                None => 0_i64,
+            };
             let offset = offset.max(0);
             let offset = usize::try_from(offset).unwrap_or(usize::MAX);
             if offset > 0 && offset < rows.len() {
@@ -54144,8 +55564,9 @@ impl Connection {
                 return Ok(());
             }
 
-            let limit =
-                self.eval_expression_only_limit_offset_expr(&limit_clause.limit, params, "LIMIT")?;
+            let limit = self
+                .eval_expression_only_limit_offset_expr(&limit_clause.limit, params, "LIMIT")
+                .await?;
             if limit >= 0 {
                 let limit = usize::try_from(limit).unwrap_or(usize::MAX);
                 rows.truncate(limit);
@@ -54155,51 +55576,54 @@ impl Connection {
         Ok(())
     }
 
-    fn resolve_expression_only_order_terms(
+    async fn resolve_expression_only_order_terms(
         &self,
         order_by: &[OrderingTerm],
         output_width: usize,
         output_aliases: &HashMap<String, usize>,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<ResolvedOrderTerm>> {
-        order_by
-            .iter()
-            .map(|term| {
-                let column_index = match &term.expr {
-                    Expr::Column(column_ref, _) if column_ref.table.is_none() => output_aliases
-                        .get(&column_ref.column.to_ascii_lowercase())
-                        .copied()
-                        .ok_or_else(|| {
-                            FrankenError::NotImplemented(
-                                "expression-only ORDER BY currently supports output-column positions or aliases only".to_owned(),
-                            )
-                        })?,
-                    _ => self.expression_only_order_term_positional_index(&term.expr, params)?,
-                };
-                if column_index >= output_width {
-                    return Err(FrankenError::OutOfRange {
-                        what: "ORDER BY column index".to_owned(),
-                        value: (column_index + 1).to_string(),
-                    });
+        let mut resolved = Vec::with_capacity(order_by.len());
+        for term in order_by {
+            let column_index = match &term.expr {
+                Expr::Column(column_ref, _) if column_ref.table.is_none() => output_aliases
+                    .get(&column_ref.column.to_ascii_lowercase())
+                    .copied()
+                    .ok_or_else(|| {
+                        FrankenError::NotImplemented(
+                            "expression-only ORDER BY currently supports output-column positions or aliases only".to_owned(),
+                        )
+                    })?,
+                _ => {
+                    self.expression_only_order_term_positional_index(&term.expr, params)
+                        .await?
                 }
-                Ok(ResolvedOrderTerm {
-                    column_index,
-                    descending: term.direction == Some(SortDirection::Desc),
-                    nulls_order: term
-                        .nulls
-                        .unwrap_or_else(|| default_nulls_order(term.direction)),
-                })
-            })
-            .collect()
+            };
+            if column_index >= output_width {
+                return Err(FrankenError::OutOfRange {
+                    what: "ORDER BY column index".to_owned(),
+                    value: (column_index + 1).to_string(),
+                });
+            }
+            resolved.push(ResolvedOrderTerm {
+                column_index,
+                descending: term.direction == Some(SortDirection::Desc),
+                nulls_order: term
+                    .nulls
+                    .unwrap_or_else(|| default_nulls_order(term.direction)),
+            });
+        }
+        Ok(resolved)
     }
 
-    fn expression_only_order_term_positional_index(
+    async fn expression_only_order_term_positional_index(
         &self,
         expr: &Expr,
         params: Option<&[SqliteValue]>,
     ) -> Result<usize> {
-        let one_based =
-            self.eval_expression_only_limit_offset_expr(expr, params, "ORDER BY column index")?;
+        let one_based = self
+            .eval_expression_only_limit_offset_expr(expr, params, "ORDER BY column index")
+            .await?;
         if one_based <= 0 {
             return Err(FrankenError::OutOfRange {
                 what: "ORDER BY column index".to_owned(),
@@ -54213,7 +55637,7 @@ impl Connection {
         })
     }
 
-    fn eval_expression_only_limit_offset_expr(
+    async fn eval_expression_only_limit_offset_expr(
         &self,
         expr: &Expr,
         params: Option<&[SqliteValue]>,
@@ -54227,7 +55651,7 @@ impl Connection {
 
         let empty_row: Vec<SqliteValue> = Vec::new();
         let empty_col_map: Vec<(String, String, bool)> = Vec::new();
-        let value = self.eval_expr_with_subqueries(expr, &empty_row, &empty_col_map, params)?;
+        let value = self.eval_expr_with_subqueries(expr, &empty_row, &empty_col_map, params).await?;
         match value {
             SqliteValue::Integer(value) => Ok(value),
             _ => Err(FrankenError::NotImplemented(format!(
@@ -54418,23 +55842,28 @@ impl Connection {
 
     /// them by executing each subquery via `execute_statement`.
     #[allow(clippy::too_many_lines)]
-    fn eval_expr_with_subqueries(
-        &self,
-        expr: &Expr,
-        row: &[SqliteValue],
-        col_map: &[(String, String, bool)],
-        params: Option<&[SqliteValue]>,
-    ) -> Result<SqliteValue> {
-        let execute_nested_select = |select: SelectStatement| -> Result<Vec<Row>> {
+    // NOTE: this evaluator recurses into itself for nested expressions, and a
+    // plain `async fn` cannot recurse without indirection, so it returns a
+    // boxed future explicitly rather than using `async fn` sugar.
+    fn eval_expr_with_subqueries<'a>(
+        &'a self,
+        expr: &'a Expr,
+        row: &'a [SqliteValue],
+        col_map: &'a [(String, String, bool)],
+        params: Option<&'a [SqliteValue]>,
+    ) -> Pin<Box<dyn Future<Output = Result<SqliteValue>> + 'a>> {
+        Box::pin(async move {
+        let execute_nested_select = async |select: SelectStatement| -> Result<Vec<Row>> {
             if self.skip_statement_memdb_refresh.get()
                 && matches!(
                     &select.body.select,
                     SelectCore::Select { from: Some(_), .. }
                 )
             {
-                self.execute_select_via_memdb_fallback(&select, params)
+                self.execute_select_via_memdb_fallback(&select, params).await
             } else {
                 self.execute_statement(&Statement::Select(select), params)
+                    .await
             }
         };
         match expr {
@@ -54452,7 +55881,7 @@ impl Connection {
                 let inner_tables = collect_subquery_inner_tables(sub);
                 let mut sub_clone = sub.as_ref().clone();
                 substitute_outer_refs_in_select(&mut sub_clone, row, col_map, &inner_tables);
-                let rows = execute_nested_select(sub_clone)?;
+                let rows = execute_nested_select(sub_clone).await?;
                 Ok(rows
                     .into_iter()
                     .next()
@@ -54477,7 +55906,7 @@ impl Connection {
                         offset: None,
                     });
                 }
-                let rows = execute_nested_select(sub_clone)?;
+                let rows = execute_nested_select(sub_clone).await?;
                 let exists = !rows.is_empty();
                 let truth = if *not { !exists } else { exists };
                 Ok(SqliteValue::Integer(i64::from(truth)))
@@ -54492,7 +55921,7 @@ impl Connection {
                 if matches!(op, BinaryOp::Is | BinaryOp::IsNot) {
                     if let Expr::Literal(lit, _) = right.as_ref() {
                         if matches!(lit, Literal::True | Literal::False) {
-                            let lv = self.eval_expr_with_subqueries(left, row, col_map, params)?;
+                            let lv = self.eval_expr_with_subqueries(left, row, col_map, params).await?;
                             let truthy = if lv.is_null() {
                                 None
                             } else {
@@ -54511,12 +55940,12 @@ impl Connection {
                         }
                     }
                 }
-                let l = self.eval_expr_with_subqueries(left, row, col_map, params)?;
-                let r = self.eval_expr_with_subqueries(right, row, col_map, params)?;
+                let l = self.eval_expr_with_subqueries(left, row, col_map, params).await?;
+                let r = self.eval_expr_with_subqueries(right, row, col_map, params).await?;
                 Ok(eval_join_binary_op(left, &l, *op, right, &r, col_map))
             }
             Expr::UnaryOp { op, expr: e, .. } => {
-                let val = self.eval_expr_with_subqueries(e, row, col_map, params)?;
+                let val = self.eval_expr_with_subqueries(e, row, col_map, params).await?;
                 match op {
                     UnaryOp::Negate => match &val {
                         SqliteValue::Integer(n) => Ok(n.checked_neg().map_or_else(
@@ -54544,7 +55973,7 @@ impl Connection {
                 }
             }
             Expr::IsNull { expr: e, not, .. } => {
-                let val = self.eval_expr_with_subqueries(e, row, col_map, params)?;
+                let val = self.eval_expr_with_subqueries(e, row, col_map, params).await?;
                 let result = if *not { !val.is_null() } else { val.is_null() };
                 Ok(SqliteValue::Integer(i64::from(result)))
             }
@@ -54555,24 +55984,27 @@ impl Connection {
                 ..
             } => {
                 let base = if let Some(op) = operand {
-                    Some(self.eval_expr_with_subqueries(op, row, col_map, params)?)
+                    Some(self.eval_expr_with_subqueries(op, row, col_map, params).await?)
                 } else {
                     None
                 };
                 for (when_expr, then_expr) in whens {
                     let when_val =
-                        self.eval_expr_with_subqueries(when_expr, row, col_map, params)?;
+                        self.eval_expr_with_subqueries(when_expr, row, col_map, params).await?;
                     let matched = if let Some(ref b) = base {
                         cmp_values(b, &when_val) == std::cmp::Ordering::Equal
                     } else {
                         is_sqlite_truthy(&when_val)
                     };
                     if matched {
-                        return self.eval_expr_with_subqueries(then_expr, row, col_map, params);
+                        return self
+                            .eval_expr_with_subqueries(then_expr, row, col_map, params)
+                            .await;
                     }
                 }
                 if let Some(el) = else_expr {
                     self.eval_expr_with_subqueries(el, row, col_map, params)
+                        .await
                 } else {
                     Ok(SqliteValue::Null)
                 }
@@ -54588,10 +56020,16 @@ impl Connection {
                 }
                 let arg_vals: Vec<SqliteValue> = match args {
                     FunctionArgs::Star => vec![],
-                    FunctionArgs::List(exprs) => exprs
-                        .iter()
-                        .map(|e| self.eval_expr_with_subqueries(e, row, col_map, params))
-                        .collect::<Result<Vec<_>>>()?,
+                    FunctionArgs::List(exprs) => {
+                        let mut vals = Vec::with_capacity(exprs.len());
+                        for e in exprs {
+                            vals.push(
+                                self.eval_expr_with_subqueries(e, row, col_map, params)
+                                    .await?,
+                            );
+                        }
+                        vals
+                    }
                 };
                 if let Some(scalar) = self
                     .func_registry
@@ -54610,9 +56048,9 @@ impl Connection {
                 not,
                 ..
             } => {
-                let val = self.eval_expr_with_subqueries(e, row, col_map, params)?;
-                let lo = self.eval_expr_with_subqueries(low, row, col_map, params)?;
-                let hi = self.eval_expr_with_subqueries(high, row, col_map, params)?;
+                let val = self.eval_expr_with_subqueries(e, row, col_map, params).await?;
+                let lo = self.eval_expr_with_subqueries(low, row, col_map, params).await?;
+                let hi = self.eval_expr_with_subqueries(high, row, col_map, params).await?;
                 // Three-valued BETWEEN: `x BETWEEN y AND z` ≡ `x >= y AND x <= z`.
                 // NULL propagates per comparison, then through AND.
                 // Crucially, `FALSE AND NULL = FALSE` (short-circuit), so
@@ -54658,7 +56096,7 @@ impl Connection {
             Expr::In {
                 expr: e, set, not, ..
             } => {
-                let val = self.eval_expr_with_subqueries(e, row, col_map, params)?;
+                let val = self.eval_expr_with_subqueries(e, row, col_map, params).await?;
                 if val.is_null() {
                     return Ok(SqliteValue::Null);
                 }
@@ -54697,7 +56135,7 @@ impl Connection {
                             let mut set_vals = std::collections::HashSet::with_capacity(list.len());
                             for le in list.iter() {
                                 let lv =
-                                    self.eval_expr_with_subqueries(le, row, col_map, params)?;
+                                    self.eval_expr_with_subqueries(le, row, col_map, params).await?;
                                 if lv.is_null() {
                                     saw_null = true;
                                 } else {
@@ -54720,7 +56158,8 @@ impl Connection {
                             };
                             for list_expr in list {
                                 let list_value = self
-                                    .eval_expr_with_subqueries(list_expr, row, col_map, params)?;
+                                    .eval_expr_with_subqueries(list_expr, row, col_map, params)
+                                    .await?;
                                 if list_value.is_null() {
                                     saw_null = true;
                                     continue;
@@ -54752,7 +56191,7 @@ impl Connection {
                         } else {
                             None
                         };
-                        let rows = execute_nested_select(sub_clone)?;
+                        let rows = execute_nested_select(sub_clone).await?;
                         for row in rows {
                             let candidate =
                                 row.values.into_iter().next().unwrap_or(SqliteValue::Null);
@@ -54778,7 +56217,8 @@ impl Connection {
                         } else {
                             None
                         };
-                        let rows = execute_nested_select(in_table_name_to_select_statement(name))?;
+                        let rows =
+                            execute_nested_select(in_table_name_to_select_statement(name)).await?;
                         for row in rows {
                             let candidate =
                                 row.values.into_iter().next().unwrap_or(SqliteValue::Null);
@@ -54811,11 +56251,12 @@ impl Connection {
             Expr::Cast {
                 expr: e, type_name, ..
             } => {
-                let val = self.eval_expr_with_subqueries(e, row, col_map, params)?;
+                let val = self.eval_expr_with_subqueries(e, row, col_map, params).await?;
                 Ok(apply_cast(val, &type_name.name))
             }
             Expr::Collate { expr: inner, .. } => {
                 self.eval_expr_with_subqueries(inner, row, col_map, params)
+                    .await
             }
             Expr::Like {
                 expr: inner,
@@ -54825,8 +56266,8 @@ impl Connection {
                 escape,
                 ..
             } => {
-                let val = self.eval_expr_with_subqueries(inner, row, col_map, params)?;
-                let pat = self.eval_expr_with_subqueries(pattern, row, col_map, params)?;
+                let val = self.eval_expr_with_subqueries(inner, row, col_map, params).await?;
+                let pat = self.eval_expr_with_subqueries(pattern, row, col_map, params).await?;
                 if val.is_null() || pat.is_null() {
                     return Ok(SqliteValue::Null);
                 }
@@ -54834,7 +56275,7 @@ impl Connection {
                 let pattern_text = pat.to_text();
                 let escape_char = if let Some(escape_expr) = escape {
                     let escape_value =
-                        self.eval_expr_with_subqueries(escape_expr, row, col_map, params)?;
+                        self.eval_expr_with_subqueries(escape_expr, row, col_map, params).await?;
                     escape_value.to_text().chars().next()
                 } else {
                     None
@@ -54863,8 +56304,8 @@ impl Connection {
                 arrow,
                 ..
             } => {
-                let input = self.eval_expr_with_subqueries(inner, row, col_map, params)?;
-                let json_path = self.eval_expr_with_subqueries(path, row, col_map, params)?;
+                let input = self.eval_expr_with_subqueries(inner, row, col_map, params).await?;
+                let json_path = self.eval_expr_with_subqueries(path, row, col_map, params).await?;
                 let function_name = match arrow {
                     JsonArrow::Arrow => "JSON_ARROW",
                     JsonArrow::DoubleArrow => "JSON_DOUBLE_ARROW",
@@ -54873,9 +56314,10 @@ impl Connection {
             }
             _ => eval_join_expr(expr, row, col_map),
         }
+        })
     }
 
-    fn execute_table_function_rows(
+    async fn execute_table_function_rows(
         &self,
         name: &str,
         args: &[Expr],
@@ -54885,21 +56327,26 @@ impl Connection {
         // bd-1hn48: `pragma_<name>(arg)` table-valued functions reuse the
         // existing PRAGMA row generators by synthesizing a PRAGMA statement.
         if let Some(columns) = pragma_table_function_columns(name) {
-            return self.execute_pragma_table_function_rows(
-                name,
-                columns.len(),
-                args,
-                params,
-                include_hidden_rowid,
-            );
+            return self
+                .execute_pragma_table_function_rows(
+                    name,
+                    columns.len(),
+                    args,
+                    params,
+                    include_hidden_rowid,
+                )
+                .await;
         }
 
         let empty_row: Vec<SqliteValue> = Vec::new();
         let empty_col_map: Vec<(String, String, bool)> = Vec::new();
-        let arg_values = args
-            .iter()
-            .map(|arg| self.eval_expr_with_subqueries(arg, &empty_row, &empty_col_map, params))
-            .collect::<Result<Vec<_>>>()?;
+        let mut arg_values = Vec::with_capacity(args.len());
+        for arg in args {
+            arg_values.push(
+                self.eval_expr_with_subqueries(arg, &empty_row, &empty_col_map, params)
+                    .await?,
+            );
+        }
 
         let column_names = self.table_function_result_column_names(name).map_or_else(
             || {
@@ -54935,7 +56382,7 @@ impl Connection {
     /// synthesizing the equivalent PRAGMA statement and reusing the existing
     /// `execute_pragma` row generators. The single optional argument becomes the
     /// pragma's call value (e.g. `pragma_table_info('t')` -> `PRAGMA table_info(t)`).
-    fn execute_pragma_table_function_rows(
+    async fn execute_pragma_table_function_rows(
         &self,
         name: &str,
         column_count: usize,
@@ -54948,7 +56395,7 @@ impl Connection {
             let empty_row: Vec<SqliteValue> = Vec::new();
             let empty_col_map: Vec<(String, String, bool)> = Vec::new();
             let arg_value =
-                self.eval_expr_with_subqueries(arg, &empty_row, &empty_col_map, params)?;
+                self.eval_expr_with_subqueries(arg, &empty_row, &empty_col_map, params).await?;
             let arg_text =
                 arg_value
                     .as_text_str()
@@ -54974,7 +56421,7 @@ impl Connection {
             },
             value,
         };
-        let rows = self.execute_pragma(&stmt)?;
+        let rows = self.execute_pragma(&stmt).await?;
         let mut out = Vec::with_capacity(rows.len());
         for (i, row) in rows.into_iter().enumerate() {
             let mut values = row.values;
@@ -55024,7 +56471,7 @@ impl Connection {
     /// Execute a GROUP BY aggregate SELECT via post-execution processing:
     /// scan all rows, group by key columns, compute aggregates per group.
     #[allow(clippy::too_many_lines)]
-    fn execute_group_by_select(
+    async fn execute_group_by_select(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -55475,8 +56922,10 @@ impl Connection {
         }
 
         // Compile and execute the raw scan that feeds GROUP BY aggregation.
-        let program = self.compile_table_select(&raw_select)?;
-        let (raw_rows, _, _) = self.execute_table_program(&program, params, false)?;
+        let program = self.compile_table_select(&raw_select).await?;
+        let (raw_rows, _, _) = self
+            .execute_table_program(&program, params, false)
+            .await?;
 
         // SQL semantics: implicit aggregation (no GROUP BY) on an empty table
         // must produce exactly one row with default aggregate values (COUNT→0,
@@ -55569,7 +57018,9 @@ impl Connection {
                             let inlined_expr;
                             let effective: &Expr = if expr_has_any_subquery(expr) {
                                 if let Some(r) = group_rows.first() {
-                                    if let Ok(e) = self.inline_subqueries_in_expr(expr, r, &col_map)
+                                    if let Ok(e) = self
+                                        .inline_subqueries_in_expr(expr, r, &col_map)
+                                        .await
                                     {
                                         inlined_expr = e;
                                         &inlined_expr
@@ -55587,12 +57038,16 @@ impl Connection {
                         } else if expr_has_any_subquery(expr) {
                             // Correlated scalar subqueries need to be inlined
                             // with the representative row's column values.
-                            repr_row.map_or(Ok(SqliteValue::Null), |r| {
-                                let inlined = self
-                                    .inline_subqueries_in_expr(expr, r, &col_map)
-                                    .unwrap_or_else(|_| (**expr).clone());
-                                eval_join_expr(&inlined, r, &col_map)
-                            })?
+                            match repr_row {
+                                Some(r) => {
+                                    let inlined = self
+                                        .inline_subqueries_in_expr(expr, r, &col_map)
+                                        .await
+                                        .unwrap_or_else(|_| (**expr).clone());
+                                    eval_join_expr(&inlined, r, &col_map)?
+                                }
+                                None => SqliteValue::Null,
+                            }
                         } else {
                             repr_row.map_or(Ok(SqliteValue::Null), |r| {
                                 eval_join_expr(expr, r, &col_map)
@@ -55613,13 +57068,17 @@ impl Connection {
                     } => {
                         // Apply FILTER clause: only include rows where filter is true.
                         let filtered_rows: Vec<&Vec<SqliteValue>> = if let Some(filt) = filter {
-                            group_rows
-                                .iter()
-                                .filter(|r| {
-                                    self.eval_row_expr_allowing_subqueries(filt, r, &col_map)
-                                        .is_ok_and(|v| !v.is_null() && v.to_integer() != 0)
-                                })
-                                .collect()
+                            let mut kept: Vec<&Vec<SqliteValue>> = Vec::new();
+                            for r in group_rows.iter() {
+                                let keep = self
+                                    .eval_row_expr_allowing_subqueries(filt, r, &col_map)
+                                    .await
+                                    .is_ok_and(|v| !v.is_null() && v.to_integer() != 0);
+                                if keep {
+                                    kept.push(r);
+                                }
+                            }
+                            kept
                         } else {
                             group_rows.iter().collect()
                         };
@@ -55636,31 +57095,42 @@ impl Connection {
                                 let val = if let Some(idx) = *arg_col {
                                     row.get(idx).cloned().unwrap_or(SqliteValue::Null)
                                 } else if let Some(expr) = arg_expr {
-                                    self.eval_row_expr_allowing_subqueries(expr, row, &col_map)?
+                                    self.eval_row_expr_allowing_subqueries(expr, row, &col_map)
+                                        .await?
                                 } else {
                                     SqliteValue::Null
                                 };
                                 if matches!(val, SqliteValue::Null) {
                                     continue;
                                 }
-                                let sep = separator.clone().or_else(|| {
-                                    separator_expr.as_ref().map(|expr| {
-                                        let sv = self
-                                            .eval_row_expr_allowing_subqueries(expr, row, &col_map)
-                                            .unwrap_or(SqliteValue::Null);
-                                        if sv.is_null() {
-                                            // C SQLite: NULL separator → no separator (empty).
-                                            String::new()
-                                        } else {
-                                            sqlite_value_to_text(&sv)
+                                let sep = match separator.clone() {
+                                    Some(sep) => Some(sep),
+                                    None => match separator_expr.as_ref() {
+                                        Some(expr) => {
+                                            let sv = self
+                                                .eval_row_expr_allowing_subqueries(
+                                                    expr, row, &col_map,
+                                                )
+                                                .await
+                                                .unwrap_or(SqliteValue::Null);
+                                            Some(if sv.is_null() {
+                                                // C SQLite: NULL separator → no separator (empty).
+                                                String::new()
+                                            } else {
+                                                sqlite_value_to_text(&sv)
+                                            })
                                         }
-                                    })
-                                });
+                                        None => None,
+                                    },
+                                };
                                 let mut keys = Vec::with_capacity(order_by.len());
                                 for term in order_by {
-                                    keys.push(self.eval_row_expr_allowing_subqueries(
-                                        &term.expr, row, &col_map,
-                                    )?);
+                                    keys.push(
+                                        self.eval_row_expr_allowing_subqueries(
+                                            &term.expr, row, &col_map,
+                                        )
+                                        .await?,
+                                    );
                                 }
                                 entries.push((val, sep, keys));
                             }
@@ -55720,12 +57190,14 @@ impl Connection {
                                     .filter(|v| !matches!(v, SqliteValue::Null))
                                     .collect()
                             } else if let Some(expr) = arg_expr {
-                                filtered_rows
-                                    .iter()
-                                    .map(|r| {
+                                let mut evaluated = Vec::with_capacity(filtered_rows.len());
+                                for r in &filtered_rows {
+                                    evaluated.push(
                                         self.eval_row_expr_allowing_subqueries(expr, r, &col_map)
-                                    })
-                                    .collect::<Result<Vec<_>>>()?
+                                            .await?,
+                                    );
+                                }
+                                evaluated
                                     .into_iter()
                                     .filter(|v| !matches!(v, SqliteValue::Null))
                                     .collect()
@@ -55744,17 +57216,20 @@ impl Connection {
                                 owned_values = refs.into_iter().cloned().collect();
                             }
                             let agg_values: Vec<&SqliteValue> = owned_values.iter().collect();
-                            let evaluated_separator = separator.clone().or_else(|| {
-                                separator_expr.as_ref().and_then(|expr| {
-                                    group_rows.first().and_then(|r| {
-                                        let val = self
-                                            .eval_row_expr_allowing_subqueries(expr, r, &col_map)
-                                            .ok()?;
-                                        (!matches!(val, SqliteValue::Null))
-                                            .then(|| sqlite_value_to_text(&val))
-                                    })
-                                })
-                            });
+                            let evaluated_separator = match separator.clone() {
+                                Some(sep) => Some(sep),
+                                None => match (separator_expr.as_ref(), group_rows.first()) {
+                                    (Some(expr), Some(r)) => self
+                                        .eval_row_expr_allowing_subqueries(expr, r, &col_map)
+                                        .await
+                                        .ok()
+                                        .and_then(|val| {
+                                            (!matches!(val, SqliteValue::Null))
+                                                .then(|| sqlite_value_to_text(&val))
+                                        }),
+                                    _ => None,
+                                },
+                            };
                             if let Some(result) =
                                 self.compute_custom_aggregate_with_registry(name, &owned_values)?
                             {
@@ -55777,7 +57252,9 @@ impl Connection {
                 let resolved_having;
                 let effective_having = if expr_has_any_subquery(having) {
                     if let Some(rep) = group_rows.first() {
-                        resolved_having = self.resolve_having_subqueries(having, rep, &col_map)?;
+                        resolved_having = self
+                    .resolve_having_subqueries(having, rep, &col_map)
+                    .await?;
                         &resolved_having
                     } else {
                         having
@@ -55825,7 +57302,7 @@ impl Connection {
                         let effective_having = if expr_has_any_subquery(having) {
                             if let Some(rep) = group_rows.first() {
                                 resolved_having =
-                                    self.resolve_having_subqueries(having, rep, &col_map)?;
+                                    self.resolve_having_subqueries(having, rep, &col_map).await?;
                                 &resolved_having
                             } else {
                                 having
@@ -55833,9 +57310,10 @@ impl Connection {
                         } else {
                             having
                         };
-                        let check_vals: Vec<SqliteValue> = result_descriptors
-                            .iter()
-                            .map(|desc| match desc {
+                        let mut check_vals: Vec<SqliteValue> =
+                            Vec::with_capacity(result_descriptors.len());
+                        for desc in &result_descriptors {
+                            let v = match desc {
                                 GroupByColumn::Plain(expr) => {
                                     if expr_contains_agg(expr) {
                                         let refs: Vec<&Vec<SqliteValue>> =
@@ -55843,17 +57321,21 @@ impl Connection {
                                         eval_group_agg_join_expr(expr, &refs, &col_map)
                                             .unwrap_or(SqliteValue::Null)
                                     } else {
-                                        group_rows.first().map_or(SqliteValue::Null, |r| {
-                                            self.eval_row_expr_allowing_subqueries(
-                                                expr, r, &col_map,
-                                            )
-                                            .unwrap_or(SqliteValue::Null)
-                                        })
+                                        match group_rows.first() {
+                                            Some(r) => self
+                                                .eval_row_expr_allowing_subqueries(
+                                                    expr, r, &col_map,
+                                                )
+                                                .await
+                                                .unwrap_or(SqliteValue::Null),
+                                            None => SqliteValue::Null,
+                                        }
                                     }
                                 }
                                 GroupByColumn::Agg { .. } => SqliteValue::Null,
-                            })
-                            .collect();
+                            };
+                            check_vals.push(v);
+                        }
                         if !evaluate_having_predicate(
                             effective_having,
                             &check_vals,
@@ -55874,7 +57356,9 @@ impl Connection {
                             let inlined_expr;
                             let effective: &Expr = if expr_has_any_subquery(expr) {
                                 if let Some(r) = group_rows.first() {
-                                    if let Ok(e) = self.inline_subqueries_in_expr(expr, r, &col_map)
+                                    if let Ok(e) = self
+                                        .inline_subqueries_in_expr(expr, r, &col_map)
+                                        .await
                                     {
                                         inlined_expr = e;
                                         &inlined_expr
@@ -55890,12 +57374,16 @@ impl Connection {
                             let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
                             eval_group_agg_join_expr(effective, &refs, &col_map)?
                         } else if expr_has_any_subquery(expr) {
-                            group_rows.first().map_or(Ok(SqliteValue::Null), |r| {
-                                let inlined = self
-                                    .inline_subqueries_in_expr(expr, r, &col_map)
-                                    .unwrap_or_else(|_| (*expr).clone());
-                                eval_join_expr(&inlined, r, &col_map)
-                            })?
+                            match group_rows.first() {
+                                Some(r) => {
+                                    let inlined = self
+                                        .inline_subqueries_in_expr(expr, r, &col_map)
+                                        .await
+                                        .unwrap_or_else(|_| (*expr).clone());
+                                    eval_join_expr(&inlined, r, &col_map)?
+                                }
+                                None => SqliteValue::Null,
+                            }
                         } else {
                             group_rows.first().map_or(Ok(SqliteValue::Null), |r| {
                                 eval_join_expr(expr, r, &col_map)
@@ -56056,7 +57544,7 @@ impl Connection {
         }
     }
 
-    fn eval_row_expr_allowing_subqueries(
+    async fn eval_row_expr_allowing_subqueries(
         &self,
         expr: &Expr,
         row: &[SqliteValue],
@@ -56064,6 +57552,7 @@ impl Connection {
     ) -> Result<SqliteValue> {
         if expr_has_any_subquery(expr) {
             self.eval_expr_with_subqueries(expr, row, col_map, None)
+                .await
         } else {
             eval_join_expr(expr, row, col_map)
         }
@@ -56114,7 +57603,7 @@ impl Connection {
         Some(rows)
     }
 
-    fn try_scan_join_source_from_pager(
+    async fn try_scan_join_source_from_pager(
         &self,
         src: &JoinTableSource,
     ) -> Option<Result<Vec<Vec<SqliteValue>>>> {
@@ -56135,15 +57624,16 @@ impl Connection {
                 .map(|table| (table.root_page, table.clone()))?
         };
         let cx = &self.root_cx;
-        let result = (|| -> Result<Vec<Vec<SqliteValue>>> {
-            let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly)?;
+        let result: Result<Vec<Vec<SqliteValue>>> = async {
+            let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly).await?;
             let page_no = PageNumber::new(u32::try_from(root_page_num).unwrap_or(1))
                 .unwrap_or(PageNumber::ONE);
-            let mut cursor = Self::new_pager_btree_cursor(cx, &mut txn, page_no, true)?;
+            let mut cursor =
+                Self::new_pager_btree_cursor(cx, &mut txn, page_no, true).await?;
             let mut rows = Vec::new();
-            if cursor.first(cx)? {
+            if cursor.first(cx).await? {
                 loop {
-                    let (rowid, payload) = cursor.rowid_and_payload_cow(cx)?;
+                    let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
                     let payload_values = parse_record(payload.as_ref()).ok_or_else(|| {
                         FrankenError::DatabaseCorrupt {
                             detail: format!(
@@ -56152,25 +57642,28 @@ impl Connection {
                             ),
                         }
                     })?;
-                    let mut values = self.inflate_table_row_values_for_storage_reload(
-                        &table_schema,
-                        rowid,
-                        &payload_values,
-                        rowid_alias_column_index,
-                    )?;
+                    let mut values = self
+                        .inflate_table_row_values_for_storage_reload(
+                            &table_schema,
+                            rowid,
+                            &payload_values,
+                            rowid_alias_column_index,
+                        )
+                        .await?;
                     if src.hidden_rowid_projection.is_some() {
                         values.push(SqliteValue::Integer(rowid));
                     }
                     rows.push(values);
-                    if !cursor.next(cx)? {
+                    if !cursor.next(cx).await? {
                         break;
                     }
                 }
             }
             drop(cursor);
-            txn.commit(cx)?;
+            txn.commit(cx).await?;
             Ok(rows)
-        })();
+        }
+        .await;
         if result.is_ok() && hot_path_profile_enabled() {
             FSQLITE_JOIN_PAGER_SCAN_FAST_PATH_HITS.fetch_add(1, AtomicOrdering::Relaxed);
         }
@@ -56186,7 +57679,7 @@ impl Connection {
     ///    expressions used in window ORDER BY / PARTITION BY, run GROUP BY.
     /// 2. Apply window functions over the grouped result set.
     #[allow(clippy::too_many_lines)]
-    fn execute_group_by_window_select(
+    async fn execute_group_by_window_select(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -56469,7 +57962,7 @@ impl Connection {
             limit: None,
         };
 
-        let grouped_rows = self.execute_group_by_select(&gb_select, params)?;
+        let grouped_rows = self.execute_group_by_select(&gb_select, params).await?;
 
         // ── Phase 2: Apply window functions to grouped rows ────────────────
 
@@ -56995,7 +58488,7 @@ impl Connection {
     /// 4. For each partition, step/value through each window function
     /// 5. Assemble result rows with window values alongside plain columns
     #[allow(clippy::too_many_lines)]
-    fn execute_window_select(
+    async fn execute_window_select(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -57349,10 +58842,12 @@ impl Connection {
                 .collect();
         }
         let raw_rows = if has_join {
-            self.execute_join_select(&raw_select, params)?
+            self.execute_join_select(&raw_select, params).await?
         } else {
-            let program = self.compile_table_select(&raw_select)?;
-            let (rows, _, _) = self.execute_table_program(&program, params, false)?;
+            let program = self.compile_table_select(&raw_select).await?;
+            let (rows, _, _) = self
+                .execute_table_program(&program, params, false)
+                .await?;
             rows
         };
 
@@ -58091,7 +59586,7 @@ impl Connection {
     ///
     /// Executes each SELECT arm independently, then combines results according
     /// to the set operation. ORDER BY and LIMIT are applied to the final result.
-    fn execute_compound_select(
+    async fn execute_compound_select(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -58125,7 +59620,9 @@ impl Connection {
         } else {
             (Vec::new(), CollationRegistry::default())
         };
-        let mut result = self.execute_statement(&Statement::Select(first_arm), params)?;
+        let mut result = self
+            .execute_statement(&Statement::Select(first_arm), params)
+            .await?;
 
         // SQLite's UNION survivor rule for collation-equal-but-byte-distinct
         // duplicates (e.g. 'Apple' vs 'apple' under NOCASE): the surviving
@@ -58161,7 +59658,9 @@ impl Connection {
                 order_by: vec![],
                 limit: None,
             };
-            let arm_rows = self.execute_statement(&Statement::Select(arm_select), params)?;
+            let arm_rows = self
+                .execute_statement(&Statement::Select(arm_select), params)
+                .await?;
 
             match op {
                 CompoundOp::UnionAll => {
@@ -58286,7 +59785,7 @@ impl Connection {
 
     /// Materialize CTEs as temporary in-memory tables, execute the main query
     /// with `with` stripped, then clean up the temporary tables.
-    fn execute_with_ctes(
+    async fn execute_with_ctes(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -58295,7 +59794,10 @@ impl Connection {
             "select",
             "with_clause_materialization",
         )?;
-        match self.execute_recursive_cte_direct_sum_consumer(select, params) {
+        match self
+            .execute_recursive_cte_direct_sum_consumer(select, params)
+            .await
+        {
             Ok(Some(rows)) => return Ok(rows),
             Ok(None) => {}
             Err(error) => return Err(error),
@@ -58304,79 +59806,86 @@ impl Connection {
             return Ok(rows);
         }
         if let Some(inlined) = self.inline_single_use_non_recursive_cte_join_select(select) {
-            let rewritten = self.rewrite_in_subqueries_select(&inlined, params)?;
+            let rewritten = self.rewrite_in_subqueries_select(&inlined, params).await?;
             let bound = bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-            return self.execute_join_select(&bound, None);
+            return self.execute_join_select(&bound, None).await;
         }
-        let mut temp_tables = Vec::new();
-        let result = (|| -> Result<Vec<Row>> {
-            self.materialize_with_clause(select.with.as_ref(), params, &mut temp_tables)?;
+        let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
+        let result = async {
+            self.materialize_with_clause(
+                select.with.as_ref(),
+                params,
+                &mut temp_tables.tables,
+            )
+            .await?;
             // CTE temp tables have dynamically allocated root pages. Do not
             // reuse compiled bytecode keyed only by stripped SQL text, but also
             // do not flush unrelated global caches on every execution.
-            self.with_compiled_cache_bypass(|| {
-                let mut stripped = select.clone();
-                stripped.with = None;
-                let cte_names = temp_tables
-                    .iter()
-                    .map(|(name, _)| name.clone())
-                    .collect::<Vec<_>>();
-                let attached_schema = {
-                    let registry = self.attached_schemas.borrow();
-                    determine_attached_select_schema_with_allowed_local_tables(
-                        &stripped, &registry, &cte_names,
-                    )?
-                };
-                if let Some(target_schema) = attached_schema {
-                    if select_references_allowed_local_tables(&stripped, &cte_names) {
-                        return self.execute_select_via_memdb_fallback(&stripped, params);
-                    }
-                    // T1.5: the stripped query references ONLY the attached
-                    // schema (proved by the branch above returning false).
-                    // The previous code materialized the main-schema CTEs and
-                    // installed them on the attached connection, which would
-                    // let a CTE with the same bare name as an attached table
-                    // shadow it once the schema prefix was stripped
-                    // (e.g. `WITH t AS (...) SELECT * FROM aux.t` resolved the
-                    // post-strip `FROM t` to the CTE rather than `aux.t`).
-                    // Snapshot the CTEs under a mangled internal prefix so
-                    // they cannot alias any attached-schema name; the stripped
-                    // query provably does not reference them, so the mangling
-                    // is invisible to the query.
-                    let mut materialized_ctes =
-                        self.snapshot_materialized_temp_tables(&temp_tables)?;
-                    for mat in &mut materialized_ctes {
-                        mat.name = format!("__fsqlite_shadow_cte__{}", mat.name);
-                    }
-                    strip_attached_schema_from_select(&mut stripped, &target_schema);
-                    return self.with_attached_connection(&target_schema, move |conn| {
+            let _compiled_cache_guard =
+                BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+            let mut stripped = select.clone();
+            stripped.with = None;
+            let cte_names = temp_tables
+                .tables
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            let attached_schema = {
+                let registry = self.attached_schemas.borrow();
+                determine_attached_select_schema_with_allowed_local_tables(
+                    &stripped, &registry, &cte_names,
+                )?
+            };
+            if let Some(target_schema) = attached_schema {
+                if select_references_allowed_local_tables(&stripped, &cte_names) {
+                    return self
+                        .execute_select_via_memdb_fallback(&stripped, params)
+                        .await;
+                }
+                // T1.5: the stripped query references ONLY the attached
+                // schema (proved by the branch above returning false).
+                // The previous code materialized the main-schema CTEs and
+                // installed them on the attached connection, which would
+                // let a CTE with the same bare name as an attached table
+                // shadow it once the schema prefix was stripped
+                // (e.g. `WITH t AS (...) SELECT * FROM aux.t` resolved the
+                // post-strip `FROM t` to the CTE rather than `aux.t`).
+                // Snapshot the CTEs under a mangled internal prefix so
+                // they cannot alias any attached-schema name; the stripped
+                // query provably does not reference them, so the mangling
+                // is invisible to the query.
+                let mut materialized_ctes =
+                    self.snapshot_materialized_temp_tables(&temp_tables.tables)?;
+                for mat in &mut materialized_ctes {
+                    mat.name = format!("__fsqlite_shadow_cte__{}", mat.name);
+                }
+                strip_attached_schema_from_select(&mut stripped, &target_schema);
+                return self
+                    .with_attached_connection_async(&target_schema, async move |conn| {
                         conn.execute_statement_with_materialized_temp_tables(
                             &Statement::Select(stripped),
                             &materialized_ctes,
                             params,
                         )
-                    });
-                }
-                if self.should_route_cte_join_through_memdb_fallback(&stripped) {
-                    let rewritten = self.rewrite_in_subqueries_select(&stripped, params)?;
-                    let bound =
-                        bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    return self.execute_join_select(&bound, None);
-                }
-                let suppress_hash_join_dispatch = select_has_single_left_join(&stripped)
-                    && select_join_is_vdbe_eligible(&stripped);
-                let prev_strict_reject = *self.reject_mem_fallback_strict.borrow();
-                if suppress_hash_join_dispatch {
-                    self.set_strict_mem_fallback_rejection(true);
-                }
-                let result = self.execute_statement(&Statement::Select(stripped), params);
-                if suppress_hash_join_dispatch {
-                    *self.reject_mem_fallback_strict.borrow_mut() = prev_strict_reject;
-                }
-                result
-            })
-        })();
-        self.cleanup_cte_tables(&temp_tables);
+                        .await
+                    })
+                    .await;
+            }
+            if self.should_route_cte_join_through_memdb_fallback(&stripped) {
+                let rewritten = self.rewrite_in_subqueries_select(&stripped, params).await?;
+                let bound =
+                    bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
+                return self.execute_join_select(&bound, None).await;
+            }
+            let suppress_hash_join_dispatch = select_has_single_left_join(&stripped)
+                && select_join_is_vdbe_eligible(&stripped);
+            let _strict_rejection_guard = suppress_hash_join_dispatch.then(|| {
+                BoolRefCellRestoreGuard::new(&self.reject_mem_fallback_strict, true)
+            });
+            self.execute_statement(&Statement::Select(stripped), params)
+                .await
+        }
+        .await;
         result
     }
 
@@ -58948,7 +60457,7 @@ impl Connection {
         *replacements += 1;
     }
 
-    fn execute_recursive_cte_direct_sum_consumer(
+    async fn execute_recursive_cte_direct_sum_consumer(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -58956,7 +60465,9 @@ impl Connection {
         let Some(plan) = self.recursive_cte_direct_sum_consumer_plan(select) else {
             return Ok(None);
         };
-        let Some(sum) = self.execute_recursive_cte_direct_sum_consumer_stream(&plan, params)?
+        let Some(sum) = self
+            .execute_recursive_cte_direct_sum_consumer_stream(&plan, params)
+            .await?
         else {
             return Ok(None);
         };
@@ -58964,7 +60475,7 @@ impl Connection {
         Ok(Some(vec![Row { values: vec![sum] }]))
     }
 
-    fn execute_recursive_cte_direct_sum_consumer_stream(
+    async fn execute_recursive_cte_direct_sum_consumer_stream(
         &self,
         plan: &RecursiveCteDirectSumConsumerPlan,
         params: Option<&[SqliteValue]>,
@@ -58985,7 +60496,9 @@ impl Connection {
             order_by: vec![],
             limit: None,
         };
-        let base_rows = self.execute_statement(&Statement::Select(base_select), params)?;
+        let base_rows = self
+            .execute_statement(&Statement::Select(base_select), params)
+            .await?;
         let mut working_set: Vec<Vec<SqliteValue>> =
             base_rows.into_iter().map(|row| row.values).collect();
         let mut recursive_arms: Vec<(CompoundOp, RecursiveCteDirectEvalPlan)> = Vec::new();
@@ -59011,7 +60524,9 @@ impl Connection {
                 recursive_arms.push((*op, eval_plan));
                 continue;
             }
-            let arm_rows = self.execute_statement(&Statement::Select(arm_select), params)?;
+            let arm_rows = self
+                .execute_statement(&Statement::Select(arm_select), params)
+                .await?;
             match op {
                 CompoundOp::UnionAll => {
                     working_set.extend(arm_rows.into_iter().map(|row| row.values));
@@ -59060,11 +60575,9 @@ impl Connection {
             }
             let mut new_rows: Vec<Vec<SqliteValue>> = Vec::new();
             for (op, execution_plan) in &recursive_arms {
-                let arm_rows = self.execute_recursive_cte_direct_eval_plan(
-                    execution_plan,
-                    &working_set,
-                    params,
-                )?;
+                let arm_rows = self
+                    .execute_recursive_cte_direct_eval_plan(execution_plan, &working_set, params)
+                    .await?;
                 for row in arm_rows {
                     let vals = row.values;
                     match op {
@@ -59487,7 +61000,7 @@ impl Connection {
 
     /// Materialize CTEs for a DELETE statement, execute the DELETE with the
     /// WITH clause stripped, then clean up the temporary CTE tables.
-    fn execute_delete_with_ctes(
+    async fn execute_delete_with_ctes(
         &self,
         delete: &fsqlite_ast::DeleteStatement,
         params: Option<&[SqliteValue]>,
@@ -59503,19 +61016,24 @@ impl Connection {
                     .unwrap_or(&target_schema),
             )?;
             let materialized_ctes =
-                self.materialize_with_clause_snapshot(delete.with.as_ref(), params)?;
+                self.materialize_with_clause_snapshot(delete.with.as_ref(), params)
+                    .await?;
             let mut stripped = delete.clone();
             stripped.with = None;
             strip_attached_schema_from_delete(&mut stripped, &target_schema);
             let statement = Statement::Delete(stripped);
-            let (rows, changes) = self.with_attached_connection(&target_schema, move |conn| {
-                let rows = conn.execute_statement_with_materialized_temp_tables(
-                    &statement,
-                    &materialized_ctes,
-                    params,
-                )?;
-                Ok((rows, conn.last_changes.get()))
-            })?;
+            let (rows, changes) = self
+                .with_attached_connection_async(&target_schema, async move |conn| {
+                    let rows = conn
+                        .execute_statement_with_materialized_temp_tables(
+                            &statement,
+                            &materialized_ctes,
+                            params,
+                        )
+                        .await?;
+                    Ok((rows, conn.last_changes.get()))
+                })
+                .await?;
             self.reset_statement_change_count();
             self.record_statement_changes(changes);
             return Ok(rows);
@@ -59525,22 +61043,24 @@ impl Connection {
             "delete",
             "with_clause_materialization",
         )?;
-        let mut temp_tables = Vec::new();
-        let result = (|| -> Result<Vec<Row>> {
-            self.materialize_with_clause(delete.with.as_ref(), params, &mut temp_tables)?;
-            let mut stripped = delete.clone();
-            stripped.with = None;
-            self.with_compiled_cache_bypass(|| {
-                self.execute_statement(&Statement::Delete(stripped), params)
-            })
-        })();
-        self.cleanup_cte_tables(&temp_tables);
-        result
+        let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
+        self.materialize_with_clause(
+            delete.with.as_ref(),
+            params,
+            &mut temp_tables.tables,
+        )
+        .await?;
+        let mut stripped = delete.clone();
+        stripped.with = None;
+        let _compiled_cache_guard =
+            BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+        self.execute_statement(&Statement::Delete(stripped), params)
+            .await
     }
 
     /// Materialize CTEs for an UPDATE statement, execute the UPDATE with the
     /// WITH clause stripped, then clean up the temporary CTE tables.
-    fn execute_update_with_ctes(
+    async fn execute_update_with_ctes(
         &self,
         update: &fsqlite_ast::UpdateStatement,
         params: Option<&[SqliteValue]>,
@@ -59556,31 +61076,36 @@ impl Connection {
                     .unwrap_or(&target_schema),
             )?;
             let materialized_ctes =
-                self.materialize_with_clause_snapshot(update.with.as_ref(), params)?;
+                self.materialize_with_clause_snapshot(update.with.as_ref(), params)
+                    .await?;
             let mut stripped = update.clone();
             stripped.with = None;
             strip_attached_schema_from_update(&mut stripped, &target_schema);
             let statement = Statement::Update(stripped);
             let preserve_prior_changes_on_constraint_violation =
                 update.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
-            let (result, changes) = self.with_attached_connection(&target_schema, move |conn| {
-                let previous_last_insert_rowid = conn.current_last_insert_rowid();
-                let result = conn.execute_statement_with_materialized_temp_tables(
-                    &statement,
-                    &materialized_ctes,
-                    params,
-                );
-                let changes = conn.last_changes.get();
-                if preserve_prior_changes_on_constraint_violation
-                    && matches!(
-                        result.as_ref(),
-                        Err(error) if error_is_constraint_violation(error)
-                    )
-                {
-                    conn.record_last_insert_rowid(previous_last_insert_rowid);
-                }
-                Ok((result, changes))
-            })?;
+            let (result, changes) = self
+                .with_attached_connection_async(&target_schema, async move |conn| {
+                    let previous_last_insert_rowid = conn.current_last_insert_rowid();
+                    let result = conn
+                        .execute_statement_with_materialized_temp_tables(
+                            &statement,
+                            &materialized_ctes,
+                            params,
+                        )
+                        .await;
+                    let changes = conn.last_changes.get();
+                    if preserve_prior_changes_on_constraint_violation
+                        && matches!(
+                            result.as_ref(),
+                            Err(error) if error_is_constraint_violation(error)
+                        )
+                    {
+                        conn.record_last_insert_rowid(previous_last_insert_rowid);
+                    }
+                    Ok((result, changes))
+                })
+                .await?;
             return match result {
                 Ok(rows) => {
                     self.apply_attached_statement_tracking(changes);
@@ -59602,22 +61127,24 @@ impl Connection {
             "update",
             "with_clause_materialization",
         )?;
-        let mut temp_tables = Vec::new();
-        let result = (|| -> Result<Vec<Row>> {
-            self.materialize_with_clause(update.with.as_ref(), params, &mut temp_tables)?;
-            let mut stripped = update.clone();
-            stripped.with = None;
-            self.with_compiled_cache_bypass(|| {
-                self.execute_statement(&Statement::Update(stripped), params)
-            })
-        })();
-        self.cleanup_cte_tables(&temp_tables);
-        result
+        let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
+        self.materialize_with_clause(
+            update.with.as_ref(),
+            params,
+            &mut temp_tables.tables,
+        )
+        .await?;
+        let mut stripped = update.clone();
+        stripped.with = None;
+        let _compiled_cache_guard =
+            BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+        self.execute_statement(&Statement::Update(stripped), params)
+            .await
     }
 
     /// Materialize CTEs for an INSERT statement, execute the INSERT with the
     /// WITH clause stripped, then clean up the temporary CTE tables.
-    fn execute_insert_with_ctes(
+    async fn execute_insert_with_ctes(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         params: Option<&[SqliteValue]>,
@@ -59628,26 +61155,30 @@ impl Connection {
                 insert.table.schema.as_deref().unwrap_or(&target_schema),
             )?;
             let materialized_ctes =
-                self.materialize_with_clause_snapshot(insert.with.as_ref(), params)?;
+                self.materialize_with_clause_snapshot(insert.with.as_ref(), params)
+                    .await?;
             let mut stripped = insert.clone();
             stripped.with = None;
             strip_attached_schema_from_insert(&mut stripped, &target_schema);
             let statement = Statement::Insert(stripped.clone());
             let preserve_prior_changes_on_constraint_violation =
                 insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
-            let (result, changes, last_insert_rowid) =
-                self.with_attached_connection(&target_schema, move |conn| {
-                    let result = conn.execute_statement_with_materialized_temp_tables(
-                        &statement,
-                        &materialized_ctes,
-                        params,
-                    );
+            let (result, changes, last_insert_rowid) = self
+                .with_attached_connection_async(&target_schema, async move |conn| {
+                    let result = conn
+                        .execute_statement_with_materialized_temp_tables(
+                            &statement,
+                            &materialized_ctes,
+                            params,
+                        )
+                        .await;
                     let changes = conn.last_changes.get();
                     let last_insert_rowid = (changes > 0
                         && conn.attached_table_supports_last_insert_rowid(&stripped.table.name))
                     .then(|| conn.current_last_insert_rowid());
                     Ok((result, changes, last_insert_rowid))
-                })?;
+                })
+                .await?;
             return match result {
                 Ok(rows) => {
                     self.apply_attached_insert_tracking(changes, last_insert_rowid);
@@ -59669,47 +61200,51 @@ impl Connection {
             "insert",
             "with_clause_materialization",
         )?;
-        let mut temp_tables = Vec::new();
-        let result = (|| -> Result<Vec<Row>> {
-            self.materialize_with_clause(insert.with.as_ref(), params, &mut temp_tables)?;
-            let mut stripped = insert.clone();
-            stripped.with = None;
-            // Route through the interpreted INSERT fallback instead of the
-            // full dispatch. The VDBE codegen's find_table cannot locate
-            // CTE temp tables that are only in the connection's live schema,
-            // causing "no such table" errors. The interpreted fallback
-            // materializes the SELECT source rows (which CAN find the temp
-            // table via the connection's schema) and inserts them row-by-row.
-            if let InsertSource::Select(ref select_stmt) = stripped.source {
-                let source_rows = self
-                    .execute_statement(&Statement::Select(select_stmt.as_ref().clone()), params)?;
-                if source_rows.is_empty() {
-                    self.reset_statement_change_count();
-                    return Ok(Vec::new());
-                }
-                // Replay the materialized CTE rows through the per-row INSERT
-                // machinery, which correctly threads the ON CONFLICT/UPSERT
-                // clause and RETURNING (the previous bespoke loop here dropped
-                // both, turning an upsert into a plain INSERT that then hit a
-                // spurious UNIQUE violation).
-                let outcome =
-                    self.execute_insert_select_materialized_rows_outcome(&stripped, &source_rows)?;
-                self.set_statement_change_count(outcome.changes);
-                Ok(outcome.returning_rows)
-            } else {
-                self.with_compiled_cache_bypass(|| {
-                    self.execute_statement(&Statement::Insert(stripped), params)
-                })
+        let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
+        self.materialize_with_clause(
+            insert.with.as_ref(),
+            params,
+            &mut temp_tables.tables,
+        )
+        .await?;
+        let mut stripped = insert.clone();
+        stripped.with = None;
+        // Route through the interpreted INSERT fallback instead of the
+        // full dispatch. The VDBE codegen's find_table cannot locate
+        // CTE temp tables that are only in the connection's live schema,
+        // causing "no such table" errors. The interpreted fallback
+        // materializes the SELECT source rows (which CAN find the temp
+        // table via the connection's schema) and inserts them row-by-row.
+        if let InsertSource::Select(ref select_stmt) = stripped.source {
+            let source_rows = self
+                .execute_statement(&Statement::Select(select_stmt.as_ref().clone()), params)
+                .await?;
+            if source_rows.is_empty() {
+                self.reset_statement_change_count();
+                return Ok(Vec::new());
             }
-        })();
-        self.cleanup_cte_tables(&temp_tables);
-        result
+            // Replay the materialized CTE rows through the per-row INSERT
+            // machinery, which correctly threads the ON CONFLICT/UPSERT
+            // clause and RETURNING (the previous bespoke loop here dropped
+            // both, turning an upsert into a plain INSERT that then hit a
+            // spurious UNIQUE violation).
+            let outcome =
+                self.execute_insert_select_materialized_rows_outcome(&stripped, &source_rows)
+                    .await?;
+            self.set_statement_change_count(outcome.changes);
+            Ok(outcome.returning_rows)
+        } else {
+            let _compiled_cache_guard =
+                BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+            self.execute_statement(&Statement::Insert(stripped), params)
+                .await
+        }
     }
 
     /// Shared CTE materialization: create temporary tables for each CTE in the
     /// WITH clause. Returns the list of temporary table names for cleanup.
     #[allow(clippy::too_many_lines)]
-    fn materialize_with_clause(
+    async fn materialize_with_clause(
         &self,
         with: Option<&fsqlite_ast::WithClause>,
         params: Option<&[SqliteValue]>,
@@ -59718,7 +61253,7 @@ impl Connection {
         let with_clause = with.ok_or_else(|| FrankenError::internal("expected CTE with clause"))?;
         let is_recursive = with_clause.recursive;
         let ctes = &with_clause.ctes;
-        self.reserve_clean_memdb_root_pages(ctes.len())?;
+        self.reserve_clean_memdb_root_pages(ctes.len()).await?;
         for cte in ctes {
             let cte_name = &cte.name;
             let has_self_ref = is_recursive
@@ -59730,10 +61265,12 @@ impl Connection {
                     .any(|(_, core)| select_core_references_table(core, cte_name));
 
             if has_self_ref {
-                self.materialize_recursive_cte(cte, params, &mut *temp_tables)?;
+                self.materialize_recursive_cte(cte, params, &mut *temp_tables)
+                    .await?;
             } else {
-                let cte_rows =
-                    self.execute_statement(&Statement::Select(cte.query.clone()), params)?;
+                let cte_rows = self
+                    .execute_statement(&Statement::Select(cte.query.clone()), params)
+                    .await?;
                 let col_names: Vec<String> = if cte.columns.is_empty() {
                     let resolved =
                         self.select_result_column_names(&cte.query, &[], &mut Vec::new());
@@ -59795,7 +61332,7 @@ impl Connection {
         Ok(())
     }
 
-    fn materialize_with_clause_snapshot(
+    async fn materialize_with_clause_snapshot(
         &self,
         with: Option<&fsqlite_ast::WithClause>,
         params: Option<&[SqliteValue]>,
@@ -59804,13 +61341,10 @@ impl Connection {
             "statement",
             "with_clause_materialization",
         )?;
-        let mut temp_tables = Vec::new();
-        let result = (|| -> Result<Vec<MaterializedTempTable>> {
-            self.materialize_with_clause(with, params, &mut temp_tables)?;
-            self.snapshot_materialized_temp_tables(&temp_tables)
-        })();
-        self.cleanup_cte_tables(&temp_tables);
-        result
+        let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
+        self.materialize_with_clause(with, params, &mut temp_tables.tables)
+            .await?;
+        self.snapshot_materialized_temp_tables(&temp_tables.tables)
     }
 
     fn snapshot_materialized_temp_tables(
@@ -59848,11 +61382,11 @@ impl Connection {
         Ok(snapshot)
     }
 
-    fn install_materialized_temp_tables(
+    async fn install_materialized_temp_tables(
         &self,
         temp_tables: &[MaterializedTempTable],
     ) -> Result<Vec<(String, i32)>> {
-        self.reserve_clean_memdb_root_pages(temp_tables.len())?;
+        self.reserve_clean_memdb_root_pages(temp_tables.len()).await?;
         let mut installed = Vec::with_capacity(temp_tables.len());
         for temp_table in temp_tables {
             let root_page = self.db.borrow_mut().create_table(temp_table.columns.len());
@@ -59882,7 +61416,7 @@ impl Connection {
         Ok(installed)
     }
 
-    fn execute_statement_with_materialized_temp_tables(
+    async fn execute_statement_with_materialized_temp_tables(
         &self,
         statement: &Statement,
         temp_tables: &[MaterializedTempTable],
@@ -59896,7 +61430,7 @@ impl Connection {
         if self.memdb_requires_active_txn_reload.get()
             || !self.pending_memdb_direct_upserts.borrow().is_empty()
         {
-            self.refresh_memdb_from_active_txn_if_dirty(&op_cx)?;
+            self.refresh_memdb_from_active_txn_if_dirty(&op_cx).await?;
         }
         if matches!(statement, Statement::Select(_)) {
             // T1.6: when an outer connection delegates an attached-schema read
@@ -59912,11 +61446,12 @@ impl Connection {
             // retained batch so the subsequent pager reload sees all the
             // writes the outer connection already dispatched to us.
             if self.retained_autocommit_txn.borrow().is_some() {
-                self.flush_retained_autocommit_txn(&op_cx)?;
+                self.flush_retained_autocommit_txn(&op_cx).await?;
             }
-            self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)?;
+            self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)
+                .await?;
             if !self.memdb_rows_loaded.get() {
-                self.reload_memdb_from_pager(&op_cx)?;
+                self.reload_memdb_from_pager(&op_cx).await?;
             } else {
                 // T1.5: when a parent connection delegates an attached-schema
                 // read to us via with_attached_connection, our memdb may be
@@ -59924,18 +61459,21 @@ impl Connection {
                 // the parent-issued writes committed to our pager. Force a
                 // fresh reload so the stripped query (e.g. `SELECT SUM FROM t`
                 // rewritten from `aux.t`) observes the committed pager state.
-                self.reload_memdb_from_pager(&op_cx)?;
+                self.reload_memdb_from_pager(&op_cx).await?;
             }
         }
-        let installed = self.install_materialized_temp_tables(temp_tables)?;
-        let result = self.with_statement_memdb_refresh_bypass(|| {
-            self.with_compiled_cache_bypass(|| match statement {
-                Statement::Select(select) => self.execute_select_via_memdb_fallback(select, params),
-                _ => self.execute_statement(statement, params),
-            })
-        });
-        self.cleanup_cte_tables(&installed);
-        result
+        let installed = self.install_materialized_temp_tables(temp_tables).await?;
+        let _installed_guard = MaterializedTablesCleanupGuard::from_tables(self, installed);
+        let _refresh_guard =
+            BoolCellRestoreGuard::new(&self.skip_statement_memdb_refresh, true);
+        let _compiled_cache_guard =
+            BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+        match statement {
+            Statement::Select(select) => {
+                self.execute_select_via_memdb_fallback(select, params).await
+            }
+            _ => self.execute_statement(statement, params).await,
+        }
     }
 
     /// Clean up temporary CTE tables by exact materialized root page.
@@ -59960,7 +61498,7 @@ impl Connection {
 
     /// Materialize a recursive CTE by iterating until no new rows are produced.
     #[allow(clippy::cast_possible_wrap, clippy::too_many_lines)]
-    fn materialize_recursive_cte(
+    async fn materialize_recursive_cte(
         &self,
         cte: &fsqlite_ast::Cte,
         params: Option<&[SqliteValue]>,
@@ -60015,7 +61553,9 @@ impl Connection {
             order_by: vec![],
             limit: None,
         };
-        let base_rows = self.execute_statement(&Statement::Select(base_select), params)?;
+        let base_rows = self
+            .execute_statement(&Statement::Select(base_select), params)
+            .await?;
         let mut all_rows: Vec<Vec<SqliteValue>> =
             base_rows.iter().map(|r| r.values().to_vec()).collect();
         let mut recursive_arms: Vec<(CompoundOp, RecursiveCteArmExecutionPlan)> = Vec::new();
@@ -60039,8 +61579,9 @@ impl Connection {
                     Self::recursive_cte_direct_eval_plan(cte_name, &col_names, &arm_select)
                 {
                     RecursiveCteArmExecutionPlan::Direct(plan)
-                } else if let Some(program) =
-                    self.recursive_cte_precompiled_arm_program(&arm_select)
+                } else if let Some(program) = self
+                    .recursive_cte_precompiled_arm_program(&arm_select)
+                    .await
                 {
                     RecursiveCteArmExecutionPlan::Precompiled(Arc::new(program))
                 } else {
@@ -60049,7 +61590,9 @@ impl Connection {
                 recursive_arms.push((*op, execution_plan));
                 continue;
             }
-            let arm_rows = self.execute_statement(&Statement::Select(arm_select), params)?;
+            let arm_rows = self
+                .execute_statement(&Statement::Select(arm_select), params)
+                .await?;
             match op {
                 CompoundOp::UnionAll => {
                     all_rows.extend(arm_rows.iter().map(|row| row.values().to_vec()));
@@ -60116,7 +61659,8 @@ impl Connection {
                     execution_plan,
                     &working_set,
                     params,
-                )?;
+                )
+                .await?;
                 for row in &arm_rows {
                     let vals = row.values().to_vec();
                     match op {
@@ -60156,7 +61700,7 @@ impl Connection {
         Ok(())
     }
 
-    fn execute_recursive_cte_arm_select(
+    async fn execute_recursive_cte_arm_select(
         &self,
         cx: &Cx,
         execution_plan: &RecursiveCteArmExecutionPlan,
@@ -60166,6 +61710,7 @@ impl Connection {
         match execution_plan {
             RecursiveCteArmExecutionPlan::Direct(plan) => {
                 self.execute_recursive_cte_direct_eval_plan(plan, working_set, params)
+                    .await
             }
             RecursiveCteArmExecutionPlan::Precompiled(program) => {
                 FSQLITE_RECURSIVE_CTE_PRECOMPILED_ARM_HITS.fetch_add(1, AtomicOrdering::Relaxed);
@@ -60176,16 +61721,18 @@ impl Connection {
                     TableExecutionRuntimeRequirements::read_path(),
                     cx,
                     false,
-                )?;
+                )
+                .await?;
                 Ok(rows)
             }
             RecursiveCteArmExecutionPlan::Statement(select) => {
                 self.execute_statement(&Statement::Select(select.clone()), params)
+                    .await
             }
         }
     }
 
-    fn recursive_cte_precompiled_arm_program(
+    async fn recursive_cte_precompiled_arm_program(
         &self,
         select: &SelectStatement,
     ) -> Option<VdbeProgram> {
@@ -60202,7 +61749,7 @@ impl Connection {
         {
             return None;
         }
-        self.compile_table_select(select).ok()
+        self.compile_table_select(select).await.ok()
     }
 
     fn recursive_cte_direct_eval_plan(
@@ -60276,7 +61823,7 @@ impl Connection {
         })
     }
 
-    fn execute_recursive_cte_direct_eval_plan(
+    async fn execute_recursive_cte_direct_eval_plan(
         &self,
         plan: &RecursiveCteDirectEvalPlan,
         working_set: &[Vec<SqliteValue>],
@@ -60287,7 +61834,7 @@ impl Connection {
         for input_row in working_set {
             if let Some(where_expr) = plan.where_clause.as_ref() {
                 let predicate =
-                    self.eval_expr_with_subqueries(where_expr, input_row, &plan.col_map, params)?;
+                    self.eval_expr_with_subqueries(where_expr, input_row, &plan.col_map, params).await?;
                 if !is_sqlite_truthy(&predicate) {
                     continue;
                 }
@@ -60295,12 +61842,10 @@ impl Connection {
 
             let mut values = Vec::with_capacity(plan.result_exprs.len());
             for expr in &plan.result_exprs {
-                values.push(self.eval_expr_with_subqueries(
-                    expr,
-                    input_row,
-                    &plan.col_map,
-                    params,
-                )?);
+                values.push(
+                    self.eval_expr_with_subqueries(expr, input_row, &plan.col_map, params)
+                        .await?,
+                );
             }
             rows.push(Row { values });
         }
@@ -60310,7 +61855,7 @@ impl Connection {
     /// Pre-process a SELECT statement, eagerly evaluating EXISTS and scalar
     /// subqueries.  `IN (SELECT ...)` is left intact so the VDBE codegen
     /// can handle it via runtime probe scans.
-    fn rewrite_subqueries(
+    async fn rewrite_subqueries(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -60320,14 +61865,14 @@ impl Connection {
         // extracted subquery would restart anonymous `?` slots at one and
         // make the remaining outer expression read the wrong parameter.
         let mut result = canonicalize_select_placeholders(select)?;
-        rewrite_in_select_core(&mut result.body.select, self, false, params)?;
+        rewrite_in_select_core(&mut result.body.select, self, false, params).await?;
         // Also rewrite any compound arms.
         for (_op, core) in &mut result.body.compounds {
-            rewrite_in_select_core(core, self, false, params)?;
+            rewrite_in_select_core(core, self, false, params).await?;
         }
-        rewrite_in_ordering_terms(&mut result.order_by, self, false, params)?;
+        rewrite_in_ordering_terms(&mut result.order_by, self, false, params).await?;
         if let Some(limit) = result.limit.as_mut() {
-            rewrite_in_limit_clause(limit, self, false, params)?;
+            rewrite_in_limit_clause(limit, self, false, params).await?;
         }
         while let Some(flattened) = flatten_simple_from_subquery_select(&result) {
             result = flattened;
@@ -60338,7 +61883,7 @@ impl Connection {
     /// Eagerly rewrite `IN (SELECT ...)` subqueries into literal lists
     /// for fallback execution paths that cannot handle them natively
     /// (expression-only SELECT, GROUP BY, JOINs).
-    fn rewrite_in_subqueries_select<'a>(
+    async fn rewrite_in_subqueries_select<'a>(
         &self,
         select: &'a SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -60354,13 +61899,13 @@ impl Connection {
         // so it needs the same statement-wide bind-slot preservation as the
         // primary rewrite path.
         let mut result = canonicalize_select_placeholders(select)?;
-        rewrite_in_select_core(&mut result.body.select, self, true, params)?;
+        rewrite_in_select_core(&mut result.body.select, self, true, params).await?;
         for (_op, core) in &mut result.body.compounds {
-            rewrite_in_select_core(core, self, true, params)?;
+            rewrite_in_select_core(core, self, true, params).await?;
         }
-        rewrite_in_ordering_terms(&mut result.order_by, self, true, params)?;
+        rewrite_in_ordering_terms(&mut result.order_by, self, true, params).await?;
         if let Some(limit) = result.limit.as_mut() {
-            rewrite_in_limit_clause(limit, self, true, params)?;
+            rewrite_in_limit_clause(limit, self, true, params).await?;
         }
         Ok(Cow::Owned(result))
     }
@@ -60371,7 +61916,7 @@ impl Connection {
     /// the join type and constraint. WHERE, ORDER BY, LIMIT/OFFSET, and column
     /// projection are applied to the combined result.
     #[allow(clippy::too_many_lines)]
-    fn execute_join_select(
+    async fn execute_join_select(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -60513,7 +62058,8 @@ impl Connection {
                         let rows = self.execute_statement(
                             &Statement::Select(query.as_ref().clone()),
                             params,
-                        )?;
+                        )
+                        .await?;
                         let row_data: Vec<Vec<SqliteValue>> =
                             rows.iter().map(|r| r.values().to_vec()).collect();
                         let resolved =
@@ -60531,12 +62077,15 @@ impl Connection {
                     TableOrSubquery::TableFunction { name, args, .. } => {
                         let include_hidden_rowid =
                             table_sources[i].hidden_rowid_projection.is_some();
-                        *pre = Some(self.execute_table_function_rows(
-                            name,
-                            args,
-                            params,
-                            include_hidden_rowid,
-                        )?);
+                        *pre = Some(
+                            self.execute_table_function_rows(
+                                name,
+                                args,
+                                params,
+                                include_hidden_rowid,
+                            )
+                            .await?,
+                        );
                     }
                     _ => {}
                 }
@@ -60668,7 +62217,8 @@ impl Connection {
                     let queries =
                         collect_fts5_match_queries_for_source(match_query_source, &src.table_name);
                     if let Some(aux_table) =
-                        self.build_fts5_aux_context_for_source(src, &queries)?
+                        self.build_fts5_aux_context_for_source(src, &queries)
+                            .await?
                     {
                         context.insert(src.table_name.clone(), aux_table);
                     }
@@ -60724,7 +62274,7 @@ impl Connection {
                 )?);
             } else {
                 if let Some(plan) = live_vtab_scan_plans[i].as_ref() {
-                    let row_data = self.scan_live_vtab_rows(src, plan)?;
+                    let row_data = self.scan_live_vtab_rows(src, plan).await?;
                     scanned_cache.insert(src.scan_cache_key.clone(), row_data.clone());
                     table_rows.push(maybe_filter_primary_join_rows(
                         row_data,
@@ -60738,11 +62288,11 @@ impl Connection {
                 let mut row_data = if let Some(row_data) = self.try_scan_join_source_from_memdb(src)
                 {
                     row_data
-                } else if let Some(result) = self.try_scan_join_source_from_pager(src) {
+                } else if let Some(result) = self.try_scan_join_source_from_pager(src).await {
                     result?
                 } else {
                     let scan_sql = build_join_scan_sql(src);
-                    let rows = self.query(&scan_sql)?;
+                    let rows = self.query(&scan_sql).await?;
                     rows.iter().map(|r| r.values().to_vec()).collect()
                 };
                 // Normalize every scanned row to the source's logical scan
@@ -60840,7 +62390,7 @@ impl Connection {
             } else if let Some(JoinConstraint::On(on_expr)) = &join.constraint {
                 if expr_has_any_subquery(on_expr) {
                     let resolved =
-                        self.pre_resolve_non_correlated_subqueries_in_expr(on_expr, params)?;
+                        self.pre_resolve_non_correlated_subqueries_in_expr(on_expr, params).await?;
                     resolved_on_constraint = JoinConstraint::On(resolved);
                     Some(&resolved_on_constraint)
                 } else {
@@ -60864,15 +62414,17 @@ impl Connection {
                     Some(JoinConstraint::On(e)) => e.clone(),
                     _ => unreachable!("on_has_correlated_subquery implies On constraint"),
                 };
-                combined = self.execute_single_join_with_correlated_subqueries(
-                    &combined,
-                    right_rows,
-                    right_width,
-                    current_width,
-                    join.join_type.kind,
-                    &on_expr,
-                    &col_map,
-                )?;
+                combined = self
+                    .execute_single_join_with_correlated_subqueries(
+                        &combined,
+                        right_rows,
+                        right_width,
+                        current_width,
+                        join.join_type.kind,
+                        &on_expr,
+                        &col_map,
+                    )
+                    .await?;
             } else {
                 combined = execute_single_join(
                     &combined,
@@ -60910,7 +62462,7 @@ impl Connection {
             let mut filtered = Vec::with_capacity(combined.len());
             for row in combined {
                 let predicate =
-                    self.eval_expr_with_subqueries(where_expr, &row, &col_map, params)?;
+                    self.eval_expr_with_subqueries(where_expr, &row, &col_map, params).await?;
                 if is_sqlite_truthy(&predicate) {
                     filtered.push(row);
                 }
@@ -61032,7 +62584,9 @@ impl Connection {
                     }
                     ResultColumn::Expr { expr, .. } => {
                         if has_subqueries && expr_has_any_subquery(expr) {
-                            let inlined = self.inline_subqueries_in_expr(expr, row, &col_map)?;
+                            let inlined = self
+                .inline_subqueries_in_expr(expr, row, &col_map)
+                .await?;
                             values.push(eval_join_expr_with_using(
                                 &inlined, row, &col_map, using_skip,
                             )?);
@@ -61045,7 +62599,9 @@ impl Connection {
             }
             for expr in &extra_order_exprs {
                 if has_subqueries && expr_has_any_subquery(expr) {
-                    let inlined = self.inline_subqueries_in_expr(expr, row, &col_map)?;
+                    let inlined = self
+                .inline_subqueries_in_expr(expr, row, &col_map)
+                .await?;
                     values.push(eval_join_expr_with_using(
                         &inlined, row, &col_map, using_skip,
                     )?);
@@ -61120,7 +62676,7 @@ impl Connection {
     /// these are rare; the previous behavior was returning
     /// `NotImplemented`, which is a strictly worse outcome.
     #[allow(clippy::too_many_arguments)]
-    fn execute_single_join_with_correlated_subqueries(
+    async fn execute_single_join_with_correlated_subqueries(
         &self,
         left: &[Vec<SqliteValue>],
         right: &[Vec<SqliteValue>],
@@ -61149,7 +62705,7 @@ impl Connection {
                 scratch.extend_from_slice(left_row);
                 scratch.extend_from_slice(&right_row[..right_width]);
 
-                let inlined = self.inline_subqueries_in_expr(on_expr, &scratch, col_map)?;
+                let inlined = self.inline_subqueries_in_expr(on_expr, &scratch, col_map).await?;
                 let predicate_value = eval_join_expr(&inlined, &scratch, col_map)?;
                 let passes = is_sqlite_truthy(&predicate_value);
 
@@ -61204,16 +62760,20 @@ impl Connection {
     /// Correlated forms are left unchanged so the per-row substitute path
     /// (`eval_expr_with_subqueries` / `inline_subqueries_in_expr`) still
     /// applies.
-    fn pre_resolve_non_correlated_subqueries_in_expr(
-        &self,
-        expr: &Expr,
-        params: Option<&[SqliteValue]>,
-    ) -> Result<Expr> {
+    // Recurses into sub-expressions, so it returns a boxed future rather than
+    // using `async fn` sugar.
+    fn pre_resolve_non_correlated_subqueries_in_expr<'a>(
+        &'a self,
+        expr: &'a Expr,
+        params: Option<&'a [SqliteValue]>,
+    ) -> Pin<Box<dyn Future<Output = Result<Expr>> + 'a>> {
+        Box::pin(async move {
         match expr {
             Expr::Subquery(sub, span) => {
                 if !is_correlated_subquery(sub) {
                     let rows =
-                        self.execute_statement(&Statement::Select((**sub).clone()), params)?;
+                        self.execute_statement(&Statement::Select((**sub).clone()), params)
+                    .await?;
                     let val = rows
                         .into_iter()
                         .next()
@@ -61231,7 +62791,8 @@ impl Connection {
             } => {
                 if !is_correlated_subquery(subquery) {
                     let rows =
-                        self.execute_statement(&Statement::Select((**subquery).clone()), params)?;
+                        self.execute_statement(&Statement::Select((**subquery).clone()), params)
+                        .await?;
                     let exists = !rows.is_empty();
                     let truth = if *not { !exists } else { exists };
                     Ok(Expr::Literal(Literal::Integer(i64::from(truth)), *span))
@@ -61246,11 +62807,12 @@ impl Connection {
                 span,
             } => {
                 let resolved_inner =
-                    self.pre_resolve_non_correlated_subqueries_in_expr(inner, params)?;
+                    self.pre_resolve_non_correlated_subqueries_in_expr(inner, params).await?;
                 let resolved_set = match set {
                     InSet::Subquery(sub) if !is_correlated_subquery(sub) => {
                         let rows =
-                            self.execute_statement(&Statement::Select((**sub).clone()), params)?;
+                            self.execute_statement(&Statement::Select((**sub).clone()), params)
+                    .await?;
                         let literals: Vec<Expr> = rows
                             .into_iter()
                             .filter_map(|r| r.values.into_iter().next())
@@ -61258,12 +62820,16 @@ impl Connection {
                             .collect();
                         InSet::List(literals)
                     }
-                    InSet::List(items) => InSet::List(
-                        items
-                            .iter()
-                            .map(|e| self.pre_resolve_non_correlated_subqueries_in_expr(e, params))
-                            .collect::<Result<Vec<_>>>()?,
-                    ),
+                    InSet::List(items) => {
+                        let mut resolved_items = Vec::with_capacity(items.len());
+                        for e in items {
+                            resolved_items.push(
+                                self.pre_resolve_non_correlated_subqueries_in_expr(e, params)
+                                    .await?,
+                            );
+                        }
+                        InSet::List(resolved_items)
+                    }
                     other => other.clone(),
                 };
                 Ok(Expr::In {
@@ -61279,9 +62845,9 @@ impl Connection {
                 right,
                 span,
             } => Ok(Expr::BinaryOp {
-                left: Box::new(self.pre_resolve_non_correlated_subqueries_in_expr(left, params)?),
+                left: Box::new(self.pre_resolve_non_correlated_subqueries_in_expr(left, params).await?),
                 op: *op,
-                right: Box::new(self.pre_resolve_non_correlated_subqueries_in_expr(right, params)?),
+                right: Box::new(self.pre_resolve_non_correlated_subqueries_in_expr(right, params).await?),
                 span: *span,
             }),
             Expr::UnaryOp {
@@ -61290,7 +62856,10 @@ impl Connection {
                 span,
             } => Ok(Expr::UnaryOp {
                 op: *op,
-                expr: Box::new(self.pre_resolve_non_correlated_subqueries_in_expr(inner, params)?),
+                expr: Box::new(
+                    self.pre_resolve_non_correlated_subqueries_in_expr(inner, params)
+                        .await?,
+                ),
                 span: *span,
             }),
             Expr::IsNull {
@@ -61298,7 +62867,10 @@ impl Connection {
                 not,
                 span,
             } => Ok(Expr::IsNull {
-                expr: Box::new(self.pre_resolve_non_correlated_subqueries_in_expr(inner, params)?),
+                expr: Box::new(
+                    self.pre_resolve_non_correlated_subqueries_in_expr(inner, params)
+                        .await?,
+                ),
                 not: *not,
                 span: *span,
             }),
@@ -61307,7 +62879,10 @@ impl Connection {
                 type_name,
                 span,
             } => Ok(Expr::Cast {
-                expr: Box::new(self.pre_resolve_non_correlated_subqueries_in_expr(inner, params)?),
+                expr: Box::new(
+                    self.pre_resolve_non_correlated_subqueries_in_expr(inner, params)
+                        .await?,
+                ),
                 type_name: type_name.clone(),
                 span: *span,
             }),
@@ -61316,7 +62891,10 @@ impl Connection {
                 collation,
                 span,
             } => Ok(Expr::Collate {
-                expr: Box::new(self.pre_resolve_non_correlated_subqueries_in_expr(inner, params)?),
+                expr: Box::new(
+                    self.pre_resolve_non_correlated_subqueries_in_expr(inner, params)
+                        .await?,
+                ),
                 collation: collation.clone(),
                 span: *span,
             }),
@@ -61327,9 +62905,12 @@ impl Connection {
                 not,
                 span,
             } => Ok(Expr::Between {
-                expr: Box::new(self.pre_resolve_non_correlated_subqueries_in_expr(inner, params)?),
-                low: Box::new(self.pre_resolve_non_correlated_subqueries_in_expr(low, params)?),
-                high: Box::new(self.pre_resolve_non_correlated_subqueries_in_expr(high, params)?),
+                expr: Box::new(
+                    self.pre_resolve_non_correlated_subqueries_in_expr(inner, params)
+                        .await?,
+                ),
+                low: Box::new(self.pre_resolve_non_correlated_subqueries_in_expr(low, params).await?),
+                high: Box::new(self.pre_resolve_non_correlated_subqueries_in_expr(high, params).await?),
                 not: *not,
                 span: *span,
             }),
@@ -61341,13 +62922,16 @@ impl Connection {
                 not,
                 span,
             } => Ok(Expr::Like {
-                expr: Box::new(self.pre_resolve_non_correlated_subqueries_in_expr(inner, params)?),
+                expr: Box::new(
+                    self.pre_resolve_non_correlated_subqueries_in_expr(inner, params)
+                        .await?,
+                ),
                 pattern: Box::new(
-                    self.pre_resolve_non_correlated_subqueries_in_expr(pattern, params)?,
+                    self.pre_resolve_non_correlated_subqueries_in_expr(pattern, params).await?,
                 ),
                 escape: match escape {
                     Some(e) => Some(Box::new(
-                        self.pre_resolve_non_correlated_subqueries_in_expr(e, params)?,
+                        self.pre_resolve_non_correlated_subqueries_in_expr(e, params).await?,
                     )),
                     None => None,
                 },
@@ -61360,30 +62944,37 @@ impl Connection {
                 whens,
                 else_expr,
                 span,
-            } => Ok(Expr::Case {
-                operand: match operand {
+            } => {
+                let new_operand = match operand {
                     Some(o) => Some(Box::new(
-                        self.pre_resolve_non_correlated_subqueries_in_expr(o, params)?,
+                        self.pre_resolve_non_correlated_subqueries_in_expr(o, params)
+                            .await?,
                     )),
                     None => None,
-                },
-                whens: whens
-                    .iter()
-                    .map(|(c, t)| {
-                        Ok((
-                            self.pre_resolve_non_correlated_subqueries_in_expr(c, params)?,
-                            self.pre_resolve_non_correlated_subqueries_in_expr(t, params)?,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-                else_expr: match else_expr {
+                };
+                let mut new_whens = Vec::with_capacity(whens.len());
+                for (c, t) in whens {
+                    new_whens.push((
+                        self.pre_resolve_non_correlated_subqueries_in_expr(c, params)
+                            .await?,
+                        self.pre_resolve_non_correlated_subqueries_in_expr(t, params)
+                            .await?,
+                    ));
+                }
+                let new_else = match else_expr {
                     Some(e) => Some(Box::new(
-                        self.pre_resolve_non_correlated_subqueries_in_expr(e, params)?,
+                        self.pre_resolve_non_correlated_subqueries_in_expr(e, params)
+                            .await?,
                     )),
                     None => None,
-                },
-                span: *span,
-            }),
+                };
+                Ok(Expr::Case {
+                    operand: new_operand,
+                    whens: new_whens,
+                    else_expr: new_else,
+                    span: *span,
+                })
+            }
             Expr::FunctionCall {
                 name,
                 args,
@@ -61394,22 +62985,28 @@ impl Connection {
                 span,
             } => {
                 let new_args = match args {
-                    FunctionArgs::List(exprs) => FunctionArgs::List(
-                        exprs
-                            .iter()
-                            .map(|e| self.pre_resolve_non_correlated_subqueries_in_expr(e, params))
-                            .collect::<Result<Vec<_>>>()?,
-                    ),
+                    FunctionArgs::List(exprs) => {
+                        let mut resolved_args = Vec::with_capacity(exprs.len());
+                        for e in exprs {
+                            resolved_args.push(
+                                self.pre_resolve_non_correlated_subqueries_in_expr(e, params)
+                                    .await?,
+                            );
+                        }
+                        FunctionArgs::List(resolved_args)
+                    }
                     FunctionArgs::Star => FunctionArgs::Star,
                 };
                 let new_order_by =
-                    self.pre_resolve_non_correlated_subqueries_in_ordering_terms(order_by, params)?;
-                let new_over = over
-                    .as_ref()
-                    .map(|window| {
+                    self.pre_resolve_non_correlated_subqueries_in_ordering_terms(order_by, params)
+                .await?;
+                let new_over = match over.as_ref() {
+                    Some(window) => Some(
                         self.pre_resolve_non_correlated_subqueries_in_window_spec(window, params)
-                    })
-                    .transpose()?;
+                            .await?,
+                    ),
+                    None => None,
+                };
                 Ok(Expr::FunctionCall {
                     name: name.clone(),
                     args: new_args,
@@ -61417,7 +63014,7 @@ impl Connection {
                     order_by: new_order_by,
                     filter: match filter {
                         Some(f) => Some(Box::new(
-                            self.pre_resolve_non_correlated_subqueries_in_expr(f, params)?,
+                            self.pre_resolve_non_correlated_subqueries_in_expr(f, params).await?,
                         )),
                         None => None,
                     },
@@ -61428,13 +63025,16 @@ impl Connection {
             // Row-values like `(a, b)` recurse into each element so a
             // subquery inside one of them is pre-resolved (e.g.
             // `(x, (SELECT MAX(y) FROM t)) IN (...)`).
-            Expr::RowValue(values, span) => Ok(Expr::RowValue(
-                values
-                    .iter()
-                    .map(|v| self.pre_resolve_non_correlated_subqueries_in_expr(v, params))
-                    .collect::<Result<Vec<_>>>()?,
-                *span,
-            )),
+            Expr::RowValue(values, span) => {
+                let mut resolved_values = Vec::with_capacity(values.len());
+                for v in values {
+                    resolved_values.push(
+                        self.pre_resolve_non_correlated_subqueries_in_expr(v, params)
+                            .await?,
+                    );
+                }
+                Ok(Expr::RowValue(resolved_values, *span))
+            }
             // JSON access (`->`, `->>`) can host subqueries in either side.
             Expr::JsonAccess {
                 expr: inner,
@@ -61442,8 +63042,11 @@ impl Connection {
                 arrow,
                 span,
             } => Ok(Expr::JsonAccess {
-                expr: Box::new(self.pre_resolve_non_correlated_subqueries_in_expr(inner, params)?),
-                path: Box::new(self.pre_resolve_non_correlated_subqueries_in_expr(path, params)?),
+                expr: Box::new(
+                    self.pre_resolve_non_correlated_subqueries_in_expr(inner, params)
+                        .await?,
+                ),
+                path: Box::new(self.pre_resolve_non_correlated_subqueries_in_expr(path, params).await?),
                 arrow: *arrow,
                 span: *span,
             }),
@@ -61451,36 +63054,38 @@ impl Connection {
             // resolve; clone as-is.
             _ => Ok(expr.clone()),
         }
+        })
     }
 
-    fn pre_resolve_non_correlated_subqueries_in_ordering_terms(
+    async fn pre_resolve_non_correlated_subqueries_in_ordering_terms(
         &self,
         order_by: &[OrderingTerm],
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<OrderingTerm>> {
-        order_by
-            .iter()
-            .map(|term| {
-                Ok(OrderingTerm {
-                    expr: self.pre_resolve_non_correlated_subqueries_in_expr(&term.expr, params)?,
-                    direction: term.direction,
-                    nulls: term.nulls,
-                })
-            })
-            .collect()
+        let mut resolved = Vec::with_capacity(order_by.len());
+        for term in order_by {
+            resolved.push(OrderingTerm {
+                expr: self
+                    .pre_resolve_non_correlated_subqueries_in_expr(&term.expr, params)
+                    .await?,
+                direction: term.direction,
+                nulls: term.nulls,
+            });
+        }
+        Ok(resolved)
     }
 
-    fn pre_resolve_non_correlated_subqueries_in_frame_bound(
+    async fn pre_resolve_non_correlated_subqueries_in_frame_bound(
         &self,
         bound: &FrameBound,
         params: Option<&[SqliteValue]>,
     ) -> Result<FrameBound> {
         match bound {
             FrameBound::Preceding(expr) => Ok(FrameBound::Preceding(Box::new(
-                self.pre_resolve_non_correlated_subqueries_in_expr(expr, params)?,
+                self.pre_resolve_non_correlated_subqueries_in_expr(expr, params).await?,
             ))),
             FrameBound::Following(expr) => Ok(FrameBound::Following(Box::new(
-                self.pre_resolve_non_correlated_subqueries_in_expr(expr, params)?,
+                self.pre_resolve_non_correlated_subqueries_in_expr(expr, params).await?,
             ))),
             FrameBound::UnboundedPreceding
             | FrameBound::CurrentRow
@@ -61488,49 +63093,56 @@ impl Connection {
         }
     }
 
-    fn pre_resolve_non_correlated_subqueries_in_frame_spec(
+    async fn pre_resolve_non_correlated_subqueries_in_frame_spec(
         &self,
         frame: &FrameSpec,
         params: Option<&[SqliteValue]>,
     ) -> Result<FrameSpec> {
+        let start = self
+            .pre_resolve_non_correlated_subqueries_in_frame_bound(&frame.start, params)
+            .await?;
+        let end = match frame.end.as_ref() {
+            Some(bound) => Some(
+                self.pre_resolve_non_correlated_subqueries_in_frame_bound(bound, params)
+                    .await?,
+            ),
+            None => None,
+        };
         Ok(FrameSpec {
             frame_type: frame.frame_type,
-            start: self
-                .pre_resolve_non_correlated_subqueries_in_frame_bound(&frame.start, params)?,
-            end: frame
-                .end
-                .as_ref()
-                .map(|bound| {
-                    self.pre_resolve_non_correlated_subqueries_in_frame_bound(bound, params)
-                })
-                .transpose()?,
+            start,
+            end,
             exclude: frame.exclude,
         })
     }
 
-    fn pre_resolve_non_correlated_subqueries_in_window_spec(
+    async fn pre_resolve_non_correlated_subqueries_in_window_spec(
         &self,
         window: &WindowSpec,
         params: Option<&[SqliteValue]>,
     ) -> Result<WindowSpec> {
+        let mut partition_by = Vec::with_capacity(window.partition_by.len());
+        for expr in &window.partition_by {
+            partition_by.push(
+                self.pre_resolve_non_correlated_subqueries_in_expr(expr, params)
+                    .await?,
+            );
+        }
+        let order_by = self
+            .pre_resolve_non_correlated_subqueries_in_ordering_terms(&window.order_by, params)
+            .await?;
+        let frame = match window.frame.as_ref() {
+            Some(frame) => Some(
+                self.pre_resolve_non_correlated_subqueries_in_frame_spec(frame, params)
+                    .await?,
+            ),
+            None => None,
+        };
         Ok(WindowSpec {
             base_window: window.base_window.clone(),
-            partition_by: window
-                .partition_by
-                .iter()
-                .map(|expr| self.pre_resolve_non_correlated_subqueries_in_expr(expr, params))
-                .collect::<Result<Vec<_>>>()?,
-            order_by: self.pre_resolve_non_correlated_subqueries_in_ordering_terms(
-                &window.order_by,
-                params,
-            )?,
-            frame: window
-                .frame
-                .as_ref()
-                .map(|frame| {
-                    self.pre_resolve_non_correlated_subqueries_in_frame_spec(frame, params)
-                })
-                .transpose()?,
+            partition_by,
+            order_by,
+            frame,
         })
     }
 
@@ -61541,18 +63153,23 @@ impl Connection {
     /// This allows `execute_join_select` to evaluate result columns that
     /// contain correlated scalar subqueries (including those with JOINs in
     /// their FROM clause, which the VDBE `emit_scalar_subquery` cannot handle).
-    fn inline_subqueries_in_expr(
-        &self,
-        expr: &Expr,
-        row: &[SqliteValue],
-        outer_col_map: &[(String, String, bool)],
-    ) -> Result<Expr> {
+    // Recurses into sub-expressions, so it returns a boxed future rather than
+    // using `async fn` sugar.
+    fn inline_subqueries_in_expr<'a>(
+        &'a self,
+        expr: &'a Expr,
+        row: &'a [SqliteValue],
+        outer_col_map: &'a [(String, String, bool)],
+    ) -> Pin<Box<dyn Future<Output = Result<Expr>> + 'a>> {
+        Box::pin(async move {
         match expr {
             Expr::Subquery(sub, span) => {
                 let inner_tables = collect_subquery_inner_tables(sub);
                 let mut sub_clone = sub.as_ref().clone();
                 substitute_outer_refs_in_select(&mut sub_clone, row, outer_col_map, &inner_tables);
-                let rows = self.execute_statement(&Statement::Select(sub_clone), None)?;
+                let rows = self
+                            .execute_statement(&Statement::Select(sub_clone), None)
+                            .await?;
                 let val = rows
                     .into_iter()
                     .next()
@@ -61568,7 +63185,9 @@ impl Connection {
                 let inner_tables = collect_subquery_inner_tables(subquery);
                 let mut sub_clone = subquery.as_ref().clone();
                 substitute_outer_refs_in_select(&mut sub_clone, row, outer_col_map, &inner_tables);
-                let rows = self.execute_statement(&Statement::Select(sub_clone), None)?;
+                let rows = self
+                            .execute_statement(&Statement::Select(sub_clone), None)
+                            .await?;
                 let exists = !rows.is_empty();
                 let truth = if *not { !exists } else { exists };
                 Ok(Expr::Literal(Literal::Integer(i64::from(truth)), *span))
@@ -61579,8 +63198,8 @@ impl Connection {
                 right,
                 span,
             } => {
-                let l = self.inline_subqueries_in_expr(left, row, outer_col_map)?;
-                let r = self.inline_subqueries_in_expr(right, row, outer_col_map)?;
+                let l = self.inline_subqueries_in_expr(left, row, outer_col_map).await?;
+                let r = self.inline_subqueries_in_expr(right, row, outer_col_map).await?;
                 Ok(Expr::BinaryOp {
                     left: Box::new(l),
                     op: *op,
@@ -61593,7 +63212,9 @@ impl Connection {
                 expr: inner,
                 span,
             } => {
-                let inlined = self.inline_subqueries_in_expr(inner, row, outer_col_map)?;
+                let inlined = self
+                    .inline_subqueries_in_expr(inner, row, outer_col_map)
+                    .await?;
                 Ok(Expr::UnaryOp {
                     op: *op,
                     expr: Box::new(inlined),
@@ -61605,7 +63226,9 @@ impl Connection {
                 not,
                 span,
             } => {
-                let inlined = self.inline_subqueries_in_expr(inner, row, outer_col_map)?;
+                let inlined = self
+                    .inline_subqueries_in_expr(inner, row, outer_col_map)
+                    .await?;
                 Ok(Expr::IsNull {
                     expr: Box::new(inlined),
                     not: *not,
@@ -61617,7 +63240,9 @@ impl Connection {
                 type_name,
                 span,
             } => {
-                let inlined = self.inline_subqueries_in_expr(inner, row, outer_col_map)?;
+                let inlined = self
+                    .inline_subqueries_in_expr(inner, row, outer_col_map)
+                    .await?;
                 Ok(Expr::Cast {
                     expr: Box::new(inlined),
                     type_name: type_name.clone(),
@@ -61629,7 +63254,9 @@ impl Connection {
                 collation,
                 span,
             } => {
-                let inlined = self.inline_subqueries_in_expr(inner, row, outer_col_map)?;
+                let inlined = self
+                    .inline_subqueries_in_expr(inner, row, outer_col_map)
+                    .await?;
                 Ok(Expr::Collate {
                     expr: Box::new(inlined),
                     collation: collation.clone(),
@@ -61643,9 +63270,11 @@ impl Connection {
                 not,
                 span,
             } => {
-                let inlined = self.inline_subqueries_in_expr(inner, row, outer_col_map)?;
-                let low = self.inline_subqueries_in_expr(low, row, outer_col_map)?;
-                let high = self.inline_subqueries_in_expr(high, row, outer_col_map)?;
+                let inlined = self
+                    .inline_subqueries_in_expr(inner, row, outer_col_map)
+                    .await?;
+                let low = self.inline_subqueries_in_expr(low, row, outer_col_map).await?;
+                let high = self.inline_subqueries_in_expr(high, row, outer_col_map).await?;
                 Ok(Expr::Between {
                     expr: Box::new(inlined),
                     low: Box::new(low),
@@ -61660,7 +63289,9 @@ impl Connection {
                 not,
                 span,
             } => {
-                let new_inner = self.inline_subqueries_in_expr(inner, row, outer_col_map)?;
+                let new_inner = self
+                    .inline_subqueries_in_expr(inner, row, outer_col_map)
+                    .await?;
                 let new_set = match set {
                     InSet::Subquery(subquery) => {
                         let inner_tables = collect_subquery_inner_tables(subquery);
@@ -61671,7 +63302,9 @@ impl Connection {
                             outer_col_map,
                             &inner_tables,
                         );
-                        let rows = self.execute_statement(&Statement::Select(sub_clone), None)?;
+                        let rows = self
+                            .execute_statement(&Statement::Select(sub_clone), None)
+                            .await?;
                         let literals = rows
                             .into_iter()
                             .filter_map(|r| r.values.into_iter().next())
@@ -61679,12 +63312,16 @@ impl Connection {
                             .collect();
                         InSet::List(literals)
                     }
-                    InSet::List(exprs) => InSet::List(
-                        exprs
-                            .iter()
-                            .map(|item| self.inline_subqueries_in_expr(item, row, outer_col_map))
-                            .collect::<Result<Vec<_>>>()?,
-                    ),
+                    InSet::List(exprs) => {
+                        let mut inlined_items = Vec::with_capacity(exprs.len());
+                        for item in exprs {
+                            inlined_items.push(
+                                self.inline_subqueries_in_expr(item, row, outer_col_map)
+                                    .await?,
+                            );
+                        }
+                        InSet::List(inlined_items)
+                    }
                     other => other.clone(),
                 };
                 Ok(Expr::In {
@@ -61705,34 +63342,41 @@ impl Connection {
             } => {
                 let new_args = match args {
                     FunctionArgs::List(exprs) => {
-                        let new_exprs: Result<Vec<_>> = exprs
-                            .iter()
-                            .map(|e| self.inline_subqueries_in_expr(e, row, outer_col_map))
-                            .collect();
-                        FunctionArgs::List(new_exprs?)
+                        let mut new_exprs = Vec::with_capacity(exprs.len());
+                        for e in exprs {
+                            new_exprs.push(
+                                self.inline_subqueries_in_expr(e, row, outer_col_map)
+                                    .await?,
+                            );
+                        }
+                        FunctionArgs::List(new_exprs)
                     }
                     FunctionArgs::Star => FunctionArgs::Star,
+                };
+                let new_order_by = self
+                    .inline_subqueries_in_ordering_terms(order_by, row, outer_col_map)
+                    .await?;
+                let new_filter = match filter.as_ref() {
+                    Some(f) => Some(Box::new(
+                        self.inline_subqueries_in_expr(f, row, outer_col_map)
+                            .await?,
+                    )),
+                    None => None,
+                };
+                let new_over = match over.as_ref() {
+                    Some(window) => Some(
+                        self.inline_subqueries_in_window_spec(window, row, outer_col_map)
+                            .await?,
+                    ),
+                    None => None,
                 };
                 Ok(Expr::FunctionCall {
                     name: name.clone(),
                     args: new_args,
                     distinct: *distinct,
-                    order_by: self.inline_subqueries_in_ordering_terms(
-                        order_by,
-                        row,
-                        outer_col_map,
-                    )?,
-                    filter: filter
-                        .as_ref()
-                        .map(|f| self.inline_subqueries_in_expr(f, row, outer_col_map))
-                        .transpose()?
-                        .map(Box::new),
-                    over: over
-                        .as_ref()
-                        .map(|window| {
-                            self.inline_subqueries_in_window_spec(window, row, outer_col_map)
-                        })
-                        .transpose()?,
+                    order_by: new_order_by,
+                    filter: new_filter,
+                    over: new_over,
                     span: *span,
                 })
             }
@@ -61742,27 +63386,33 @@ impl Connection {
                 else_expr,
                 span,
             } => {
-                let new_op = operand
-                    .as_ref()
-                    .map(|e| self.inline_subqueries_in_expr(e, row, outer_col_map))
-                    .transpose()?
-                    .map(Box::new);
-                let new_whens: Result<Vec<_>> = whens
-                    .iter()
-                    .map(|(w, t)| {
-                        let nw = self.inline_subqueries_in_expr(w, row, outer_col_map)?;
-                        let nt = self.inline_subqueries_in_expr(t, row, outer_col_map)?;
-                        Ok((nw, nt))
-                    })
-                    .collect();
-                let new_else = else_expr
-                    .as_ref()
-                    .map(|e| self.inline_subqueries_in_expr(e, row, outer_col_map))
-                    .transpose()?
-                    .map(Box::new);
+                let new_op = match operand.as_ref() {
+                    Some(e) => Some(Box::new(
+                        self.inline_subqueries_in_expr(e, row, outer_col_map)
+                            .await?,
+                    )),
+                    None => None,
+                };
+                let mut new_whens = Vec::with_capacity(whens.len());
+                for (w, t) in whens {
+                    let nw = self
+                        .inline_subqueries_in_expr(w, row, outer_col_map)
+                        .await?;
+                    let nt = self
+                        .inline_subqueries_in_expr(t, row, outer_col_map)
+                        .await?;
+                    new_whens.push((nw, nt));
+                }
+                let new_else = match else_expr.as_ref() {
+                    Some(e) => Some(Box::new(
+                        self.inline_subqueries_in_expr(e, row, outer_col_map)
+                            .await?,
+                    )),
+                    None => None,
+                };
                 Ok(Expr::Case {
                     operand: new_op,
-                    whens: new_whens?,
+                    whens: new_whens,
                     else_expr: new_else,
                     span: *span,
                 })
@@ -61775,14 +63425,18 @@ impl Connection {
                 not,
                 span,
             } => {
-                let inlined_expr = self.inline_subqueries_in_expr(inner, row, outer_col_map)?;
+                let inlined_expr = self
+                    .inline_subqueries_in_expr(inner, row, outer_col_map)
+                    .await?;
                 let inlined_pattern =
-                    self.inline_subqueries_in_expr(pattern, row, outer_col_map)?;
-                let inlined_escape = escape
-                    .as_ref()
-                    .map(|expr| self.inline_subqueries_in_expr(expr, row, outer_col_map))
-                    .transpose()?
-                    .map(Box::new);
+                    self.inline_subqueries_in_expr(pattern, row, outer_col_map).await?;
+                let inlined_escape = match escape.as_ref() {
+                    Some(expr) => Some(Box::new(
+                        self.inline_subqueries_in_expr(expr, row, outer_col_map)
+                            .await?,
+                    )),
+                    None => None,
+                };
                 Ok(Expr::Like {
                     expr: Box::new(inlined_expr),
                     pattern: Box::new(inlined_pattern),
@@ -61798,8 +63452,10 @@ impl Connection {
                 arrow,
                 span,
             } => {
-                let inlined_expr = self.inline_subqueries_in_expr(inner, row, outer_col_map)?;
-                let inlined_path = self.inline_subqueries_in_expr(path, row, outer_col_map)?;
+                let inlined_expr = self
+                    .inline_subqueries_in_expr(inner, row, outer_col_map)
+                    .await?;
+                let inlined_path = self.inline_subqueries_in_expr(path, row, outer_col_map).await?;
                 Ok(Expr::JsonAccess {
                     expr: Box::new(inlined_expr),
                     path: Box::new(inlined_path),
@@ -61807,39 +63463,44 @@ impl Connection {
                     span: *span,
                 })
             }
-            Expr::RowValue(values, span) => Ok(Expr::RowValue(
-                values
-                    .iter()
-                    .map(|value| self.inline_subqueries_in_expr(value, row, outer_col_map))
-                    .collect::<Result<Vec<_>>>()?,
-                *span,
-            )),
+            Expr::RowValue(values, span) => {
+                let mut inlined_values = Vec::with_capacity(values.len());
+                for value in values {
+                    inlined_values.push(
+                        self.inline_subqueries_in_expr(value, row, outer_col_map)
+                            .await?,
+                    );
+                }
+                Ok(Expr::RowValue(inlined_values, *span))
+            }
             Expr::Literal(_, _)
             | Expr::Column(_, _)
             | Expr::Raise { .. }
             | Expr::Placeholder(_, _) => Ok(expr.clone()),
         }
+        })
     }
 
-    fn inline_subqueries_in_ordering_terms(
+    async fn inline_subqueries_in_ordering_terms(
         &self,
         order_by: &[OrderingTerm],
         row: &[SqliteValue],
         outer_col_map: &[(String, String, bool)],
     ) -> Result<Vec<OrderingTerm>> {
-        order_by
-            .iter()
-            .map(|term| {
-                Ok(OrderingTerm {
-                    expr: self.inline_subqueries_in_expr(&term.expr, row, outer_col_map)?,
-                    direction: term.direction,
-                    nulls: term.nulls,
-                })
-            })
-            .collect()
+        let mut resolved = Vec::with_capacity(order_by.len());
+        for term in order_by {
+            resolved.push(OrderingTerm {
+                expr: self
+                    .inline_subqueries_in_expr(&term.expr, row, outer_col_map)
+                    .await?,
+                direction: term.direction,
+                nulls: term.nulls,
+            });
+        }
+        Ok(resolved)
     }
 
-    fn inline_subqueries_in_frame_bound(
+    async fn inline_subqueries_in_frame_bound(
         &self,
         bound: &FrameBound,
         row: &[SqliteValue],
@@ -61847,10 +63508,10 @@ impl Connection {
     ) -> Result<FrameBound> {
         match bound {
             FrameBound::Preceding(expr) => Ok(FrameBound::Preceding(Box::new(
-                self.inline_subqueries_in_expr(expr, row, outer_col_map)?,
+                self.inline_subqueries_in_expr(expr, row, outer_col_map).await?,
             ))),
             FrameBound::Following(expr) => Ok(FrameBound::Following(Box::new(
-                self.inline_subqueries_in_expr(expr, row, outer_col_map)?,
+                self.inline_subqueries_in_expr(expr, row, outer_col_map).await?,
             ))),
             FrameBound::UnboundedPreceding => Ok(FrameBound::UnboundedPreceding),
             FrameBound::CurrentRow => Ok(FrameBound::CurrentRow),
@@ -61858,47 +63519,58 @@ impl Connection {
         }
     }
 
-    fn inline_subqueries_in_frame_spec(
+    async fn inline_subqueries_in_frame_spec(
         &self,
         frame: &FrameSpec,
         row: &[SqliteValue],
         outer_col_map: &[(String, String, bool)],
     ) -> Result<FrameSpec> {
+        let start = self
+            .inline_subqueries_in_frame_bound(&frame.start, row, outer_col_map)
+            .await?;
+        let end = match frame.end.as_ref() {
+            Some(bound) => Some(
+                self.inline_subqueries_in_frame_bound(bound, row, outer_col_map)
+                    .await?,
+            ),
+            None => None,
+        };
         Ok(FrameSpec {
             frame_type: frame.frame_type,
-            start: self.inline_subqueries_in_frame_bound(&frame.start, row, outer_col_map)?,
-            end: frame
-                .end
-                .as_ref()
-                .map(|bound| self.inline_subqueries_in_frame_bound(bound, row, outer_col_map))
-                .transpose()?,
+            start,
+            end,
             exclude: frame.exclude,
         })
     }
 
-    fn inline_subqueries_in_window_spec(
+    async fn inline_subqueries_in_window_spec(
         &self,
         window: &WindowSpec,
         row: &[SqliteValue],
         outer_col_map: &[(String, String, bool)],
     ) -> Result<WindowSpec> {
+        let mut partition_by = Vec::with_capacity(window.partition_by.len());
+        for expr in &window.partition_by {
+            partition_by.push(
+                self.inline_subqueries_in_expr(expr, row, outer_col_map)
+                    .await?,
+            );
+        }
+        let order_by = self
+            .inline_subqueries_in_ordering_terms(&window.order_by, row, outer_col_map)
+            .await?;
+        let frame = match window.frame.as_ref() {
+            Some(frame) => Some(
+                self.inline_subqueries_in_frame_spec(frame, row, outer_col_map)
+                    .await?,
+            ),
+            None => None,
+        };
         Ok(WindowSpec {
             base_window: window.base_window.clone(),
-            partition_by: window
-                .partition_by
-                .iter()
-                .map(|expr| self.inline_subqueries_in_expr(expr, row, outer_col_map))
-                .collect::<Result<Vec<_>>>()?,
-            order_by: self.inline_subqueries_in_ordering_terms(
-                &window.order_by,
-                row,
-                outer_col_map,
-            )?,
-            frame: window
-                .frame
-                .as_ref()
-                .map(|frame| self.inline_subqueries_in_frame_spec(frame, row, outer_col_map))
-                .transpose()?,
+            partition_by,
+            order_by,
+            frame,
         })
     }
 
@@ -61906,21 +63578,24 @@ impl Connection {
     /// substituting outer column references from the group's representative
     /// row and executing each subquery eagerly.  Returns a rewritten
     /// expression with those nodes replaced by literal values.
-    fn resolve_having_subqueries(
+    async fn resolve_having_subqueries(
         &self,
         expr: &Expr,
         row: &[SqliteValue],
         col_map: &[(String, String, bool)],
     ) -> Result<Expr> {
-        self.inline_subqueries_in_expr(expr, row, col_map)
+        self.inline_subqueries_in_expr(expr, row, col_map).await
     }
 
     /// Compile an INSERT through the VDBE codegen.
-    fn compile_table_insert(&self, insert: &fsqlite_ast::InsertStatement) -> Result<VdbeProgram> {
+    async fn compile_table_insert(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+    ) -> Result<VdbeProgram> {
         // Resolve any subqueries inside VALUES expressions before VDBE codegen,
         // because emit_expr receives None scan context for VALUES rows and
         // cannot handle Expr::Subquery/Expr::Exists.
-        let insert = self.resolve_insert_values_subqueries(insert)?;
+        let insert = self.resolve_insert_values_subqueries(insert).await?;
         {
             let schema = self.schema.borrow();
             let table_schema = schema
@@ -61969,32 +63644,34 @@ impl Connection {
     /// common case for `INSERT INTO t VALUES (1, 2, 3)`), avoiding a full
     /// deep clone of `InsertStatement` on every prepare. Returns `Cow::Owned`
     /// only when a subquery was rewritten into a literal.
-    fn resolve_insert_values_subqueries<'a>(
+    async fn resolve_insert_values_subqueries<'a>(
         &self,
         insert: &'a fsqlite_ast::InsertStatement,
     ) -> Result<Cow<'a, fsqlite_ast::InsertStatement>> {
         let empty_row: &[SqliteValue] = &[];
         let empty_col_map: &[(String, String, bool)] = &[];
-        let resolve_rows = |rows: &[Vec<Expr>]| -> Result<Vec<Vec<Expr>>> {
-            rows.iter()
-                .map(|row| {
-                    row.iter()
-                        .map(|expr| {
-                            if expr_has_any_subquery(expr) {
-                                self.inline_subqueries_in_expr(expr, empty_row, empty_col_map)
-                            } else {
-                                Ok(expr.clone())
-                            }
-                        })
-                        .collect()
-                })
-                .collect()
+        let resolve_rows = async |rows: &[Vec<Expr>]| -> Result<Vec<Vec<Expr>>> {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut new_row = Vec::with_capacity(row.len());
+                for expr in row {
+                    new_row.push(if expr_has_any_subquery(expr) {
+                        self.inline_subqueries_in_expr(expr, empty_row, empty_col_map)
+                            .await?
+                    } else {
+                        expr.clone()
+                    });
+                }
+                out.push(new_row);
+            }
+            Ok(out)
         };
         match &insert.source {
             fsqlite_ast::InsertSource::Values(rows) => {
                 if rows.iter().any(|r| r.iter().any(expr_has_any_subquery)) {
                     let mut new_insert = insert.clone();
-                    new_insert.source = fsqlite_ast::InsertSource::Values(resolve_rows(rows)?);
+                    new_insert.source =
+                        fsqlite_ast::InsertSource::Values(resolve_rows(rows).await?);
                     Ok(Cow::Owned(new_insert))
                 } else {
                     Ok(Cow::Borrowed(insert))
@@ -62005,7 +63682,7 @@ impl Connection {
                     if rows.iter().any(|r| r.iter().any(expr_has_any_subquery)) {
                         let mut new_insert = insert.clone();
                         let mut new_sel = sel.as_ref().clone();
-                        new_sel.body.select = SelectCore::Values(resolve_rows(rows)?);
+                        new_sel.body.select = SelectCore::Values(resolve_rows(rows).await?);
                         new_insert.source = fsqlite_ast::InsertSource::Select(Box::new(new_sel));
                         return Ok(Cow::Owned(new_insert));
                     }
@@ -62072,10 +63749,10 @@ impl Connection {
     /// Returns `Ok(program)` when the statement type has VDBE codegen,
     /// or `Err(...)` for statement types that don't go through the bytecode
     /// compiler (DDL, transaction control, PRAGMA, etc.).
-    fn try_compile_statement(&self, stmt: &Statement) -> Result<VdbeProgram> {
+    async fn try_compile_statement(&self, stmt: &Statement) -> Result<VdbeProgram> {
         match stmt {
-            Statement::Select(select) => self.compile_table_select(select),
-            Statement::Insert(insert) => self.compile_table_insert(insert),
+            Statement::Select(select) => self.compile_table_select(select).await,
+            Statement::Insert(insert) => self.compile_table_insert(insert).await,
             Statement::Update(update) => self.compile_table_update(update),
             Statement::Delete(delete) => self.compile_table_delete(delete),
             _ => Err(FrankenError::not_implemented(format!(
@@ -62094,7 +63771,7 @@ impl Connection {
     ///
     /// For `EXPLAIN QUERY PLAN`, each row has 4 columns:
     ///   id | parent | notused | detail
-    fn execute_explain(
+    async fn execute_explain(
         &self,
         stmt: &Statement,
         query_plan: bool,
@@ -62103,10 +63780,10 @@ impl Connection {
         let _ = params; // reserved for future use
 
         if query_plan {
-            return Ok(self.execute_explain_query_plan(stmt));
+            return Ok(self.execute_explain_query_plan(stmt).await);
         }
 
-        let program = self.try_compile_statement(stmt)?;
+        let program = self.try_compile_statement(stmt).await?;
 
         let rows = program
             .ops()
@@ -62154,7 +63831,7 @@ impl Connection {
     /// Execute `EXPLAIN QUERY PLAN` by describing the scan strategy of the
     /// inner statement at a high level.  Each row has four columns:
     ///   id | parent | notused | detail
-    fn execute_explain_query_plan(&self, stmt: &Statement) -> Vec<Row> {
+    async fn execute_explain_query_plan(&self, stmt: &Statement) -> Vec<Row> {
         let to_row = |id: i32, parent: i32, notused: i32, detail: String| Row {
             values: vec![
                 SqliteValue::Integer(i64::from(id)),
@@ -62173,7 +63850,7 @@ impl Connection {
                 }
 
                 let fallback_detail = first_source_eqp_detail_from_core(&select.body.select);
-                if let Ok(program) = self.compile_table_select(select) {
+                if let Ok(program) = self.compile_table_select(select).await {
                     // bd-2dgf5 / bd-jyyae: the planner produces no directive for an
                     // aggregate, and the generic bytecode explain below cannot express
                     // a seek at all — it renders every `OpenRead` as a `SCAN`. So an
@@ -62288,7 +63965,7 @@ impl Connection {
     }
 
     /// Execute a VDBE program with the in-memory database attached.
-    fn execute_table_program(
+    async fn execute_table_program(
         &self,
         program: &VdbeProgram,
         params: Option<&[SqliteValue]>,
@@ -62304,12 +63981,13 @@ impl Connection {
             &execution_cx,
             false,
         )
+        .await
     }
 
     /// Execute a VDBE program with the in-memory database attached using a
     /// caller-supplied operation context so autocommit begin/dispatch/commit
     /// can stay on one execution lineage.
-    fn execute_table_program_with_cx(
+    async fn execute_table_program_with_cx(
         &self,
         program: &VdbeProgram,
         params: Option<&[SqliteValue]>,
@@ -62330,10 +64008,13 @@ impl Connection {
                 span
             });
         let _execution_guard = execution_span.as_ref().map(tracing::Span::enter);
-        self.flush_pending_direct_write_runs(execution_cx)?;
+        self.flush_pending_direct_write_runs(execution_cx).await?;
         let func_reg = self.func_registry.borrow().clone();
         let reject_mem = *self.reject_mem_fallback.borrow();
-        let runtime_inputs = self.table_execution_runtime_inputs(runtime_requirements);
+        let runtime_inputs = self
+            .table_execution_runtime_inputs(runtime_requirements)
+            .await;
+        let page_size = page_size_from_pragma_state(self.pragma_state.borrow().page_size)?;
 
         // Lend the active transaction to the VDBE engine so that storage
         // cursors route through the real pager/WAL stack (Phase 5, bd-2a3y).
@@ -62372,14 +64053,15 @@ impl Connection {
             self.memdb_rows_loaded.get(),
             self.memdb_storage_count_shortcuts_safe.get(),
             self.version_store_for_program(program),
-            page_size_from_pragma_state(self.pragma_state.borrow().page_size)?,
+            page_size,
             true,
             None,
             None,
             allow_retained_cursor_reuse,
             false,
             cached_engine,
-        );
+        )
+        .await;
         let memdb_count_shortcuts_safe_after_exec = engine_back
             .as_ref()
             .is_some_and(|engine| engine.storage_cursor_memdb_count_shortcuts_safe());
@@ -62442,7 +64124,7 @@ impl Connection {
     // ── Schema cookie and change counter tracking (bd-3mmj) ─────────
 
     /// Persist selected database header metadata fields on page 1.
-    fn update_database_header_metadata(
+    async fn update_database_header_metadata(
         &self,
         schema_cookie: Option<u32>,
         user_version: Option<u32>,
@@ -62451,8 +64133,8 @@ impl Connection {
         if schema_cookie.is_none() && user_version.is_none() && application_id.is_none() {
             return Ok(());
         }
-        self.with_pager_write_txn(|cx, txn| {
-            let page1 = txn.get_page(cx, PageNumber::ONE)?;
+        self.with_pager_write_txn(async |cx, txn| {
+            let page1 = txn.get_page(cx, PageNumber::ONE).await?;
             let mut page_bytes = page1.as_ref().to_vec();
             if page_bytes.len() < DATABASE_HEADER_SIZE {
                 return Err(FrankenError::internal(format!(
@@ -62477,9 +64159,10 @@ impl Connection {
                 .to_bytes()
                 .map_err(|e| FrankenError::internal(format!("failed to encode header: {e}")))?;
             page_bytes[..DATABASE_HEADER_SIZE].copy_from_slice(&encoded);
-            txn.write_page(cx, PageNumber::ONE, &page_bytes)?;
+            txn.write_page(cx, PageNumber::ONE, &page_bytes).await?;
             Ok(())
         })
+        .await
     }
 
     /// IMPL-28 / AG-O3: Toggle a single bit in the unified fast-path gate.
@@ -62521,9 +64204,9 @@ impl Connection {
     /// Increment the schema cookie.  Must be called for every DDL
     /// operation (CREATE TABLE, DROP TABLE, ALTER TABLE, CREATE INDEX,
     /// CREATE VIEW, DROP INDEX, DROP VIEW, etc.).
-    fn increment_schema_cookie(&self) -> Result<()> {
+    async fn increment_schema_cookie(&self) -> Result<()> {
         if let Ok(cx) = self.op_cx() {
-            self.flush_pending_direct_write_runs(&cx)?;
+            self.flush_pending_direct_write_runs(&cx).await?;
         }
         // IMPL-28 / AG-O3: DDL in flight — close the SCHEMA_STABLE gate.
         // The fast-lane dispatch sites (once migrated) must fall back to
@@ -62532,7 +64215,8 @@ impl Connection {
         // the end of this function once the DDL state is fully consistent.
         self.set_fast_path_bit(fast_path_gate::SCHEMA_STABLE, false);
         let new_cookie = self.schema_cookie.borrow().wrapping_add(1);
-        self.update_database_header_metadata(Some(new_cookie), None, None)?;
+        self.update_database_header_metadata(Some(new_cookie), None, None)
+            .await?;
         *self.schema_cookie.borrow_mut() = new_cookie;
         self.schema_generation
             .set(self.schema_generation.get().wrapping_add(1));
@@ -62543,8 +64227,8 @@ impl Connection {
         // Invalidate cached snapshots — DDL changed schema.
         let cx_result = self.op_cx();
         if let Ok(cx) = cx_result {
-            self.invalidate_cached_read_snapshot(&cx);
-            self.invalidate_cached_write_txn(&cx);
+            self.invalidate_cached_read_snapshot(&cx).await;
+            self.invalidate_cached_write_txn(&cx).await;
         }
         // IMPL-28 / AG-O3: DDL state fully consistent again — reopen
         // SCHEMA_STABLE so fast-lane consumers can re-enter once migrated.
@@ -62635,9 +64319,9 @@ impl Connection {
     /// is rewritten (DDL, page-count change). For `:memory:` databases there is
     /// no persistent header, so the cached counter (maintained by reload/VACUUM)
     /// is returned. (5D.4 / bd-lxm9j)
-    pub fn change_counter(&self) -> u32 {
+    pub async fn change_counter(&self) -> u32 {
         if !self.pager.is_memory()
-            && let Ok(Some(header)) = self.pragma_database_header()
+            && let Ok(Some(header)) = self.pragma_database_header().await
         {
             let counter = header.change_counter;
             *self.change_counter.borrow_mut() = counter;
@@ -62756,13 +64440,14 @@ impl Connection {
     /// # Errors
     ///
     /// Returns an error if the pager cannot be read or if B-tree traversal fails.
-    fn reload_memdb_from_pager(&self, cx: &Cx) -> Result<()> {
+    async fn reload_memdb_from_pager(&self, cx: &Cx) -> Result<()> {
         self.reload_memdb_from_pager_with_mode(cx, self.should_eagerly_hydrate_memdb_rows())
+            .await
     }
 
     /// bd-db300.4.5.2: Reload memdb using an already-bound publication, avoiding
     /// a redundant `bind_pager_publication` call on the hot path.
-    fn reload_memdb_from_pager_with_prebound_publication(
+    async fn reload_memdb_from_pager_with_prebound_publication(
         &self,
         cx: &Cx,
         publication: &BoundPagerPublication,
@@ -62772,9 +64457,10 @@ impl Connection {
             publication,
             self.should_eagerly_hydrate_memdb_rows(),
         )
+        .await
     }
 
-    fn reload_memdb_from_pager_with_prebound_publication_and_mode(
+    async fn reload_memdb_from_pager_with_prebound_publication_and_mode(
         &self,
         cx: &Cx,
         publication: &BoundPagerPublication,
@@ -62782,48 +64468,50 @@ impl Connection {
     ) -> Result<()> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
         let bound_visible_commit_seq = publication.snapshot.visible_commit_seq;
-        let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly)?;
+        let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly).await?;
         self.reload_memdb_from_txn_with_mode(
             cx,
             &mut txn,
             bound_visible_commit_seq,
             hydrate_rows,
             true,
-        )?;
+        )
+        .await?;
         self.publish_committed_schema_cookie(self.schema_cookie());
         Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
-    fn reload_memdb_from_pager_with_mode(&self, cx: &Cx, hydrate_rows: bool) -> Result<()> {
+    async fn reload_memdb_from_pager_with_mode(&self, cx: &Cx, hydrate_rows: bool) -> Result<()> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
-        let bound_publication = self.bind_pager_publication(cx, "memdb_reload")?;
+        let bound_publication = self.bind_pager_publication(cx, "memdb_reload").await?;
         let bound_visible_commit_seq = bound_publication.snapshot.visible_commit_seq;
 
         // Open a read transaction to see the committed state.
-        let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly)?;
+        let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly).await?;
         self.reload_memdb_from_txn_with_mode(
             cx,
             &mut txn,
             bound_visible_commit_seq,
             hydrate_rows,
             true,
-        )?;
+        )
+        .await?;
         self.publish_committed_schema_cookie(self.schema_cookie());
         Ok(())
     }
 
-    fn reload_memdb_rows_from_txn_preserving_schema(
+    async fn reload_memdb_rows_from_txn_preserving_schema(
         &self,
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         bound_visible_commit_seq: CommitSeq,
     ) -> Result<()> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
         if bound_visible_commit_seq > *self.memdb_visible_commit_seq.borrow() {
             self.discard_cached_vdbe_engine();
         }
-        let page1 = txn.get_page(cx, PageNumber::ONE)?;
+        let page1 = txn.get_page(cx, PageNumber::ONE).await?;
         let header = parse_database_header_checked(page1.as_ref())?;
         let page_size = header.page_size;
         let reserved_per_page = header.reserved_per_page;
@@ -62869,11 +64557,11 @@ impl Connection {
                 .get(&table.name.to_ascii_lowercase())
                 .copied();
 
-            if cursor.first(cx)? {
+            if cursor.first(cx).await? {
                 if table.without_rowid {
                     let mut synthetic_rowid = 1_i64;
                     loop {
-                        let payload = cursor.payload(cx)?;
+                        let payload = cursor.payload(cx).await?;
                         let values = parse_record(&payload).ok_or_else(|| {
                             FrankenError::DatabaseCorrupt {
                                 detail: format!(
@@ -62882,24 +64570,26 @@ impl Connection {
                                 ),
                             }
                         })?;
-                        let values = self.inflate_table_row_values_for_storage_reload(
-                            table,
-                            synthetic_rowid,
-                            &values,
-                            None,
-                        )?;
+                        let values = self
+                            .inflate_table_row_values_for_storage_reload(
+                                table,
+                                synthetic_rowid,
+                                &values,
+                                None,
+                            )
+                            .await?;
                         if let Some(mem_table) = new_db.get_table_mut(table.root_page) {
                             mem_table.insert_row(synthetic_rowid, values);
                         }
                         synthetic_rowid = synthetic_rowid.saturating_add(1);
-                        if !cursor.next(cx)? {
+                        if !cursor.next(cx).await? {
                             break;
                         }
                     }
                     continue;
                 }
                 loop {
-                    let (rowid, payload) = cursor.rowid_and_payload_cow(cx)?;
+                    let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
                     let mut values = parse_record(payload.as_ref()).ok_or_else(|| {
                         FrankenError::DatabaseCorrupt {
                             detail: format!(
@@ -62916,16 +64606,18 @@ impl Connection {
                     {
                         new_sqlite_sequence_cache.insert(tbl_name.to_ascii_lowercase(), *seq);
                     }
-                    values = self.inflate_table_row_values_for_storage_reload(
-                        table,
-                        rowid,
-                        &values,
-                        ipk_col_idx,
-                    )?;
+                    values = self
+                        .inflate_table_row_values_for_storage_reload(
+                            table,
+                            rowid,
+                            &values,
+                            ipk_col_idx,
+                        )
+                        .await?;
                     if let Some(mem_table) = new_db.get_table_mut(table.root_page) {
                         mem_table.insert_row(rowid, values);
                     }
-                    if !cursor.next(cx)? {
+                    if !cursor.next(cx).await? {
                         break;
                     }
                 }
@@ -62946,10 +64638,10 @@ impl Connection {
     }
 
     #[cfg(any(feature = "ext-fts5", feature = "ext-rtree"))]
-    fn read_storage_table_rows_for_reload(
+    async fn read_storage_table_rows_for_reload(
         &self,
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         page_size: PageSize,
         reserved_per_page: u8,
         table: &TableSchema,
@@ -62972,11 +64664,11 @@ impl Connection {
             .copied();
         let mut rows = Vec::new();
 
-        if cursor.first(cx)? {
+        if cursor.first(cx).await? {
             if table.without_rowid {
                 let mut synthetic_rowid = 1_i64;
                 loop {
-                    let payload = cursor.payload(cx)?;
+                    let payload = cursor.payload(cx).await?;
                     let values =
                         parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
                             detail: format!(
@@ -62984,23 +64676,25 @@ impl Connection {
                                 table.name
                             ),
                         })?;
-                    let values = self.inflate_table_row_values_for_storage_reload(
-                        table,
-                        synthetic_rowid,
-                        &values,
-                        None,
-                    )?;
+                    let values = self
+                        .inflate_table_row_values_for_storage_reload(
+                            table,
+                            synthetic_rowid,
+                            &values,
+                            None,
+                        )
+                        .await?;
                     rows.push((synthetic_rowid, values));
                     synthetic_rowid = synthetic_rowid.saturating_add(1);
-                    if !cursor.next(cx)? {
+                    if !cursor.next(cx).await? {
                         break;
                     }
                 }
                 return Ok(rows);
             }
             loop {
-                let rowid = cursor.rowid(cx)?;
-                let payload = cursor.payload(cx)?;
+                let rowid = cursor.rowid(cx).await?;
+                let payload = cursor.payload(cx).await?;
                 let mut values =
                     parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -63008,14 +64702,16 @@ impl Connection {
                             table.name
                         ),
                     })?;
-                values = self.inflate_table_row_values_for_storage_reload(
-                    table,
-                    rowid,
-                    &values,
-                    ipk_col_idx,
-                )?;
+                values = self
+                    .inflate_table_row_values_for_storage_reload(
+                        table,
+                        rowid,
+                        &values,
+                        ipk_col_idx,
+                    )
+                    .await?;
                 rows.push((rowid, values));
-                if !cursor.next(cx)? {
+                if !cursor.next(cx).await? {
                     break;
                 }
             }
@@ -63025,10 +64721,10 @@ impl Connection {
     }
 
     #[cfg(feature = "ext-fts5")]
-    fn read_fts5_rootpage_zero_content_rows_for_reload(
+    async fn read_fts5_rootpage_zero_content_rows_for_reload(
         &self,
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         page_size: PageSize,
         reserved_per_page: u8,
         schema: &[TableSchema],
@@ -63047,14 +64743,16 @@ impl Connection {
                         "FTS5 table `{table_name}` is missing required content shadow table `{content_table_name}`"
                     ),
                 })?;
-            let rows = self.read_storage_table_rows_for_reload(
-                cx,
-                txn,
-                page_size,
-                reserved_per_page,
-                content_table,
-                rowid_alias_columns,
-            )?;
+            let rows = self
+                .read_storage_table_rows_for_reload(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    content_table,
+                    rowid_alias_columns,
+                )
+                .await?;
 
             return Ok(rows
                 .into_iter()
@@ -63088,14 +64786,16 @@ impl Connection {
                     "FTS5 table `{table_name}` references missing external content table `{content_option}`"
                 ),
             })?;
-        let rows = self.read_storage_table_rows_for_reload(
-            cx,
-            txn,
-            page_size,
-            reserved_per_page,
-            content_table,
-            rowid_alias_columns,
-        )?;
+        let rows = self
+            .read_storage_table_rows_for_reload(
+                cx,
+                txn,
+                page_size,
+                reserved_per_page,
+                content_table,
+                rowid_alias_columns,
+            )
+            .await?;
         let content_rowid =
             virtual_table_option_value(args, "content_rowid").unwrap_or_else(|| "rowid".to_owned());
         let content_rowid_index = content_table
@@ -63149,10 +64849,10 @@ impl Connection {
     /// reader remains correct when it is absent.
     #[cfg(feature = "ext-fts5")]
     #[allow(clippy::too_many_arguments)]
-    fn read_fts5_shadow_rows_for_reload(
+    async fn read_fts5_shadow_rows_for_reload(
         &self,
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         page_size: PageSize,
         reserved_per_page: u8,
         schema: &[TableSchema],
@@ -63168,14 +64868,16 @@ impl Connection {
                 .iter()
                 .find(|candidate| candidate.name.eq_ignore_ascii_case(&name))
             {
-                *slot = self.read_storage_table_rows_for_reload(
-                    cx,
-                    txn,
-                    page_size,
-                    reserved_per_page,
-                    table,
-                    rowid_alias_columns,
-                )?;
+                *slot = self
+                    .read_storage_table_rows_for_reload(
+                        cx,
+                        txn,
+                        page_size,
+                        reserved_per_page,
+                        table,
+                        rowid_alias_columns,
+                    )
+                    .await?;
             }
         }
         let [data, docsize] = shadow;
@@ -63189,7 +64891,8 @@ impl Connection {
                 rowid_alias_columns,
                 table_name,
                 args,
-            )?
+            )
+            .await?
             .into_iter()
             .map(|(rowid, values)| {
                 (
@@ -63210,10 +64913,10 @@ impl Connection {
     }
 
     #[cfg(feature = "ext-fts5")]
-    fn rebuild_rootpage_zero_live_vtab_instances_from_reload(
+    async fn rebuild_rootpage_zero_live_vtab_instances_from_reload(
         &self,
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         page_size: PageSize,
         reserved_per_page: u8,
         schema: &[TableSchema],
@@ -63317,39 +65020,46 @@ impl Connection {
                     table_name,
                     &create_stmt.args,
                     self.allow_lazy_contentless_fts5,
-                ) && self.read_fts5_lazy_has_segments(
-                    cx,
-                    txn,
-                    page_size,
-                    reserved_per_page,
-                    schema,
-                    table_name,
-                )? {
-                    let column_count = parse_virtual_table_column_infos(&create_stmt.args).len();
-                    let doc_count = self.read_fts5_lazy_doc_count(
+                ) && self
+                    .read_fts5_lazy_has_segments(
                         cx,
                         txn,
                         page_size,
                         reserved_per_page,
                         schema,
                         table_name,
-                        column_count,
-                    )?;
+                    )
+                    .await?
+                {
+                    let column_count = parse_virtual_table_column_infos(&create_stmt.args).len();
+                    let doc_count = self
+                        .read_fts5_lazy_doc_count(
+                            cx,
+                            txn,
+                            page_size,
+                            reserved_per_page,
+                            schema,
+                            table_name,
+                            column_count,
+                        )
+                        .await?;
                     fts5.mark_lazy_on_disk(doc_count);
                     reloaded.insert(table_key, instance);
                     continue;
                 }
 
-                let rows = self.read_fts5_shadow_rows_for_reload(
-                    cx,
-                    txn,
-                    page_size,
-                    reserved_per_page,
-                    schema,
-                    rowid_alias_columns,
-                    table_name,
-                    &create_stmt.args,
-                )?;
+                let rows = self
+                    .read_fts5_shadow_rows_for_reload(
+                        cx,
+                        txn,
+                        page_size,
+                        reserved_per_page,
+                        schema,
+                        rowid_alias_columns,
+                        table_name,
+                        &create_stmt.args,
+                    )
+                    .await?;
                 fts5.apply_shadow_rows(&rows)?;
                 reloaded.insert(table_key, instance);
                 continue;
@@ -63366,10 +65076,10 @@ impl Connection {
     }
 
     #[cfg(not(feature = "ext-fts5"))]
-    fn rebuild_rootpage_zero_live_vtab_instances_from_reload(
+    async fn rebuild_rootpage_zero_live_vtab_instances_from_reload(
         &self,
         _cx: &Cx,
-        _txn: &mut dyn TransactionHandle,
+        _txn: &mut TransactionKind,
         _page_size: PageSize,
         _reserved_per_page: u8,
         _schema: &[TableSchema],
@@ -63381,10 +65091,10 @@ impl Connection {
         Ok(HashMap::new())
     }
 
-    fn rebuild_materialized_live_vtab_instances_from_reload(
+    async fn rebuild_materialized_live_vtab_instances_from_reload(
         &self,
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &mut TransactionKind,
         page_size: PageSize,
         reserved_per_page: u8,
         schema: &[TableSchema],
@@ -63489,14 +65199,16 @@ impl Connection {
                             "schema reload lost materialized virtual table metadata for {table_name}"
                         ))
                     })?;
-                let rows = self.read_storage_table_rows_for_reload(
-                    cx,
-                    txn,
-                    page_size,
-                    reserved_per_page,
-                    table,
-                    rowid_alias_columns,
-                )?;
+                let rows = self
+                    .read_storage_table_rows_for_reload(
+                        cx,
+                        txn,
+                        page_size,
+                        reserved_per_page,
+                        table,
+                        rowid_alias_columns,
+                    )
+                    .await?;
                 #[cfg(feature = "ext-fts5")]
                 if let Some(fts5) = instance.as_any_mut().downcast_mut::<Fts5Table>() {
                     let documents = rows
@@ -63530,14 +65242,18 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn reload_memdb_from_txn_with_mode(
-        &self,
-        cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+    // Row hydration can evaluate column DEFAULTs, which re-enters statement
+    // execution and can reach this reload again, so the future is boxed to break
+    // the recursive type.
+    fn reload_memdb_from_txn_with_mode<'a>(
+        &'a self,
+        cx: &'a Cx,
+        txn: &'a mut TransactionKind,
         bound_visible_commit_seq: CommitSeq,
         hydrate_rows: bool,
         allow_dirty_schema_only_fast_path: bool,
-    ) -> Result<()> {
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        Box::pin(async move {
         // bd-xvv8f: one-shot request (consumed here regardless of path) to take
         // the full sqlite_master rebuild below instead of the schema-only fast
         // path. Set on autocommit DDL rollback recovery, where the
@@ -63548,7 +65264,7 @@ impl Connection {
             self.discard_cached_vdbe_engine();
         }
         // Check if the database is empty (page 1 uninitialized).
-        let page1 = txn.get_page(cx, PageNumber::ONE)?;
+        let page1 = txn.get_page(cx, PageNumber::ONE).await?;
         let page1_bytes = page1.as_ref();
 
         // If page 1 is all zeros or doesn't have a valid B-tree header, the
@@ -63662,8 +65378,9 @@ impl Connection {
             // Match the Lightweight refresh path in
             // `try_refresh_prepared_metadata_if_stale` and refresh the cache
             // here when we have any autoincrement tables to track.
-            if !self.autoincrement_tables.borrow().is_empty() {
-                let cache = self.read_sqlite_sequence_cache_in_txn(cx, txn)?;
+            let has_autoincrement_tables = !self.autoincrement_tables.borrow().is_empty();
+            if has_autoincrement_tables {
+                let cache = self.read_sqlite_sequence_cache_in_txn(cx, txn).await?;
                 *self.sqlite_sequence_cache.borrow_mut() = cache;
             }
             // bd-#70 wedge extension: raise the finalized commit clock floor
@@ -63707,9 +65424,9 @@ impl Connection {
             let mut cursor =
                 Self::new_header_btree_cursor(txn, master_root, page_size, reserved_per_page, true);
 
-            if cursor.first(cx)? {
+            if cursor.first(cx).await? {
                 loop {
-                    let (rowid, payload) = cursor.rowid_and_payload_cow(cx)?;
+                    let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
                     max_rowid = max_rowid.max(rowid);
                     let values = parse_record(payload.as_ref()).ok_or_else(|| {
                         FrankenError::DatabaseCorrupt {
@@ -63719,7 +65436,7 @@ impl Connection {
                         }
                     })?;
                     entries.push(values);
-                    if !cursor.next(cx)? {
+                    if !cursor.next(cx).await? {
                         break;
                     }
                 }
@@ -64179,11 +65896,11 @@ impl Connection {
                     !without_rowid,
                 );
 
-                if cursor.first(cx)? {
+                if cursor.first(cx).await? {
                     if without_rowid {
                         let mut synthetic_rowid = 1_i64;
                         loop {
-                            let payload = cursor.payload(cx)?;
+                            let payload = cursor.payload(cx).await?;
                             let values = parse_record(&payload).ok_or_else(|| {
                                 FrankenError::DatabaseCorrupt {
                                     detail: format!(
@@ -64197,25 +65914,27 @@ impl Connection {
                                         "schema reload lost table metadata for `{name}`"
                                     ))
                                 })?;
-                                let values = self.inflate_table_row_values_for_storage_reload(
-                                    tbl_schema,
-                                    synthetic_rowid,
-                                    &values,
-                                    None,
-                                )?;
+                                let values = self
+                                    .inflate_table_row_values_for_storage_reload(
+                                        tbl_schema,
+                                        synthetic_rowid,
+                                        &values,
+                                        None,
+                                    )
+                                    .await?;
                                 if let Some(mem_table) = new_db.tables.get_mut(&real_root_page) {
                                     mem_table.insert_row(synthetic_rowid, values);
                                 }
                             }
                             synthetic_rowid = synthetic_rowid.saturating_add(1);
-                            if !cursor.next(cx)? {
+                            if !cursor.next(cx).await? {
                                 break;
                             }
                         }
                         continue;
                     }
                     loop {
-                        let (rowid, payload) = cursor.rowid_and_payload_cow(cx)?;
+                        let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
                         let mut values = parse_record(payload.as_ref()).ok_or_else(|| {
                             FrankenError::DatabaseCorrupt {
                                 detail: format!(
@@ -64236,17 +65955,19 @@ impl Connection {
                                     "schema reload lost table metadata for `{name}`"
                                 ))
                             })?;
-                            values = self.inflate_table_row_values_for_storage_reload(
-                                tbl_schema,
-                                rowid,
-                                &values,
-                                ipk_col_idx,
-                            )?;
+                            values = self
+                                .inflate_table_row_values_for_storage_reload(
+                                    tbl_schema,
+                                    rowid,
+                                    &values,
+                                    ipk_col_idx,
+                                )
+                                .await?;
                             if let Some(mem_table) = new_db.tables.get_mut(&real_root_page) {
                                 mem_table.insert_row(rowid, values);
                             }
                         }
-                        if !cursor.next(cx)? {
+                        if !cursor.next(cx).await? {
                             break;
                         }
                     }
@@ -64307,16 +66028,18 @@ impl Connection {
         let reloaded_live_vtabs = if self.transactional_live_vtab_registry_active() {
             None
         } else {
-            let mut reloaded = self.rebuild_materialized_live_vtab_instances_from_reload(
-                cx,
-                txn,
-                page_size,
-                reserved_per_page,
-                &new_schema,
-                &new_alias_map,
-                &pending_materialized_live_vtabs,
-                preserve_existing_live_vtabs,
-            )?;
+            let mut reloaded = self
+                .rebuild_materialized_live_vtab_instances_from_reload(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    &new_schema,
+                    &new_alias_map,
+                    &pending_materialized_live_vtabs,
+                    preserve_existing_live_vtabs,
+                )
+                .await?;
             let rootpage_zero_live_vtabs = self
                 .rebuild_rootpage_zero_live_vtab_instances_from_reload(
                     cx,
@@ -64327,7 +66050,8 @@ impl Connection {
                     &new_alias_map,
                     &pending_rootpage_zero_virtual_tables,
                     preserve_existing_live_vtabs,
-                )?;
+                )
+                .await?;
             reloaded.extend(rootpage_zero_live_vtabs);
             Some(reloaded)
         };
@@ -64495,23 +66219,35 @@ impl Connection {
         self.pending_local_live_vtab_preserve_once.set(false);
 
         Ok(())
+        })
     }
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        // Shutdown I/O (transaction rollback/commit, WAL checkpoint) is `async`
+        // in the asupersync storage stack, and `Drop::drop` cannot await. This
+        // crate deliberately never builds its own runtime (see AGENTS.md: the
+        // `Cx` always flows down from the consumer), so we must NOT block on a
+        // locally-constructed executor here just to finish teardown.
+        //
+        // Consequence: dropping a `Connection` without an explicit close leaves
+        // any still-open transaction unrolled-back and skips the passive
+        // checkpoint. Committed bytes remain durable in the WAL and the next
+        // open recovers them, but callers that care about prompt rollback and
+        // checkpointing MUST await one of:
+        //   * `Connection::close()` / `close_without_checkpoint()`
+        //   * `close_in_place()` / `close_without_checkpoint_in_place()`
+        //   * `close_best_effort_in_place()`
         if !*self.closed.get_mut() {
             tracing::warn!(
                 target: "fsqlite::runtime",
                 event = "drop_close",
                 db_path = %self.path,
-                msg = "Connection dropped without explicit close()"
+                msg = "Connection dropped without an awaited close(); \
+                       open transactions are not rolled back and no checkpoint runs"
             );
         }
-        // Drop is a best-effort cleanup path and cannot report checkpoint I/O
-        // errors. Keep committed bytes durable in WAL and leave forced
-        // checkpointing to explicit close()/PRAGMA callers.
-        let _ = self.close_internal(true, false);
     }
 }
 
@@ -68927,7 +70663,7 @@ fn source_matches_name(source: &TableOrSubquery, target: &QualifiedName) -> bool
 ///
 /// When `rewrite_in` is true, also eagerly evaluate `IN (SELECT ...)`
 /// into literal lists (needed for interpreted fallback paths).
-fn rewrite_in_select_core(
+async fn rewrite_in_select_core(
     core: &mut SelectCore,
     conn: &Connection,
     rewrite_in: bool,
@@ -68944,20 +70680,20 @@ fn rewrite_in_select_core(
     {
         for col in columns.iter_mut() {
             if let ResultColumn::Expr { expr, .. } = col {
-                rewrite_in_expr(expr, conn, rewrite_in, params)?;
+                rewrite_in_expr(expr, conn, rewrite_in, params).await?;
             }
         }
         if let Some(wh) = where_clause.as_mut() {
-            rewrite_in_expr(wh, conn, rewrite_in, params)?;
+            rewrite_in_expr(wh, conn, rewrite_in, params).await?;
         }
         for expr in group_by.iter_mut() {
-            rewrite_in_expr(expr, conn, rewrite_in, params)?;
+            rewrite_in_expr(expr, conn, rewrite_in, params).await?;
         }
         if let Some(hv) = having.as_mut() {
-            rewrite_in_expr(hv, conn, rewrite_in, params)?;
+            rewrite_in_expr(hv, conn, rewrite_in, params).await?;
         }
         for window in windows.iter_mut() {
-            rewrite_in_window_spec(&mut window.spec, conn, rewrite_in, params)?;
+            rewrite_in_window_spec(&mut window.spec, conn, rewrite_in, params).await?;
         }
     }
     Ok(())
@@ -73408,19 +75144,19 @@ fn substitute_outer_refs_in_table_or_subquery(
     }
 }
 
-fn rewrite_in_ordering_terms(
+async fn rewrite_in_ordering_terms(
     order_by: &mut [OrderingTerm],
     conn: &Connection,
     rewrite_in_subqueries: bool,
     params: Option<&[SqliteValue]>,
 ) -> Result<()> {
     for term in order_by {
-        rewrite_in_expr(&mut term.expr, conn, rewrite_in_subqueries, params)?;
+        rewrite_in_expr(&mut term.expr, conn, rewrite_in_subqueries, params).await?;
     }
     Ok(())
 }
 
-fn rewrite_in_frame_bound(
+async fn rewrite_in_frame_bound(
     bound: &mut FrameBound,
     conn: &Connection,
     rewrite_in_subqueries: bool,
@@ -73428,7 +75164,7 @@ fn rewrite_in_frame_bound(
 ) -> Result<()> {
     match bound {
         FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
-            rewrite_in_expr(expr, conn, rewrite_in_subqueries, params)
+            rewrite_in_expr(expr, conn, rewrite_in_subqueries, params).await
         }
         FrameBound::UnboundedPreceding
         | FrameBound::CurrentRow
@@ -73436,31 +75172,31 @@ fn rewrite_in_frame_bound(
     }
 }
 
-fn rewrite_in_frame_spec(
+async fn rewrite_in_frame_spec(
     frame: &mut FrameSpec,
     conn: &Connection,
     rewrite_in_subqueries: bool,
     params: Option<&[SqliteValue]>,
 ) -> Result<()> {
-    rewrite_in_frame_bound(&mut frame.start, conn, rewrite_in_subqueries, params)?;
+    rewrite_in_frame_bound(&mut frame.start, conn, rewrite_in_subqueries, params).await?;
     if let Some(end) = &mut frame.end {
-        rewrite_in_frame_bound(end, conn, rewrite_in_subqueries, params)?;
+        rewrite_in_frame_bound(end, conn, rewrite_in_subqueries, params).await?;
     }
     Ok(())
 }
 
-fn rewrite_in_window_spec(
+async fn rewrite_in_window_spec(
     window: &mut WindowSpec,
     conn: &Connection,
     rewrite_in_subqueries: bool,
     params: Option<&[SqliteValue]>,
 ) -> Result<()> {
     for expr in &mut window.partition_by {
-        rewrite_in_expr(expr, conn, rewrite_in_subqueries, params)?;
+        rewrite_in_expr(expr, conn, rewrite_in_subqueries, params).await?;
     }
-    rewrite_in_ordering_terms(&mut window.order_by, conn, rewrite_in_subqueries, params)?;
+    rewrite_in_ordering_terms(&mut window.order_by, conn, rewrite_in_subqueries, params).await?;
     if let Some(frame) = &mut window.frame {
-        rewrite_in_frame_spec(frame, conn, rewrite_in_subqueries, params)?;
+        rewrite_in_frame_spec(frame, conn, rewrite_in_subqueries, params).await?;
     }
     Ok(())
 }
@@ -73493,16 +75229,16 @@ fn in_table_name_to_select_statement(name: &QualifiedName) -> SelectStatement {
     }
 }
 
-fn rewrite_dml_in_expr(
+async fn rewrite_dml_in_expr(
     expr: &mut Expr,
     conn: &Connection,
     rewrite_in_subqueries: bool,
     params: Option<&[SqliteValue]>,
 ) -> Result<()> {
-    rewrite_in_expr(expr, conn, rewrite_in_subqueries, params)
+    rewrite_in_expr(expr, conn, rewrite_in_subqueries, params).await
 }
 
-fn rewrite_dml_result_columns(
+async fn rewrite_dml_result_columns(
     columns: &mut [ResultColumn],
     conn: &Connection,
     rewrite_in_subqueries: bool,
@@ -73510,30 +75246,30 @@ fn rewrite_dml_result_columns(
 ) -> Result<()> {
     for column in columns {
         if let ResultColumn::Expr { expr, .. } = column {
-            rewrite_dml_in_expr(expr, conn, rewrite_in_subqueries, params)?;
+            rewrite_dml_in_expr(expr, conn, rewrite_in_subqueries, params).await?;
         }
     }
     Ok(())
 }
 
-fn rewrite_dml_limit_clause(
+async fn rewrite_dml_limit_clause(
     limit: &mut LimitClause,
     conn: &Connection,
     rewrite_in_subqueries: bool,
     params: Option<&[SqliteValue]>,
 ) -> Result<()> {
-    rewrite_in_limit_clause(limit, conn, rewrite_in_subqueries, params)
+    rewrite_in_limit_clause(limit, conn, rewrite_in_subqueries, params).await
 }
 
-fn rewrite_in_limit_clause(
+async fn rewrite_in_limit_clause(
     limit: &mut LimitClause,
     conn: &Connection,
     rewrite_in_subqueries: bool,
     params: Option<&[SqliteValue]>,
 ) -> Result<()> {
-    rewrite_dml_in_expr(&mut limit.limit, conn, rewrite_in_subqueries, params)?;
+    rewrite_dml_in_expr(&mut limit.limit, conn, rewrite_in_subqueries, params).await?;
     if let Some(offset) = limit.offset.as_mut() {
-        rewrite_dml_in_expr(offset, conn, rewrite_in_subqueries, params)?;
+        rewrite_dml_in_expr(offset, conn, rewrite_in_subqueries, params).await?;
     }
     Ok(())
 }
@@ -73893,17 +75629,20 @@ fn rewrite_row_value_comparisons_in_select_core(core: &mut SelectCore) {
 /// GROUP BY, HAVING, windows, compounds, or WITH clauses) — simple
 /// ones are left intact for VDBE runtime probe scans.
 #[allow(clippy::too_many_lines)]
-fn rewrite_in_expr(
-    expr: &mut Expr,
-    conn: &Connection,
+// Recurses into sub-expressions, so it returns a boxed future rather than using
+// `async fn` sugar (a plain `async fn` cannot call itself without indirection).
+fn rewrite_in_expr<'a>(
+    expr: &'a mut Expr,
+    conn: &'a Connection,
     rewrite_in_subqueries: bool,
-    params: Option<&[SqliteValue]>,
-) -> Result<()> {
+    params: Option<&'a [SqliteValue]>,
+) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
     match expr {
         Expr::In {
             set, expr: inner, ..
         } => {
-            rewrite_in_expr(inner, conn, rewrite_in_subqueries, params)?;
+            rewrite_in_expr(inner, conn, rewrite_in_subqueries, params).await?;
             if let InSet::Table(name) = set {
                 *set = InSet::Subquery(Box::new(in_table_name_to_select_statement(name)));
             }
@@ -73926,7 +75665,9 @@ fn rewrite_in_expr(
                     // temporarily install mirrored temp tables keep supported
                     // IN subqueries intact so recursive rewrite-time dispatch
                     // does not lose those ephemeral relations.
-                    let rows = conn.execute_statement(&Statement::Select(*sub.clone()), params)?;
+                    let rows = conn
+            .execute_statement(&Statement::Select(*sub.clone()), params)
+            .await?;
                     // bd-7ccda: for a row-value LHS — `(a, b) IN (SELECT x, y …)`
                     // — build a tuple literal per row from ALL projected columns
                     // so the multi-column IN → OR expansion below can match. A
@@ -73951,7 +75692,7 @@ fn rewrite_in_expr(
             }
             if let InSet::List(exprs) = set {
                 for e in exprs.iter_mut() {
-                    rewrite_in_expr(e, conn, rewrite_in_subqueries, params)?;
+                    rewrite_in_expr(e, conn, rewrite_in_subqueries, params).await?;
                 }
             }
             // Rewrite multi-column IN: (a, b) IN ((1, 10), (3, 30))
@@ -74031,7 +75772,9 @@ fn rewrite_in_expr(
             if params.is_none() && select_contains_any_placeholder(subquery) {
                 return Ok(());
             }
-            let rows = conn.execute_statement(&Statement::Select(*subquery.clone()), params)?;
+            let rows = conn
+        .execute_statement(&Statement::Select(*subquery.clone()), params)
+        .await?;
             let exists = !rows.is_empty();
             let result = if *not { !exists } else { exists };
             *expr = Expr::Literal(Literal::Integer(i64::from(result)), *span);
@@ -74057,7 +75800,9 @@ fn rewrite_in_expr(
             if conn.select_result_column_count(sub, &[], &mut Vec::new()) != 1 {
                 return Ok(());
             }
-            let rows = conn.execute_statement(&Statement::Select(*sub.clone()), params)?;
+            let rows = conn
+            .execute_statement(&Statement::Select(*sub.clone()), params)
+            .await?;
             let val = rows
                 .into_iter()
                 .next()
@@ -74075,14 +75820,14 @@ fn rewrite_in_expr(
             );
         }
         Expr::BinaryOp { left, right, .. } => {
-            rewrite_in_expr(left, conn, rewrite_in_subqueries, params)?;
-            rewrite_in_expr(right, conn, rewrite_in_subqueries, params)?;
+            rewrite_in_expr(left, conn, rewrite_in_subqueries, params).await?;
+            rewrite_in_expr(right, conn, rewrite_in_subqueries, params).await?;
         }
         Expr::UnaryOp { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
         | Expr::Cast { expr: inner, .. }
         | Expr::Collate { expr: inner, .. } => {
-            rewrite_in_expr(inner, conn, rewrite_in_subqueries, params)?;
+            rewrite_in_expr(inner, conn, rewrite_in_subqueries, params).await?;
         }
         Expr::Between {
             expr: inner,
@@ -74090,9 +75835,9 @@ fn rewrite_in_expr(
             high,
             ..
         } => {
-            rewrite_in_expr(inner, conn, rewrite_in_subqueries, params)?;
-            rewrite_in_expr(low, conn, rewrite_in_subqueries, params)?;
-            rewrite_in_expr(high, conn, rewrite_in_subqueries, params)?;
+            rewrite_in_expr(inner, conn, rewrite_in_subqueries, params).await?;
+            rewrite_in_expr(low, conn, rewrite_in_subqueries, params).await?;
+            rewrite_in_expr(high, conn, rewrite_in_subqueries, params).await?;
         }
         Expr::Case {
             operand,
@@ -74101,14 +75846,14 @@ fn rewrite_in_expr(
             ..
         } => {
             if let Some(op) = operand.as_mut() {
-                rewrite_in_expr(op, conn, rewrite_in_subqueries, params)?;
+                rewrite_in_expr(op, conn, rewrite_in_subqueries, params).await?;
             }
             for (cond, then) in whens.iter_mut() {
-                rewrite_in_expr(cond, conn, rewrite_in_subqueries, params)?;
-                rewrite_in_expr(then, conn, rewrite_in_subqueries, params)?;
+                rewrite_in_expr(cond, conn, rewrite_in_subqueries, params).await?;
+                rewrite_in_expr(then, conn, rewrite_in_subqueries, params).await?;
             }
             if let Some(el) = else_expr.as_mut() {
-                rewrite_in_expr(el, conn, rewrite_in_subqueries, params)?;
+                rewrite_in_expr(el, conn, rewrite_in_subqueries, params).await?;
             }
         }
         Expr::FunctionCall {
@@ -74120,15 +75865,15 @@ fn rewrite_in_expr(
         } => {
             if let FunctionArgs::List(exprs) = args {
                 for e in exprs.iter_mut() {
-                    rewrite_in_expr(e, conn, rewrite_in_subqueries, params)?;
+                    rewrite_in_expr(e, conn, rewrite_in_subqueries, params).await?;
                 }
             }
-            rewrite_in_ordering_terms(order_by, conn, rewrite_in_subqueries, params)?;
+            rewrite_in_ordering_terms(order_by, conn, rewrite_in_subqueries, params).await?;
             if let Some(filter_expr) = filter.as_mut() {
-                rewrite_in_expr(filter_expr, conn, rewrite_in_subqueries, params)?;
+                rewrite_in_expr(filter_expr, conn, rewrite_in_subqueries, params).await?;
             }
             if let Some(window) = over.as_mut() {
-                rewrite_in_window_spec(window, conn, rewrite_in_subqueries, params)?;
+                rewrite_in_window_spec(window, conn, rewrite_in_subqueries, params).await?;
             }
         }
         Expr::Like {
@@ -74137,27 +75882,28 @@ fn rewrite_in_expr(
             escape,
             ..
         } => {
-            rewrite_in_expr(inner, conn, rewrite_in_subqueries, params)?;
-            rewrite_in_expr(pattern, conn, rewrite_in_subqueries, params)?;
+            rewrite_in_expr(inner, conn, rewrite_in_subqueries, params).await?;
+            rewrite_in_expr(pattern, conn, rewrite_in_subqueries, params).await?;
             if let Some(escape_expr) = escape.as_mut() {
-                rewrite_in_expr(escape_expr, conn, rewrite_in_subqueries, params)?;
+                rewrite_in_expr(escape_expr, conn, rewrite_in_subqueries, params).await?;
             }
         }
         Expr::JsonAccess {
             expr: inner, path, ..
         } => {
-            rewrite_in_expr(inner, conn, rewrite_in_subqueries, params)?;
-            rewrite_in_expr(path, conn, rewrite_in_subqueries, params)?;
+            rewrite_in_expr(inner, conn, rewrite_in_subqueries, params).await?;
+            rewrite_in_expr(path, conn, rewrite_in_subqueries, params).await?;
         }
         Expr::RowValue(values, _) => {
             for value in values.iter_mut() {
-                rewrite_in_expr(value, conn, rewrite_in_subqueries, params)?;
+                rewrite_in_expr(value, conn, rewrite_in_subqueries, params).await?;
             }
         }
         // Leaf nodes that contain no sub-expressions.
         _ => {}
     }
     Ok(())
+    })
 }
 
 /// Convert a `SqliteValue` into a synthetic `Expr::Literal`.
@@ -84783,7 +86529,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-fn execute_program_with_row_cap(
+async fn execute_program_with_row_cap(
     program: &VdbeProgram,
     params: Option<&[SqliteValue]>,
     func_registry: Option<&Arc<FunctionRegistry>>,
@@ -84806,9 +86552,11 @@ fn execute_program_with_row_cap(
     engine.set_max_collected_result_rows(max_collected_result_rows);
 
     let exec_outcome = if let Some(params) = params {
-        engine.execute_with_borrowed_bindings(program, Some(params))?
+        engine
+            .execute_with_borrowed_bindings(program, Some(params))
+            .await?
     } else {
-        engine.execute(program)?
+        engine.execute(program).await?
     };
 
     match exec_outcome {
@@ -84825,7 +86573,7 @@ fn execute_program_with_row_cap(
     }
 }
 
-fn execute_program_with_postprocess(
+async fn execute_program_with_postprocess(
     program: &VdbeProgram,
     params: Option<&[SqliteValue]>,
     func_registry: Option<&Arc<FunctionRegistry>>,
@@ -84844,10 +86592,11 @@ fn execute_program_with_postprocess(
         page_size,
         None,
     )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_program_with_postprocess_row_cap(
+async fn execute_program_with_postprocess_row_cap(
     program: &VdbeProgram,
     params: Option<&[SqliteValue]>,
     func_registry: Option<&Arc<FunctionRegistry>>,
@@ -84865,14 +86614,15 @@ fn execute_program_with_postprocess_row_cap(
         execution_cx,
         page_size,
         max_collected_result_rows,
-    )?;
+    )
+    .await?;
     if let Some(postprocess) = expression_postprocess {
         apply_expression_postprocess(&mut rows, postprocess)?;
     }
     Ok(rows)
 }
 
-fn execute_program_exactly_one_row_with_row_cap(
+async fn execute_program_exactly_one_row_with_row_cap(
     program: &VdbeProgram,
     params: Option<&[SqliteValue]>,
     func_registry: Option<&Arc<FunctionRegistry>>,
@@ -84895,9 +86645,11 @@ fn execute_program_exactly_one_row_with_row_cap(
     engine.set_max_collected_result_rows(max_collected_result_rows);
 
     let exec_outcome = if let Some(params) = params {
-        engine.execute_with_borrowed_bindings(program, Some(params))?
+        engine
+            .execute_with_borrowed_bindings(program, Some(params))
+            .await?
     } else {
-        engine.execute(program)?
+        engine.execute(program).await?
     };
 
     match exec_outcome {
@@ -84977,7 +86729,7 @@ thread_local! {
 }
 
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
-fn execute_table_program_with_db(
+async fn execute_table_program_with_db(
     program: &VdbeProgram,
     params: Option<&[SqliteValue]>,
     func_registry: &Arc<FunctionRegistry>,
@@ -85133,13 +86885,17 @@ fn execute_table_program_with_db(
                 };
                 (*handler)(&row)
             };
-            engine.execute_with_borrowed_bindings_and_row_handler(
-                program,
-                Some(params),
-                &mut bridge,
-            )
+            engine
+                .execute_with_borrowed_bindings_and_row_handler(
+                    program,
+                    Some(params),
+                    &mut bridge,
+                )
+                .await
         } else {
-            engine.execute_with_borrowed_bindings(program, Some(params))
+            engine
+                .execute_with_borrowed_bindings(program, Some(params))
+                .await
         }
     } else {
         if let Some(handler) = row_handler.as_mut() {
@@ -85150,9 +86906,11 @@ fn execute_table_program_with_db(
                 };
                 (*handler)(&row)
             };
-            engine.execute_with_borrowed_bindings_and_row_handler(program, None, &mut bridge)
+            engine
+                .execute_with_borrowed_bindings_and_row_handler(program, None, &mut bridge)
+                .await
         } else {
-            engine.execute(program)
+            engine.execute(program).await
         }
     };
     if let Some(export_started) = export_started {
@@ -85231,7 +86989,7 @@ fn execute_table_program_with_db(
 }
 
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
-fn execute_table_program_exactly_one_row_with_db(
+async fn execute_table_program_exactly_one_row_with_db(
     program: &VdbeProgram,
     params: Option<&[SqliteValue]>,
     func_registry: &Arc<FunctionRegistry>,
@@ -85355,9 +87113,11 @@ fn execute_table_program_exactly_one_row_with_db(
         tracing::enabled!(target: "fsqlite.trace_export", tracing::Level::DEBUG);
     let export_started = trace_export_enabled.then(fsqlite_types::sync_primitives::Instant::now);
     let exec_res = if let Some(params) = params {
-        engine.execute_with_borrowed_bindings(program, Some(params))
+        engine
+            .execute_with_borrowed_bindings(program, Some(params))
+            .await
     } else {
-        engine.execute(program)
+        engine.execute(program).await
     };
     if let Some(export_started) = export_started {
         let export_latency_us =
@@ -86008,7 +87768,7 @@ fn parse_lineage_query(value: &fsqlite_ast::PragmaValue) -> Result<LineageJoinSp
 }
 
 #[cfg(feature = "diagnostic-pragmas")]
-fn execute_simple_join_lineage_query(
+async fn execute_simple_join_lineage_query(
     conn: &Connection,
     spec: &LineageJoinSpec,
 ) -> Result<Vec<Row>> {
@@ -86025,7 +87785,7 @@ fn execute_simple_join_lineage_query(
         left_tbl = spec.left_table,
         right_tbl = spec.right_table
     );
-    conn.query(&sql)
+    conn.query(&sql).await
 }
 
 #[cfg(feature = "diagnostic-pragmas")]
@@ -86845,7 +88605,7 @@ fn should_ignore_actual_master_row_for_integrity(row: &[SqliteValue]) -> Result<
 #[allow(dead_code)] // wired into scan_live_fts5_rows in child bead .4
 struct Fts5LiveShadowReader<'a> {
     cx: &'a Cx,
-    txn: &'a mut dyn TransactionHandle,
+    txn: &'a mut TransactionKind,
     page_size: PageSize,
     reserved_per_page: u8,
     data_root: PageNumber,
@@ -86864,7 +88624,7 @@ impl<'a> Fts5LiveShadowReader<'a> {
     /// `None`, e.g. contentless tables have no `_content`).
     fn new(
         cx: &'a Cx,
-        txn: &'a mut dyn TransactionHandle,
+        txn: &'a mut TransactionKind,
         page_size: PageSize,
         reserved_per_page: u8,
         schema: &[TableSchema],
@@ -86906,7 +88666,7 @@ impl<'a> Fts5LiveShadowReader<'a> {
     #[allow(clippy::too_many_arguments)]
     fn with_roots(
         cx: &'a Cx,
-        txn: &'a mut dyn TransactionHandle,
+        txn: &'a mut TransactionKind,
         page_size: PageSize,
         reserved_per_page: u8,
         data_root: PageNumber,
@@ -86929,7 +88689,7 @@ impl<'a> Fts5LiveShadowReader<'a> {
     }
 
     /// Seek a rowid table and return the matched row's parsed record values.
-    fn read_table_record(
+    async fn read_table_record(
         &mut self,
         root: PageNumber,
         rowid: i64,
@@ -86941,10 +88701,10 @@ impl<'a> Fts5LiveShadowReader<'a> {
             self.reserved_per_page,
             true,
         );
-        if !cursor.table_move_to(self.cx, rowid)?.is_found() {
+        if !cursor.table_move_to(self.cx, rowid).await?.is_found() {
             return Ok(None);
         }
-        let payload = cursor.payload(self.cx)?;
+        let payload = cursor.payload(self.cx).await?;
         let values = parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
             detail: format!("fts5 shadow row {rowid} payload is not a valid SQLite record"),
         })?;
@@ -86954,10 +88714,10 @@ impl<'a> Fts5LiveShadowReader<'a> {
 
 #[cfg(feature = "ext-fts5")]
 impl Fts5OnDiskReader for Fts5LiveShadowReader<'_> {
-    fn read_data_block(&mut self, id: i64) -> Result<Option<Vec<u8>>> {
+    async fn read_data_block(&mut self, id: i64) -> Result<Option<Vec<u8>>> {
         // `_data(id INTEGER PRIMARY KEY, block BLOB)`: the block is the lone
         // stored BLOB (the rowid-alias `id` is not in the record payload).
-        let Some(values) = self.read_table_record(self.data_root, id)? else {
+        let Some(values) = self.read_table_record(self.data_root, id).await? else {
             return Ok(None);
         };
         Ok(values
@@ -86966,11 +88726,15 @@ impl Fts5OnDiskReader for Fts5LiveShadowReader<'_> {
             .find_map(|value| value.as_blob_bytes().map(<[u8]>::to_vec)))
     }
 
-    fn read_docsize(&mut self, rowid: i64, column_count: usize) -> Result<Option<Fts5DocsizeRow>> {
+    async fn read_docsize(
+        &mut self,
+        rowid: i64,
+        column_count: usize,
+    ) -> Result<Option<Fts5DocsizeRow>> {
         let Some(root) = self.docsize_root else {
             return Ok(None);
         };
-        let Some(values) = self.read_table_record(root, rowid)? else {
+        let Some(values) = self.read_table_record(root, rowid).await? else {
             return Ok(None);
         };
         let blob = values
@@ -86984,11 +88748,15 @@ impl Fts5OnDiskReader for Fts5LiveShadowReader<'_> {
         )))
     }
 
-    fn read_content(&mut self, rowid: i64, column_count: usize) -> Result<Option<Vec<String>>> {
+    async fn read_content(
+        &mut self,
+        rowid: i64,
+        column_count: usize,
+    ) -> Result<Option<Vec<String>>> {
         let Some(root) = self.content_root else {
             return Ok(None);
         };
-        let Some(values) = self.read_table_record(root, rowid)? else {
+        let Some(values) = self.read_table_record(root, rowid).await? else {
             return Ok(None);
         };
         // `_content(id INTEGER PRIMARY KEY, c0, c1, ...)`: the trailing
@@ -87000,7 +88768,7 @@ impl Fts5OnDiskReader for Fts5LiveShadowReader<'_> {
         ))
     }
 
-    fn idx_candidate_page(&mut self, segid: u32, term: &[u8]) -> Result<Option<u32>> {
+    async fn idx_candidate_page(&mut self, segid: u32, term: &[u8]) -> Result<Option<u32>> {
         let Some(root) = self.idx_root else {
             return Ok(None);
         };
@@ -87020,13 +88788,13 @@ impl Fts5OnDiskReader for Fts5LiveShadowReader<'_> {
             vec![None, None],
             Arc::clone(&self.collation_registry),
         );
-        cursor.index_move_to(self.cx, &probe)?;
+        cursor.index_move_to(self.cx, &probe).await?;
         // index_move_to lands at the smallest stored key >= probe (or EOF).
         // Decide whether the current row is already <= (segid, term); if not,
         // step back once to the largest key strictly below the probe.
         let mut positioned = !cursor.eof();
         if positioned {
-            let payload = cursor.payload(self.cx)?;
+            let payload = cursor.payload(self.cx).await?;
             let values = parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: "fts5 _idx payload is not a valid SQLite record".to_owned(),
             })?;
@@ -87037,15 +88805,15 @@ impl Fts5OnDiskReader for Fts5LiveShadowReader<'_> {
                 .unwrap_or(&[]);
             let cur_le = (cur_segid, cur_term) <= (i64::from(segid), term);
             if !cur_le {
-                positioned = cursor.prev(self.cx)?;
+                positioned = cursor.prev(self.cx).await?;
             }
         } else {
-            positioned = cursor.prev(self.cx)?;
+            positioned = cursor.prev(self.cx).await?;
         }
         if !positioned {
             return Ok(None);
         }
-        let payload = cursor.payload(self.cx)?;
+        let payload = cursor.payload(self.cx).await?;
         let values = parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
             detail: "fts5 _idx payload is not a valid SQLite record".to_owned(),
         })?;
@@ -95517,22 +97285,37 @@ mod tests {
 
     #[test]
     fn test_execute_join_select_scans_primary_named_table_without_live_vtab() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
-        conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        use asupersync::runtime::RuntimeBuilder;
 
-        let statement = conn
-            .cached_parse_single("SELECT a.x FROM t AS a JOIN t AS b ON a.x = b.x ORDER BY a.x;")
-            .unwrap();
-        let Statement::Select(select) = statement.as_ref() else {
-            panic!("expected SELECT statement");
-        };
+        let runtime = RuntimeBuilder::new()
+            .worker_threads(1)
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER)").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1), (2)")
+                .await
+                .unwrap();
 
-        let rows = conn.execute_join_select(select, None).unwrap();
-        assert_eq!(
-            rows.iter().map(row_values).collect::<Vec<_>>(),
-            vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(2)],],
-        );
+            let statement = conn
+                .cached_parse_single(
+                    "SELECT a.x FROM t AS a JOIN t AS b ON a.x = b.x ORDER BY a.x;",
+                )
+                .unwrap();
+            let Statement::Select(select) = statement.as_ref() else {
+                panic!("expected SELECT statement");
+            };
+
+            let rows = conn.execute_join_select(select, None).await.unwrap();
+            assert_eq!(
+                rows.iter().map(row_values).collect::<Vec<_>>(),
+                vec![
+                    vec![SqliteValue::Integer(1)],
+                    vec![SqliteValue::Integer(2)],
+                ],
+            );
+        });
     }
 
     #[test]
@@ -135695,97 +137478,79 @@ fts5(title, body, content=docs, content_rowid=id)'
     #[cfg(all(unix, feature = "ext-fts5"))]
     #[test]
     fn test_fts5_live_shadow_reader_reads_persisted_index() {
-        let _serial = super::fsqlite_core_test_serializer();
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("fts5_live_reader_fixture.db");
-        let db_str = db_path.to_string_lossy().into_owned();
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("fts5_live_reader_fixture.db");
+            let db_str = db_path.to_string_lossy().into_owned();
 
-        // Build a standard on-disk FTS5 index with stock SQLite. `optimize`
-        // flushes pending postings into on-disk segments so `_data`/`_idx`/
-        // `_docsize`/`_content` are all populated.
-        {
-            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
-            sqlite
-                .execute_batch(
-                    "CREATE VIRTUAL TABLE docs USING fts5(body);\n\
-                     INSERT INTO docs(rowid, body) VALUES (1, 'alpha rust beta');\n\
-                     INSERT INTO docs(rowid, body) VALUES (2, 'gamma rust delta');\n\
-                     INSERT INTO docs(docs) VALUES('optimize');",
-                )
-                .unwrap();
-            sqlite.close().unwrap();
-        }
+            // Build a standard on-disk FTS5 index with stock SQLite. `optimize`
+            // flushes pending postings into on-disk segments so `_data`/`_idx`/
+            // `_docsize`/`_content` are all populated.
+            {
+                let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+                sqlite
+                    .execute_batch(
+                        "CREATE VIRTUAL TABLE docs USING fts5(body);\n\
+                         INSERT INTO docs(rowid, body) VALUES (1, 'alpha rust beta');\n\
+                         INSERT INTO docs(rowid, body) VALUES (2, 'gamma rust delta');\n\
+                         INSERT INTO docs(docs) VALUES('optimize');",
+                    )
+                    .unwrap();
+                sqlite.close().unwrap();
+            }
 
-        let conn = Connection::open(&db_str).unwrap();
-        let root = |name: &str| -> Option<fsqlite_types::PageNumber> {
-            let rows = conn
-                .query(&format!(
-                    "SELECT rootpage FROM sqlite_master WHERE name = '{name}';"
-                ))
-                .ok()?;
-            let raw = rows.first()?.values().first()?.to_integer();
-            fsqlite_types::PageNumber::new(u32::try_from(raw).ok()?)
-        };
-        let data_root = root("docs_data").expect("docs_data rootpage");
-        let idx_root = root("docs_idx");
-        let docsize_root = root("docs_docsize");
-        let content_root = root("docs_content");
+            let conn = Connection::open(&db_str).unwrap();
+            conn.with_lazy_fts5_reader("docs", async |reader| {
+                // Special `_data` rows: id=1 averages, id=10 structure.
+                assert!(
+                    reader.read_data_block(1).await?.is_some(),
+                    "averages row (id=1)"
+                );
+                assert!(
+                    reader.read_data_block(10).await?.is_some(),
+                    "structure row (id=10)"
+                );
+                assert!(
+                    reader.read_data_block(123_456_789).await?.is_none(),
+                    "absent _data id -> None"
+                );
 
-        conn.with_integrity_txn(|cx, txn| {
-            let page1 = txn.get_page(cx, fsqlite_types::PageNumber::ONE)?;
-            let header = super::parse_database_header_checked(page1.as_ref())?;
-            let registry = std::sync::Arc::new(std::sync::Mutex::new(
-                fsqlite_func::collation::CollationRegistry::new(),
-            ));
-            let mut reader = super::Fts5LiveShadowReader::with_roots(
-                cx,
-                txn,
-                header.page_size,
-                header.reserved_per_page,
-                data_root,
-                idx_root,
-                docsize_root,
-                content_root,
-                registry,
-            );
+                // Content point reads for known rowids + absent -> None.
+                assert_eq!(
+                    reader
+                        .read_content(1, 1)
+                        .await?
+                        .expect("content for rowid 1"),
+                    vec!["alpha rust beta".to_owned()],
+                );
+                assert_eq!(
+                    reader
+                        .read_content(2, 1)
+                        .await?
+                        .expect("content for rowid 2"),
+                    vec!["gamma rust delta".to_owned()],
+                );
+                assert!(
+                    reader.read_content(9999, 1).await?.is_none(),
+                    "absent content rowid -> None"
+                );
 
-            // Special `_data` rows: id=1 averages, id=10 structure.
-            assert!(reader.read_data_block(1)?.is_some(), "averages row (id=1)");
-            assert!(
-                reader.read_data_block(10)?.is_some(),
-                "structure row (id=10)"
-            );
-            assert!(
-                reader.read_data_block(123_456_789)?.is_none(),
-                "absent _data id -> None"
-            );
+                // Docsize token counts (alpha rust beta = 3 tokens).
+                assert_eq!(
+                    reader
+                        .read_docsize(1, 1)
+                        .await?
+                        .expect("docsize for rowid 1")
+                        .total_tokens(),
+                    3,
+                );
 
-            // Content point reads for known rowids + absent -> None.
-            assert_eq!(
-                reader.read_content(1, 1)?.expect("content for rowid 1"),
-                vec!["alpha rust beta".to_owned()],
-            );
-            assert_eq!(
-                reader.read_content(2, 1)?.expect("content for rowid 2"),
-                vec!["gamma rust delta".to_owned()],
-            );
-            assert!(
-                reader.read_content(9999, 1)?.is_none(),
-                "absent content rowid -> None"
-            );
-
-            // Docsize token counts (alpha rust beta = 3 tokens).
-            assert_eq!(
-                reader
-                    .read_docsize(1, 1)?
-                    .expect("docsize for rowid 1")
-                    .total_tokens(),
-                3,
-            );
-
-            Ok(())
-        })
-        .unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        });
     }
 
     /// bd-fts5-lazy-shadow-reads-itcc4.2(a): the lazy on-disk segment scan
@@ -135795,80 +137560,65 @@ fts5(title, body, content=docs, content_rowid=id)'
     #[cfg(all(unix, feature = "ext-fts5"))]
     #[test]
     fn test_fts5_lazy_exact_doclist_entries_match_known_terms() {
-        let _serial = super::fsqlite_core_test_serializer();
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("fts5_lazy_doclist_fixture.db");
-        let db_str = db_path.to_string_lossy().into_owned();
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("fts5_lazy_doclist_fixture.db");
+            let db_str = db_path.to_string_lossy().into_owned();
 
-        {
-            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
-            sqlite
-                .execute_batch(
-                    "CREATE VIRTUAL TABLE docs USING fts5(body);\n\
-                     INSERT INTO docs(rowid, body) VALUES (1, 'alpha rust beta');\n\
-                     INSERT INTO docs(rowid, body) VALUES (2, 'gamma rust delta');\n\
-                     INSERT INTO docs(rowid, body) VALUES (3, 'epsilon zeta');\n\
-                     INSERT INTO docs(docs) VALUES('optimize');",
-                )
-                .unwrap();
-            sqlite.close().unwrap();
-        }
+            {
+                let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+                sqlite
+                    .execute_batch(
+                        "CREATE VIRTUAL TABLE docs USING fts5(body);\n\
+                         INSERT INTO docs(rowid, body) VALUES (1, 'alpha rust beta');\n\
+                         INSERT INTO docs(rowid, body) VALUES (2, 'gamma rust delta');\n\
+                         INSERT INTO docs(rowid, body) VALUES (3, 'epsilon zeta');\n\
+                         INSERT INTO docs(docs) VALUES('optimize');",
+                    )
+                    .unwrap();
+                sqlite.close().unwrap();
+            }
 
-        let conn = Connection::open(&db_str).unwrap();
-        let root = |name: &str| -> Option<fsqlite_types::PageNumber> {
-            let rows = conn
-                .query(&format!(
-                    "SELECT rootpage FROM sqlite_master WHERE name = '{name}';"
-                ))
-                .ok()?;
-            let raw = rows.first()?.values().first()?.to_integer();
-            fsqlite_types::PageNumber::new(u32::try_from(raw).ok()?)
-        };
-        let data_root = root("docs_data").expect("docs_data rootpage");
-        let idx_root = root("docs_idx");
-        let docsize_root = root("docs_docsize");
-        let content_root = root("docs_content");
+            let conn = Connection::open(&db_str).unwrap();
+            conn.with_lazy_fts5_reader("docs", async |reader| {
+                let structure_block = reader
+                    .read_data_block(10)
+                    .await?
+                    .expect("structure row (id=10)");
+                let structure =
+                    fsqlite_ext_fts5::Fts5StructureRecord::decode(&structure_block)?;
 
-        conn.with_integrity_txn(|cx, txn| {
-            let page1 = txn.get_page(cx, fsqlite_types::PageNumber::ONE)?;
-            let header = super::parse_database_header_checked(page1.as_ref())?;
-            let registry = std::sync::Arc::new(std::sync::Mutex::new(
-                fsqlite_func::collation::CollationRegistry::new(),
-            ));
-            let mut reader = super::Fts5LiveShadowReader::with_roots(
-                cx,
-                txn,
-                header.page_size,
-                header.reserved_per_page,
-                data_root,
-                idx_root,
-                docsize_root,
-                content_root,
-                registry,
-            );
-
-            let structure_block = reader.read_data_block(10)?.expect("structure row (id=10)");
-            let structure = fsqlite_ext_fts5::Fts5StructureRecord::decode(&structure_block)?;
-
-            let mut rowids = |term: &[u8]| -> Result<Vec<u64>> {
-                let mut ids: Vec<u64> =
-                    fsqlite_ext_fts5::lazy_exact_doclist_entries(&mut reader, &structure, term)?
+                for (term, expected, message) in [
+                    (b"rust".as_slice(), vec![1, 2], "'rust' is in docs 1 and 2"),
+                    (b"alpha".as_slice(), vec![1], "'alpha' only in doc 1"),
+                    (b"zeta".as_slice(), vec![3], "'zeta' only in doc 3"),
+                    (
+                        b"nonexistent".as_slice(),
+                        Vec::new(),
+                        "absent term -> no docs",
+                    ),
+                ] {
+                    let mut ids: Vec<u64> =
+                        fsqlite_ext_fts5::lazy_exact_doclist_entries(
+                            &mut *reader,
+                            &structure,
+                            term,
+                        )
+                        .await?
                         .into_iter()
                         .map(|entry| entry.rowid)
                         .collect();
-                ids.sort_unstable();
-                ids.dedup();
-                Ok(ids)
-            };
+                    ids.sort_unstable();
+                    ids.dedup();
+                    assert_eq!(ids, expected, "{message}");
+                }
 
-            assert_eq!(rowids(b"rust")?, vec![1, 2], "'rust' is in docs 1 and 2");
-            assert_eq!(rowids(b"alpha")?, vec![1], "'alpha' only in doc 1");
-            assert_eq!(rowids(b"zeta")?, vec![3], "'zeta' only in doc 3");
-            assert!(rowids(b"nonexistent")?.is_empty(), "absent term -> no docs");
-
-            Ok(())
-        })
-        .unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        });
     }
 
     /// bd-fts5-lazy-shadow-reads-itcc4.3: multi-segment recency parity. With
@@ -135881,140 +137631,117 @@ fts5(title, body, content=docs, content_rowid=id)'
     #[cfg(all(unix, feature = "ext-fts5"))]
     #[test]
     fn test_fts5_lazy_query_matches_stock_after_multisegment_delete_update() {
-        let _serial = super::fsqlite_core_test_serializer();
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("fts5_multiseg_recency.db");
-        let db_str = db_path.to_string_lossy().into_owned();
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("fts5_multiseg_recency.db");
+            let db_str = db_path.to_string_lossy().into_owned();
 
-        {
-            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
-            sqlite
-                .execute_batch("CREATE VIRTUAL TABLE docs USING fts5(body);")
-                .unwrap();
-            // Separate autocommit statements => separate level-0 segments.
-            for (rowid, body) in [
-                (1_i64, "rust alpha"),
-                (2, "rust beta"),
-                (3, "rust gamma"),
-                (4, "rust delta"),
-                (5, "zeta only"),
-            ] {
+            {
+                let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+                sqlite
+                    .execute_batch("CREATE VIRTUAL TABLE docs USING fts5(body);")
+                    .unwrap();
+                // Separate autocommit statements => separate level-0 segments.
+                for (rowid, body) in [
+                    (1_i64, "rust alpha"),
+                    (2, "rust beta"),
+                    (3, "rust gamma"),
+                    (4, "rust delta"),
+                    (5, "zeta only"),
+                ] {
+                    sqlite
+                        .execute(
+                            "INSERT INTO docs(rowid, body) VALUES (?1, ?2)",
+                            rusqlite::params![rowid, body],
+                        )
+                        .unwrap();
+                }
+                // doc 2 deleted; doc 3 updated so it no longer contains `rust`/`gamma`.
+                sqlite
+                    .execute("DELETE FROM docs WHERE rowid = 2", [])
+                    .unwrap();
                 sqlite
                     .execute(
-                        "INSERT INTO docs(rowid, body) VALUES (?1, ?2)",
-                        rusqlite::params![rowid, body],
+                        "UPDATE docs SET body = 'replaced epsilon' WHERE rowid = 3",
+                        [],
                     )
                     .unwrap();
+                sqlite.close().unwrap();
             }
-            // doc 2 deleted; doc 3 updated so it no longer contains `rust`/`gamma`.
-            sqlite
-                .execute("DELETE FROM docs WHERE rowid = 2", [])
-                .unwrap();
-            sqlite
-                .execute(
-                    "UPDATE docs SET body = 'replaced epsilon' WHERE rowid = 3",
-                    [],
+
+            let queries: &[&str] = &[
+                "rust",            // 1, 4 (2 deleted, 3 updated away)
+                "alpha",           // 1
+                "beta",            // none (2 deleted)
+                "gamma",           // none (3 updated away)
+                "replaced",        // 3 (new content)
+                "epsilon",         // 3
+                "zeta",            // 5
+                "rust*",           // 1, 4
+                "rust OR epsilon", // 1, 3, 4
+            ];
+
+            let stock: Vec<(String, Vec<i64>)> = {
+                let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+                let captured = queries
+                    .iter()
+                    .map(|query| {
+                        let mut stmt = sqlite
+                            .prepare("SELECT rowid FROM docs WHERE docs MATCH ?1 ORDER BY rowid")
+                            .unwrap();
+                        let ids: Vec<i64> = stmt
+                            .query_map(rusqlite::params![query], |row| row.get::<_, i64>(0))
+                            .unwrap()
+                            .map(std::result::Result::unwrap)
+                            .collect();
+                        ((*query).to_owned(), ids)
+                    })
+                    .collect();
+                sqlite.close().unwrap();
+                captured
+            };
+
+            let conn = Connection::open(&db_str).unwrap();
+            conn.with_lazy_fts5_reader("docs", async |reader| {
+                let columns = vec!["body".to_owned()];
+                let tokenizer = fsqlite_ext_fts5::create_tokenizer("unicode61")
+                    .expect("unicode61 tokenizer available");
+                let weights = vec![1.0_f64; columns.len()];
+                let mut query = fsqlite_ext_fts5::Fts5LazyQuery::new(
+                    &mut *reader,
+                    &columns,
+                    tokenizer.as_ref(),
+                    fsqlite_ext_fts5::DetailMode::Full,
                 )
-                .unwrap();
-            sqlite.close().unwrap();
-        }
+                .await
+                .expect("build lazy query");
 
-        let queries: &[&str] = &[
-            "rust",            // 1, 4 (2 deleted, 3 updated away)
-            "alpha",           // 1
-            "beta",            // none (2 deleted)
-            "gamma",           // none (3 updated away)
-            "replaced",        // 3 (new content)
-            "epsilon",         // 3
-            "zeta",            // 5
-            "rust*",           // 1, 4
-            "rust OR epsilon", // 1, 3, 4
-        ];
+                for (q, expected_ids) in &stock {
+                    let ranked = query
+                        .search_queries_with_weights(&[q.as_str()], &weights)
+                        .await
+                        .map_err(|e| {
+                            FrankenError::function_error(format!("lazy query `{q}`: {e}"))
+                        })?;
+                    let mut lazy_ids: Vec<i64> =
+                        ranked.iter().map(|(rowid, _)| *rowid).collect();
+                    lazy_ids.sort_unstable();
+                    lazy_ids.dedup();
+                    let mut want = expected_ids.clone();
+                    want.sort_unstable();
+                    want.dedup();
+                    assert_eq!(
+                        lazy_ids, want,
+                        "multi-segment recency: lazy MATCH `{q}` must equal stock (lazy={lazy_ids:?}, stock={want:?})"
+                    );
+                }
 
-        let stock: Vec<(String, Vec<i64>)> = {
-            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
-            let captured = queries
-                .iter()
-                .map(|query| {
-                    let mut stmt = sqlite
-                        .prepare("SELECT rowid FROM docs WHERE docs MATCH ?1 ORDER BY rowid")
-                        .unwrap();
-                    let ids: Vec<i64> = stmt
-                        .query_map(rusqlite::params![query], |row| row.get::<_, i64>(0))
-                        .unwrap()
-                        .map(std::result::Result::unwrap)
-                        .collect();
-                    ((*query).to_owned(), ids)
-                })
-                .collect();
-            sqlite.close().unwrap();
-            captured
-        };
-
-        let conn = Connection::open(&db_str).unwrap();
-        let root = |name: &str| -> Option<fsqlite_types::PageNumber> {
-            let rows = conn
-                .query(&format!(
-                    "SELECT rootpage FROM sqlite_master WHERE name = '{name}';"
-                ))
-                .ok()?;
-            let raw = rows.first()?.values().first()?.to_integer();
-            fsqlite_types::PageNumber::new(u32::try_from(raw).ok()?)
-        };
-        let data_root = root("docs_data").expect("docs_data rootpage");
-        let idx_root = root("docs_idx");
-        let docsize_root = root("docs_docsize");
-        let content_root = root("docs_content");
-
-        conn.with_integrity_txn(|cx, txn| {
-            let page1 = txn.get_page(cx, fsqlite_types::PageNumber::ONE)?;
-            let header = super::parse_database_header_checked(page1.as_ref())?;
-            let registry = std::sync::Arc::new(std::sync::Mutex::new(
-                fsqlite_func::collation::CollationRegistry::new(),
-            ));
-            let mut reader = super::Fts5LiveShadowReader::with_roots(
-                cx,
-                txn,
-                header.page_size,
-                header.reserved_per_page,
-                data_root,
-                idx_root,
-                docsize_root,
-                content_root,
-                registry,
-            );
-
-            let columns = vec!["body".to_owned()];
-            let tokenizer = fsqlite_ext_fts5::create_tokenizer("unicode61")
-                .expect("unicode61 tokenizer available");
-            let weights = vec![1.0_f64; columns.len()];
-            let query = fsqlite_ext_fts5::Fts5LazyQuery::new(
-                &mut reader,
-                &columns,
-                tokenizer.as_ref(),
-                fsqlite_ext_fts5::DetailMode::Full,
-            )
-            .expect("build lazy query");
-
-            for (q, expected_ids) in &stock {
-                let ranked = query
-                    .search_queries_with_weights(&[q.as_str()], &weights)
-                    .map_err(|e| FrankenError::function_error(format!("lazy query `{q}`: {e}")))?;
-                let mut lazy_ids: Vec<i64> = ranked.iter().map(|(rowid, _)| *rowid).collect();
-                lazy_ids.sort_unstable();
-                lazy_ids.dedup();
-                let mut want = expected_ids.clone();
-                want.sort_unstable();
-                want.dedup();
-                assert_eq!(
-                    lazy_ids, want,
-                    "multi-segment recency: lazy MATCH `{q}` must equal stock (lazy={lazy_ids:?}, stock={want:?})"
-                );
-            }
-
-            Ok(())
-        })
-        .unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        });
     }
 
     /// bd-fts5-lazy-shadow-reads-itcc4.2(c): differential parity of the lazy
@@ -136029,10 +137756,11 @@ fts5(title, body, content=docs, content_rowid=id)'
     #[cfg(all(unix, feature = "ext-fts5"))]
     #[test]
     fn test_fts5_lazy_query_matches_stock_sqlite_across_operator_matrix() {
-        let _serial = super::fsqlite_core_test_serializer();
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("fts5_lazy_diffparity_fixture.db");
-        let db_str = db_path.to_string_lossy().into_owned();
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("fts5_lazy_diffparity_fixture.db");
+            let db_str = db_path.to_string_lossy().into_owned();
 
         // Two indexed columns so column filters are discriminating. `rust`
         // appears in different columns and with different term frequencies so
@@ -136107,48 +137835,18 @@ fts5(title, body, content=docs, content_rowid=id)'
         };
 
         let conn = Connection::open(&db_str).unwrap();
-        let root = |name: &str| -> Option<fsqlite_types::PageNumber> {
-            let rows = conn
-                .query(&format!(
-                    "SELECT rootpage FROM sqlite_master WHERE name = '{name}';"
-                ))
-                .ok()?;
-            let raw = rows.first()?.values().first()?.to_integer();
-            fsqlite_types::PageNumber::new(u32::try_from(raw).ok()?)
-        };
-        let data_root = root("docs_data").expect("docs_data rootpage");
-        let idx_root = root("docs_idx");
-        let docsize_root = root("docs_docsize");
-        let content_root = root("docs_content");
-
-        conn.with_integrity_txn(|cx, txn| {
-            let page1 = txn.get_page(cx, fsqlite_types::PageNumber::ONE)?;
-            let header = super::parse_database_header_checked(page1.as_ref())?;
-            let registry = std::sync::Arc::new(std::sync::Mutex::new(
-                fsqlite_func::collation::CollationRegistry::new(),
-            ));
-            let mut reader = super::Fts5LiveShadowReader::with_roots(
-                cx,
-                txn,
-                header.page_size,
-                header.reserved_per_page,
-                data_root,
-                idx_root,
-                docsize_root,
-                content_root,
-                registry,
-            );
-
+        conn.with_lazy_fts5_reader("docs", async |reader| {
             let columns = vec!["title".to_owned(), "body".to_owned()];
             let tokenizer = fsqlite_ext_fts5::create_tokenizer("unicode61")
                 .expect("unicode61 tokenizer available");
             let weights = vec![1.0_f64; columns.len()];
-            let query = fsqlite_ext_fts5::Fts5LazyQuery::new(
-                &mut reader,
+            let mut query = fsqlite_ext_fts5::Fts5LazyQuery::new(
+                &mut *reader,
                 &columns,
                 tokenizer.as_ref(),
                 fsqlite_ext_fts5::DetailMode::Full,
             )
+            .await
             .expect("build lazy query");
 
             let sorted = |mut ids: Vec<i64>| -> Vec<i64> {
@@ -136160,6 +137858,7 @@ fts5(title, body, content=docs, content_rowid=id)'
             for (q, expected_ids) in &stock {
                 let ranked = query
                     .search_queries_with_weights(&[q.as_str()], &weights)
+                    .await
                     .map_err(|e| FrankenError::function_error(format!("lazy query `{q}`: {e}")))?;
                 let lazy_ids: Vec<i64> = ranked.iter().map(|(rowid, _score)| *rowid).collect();
 
@@ -136188,7 +137887,9 @@ fts5(title, body, content=docs, content_rowid=id)'
 
             Ok(())
         })
+        .await
         .unwrap();
+        });
     }
 
     /// Regression for meta_skill#113 ("`ms search` broken — `skills_fts`

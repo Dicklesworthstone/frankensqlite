@@ -163,13 +163,13 @@ fn validate_open_flags(flags: OpenFlags) -> Result<(), FrankenError> {
     Ok(())
 }
 
-fn open_read_only_connection(path: &str) -> Result<Connection, FrankenError> {
+async fn open_read_only_connection(path: &str) -> Result<Connection, FrankenError> {
     if path == ":memory:" {
         return Err(FrankenError::NotImplemented(
             "read-only :memory: connections are not supported".to_owned(),
         ));
     }
-    Connection::open_schema_only(path)
+    Connection::open_schema_only(path).await
 }
 
 impl std::ops::BitOr for OpenFlags {
@@ -196,17 +196,17 @@ impl std::ops::BitOr for OpenFlags {
 ///
 /// let conn = open_with_flags("my.db", OpenFlags::SQLITE_OPEN_READ_ONLY)?;
 /// ```
-pub fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, FrankenError> {
+pub async fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, FrankenError> {
     match classify_access_mode(flags)? {
-        OpenDisposition::ReadOnly => open_read_only_connection(path),
+        OpenDisposition::ReadOnly => open_read_only_connection(path).await,
         OpenDisposition::WriteExisting => {
             if path == ":memory:" {
-                Connection::open(path)
+                Connection::open(path).await
             } else {
-                Connection::open_existing(path)
+                Connection::open_existing(path).await
             }
         }
-        OpenDisposition::WriteCreate => Connection::open(path),
+        OpenDisposition::WriteCreate => Connection::open(path).await,
     }
 }
 

@@ -2,6 +2,7 @@
 mod tests {
     use crate::ProgramBuilder;
     use crate::engine::{ExecOutcome, MemDatabase, VdbeEngine};
+    use asupersync::runtime::RuntimeBuilder;
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::SqliteValue;
 
@@ -46,7 +47,13 @@ mod tests {
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
 
-        let outcome = engine.execute(&program).expect("program executes");
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("delete-skip repro runtime should build");
+        let outcome = runtime
+            .block_on(engine.execute(&program))
+            .expect("program executes");
         assert!(matches!(outcome, ExecOutcome::Done));
 
         let visited: Vec<i64> = engine

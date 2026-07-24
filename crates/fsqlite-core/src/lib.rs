@@ -4,6 +4,12 @@
 //! It is intentionally non-blocking: overflow is rejected with `SQLITE_BUSY`
 //! (`FrankenError::Busy`) instead of queue-and-wait semantics.
 
+// `connection.rs` composes deeply nested `async fn` futures (statement dispatch
+// → DML → triggers → nested statement execution), and each layer widens the
+// generated future type. The default limit overflows while type-checking that
+// chain.
+#![recursion_limit = "512"]
+
 pub mod attach;
 pub mod commit_marker;
 #[cfg(not(target_arch = "wasm32"))]

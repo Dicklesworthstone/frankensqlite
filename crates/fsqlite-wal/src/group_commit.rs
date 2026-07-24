@@ -1553,8 +1553,8 @@ impl GroupCommitConsolidator {
     ///
     /// # Errors
     ///
-    /// Returns `Err` unless a non-empty filling epoch is active.
-    pub fn abort_filling(&mut self) -> Result<u64> {
+    /// Returns `Err` unless the expected non-empty filling epoch is active.
+    pub fn abort_filling(&mut self, expected_epoch: u64) -> Result<u64> {
         if self.phase != ConsolidationPhase::Filling || self.pending_batches.is_empty() {
             return Err(FrankenError::Internal(format!(
                 "abort_filling called in {:?} phase with {} pending batches",
@@ -1567,6 +1567,11 @@ impl GroupCommitConsolidator {
             .epoch
             .checked_add(1)
             .ok_or(FrankenError::DatabaseFull)?;
+        if failed_epoch != expected_epoch {
+            return Err(FrankenError::Internal(format!(
+                "abort_filling expected epoch {expected_epoch}, but active filling epoch targets {failed_epoch}"
+            )));
+        }
         self.epoch = failed_epoch;
         self.pending_batches.clear();
         self.pending_frame_count = 0;
@@ -1836,7 +1841,7 @@ mod tests {
             );
         }
 
-        assert_eq!(c.abort_filling().unwrap(), 1);
+        assert_eq!(c.abort_filling(1).unwrap(), 1);
         assert_eq!(c.phase(), ConsolidationPhase::Complete);
         assert_eq!(c.epoch(), 1);
         assert_eq!(c.pending_batch_count(), 0);
@@ -1854,6 +1859,31 @@ mod tests {
             replacement.target_epoch, 2,
             "a retained failure for epoch 1 must not poison the next group"
         );
+    }
+
+    #[test]
+    fn test_consolidator_cancelled_filling_obligation_cannot_consume_newer_epoch() {
+        let mut c = GroupCommitConsolidator::new(GroupCommitConfig::default());
+        let receipt = c
+            .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 1,
+                page_data: sample_page(0x01),
+                db_size_if_commit: 1,
+            }]))
+            .unwrap();
+        assert_eq!(receipt.target_epoch, 1);
+
+        let error = c
+            .abort_filling(2)
+            .expect_err("a stale obligation must not consume the active filling epoch");
+        assert!(
+            error.to_string().contains("expected epoch 2"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(c.phase(), ConsolidationPhase::Filling);
+        assert_eq!(c.epoch(), 0);
+        assert_eq!(c.pending_batch_count(), 1);
+        assert_eq!(c.pending_frame_count(), 1);
     }
 
     #[test]
