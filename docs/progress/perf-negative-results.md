@@ -20254,3 +20254,30 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   and CVs >5%; reducing it crosses into the security-sensitive MVCC/identity-probe lane (commit
   1136c171). Retry predicate unmet (needs a same-worker improvement signal on a quiet host). Frontier
   stays REJECT-gated; the architectural skip-scan lane carried this cycle.
+
+## 2026-07-24 - BLOCKER (frontier, sole-producer confirm): every comprehensive-bench loser is WRITE-side + host too noisy for a KEEP-quality A/B
+
+- Analyzed the refreshed `cod-fullquick-refresh-20260724T0030Z/full-quick.json` (93 scenarios).
+  ALL 10 scenarios where FrankenSQLite is slower than C SQLite (`ratio_fsqlite_over_csqlite > 1.12`)
+  are WRITE-side; there are ZERO read/query losers — FrankenSQLite BEATS C SQLite on every SELECT
+  workload (the skip-scan / read lane is won, not a frontier):
+  * write_single (DELETE/UPDATE): delete-5/100 3.36x, delete-50/1000 2.00x, delete-500/10000 1.80x,
+    update-10/100 1.44x, update-100/1000 1.35x.
+  * write_bulk (INSERT): large-10col 1000-row 1.50x, large-10col 10000-row 1.29x, small-3col batched
+    1.27x, small-3col autocommit 1.18x, tiny-1col 100-row 1.15x.
+- ROOT SHAPE: two write costs. (a) small-N DELETE/UPDATE — dominated by MVCC per-transaction
+  begin_ns+commit_roundtrip_ns (~42%, cod's 2026-07-24 REJECT); (b) single-transaction BULK INSERT
+  (large-10col) — per-ROW cost (record encode / index insert / MVCC version), transaction overhead
+  amortized. (b) is the more addressable shape (not transaction-control), but see the gate below.
+- BLOCKER: EVERY loser's fsqlite CV exceeds 5% (7.0% / 18.3% / 12.9% / 18.2% / 47.1% / 4.3%* / 12.3% /
+  13.7% / 22.7% / 11.6%) — so no lever here can pass the KEEP-quality gate (same-worker A/B, CV<5%,
+  null-control) on the current shared remote host, which is under load (a `ld` signal-7 Bus error hit
+  this cycle, [[rch-parallel-link-oom-bus-error]]). The DELETE/UPDATE family additionally crosses into
+  the security-sensitive MVCC/identity-probe lane (commit 1136c171 — no touch without sign-off).
+- RETRY PREDICATE: reopen the frontier when a QUIET dedicated host is available (fsqlite CV < 5% on the
+  target scenario). First target then = the single-transaction large-10col BULK INSERT per-row path
+  (profile with FSQLITE_BENCH_PROFILE_DML, look for a >=30% removable non-txn component); the small-N
+  DELETE/UPDATE stays behind the MVCC sign-off. (*update-100/1000 shows 4.3% but is only 1.35x and its
+  cost is transaction-control — same MVCC lane.)
+- VERDICT: frontier is a ledgered BLOCKER (host-quietness + MVCC-security). The read/skip-scan lane is
+  comprehensively complete AND winning on every read workload — no read-side frontier exists.
