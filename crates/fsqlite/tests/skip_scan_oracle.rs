@@ -284,15 +284,25 @@ fn skip_scan_range_matches_sqlite() {
         has_op(&f, "SELECT x, a FROM t WHERE a >= 5", "SeekGT"),
         "range skip scan should serve WHERE a >= 5 over idx_xa(x, a)"
     );
+    assert!(
+        has_op(&f, "SELECT x, a FROM t WHERE a > 5", "SeekGT"),
+        "range skip scan should serve exclusive-lower WHERE a > 5"
+    );
     for sql in [
         "SELECT x, a FROM t WHERE a >= 5", // inclusive lower, no upper (covering)
         "SELECT id, c FROM t WHERE a >= 5", // non-covering
+        "SELECT x, a FROM t WHERE a > 5",  // EXCLUSIVE lower, no upper
+        "SELECT id, c FROM t WHERE a > 5", // exclusive lower, non-covering
         "SELECT x, a FROM t WHERE a BETWEEN 5 AND 12", // inclusive both
         "SELECT id FROM t WHERE a BETWEEN 5 AND 12", // non-covering
         "SELECT x, a FROM t WHERE a >= 5 AND a < 12", // inclusive lower, exclusive upper
+        "SELECT x, a FROM t WHERE a > 5 AND a <= 12", // exclusive lower, inclusive upper
+        "SELECT x, a FROM t WHERE a > 5 AND a < 12", // exclusive both
         "SELECT x, a FROM t WHERE a >= 0 AND a <= 19", // whole domain
         "SELECT x, a FROM t WHERE a >= 100", // empty (above all)
+        "SELECT x, a FROM t WHERE a > 100", // empty (exclusive, above all)
         "SELECT x, a FROM t WHERE a BETWEEN 8 AND 3", // empty (lo > hi)
+        "SELECT x, a FROM t WHERE a > 19", // empty (exclusive, at max)
     ] {
         cmp(&f, &r, sql);
     }
@@ -351,10 +361,13 @@ fn skip_scan_range_declines_when_unsafe() {
         "range skip scan must decline when a non-key residual is present"
     );
     cmp(&f, &r, "SELECT x, a, c FROM t WHERE a >= 5 AND c = 1");
-    // Exclusive lower (`> k`) is deferred (first cut requires inclusive lower): still correct.
-    cmp(&f, &r, "SELECT x, a FROM t WHERE a > 5");
-    // Upper-only (no lower) is deferred: still correct.
+    // Upper-only (no lower bound) is deferred (a seek to NULL would loop): declines but stays correct.
+    assert!(
+        !has_op(&f, "SELECT x, a FROM t WHERE a < 5", "SeekGT"),
+        "upper-only range (no lower bound) must decline the skip scan"
+    );
     cmp(&f, &r, "SELECT x, a FROM t WHERE a < 5");
+    cmp(&f, &r, "SELECT x, a FROM t WHERE a <= 5");
 }
 
 #[test]
