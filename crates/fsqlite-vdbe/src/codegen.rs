@@ -2350,6 +2350,38 @@ pub fn codegen_select(
         );
     }
 
+    // bd-nax2y skip scan: `SELECT <cols> FROM t WHERE <second_col> = <const>` where the constrained
+    // column is the SECOND term of a two-column index whose LEADING term is unconstrained (a
+    // MySQL-style skip scan). No constraint on the leading term, so the equality/range/composite seeks
+    // above all decline and the query would otherwise full-scan. The emitter is adaptive so a
+    // near-unique leading column degrades to a full index walk (== the covering scan it replaces).
+    // First cut: no ORDER BY / LIMIT / GROUP BY / HAVING / DISTINCT / aggregate / index hint.
+    if !is_aggregate
+        && time_travel.is_none()
+        && from_index_hint.is_none()
+        && distinct == Distinctness::All
+        && group_by.is_empty()
+        && having.is_none()
+        && stmt.order_by.is_empty()
+        && stmt.limit.is_none()
+        && let Some(skip) = skip_scan_eq_target(where_clause.as_deref(), table, table_alias)
+    {
+        return codegen_select_skip_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            skip.index,
+            skip.const_expr,
+        );
+    }
+
     // bd-rowid-range-before-directive: `SELECT ... FROM t WHERE <rowid> <range>` receives a
     // `FullTableScan` planner directive — `PlannerSelectAccessKind` has no rowid-range variant, so the
     // planner cannot model it as a seekable path — which short-circuits to `codegen_select_full_scan`
@@ -11253,6 +11285,250 @@ fn codegen_select_count_distinct_index_walk(
 /// index scan: emit each distinct value once, then `SeekGT [value, i64::MAX]` past the value's whole
 /// duplicate run to the next distinct value. Work scales with the number of DISTINCT values, not rows.
 /// bd-distinct-loose-scan.
+/// Cheap `Next` attempts per distinct leading value before the skip scan pays a root-to-leaf
+/// `SeekGE [leading, const]`. Keeps a near-unique leading column at full-index-walk cost (never worse
+/// than the covering scan it replaces) instead of one seek per row.
+const SKIP_SCAN_WALK_PROBES: usize = 3;
+
+/// `SELECT <cols> FROM t WHERE <second_col> = <const>` where `<second_col>` is the SECOND key term of a
+/// two-column ASC BINARY index whose LEADING term is a DIFFERENT (unconstrained) column — a MySQL-style
+/// skip scan candidate. bd-nax2y.
+struct SkipScanEqTarget<'a> {
+    index: &'a IndexSchema,
+    const_expr: &'a Expr,
+}
+
+/// Detect the skip-scan shape: the WHOLE WHERE is `<col> = <const>`, `<col>` is a plain BINARY
+/// non-generated column that is the SECOND term of a two-column ASC BINARY index whose leading term is
+/// a different column (so the leading term is unconstrained by the WHERE). The seek is
+/// residual-free (the whole WHERE is the equality), so no residual filter is dropped.
+fn skip_scan_eq_target<'a>(
+    where_clause: Option<&'a Expr>,
+    table: &'a TableSchema,
+    table_alias: Option<&str>,
+) -> Option<SkipScanEqTarget<'a>> {
+    if table.without_rowid {
+        return None;
+    }
+    let (col_name, const_expr) = extract_column_eq_target(where_clause, table, table_alias)?;
+    let col_idx = table.column_index(&col_name)?;
+    let column = table.columns.get(col_idx)?;
+    if column.generated_expr.is_some()
+        || column
+            .collation
+            .as_deref()
+            .is_some_and(|c| !c.eq_ignore_ascii_case("BINARY"))
+    {
+        return None;
+    }
+    // If a single-column index on the target column exists, the equality seek (dispatched earlier)
+    // serves `col = const` directly and more cheaply than a skip scan — decline so it wins.
+    if table.indexes.iter().any(|idx| {
+        idx.supports_direct_column_lookup()
+            && idx.key_term_count() == 1
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
+    }) {
+        return None;
+    }
+    let index = table.indexes.iter().find(|idx| {
+        idx.supports_direct_column_lookup()
+            && idx.key_term_count() == 2
+            && (0..2).all(|i| {
+                !idx.key_term_descending(i)
+                    && idx
+                        .key_term_collation(i)
+                        .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+            })
+            && idx
+                .columns
+                .get(1)
+                .is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| !c.eq_ignore_ascii_case(&col_name))
+    })?;
+    Some(SkipScanEqTarget { index, const_expr })
+}
+
+/// Emit the skip scan. Enumerate distinct leading values; per value, adaptively WALK a few entries
+/// (checking `a == const`, emitting matches) and, only for a large block, `SeekGE [x, const]` to jump
+/// to the constrained run — then `SeekGT [x]` to the next distinct leading value. A near-unique
+/// leading column never seeks (the walk finds the next value first), so it degrades to a full index
+/// walk (== the covering scan it replaces); a low-cardinality leading column pays ~2 seeks per value.
+/// The walk NEVER emits a `(x, const)` entry that the post-walk seek would re-find: the walk only
+/// falls through to the seek when the last inspected `a < const` (the const run is entirely ahead).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn codegen_select_skip_scan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    idx_schema: &IndexSchema,
+    const_expr: &Expr,
+) -> Result<(), CodegenError> {
+    let idx_cursor = cursor + 1;
+    let target_aff = idx_schema
+        .columns
+        .get(1)
+        .and_then(|name| table.column_index(name))
+        .map(|i| table.columns[i].affinity)
+        .filter(|&a| matches!(a, 'C' | 'D' | 'E' | 'B'));
+    let const_reg = b.alloc_reg();
+    emit_expr(b, const_expr, const_reg, None);
+    if let Some(aff) = target_aff
+        && !bound_matches_affinity(aff, const_expr)
+    {
+        b.emit_op(
+            Opcode::Affinity,
+            const_reg,
+            1,
+            0,
+            P4::Affinity(aff.to_string()),
+            0,
+        );
+    }
+    // `col = NULL` matches nothing in SQLite: a NULL constant yields zero rows.
+    b.emit_jump_to_label(Opcode::IsNull, const_reg, 0, done_label, P4::None, 0);
+
+    let covering = resolve_covering_output_sources(columns, table, table_alias, idx_schema);
+    let needs_table = covering.is_none();
+    if needs_table {
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+    }
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        idx_schema.root_page,
+        0,
+        P4::Index(idx_schema.name.clone()),
+        0,
+    );
+    b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, done_label, P4::None, 0);
+
+    let x_reg = b.alloc_reg();
+    let cur_x_reg = b.alloc_reg();
+    let a_reg = b.alloc_reg();
+    // Probe = [leading, const, rowid = MIN]: a full index key. This engine pads a SHORT seek probe
+    // toward the HIGH end (which is why the 1-field `SeekGT` advance below correctly lands past the
+    // whole `(x, *)` run), so a bare 2-field `(x, const)` `SeekGE` would overshoot PAST the `(x, const)`
+    // run instead of landing on its first entry. The `i64::MIN` rowid sentinel sorts before every real
+    // rowid, anchoring `SeekGE` on the first `(x, const, *)` — mirrors the composite prefix+range seek.
+    let probe_base = b.alloc_regs(3);
+    let probe_rec = b.alloc_reg();
+    let rowid_reg = b.alloc_reg();
+
+    let emit_run = b.emit_label();
+    let advance = b.emit_label();
+    let bin = || P4::Collation("BINARY".to_owned());
+
+    // outer: positioned at the first entry of a new distinct leading value.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let outer = b.current_addr() as i32;
+    b.emit_op(Opcode::Column, idx_cursor, 0, x_reg, P4::None, 0);
+    b.emit_op(Opcode::Column, idx_cursor, 1, a_reg, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Eq, a_reg, const_reg, emit_run, bin(), 0);
+    // `Gt(const, a)` jumps on `a > const` (jump cond is `reg[P3] OP reg[P1]`); see the walk copy below.
+    b.emit_jump_to_label(Opcode::Gt, const_reg, a_reg, advance, bin(), 0);
+    // a < const (or NULL): adaptive walk.
+    for _ in 0..SKIP_SCAN_WALK_PROBES {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let next_addr = b.current_addr() as i32;
+        b.emit_op(Opcode::Next, idx_cursor, next_addr + 2, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+        b.emit_op(Opcode::Column, idx_cursor, 0, cur_x_reg, P4::None, 0);
+        b.emit_op(Opcode::Ne, x_reg, outer, cur_x_reg, bin(), 0x80);
+        b.emit_op(Opcode::Column, idx_cursor, 1, a_reg, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Eq, a_reg, const_reg, emit_run, bin(), 0);
+        // `emit_jump_to_label(OP, P1, P3)` jumps when `reg[P3] OP reg[P1]`, so to advance on `a > const`
+        // the const is P1 and `a` is P3 (a bare `Gt(a, const)` would test `const > a` == `a < const` and
+        // wrongly skip the whole block on its first sub-const row). `Eq`/`Ne` above are symmetric.
+        b.emit_jump_to_label(Opcode::Gt, const_reg, a_reg, advance, bin(), 0);
+    }
+    // Large block, still a < const: seek straight to the first (x, const, -inf).
+    b.emit_op(Opcode::Copy, x_reg, probe_base, 0, P4::None, 0);
+    b.emit_op(Opcode::Copy, const_reg, probe_base + 1, 0, P4::None, 0);
+    b.emit_op(Opcode::Int64, 0, probe_base + 2, 0, P4::Int64(i64::MIN), 0);
+    b.emit_op(Opcode::MakeRecord, probe_base, 3, probe_rec, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::SeekGE,
+        idx_cursor,
+        probe_rec,
+        done_label,
+        P4::None,
+        0,
+    );
+    b.emit_op(Opcode::Column, idx_cursor, 0, cur_x_reg, P4::None, 0);
+    b.emit_op(Opcode::Ne, x_reg, outer, cur_x_reg, bin(), 0x80);
+    b.emit_op(Opcode::Column, idx_cursor, 1, a_reg, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Ne, a_reg, const_reg, advance, bin(), 0);
+    // fall through to emit_run.
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let emit_run_addr = b.current_addr() as i32;
+    b.resolve_label(emit_run);
+    b.emit_op(Opcode::Column, idx_cursor, 0, cur_x_reg, P4::None, 0);
+    b.emit_op(Opcode::Ne, x_reg, outer, cur_x_reg, bin(), 0x80);
+    b.emit_op(Opcode::Column, idx_cursor, 1, a_reg, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Ne, a_reg, const_reg, advance, bin(), 0);
+    b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+    let emit_next = b.emit_label();
+    if needs_table {
+        b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, emit_next, P4::None, 0);
+    }
+    if let Some(cov) = &covering {
+        emit_covering_output_reads(b, idx_cursor, rowid_reg, cov, out_regs);
+    } else {
+        emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    }
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    b.resolve_label(emit_next);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let emit_next_addr = b.current_addr() as i32;
+    b.emit_op(Opcode::Next, idx_cursor, emit_next_addr + 2, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+    b.emit_op(Opcode::Goto, 0, emit_run_addr, 0, P4::None, 0);
+
+    // advance: at (x, a>const); skip to the next distinct leading value.
+    b.resolve_label(advance);
+    b.emit_op(Opcode::Copy, x_reg, probe_base, 0, P4::None, 0);
+    b.emit_op(Opcode::MakeRecord, probe_base, 1, probe_rec, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::SeekGT,
+        idx_cursor,
+        probe_rec,
+        done_label,
+        P4::None,
+        0,
+    );
+    b.emit_op(Opcode::Goto, 0, outer, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    if needs_table {
+        b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    }
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
 struct DistinctLooseScan {
     index_name: String,
     index_root: i32,
@@ -25247,6 +25523,26 @@ fn composite_index_prefix_range_target<'a>(
             let pos = prefix_exprs.len();
             (prefix_exprs, pos, range)
         };
+        // bd-agg-range-shadowed-index: a PURE leading-term range (empty equality prefix, so
+        // `range_pos == 0`) is fully served by a NARROWER single-column ascending index on that
+        // leading column, if one is declared — prefer it (the single-column range planner opens
+        // `idx_col`; SQLite likewise picks the narrower index). Only decline for the empty-prefix
+        // case: with an equality prefix the composite is required (a single-column index cannot pin
+        // `a=? AND b<range`). Mirrors the single-column range planner's usability test verbatim, so we
+        // never decline into a full table scan when the single-column index is unusable (desc/collation).
+        if range_pos == 0
+            && table.indexes.iter().any(|other| {
+                other.supports_direct_column_lookup()
+                    && other.key_term_count() == 1
+                    && !other.key_term_descending(0)
+                    && other
+                        .columns
+                        .first()
+                        .is_some_and(|c| c.eq_ignore_ascii_case(&index.columns[0]))
+            })
+        {
+            continue;
+        }
         // Residual guard: the seek enforces only the pinned prefix equalities and the range on
         // `columns[range_pos]`. If ANY conjunct is not one of those (a predicate on a non-key column,
         // or a second unpinnable term), decline so the full scan enforces the whole WHERE — otherwise
