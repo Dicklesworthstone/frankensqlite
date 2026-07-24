@@ -22982,8 +22982,30 @@ impl Connection {
         self.prepared_cache.borrow_mut().clear();
         self.planner_directive_cache.borrow_mut().clear();
         self.storage_count_cache.borrow_mut().clear();
+        self.clear_prepared_indexed_equality_caches();
         self.discard_cached_vdbe_engine();
         self.reset_statement_lookaside();
+    }
+
+    /// Drop the version-scoped prepared indexed-equality caches (the
+    /// rowids-by-value maps plus the one-entry equality/count-probe memos).
+    ///
+    /// These caches are derived from the MemDatabase mirror's row image and
+    /// normally expire through their version key (`memdb_visible_commit_seq`
+    /// plus the mirror's undo version). Both key components can stay unchanged
+    /// while the mirror's CONTENT changes: an explicit `:memory:` write
+    /// transaction rehydrates the mirror from the ACTIVE transaction bound at
+    /// the pre-transaction snapshot seq, and the explicit COMMIT then advances
+    /// the commit clock without memdb visibility. Any wholesale mirror reload
+    /// or write commit must therefore drop these caches explicitly, or
+    /// statements warmed before the connection's first write transaction keep
+    /// serving frozen pre-transaction results forever (bd-md5pf).
+    fn clear_prepared_indexed_equality_caches(&self) {
+        self.prepared_indexed_equality_cache.borrow_mut().clear();
+        *self.prepared_indexed_equality_last_result.borrow_mut() = None;
+        *self
+            .prepared_count_indexed_rowid_probe_last_result
+            .borrow_mut() = None;
     }
 
     /// Clear compilation caches after an ordinary DML write commit.
@@ -22999,6 +23021,7 @@ impl Connection {
         self.prune_prepared_cache_after_write_commit();
         self.planner_directive_cache.borrow_mut().clear();
         self.storage_count_cache.borrow_mut().clear();
+        self.clear_prepared_indexed_equality_caches();
         self.discard_cached_vdbe_engine();
         self.reset_statement_lookaside();
     }
@@ -62820,6 +62843,10 @@ impl Connection {
         bound_visible_commit_seq: CommitSeq,
     ) -> Result<()> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
+        // The reload can rewrite mirror rows without advancing the
+        // (visible_commit_seq, undo_version) key the prepared indexed-equality
+        // caches are scoped by, so drop them explicitly (bd-md5pf).
+        self.clear_prepared_indexed_equality_caches();
         if bound_visible_commit_seq > *self.memdb_visible_commit_seq.borrow() {
             self.discard_cached_vdbe_engine();
         }
@@ -63538,6 +63565,12 @@ impl Connection {
         hydrate_rows: bool,
         allow_dirty_schema_only_fast_path: bool,
     ) -> Result<()> {
+        // The reload can rewrite mirror rows without advancing the
+        // (visible_commit_seq, undo_version) key the prepared indexed-equality
+        // caches are scoped by — e.g. an in-transaction rehydration from the
+        // ACTIVE txn binds at the pre-transaction snapshot seq — so drop them
+        // explicitly (bd-md5pf).
+        self.clear_prepared_indexed_equality_caches();
         // bd-xvv8f: one-shot request (consumed here regardless of path) to take
         // the full sqlite_master rebuild below instead of the schema-only fast
         // path. Set on autocommit DDL rollback recovery, where the
