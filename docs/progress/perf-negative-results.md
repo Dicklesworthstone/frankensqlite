@@ -19514,6 +19514,58 @@ UpperBound, so `index_seek_upper_bound` mis-positions when a value's run spans m
 bead) — likely the interior descent must propagate the UpperBound bias, or the leaf-crossing successor logic
 (cursor.rs:4247) must re-seek. Codegen WIP is correct in shape; unblocking is a btree-cursor fix. Did NOT ship.
 
+## 2026-07-24 - BLOCKER: comprehensive frontier refresh cannot compile after the async `TransactionHandle` migration
+
+- Result type: build blocker before the timed path, not a performance REJECT.
+  The attempted refresh used clean merged HEAD
+  `e4be5aee34f4919fa73071f351f9018d094d9422` and strict remote execution:
+  `RCH_WORKER=vmi1227854 RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec
+  -- cargo run -j2 --profile release-perf -p fsqlite-e2e --bin
+  comprehensive-bench -- --quick --json-out
+  tests/artifacts/perf/snowybrook-full-quick-20260724T0200Z.json --no-html`
+  (RCH job `j-29944835100115059`). Worker placement was honored and no local
+  Cargo fallback ran.
+- Failure: `fsqlite-btree` stopped compilation with eight type errors in
+  `crates/fsqlite-btree/src/cursor.rs:385-432`. `TransactionPageIo` implements
+  synchronous `PageReader`/`PageWriter`, but its calls to
+  `TransactionHandle::{get_page,write_page,write_page_data,
+  restore_staged_page_data,allocate_page,free_page}` now return Futures.
+  Representative diagnostics were E0277 (`?` cannot be applied to a Future)
+  and E0308 (expected `Result<...>`, found
+  `impl Future<Output = Result<...>>`).
+- Root cause is the incomplete contract migration in commit `213448b0`
+  (`fix(wal): db-fsync recovery fence before WAL truncate over an async
+  checkpoint target`). That commit changed the `TransactionHandle` methods in
+  `crates/fsqlite-pager/src/traits.rs` from synchronous Results to Futures but
+  did not touch `crates/fsqlite-btree/src/cursor.rs`; later commits through
+  merged HEAD did not bridge or migrate the synchronous B-tree adapter.
+- No artifact, benchmark result, new worst-ratio ranking, or candidate
+  performance claim exists for this attempt. The last admissible frontier
+  artifact remains
+  `tests/artifacts/perf/cod-fullquick-refresh-20260724T0030Z/full-quick.json`
+  from pre-migration source `d2ec37bf`. The consecutive performance-REJECT
+  count therefore remains one; a build blocker is not counted as REJECT #2.
+- This measured-frontier lane did not patch the async architecture. An
+  ad-hoc blocking executor inside `TransactionPageIo` would make
+  cancellation/runtime semantics part of a benchmark-enabling workaround and
+  would cross the separately owned architectural lane. The owning fix must
+  make the B-tree page-I/O contract and async pager contract coherent, with
+  explicit asupersync/cancellation semantics, before performance work resumes.
+- `zz_*_bench.rs` triage refresh: all 29 benches are still present, still
+  declare `EPHEMERAL ... Not for commit`, and remain ignored single-shot
+  `Instant` probes without interleaved null controls, repeated-sample CV, or a
+  general SQLite differential oracle. None became a durable KEEP candidate;
+  the complete preserved filename list and promotion requirements remain in
+  the 2026-07-22 probe-triage entry. The separate
+  `zz_seekgap_probe.rs` is also still present. No probe was edited, committed,
+  archived, or deleted.
+- Retry predicate: first require exact current `origin/main` to pass
+  `RCH_REQUIRE_REMOTE=1 rch exec -- cargo check -p fsqlite-btree` on a remote
+  worker, then require the exact-SHA release-perf comprehensive command above
+  to reach and finish the timed `--quick` matrix. Only then refresh the
+  artifact, re-rank stable rows, and resume one-lever profile/A-B/conformance
+  cycles.
+
 ## 2026-07-24 - REJECT/SURFACE: refreshed worst ratio still fails the small-N DELETE retry gate
 
 - Result type: profile-gated lever REJECT with no source mutation. The fresh
