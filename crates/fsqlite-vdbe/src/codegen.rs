@@ -11425,13 +11425,13 @@ fn conjunct_is_range_bound_on_column(
     }
 }
 
-/// Detect a RANGE skip scan: the WHOLE WHERE is a range with a lower bound (optionally an upper bound)
-/// on a plain BINARY column that is the SECOND key term of a `>= 2`-column ASC BINARY index whose
-/// leading term differs (unconstrained). A lower bound is REQUIRED (inclusive `>=` seeks `SeekGE(x, lo,
-/// NULL…, -inf)`; exclusive `>` seeks a 2-field `SeekGT(x, lo)` past the whole `(x, lo, *)` run) — the
-/// no-lower `<`/`<=` case is deferred (it needs a NULL-run walk; a seek to NULL would loop). Residual-
-/// safe: EVERY conjunct must be a bound on the target (else the seek would silently drop it). Declines
-/// when a single-column index on the target exists (a plain range seek serves that directly).
+/// Detect a RANGE skip scan: the WHOLE WHERE is a range (any of `<`,`<=`,`>`,`>=`,`BETWEEN`) on a plain
+/// BINARY column that is the SECOND key term of a `>= 2`-column ASC BINARY index whose leading term
+/// differs (unconstrained). Inclusive lower `>=` seeks `SeekGE(x, lo, NULL…, -inf)`; exclusive `>` seeks
+/// a 2-field `SeekGT(x, lo)` past the whole `(x, lo, *)` run; a no-lower `<`/`<=` walks past the NULL
+/// prefix run (no seekable lower). Residual-safe: EVERY conjunct must be a bound on the target (else the
+/// seek would silently drop it). Declines when a single-column index on the target exists (a plain range
+/// seek serves that directly).
 fn skip_scan_range_target<'a>(
     where_clause: Option<&'a Expr>,
     table: &'a TableSchema,
@@ -11499,9 +11499,6 @@ fn skip_scan_range_target<'a>(
         let Some(range) = extract_named_column_range(where_expr, table, table_alias, target) else {
             continue;
         };
-        if range.lower.is_none() {
-            continue;
-        }
         if !conjuncts
             .iter()
             .all(|term| conjunct_is_range_bound_on_column(term, target, table, table_alias))
@@ -11719,8 +11716,7 @@ fn codegen_select_skip_scan(
 fn emit_skip_scan_range_decision(
     b: &mut ProgramBuilder,
     upper: Option<(i32, bool)>,
-    lo_reg: i32,
-    lo_inclusive: bool,
+    lower: Option<(i32, bool)>,
     a_reg: i32,
     advance: crate::Label,
     emit_run: crate::Label,
@@ -11730,8 +11726,17 @@ fn emit_skip_scan_range_decision(
         let above = if up_inclusive { Opcode::Gt } else { Opcode::Ge };
         b.emit_jump_to_label(above, up_reg, a_reg, advance, bin(), 0);
     }
-    let reached = if lo_inclusive { Opcode::Ge } else { Opcode::Gt };
-    b.emit_jump_to_label(reached, lo_reg, a_reg, emit_run, bin(), 0);
+    match lower {
+        Some((lo_reg, lo_inclusive)) => {
+            let reached = if lo_inclusive { Opcode::Ge } else { Opcode::Gt };
+            b.emit_jump_to_label(reached, lo_reg, a_reg, emit_run, bin(), 0);
+        }
+        // No lower bound: any NON-NULL value not above the upper is in range. NULLs sort first and are
+        // excluded, so they are the only "below" — the caller keeps walking on fall-through.
+        None => {
+            b.emit_jump_to_label(Opcode::NotNull, a_reg, 0, emit_run, P4::None, 0);
+        }
+    }
 }
 
 /// Range skip scan (bd-nax2y): the second key term carries a range with a lower bound (inclusive or
@@ -11776,17 +11781,16 @@ fn codegen_select_skip_scan_range(
             );
         }
     };
-    // Lower bound (required by detection). A NULL bound matches nothing → zero rows.
-    let lower = range
-        .lower
-        .as_ref()
-        .expect("range skip scan requires a lower bound");
-    let lo_expr = lower.expr();
-    let lo_inclusive = lower.inclusive;
-    let lo_reg = b.alloc_reg();
-    emit_expr(b, lo_expr, lo_reg, None);
-    coerce(b, lo_reg, lo_expr);
-    b.emit_jump_to_label(Opcode::IsNull, lo_reg, 0, done_label, P4::None, 0);
+    // Lower bound (optional — absent for a no-lower `< hi` / `<= hi` range). A NULL bound matches
+    // nothing → zero rows.
+    let lower = range.lower.as_ref().map(|bound| {
+        let lo_expr = bound.expr();
+        let lo_reg = b.alloc_reg();
+        emit_expr(b, lo_expr, lo_reg, None);
+        coerce(b, lo_reg, lo_expr);
+        b.emit_jump_to_label(Opcode::IsNull, lo_reg, 0, done_label, P4::None, 0);
+        (lo_reg, bound.inclusive)
+    });
     // Optional upper bound.
     let upper = range.upper.as_ref().map(|bound| {
         let up_reg = b.alloc_reg();
@@ -11836,69 +11840,84 @@ fn codegen_select_skip_scan_range(
     let outer = b.current_addr() as i32;
     b.emit_op(Opcode::Column, idx_cursor, 0, x_reg, P4::None, 0);
     b.emit_op(Opcode::Column, idx_cursor, 1, a_reg, P4::None, 0);
-    emit_skip_scan_range_decision(b, upper, lo_reg, lo_inclusive, a_reg, advance, emit_run);
-    // below range (or NULL): adaptive walk.
-    for _ in 0..SKIP_SCAN_WALK_PROBES {
+    emit_skip_scan_range_decision(b, upper, lower, a_reg, advance, emit_run);
+    if let Some((lo_reg, lo_inclusive)) = lower {
+        // below the lower bound (or NULL): adaptive walk, then seek to the first in-range entry.
+        for _ in 0..SKIP_SCAN_WALK_PROBES {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let next_addr = b.current_addr() as i32;
+            b.emit_op(Opcode::Next, idx_cursor, next_addr + 2, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+            b.emit_op(Opcode::Column, idx_cursor, 0, cur_x_reg, P4::None, 0);
+            b.emit_op(Opcode::Ne, x_reg, outer, cur_x_reg, bin(), 0x80);
+            b.emit_op(Opcode::Column, idx_cursor, 1, a_reg, P4::None, 0);
+            emit_skip_scan_range_decision(b, upper, lower, a_reg, advance, emit_run);
+        }
+        // Large block, still below the lower bound: seek to the first in-range entry. Inclusive `>= lo`:
+        // `SeekGE (x, lo, NULL…, -inf)` lands on the first `(x, lo, …)`. Exclusive `> lo`: a 2-field
+        // `SeekGT (x, lo)` — the engine pads the short probe toward the HIGH end, so it lands past the
+        // whole `(x, lo, *)` run on the first `(x, b > lo)`.
+        b.emit_op(Opcode::Copy, x_reg, probe_base, 0, P4::None, 0);
+        b.emit_op(Opcode::Copy, lo_reg, probe_base + 1, 0, P4::None, 0);
+        if lo_inclusive {
+            for off in 2..key_terms {
+                b.emit_op(Opcode::Null, 0, probe_base + off, 0, P4::None, 0);
+            }
+            b.emit_op(
+                Opcode::Int64,
+                0,
+                probe_base + key_terms,
+                0,
+                P4::Int64(i64::MIN),
+                0,
+            );
+            b.emit_op(
+                Opcode::MakeRecord,
+                probe_base,
+                key_terms + 1,
+                probe_rec,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(
+                Opcode::SeekGE,
+                idx_cursor,
+                probe_rec,
+                done_label,
+                P4::None,
+                0,
+            );
+        } else {
+            b.emit_op(Opcode::MakeRecord, probe_base, 2, probe_rec, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::SeekGT,
+                idx_cursor,
+                probe_rec,
+                done_label,
+                P4::None,
+                0,
+            );
+        }
+        b.emit_op(Opcode::Column, idx_cursor, 0, cur_x_reg, P4::None, 0);
+        b.emit_op(Opcode::Ne, x_reg, outer, cur_x_reg, bin(), 0x80);
+        b.emit_op(Opcode::Column, idx_cursor, 1, a_reg, P4::None, 0);
+        // Now at/after the lower bound, so this either advances (above upper) or emits.
+        emit_skip_scan_range_decision(b, upper, lower, a_reg, advance, emit_run);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, advance, P4::None, 0);
+    } else {
+        // No lower bound: the only sub-range values are the NULL prefix run at the block start (NULLs
+        // sort first and are excluded). Walk past them — unbounded, but NULL runs are short and the
+        // required upper bound still terminates the emitted run. No seek is possible without a lower.
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let next_addr = b.current_addr() as i32;
-        b.emit_op(Opcode::Next, idx_cursor, next_addr + 2, 0, P4::None, 0);
+        let null_walk = b.current_addr() as i32;
+        b.emit_op(Opcode::Next, idx_cursor, null_walk + 2, 0, P4::None, 0);
         b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
         b.emit_op(Opcode::Column, idx_cursor, 0, cur_x_reg, P4::None, 0);
         b.emit_op(Opcode::Ne, x_reg, outer, cur_x_reg, bin(), 0x80);
         b.emit_op(Opcode::Column, idx_cursor, 1, a_reg, P4::None, 0);
-        emit_skip_scan_range_decision(b, upper, lo_reg, lo_inclusive, a_reg, advance, emit_run);
+        emit_skip_scan_range_decision(b, upper, lower, a_reg, advance, emit_run);
+        b.emit_op(Opcode::Goto, 0, null_walk, 0, P4::None, 0);
     }
-    // Large block, still below the lower bound: seek to the first in-range entry. Inclusive `>= lo`:
-    // `SeekGE (x, lo, NULL…, -inf)` lands on the first `(x, lo, …)`. Exclusive `> lo`: a 2-field
-    // `SeekGT (x, lo)` — the engine pads the short probe toward the HIGH end, so it lands past the whole
-    // `(x, lo, *)` run on the first `(x, b > lo)`.
-    b.emit_op(Opcode::Copy, x_reg, probe_base, 0, P4::None, 0);
-    b.emit_op(Opcode::Copy, lo_reg, probe_base + 1, 0, P4::None, 0);
-    if lo_inclusive {
-        for off in 2..key_terms {
-            b.emit_op(Opcode::Null, 0, probe_base + off, 0, P4::None, 0);
-        }
-        b.emit_op(
-            Opcode::Int64,
-            0,
-            probe_base + key_terms,
-            0,
-            P4::Int64(i64::MIN),
-            0,
-        );
-        b.emit_op(
-            Opcode::MakeRecord,
-            probe_base,
-            key_terms + 1,
-            probe_rec,
-            P4::None,
-            0,
-        );
-        b.emit_jump_to_label(
-            Opcode::SeekGE,
-            idx_cursor,
-            probe_rec,
-            done_label,
-            P4::None,
-            0,
-        );
-    } else {
-        b.emit_op(Opcode::MakeRecord, probe_base, 2, probe_rec, P4::None, 0);
-        b.emit_jump_to_label(
-            Opcode::SeekGT,
-            idx_cursor,
-            probe_rec,
-            done_label,
-            P4::None,
-            0,
-        );
-    }
-    b.emit_op(Opcode::Column, idx_cursor, 0, cur_x_reg, P4::None, 0);
-    b.emit_op(Opcode::Ne, x_reg, outer, cur_x_reg, bin(), 0x80);
-    b.emit_op(Opcode::Column, idx_cursor, 1, a_reg, P4::None, 0);
-    // The value is now at/after the lower bound, so this either advances (above upper) or emits.
-    emit_skip_scan_range_decision(b, upper, lo_reg, lo_inclusive, a_reg, advance, emit_run);
-    b.emit_jump_to_label(Opcode::Goto, 0, 0, advance, P4::None, 0);
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let emit_run_addr = b.current_addr() as i32;

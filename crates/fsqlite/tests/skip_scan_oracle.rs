@@ -288,6 +288,10 @@ fn skip_scan_range_matches_sqlite() {
         has_op(&f, "SELECT x, a FROM t WHERE a > 5", "SeekGT"),
         "range skip scan should serve exclusive-lower WHERE a > 5"
     );
+    assert!(
+        has_op(&f, "SELECT x, a FROM t WHERE a < 15", "SeekGT"),
+        "range skip scan should serve no-lower WHERE a < 15"
+    );
     for sql in [
         "SELECT x, a FROM t WHERE a >= 5", // inclusive lower, no upper (covering)
         "SELECT id, c FROM t WHERE a >= 5", // non-covering
@@ -298,6 +302,10 @@ fn skip_scan_range_matches_sqlite() {
         "SELECT x, a FROM t WHERE a >= 5 AND a < 12", // inclusive lower, exclusive upper
         "SELECT x, a FROM t WHERE a > 5 AND a <= 12", // exclusive lower, inclusive upper
         "SELECT x, a FROM t WHERE a > 5 AND a < 12", // exclusive both
+        "SELECT x, a FROM t WHERE a < 15", // NO lower, exclusive upper (covering)
+        "SELECT id, c FROM t WHERE a < 15", // no lower, non-covering
+        "SELECT x, a FROM t WHERE a <= 15", // no lower, inclusive upper
+        "SELECT x, a FROM t WHERE a < 0",  // no lower, empty (below all non-null)
         "SELECT x, a FROM t WHERE a >= 0 AND a <= 19", // whole domain
         "SELECT x, a FROM t WHERE a >= 100", // empty (above all)
         "SELECT x, a FROM t WHERE a > 100", // empty (exclusive, above all)
@@ -361,13 +369,12 @@ fn skip_scan_range_declines_when_unsafe() {
         "range skip scan must decline when a non-key residual is present"
     );
     cmp(&f, &r, "SELECT x, a, c FROM t WHERE a >= 5 AND c = 1");
-    // Upper-only (no lower bound) is deferred (a seek to NULL would loop): declines but stays correct.
-    assert!(
-        !has_op(&f, "SELECT x, a FROM t WHERE a < 5", "SeekGT"),
-        "upper-only range (no lower bound) must decline the skip scan"
+    // A residual on the range column itself referencing another shape must still stay correct.
+    cmp(
+        &f,
+        &r,
+        "SELECT x, a FROM t WHERE a >= 5 AND a <= 8 AND c = 2",
     );
-    cmp(&f, &r, "SELECT x, a FROM t WHERE a < 5");
-    cmp(&f, &r, "SELECT x, a FROM t WHERE a <= 5");
 }
 
 #[test]
