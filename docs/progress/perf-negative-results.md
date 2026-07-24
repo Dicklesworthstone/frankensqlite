@@ -20281,3 +20281,24 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   cost is transaction-control — same MVCC lane.)
 - VERDICT: frontier is a ledgered BLOCKER (host-quietness + MVCC-security). The read/skip-scan lane is
   comprehensively complete AND winning on every read workload — no read-side frontier exists.
+
+## 2026-07-24 - REJECT (frontier, code screen, no A/B needed): bulk-INSERT per-row path is already optimized; residual is inherent MVCC/COW
+
+- Retry-target from the BLOCKER entry above (single-transaction large-10col bulk INSERT, 1.50x). Screened
+  the `Opcode::Insert` hot path (engine.rs ~9904) WITHOUT a perf A/B, looking for a per-row algorithmic
+  inefficiency justifiable on code alone. Found the path is ALREADY heavily optimized (all prior bd-*):
+  * MakeRecord SIDEBAND buffer — the record bytes are taken from a lookaside, avoiding an Arc alloc for
+    the Blob/Text record (`sideband_is_armed_for` / `take_buf`); `take_reg` moves instead of cloning.
+  * APPEND fast-path (bd-p666i/bd-0zxi6) — a strictly-increasing rowid skips the full B-tree seek
+    entirely (matches C SQLite BTREE_APPEND).
+  * `table_insert_prechecked_absent` — when the existence probe already proved the row absent, the
+    insert reuses that leaf position instead of re-seeking.
+  * rightmost-leaf cache refresh on append; decode-cache invalidation scoped to the write.
+- CONCLUSION: no removable per-row redundancy remains. The residual vs C SQLite is INHERENT to the MVCC
+  design — copy-on-write page duplication for concurrent writers, per-row version tracking, and RaptorQ
+  durability — i.e. the concurrent-writer capability that IS the product (concurrent_mode default true,
+  never to be weakened). Reducing it means weakening MVCC/durability, out of scope.
+- VERDICT: REJECTED on code screen (no eligible micro-perf A/B was entered — the host is also too noisy,
+  per the BLOCKER entry). This is the 2nd frontier REJECT (after cod's small-N DELETE). Combined with the
+  all-write-side BLOCKER, the comprehensive-bench frontier is firmly blocked: reads are won, writes are
+  inherent-MVCC-cost. Retry predicate unchanged (quiet host + MVCC sign-off for any deeper write lever).
