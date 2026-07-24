@@ -255,6 +255,109 @@ fn skip_scan_three_column_index_matches_sqlite() {
 }
 
 #[test]
+fn skip_scan_range_matches_sqlite() {
+    // `WHERE a <range>` (inclusive lower) where `a` is the SECOND term of `idx(x, a)` with `x`
+    // unconstrained: the range skip scan seeks `(x, lo)` per distinct leading value. Covers `>=`,
+    // `BETWEEN`, and inclusive-lower/exclusive-upper, low- and high-cardinality leading `x`, NULLs.
+    let mut ins = Vec::new();
+    for i in 1..=4000_i64 {
+        let x = if i % 53 == 0 {
+            "NULL".to_owned()
+        } else {
+            (i % 12).to_string()
+        };
+        let a = if i % 37 == 0 {
+            "NULL".to_owned()
+        } else {
+            (i % 20).to_string()
+        };
+        ins.push(format!("INSERT INTO t VALUES ({i}, {x}, {a}, {});", i % 4));
+    }
+    let (f, r) = both(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER, c INTEGER);",
+            "CREATE INDEX idx_xa ON t(x, a);",
+        ],
+        &ins,
+    );
+    assert!(
+        has_op(&f, "SELECT x, a FROM t WHERE a >= 5", "SeekGT"),
+        "range skip scan should serve WHERE a >= 5 over idx_xa(x, a)"
+    );
+    for sql in [
+        "SELECT x, a FROM t WHERE a >= 5", // inclusive lower, no upper (covering)
+        "SELECT id, c FROM t WHERE a >= 5", // non-covering
+        "SELECT x, a FROM t WHERE a BETWEEN 5 AND 12", // inclusive both
+        "SELECT id FROM t WHERE a BETWEEN 5 AND 12", // non-covering
+        "SELECT x, a FROM t WHERE a >= 5 AND a < 12", // inclusive lower, exclusive upper
+        "SELECT x, a FROM t WHERE a >= 0 AND a <= 19", // whole domain
+        "SELECT x, a FROM t WHERE a >= 100", // empty (above all)
+        "SELECT x, a FROM t WHERE a BETWEEN 8 AND 3", // empty (lo > hi)
+    ] {
+        cmp(&f, &r, sql);
+    }
+}
+
+#[test]
+fn skip_scan_range_high_cardinality_matches_sqlite() {
+    // Near-unique leading `x` -> the adaptive walk dominates (never worse than a covering scan).
+    let mut ins = Vec::new();
+    for i in 1..=3000_i64 {
+        ins.push(format!(
+            "INSERT INTO t VALUES ({i}, {i}, {}, {});",
+            i % 25,
+            i % 3
+        ));
+    }
+    let (f, r) = both(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER, c INTEGER);",
+            "CREATE INDEX idx_xa ON t(x, a);",
+        ],
+        &ins,
+    );
+    assert!(has_op(&f, "SELECT id FROM t WHERE a >= 10", "SeekGT"));
+    for sql in [
+        "SELECT x, a FROM t WHERE a >= 10",
+        "SELECT id FROM t WHERE a BETWEEN 5 AND 15",
+        "SELECT x, a FROM t WHERE a >= 20 AND a < 24",
+    ] {
+        cmp(&f, &r, sql);
+    }
+}
+
+#[test]
+fn skip_scan_range_declines_when_unsafe() {
+    // A single-column index on the target, or a residual on a non-key column, must NOT skip-scan.
+    let (f, r) = both(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER, c INTEGER);",
+            "CREATE INDEX idx_xa ON t(x, a);",
+        ],
+        &(1..=800)
+            .map(|i| {
+                format!(
+                    "INSERT INTO t VALUES ({i}, {}, {}, {});",
+                    i % 10,
+                    i % 20,
+                    i % 3
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    // Residual on a non-key column: must decline (else `c = 1` is silently dropped).
+    assert!(
+        !has_op(&f, "SELECT x, a FROM t WHERE a >= 5 AND c = 1", "SeekGT"),
+        "range skip scan must decline when a non-key residual is present"
+    );
+    cmp(&f, &r, "SELECT x, a, c FROM t WHERE a >= 5 AND c = 1");
+    // Exclusive lower (`> k`) is deferred (first cut requires inclusive lower): still correct.
+    cmp(&f, &r, "SELECT x, a FROM t WHERE a > 5");
+    // Upper-only (no lower) is deferred: still correct.
+    cmp(&f, &r, "SELECT x, a FROM t WHERE a < 5");
+}
+
+#[test]
 fn skip_scan_declines_when_avoidable() {
     let (f, r) = both(
         &[

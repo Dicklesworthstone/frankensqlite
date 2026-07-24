@@ -2381,6 +2381,33 @@ pub fn codegen_select(
             skip.const_expr,
         );
     }
+    // Range skip scan (bd-nax2y): the same shape but the constrained second key term carries an
+    // inclusive-lower range instead of an equality.
+    if !is_aggregate
+        && time_travel.is_none()
+        && from_index_hint.is_none()
+        && distinct == Distinctness::All
+        && group_by.is_empty()
+        && having.is_none()
+        && stmt.order_by.is_empty()
+        && stmt.limit.is_none()
+        && let Some(skip) = skip_scan_range_target(where_clause.as_deref(), table, table_alias)
+    {
+        return codegen_select_skip_scan_range(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            skip.index,
+            &skip.range,
+        );
+    }
 
     // bd-rowid-range-before-directive: `SELECT ... FROM t WHERE <rowid> <range>` receives a
     // `FullTableScan` planner directive — `PlannerSelectAccessKind` has no rowid-range variant, so the
@@ -11362,6 +11389,130 @@ fn skip_scan_eq_target<'a>(
     Some(SkipScanEqTarget { index, const_expr })
 }
 
+/// A range skip-scan target: the constrained SECOND key term carries a range (with an inclusive lower
+/// bound) instead of an equality. bd-nax2y range extension.
+struct SkipScanRangeTarget<'a> {
+    index: &'a IndexSchema,
+    range: ColumnRangeTarget<'a>,
+}
+
+/// True if `term` is a range bound (`<`,`<=`,`>`,`>=`) or `BETWEEN` on `column` and nothing else — used
+/// to prove the WHOLE WHERE is a range on the target so the residual-free seek drops no predicate.
+fn conjunct_is_range_bound_on_column(
+    term: &Expr,
+    column: &str,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    match term {
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => extract_column_range_bound(left, *op, right, table, table_alias)
+            .is_some_and(|(col, _, _)| col.eq_ignore_ascii_case(column)),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            not: false,
+            ..
+        } => {
+            is_index_range_constant(low)
+                && is_index_range_constant(high)
+                && column_name(expr, table, table_alias)
+                    .is_some_and(|c| c.eq_ignore_ascii_case(column))
+        }
+        _ => false,
+    }
+}
+
+/// Detect a RANGE skip scan: the WHOLE WHERE is a range with an INCLUSIVE lower bound (optionally an
+/// upper bound) on a plain BINARY column that is the SECOND key term of a `>= 2`-column ASC BINARY
+/// index whose leading term differs (unconstrained). Requires an inclusive lower so `SeekGE(x, lo)`
+/// lands exactly on the first in-range entry per leading value (exclusive `>` and no-lower `<`/`<=` are
+/// deferred — they need a post-seek skip / a NULL-run walk). Residual-safe: EVERY conjunct must be a
+/// bound on the target (else the seek would silently drop it). Declines when a single-column index on
+/// the target exists (a plain range seek serves that directly).
+fn skip_scan_range_target<'a>(
+    where_clause: Option<&'a Expr>,
+    table: &'a TableSchema,
+    table_alias: Option<&str>,
+) -> Option<SkipScanRangeTarget<'a>> {
+    if table.without_rowid {
+        return None;
+    }
+    let where_expr = where_clause?;
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+    for index in &table.indexes {
+        let kt = index.key_term_count();
+        if !(index.supports_direct_column_lookup()
+            && kt >= 2
+            && index.columns.len() == kt
+            && (0..kt).all(|i| {
+                !index.key_term_descending(i)
+                    && index
+                        .key_term_collation(i)
+                        .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+            }))
+        {
+            continue;
+        }
+        let Some(target) = index.columns.get(1) else {
+            continue;
+        };
+        // Leading term must be a DIFFERENT (unconstrained) column.
+        if index
+            .columns
+            .first()
+            .is_none_or(|c| c.eq_ignore_ascii_case(target))
+        {
+            continue;
+        }
+        // Target must be a plain, non-generated BINARY column.
+        let Some(column) = table
+            .column_index(target)
+            .and_then(|i| table.columns.get(i))
+        else {
+            continue;
+        };
+        if column.generated_expr.is_some()
+            || column
+                .collation
+                .as_deref()
+                .is_some_and(|c| !c.eq_ignore_ascii_case("BINARY"))
+        {
+            continue;
+        }
+        // A single-column index on the target serves the range directly and more cheaply.
+        if table.indexes.iter().any(|idx| {
+            idx.supports_direct_column_lookup()
+                && idx.key_term_count() == 1
+                && idx
+                    .columns
+                    .first()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(target))
+        }) {
+            continue;
+        }
+        // The whole WHERE must be a range on the target, with an inclusive lower bound present, and no
+        // conjunct on any other column (else the residual-free seek would drop it).
+        let Some(range) = extract_named_column_range(where_expr, table, table_alias, target) else {
+            continue;
+        };
+        if !range.lower.as_ref().is_some_and(|bound| bound.inclusive) {
+            continue;
+        }
+        if !conjuncts
+            .iter()
+            .all(|term| conjunct_is_range_bound_on_column(term, target, table, table_alias))
+        {
+            continue;
+        }
+        return Some(SkipScanRangeTarget { index, range });
+    }
+    None
+}
+
 /// Emit the skip scan. Enumerate distinct leading values; per value, adaptively WALK a few entries
 /// (checking `a == const`, emitting matches) and, only for a large block, `SeekGE [x, const]` to jump
 /// to the constrained run — then `SeekGT [x]` to the next distinct leading value. A near-unique
@@ -11537,6 +11688,230 @@ fn codegen_select_skip_scan(
     b.emit_op(Opcode::Goto, 0, emit_run_addr, 0, P4::None, 0);
 
     // advance: at (x, a>const); skip to the next distinct leading value.
+    b.resolve_label(advance);
+    b.emit_op(Opcode::Copy, x_reg, probe_base, 0, P4::None, 0);
+    b.emit_op(Opcode::MakeRecord, probe_base, 1, probe_rec, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::SeekGT,
+        idx_cursor,
+        probe_rec,
+        done_label,
+        P4::None,
+        0,
+    );
+    b.emit_op(Opcode::Goto, 0, outer, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    if needs_table {
+        b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    }
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+/// Emit the three range-membership jumps for one index entry whose second-key value is in `a_reg`:
+/// jump to `advance` when it is ABOVE the range (`a > up` inclusive / `a >= up` exclusive), else jump
+/// to `emit_run` when it has reached the INCLUSIVE lower (`a >= lo`), else fall through (below the range
+/// or NULL — the caller keeps walking). `emit_jump_to_label(OP, P1, P3)` jumps on `reg[P3] OP reg[P1]`,
+/// so the bound register is P1 and `a` is P3 (matches the composite prefix+range emitter).
+fn emit_skip_scan_range_decision(
+    b: &mut ProgramBuilder,
+    upper: Option<(i32, bool)>,
+    lo_reg: i32,
+    a_reg: i32,
+    advance: crate::Label,
+    emit_run: crate::Label,
+) {
+    let bin = || P4::Collation("BINARY".to_owned());
+    if let Some((up_reg, up_inclusive)) = upper {
+        let above = if up_inclusive { Opcode::Gt } else { Opcode::Ge };
+        b.emit_jump_to_label(above, up_reg, a_reg, advance, bin(), 0);
+    }
+    b.emit_jump_to_label(Opcode::Ge, lo_reg, a_reg, emit_run, bin(), 0);
+}
+
+/// Range skip scan (bd-nax2y): the second key term carries a range with an INCLUSIVE lower bound
+/// (optionally an upper bound) instead of an equality. Same distinct-leading-value iteration + adaptive
+/// walk as [`codegen_select_skip_scan`], but each entry is classified by [`emit_skip_scan_range_decision`]
+/// (above → advance to the next leading value, in-range → emit, below/NULL → keep walking) and the seek
+/// anchors at `(x, lo, NULL…, -inf)`. Byte-identical to C SQLite.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn codegen_select_skip_scan_range(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    idx_schema: &IndexSchema,
+    range: &ColumnRangeTarget<'_>,
+) -> Result<(), CodegenError> {
+    let idx_cursor = cursor + 1;
+    let target_aff = idx_schema
+        .columns
+        .get(1)
+        .and_then(|name| table.column_index(name))
+        .map(|i| table.columns[i].affinity)
+        .filter(|&a| matches!(a, 'C' | 'D' | 'E' | 'B'));
+    let coerce = |b: &mut ProgramBuilder, reg: i32, expr: &Expr| {
+        if let Some(aff) = target_aff
+            && !bound_matches_affinity(aff, expr)
+        {
+            b.emit_op(
+                Opcode::Affinity,
+                reg,
+                1,
+                0,
+                P4::Affinity(aff.to_string()),
+                0,
+            );
+        }
+    };
+    // Inclusive lower bound (required by detection). A NULL bound matches nothing → zero rows.
+    let lo_expr = range
+        .lower
+        .as_ref()
+        .expect("range skip scan requires a lower bound")
+        .expr();
+    let lo_reg = b.alloc_reg();
+    emit_expr(b, lo_expr, lo_reg, None);
+    coerce(b, lo_reg, lo_expr);
+    b.emit_jump_to_label(Opcode::IsNull, lo_reg, 0, done_label, P4::None, 0);
+    // Optional upper bound.
+    let upper = range.upper.as_ref().map(|bound| {
+        let up_reg = b.alloc_reg();
+        emit_expr(b, bound.expr(), up_reg, None);
+        coerce(b, up_reg, bound.expr());
+        b.emit_jump_to_label(Opcode::IsNull, up_reg, 0, done_label, P4::None, 0);
+        (up_reg, bound.inclusive)
+    });
+
+    let covering = resolve_covering_output_sources(columns, table, table_alias, idx_schema);
+    let needs_table = covering.is_none();
+    if needs_table {
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+    }
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        idx_schema.root_page,
+        0,
+        P4::Index(idx_schema.name.clone()),
+        0,
+    );
+    b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, done_label, P4::None, 0);
+
+    let x_reg = b.alloc_reg();
+    let cur_x_reg = b.alloc_reg();
+    let a_reg = b.alloc_reg();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let key_terms = idx_schema.key_term_count() as i32;
+    let probe_base = b.alloc_regs(key_terms + 1);
+    let probe_rec = b.alloc_reg();
+    let rowid_reg = b.alloc_reg();
+
+    let emit_run = b.emit_label();
+    let advance = b.emit_label();
+    let bin = || P4::Collation("BINARY".to_owned());
+
+    // outer: positioned at the first entry of a new distinct leading value.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let outer = b.current_addr() as i32;
+    b.emit_op(Opcode::Column, idx_cursor, 0, x_reg, P4::None, 0);
+    b.emit_op(Opcode::Column, idx_cursor, 1, a_reg, P4::None, 0);
+    emit_skip_scan_range_decision(b, upper, lo_reg, a_reg, advance, emit_run);
+    // below range (or NULL): adaptive walk.
+    for _ in 0..SKIP_SCAN_WALK_PROBES {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let next_addr = b.current_addr() as i32;
+        b.emit_op(Opcode::Next, idx_cursor, next_addr + 2, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+        b.emit_op(Opcode::Column, idx_cursor, 0, cur_x_reg, P4::None, 0);
+        b.emit_op(Opcode::Ne, x_reg, outer, cur_x_reg, bin(), 0x80);
+        b.emit_op(Opcode::Column, idx_cursor, 1, a_reg, P4::None, 0);
+        emit_skip_scan_range_decision(b, upper, lo_reg, a_reg, advance, emit_run);
+    }
+    // Large block, still below the lower bound: seek straight to the first (x, lo, NULL…, -inf).
+    b.emit_op(Opcode::Copy, x_reg, probe_base, 0, P4::None, 0);
+    b.emit_op(Opcode::Copy, lo_reg, probe_base + 1, 0, P4::None, 0);
+    for off in 2..key_terms {
+        b.emit_op(Opcode::Null, 0, probe_base + off, 0, P4::None, 0);
+    }
+    b.emit_op(
+        Opcode::Int64,
+        0,
+        probe_base + key_terms,
+        0,
+        P4::Int64(i64::MIN),
+        0,
+    );
+    b.emit_op(
+        Opcode::MakeRecord,
+        probe_base,
+        key_terms + 1,
+        probe_rec,
+        P4::None,
+        0,
+    );
+    b.emit_jump_to_label(
+        Opcode::SeekGE,
+        idx_cursor,
+        probe_rec,
+        done_label,
+        P4::None,
+        0,
+    );
+    b.emit_op(Opcode::Column, idx_cursor, 0, cur_x_reg, P4::None, 0);
+    b.emit_op(Opcode::Ne, x_reg, outer, cur_x_reg, bin(), 0x80);
+    b.emit_op(Opcode::Column, idx_cursor, 1, a_reg, P4::None, 0);
+    // After SeekGE the value is >= lo, so this either advances (above upper) or falls to emit_run.
+    emit_skip_scan_range_decision(b, upper, lo_reg, a_reg, advance, emit_run);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, advance, P4::None, 0);
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let emit_run_addr = b.current_addr() as i32;
+    b.resolve_label(emit_run);
+    b.emit_op(Opcode::Column, idx_cursor, 0, cur_x_reg, P4::None, 0);
+    b.emit_op(Opcode::Ne, x_reg, outer, cur_x_reg, bin(), 0x80);
+    b.emit_op(Opcode::Column, idx_cursor, 1, a_reg, P4::None, 0);
+    // Sorted ascending: once in-range the lower bound stays satisfied, so only the upper bound can end
+    // the run (besides a leading-value change) — jump to advance when the value climbs above it.
+    if let Some((up_reg, up_inclusive)) = upper {
+        let above = if up_inclusive { Opcode::Gt } else { Opcode::Ge };
+        b.emit_jump_to_label(above, up_reg, a_reg, advance, bin(), 0);
+    }
+    b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+    let emit_next = b.emit_label();
+    if needs_table {
+        b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, emit_next, P4::None, 0);
+    }
+    if let Some(cov) = &covering {
+        emit_covering_output_reads(b, idx_cursor, rowid_reg, cov, out_regs);
+    } else {
+        emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    }
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    b.resolve_label(emit_next);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let emit_next_addr = b.current_addr() as i32;
+    b.emit_op(Opcode::Next, idx_cursor, emit_next_addr + 2, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+    b.emit_op(Opcode::Goto, 0, emit_run_addr, 0, P4::None, 0);
+
+    // advance: skip to the next distinct leading value.
     b.resolve_label(advance);
     b.emit_op(Opcode::Copy, x_reg, probe_base, 0, P4::None, 0);
     b.emit_op(Opcode::MakeRecord, probe_base, 1, probe_rec, P4::None, 0);
