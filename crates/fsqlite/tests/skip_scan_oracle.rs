@@ -210,6 +210,51 @@ fn skip_scan_edge_cases_match_sqlite() {
 }
 
 #[test]
+fn skip_scan_three_column_index_matches_sqlite() {
+    // `WHERE a = <const>` where `a` is the SECOND term of a THREE-column index `idx(x, a, c)`: `x` is
+    // the unconstrained leading term, `c` is an unconstrained TRAILING term. The seek must fill `c` and
+    // the rowid with the MIN sentinel so it lands on the first `(x, a, *)`, and the run emits every
+    // matching row across all `c`. Low- and high-cardinality leading `x`, NULLs in `x`, `a`, and `c`.
+    let mut ins = Vec::new();
+    for i in 1..=4000_i64 {
+        let x = if i % 53 == 0 {
+            "NULL".to_owned()
+        } else {
+            (i % 15).to_string()
+        };
+        let a = if i % 37 == 0 {
+            "NULL".to_owned()
+        } else {
+            (i % 8).to_string()
+        };
+        let c = if i % 29 == 0 {
+            "NULL".to_owned()
+        } else {
+            (i % 6).to_string()
+        };
+        ins.push(format!("INSERT INTO t VALUES ({i}, {x}, {a}, {c});"));
+    }
+    let (f, r) = both(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER, c INTEGER);",
+            "CREATE INDEX idx_xac ON t(x, a, c);",
+        ],
+        &ins,
+    );
+    // Skip scan fires over the 3-col index (SeekGT advance between distinct leading values), and a
+    // covering query (x, a, c all in the index) never opens the base table.
+    assert!(
+        has_op(&f, "SELECT x, a, c FROM t WHERE a = 5", "SeekGT"),
+        "skip scan should serve WHERE a = 5 over idx_xac(x, a, c)"
+    );
+    for a in [0, 3, 5, 7, 999] {
+        cmp(&f, &r, &format!("SELECT x, a, c FROM t WHERE a = {a}")); // covering (all 3 key cols)
+        cmp(&f, &r, &format!("SELECT id FROM t WHERE a = {a}")); // non-covering
+        cmp(&f, &r, &format!("SELECT x, c FROM t WHERE a = {a}")); // covering subset
+    }
+}
+
+#[test]
 fn skip_scan_declines_when_avoidable() {
     let (f, r) = both(
         &[

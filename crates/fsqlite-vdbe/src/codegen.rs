@@ -11333,10 +11333,18 @@ fn skip_scan_eq_target<'a>(
     }) {
         return None;
     }
+    // Any index with >= 2 plain ASC BINARY key terms whose SECOND term is the constrained column and
+    // whose FIRST (leading) term is a different, unconstrained column. Trailing key terms beyond the
+    // second (`idx(a, b, c, …)`) are unconstrained too — the seek fills them with the `i64::MIN`
+    // sentinel so `SeekGE` still lands on the FIRST `(leading, const, …)` entry, and the run emits every
+    // matching row regardless of the trailing columns. ALL key terms must be ASC BINARY: a DESC or
+    // non-BINARY trailing term would order the sentinel wrong and the seek could overshoot.
     let index = table.indexes.iter().find(|idx| {
+        let kt = idx.key_term_count();
         idx.supports_direct_column_lookup()
-            && idx.key_term_count() == 2
-            && (0..2).all(|i| {
+            && kt >= 2
+            && idx.columns.len() == kt
+            && (0..kt).all(|i| {
                 !idx.key_term_descending(i)
                     && idx
                         .key_term_collation(i)
@@ -11425,12 +11433,15 @@ fn codegen_select_skip_scan(
     let x_reg = b.alloc_reg();
     let cur_x_reg = b.alloc_reg();
     let a_reg = b.alloc_reg();
-    // Probe = [leading, const, rowid = MIN]: a full index key. This engine pads a SHORT seek probe
-    // toward the HIGH end (which is why the 1-field `SeekGT` advance below correctly lands past the
-    // whole `(x, *)` run), so a bare 2-field `(x, const)` `SeekGE` would overshoot PAST the `(x, const)`
-    // run instead of landing on its first entry. The `i64::MIN` rowid sentinel sorts before every real
-    // rowid, anchoring `SeekGE` on the first `(x, const, *)` — mirrors the composite prefix+range seek.
-    let probe_base = b.alloc_regs(3);
+    // Probe = [leading, const, MIN × (key_terms - 1)]: a full index key (every trailing key term plus
+    // the rowid filled with the `i64::MIN` sentinel). This engine pads a SHORT seek probe toward the
+    // HIGH end (which is why the 1-field `SeekGT` advance below correctly lands past the whole `(x, *)`
+    // run), so a bare `(x, const)` `SeekGE` would overshoot PAST the `(x, const, …)` run instead of
+    // landing on its first entry. `MIN` sorts before every real value, anchoring `SeekGE` on the first
+    // `(x, const, …)` across any >=2-col index — mirrors the composite prefix+range seek.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let key_terms = idx_schema.key_term_count() as i32;
+    let probe_base = b.alloc_regs(key_terms + 1);
     let probe_rec = b.alloc_reg();
     let rowid_reg = b.alloc_reg();
 
@@ -11461,11 +11472,31 @@ fn codegen_select_skip_scan(
         // wrongly skip the whole block on its first sub-const row). `Eq`/`Ne` above are symmetric.
         b.emit_jump_to_label(Opcode::Gt, const_reg, a_reg, advance, bin(), 0);
     }
-    // Large block, still a < const: seek straight to the first (x, const, -inf).
+    // Large block, still a < const: seek straight to the first (x, const, NULL…, -inf). Trailing KEY
+    // columns get NULL (which sorts BEFORE every value, so the seek lands on the FIRST `(x, const, …)`
+    // entry — a MIN integer would skip past `(x, const, NULL, …)` rows since NULL sorts below it); only
+    // the rowid slot gets `i64::MIN` (rowids are never NULL and MIN sorts before every real rowid).
     b.emit_op(Opcode::Copy, x_reg, probe_base, 0, P4::None, 0);
     b.emit_op(Opcode::Copy, const_reg, probe_base + 1, 0, P4::None, 0);
-    b.emit_op(Opcode::Int64, 0, probe_base + 2, 0, P4::Int64(i64::MIN), 0);
-    b.emit_op(Opcode::MakeRecord, probe_base, 3, probe_rec, P4::None, 0);
+    for off in 2..key_terms {
+        b.emit_op(Opcode::Null, 0, probe_base + off, 0, P4::None, 0);
+    }
+    b.emit_op(
+        Opcode::Int64,
+        0,
+        probe_base + key_terms,
+        0,
+        P4::Int64(i64::MIN),
+        0,
+    );
+    b.emit_op(
+        Opcode::MakeRecord,
+        probe_base,
+        key_terms + 1,
+        probe_rec,
+        P4::None,
+        0,
+    );
     b.emit_jump_to_label(
         Opcode::SeekGE,
         idx_cursor,
