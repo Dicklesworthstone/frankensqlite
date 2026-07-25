@@ -38,8 +38,12 @@ fn format_rusqlite_value(value: rusqlite::types::Value) -> String {
     }
 }
 
-fn franken_rows(conn: &Connection, sql: &str) -> std::result::Result<Vec<Vec<String>>, String> {
+async fn franken_rows(
+    conn: &Connection,
+    sql: &str,
+) -> std::result::Result<Vec<Vec<String>>, String> {
     conn.query(sql)
+        .await
         .map_err(|error| format!("{error}"))
         .map(|rows| {
             rows.iter()

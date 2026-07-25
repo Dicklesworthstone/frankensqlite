@@ -15,13 +15,13 @@ use std::time::Instant;
 
 use fsqlite::Connection;
 
-fn measure(conn: &Connection, sql: &str, n: u64) -> f64 {
+async fn measure(conn: &Connection, sql: &str, n: u64) -> f64 {
     for _ in 0..50 {
-        let _ = conn.query(sql).unwrap();
+        let _ = conn.query(sql).await.unwrap();
     }
     let t = Instant::now();
     for _ in 0..n {
-        let _ = black_box(conn.query(black_box(sql)).unwrap());
+        let _ = black_box(conn.query(black_box(sql)).await.unwrap());
     }
     t.elapsed().as_nanos() as f64 / n as f64
 }
@@ -29,38 +29,45 @@ fn measure(conn: &Connection, sql: &str, n: u64) -> f64 {
 #[test]
 #[ignore = "profile; run under --profile release-perf"]
 fn minmax_index_bounded_or_scan() {
-    let conn = Connection::open(":memory:").expect("open");
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, w TEXT, u INTEGER);")
-        .unwrap();
-    // v indexed (int), w indexed (text). u NOT indexed (control). Pseudo-shuffled so nothing is
-    // pre-sorted by insert order.
-    conn.execute("CREATE INDEX idx_t_v ON t(v);").unwrap();
-    conn.execute("CREATE INDEX idx_t_w ON t(w);").unwrap();
-    for i in 1..=20_000_i64 {
-        let key = (i.wrapping_mul(2_654_435_761)) & 0xffff;
-        conn.execute(&format!(
-            "INSERT INTO t VALUES ({i}, {key}, 'w{key:05}', {key});"
-        ))
-        .unwrap();
-    }
-    let n = 5_000u64;
-    let cases = [
-        ("MIN(id) rowid (already O(1))", "SELECT MIN(id) FROM t"),
-        ("MAX(id) rowid (already O(1))", "SELECT MAX(id) FROM t"),
-        ("MIN(v) INT indexed", "SELECT MIN(v) FROM t"),
-        ("MAX(v) INT indexed", "SELECT MAX(v) FROM t"),
-        ("MIN(w) TEXT indexed", "SELECT MIN(w) FROM t"),
-        ("MAX(w) TEXT indexed", "SELECT MAX(w) FROM t"),
-        ("MIN(u) NOT indexed (scan)", "SELECT MIN(u) FROM t"),
-        ("MAX(u) NOT indexed (scan)", "SELECT MAX(u) FROM t"),
-    ];
-    eprintln!("\n########## bd-5310l MIN/MAX via secondary index: seek vs scan ##########");
-    for (label, sql) in cases {
-        eprintln!("  [{label:30}] {:9.1} ns/query", measure(&conn, sql, n));
-    }
-    eprintln!(
-        "  -> if MIN(v)/MAX(v) (indexed) ~= MIN(u)/MAX(u) (scan) and >> MIN(id) (rowid O(1)),\n     \
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.expect("open");
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, w TEXT, u INTEGER);")
+            .await
+            .unwrap();
+        // v indexed (int), w indexed (text). u NOT indexed (control). Pseudo-shuffled so nothing is
+        // pre-sorted by insert order.
+        conn.execute("CREATE INDEX idx_t_v ON t(v);").await.unwrap();
+        conn.execute("CREATE INDEX idx_t_w ON t(w);").await.unwrap();
+        for i in 1..=20_000_i64 {
+            let key = (i.wrapping_mul(2_654_435_761)) & 0xffff;
+            conn.execute(&format!(
+                "INSERT INTO t VALUES ({i}, {key}, 'w{key:05}', {key});"
+            ))
+            .await
+            .unwrap();
+        }
+        let n = 5_000u64;
+        let cases = [
+            ("MIN(id) rowid (already O(1))", "SELECT MIN(id) FROM t"),
+            ("MAX(id) rowid (already O(1))", "SELECT MAX(id) FROM t"),
+            ("MIN(v) INT indexed", "SELECT MIN(v) FROM t"),
+            ("MAX(v) INT indexed", "SELECT MAX(v) FROM t"),
+            ("MIN(w) TEXT indexed", "SELECT MIN(w) FROM t"),
+            ("MAX(w) TEXT indexed", "SELECT MAX(w) FROM t"),
+            ("MIN(u) NOT indexed (scan)", "SELECT MIN(u) FROM t"),
+            ("MAX(u) NOT indexed (scan)", "SELECT MAX(u) FROM t"),
+        ];
+        eprintln!("\n########## bd-5310l MIN/MAX via secondary index: seek vs scan ##########");
+        for (label, sql) in cases {
+            eprintln!(
+                "  [{label:30}] {:9.1} ns/query",
+                measure(&conn, sql, n).await
+            );
+        }
+        eprintln!(
+            "  -> if MIN(v)/MAX(v) (indexed) ~= MIN(u)/MAX(u) (scan) and >> MIN(id) (rowid O(1)),\n     \
          the index MIN/MAX seek is MISSING -> byte-exact lever."
-    );
-    eprintln!("########## end minmax index profile ##########\n");
+        );
+        eprintln!("########## end minmax index profile ##########\n");
+    });
 }

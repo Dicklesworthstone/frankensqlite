@@ -31,8 +31,9 @@ fn render(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+async fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     conn.query(sql)
+        .await
         .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"))
         .iter()
         .map(|row| row.values().iter().map(render).collect())
@@ -63,15 +64,20 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
     .collect()
 }
 
-fn has_op(conn: &Connection, sql: &str, want: &str) -> bool {
-    conn.query(&format!("EXPLAIN {sql}")).unwrap().iter().any(
-        |row| matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.to_string() == want),
-    )
+async fn has_op(conn: &Connection, sql: &str, want: &str) -> bool {
+    conn.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap()
+        .iter()
+        .any(
+            |row| matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.to_string() == want),
+        )
 }
 
 /// True if the plan opens an `OpenRead` whose P4 text equals `name` (an index name or the table name).
-fn opens(conn: &Connection, sql: &str, name: &str) -> bool {
+async fn opens(conn: &Connection, sql: &str, name: &str) -> bool {
     conn.query(&format!("EXPLAIN {sql}"))
+        .await
         .unwrap()
         .iter()
         .any(|row| {
@@ -97,11 +103,11 @@ const CORRECTNESS_ONLY: &[&str] = &[
     "SELECT COUNT(*) FROM w WHERE c IN ('k1','k2','k3','k4','k5','k6','k7','k8',NULL)",
 ];
 
-fn check_schema(label: &str, ddl: &[&str], seek_gated: bool) {
-    let f = Connection::open(":memory:").expect("frank");
+async fn check_schema(label: &str, ddl: &[&str], seek_gated: bool) {
+    let f = Connection::open(":memory:").await.expect("frank");
     let r = rusqlite::Connection::open_in_memory().expect("sqlite");
     for stmt in ddl {
-        f.execute(stmt).unwrap();
+        f.execute(stmt).await.unwrap();
         r.execute_batch(stmt).unwrap();
     }
     for i in 1..=3000_i64 {
@@ -112,29 +118,26 @@ fn check_schema(label: &str, ddl: &[&str], seek_gated: bool) {
             format!("'k{}'", i % 25)
         };
         let stmt = format!("INSERT INTO w VALUES ({i}, {c}, {});", i % 7);
-        f.execute(&stmt).unwrap();
+        f.execute(&stmt).await.unwrap();
         r.execute_batch(&stmt).unwrap();
     }
 
-    let cmp = |sql: &str| {
+    for sql in SEEKING.iter().chain(CORRECTNESS_ONLY) {
         assert_eq!(
-            frank_rows(&f, sql),
+            frank_rows(&f, sql).await,
             sqlite_rows(&r, sql),
             "[{label}] diverged: `{sql}`"
         );
-    };
-    for sql in SEEKING.iter().chain(CORRECTNESS_ONLY) {
-        cmp(sql);
     }
 
     if seek_gated {
         for sql in SEEKING {
             assert!(
-                has_op(&f, sql, "SeekGE") && opens(&f, sql, "idx_c"),
+                has_op(&f, sql, "SeekGE").await && opens(&f, sql, "idx_c").await,
                 "[{label}] threshold COUNT(*) IN-list must SeekGE idx_c: `{sql}`"
             );
             assert!(
-                !opens(&f, sql, "w"),
+                !opens(&f, sql, "w").await,
                 "[{label}] covering COUNT(*) IN-list must not open the table: `{sql}`"
             );
         }
@@ -143,23 +146,27 @@ fn check_schema(label: &str, ddl: &[&str], seek_gated: bool) {
 
 #[test]
 fn count_in_list_shadowed_index_matches_sqlite() {
-    // Single-column TEXT index only: control (already seeked before the fix).
-    check_schema(
-        "single idx_c",
-        &[
-            "CREATE TABLE w (id INTEGER PRIMARY KEY, c TEXT, d INTEGER);",
-            "CREATE INDEX idx_c ON w(c);",
-        ],
-        true,
-    );
-    // Composite index declared FIRST, shadowing idx_c: the regressing case.
-    check_schema(
-        "idx_cd shadows idx_c",
-        &[
-            "CREATE TABLE w (id INTEGER PRIMARY KEY, c TEXT, d INTEGER);",
-            "CREATE INDEX idx_cd ON w(c, d);",
-            "CREATE INDEX idx_c ON w(c);",
-        ],
-        true,
-    );
+    asupersync::test_utils::run_test(|| async {
+        // Single-column TEXT index only: control (already seeked before the fix).
+        check_schema(
+            "single idx_c",
+            &[
+                "CREATE TABLE w (id INTEGER PRIMARY KEY, c TEXT, d INTEGER);",
+                "CREATE INDEX idx_c ON w(c);",
+            ],
+            true,
+        )
+        .await;
+        // Composite index declared FIRST, shadowing idx_c: the regressing case.
+        check_schema(
+            "idx_cd shadows idx_c",
+            &[
+                "CREATE TABLE w (id INTEGER PRIMARY KEY, c TEXT, d INTEGER);",
+                "CREATE INDEX idx_cd ON w(c, d);",
+                "CREATE INDEX idx_c ON w(c);",
+            ],
+            true,
+        )
+        .await;
+    });
 }

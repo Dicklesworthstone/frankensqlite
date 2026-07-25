@@ -31,11 +31,13 @@ fn build_stock_database(dir: &tempfile::TempDir) -> std::path::PathBuf {
     path
 }
 
-fn assert_fsqlite_reads_rows(path: &std::path::Path) {
+async fn assert_fsqlite_reads_rows(path: &std::path::Path) {
     let conn = Connection::open(path.to_str().unwrap())
+        .await
         .expect("open must treat the unusable WAL sidecar as empty (GH #292)");
     let rows = conn
         .query("SELECT value FROM probe ORDER BY id")
+        .await
         .expect("query rows from the main database");
     let values: Vec<_> = rows.iter().map(|row| row.values()[0].clone()).collect();
     assert_eq!(
@@ -49,60 +51,64 @@ fn assert_fsqlite_reads_rows(path: &std::path::Path) {
 
 #[test]
 fn open_treats_garbage_wal_sidecar_as_empty() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let path = build_stock_database(&dir);
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = build_stock_database(&dir);
 
-    // A garbage sidecar (invalid magic) as left behind by an unrelated crash.
-    let wal_path = dir.path().join("gh292.db-wal");
-    std::fs::write(&wal_path, vec![0xA5_u8; 4096]).expect("plant garbage WAL sidecar");
+        // A garbage sidecar (invalid magic) as left behind by an unrelated crash.
+        let wal_path = dir.path().join("gh292.db-wal");
+        std::fs::write(&wal_path, vec![0xA5_u8; 4096]).expect("plant garbage WAL sidecar");
 
-    // Stock SQLite accepts this database as-is.
-    let stock = rusqlite::Connection::open(&path).expect("stock open");
-    let ok: String = stock
-        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .expect("stock integrity_check");
-    assert_eq!(
-        ok, "ok",
-        "oracle: stock SQLite treats the database as healthy"
-    );
-    drop(stock);
-    std::fs::write(&wal_path, vec![0xA5_u8; 4096]).expect("re-plant garbage WAL sidecar");
+        // Stock SQLite accepts this database as-is.
+        let stock = rusqlite::Connection::open(&path).expect("stock open");
+        let ok: String = stock
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("stock integrity_check");
+        assert_eq!(
+            ok, "ok",
+            "oracle: stock SQLite treats the database as healthy"
+        );
+        drop(stock);
+        std::fs::write(&wal_path, vec![0xA5_u8; 4096]).expect("re-plant garbage WAL sidecar");
 
-    assert_fsqlite_reads_rows(&path);
+        assert_fsqlite_reads_rows(&path).await;
+    });
 }
 
 #[test]
 fn open_treats_checksum_flipped_wal_header_as_empty() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let path = build_stock_database(&dir);
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = build_stock_database(&dir);
 
-    // The torn-header shape from the issue: a `-wal` whose header checksum
-    // does not match its contents. Stock SQLite drops such a WAL silently
-    // (treat-as-empty), so FrankenSQLite must too.
-    let wal_path = dir.path().join("gh292.db-wal");
-    // A stock-shaped header (valid magic, format version, page size) whose
-    // checksum words do not match the covered bytes.
-    let mut header = vec![0_u8; 32];
-    header[..4].copy_from_slice(&0x377f_0682_u32.to_be_bytes()); // magic (LE checksums)
-    header[4..8].copy_from_slice(&3_007_000_u32.to_be_bytes()); // format version
-    header[8..12].copy_from_slice(&4096_u32.to_be_bytes()); // page size
-    header[24..28].copy_from_slice(&0xDEAD_BEEF_u32.to_be_bytes()); // checksum-1: wrong
-    std::fs::write(&wal_path, header).expect("plant checksum-mismatched WAL header");
+        // The torn-header shape from the issue: a `-wal` whose header checksum
+        // does not match its contents. Stock SQLite drops such a WAL silently
+        // (treat-as-empty), so FrankenSQLite must too.
+        let wal_path = dir.path().join("gh292.db-wal");
+        // A stock-shaped header (valid magic, format version, page size) whose
+        // checksum words do not match the covered bytes.
+        let mut header = vec![0_u8; 32];
+        header[..4].copy_from_slice(&0x377f_0682_u32.to_be_bytes()); // magic (LE checksums)
+        header[4..8].copy_from_slice(&3_007_000_u32.to_be_bytes()); // format version
+        header[8..12].copy_from_slice(&4096_u32.to_be_bytes()); // page size
+        header[24..28].copy_from_slice(&0xDEAD_BEEF_u32.to_be_bytes()); // checksum-1: wrong
+        std::fs::write(&wal_path, header).expect("plant checksum-mismatched WAL header");
 
-    // Oracle: stock SQLite still opens and reads the database.
-    let stock = rusqlite::Connection::open(&path).expect("stock open with bad-checksum WAL");
-    let n: i64 = stock
-        .query_row("SELECT COUNT(*) FROM probe", [], |row| row.get(0))
-        .expect("stock read");
-    assert_eq!(n, 2);
-    drop(stock);
-    // Re-plant: the stock open may have rewritten/removed the sidecar.
-    let mut header = vec![0_u8; 32];
-    header[..4].copy_from_slice(&0x377f_0682_u32.to_be_bytes());
-    header[4..8].copy_from_slice(&3_007_000_u32.to_be_bytes());
-    header[8..12].copy_from_slice(&4096_u32.to_be_bytes());
-    header[24..28].copy_from_slice(&0xDEAD_BEEF_u32.to_be_bytes());
-    std::fs::write(&wal_path, header).expect("re-plant checksum-mismatched WAL header");
+        // Oracle: stock SQLite still opens and reads the database.
+        let stock = rusqlite::Connection::open(&path).expect("stock open with bad-checksum WAL");
+        let n: i64 = stock
+            .query_row("SELECT COUNT(*) FROM probe", [], |row| row.get(0))
+            .expect("stock read");
+        assert_eq!(n, 2);
+        drop(stock);
+        // Re-plant: the stock open may have rewritten/removed the sidecar.
+        let mut header = vec![0_u8; 32];
+        header[..4].copy_from_slice(&0x377f_0682_u32.to_be_bytes());
+        header[4..8].copy_from_slice(&3_007_000_u32.to_be_bytes());
+        header[8..12].copy_from_slice(&4096_u32.to_be_bytes());
+        header[24..28].copy_from_slice(&0xDEAD_BEEF_u32.to_be_bytes());
+        std::fs::write(&wal_path, header).expect("re-plant checksum-mismatched WAL header");
 
-    assert_fsqlite_reads_rows(&path);
+        assert_fsqlite_reads_rows(&path).await;
+    });
 }

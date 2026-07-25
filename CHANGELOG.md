@@ -17,12 +17,72 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
-## [0.1.19] -- 2026-07-19 (bounded FTS repair and TEMP-page integrity)
+## [0.2.0] -- 2026-07-25 (async storage stack, skip-scan acceleration, durable WAL certificates)
 
-Full-workspace lockstep release (`0.1.18 -> 0.1.19`). Semver-compatible 0.1.x;
-no breaking API changes.
+Full-workspace lockstep release (`0.1.18 -> 0.2.0`).
+
+> **BREAKING.** This release makes the storage stack `async` end to end, which
+> changes public signatures. Under Cargo's 0.x rules the minor version is the
+> compatibility axis, so this ships as `0.2.0` rather than `0.1.19`: a caller
+> pinning `fsqlite = "0.1"` keeps the synchronous 0.1.18 API and is not
+> upgraded silently. See **Breaking changes** below for the migration.
+
+### Breaking changes
+
+- **The storage stack is `async` end to end.** `Connection::open` and its
+  `open_existing` / `open_with_page_size` / `open_schema_only` / identity and
+  reserved variants, along with `execute`, `execute_batch`, `query`,
+  `query_row`, and `prepare`, are now `async fn`. Call sites add `.await`.
+  FrankenSQLite still never builds a runtime of its own -- the `Cx` and the
+  executor come from the caller, per the asupersync contract.
+- **`compat::Transaction` is no longer RAII.** Dropping a transaction without
+  finalizing it previously rolled back; it now leaves the transaction open,
+  because `Drop::drop` cannot await and this crate will not build a runtime to
+  bridge that. Callers must explicitly `commit().await` or `rollback().await`.
+  This is the one silent behavior change in the release: code that relied on
+  drop-rollback will now leak an open transaction rather than fail loudly.
+- **The sealed storage traits are no longer dyn-compatible.** `MvccPager`,
+  `TransactionHandle`, and the neighbouring pager traits return
+  `impl Future` (RPITIT) instead of being `async_trait`-boxed, which keeps the
+  hot path allocation-free but means `&dyn MvccPager<Txn = _>` no longer
+  compiles. Use a generic bound (`fn f<P: MvccPager>(p: &P)`) instead of a
+  trait object. These traits are sealed, so this affects call sites rather
+  than implementors.
+- Tests and doc examples that drive the engine need an executor.
+  `asupersync::test_utils::run_test(|| async { ... })` is the supported entry
+  point and is available behind asupersync's `test-internals` feature.
 
 ### Added
+
+- **MySQL-style skip scan.** Composite indexes are now usable when the leading
+  column has no equality constraint, by iterating its distinct values. Covers
+  `WHERE b = <const>` on a 2-column index, `IS NULL`, inclusive and exclusive
+  lower bounds, no-lower ranges (`b < k` / `b <= k`), general ranges, and
+  indexes wider than two columns. `SKIP_SCAN_WALK_PROBES` adaptively walks
+  before seeking so the optimization degrades gracefully on low-cardinality
+  leading columns.
+- Skip scans stream a satisfied `ORDER BY` without materializing a sorter, and
+  stream `LIMIT`/`OFFSET` on top of that ordering.
+- **Batched async VFS I/O.** New batched read/write traits with an io_uring
+  backend and fault-injection coverage, multiplexed through canonical
+  descriptors with preserved uring-to-Unix fallback semantics.
+- **Durable-certificate parallel WAL publication**, including a db-fsync
+  recovery fence before WAL truncation over an async checkpoint target.
+- **Durable `.fsqlite-history` commit-snapshot sidecar** for MVCC.
+- `Connection::open_existing_schema_only` and identity/environment variants
+  provide an existing-only, writable database open that loads schema metadata
+  without hydrating table rows into the compatibility `MemDatabase`. This is
+  the bounded-memory entry point for repairing or incrementally updating very
+  large SQLite-compatible databases.
+
+### Performance
+
+- `SELECT DISTINCT` is served by an adaptive loose/skip index scan, extended to
+  composite and multi-column indexes.
+- Composite indexes are seeked directly for a pure range on their leading term,
+  with a guard for empty-prefix aggregate composite-range `IdxGT`.
+
+### Fixed
 
 - `Connection::open_existing_schema_only` and identity/environment variants
   provide an existing-only, writable database open that loads schema metadata
@@ -55,11 +115,51 @@ no breaking API changes.
   retain the correct shadow layout and remain searchable across a second open,
   fixing CASS legacy-schema repair without weakening strict rejection of a
   genuinely missing content shadow.
+- **`DROP COLUMN` hardening.** Storage rewrites are now atomic, foreign-key
+  ownership survives the rewrite, view and trigger dependencies are validated
+  before the drop proceeds, and dependency validation no longer accepts
+  unrelated objects.
+- Delete cascades are ordered after parent removal rather than interleaved
+  with it.
+- `WITHOUT ROWID` index locators are preserved across schema reload.
+- `REPLACE` now removes victim rows from *all* indexes, not just the one that
+  detected the conflict.
+- `VACUUM INTO` preserves `UNIQUE` constraints.
+- An invalid WAL header is treated as an empty WAL, matching stock SQLite
+  ([#292](https://github.com/Dicklesworthstone/frankensqlite/issues/292)).
+- Explicit `INDEXED BY` is honored in the composite prefix-range seek
+  ([#291](https://github.com/Dicklesworthstone/frankensqlite/issues/291)).
+- Prepared indexed-equality caches are invalidated on write commit and on
+  `MemDatabase` reload, so a prepared lookup cannot serve a stale row.
+- Prepared TEMP inserts route to the TEMP namespace
+  ([#290](https://github.com/Dicklesworthstone/frankensqlite/issues/290)).
+- Cold MVCC history index lookups are bounded.
+- Storage-engine durability, read-only safety, and MVCC shared-memory handling
+  were hardened following an adversarial review of the durability wave.
+
+### Dependencies
+
+- `ftui` 0.4.1 -> 0.5.0, `chacha20poly1305` 0.10 -> 0.11 (RustCrypto `aead`
+  0.6 / `hybrid-array`), `criterion` 0.7 -> 0.8, `jsonschema` 0.46.5 -> 0.48.5,
+  and a full `Cargo.lock` refresh moving every other dependency to its latest
+  semver-compatible release. `asupersync` remains 0.3.9 with
+  `default-features = false`, so no tokio-ecosystem crate enters the graph.
+
+### Packaging
+
+- `fsqlite-pager`'s dev-dependency on `fsqlite-mvcc` was pinned to an exact
+  version by the previous lockstep bump. Because `fsqlite-mvcc` depends on
+  `fsqlite-pager`, pager publishes first and that pin could not resolve against
+  crates.io, which would have failed the release. Restored to a permissive
+  range; it is the only forward dev-edge in the workspace.
+- `Opcode::COUNT` is documented as the exclusive upper bound on discriminants
+  (`1..COUNT`), and its unit test, which still asserted the pre-`cc17ee46`
+  value, was corrected.
 
 ### Release
 
 - All publishable `fsqlite` / `fsqlite-*` crates are released in lockstep at
-  `0.1.19`. Native artifacts are built and signed outside GitHub Actions for
+  `0.2.0`. Native artifacts are built and signed outside GitHub Actions for
   Linux x86-64 and arm64, macOS x86-64 and arm64, and Windows x86-64.
 
 ## [0.1.18] -- 2026-07-18 (streaming composite-index count semijoins)

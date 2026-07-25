@@ -27,10 +27,11 @@ const CASS_FTS_SQL: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USIN
     created_at UNINDEXED, \
     content='', tokenize='porter')";
 
-fn match_rowids(conn: &Connection, term: &str) -> Vec<i64> {
+async fn match_rowids(conn: &Connection, term: &str) -> Vec<i64> {
     conn.query(&format!(
         "SELECT rowid FROM fts_messages WHERE fts_messages MATCH '{term}' ORDER BY rowid"
     ))
+    .await
     .expect("MATCH query")
     .iter()
     .map(|r| match &r.values()[0] {
@@ -40,7 +41,7 @@ fn match_rowids(conn: &Connection, term: &str) -> Vec<i64> {
     .collect()
 }
 
-fn insert_doc(conn: &Connection, rowid: i64, content: &str, title: &str) {
+async fn insert_doc(conn: &Connection, rowid: i64, content: &str, title: &str) {
     conn.execute_with_params(
         "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) \
          VALUES (?1, ?2, ?3, 'codex', '/ws', '/ws/s.jsonl', '0')",
@@ -50,52 +51,59 @@ fn insert_doc(conn: &Connection, rowid: i64, content: &str, title: &str) {
             SqliteValue::Text(title.into()),
         ],
     )
+    .await
     .expect("insert contentless fts row");
 }
 
 #[test]
 fn contentless_fts_reopen_then_incremental_insert() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let path = tmp.path().to_str().unwrap().to_owned();
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_owned();
 
-    // --- Phase 1: create + seed, then close (persist segments to disk). ---
-    {
-        let conn = Connection::open(&path).unwrap();
-        conn.execute("PRAGMA journal_mode = WAL;").unwrap();
-        conn.execute(CASS_FTS_SQL).expect("create contentless fts5");
-        insert_doc(&conn, 1, "authentication error in login flow", "auth bug");
-        insert_doc(&conn, 2, "database migration applied cleanly", "db notes");
-        assert_eq!(match_rowids(&conn, "authentication"), vec![1]);
-    }
+        // --- Phase 1: create + seed, then close (persist segments to disk). ---
+        {
+            let conn = Connection::open(&path).await.unwrap();
+            conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+            conn.execute(CASS_FTS_SQL)
+                .await
+                .expect("create contentless fts5");
+            insert_doc(&conn, 1, "authentication error in login flow", "auth bug").await;
+            insert_doc(&conn, 2, "database migration applied cleanly", "db notes").await;
+            assert_eq!(match_rowids(&conn, "authentication").await, vec![1]);
+        }
 
-    // --- Phase 2: reopen (Bug 1 — open-validation must accept content=''). ---
-    {
-        let conn = Connection::open(&path).expect("reopen contentless fts5 db");
-        // Reads must still work against the persisted segments.
-        assert_eq!(
-            match_rowids(&conn, "authentication"),
-            vec![1],
-            "reopened contentless table lost its persisted postings"
-        );
-        assert_eq!(match_rowids(&conn, "migration"), vec![2]);
+        // --- Phase 2: reopen (Bug 1 — open-validation must accept content=''). ---
+        {
+            let conn = Connection::open(&path)
+                .await
+                .expect("reopen contentless fts5 db");
+            // Reads must still work against the persisted segments.
+            assert_eq!(
+                match_rowids(&conn, "authentication").await,
+                vec![1],
+                "reopened contentless table lost its persisted postings"
+            );
+            assert_eq!(match_rowids(&conn, "migration").await, vec![2]);
 
-        // --- Phase 3: incremental catch-up insert (Bug 2 — reopen-mutate). ---
-        insert_doc(&conn, 3, "authentication catchup after reopen", "catchup");
-        assert_eq!(
-            match_rowids(&conn, "catchup"),
-            vec![3],
-            "new row not searchable after incremental insert into reopened table"
-        );
-        // Old rows must remain searchable (the append must not drop segments).
-        assert_eq!(match_rowids(&conn, "authentication"), vec![1, 3]);
-        assert_eq!(match_rowids(&conn, "migration"), vec![2]);
-    }
+            // --- Phase 3: incremental catch-up insert (Bug 2 — reopen-mutate). ---
+            insert_doc(&conn, 3, "authentication catchup after reopen", "catchup").await;
+            assert_eq!(
+                match_rowids(&conn, "catchup").await,
+                vec![3],
+                "new row not searchable after incremental insert into reopened table"
+            );
+            // Old rows must remain searchable (the append must not drop segments).
+            assert_eq!(match_rowids(&conn, "authentication").await, vec![1, 3]);
+            assert_eq!(match_rowids(&conn, "migration").await, vec![2]);
+        }
 
-    // --- Phase 4: reopen again; everything persisted and searchable. ---
-    {
-        let conn = Connection::open(&path).expect("second reopen");
-        assert_eq!(match_rowids(&conn, "authentication"), vec![1, 3]);
-        assert_eq!(match_rowids(&conn, "migration"), vec![2]);
-        assert_eq!(match_rowids(&conn, "catchup"), vec![3]);
-    }
+        // --- Phase 4: reopen again; everything persisted and searchable. ---
+        {
+            let conn = Connection::open(&path).await.expect("second reopen");
+            assert_eq!(match_rowids(&conn, "authentication").await, vec![1, 3]);
+            assert_eq!(match_rowids(&conn, "migration").await, vec![2]);
+            assert_eq!(match_rowids(&conn, "catchup").await, vec![3]);
+        }
+    });
 }

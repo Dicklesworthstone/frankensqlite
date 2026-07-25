@@ -5,37 +5,45 @@
 use fsqlite::Connection;
 use std::hint::black_box;
 use std::time::Instant;
-fn measure(conn: &Connection, sql: &str, n: u64) -> f64 {
+async fn measure(conn: &Connection, sql: &str, n: u64) -> f64 {
     for _ in 0..50 {
-        let _ = conn.query(sql).unwrap();
+        let _ = conn.query(sql).await.unwrap();
     }
     let t = Instant::now();
     for _ in 0..n {
-        let _ = black_box(conn.query(black_box(sql)).unwrap());
+        let _ = black_box(conn.query(black_box(sql)).await.unwrap());
     }
     t.elapsed().as_nanos() as f64 / n as f64
 }
 #[test]
 #[ignore = "profile; run under --profile release-perf"]
 fn minmax_desc_seek_or_scan() {
-    let conn = Connection::open(":memory:").expect("open");
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, u INTEGER);")
-        .unwrap();
-    conn.execute("CREATE INDEX idx_v_desc ON t(v DESC);")
-        .unwrap();
-    for i in 1..=20_000_i64 {
-        let v = (i.wrapping_mul(2_654_435_761) >> 8) & 0xffff;
-        conn.execute(&format!("INSERT INTO t VALUES ({i}, {v}, {v});"))
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.expect("open");
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, u INTEGER);")
+            .await
             .unwrap();
-    }
-    let n = 5_000u64;
-    for (label, sql) in [
-        ("MAX(v) [DESC index]", "SELECT MAX(v) FROM t"),
-        ("MIN(v) [DESC index]", "SELECT MIN(v) FROM t"),
-        ("MAX(u) NOT indexed", "SELECT MAX(u) FROM t"),
-        ("MIN(u) NOT indexed", "SELECT MIN(u) FROM t"),
-    ] {
-        eprintln!("  [{label:24}] {:9.1} ns/query", measure(&conn, sql, n));
-    }
-    eprintln!("########## end desc profile ##########");
+        conn.execute("CREATE INDEX idx_v_desc ON t(v DESC);")
+            .await
+            .unwrap();
+        for i in 1..=20_000_i64 {
+            let v = (i.wrapping_mul(2_654_435_761) >> 8) & 0xffff;
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, {v}, {v});"))
+                .await
+                .unwrap();
+        }
+        let n = 5_000u64;
+        for (label, sql) in [
+            ("MAX(v) [DESC index]", "SELECT MAX(v) FROM t"),
+            ("MIN(v) [DESC index]", "SELECT MIN(v) FROM t"),
+            ("MAX(u) NOT indexed", "SELECT MAX(u) FROM t"),
+            ("MIN(u) NOT indexed", "SELECT MIN(u) FROM t"),
+        ] {
+            eprintln!(
+                "  [{label:24}] {:9.1} ns/query",
+                measure(&conn, sql, n).await
+            );
+        }
+        eprintln!("########## end desc profile ##########");
+    });
 }

@@ -47,6 +47,9 @@ asupersync.workspace = true
 parking_lot = { workspace = true }
 
 [dev-dependencies]
+# The storage stack is `async`, so inline tests must drive a runtime via
+# `asupersync::test_utils::run_test`, which lives behind `test-internals`.
+asupersync = { workspace = true, features = ["test-internals"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 # Dev-only, and fsqlite-mvcc depends on fsqlite-pager — so pager must publish

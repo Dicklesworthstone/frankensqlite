@@ -6,8 +6,8 @@
 #   curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/frankensqlite/main/install.sh?$(date +%s)" | bash
 #
 # Examples:
-#   bash install.sh --version v0.1.19
-#   bash install.sh --offline ./fsqlite-0.1.19-linux_amd64.tar.gz --checksum SHA256
+#   bash install.sh --version v0.2.0
+#   bash install.sh --offline ./fsqlite-0.2.0-linux_amd64.tar.gz --checksum SHA256
 #
 set -euo pipefail
 umask 022

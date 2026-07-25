@@ -17,12 +17,33 @@ fn render(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+async fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     conn.query(sql)
+        .await
         .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"))
         .iter()
         .map(|row| row.values().iter().map(render).collect())
         .collect()
+}
+
+/// True when the EXPLAIN of `sql` contains the given opcode name.
+async fn has_op(conn: &Connection, sql: &str, want: &str) -> bool {
+    conn.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap()
+        .iter()
+        .any(
+            |row| matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.to_string() == want),
+        )
+}
+
+/// Compare frank and C SQLite as SORTED SETS.
+async fn cmp_sorted(f: &Connection, r: &rusqlite::Connection, sql: &str) {
+    let mut a = frank_rows(f, sql).await;
+    let mut b = sqlite_rows(r, sql);
+    a.sort();
+    b.sort();
+    assert_eq!(a, b, "diverged: `{sql}`");
 }
 
 fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
@@ -48,65 +69,60 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
 
 #[test]
 fn composite_prefix_range_residual_matches_sqlite() {
-    let f = Connection::open(":memory:").expect("frank");
-    let r = rusqlite::Connection::open_in_memory().expect("sqlite");
-    for stmt in [
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);",
-        "CREATE INDEX idx_ab ON t(a, b);",
-    ] {
-        f.execute(stmt).unwrap();
-        r.execute_batch(stmt).unwrap();
-    }
-    for i in 1..=2000_i64 {
-        let a = i % 10;
-        let b = i % 25;
-        let c = i % 4;
-        let stmt = format!("INSERT INTO t VALUES ({i}, {a}, {b}, {c});");
-        f.execute(&stmt).unwrap();
-        r.execute_batch(&stmt).unwrap();
-    }
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.expect("frank");
+        let r = rusqlite::Connection::open_in_memory().expect("sqlite");
+        for stmt in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);",
+            "CREATE INDEX idx_ab ON t(a, b);",
+        ] {
+            f.execute(stmt).await.unwrap();
+            r.execute_batch(stmt).unwrap();
+        }
+        for i in 1..=2000_i64 {
+            let a = i % 10;
+            let b = i % 25;
+            let c = i % 4;
+            let stmt = format!("INSERT INTO t VALUES ({i}, {a}, {b}, {c});");
+            f.execute(&stmt).await.unwrap();
+            r.execute_batch(&stmt).unwrap();
+        }
 
-    // Compare as SORTED SETS: no ORDER BY (so the composite prefix-range SEEK is actually taken — an
-    // `ORDER BY id` it can't satisfy would decline the seek and hide the bug), sort to ignore the
-    // seek's (b, rowid) emission order.
-    let cmp = |sql: &str| {
-        let mut a = frank_rows(&f, sql);
-        let mut b = sqlite_rows(&r, sql);
-        a.sort();
-        b.sort();
-        assert_eq!(a, b, "diverged: `{sql}`");
-    };
-    for sql in [
-        // Plain prefix+range (no residual) — should seek and match.
-        "SELECT id FROM t WHERE a = 5 AND b > 10",
-        // Residual on a NON-key column: `c = 1` must NOT be dropped.
-        "SELECT id FROM t WHERE a = 5 AND b > 10 AND c = 1",
-        "SELECT id FROM t WHERE a = 3 AND b >= 5 AND c = 2",
-        "SELECT id FROM t WHERE a = 7 AND b BETWEEN 2 AND 20 AND c = 0",
-        "SELECT id FROM t WHERE a = 2 AND b < 15 AND c = 3",
-        // Residual that references the range column again with a different op.
-        "SELECT id FROM t WHERE a = 4 AND b > 3 AND c <> 1",
-        // Also select c so a dropped `c` predicate shows as wrong rows even when ids happen to align.
-        "SELECT id, c FROM t WHERE a = 5 AND b > 10 AND c = 1",
-    ] {
-        cmp(sql);
-    }
+        // Compare as SORTED SETS: no ORDER BY (so the composite prefix-range SEEK is actually taken — an
+        // `ORDER BY id` it can't satisfy would decline the seek and hide the bug), sort to ignore the
+        // seek's (b, rowid) emission order.
+        for sql in [
+            // Plain prefix+range (no residual) — should seek and match.
+            "SELECT id FROM t WHERE a = 5 AND b > 10",
+            // Residual on a NON-key column: `c = 1` must NOT be dropped.
+            "SELECT id FROM t WHERE a = 5 AND b > 10 AND c = 1",
+            "SELECT id FROM t WHERE a = 3 AND b >= 5 AND c = 2",
+            "SELECT id FROM t WHERE a = 7 AND b BETWEEN 2 AND 20 AND c = 0",
+            "SELECT id FROM t WHERE a = 2 AND b < 15 AND c = 3",
+            // Residual that references the range column again with a different op.
+            "SELECT id FROM t WHERE a = 4 AND b > 3 AND c <> 1",
+            // Also select c so a dropped `c` predicate shows as wrong rows even when ids happen to align.
+            "SELECT id, c FROM t WHERE a = 5 AND b > 10 AND c = 1",
+        ] {
+            cmp_sorted(&f, &r, sql).await;
+        }
 
-    // The no-residual case must STILL take the composite prefix-range seek (guard must not
-    // over-decline): its stop opcode is IdxGT. The residual case must NOT seek (declined to a scan).
-    let has_op = |sql: &str, want: &str| {
-        f.query(&format!("EXPLAIN {sql}")).unwrap().iter().any(
-            |row| matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.to_string() == want),
-        )
-    };
-    assert!(
-        has_op("SELECT id FROM t WHERE a = 5 AND b > 10", "IdxGT"),
-        "no-residual composite prefix+range must still seek (IdxGT)"
-    );
-    assert!(
-        !has_op("SELECT id FROM t WHERE a = 5 AND b > 10 AND c = 1", "IdxGT"),
-        "residual `c = 1` must decline the seek (fall to a scan that enforces c)"
-    );
+        // The no-residual case must STILL take the composite prefix-range seek (guard must not
+        // over-decline): its stop opcode is IdxGT. The residual case must NOT seek (declined to a scan).
+        assert!(
+            has_op(&f, "SELECT id FROM t WHERE a = 5 AND b > 10", "IdxGT").await,
+            "no-residual composite prefix+range must still seek (IdxGT)"
+        );
+        assert!(
+            !has_op(
+                &f,
+                "SELECT id FROM t WHERE a = 5 AND b > 10 AND c = 1",
+                "IdxGT"
+            )
+            .await,
+            "residual `c = 1` must decline the seek (fall to a scan that enforces c)"
+        );
+    });
 }
 
 /// bd-bn45n: a PURE range on the LEADING key term of a composite-only index (`WHERE a <range>` on
@@ -116,69 +132,59 @@ fn composite_prefix_range_residual_matches_sqlite() {
 /// implementation-defined). Residual predicates on non-key columns still decline to a scan.
 #[test]
 fn composite_pure_leading_range_matches_sqlite() {
-    let f = Connection::open(":memory:").expect("frank");
-    let r = rusqlite::Connection::open_in_memory().expect("sqlite");
-    for stmt in [
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);",
-        "CREATE INDEX idx_ab ON t(a, b);",
-    ] {
-        f.execute(stmt).unwrap();
-        r.execute_batch(stmt).unwrap();
-    }
-    for i in 1..=3000_i64 {
-        // A NULL run in `a` (NULLs must be excluded by any `a <range>`, matching C SQLite).
-        let a = if i % 47 == 0 {
-            "NULL".to_owned()
-        } else {
-            (i % 12).to_string()
-        };
-        let stmt = format!("INSERT INTO t VALUES ({i}, {a}, {}, {});", i % 25, i % 4);
-        f.execute(&stmt).unwrap();
-        r.execute_batch(&stmt).unwrap();
-    }
-    let cmp = |sql: &str| {
-        let mut a = frank_rows(&f, sql);
-        let mut b = sqlite_rows(&r, sql);
-        a.sort();
-        b.sort();
-        assert_eq!(a, b, "diverged: `{sql}`");
-    };
-    for sql in [
-        // Every bound flavour on the leading term.
-        "SELECT id FROM t WHERE a < 5",
-        "SELECT id FROM t WHERE a <= 4",
-        "SELECT id FROM t WHERE a > 3",
-        "SELECT id FROM t WHERE a >= 7",
-        "SELECT id FROM t WHERE a BETWEEN 2 AND 8",
-        "SELECT id FROM t WHERE a > 2 AND a < 9",
-        // Covering output (a, b are both in the index).
-        "SELECT a, b FROM t WHERE a < 5",
-        // Non-covering output (c requires a table lookup).
-        "SELECT id, c FROM t WHERE a >= 6",
-        // Residual on a non-key column must NOT be dropped (falls to a scan enforcing c).
-        "SELECT id FROM t WHERE a < 5 AND c = 1",
-    ] {
-        cmp(sql);
-    }
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.expect("frank");
+        let r = rusqlite::Connection::open_in_memory().expect("sqlite");
+        for stmt in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);",
+            "CREATE INDEX idx_ab ON t(a, b);",
+        ] {
+            f.execute(stmt).await.unwrap();
+            r.execute_batch(stmt).unwrap();
+        }
+        for i in 1..=3000_i64 {
+            // A NULL run in `a` (NULLs must be excluded by any `a <range>`, matching C SQLite).
+            let a = if i % 47 == 0 {
+                "NULL".to_owned()
+            } else {
+                (i % 12).to_string()
+            };
+            let stmt = format!("INSERT INTO t VALUES ({i}, {a}, {}, {});", i % 25, i % 4);
+            f.execute(&stmt).await.unwrap();
+            r.execute_batch(&stmt).unwrap();
+        }
+        for sql in [
+            // Every bound flavour on the leading term.
+            "SELECT id FROM t WHERE a < 5",
+            "SELECT id FROM t WHERE a <= 4",
+            "SELECT id FROM t WHERE a > 3",
+            "SELECT id FROM t WHERE a >= 7",
+            "SELECT id FROM t WHERE a BETWEEN 2 AND 8",
+            "SELECT id FROM t WHERE a > 2 AND a < 9",
+            // Covering output (a, b are both in the index).
+            "SELECT a, b FROM t WHERE a < 5",
+            // Non-covering output (c requires a table lookup).
+            "SELECT id, c FROM t WHERE a >= 6",
+            // Residual on a non-key column must NOT be dropped (falls to a scan enforcing c).
+            "SELECT id FROM t WHERE a < 5 AND c = 1",
+        ] {
+            cmp_sorted(&f, &r, sql).await;
+        }
 
-    let has_op = |sql: &str, want: &str| {
-        f.query(&format!("EXPLAIN {sql}")).unwrap().iter().any(
-            |row| matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.to_string() == want),
-        )
-    };
-    // The pure leading range must now SEEK the composite index (SeekGE), not full-scan.
-    assert!(
-        has_op("SELECT id FROM t WHERE a < 5", "SeekGE"),
-        "pure leading range `a < 5` must seek idx_ab (SeekGE), not full-scan"
-    );
-    // Empty-prefix seek uses no prefix IdxGT (range bounds terminate the walk).
-    assert!(
-        !has_op("SELECT id FROM t WHERE a < 5", "IdxGT"),
-        "empty-prefix leading-range seek must not emit a prefix IdxGT"
-    );
-    // A residual on a non-key column must still decline to a scan (residual safety).
-    assert!(
-        !has_op("SELECT id FROM t WHERE a < 5 AND c = 1", "SeekGE"),
-        "residual `c = 1` must decline the leading-range seek"
-    );
+        // The pure leading range must now SEEK the composite index (SeekGE), not full-scan.
+        assert!(
+            has_op(&f, "SELECT id FROM t WHERE a < 5", "SeekGE").await,
+            "pure leading range `a < 5` must seek idx_ab (SeekGE), not full-scan"
+        );
+        // Empty-prefix seek uses no prefix IdxGT (range bounds terminate the walk).
+        assert!(
+            !has_op(&f, "SELECT id FROM t WHERE a < 5", "IdxGT").await,
+            "empty-prefix leading-range seek must not emit a prefix IdxGT"
+        );
+        // A residual on a non-key column must still decline to a scan (residual safety).
+        assert!(
+            !has_op(&f, "SELECT id FROM t WHERE a < 5 AND c = 1", "SeekGE").await,
+            "residual `c = 1` must decline the leading-range seek"
+        );
+    });
 }

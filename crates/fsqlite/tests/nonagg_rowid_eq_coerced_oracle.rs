@@ -7,8 +7,9 @@
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 
-fn rows_f(c: &Connection, sql: &str) -> Vec<i64> {
+async fn rows_f(c: &Connection, sql: &str) -> Vec<i64> {
     c.query(sql)
+        .await
         .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"))
         .iter()
         .map(|r| match r.values().first() {
@@ -24,64 +25,71 @@ fn rows_r(c: &rusqlite::Connection, sql: &str) -> Vec<i64> {
     out.map(Result::unwrap).collect()
 }
 
-fn has_op(c: &Connection, sql: &str, prefix: &str) -> bool {
+async fn has_op(c: &Connection, sql: &str, prefix: &str) -> bool {
     c.query(&format!("EXPLAIN {sql}"))
+        .await
         .unwrap()
         .iter()
         .any(|row| matches!(row.values().get(1), Some(SqliteValue::Text(o)) if o.to_string().starts_with(prefix)))
 }
 
-fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, no_rewind: Option<bool>) {
+async fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, no_rewind: Option<bool>) {
     match no_rewind {
         Some(true) => assert!(
-            !has_op(f, sql, "Rewind"),
+            !has_op(f, sql, "Rewind").await,
             "rowid-eq-coerced lookup must not full-scan (Rewind): `{sql}`"
         ),
         Some(false) => assert!(
-            has_op(f, sql, "Rewind"),
+            has_op(f, sql, "Rewind").await,
             "control should full-scan (Rewind): `{sql}`"
         ),
         None => {}
     }
-    assert_eq!(rows_f(f, sql), rows_r(r, sql), "rows diverged for `{sql}`");
+    assert_eq!(
+        rows_f(f, sql).await,
+        rows_r(r, sql),
+        "rows diverged for `{sql}`"
+    );
 }
 
 #[test]
 fn nonagg_rowid_eq_coerced_matches_sqlite() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    let schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);";
-    f.execute(schema).unwrap();
-    r.execute_batch(schema).unwrap();
-    for i in 1..=300_i64 {
-        let s = format!("INSERT INTO t VALUES ({i}, {});", i * 10);
-        f.execute(&s).unwrap();
-        r.execute_batch(&s).unwrap();
-    }
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);";
+        f.execute(schema).await.unwrap();
+        r.execute_batch(schema).unwrap();
+        for i in 1..=300_i64 {
+            let s = format!("INSERT INTO t VALUES ({i}, {});", i * 10);
+            f.execute(&s).await.unwrap();
+            r.execute_batch(&s).unwrap();
+        }
 
-    // Integer literal still seeks and is byte-identical (no MustBeInt).
-    cmp(&f, &r, "SELECT x FROM t WHERE id = 5", Some(true)); // -> [50]
+        // Integer literal still seeks and is byte-identical (no MustBeInt).
+        cmp(&f, &r, "SELECT x FROM t WHERE id = 5", Some(true)).await; // -> [50]
 
-    // Real / text constants seek via MustBeInt coercion; result byte-exact.
-    cmp(&f, &r, "SELECT x FROM t WHERE id = 5.0", Some(true)); // exact real -> [50]
-    cmp(&f, &r, "SELECT x FROM t WHERE id = 2.5", Some(true)); // non-exact real -> [] (was wrongly [20])
-    cmp(&f, &r, "SELECT x FROM t WHERE id = '5'", Some(true)); // numeric text -> [50]
-    cmp(&f, &r, "SELECT x FROM t WHERE id = 'abc'", Some(true)); // non-numeric text -> []
-    cmp(&f, &r, "SELECT x FROM t WHERE id = 300.0", Some(true)); // last row -> [3000]
-    cmp(&f, &r, "SELECT x FROM t WHERE id = 99999.0", Some(true)); // exact real, absent -> []
-    cmp(&f, &r, "SELECT x FROM t WHERE id = 0.5", Some(true)); // below first rowid -> []
-    cmp(&f, &r, "SELECT x FROM t WHERE '25' = id", Some(true)); // reversed operand, text -> [250]
+        // Real / text constants seek via MustBeInt coercion; result byte-exact.
+        cmp(&f, &r, "SELECT x FROM t WHERE id = 5.0", Some(true)).await; // exact real -> [50]
+        cmp(&f, &r, "SELECT x FROM t WHERE id = 2.5", Some(true)).await; // non-exact real -> [] (was wrongly [20])
+        cmp(&f, &r, "SELECT x FROM t WHERE id = '5'", Some(true)).await; // numeric text -> [50]
+        cmp(&f, &r, "SELECT x FROM t WHERE id = 'abc'", Some(true)).await; // non-numeric text -> []
+        cmp(&f, &r, "SELECT x FROM t WHERE id = 300.0", Some(true)).await; // last row -> [3000]
+        cmp(&f, &r, "SELECT x FROM t WHERE id = 99999.0", Some(true)).await; // exact real, absent -> []
+        cmp(&f, &r, "SELECT x FROM t WHERE id = 0.5", Some(true)).await; // below first rowid -> []
+        cmp(&f, &r, "SELECT x FROM t WHERE '25' = id", Some(true)).await; // reversed operand, text -> [250]
 
-    // `= NULL` is always empty; plan not asserted.
-    cmp(&f, &r, "SELECT x FROM t WHERE id = NULL", None);
+        // `= NULL` is always empty; plan not asserted.
+        cmp(&f, &r, "SELECT x FROM t WHERE id = NULL", None).await;
 
-    // Placeholder routes to the coerced seek (plan asserted; MustBeInt handles the bound type at runtime,
-    // proven byte-exact by the literal cases above which take the identical MustBeInt path).
-    assert!(
-        !has_op(&f, "SELECT x FROM t WHERE id = ?", "Rewind"),
-        "param rowid-eq lookup should seek (no Rewind)"
-    );
+        // Placeholder routes to the coerced seek (plan asserted; MustBeInt handles the bound type at runtime,
+        // proven byte-exact by the literal cases above which take the identical MustBeInt path).
+        assert!(
+            !has_op(&f, "SELECT x FROM t WHERE id = ?", "Rewind").await,
+            "param rowid-eq lookup should seek (no Rewind)"
+        );
 
-    // Control: a non-rowid predicate still full-scans.
-    cmp(&f, &r, "SELECT x FROM t WHERE x = 30", Some(false)); // x[3]=30 -> [30]
+        // Control: a non-rowid predicate still full-scans.
+        cmp(&f, &r, "SELECT x FROM t WHERE x = 30", Some(false)).await; // x[3]=30 -> [30]
+    });
 }

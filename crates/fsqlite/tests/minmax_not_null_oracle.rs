@@ -13,8 +13,9 @@ fn render(v: &SqliteValue) -> String {
         SqliteValue::Blob(_) => "blob".into(),
     }
 }
-fn fr(c: &Connection, s: &str) -> Vec<Vec<String>> {
+async fn fr(c: &Connection, s: &str) -> Vec<Vec<String>> {
     c.query(s)
+        .await
         .unwrap_or_else(|e| panic!("frank `{s}`: {e}"))
         .iter()
         .map(|r| r.values().iter().map(render).collect())
@@ -40,74 +41,80 @@ fn sq(c: &rusqlite::Connection, s: &str) -> Vec<Vec<String>> {
     .map(Result::unwrap)
     .collect()
 }
-fn has_op(c: &Connection, s: &str, w: &str) -> bool {
+async fn has_op(c: &Connection, s: &str, w: &str) -> bool {
     c.query(&format!("EXPLAIN {s}"))
+        .await
         .unwrap()
         .iter()
         .any(|r| matches!(r.values().get(1), Some(SqliteValue::Text(op)) if op.to_string() == w))
 }
+/// Byte-exact comparison of one query across frank and C SQLite.
+async fn cmp(f: &Connection, r: &rusqlite::Connection, s: &str) {
+    assert_eq!(fr(f, s).await, sq(r, s), "diverged: `{s}`");
+}
 #[test]
 fn minmax_not_null_matches_sqlite() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    for s in [
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, w INTEGER);",
-        "CREATE INDEX idx_v ON t(v);",
-    ] {
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
-    for i in 1..=400_i64 {
-        let v = if i <= 6 {
-            "NULL".to_owned()
-        } else {
-            format!("{}", ((i * 7) % 300) - 120)
-        };
-        let w = if i % 5 == 0 {
-            "NULL".to_owned()
-        } else {
-            format!("{}", i % 40)
-        };
-        let s = format!("INSERT INTO t VALUES ({i}, {v}, {w});");
-        f.execute(&s).unwrap();
-        r.execute_batch(&s).unwrap();
-    }
-    let cmp = |s: &str| assert_eq!(fr(&f, s), sq(&r, s), "diverged: `{s}`");
-    for s in [
-        // Redundant IS NOT NULL -> same as no-WHERE (the lever).
-        "SELECT MIN(v) FROM t WHERE v IS NOT NULL",
-        "SELECT MAX(v) FROM t WHERE v IS NOT NULL",
-        "SELECT MIN(v), MAX(v) FROM t WHERE v IS NOT NULL",
-        "SELECT COALESCE(MAX(v), -1) FROM t WHERE v IS NOT NULL",
-        // Declines (must still match): filter on a different column; IS NULL; non-MIN/MAX aggregate.
-        "SELECT MIN(v) FROM t WHERE w IS NOT NULL",
-        "SELECT MAX(v) FROM t WHERE v IS NULL",
-        "SELECT COUNT(v) FROM t WHERE v IS NOT NULL",
-        "SELECT SUM(v) FROM t WHERE v IS NOT NULL",
-    ] {
-        cmp(s);
-    }
-    // All-NULL v.
-    for s in [
-        "CREATE TABLE n (id INTEGER PRIMARY KEY, v INTEGER);",
-        "CREATE INDEX idx_nv ON n(v);",
-    ] {
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
-    for i in 1..=30 {
-        let s = format!("INSERT INTO n VALUES ({i}, NULL);");
-        f.execute(&s).unwrap();
-        r.execute_batch(&s).unwrap();
-    }
-    cmp("SELECT MIN(v), MAX(v) FROM n WHERE v IS NOT NULL");
-    // Opcode gate: MAX(v) WHERE v IS NOT NULL uses the index seek (Last); different-column filter does not.
-    assert!(
-        has_op(&f, "SELECT MAX(v) FROM t WHERE v IS NOT NULL", "Last"),
-        "MAX(v) WHERE v IS NOT NULL must use the index-end seek (Last)"
-    );
-    assert!(
-        !has_op(&f, "SELECT MAX(v) FROM t WHERE w IS NOT NULL", "Last"),
-        "MAX(v) WHERE w IS NOT NULL (different column) must decline"
-    );
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for s in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, w INTEGER);",
+            "CREATE INDEX idx_v ON t(v);",
+        ] {
+            f.execute(s).await.unwrap();
+            r.execute_batch(s).unwrap();
+        }
+        for i in 1..=400_i64 {
+            let v = if i <= 6 {
+                "NULL".to_owned()
+            } else {
+                format!("{}", ((i * 7) % 300) - 120)
+            };
+            let w = if i % 5 == 0 {
+                "NULL".to_owned()
+            } else {
+                format!("{}", i % 40)
+            };
+            let s = format!("INSERT INTO t VALUES ({i}, {v}, {w});");
+            f.execute(&s).await.unwrap();
+            r.execute_batch(&s).unwrap();
+        }
+        for s in [
+            // Redundant IS NOT NULL -> same as no-WHERE (the lever).
+            "SELECT MIN(v) FROM t WHERE v IS NOT NULL",
+            "SELECT MAX(v) FROM t WHERE v IS NOT NULL",
+            "SELECT MIN(v), MAX(v) FROM t WHERE v IS NOT NULL",
+            "SELECT COALESCE(MAX(v), -1) FROM t WHERE v IS NOT NULL",
+            // Declines (must still match): filter on a different column; IS NULL; non-MIN/MAX aggregate.
+            "SELECT MIN(v) FROM t WHERE w IS NOT NULL",
+            "SELECT MAX(v) FROM t WHERE v IS NULL",
+            "SELECT COUNT(v) FROM t WHERE v IS NOT NULL",
+            "SELECT SUM(v) FROM t WHERE v IS NOT NULL",
+        ] {
+            cmp(&f, &r, s).await;
+        }
+        // All-NULL v.
+        for s in [
+            "CREATE TABLE n (id INTEGER PRIMARY KEY, v INTEGER);",
+            "CREATE INDEX idx_nv ON n(v);",
+        ] {
+            f.execute(s).await.unwrap();
+            r.execute_batch(s).unwrap();
+        }
+        for i in 1..=30 {
+            let s = format!("INSERT INTO n VALUES ({i}, NULL);");
+            f.execute(&s).await.unwrap();
+            r.execute_batch(&s).unwrap();
+        }
+        cmp(&f, &r, "SELECT MIN(v), MAX(v) FROM n WHERE v IS NOT NULL").await;
+        // Opcode gate: MAX(v) WHERE v IS NOT NULL uses the index seek (Last); different-column filter does not.
+        assert!(
+            has_op(&f, "SELECT MAX(v) FROM t WHERE v IS NOT NULL", "Last").await,
+            "MAX(v) WHERE v IS NOT NULL must use the index-end seek (Last)"
+        );
+        assert!(
+            !has_op(&f, "SELECT MAX(v) FROM t WHERE w IS NOT NULL", "Last").await,
+            "MAX(v) WHERE w IS NOT NULL (different column) must decline"
+        );
+    });
 }
