@@ -1,5 +1,6 @@
 use std::hint::black_box;
 
+use asupersync::runtime::{Runtime, RuntimeBuilder};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fsqlite_pager::{
     MvccPager, SimplePager, SimpleTransaction, TransactionHandle, TransactionMode,
@@ -18,6 +19,25 @@ use std::path::Path;
 const EXECUTE_STAGE_OP_REPEATS: [usize; 3] = [64, 256, 1024];
 const COMMIT_STAGE_DIRTY_PAGES: [usize; 3] = [2, 8, 32];
 const RESET_STAGE_REGISTER_COUNTS: [i32; 2] = [4, 16];
+
+fn benchmark_runtime() -> Runtime {
+    RuntimeBuilder::current_thread()
+        .blocking_threads(1, 2)
+        .build()
+        .expect("pipeline benchmark runtime should build")
+}
+
+macro_rules! bench_vdbe_execute {
+    ($bencher:expr, $engine:expr, $program:expr, $message:expr) => {{
+        let runtime = benchmark_runtime();
+        $bencher.iter(|| {
+            let outcome = runtime
+                .block_on(async { $engine.execute($program).await })
+                .expect($message);
+            black_box(outcome);
+        });
+    }};
+}
 
 fn decode_stage_row(column_count: usize) -> Vec<SqliteValue> {
     (0..column_count)
@@ -1174,7 +1194,7 @@ fn build_execute_stage_not_program(op_repeats: usize) -> VdbeProgram {
         .expect("pipeline execute not benchmark program should build")
 }
 
-fn prepare_commit_stage_fixture(dirty_pages: usize) -> (Cx, SimpleTransaction<MemoryVfs>) {
+async fn prepare_commit_stage_fixture(dirty_pages: usize) -> (Cx, SimpleTransaction<MemoryVfs>) {
     let cx = Cx::new();
     let pager = SimplePager::open_with_cx(
         &cx,
@@ -1182,19 +1202,24 @@ fn prepare_commit_stage_fixture(dirty_pages: usize) -> (Cx, SimpleTransaction<Me
         Path::new("/:memory:"),
         PageSize::DEFAULT,
     )
+    .await
     .expect("pipeline commit benchmark should open pager");
     let mut txn = pager
         .begin(&cx, TransactionMode::Immediate)
+        .await
         .expect("pipeline commit benchmark should begin transaction");
     let page_bytes = PageSize::DEFAULT.as_usize();
     txn.write_page(&cx, PageNumber::ONE, &vec![0xA5; page_bytes])
+        .await
         .expect("pipeline commit benchmark should dirty page one");
     for page_idx in 1..dirty_pages {
         let page_no = txn
             .allocate_page(&cx)
+            .await
             .expect("pipeline commit benchmark should allocate page");
         let fill = u8::try_from((page_idx % 251) + 1).unwrap();
         txn.write_page(&cx, page_no, &vec![fill; page_bytes])
+            .await
             .expect("pipeline commit benchmark should dirty page");
     }
     (cx, txn)
@@ -1246,12 +1271,12 @@ fn bench_vdbe_execute_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute benchmark should execute"
+                );
             },
         );
     }
@@ -1279,12 +1304,12 @@ fn bench_vdbe_execute_integer_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute integer benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute integer benchmark should execute"
+                );
             },
         );
     }
@@ -1312,12 +1337,12 @@ fn bench_vdbe_execute_noop_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute noop benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute noop benchmark should execute"
+                );
             },
         );
     }
@@ -1345,12 +1370,12 @@ fn bench_vdbe_execute_goto_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute goto benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute goto benchmark should execute"
+                );
             },
         );
     }
@@ -1378,12 +1403,12 @@ fn bench_vdbe_execute_resultrow_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute resultrow benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute resultrow benchmark should execute"
+                );
             },
         );
     }
@@ -1411,12 +1436,12 @@ fn bench_vdbe_execute_fused_literal_resultrow_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine.execute(program).expect(
-                        "pipeline execute fused literal resultrow benchmark should execute",
-                    );
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute fused literal resultrow benchmark should execute"
+                );
             },
         );
     }
@@ -1444,12 +1469,12 @@ fn bench_vdbe_execute_int64_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute int64 benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute int64 benchmark should execute"
+                );
             },
         );
     }
@@ -1477,12 +1502,12 @@ fn bench_vdbe_execute_real_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute real benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute real benchmark should execute"
+                );
             },
         );
     }
@@ -1510,12 +1535,12 @@ fn bench_vdbe_execute_blob_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute blob benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute blob benchmark should execute"
+                );
             },
         );
     }
@@ -1543,12 +1568,12 @@ fn bench_vdbe_execute_string8_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute string8 benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute string8 benchmark should execute"
+                );
             },
         );
     }
@@ -1576,12 +1601,12 @@ fn bench_vdbe_execute_string_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute string benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute string benchmark should execute"
+                );
             },
         );
     }
@@ -1609,12 +1634,12 @@ fn bench_vdbe_execute_null_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute null benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute null benchmark should execute"
+                );
             },
         );
     }
@@ -1642,12 +1667,12 @@ fn bench_vdbe_execute_softnull_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute softnull benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute softnull benchmark should execute"
+                );
             },
         );
     }
@@ -1675,12 +1700,12 @@ fn bench_vdbe_execute_concat_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute concat benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute concat benchmark should execute"
+                );
             },
         );
     }
@@ -1708,12 +1733,12 @@ fn bench_vdbe_execute_add_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute add benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute add benchmark should execute"
+                );
             },
         );
     }
@@ -1741,12 +1766,12 @@ fn bench_vdbe_execute_subtract_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute subtract benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute subtract benchmark should execute"
+                );
             },
         );
     }
@@ -1774,12 +1799,12 @@ fn bench_vdbe_execute_multiply_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute multiply benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute multiply benchmark should execute"
+                );
             },
         );
     }
@@ -1807,12 +1832,12 @@ fn bench_vdbe_execute_divide_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute divide benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute divide benchmark should execute"
+                );
             },
         );
     }
@@ -1840,12 +1865,12 @@ fn bench_vdbe_execute_remainder_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute remainder benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute remainder benchmark should execute"
+                );
             },
         );
     }
@@ -1873,12 +1898,12 @@ fn bench_vdbe_execute_bitand_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute bitand benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute bitand benchmark should execute"
+                );
             },
         );
     }
@@ -1906,12 +1931,12 @@ fn bench_vdbe_execute_bitor_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute bitor benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute bitor benchmark should execute"
+                );
             },
         );
     }
@@ -1939,12 +1964,12 @@ fn bench_vdbe_execute_bitnot_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute bitnot benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute bitnot benchmark should execute"
+                );
             },
         );
     }
@@ -1972,12 +1997,12 @@ fn bench_vdbe_execute_shiftleft_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute shiftleft benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute shiftleft benchmark should execute"
+                );
             },
         );
     }
@@ -2005,12 +2030,12 @@ fn bench_vdbe_execute_shiftright_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute shiftright benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute shiftright benchmark should execute"
+                );
             },
         );
     }
@@ -2039,12 +2064,12 @@ fn bench_vdbe_execute_variable_stage(c: &mut Criterion) {
                 );
                 engine.set_collect_result_rows(false);
                 engine.set_bindings_slice(&[SqliteValue::Integer(42)]);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute variable benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute variable benchmark should execute"
+                );
             },
         );
     }
@@ -2072,12 +2097,12 @@ fn bench_vdbe_execute_copy_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute copy benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute copy benchmark should execute"
+                );
             },
         );
     }
@@ -2105,12 +2130,12 @@ fn bench_vdbe_execute_scopy_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute scopy benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute scopy benchmark should execute"
+                );
             },
         );
     }
@@ -2138,12 +2163,12 @@ fn bench_vdbe_execute_intcopy_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute intcopy benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute intcopy benchmark should execute"
+                );
             },
         );
     }
@@ -2171,12 +2196,12 @@ fn bench_vdbe_execute_move_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute move benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute move benchmark should execute"
+                );
             },
         );
     }
@@ -2204,12 +2229,12 @@ fn bench_vdbe_execute_decrjumpzero_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute decrjumpzero benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute decrjumpzero benchmark should execute"
+                );
             },
         );
     }
@@ -2237,12 +2262,12 @@ fn bench_vdbe_execute_ifpos_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute ifpos benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute ifpos benchmark should execute"
+                );
             },
         );
     }
@@ -2270,12 +2295,12 @@ fn bench_vdbe_execute_ifnotzero_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute ifnotzero benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute ifnotzero benchmark should execute"
+                );
             },
         );
     }
@@ -2303,12 +2328,12 @@ fn bench_vdbe_execute_offsetlimit_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute offsetlimit benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute offsetlimit benchmark should execute"
+                );
             },
         );
     }
@@ -2336,12 +2361,12 @@ fn bench_vdbe_execute_affinity_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute affinity benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute affinity benchmark should execute"
+                );
             },
         );
     }
@@ -2369,12 +2394,12 @@ fn bench_vdbe_execute_isnull_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute isnull benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute isnull benchmark should execute"
+                );
             },
         );
     }
@@ -2402,12 +2427,12 @@ fn bench_vdbe_execute_notnull_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute notnull benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute notnull benchmark should execute"
+                );
             },
         );
     }
@@ -2435,12 +2460,12 @@ fn bench_vdbe_execute_and_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute and benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute and benchmark should execute"
+                );
             },
         );
     }
@@ -2468,12 +2493,12 @@ fn bench_vdbe_execute_or_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute or benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute or benchmark should execute"
+                );
             },
         );
     }
@@ -2501,12 +2526,12 @@ fn bench_vdbe_execute_zeroornull_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute zeroornull benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute zeroornull benchmark should execute"
+                );
             },
         );
     }
@@ -2543,12 +2568,12 @@ fn bench_vdbe_execute_column_stage(c: &mut Criterion) {
                 engine.enable_storage_cursors(true);
                 engine.set_database(db.clone());
                 engine.set_reject_mem_fallback(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute column benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute column benchmark should execute"
+                );
             },
         );
     }
@@ -2590,12 +2615,12 @@ fn bench_vdbe_execute_column_substr_prefix_stage(c: &mut Criterion) {
                 engine.enable_storage_cursors(true);
                 engine.set_database(db.clone());
                 engine.set_reject_mem_fallback(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute column substr prefix benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute column substr prefix benchmark should execute"
+                );
             },
         );
     }
@@ -2636,12 +2661,12 @@ fn bench_vdbe_execute_rowid_stage(c: &mut Criterion) {
                 engine.enable_storage_cursors(true);
                 engine.set_database(db.clone());
                 engine.set_reject_mem_fallback(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute rowid benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute rowid benchmark should execute"
+                );
             },
         );
     }
@@ -2678,12 +2703,12 @@ fn bench_vdbe_execute_idx_rowid_stage(c: &mut Criterion) {
                 engine.enable_storage_cursors(true);
                 engine.set_database(db.clone());
                 engine.set_reject_mem_fallback(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute idx_rowid benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute idx_rowid benchmark should execute"
+                );
             },
         );
     }
@@ -2711,12 +2736,12 @@ fn bench_vdbe_execute_ifnot_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute ifnot benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute ifnot benchmark should execute"
+                );
             },
         );
     }
@@ -2744,12 +2769,12 @@ fn bench_vdbe_execute_if_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute if benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute if benchmark should execute"
+                );
             },
         );
     }
@@ -2777,12 +2802,12 @@ fn bench_vdbe_execute_compare_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute compare benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute compare benchmark should execute"
+                );
             },
         );
     }
@@ -2810,12 +2835,12 @@ fn bench_vdbe_execute_comparison_jump_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute comparison-jump benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute comparison-jump benchmark should execute"
+                );
             },
         );
     }
@@ -2843,12 +2868,12 @@ fn bench_vdbe_execute_istrue_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute istrue benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute istrue benchmark should execute"
+                );
             },
         );
     }
@@ -2876,12 +2901,12 @@ fn bench_vdbe_execute_not_stage(c: &mut Criterion) {
                     PageSize::DEFAULT,
                 );
                 engine.set_collect_result_rows(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute not benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute not benchmark should execute"
+                );
             },
         );
     }
@@ -2890,6 +2915,7 @@ fn bench_vdbe_execute_not_stage(c: &mut Criterion) {
 }
 
 fn bench_vdbe_commit_stage(c: &mut Criterion) {
+    let runtime = benchmark_runtime();
     let mut group = c.benchmark_group("vdbe_pipeline_commit");
 
     for dirty_pages in COMMIT_STAGE_DIRTY_PAGES {
@@ -2901,10 +2927,11 @@ fn bench_vdbe_commit_stage(c: &mut Criterion) {
             &dirty_pages,
             |b, &dirty_pages| {
                 b.iter_batched(
-                    || prepare_commit_stage_fixture(dirty_pages),
+                    || runtime.block_on(prepare_commit_stage_fixture(dirty_pages)),
                     |(cx, mut txn)| {
                         profile_vdbe_commit_stage(|| {
-                            txn.commit(&cx)
+                            runtime
+                                .block_on(async { txn.commit(&cx).await })
                                 .expect("pipeline commit benchmark should commit");
                         });
                     },
@@ -2963,12 +2990,12 @@ fn bench_vdbe_execute_next_stage(c: &mut Criterion) {
                 engine.set_collect_result_rows(false);
                 engine.set_database(db.clone());
                 engine.set_reject_mem_fallback(false);
-                b.iter(|| {
-                    let outcome = engine
-                        .execute(program)
-                        .expect("pipeline execute next benchmark should execute");
-                    black_box(outcome);
-                });
+                bench_vdbe_execute!(
+                    b,
+                    engine,
+                    program,
+                    "pipeline execute next benchmark should execute"
+                );
             },
         );
     }

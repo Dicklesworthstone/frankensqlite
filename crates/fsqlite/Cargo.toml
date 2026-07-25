@@ -21,6 +21,7 @@ fsqlite-ext-session = { workspace = true, optional = true }
 fsqlite-ext-icu = { workspace = true, optional = true }
 fsqlite-ext-misc = { workspace = true, optional = true }
 fsqlite-parser = { workspace = true }
+tracing = { workspace = true }
 
 [features]
 default = ["native", "linux-asupersync-uring", "json", "fts5", "rtree"]
@@ -39,6 +40,11 @@ raptorq = []
 mvcc = []
 
 [dev-dependencies]
+# The whole storage stack is `async` now, so every test must drive a runtime.
+# `asupersync` is an optional *dependency* (gated behind `async-api`), but tests
+# need `asupersync::test_utils::run_test` unconditionally — hence a non-optional
+# dev-dependency as well.
+asupersync = { workspace = true, features = ["test-internals"] }
 fsqlite-ast = { workspace = true }
 fsqlite-func = { workspace = true }
 fsqlite-pager = { workspace = true }

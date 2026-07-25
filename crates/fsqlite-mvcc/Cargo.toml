@@ -31,7 +31,6 @@ fsqlite-vfs = { version = "0.1.19", path = "../fsqlite-vfs", default-features = 
 fsqlite-btree = { version = "0.1.19", path = "../fsqlite-btree", default-features = false }
 fsqlite-pager = { version = "0.1.19", path = "../fsqlite-pager", default-features = false }
 fsqlite-wal = { version = "0.1.19", path = "../fsqlite-wal", default-features = false }
-futures-lite = { workspace = true }
 smallvec = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 parking_lot = { workspace = true }

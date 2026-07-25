@@ -3392,6 +3392,84 @@ impl ShardedPageCache {
         self.take_clean_buffer().is_some()
     }
 
+    /// Evict one page without blocking an executor worker on dirty writeback.
+    ///
+    /// Clean pages are removed immediately. If every resident page is dirty,
+    /// the coldest dirty candidate is written by a task owned by the current
+    /// asupersync region. The candidate is removed only after that task
+    /// succeeds and only if its mutation generation is unchanged; a concurrent
+    /// writer therefore leaves the page resident and dirty for a later retry.
+    ///
+    /// Native callers must invoke this from an asupersync runtime task (or
+    /// attach a runtime-backed native context to `cx`). The non-native fallback
+    /// performs the same generation-safe async write directly because there is
+    /// no multi-worker runtime on that target.
+    pub async fn evict_any_async<F>(self: &Arc<Self>, cx: &Cx, file: Arc<F>) -> Result<bool>
+    where
+        F: VfsFile + 'static,
+    {
+        if self.take_clean_buffer().is_some() {
+            return Ok(true);
+        }
+
+        let Some(page_no) = self.dirty_writeback_victim() else {
+            return Ok(false);
+        };
+
+        #[cfg(feature = "native")]
+        {
+            let native_cx = asupersync::Cx::current()
+                .or_else(|| cx.attached_native_cx())
+                .ok_or_else(|| {
+                    FrankenError::internal(
+                        "dirty page eviction requires an asupersync runtime region",
+                    )
+                })?;
+            let scope = native_cx.scope();
+            let task_cache = Arc::clone(self);
+            let mut writeback = native_cx
+                .spawn_in(&scope, move |task_native_cx| async move {
+                    let task_cx = Cx::new();
+                    task_cx.set_native_cx(task_native_cx);
+                    task_cache
+                        .write_page(&task_cx, file.as_ref(), page_no)
+                        .await
+                })
+                .map_err(|error| {
+                    FrankenError::internal(format!(
+                        "failed to dispatch dirty page {page_no} writeback: {error}"
+                    ))
+                })?;
+            writeback.join(&native_cx).await.map_err(|error| {
+                FrankenError::internal(format!(
+                    "dirty page {page_no} writeback task failed: {error}"
+                ))
+            })??;
+        }
+
+        #[cfg(not(feature = "native"))]
+        self.write_page(cx, file.as_ref(), page_no).await?;
+
+        Ok(self.take_clean_buffer_at(page_no).is_some())
+    }
+
+    fn dirty_writeback_victim(&self) -> Option<PageNumber> {
+        let mut candidates = self.page_snapshots();
+        if let Some(preferred) = self.preferred_reconstructed_victim()
+            && candidates
+                .iter()
+                .any(|snapshot| snapshot.page_no == preferred && snapshot.dirty)
+        {
+            return Some(preferred);
+        }
+
+        candidates.sort_unstable_by_key(|snapshot| (snapshot.access_count, snapshot.page_no.get()));
+        candidates
+            .into_iter()
+            .find(|snapshot| snapshot.dirty)
+            .map(|snapshot| snapshot.page_no)
+    }
+
     /// Evict an arbitrary page from the cache.
     ///
     /// Tries flat slots first, then iterates shards.
@@ -3947,12 +4025,14 @@ pub async fn read_db_header(cx: &Cx, file: &impl VfsFile) -> Result<[u8; 100]> {
 mod tests {
     use super::*;
     use crate::s3_fifo::{QueueKind, S3Fifo, S3FifoConfig, S3FifoEvent};
-    use fsqlite_types::flags::VfsOpenFlags;
-    use fsqlite_vfs::{MemoryVfs, Vfs};
+    use fsqlite_types::LockLevel;
+    use fsqlite_types::flags::{SyncFlags, VfsOpenFlags};
+    use fsqlite_vfs::{MemoryVfs, ShmRegion, Vfs};
     use serde_json::json;
     use std::collections::{HashMap, VecDeque};
     use std::hint::black_box;
     use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
 
     const BEAD_ID: &str = "bd-22n.2";
@@ -3960,6 +4040,18 @@ mod tests {
     const BEAD_TRACK_Q: &str = "bd-aztlm";
     const BEAD_TZLZB: &str = "bd-tzlzb";
     const BEAD_CACHE_MONITOR: &str = "bd-t6sv2.8";
+
+    fn run_async_test<F, Fut>(test: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("build page-cache test runtime");
+        runtime.block_on(test());
+    }
 
     fn elapsed_ns(duration: Duration) -> u64 {
         u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
@@ -4189,6 +4281,443 @@ mod tests {
         (cx, file)
     }
 
+    #[derive(Clone, Copy)]
+    enum ControlledReadMode {
+        Delayed,
+        FirstPendingThenReady,
+    }
+
+    struct ControlledReadFile {
+        bytes: Arc<[u8]>,
+        read_calls: AtomicUsize,
+        mode: ControlledReadMode,
+    }
+
+    impl ControlledReadFile {
+        fn delayed(bytes: Vec<u8>) -> Self {
+            Self {
+                bytes: bytes.into(),
+                read_calls: AtomicUsize::new(0),
+                mode: ControlledReadMode::Delayed,
+            }
+        }
+
+        fn first_pending_then_ready(bytes: Vec<u8>) -> Self {
+            Self {
+                bytes: bytes.into(),
+                read_calls: AtomicUsize::new(0),
+                mode: ControlledReadMode::FirstPendingThenReady,
+            }
+        }
+
+        fn read_calls(&self) -> usize {
+            self.read_calls.load(Ordering::Acquire)
+        }
+    }
+
+    impl VfsFile for ControlledReadFile {
+        fn close(&mut self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+
+        async fn read(&self, _cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+            let read_index = self.read_calls.fetch_add(1, Ordering::AcqRel);
+            match self.mode {
+                ControlledReadMode::Delayed => {
+                    asupersync::runtime::spawn_blocking_io(|| {
+                        std::thread::sleep(Duration::from_millis(50));
+                        Ok::<(), std::io::Error>(())
+                    })
+                    .await
+                    .map_err(|error| {
+                        FrankenError::internal(format!(
+                            "controlled page-cache read delay failed: {error}"
+                        ))
+                    })?;
+                }
+                ControlledReadMode::FirstPendingThenReady if read_index == 0 => {
+                    std::future::pending::<()>().await;
+                }
+                ControlledReadMode::FirstPendingThenReady => {}
+            }
+
+            let offset = usize::try_from(offset).map_err(|_| {
+                FrankenError::internal("controlled page-cache read offset does not fit usize")
+            })?;
+            let available = self.bytes.len().saturating_sub(offset);
+            let copied = available.min(buf.len());
+            if copied > 0 {
+                buf[..copied].copy_from_slice(&self.bytes[offset..offset + copied]);
+            }
+            buf[copied..].fill(0);
+            Ok(copied)
+        }
+
+        async fn write(&self, _cx: &Cx, _buf: &[u8], _offset: u64) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn truncate(&mut self, _cx: &Cx, _size: u64) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn sync(&mut self, _cx: &Cx, _flags: SyncFlags) -> Result<()> {
+            Ok(())
+        }
+
+        fn file_size(&self, _cx: &Cx) -> Result<u64> {
+            u64::try_from(self.bytes.len())
+                .map_err(|_| FrankenError::internal("controlled file length does not fit u64"))
+        }
+
+        fn lock(&mut self, _cx: &Cx, _level: LockLevel) -> Result<()> {
+            Ok(())
+        }
+
+        fn unlock(&mut self, _cx: &Cx, _level: LockLevel) -> Result<()> {
+            Ok(())
+        }
+
+        fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn shm_map(
+            &mut self,
+            _cx: &Cx,
+            _region: u32,
+            _size: u32,
+            _extend: bool,
+        ) -> Result<ShmRegion> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn shm_lock(&mut self, _cx: &Cx, _offset: u32, _n: u32, _flags: u32) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn shm_barrier(&self) {}
+
+        fn shm_unmap(&mut self, _cx: &Cx, _delete: bool) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct RegionWritebackFile {
+        bytes: std::sync::Mutex<Vec<u8>>,
+        write_calls: AtomicUsize,
+        parent_task:
+            std::sync::Mutex<Option<(asupersync::types::TaskId, asupersync::types::RegionId)>>,
+        observed_child_task: AtomicBool,
+        observed_parent_region: AtomicBool,
+        fail_writes: bool,
+    }
+
+    impl RegionWritebackFile {
+        fn new(page_size: PageSize, fail_writes: bool) -> Self {
+            Self {
+                bytes: std::sync::Mutex::new(vec![0; page_size.as_usize()]),
+                write_calls: AtomicUsize::new(0),
+                parent_task: std::sync::Mutex::new(None),
+                observed_child_task: AtomicBool::new(false),
+                observed_parent_region: AtomicBool::new(false),
+                fail_writes,
+            }
+        }
+
+        fn set_parent(&self, native_cx: &asupersync::Cx) {
+            *self
+                .parent_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((native_cx.task_id(), native_cx.region_id()));
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl VfsFile for RegionWritebackFile {
+        fn close(&mut self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+
+        async fn read(&self, _cx: &Cx, _buf: &mut [u8], _offset: u64) -> Result<usize> {
+            Err(FrankenError::Unsupported)
+        }
+
+        async fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+            self.write_calls.fetch_add(1, Ordering::AcqRel);
+            let native_cx = cx.attached_native_cx().ok_or_else(|| {
+                FrankenError::internal("writeback task did not receive its native asupersync Cx")
+            })?;
+            let (parent_task, parent_region) = self
+                .parent_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ok_or_else(|| FrankenError::internal("writeback parent task was not recorded"))?;
+            self.observed_child_task
+                .store(native_cx.task_id() != parent_task, Ordering::Release);
+            self.observed_parent_region
+                .store(native_cx.region_id() == parent_region, Ordering::Release);
+
+            if self.fail_writes {
+                return Err(FrankenError::internal(
+                    "injected dirty page writeback failure",
+                ));
+            }
+
+            let offset = usize::try_from(offset)
+                .map_err(|_| FrankenError::internal("writeback offset does not fit usize"))?;
+            let end = offset
+                .checked_add(buf.len())
+                .ok_or_else(|| FrankenError::internal("writeback range overflow"))?;
+            let mut bytes = self
+                .bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if end > bytes.len() {
+                return Err(FrankenError::internal(
+                    "writeback extends past controlled file",
+                ));
+            }
+            bytes[offset..end].copy_from_slice(buf);
+            Ok(())
+        }
+
+        fn truncate(&mut self, _cx: &Cx, _size: u64) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn sync(&mut self, _cx: &Cx, _flags: SyncFlags) -> Result<()> {
+            Ok(())
+        }
+
+        fn file_size(&self, _cx: &Cx) -> Result<u64> {
+            u64::try_from(
+                self.bytes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+            )
+            .map_err(|_| FrankenError::internal("controlled writeback file is too large"))
+        }
+
+        fn lock(&mut self, _cx: &Cx, _level: LockLevel) -> Result<()> {
+            Ok(())
+        }
+
+        fn unlock(&mut self, _cx: &Cx, _level: LockLevel) -> Result<()> {
+            Ok(())
+        }
+
+        fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn shm_map(
+            &mut self,
+            _cx: &Cx,
+            _region: u32,
+            _size: u32,
+            _extend: bool,
+        ) -> Result<ShmRegion> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn shm_lock(&mut self, _cx: &Cx, _offset: u32, _n: u32, _flags: u32) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn shm_barrier(&self) {}
+
+        fn shm_unmap(&mut self, _cx: &Cx, _delete: bool) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bd_2jpu6_2_ten_concurrent_misses_coalesce_to_one_vfs_read() {
+        const TASK_COUNT: usize = 10;
+        let page_no = PageNumber::ONE;
+        let cache = Arc::new(ShardedPageCache::new(PageSize::DEFAULT));
+        let file = Arc::new(ControlledReadFile::delayed(vec![
+            0xA5;
+            PageSize::DEFAULT
+                .as_usize()
+        ]));
+        let runtime = asupersync::runtime::RuntimeBuilder::low_latency()
+            .worker_threads(4)
+            .blocking_threads(1, 2)
+            .build()
+            .expect("build page-cache coalescing runtime");
+        let runtime_handle = runtime.handle();
+        let mut tasks = Vec::with_capacity(TASK_COUNT);
+        for _ in 0..TASK_COUNT {
+            let task_cache = Arc::clone(&cache);
+            let task_file = Arc::clone(&file);
+            tasks.push(runtime_handle.spawn(async move {
+                let cx = Cx::new();
+                task_cache
+                    .read_page(&cx, task_file.as_ref(), page_no, |data| data[0])
+                    .await
+            }));
+        }
+
+        runtime.block_on(async move {
+            for task in tasks {
+                assert_eq!(
+                    task.await.expect("coalesced page read should succeed"),
+                    0xA5
+                );
+            }
+        });
+
+        let metrics = cache.metrics_snapshot();
+        assert_eq!(
+            file.read_calls(),
+            1,
+            "ten concurrent misses for one page must issue one VFS read"
+        );
+        assert_eq!(
+            metrics.admits, 1,
+            "the single completed flight must admit one cache image"
+        );
+        println!(
+            "PAGER_COALESCING tasks={TASK_COUNT} vfs_reads={} cache_admits={}",
+            file.read_calls(),
+            metrics.admits
+        );
+    }
+
+    #[test]
+    fn bd_2jpu6_2_dropped_read_leader_wakes_follower_for_handoff() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let page_no = PageNumber::ONE;
+        let cache = ShardedPageCache::new(PageSize::DEFAULT);
+        let file =
+            ControlledReadFile::first_pending_then_ready(vec![0x6B; PageSize::DEFAULT.as_usize()]);
+        let cx = Cx::new();
+        let mut leader = Box::pin(cache.read_page(&cx, &file, page_no, |data| data[0]));
+        let mut follower = Box::pin(cache.read_page(&cx, &file, page_no, |data| data[0]));
+        let waker = Waker::noop();
+        let mut task_cx = Context::from_waker(waker);
+
+        assert!(leader.as_mut().poll(&mut task_cx).is_pending());
+        assert!(follower.as_mut().poll(&mut task_cx).is_pending());
+        assert_eq!(file.read_calls(), 1, "only the first leader may dispatch");
+
+        drop(leader);
+
+        match follower.as_mut().poll(&mut task_cx) {
+            Poll::Ready(Ok(value)) => assert_eq!(
+                value, 0x6B,
+                "replacement flight must return the recovered page"
+            ),
+            other => panic!(
+                "dropping the leader must wake its follower to claim a replacement flight, got \
+                 {other:?}"
+            ),
+        }
+        assert_eq!(
+            file.read_calls(),
+            2,
+            "the replacement leader must issue exactly one recovery read"
+        );
+        assert_eq!(cache.metrics_snapshot().admits, 1);
+    }
+
+    #[test]
+    fn bd_2jpu6_2_dirty_eviction_runs_in_parent_asupersync_region() {
+        let page_size = PageSize::DEFAULT;
+        let cache = Arc::new(ShardedPageCache::with_max_buffers(page_size, 1));
+        cache
+            .insert_fresh(PageNumber::ONE, |bytes| bytes.fill(0xD7))
+            .expect("admit dirty writeback candidate");
+        let file = Arc::new(RegionWritebackFile::new(page_size, false));
+
+        let runtime = asupersync::runtime::RuntimeBuilder::low_latency()
+            .worker_threads(2)
+            .blocking_threads(1, 1)
+            .build()
+            .expect("build dirty-eviction runtime");
+        let task_cache = Arc::clone(&cache);
+        let task_file = Arc::clone(&file);
+        let writeback = runtime.handle().spawn(async move {
+            let native_cx = asupersync::Cx::current().expect("runtime task must expose native Cx");
+            task_file.set_parent(&native_cx);
+            let cx = Cx::new();
+            cx.set_native_cx(native_cx);
+            task_cache.evict_any_async(&cx, task_file).await
+        });
+
+        assert!(
+            runtime
+                .block_on(writeback)
+                .expect("region-owned dirty writeback must succeed")
+        );
+        assert_eq!(file.write_calls.load(Ordering::Acquire), 1);
+        assert!(
+            file.observed_child_task.load(Ordering::Acquire),
+            "dirty writeback must run in a child task, not inline in the caller"
+        );
+        assert!(
+            file.observed_parent_region.load(Ordering::Acquire),
+            "dirty writeback task must remain owned by the caller's region"
+        );
+        assert_eq!(file.bytes(), vec![0xD7; page_size.as_usize()]);
+        assert!(!cache.contains(PageNumber::ONE));
+        assert_eq!(cache.pool().available(), 1);
+    }
+
+    #[test]
+    fn bd_2jpu6_2_failed_dirty_writeback_preserves_resident_dirty_page() {
+        let page_size = PageSize::DEFAULT;
+        let cache = Arc::new(ShardedPageCache::with_max_buffers(page_size, 1));
+        cache
+            .insert_fresh(PageNumber::ONE, |bytes| bytes.fill(0xE1))
+            .expect("admit dirty writeback candidate");
+        let file = Arc::new(RegionWritebackFile::new(page_size, true));
+
+        let runtime = asupersync::runtime::RuntimeBuilder::low_latency()
+            .worker_threads(2)
+            .blocking_threads(1, 1)
+            .build()
+            .expect("build dirty-eviction failure runtime");
+        let task_cache = Arc::clone(&cache);
+        let task_file = Arc::clone(&file);
+        let writeback = runtime.handle().spawn(async move {
+            let native_cx = asupersync::Cx::current().expect("runtime task must expose native Cx");
+            task_file.set_parent(&native_cx);
+            let cx = Cx::new();
+            cx.set_native_cx(native_cx);
+            task_cache.evict_any_async(&cx, task_file).await
+        });
+
+        let error = runtime
+            .block_on(writeback)
+            .expect_err("injected writeback failure must surface");
+        assert!(
+            error
+                .to_string()
+                .contains("injected dirty page writeback failure")
+        );
+        assert_eq!(file.write_calls.load(Ordering::Acquire), 1);
+        assert!(cache.contains(PageNumber::ONE));
+        assert!(
+            cache
+                .page_snapshots()
+                .iter()
+                .any(|snapshot| snapshot.page_no == PageNumber::ONE && snapshot.dirty)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_spawn_blocking_io_read_page() {
@@ -4365,132 +4894,140 @@ mod tests {
 
     #[test]
     fn test_pager_reads_pages_via_pool() {
-        let (cx, mut file) = setup();
-        let page_data = vec![0xAB_u8; 4096];
-        file.write(&cx, &page_data, 0).unwrap();
+        run_async_test(|| async {
+            let (cx, file) = setup();
+            let page_data = vec![0xAB_u8; 4096];
+            file.write(&cx, &page_data, 0).await.unwrap();
 
-        let pool = PageBufPool::new(PageSize::DEFAULT, 4);
-        let mut cache = PageCache::with_pool(pool.clone(), PageSize::DEFAULT);
-        let read = cache.read_page(&cx, &mut file, PageNumber::ONE).unwrap();
-        assert_eq!(read, page_data.as_slice());
-        assert_eq!(pool.available(), 0, "cached page still holds the buffer");
+            let pool = PageBufPool::new(PageSize::DEFAULT, 4);
+            let mut cache = PageCache::with_pool(pool.clone(), PageSize::DEFAULT);
+            let read = cache.read_page(&cx, &file, PageNumber::ONE).await.unwrap();
+            assert_eq!(read, page_data.as_slice());
+            assert_eq!(pool.available(), 0, "cached page still holds the buffer");
 
-        assert!(cache.evict(PageNumber::ONE));
-        assert_eq!(
-            pool.available(),
-            1,
-            "evicting a cached page should return its buffer to the pool"
-        );
+            assert!(cache.evict(PageNumber::ONE));
+            assert_eq!(
+                pool.available(),
+                1,
+                "evicting a cached page should return its buffer to the pool"
+            );
+        });
     }
 
     // --- test_vfs_read_no_intermediate_alloc ---
 
     #[test]
     fn test_vfs_read_no_intermediate_alloc() {
-        // Demonstrate that VfsFile::read writes directly into the PageBuf
-        // memory with no intermediate buffer.  We verify by checking that
-        // the data appears at the same pointer address as the PageBuf slice.
-        let (cx, mut file) = setup();
+        run_async_test(|| async {
+            // Demonstrate that VfsFile::read writes directly into the PageBuf
+            // memory with no intermediate buffer.  We verify by checking that
+            // the data appears at the same pointer address as the PageBuf slice.
+            let (cx, file) = setup();
 
-        // Write a recognizable page to the file.
-        let pattern: Vec<u8> = (0..4096u16)
-            .map(|i| u8::try_from(i % 256).expect("i % 256 fits in u8"))
-            .collect();
-        file.write(&cx, &pattern, 0).unwrap();
+            // Write a recognizable page to the file.
+            let pattern: Vec<u8> = (0..4096u16)
+                .map(|i| u8::try_from(i % 256).expect("i % 256 fits in u8"))
+                .collect();
+            file.write(&cx, &pattern, 0).await.unwrap();
 
-        // Acquire a PageBuf from the pool and read directly into it.
-        let pool = PageBufPool::new(PageSize::DEFAULT, 4);
-        let mut buf = pool.acquire().unwrap();
-        let ptr_before = buf.as_ptr();
+            // Acquire a PageBuf from the pool and read directly into it.
+            let pool = PageBufPool::new(PageSize::DEFAULT, 4);
+            let mut buf = pool.acquire().unwrap();
+            let ptr_before = buf.as_ptr();
 
-        // VfsFile::read takes &mut [u8] — PageBuf::as_mut_slice gives us
-        // a reference to the same aligned memory.
-        file.read(&cx, buf.as_mut_slice(), 0).unwrap();
+            // VfsFile::read takes &mut [u8] — PageBuf::as_mut_slice gives us
+            // a reference to the same aligned memory.
+            file.read(&cx, buf.as_mut_slice(), 0).await.unwrap();
 
-        let ptr_after = buf.as_ptr();
-        assert_eq!(
-            ptr_before, ptr_after,
-            "bead_id={BEAD_ID} case=vfs_read_no_intermediate_alloc \
-             pointer must not change — read goes directly into PageBuf"
-        );
-        assert_eq!(
-            buf.as_slice(),
-            pattern.as_slice(),
-            "bead_id={BEAD_ID} case=vfs_read_data_correct"
-        );
+            let ptr_after = buf.as_ptr();
+            assert_eq!(
+                ptr_before, ptr_after,
+                "bead_id={BEAD_ID} case=vfs_read_no_intermediate_alloc \
+                 pointer must not change — read goes directly into PageBuf"
+            );
+            assert_eq!(
+                buf.as_slice(),
+                pattern.as_slice(),
+                "bead_id={BEAD_ID} case=vfs_read_data_correct"
+            );
+        });
     }
 
     // --- test_vfs_write_no_intermediate_alloc ---
 
     #[test]
     fn test_vfs_write_no_intermediate_alloc() {
-        // Demonstrate that VfsFile::write reads directly from the PageBuf
-        // memory with no intermediate staging copy.
-        let (cx, mut file) = setup();
+        run_async_test(|| async {
+            // Demonstrate that VfsFile::write reads directly from the PageBuf
+            // memory with no intermediate staging copy.
+            let (cx, file) = setup();
 
-        let pool = PageBufPool::new(PageSize::DEFAULT, 4);
-        let mut buf = pool.acquire().unwrap();
+            let pool = PageBufPool::new(PageSize::DEFAULT, 4);
+            let mut buf = pool.acquire().unwrap();
 
-        // Fill with a recognizable pattern.
-        for (i, b) in buf.as_mut_slice().iter_mut().enumerate() {
-            *b = u8::try_from(i % 251).expect("i % 251 fits in u8"); // prime-sized pattern
-        }
+            // Fill with a recognizable pattern.
+            for (i, b) in buf.as_mut_slice().iter_mut().enumerate() {
+                *b = u8::try_from(i % 251).expect("i % 251 fits in u8"); // prime-sized pattern
+            }
 
-        let ptr_before = buf.as_ptr();
+            let ptr_before = buf.as_ptr();
 
-        // VfsFile::write takes &[u8] — PageBuf::as_slice gives us a
-        // reference to the same aligned memory, no copy.
-        file.write(&cx, buf.as_slice(), 0).unwrap();
+            // VfsFile::write takes &[u8] — PageBuf::as_slice gives us a
+            // reference to the same aligned memory, no copy.
+            file.write(&cx, buf.as_slice(), 0).await.unwrap();
 
-        let ptr_after = buf.as_ptr();
-        assert_eq!(
-            ptr_before, ptr_after,
-            "bead_id={BEAD_ID} case=vfs_write_no_intermediate_alloc \
-             PageBuf pointer must be stable through write"
-        );
+            let ptr_after = buf.as_ptr();
+            assert_eq!(
+                ptr_before, ptr_after,
+                "bead_id={BEAD_ID} case=vfs_write_no_intermediate_alloc \
+                 PageBuf pointer must be stable through write"
+            );
 
-        // Verify the data was written correctly.
-        let mut verify = vec![0u8; 4096];
-        file.read(&cx, &mut verify, 0).unwrap();
-        assert_eq!(
-            verify.as_slice(),
-            buf.as_slice(),
-            "bead_id={BEAD_ID} case=vfs_write_data_roundtrip"
-        );
+            // Verify the data was written correctly.
+            let mut verify = vec![0u8; 4096];
+            file.read(&cx, &mut verify, 0).await.unwrap();
+            assert_eq!(
+                verify.as_slice(),
+                buf.as_slice(),
+                "bead_id={BEAD_ID} case=vfs_write_data_roundtrip"
+            );
+        });
     }
 
     // --- test_pager_returns_ref_not_copy ---
 
     #[test]
     fn test_pager_returns_ref_not_copy() {
-        // PageCache::get() returns &[u8] that points to the same memory
-        // as the stored PageBuf — a reference, not a copy.
-        let (cx, mut file) = setup();
+        run_async_test(|| async {
+            // PageCache::get() returns &[u8] that points to the same memory
+            // as the stored PageBuf — a reference, not a copy.
+            let (cx, file) = setup();
 
-        // Write a page to the file.
-        let data = vec![0xAB_u8; 4096];
-        file.write(&cx, &data, 0).unwrap();
+            // Write a page to the file.
+            let data = vec![0xAB_u8; 4096];
+            file.write(&cx, &data, 0).await.unwrap();
 
-        let mut cache = PageCache::new(PageSize::DEFAULT);
-        let page1 = PageNumber::ONE;
+            let mut cache = PageCache::new(PageSize::DEFAULT);
+            let page1 = PageNumber::ONE;
 
-        // Read the page into cache.
-        let ref1 = cache.read_page(&cx, &mut file, page1).unwrap();
-        let ref1_ptr = ref1.as_ptr();
-        assert_eq!(
-            &ref1[..4096],
-            data.as_slice(),
-            "bead_id={BEAD_ID} case=pager_ref_data_correct"
-        );
+            // Read the page into cache.
+            let ref1 = cache.read_page(&cx, &file, page1).await.unwrap();
+            let ref1_ptr = ref1.as_ptr();
+            assert_eq!(
+                &ref1[..4096],
+                data.as_slice(),
+                "bead_id={BEAD_ID} case=pager_ref_data_correct"
+            );
 
-        // Get the same page again — must be same pointer (cached).
-        let ref2 = cache.get(page1).unwrap();
-        let ref2_ptr = ref2.as_ptr();
-        assert_eq!(
-            ref1_ptr, ref2_ptr,
-            "bead_id={BEAD_ID} case=pager_returns_ref_not_copy \
-             get() must return reference to same memory as read_page()"
-        );
+            // Get the same page again — must be same pointer (cached).
+            let ref2 = cache.get(page1).unwrap();
+            let ref2_ptr = ref2.as_ptr();
+            assert_eq!(
+                ref1_ptr, ref2_ptr,
+                "bead_id={BEAD_ID} case=pager_returns_ref_not_copy \
+                 get() must return reference to same memory as read_page()"
+            );
+        });
     }
 
     // --- test_wal_uses_buffered_io_compat ---
@@ -4532,77 +5069,81 @@ mod tests {
 
     #[test]
     fn test_small_header_stack_buffer_ok() {
-        // Per §1.5: "Small stack buffers for fixed-size headers ARE permitted."
-        // Demonstrate that reading the 100-byte DB header into a stack
-        // buffer works correctly and does not violate zero-copy.
-        let (cx, mut file) = setup();
+        run_async_test(|| async {
+            // Per §1.5: "Small stack buffers for fixed-size headers ARE permitted."
+            // Demonstrate that reading the 100-byte DB header into a stack
+            // buffer works correctly and does not violate zero-copy.
+            let (cx, file) = setup();
 
-        // Write a minimal SQLite header (first 16 bytes of magic string).
-        let mut header_data = [0u8; 100];
-        header_data[..16].copy_from_slice(b"SQLite format 3\0");
-        header_data[16..18].copy_from_slice(&4096u16.to_be_bytes()); // page size
-        file.write(&cx, &header_data, 0).unwrap();
+            // Write a minimal SQLite header (first 16 bytes of magic string).
+            let mut header_data = [0u8; 100];
+            header_data[..16].copy_from_slice(b"SQLite format 3\0");
+            header_data[16..18].copy_from_slice(&4096u16.to_be_bytes()); // page size
+            file.write(&cx, &header_data, 0).await.unwrap();
 
-        // Read using the stack-buffer helper.
-        let header = read_db_header(&cx, &mut file).unwrap();
-        assert_eq!(
-            &header[..16],
-            b"SQLite format 3\0",
-            "bead_id={BEAD_ID} case=small_header_stack_buffer_ok"
-        );
+            // Read using the stack-buffer helper.
+            let header = read_db_header(&cx, &file).await.unwrap();
+            assert_eq!(
+                &header[..16],
+                b"SQLite format 3\0",
+                "bead_id={BEAD_ID} case=small_header_stack_buffer_ok"
+            );
 
-        // Verify page size field.
-        let page_size = u16::from_be_bytes([header[16], header[17]]);
-        assert_eq!(
-            page_size, 4096,
-            "bead_id={BEAD_ID} case=header_page_size_correct"
-        );
+            // Verify page size field.
+            let page_size = u16::from_be_bytes([header[16], header[17]]);
+            assert_eq!(
+                page_size, 4096,
+                "bead_id={BEAD_ID} case=header_page_size_correct"
+            );
+        });
     }
 
     // --- test_page_decode_bounds_checked ---
 
     #[test]
     fn test_page_decode_bounds_checked() {
-        // Verify that page structures are decoded with bounds-checked reads
-        // in safe Rust — no transmute of variable-length formats.
-        //
-        // We simulate decoding a B-tree page header from a cached page.
-        let (cx, mut file) = setup();
+        run_async_test(|| async {
+            // Verify that page structures are decoded with bounds-checked reads
+            // in safe Rust — no transmute of variable-length formats.
+            //
+            // We simulate decoding a B-tree page header from a cached page.
+            let (cx, file) = setup();
 
-        // Write a page with a simulated B-tree leaf header.
-        let mut page_data = vec![0u8; 4096];
-        page_data[0] = 0x0D; // leaf table b-tree page type
-        page_data[3..5].copy_from_slice(&10u16.to_be_bytes()); // cell count = 10
-        page_data[5..7].copy_from_slice(&100u16.to_be_bytes()); // cell content offset
-        file.write(&cx, &page_data, 0).unwrap();
+            // Write a page with a simulated B-tree leaf header.
+            let mut page_data = vec![0u8; 4096];
+            page_data[0] = 0x0D; // leaf table b-tree page type
+            page_data[3..5].copy_from_slice(&10u16.to_be_bytes()); // cell count = 10
+            page_data[5..7].copy_from_slice(&100u16.to_be_bytes()); // cell content offset
+            file.write(&cx, &page_data, 0).await.unwrap();
 
-        // Read into cache.
-        let mut cache = PageCache::new(PageSize::DEFAULT);
-        let page = cache.read_page(&cx, &mut file, PageNumber::ONE).unwrap();
+            // Read into cache.
+            let mut cache = PageCache::new(PageSize::DEFAULT);
+            let page = cache.read_page(&cx, &file, PageNumber::ONE).await.unwrap();
 
-        // Bounds-checked decode: every access goes through slice indexing.
-        let page_type = page[0];
-        assert_eq!(page_type, 0x0D, "bead_id={BEAD_ID} case=page_decode_type");
+            // Bounds-checked decode: every access goes through slice indexing.
+            let page_type = page[0];
+            assert_eq!(page_type, 0x0D, "bead_id={BEAD_ID} case=page_decode_type");
 
-        let cell_count = u16::from_be_bytes([page[3], page[4]]);
-        assert_eq!(
-            cell_count, 10,
-            "bead_id={BEAD_ID} case=page_decode_cell_count"
-        );
+            let cell_count = u16::from_be_bytes([page[3], page[4]]);
+            assert_eq!(
+                cell_count, 10,
+                "bead_id={BEAD_ID} case=page_decode_cell_count"
+            );
 
-        let content_offset = u16::from_be_bytes([page[5], page[6]]);
-        assert_eq!(
-            content_offset, 100,
-            "bead_id={BEAD_ID} case=page_decode_content_offset"
-        );
+            let content_offset = u16::from_be_bytes([page[5], page[6]]);
+            assert_eq!(
+                content_offset, 100,
+                "bead_id={BEAD_ID} case=page_decode_content_offset"
+            );
 
-        // Out of bounds access panics (safe Rust guarantee).
-        // We verify by checking the page length is exactly page_size.
-        assert_eq!(
-            page.len(),
-            4096,
-            "bead_id={BEAD_ID} case=page_decode_bounds_checked"
-        );
+            // Out of bounds access panics (safe Rust guarantee).
+            // We verify by checking the page length is exactly page_size.
+            assert_eq!(
+                page.len(),
+                4096,
+                "bead_id={BEAD_ID} case=page_decode_bounds_checked"
+            );
+        });
     }
 
     // --- Cache operation tests ---
@@ -4684,51 +5225,55 @@ mod tests {
 
     #[test]
     fn test_cache_multiple_pages() {
-        let (cx, mut file) = setup();
+        run_async_test(|| async {
+            let (cx, file) = setup();
 
-        // Write 3 pages with distinct content.
-        for i in 0..3u32 {
-            let seed = u8::try_from(i).expect("i <= 2");
-            let data = vec![(seed + 1) * 0x11; 4096];
-            let offset = u64::from(i) * 4096;
-            file.write(&cx, &data, offset).unwrap();
-        }
+            // Write 3 pages with distinct content.
+            for i in 0..3u32 {
+                let seed = u8::try_from(i).expect("i <= 2");
+                let data = vec![(seed + 1) * 0x11; 4096];
+                let offset = u64::from(i) * 4096;
+                file.write(&cx, &data, offset).await.unwrap();
+            }
 
-        let mut cache = PageCache::new(PageSize::DEFAULT);
+            let mut cache = PageCache::new(PageSize::DEFAULT);
 
-        for i in 1..=3u32 {
-            let pn = PageNumber::new(i).unwrap();
-            let page = cache.read_page(&cx, &mut file, pn).unwrap();
-            let expected = u8::try_from(i).expect("i <= 3") * 0x11;
-            assert!(
-                page.iter().all(|&b| b == expected),
-                "bead_id={BEAD_ID} case=multiple_pages page={i} expected={expected:#x}"
-            );
-        }
+            for i in 1..=3u32 {
+                let pn = PageNumber::new(i).unwrap();
+                let page = cache.read_page(&cx, &file, pn).await.unwrap();
+                let expected = u8::try_from(i).expect("i <= 3") * 0x11;
+                assert!(
+                    page.iter().all(|&b| b == expected),
+                    "bead_id={BEAD_ID} case=multiple_pages page={i} expected={expected:#x}"
+                );
+            }
 
-        assert_eq!(cache.len(), 3);
+            assert_eq!(cache.len(), 3);
+        });
     }
 
     #[test]
     fn test_cache_write_page_roundtrip() {
-        let (cx, mut file) = setup();
+        run_async_test(|| async {
+            let (cx, file) = setup();
 
-        let mut cache = PageCache::new(PageSize::DEFAULT);
-        let page1 = PageNumber::ONE;
+            let mut cache = PageCache::new(PageSize::DEFAULT);
+            let page1 = PageNumber::ONE;
 
-        // Insert a fresh page, modify it, write to VFS.
-        let data = cache.insert_fresh(page1).unwrap();
-        data.fill(0xCD);
+            // Insert a fresh page, modify it, write to VFS.
+            let data = cache.insert_fresh(page1).unwrap();
+            data.fill(0xCD);
 
-        cache.write_page(&cx, &mut file, page1).unwrap();
+            cache.write_page(&cx, &file, page1).await.unwrap();
 
-        // Read back from VFS directly (bypassing cache).
-        let mut verify = vec![0u8; 4096];
-        file.read(&cx, &mut verify, 0).unwrap();
-        assert!(
-            verify.iter().all(|&b| b == 0xCD),
-            "bead_id={BEAD_ID} case=write_page_roundtrip"
-        );
+            // Read back from VFS directly (bypassing cache).
+            let mut verify = vec![0u8; 4096];
+            file.read(&cx, &mut verify, 0).await.unwrap();
+            assert!(
+                verify.iter().all(|&b| b == 0xCD),
+                "bead_id={BEAD_ID} case=write_page_roundtrip"
+            );
+        });
     }
 
     #[test]
@@ -4762,79 +5307,81 @@ mod tests {
 
     #[test]
     fn test_e2e_zero_copy_io_no_allocations() {
-        // E2E: run a read-heavy workload (simulated point lookups) and
-        // verify that steady-state reads are allocation-free by checking
-        // pool reuse and pointer stability.
-        let (cx, mut file) = setup();
+        run_async_test(|| async {
+            // E2E: run a read-heavy workload (simulated point lookups) and
+            // verify that steady-state reads are allocation-free by checking
+            // pool reuse and pointer stability.
+            let (cx, file) = setup();
 
-        // Write 10 pages with distinct content.
-        let num_pages: u32 = 10;
-        for i in 0..num_pages {
-            let byte = u8::try_from(i).expect("i <= 9").wrapping_add(0x10);
-            let data = vec![byte; 4096];
-            file.write(&cx, &data, u64::from(i) * 4096).unwrap();
-        }
+            // Write 10 pages with distinct content.
+            let num_pages: u32 = 10;
+            for i in 0..num_pages {
+                let byte = u8::try_from(i).expect("i <= 9").wrapping_add(0x10);
+                let data = vec![byte; 4096];
+                file.write(&cx, &data, u64::from(i) * 4096).await.unwrap();
+            }
 
-        let mut cache = PageCache::new(PageSize::DEFAULT);
+            let mut cache = PageCache::new(PageSize::DEFAULT);
 
-        // Phase 1: Cold reads — pages load from VFS into cache.
-        let mut ptrs: Vec<usize> = Vec::with_capacity(num_pages as usize);
-        for i in 1..=num_pages {
-            let pn = PageNumber::new(i).unwrap();
-            let page = cache.read_page(&cx, &mut file, pn).unwrap();
-            ptrs.push(page.as_ptr() as usize);
-        }
-
-        // Phase 2: Hot reads — all pages are cached.  Verify no new
-        // allocations by checking pointer stability.
-        for round in 0..5u32 {
+            // Phase 1: Cold reads — pages load from VFS into cache.
+            let mut ptrs: Vec<usize> = Vec::with_capacity(num_pages as usize);
             for i in 1..=num_pages {
                 let pn = PageNumber::new(i).unwrap();
-                let page = cache.get(pn).unwrap();
-                let ptr = page.as_ptr() as usize;
-                assert_eq!(
-                    ptr,
-                    ptrs[(i - 1) as usize],
-                    "bead_id={BEAD_ID} case=e2e_pointer_stable \
-                     round={round} page={i}"
-                );
-
-                // Verify data correctness.
-                let expected = u8::try_from(i - 1).expect("i - 1 <= 9").wrapping_add(0x10);
-                assert!(
-                    page.iter().all(|&b| b == expected),
-                    "bead_id={BEAD_ID} case=e2e_data_correct \
-                     round={round} page={i}"
-                );
+                let page = cache.read_page(&cx, &file, pn).await.unwrap();
+                ptrs.push(page.as_ptr() as usize);
             }
-        }
 
-        // Phase 3: Evict and re-read — pool reuse avoids new allocation.
-        let pool_available_before = cache.pool().available();
-        let old_ptr = ptrs[0];
+            // Phase 2: Hot reads — all pages are cached.  Verify no new
+            // allocations by checking pointer stability.
+            for round in 0..5u32 {
+                for i in 1..=num_pages {
+                    let pn = PageNumber::new(i).unwrap();
+                    let page = cache.get(pn).unwrap();
+                    let ptr = page.as_ptr() as usize;
+                    assert_eq!(
+                        ptr,
+                        ptrs[(i - 1) as usize],
+                        "bead_id={BEAD_ID} case=e2e_pointer_stable \
+                         round={round} page={i}"
+                    );
 
-        cache.evict(PageNumber::ONE);
-        assert_eq!(
-            cache.pool().available(),
-            pool_available_before + 1,
-            "bead_id={BEAD_ID} case=e2e_evict_returns_to_pool"
-        );
+                    // Verify data correctness.
+                    let expected = u8::try_from(i - 1).expect("i - 1 <= 9").wrapping_add(0x10);
+                    assert!(
+                        page.iter().all(|&b| b == expected),
+                        "bead_id={BEAD_ID} case=e2e_data_correct \
+                         round={round} page={i}"
+                    );
+                }
+            }
 
-        // Re-read page 1: should reuse pool buffer (no new heap alloc).
-        let page1_reread = cache.read_page(&cx, &mut file, PageNumber::ONE).unwrap();
-        let new_ptr = page1_reread.as_ptr() as usize;
+            // Phase 3: Evict and re-read — pool reuse avoids new allocation.
+            let pool_available_before = cache.pool().available();
+            let old_ptr = ptrs[0];
 
-        // The recycled buffer from the pool should be the same allocation.
-        assert_eq!(
-            new_ptr, old_ptr,
-            "bead_id={BEAD_ID} case=e2e_pool_reuse_after_evict \
-             Expected recycled buffer at {old_ptr:#x}, got {new_ptr:#x}"
-        );
+            cache.evict(PageNumber::ONE);
+            assert_eq!(
+                cache.pool().available(),
+                pool_available_before + 1,
+                "bead_id={BEAD_ID} case=e2e_evict_returns_to_pool"
+            );
 
-        // Summary (grep-friendly).
-        eprintln!("pages_cached={}", cache.len());
-        eprintln!("pool_available={}", cache.pool().available());
-        eprintln!("pointer_checks_passed={}", num_pages * 5 + 1);
+            // Re-read page 1: should reuse pool buffer (no new heap alloc).
+            let page1_reread = cache.read_page(&cx, &file, PageNumber::ONE).await.unwrap();
+            let new_ptr = page1_reread.as_ptr() as usize;
+
+            // The recycled buffer from the pool should be the same allocation.
+            assert_eq!(
+                new_ptr, old_ptr,
+                "bead_id={BEAD_ID} case=e2e_pool_reuse_after_evict \
+                 Expected recycled buffer at {old_ptr:#x}, got {new_ptr:#x}"
+            );
+
+            // Summary (grep-friendly).
+            eprintln!("pages_cached={}", cache.len());
+            eprintln!("pool_available={}", cache.pool().available());
+            eprintln!("pointer_checks_passed={}", num_pages * 5 + 1);
+        });
     }
 
     // --- Debug ---
@@ -5030,47 +5577,51 @@ mod tests {
     /// keep the fresh bytes.
     #[test]
     fn gh_197_late_miss_fill_does_not_overwrite_newer_resident_page() {
-        let cx = Cx::new();
-        let vfs = MemoryVfs::new();
-        let (mut file, _) = vfs
-            .open(
-                &cx,
-                Some(Path::new("/gh-197.db")),
-                VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB,
-            )
-            .expect("open db file");
+        run_async_test(|| async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let (file, _) = vfs
+                .open(
+                    &cx,
+                    Some(Path::new("/gh-197.db")),
+                    VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB,
+                )
+                .expect("open db file");
 
-        let page_size = PageSize::DEFAULT.as_usize();
-        let page_no = PageNumber::new(7).unwrap();
-        let offset = page_offset(page_no, PageSize::DEFAULT);
+            let page_size = PageSize::DEFAULT.as_usize();
+            let page_no = PageNumber::new(7).unwrap();
+            let offset = page_offset(page_no, PageSize::DEFAULT);
 
-        // Backing store holds the stale image 0x11.
-        file.write(&cx, &vec![0x11_u8; page_size], offset)
-            .expect("seed stale page");
+            // Backing store holds the stale image 0x11.
+            file.write(&cx, &vec![0x11_u8; page_size], offset)
+                .await
+                .expect("seed stale page");
 
-        let cache = ShardedPageCache::new(PageSize::DEFAULT);
+            let cache = ShardedPageCache::new(PageSize::DEFAULT);
 
-        // Miss path: while the stale read result is still un-cached, a
-        // writer installs the fresh image 0x22 for the same page.
-        cache
-            .read_page(&cx, &mut file, page_no, |stale| {
-                assert!(
-                    stale.iter().all(|&b| b == 0x11),
-                    "miss I/O must observe the stale backing bytes"
-                );
-                let mut fresh = cache.pool().acquire().expect("acquire fresh buf");
-                fresh.as_mut_slice().fill(0x22);
-                cache.insert_buffer(page_no, fresh);
-            })
-            .expect("miss read");
+            // Miss path: while the stale read result is still un-cached, a
+            // writer installs the fresh image 0x22 for the same page.
+            cache
+                .read_page(&cx, &file, page_no, |stale| {
+                    assert!(
+                        stale.iter().all(|&b| b == 0x11),
+                        "miss I/O must observe the stale backing bytes"
+                    );
+                    let mut fresh = cache.pool().acquire().expect("acquire fresh buf");
+                    fresh.as_mut_slice().fill(0x22);
+                    cache.insert_buffer(page_no, fresh);
+                })
+                .await
+                .expect("miss read");
 
-        let resident = cache
-            .get_copy(page_no)
-            .expect("page must be resident after the race");
-        assert!(
-            resident.iter().all(|&b| b == 0x22),
-            "newer resident image must win over the stale late miss-fill (GH #197)"
-        );
+            let resident = cache
+                .get_copy(page_no)
+                .expect("page must be resident after the race");
+            assert!(
+                resident.iter().all(|&b| b == 0x22),
+                "newer resident image must win over the stale late miss-fill (GH #197)"
+            );
+        });
     }
 
     #[test]
@@ -6234,37 +6785,39 @@ mod tests {
 
     #[test]
     fn test_cache_lookup_no_alloc() {
-        // bd-22n.8: Buffer pool cache lookup is allocation-free.
-        //
-        // PageCache::get() returns Option<&[u8]> — a reference into the
-        // pool-allocated buffer.  It does a HashMap::get + PageBuf::as_slice,
-        // neither of which allocates.
-        //
-        // We verify by: (a) checking the returned &[u8] is the same pointer
-        // as the original PageBuf, and (b) repeating the lookup many times
-        // and verifying pointer stability (proves no reallocation).
-        let (cx, mut file) = setup();
+        run_async_test(|| async {
+            // bd-22n.8: Buffer pool cache lookup is allocation-free.
+            //
+            // PageCache::get() returns Option<&[u8]> — a reference into the
+            // pool-allocated buffer.  It does a HashMap::get + PageBuf::as_slice,
+            // neither of which allocates.
+            //
+            // We verify by: (a) checking the returned &[u8] is the same pointer
+            // as the original PageBuf, and (b) repeating the lookup many times
+            // and verifying pointer stability (proves no reallocation).
+            let (cx, file) = setup();
 
-        let data = vec![0xBE_u8; 4096];
-        file.write(&cx, &data, 0).unwrap();
+            let data = vec![0xBE_u8; 4096];
+            file.write(&cx, &data, 0).await.unwrap();
 
-        let mut cache = PageCache::new(PageSize::DEFAULT);
-        let page1 = PageNumber::ONE;
+            let mut cache = PageCache::new(PageSize::DEFAULT);
+            let page1 = PageNumber::ONE;
 
-        // Cold read — allocates from pool.
-        let initial = cache.read_page(&cx, &mut file, page1).unwrap();
-        let initial_ptr = initial.as_ptr();
+            // Cold read — allocates from pool.
+            let initial = cache.read_page(&cx, &file, page1).await.unwrap();
+            let initial_ptr = initial.as_ptr();
 
-        // Hot reads — must be allocation-free (same pointer).
-        for round in 0..100u32 {
-            let cached = cache.get(page1).unwrap();
-            assert_eq!(
-                cached.as_ptr(),
-                initial_ptr,
-                "bead_id={BEAD_22N8} case=cache_lookup_no_alloc \
-                 round={round} pointer must be stable (no realloc)"
-            );
-        }
+            // Hot reads — must be allocation-free (same pointer).
+            for round in 0..100u32 {
+                let cached = cache.get(page1).unwrap();
+                assert_eq!(
+                    cached.as_ptr(),
+                    initial_ptr,
+                    "bead_id={BEAD_22N8} case=cache_lookup_no_alloc \
+                     round={round} pointer must be stable (no realloc)"
+                );
+            }
+        });
     }
 
     #[test]
@@ -6299,39 +6852,41 @@ mod tests {
 
     #[test]
     fn test_pool_reuse_avoids_alloc_on_reread() {
-        // bd-22n.8: After eviction, re-reading a page reuses a pool buffer
-        // rather than allocating fresh memory.  This ensures the read path
-        // is allocation-free in steady state (pool has recycled buffers).
-        let (cx, mut file) = setup();
+        run_async_test(|| async {
+            // bd-22n.8: After eviction, re-reading a page reuses a pool buffer
+            // rather than allocating fresh memory.  This ensures the read path
+            // is allocation-free in steady state (pool has recycled buffers).
+            let (cx, file) = setup();
 
-        let data = vec![0xDD_u8; 4096];
-        file.write(&cx, &data, 0).unwrap();
+            let data = vec![0xDD_u8; 4096];
+            file.write(&cx, &data, 0).await.unwrap();
 
-        let mut cache = PageCache::new(PageSize::DEFAULT);
-        let page1 = PageNumber::ONE;
+            let mut cache = PageCache::new(PageSize::DEFAULT);
+            let page1 = PageNumber::ONE;
 
-        // Cold read, then evict.
-        let _ = cache.read_page(&cx, &mut file, page1).unwrap();
-        assert_eq!(cache.pool().available(), 0);
-        cache.evict(page1);
-        assert_eq!(
-            cache.pool().available(),
-            1,
-            "bead_id={BEAD_22N8} case=evicted_buffer_returned_to_pool"
-        );
+            // Cold read, then evict.
+            let _ = cache.read_page(&cx, &file, page1).await.unwrap();
+            assert_eq!(cache.pool().available(), 0);
+            cache.evict(page1);
+            assert_eq!(
+                cache.pool().available(),
+                1,
+                "bead_id={BEAD_22N8} case=evicted_buffer_returned_to_pool"
+            );
 
-        // Re-read: pool has a buffer, so no new allocation needed.
-        let reread = cache.read_page(&cx, &mut file, page1).unwrap();
-        assert_eq!(
-            reread,
-            data.as_slice(),
-            "bead_id={BEAD_22N8} case=pool_reuse_data_correct"
-        );
-        assert_eq!(
-            cache.pool().available(),
-            0,
-            "bead_id={BEAD_22N8} case=pool_buffer_consumed_on_reread"
-        );
+            // Re-read: pool has a buffer, so no new allocation needed.
+            let reread = cache.read_page(&cx, &file, page1).await.unwrap();
+            assert_eq!(
+                reread,
+                data.as_slice(),
+                "bead_id={BEAD_22N8} case=pool_reuse_data_correct"
+            );
+            assert_eq!(
+                cache.pool().available(),
+                0,
+                "bead_id={BEAD_22N8} case=pool_buffer_consumed_on_reread"
+            );
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -6747,37 +7302,41 @@ mod tests {
 
     #[test]
     fn test_sharded_cache_vfs_read_write() {
-        let (cx, mut file) = setup();
+        run_async_test(|| async {
+            let (cx, file) = setup();
 
-        // Write test data to VFS
-        let test_data = vec![0xAB_u8; 4096];
-        file.write(&cx, &test_data, 0).unwrap();
+            // Write test data to VFS
+            let test_data = vec![0xAB_u8; 4096];
+            file.write(&cx, &test_data, 0).await.unwrap();
 
-        let cache = ShardedPageCache::new(PageSize::DEFAULT);
-        let p1 = PageNumber::ONE;
+            let cache = ShardedPageCache::new(PageSize::DEFAULT);
+            let p1 = PageNumber::ONE;
 
-        // Read through cache
-        let result = cache.read_page(&cx, &mut file, p1, |data| {
+            // Read through cache
+            let result = cache
+                .read_page(&cx, &file, p1, |data| {
+                    assert_eq!(
+                        data,
+                        test_data.as_slice(),
+                        "bead_id={BEAD_3WOP3_2} case=vfs_read_data"
+                    );
+                    data[0]
+                })
+                .await;
+            assert_eq!(result.unwrap(), 0xAB);
+
+            // Modify and write back
+            cache.with_page_mut(p1, |data| data[0] = 0xCD);
+            cache.write_page(&cx, &file, p1).await.unwrap();
+
+            // Verify write
+            let mut verify = vec![0u8; 4096];
+            file.read(&cx, &mut verify, 0).await.unwrap();
             assert_eq!(
-                data,
-                test_data.as_slice(),
-                "bead_id={BEAD_3WOP3_2} case=vfs_read_data"
+                verify[0], 0xCD,
+                "bead_id={BEAD_3WOP3_2} case=vfs_write_verify"
             );
-            data[0]
         });
-        assert_eq!(result.unwrap(), 0xAB);
-
-        // Modify and write back
-        cache.with_page_mut(p1, |data| data[0] = 0xCD);
-        cache.write_page(&cx, &mut file, p1).unwrap();
-
-        // Verify write
-        let mut verify = vec![0u8; 4096];
-        file.read(&cx, &mut verify, 0).unwrap();
-        assert_eq!(
-            verify[0], 0xCD,
-            "bead_id={BEAD_3WOP3_2} case=vfs_write_verify"
-        );
     }
 
     // --- Concurrency tests ---
@@ -7753,34 +8312,38 @@ mod tests {
 
     #[test]
     fn test_sharded_cache_fast_path_vfs_roundtrip() {
-        let (cx, mut file) = setup();
+        run_async_test(|| async {
+            let (cx, file) = setup();
 
-        // Write test data to VFS
-        let test_data = vec![0xAB_u8; 4096];
-        file.write(&cx, &test_data, 0).unwrap();
+            // Write test data to VFS
+            let test_data = vec![0xAB_u8; 4096];
+            file.write(&cx, &test_data, 0).await.unwrap();
 
-        let cache = ShardedPageCache::new_single_connection(PageSize::DEFAULT);
-        let p1 = PageNumber::ONE;
+            let cache = ShardedPageCache::new_single_connection(PageSize::DEFAULT);
+            let p1 = PageNumber::ONE;
 
-        // Read through fast path
-        let result = cache.read_page(&cx, &mut file, p1, |data| {
-            assert_eq!(
-                data,
-                test_data.as_slice(),
-                "bead_id={BEAD_FZR07} case=fp_vfs_read"
-            );
-            data[0]
+            // Read through fast path
+            let result = cache
+                .read_page(&cx, &file, p1, |data| {
+                    assert_eq!(
+                        data,
+                        test_data.as_slice(),
+                        "bead_id={BEAD_FZR07} case=fp_vfs_read"
+                    );
+                    data[0]
+                })
+                .await;
+            assert_eq!(result.unwrap(), 0xAB);
+
+            // Modify and write back
+            cache.with_page_mut(p1, |data| data[0] = 0xCD);
+            cache.write_page(&cx, &file, p1).await.unwrap();
+
+            // Verify write
+            let mut verify = vec![0u8; 4096];
+            file.read(&cx, &mut verify, 0).await.unwrap();
+            assert_eq!(verify[0], 0xCD, "bead_id={BEAD_FZR07} case=fp_vfs_write");
         });
-        assert_eq!(result.unwrap(), 0xAB);
-
-        // Modify and write back
-        cache.with_page_mut(p1, |data| data[0] = 0xCD);
-        cache.write_page(&cx, &mut file, p1).unwrap();
-
-        // Verify write
-        let mut verify = vec![0u8; 4096];
-        file.read(&cx, &mut verify, 0).unwrap();
-        assert_eq!(verify[0], 0xCD, "bead_id={BEAD_FZR07} case=fp_vfs_write");
     }
 
     #[test]
@@ -7885,19 +8448,21 @@ mod tests {
 
     #[test]
     fn test_sharded_cache_fast_path_read_page_copy() {
-        let (cx, mut file) = setup();
+        run_async_test(|| async {
+            let (cx, file) = setup();
 
-        let test_data = vec![0x88_u8; 4096];
-        file.write(&cx, &test_data, 0).unwrap();
+            let test_data = vec![0x88_u8; 4096];
+            file.write(&cx, &test_data, 0).await.unwrap();
 
-        let cache = ShardedPageCache::new_single_connection(PageSize::DEFAULT);
-        let p1 = PageNumber::ONE;
+            let cache = ShardedPageCache::new_single_connection(PageSize::DEFAULT);
+            let p1 = PageNumber::ONE;
 
-        let copy = cache.read_page_copy(&cx, &mut file, p1).unwrap();
-        assert!(
-            copy.iter().all(|&b| b == 0x88),
-            "bead_id={BEAD_FZR07} case=fp_read_page_copy"
-        );
+            let copy = cache.read_page_copy(&cx, &file, p1).await.unwrap();
+            assert!(
+                copy.iter().all(|&b| b == 0x88),
+                "bead_id={BEAD_FZR07} case=fp_read_page_copy"
+            );
+        });
     }
 
     #[test]

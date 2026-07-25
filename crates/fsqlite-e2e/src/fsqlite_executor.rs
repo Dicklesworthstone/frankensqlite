@@ -917,7 +917,8 @@ fn open_connection(db_path: &Path) -> E2eResult<Connection> {
             .ok_or_else(|| E2eError::Io(std::io::Error::other("path is not valid UTF-8")))?
             .to_owned()
     };
-    Connection::open(&path_str).map_err(|e| E2eError::Fsqlite(format!("open: {e}")))
+    crate::block_on(Connection::open(&path_str))
+        .map_err(|e| E2eError::Fsqlite(format!("open: {e}")))
 }
 
 const FILE_BACKED_DEFAULT_PARITY_PRAGMAS: [&str; 2] = [
@@ -942,8 +943,7 @@ fn config_has_explicit_parity_override(config: &FsqliteExecConfig) -> bool {
 }
 
 fn query_pragma_text(conn: &Connection, pragma: &str) -> E2eResult<String> {
-    let rows = conn
-        .query(pragma)
+    let rows = crate::block_on(conn.query(pragma))
         .map_err(|e| E2eError::Fsqlite(format!("query `{pragma}`: {e}")))?;
     let Some(value) = rows.first().and_then(|row| row.values().first()) else {
         return Err(E2eError::Fsqlite(format!(
@@ -960,14 +960,13 @@ fn query_pragma_text(conn: &Connection, pragma: &str) -> E2eResult<String> {
 }
 
 fn reset_conflict_stats(conn: &Connection) -> E2eResult<()> {
-    conn.query("PRAGMA fsqlite.conflict_reset;")
+    crate::block_on(conn.query("PRAGMA fsqlite.conflict_reset;"))
         .map(|_| ())
         .map_err(|e| E2eError::Fsqlite(format!("query `PRAGMA fsqlite.conflict_reset;`: {e}")))
 }
 
 fn query_conflict_stats_note(conn: &Connection) -> E2eResult<Option<String>> {
-    let rows = conn
-        .query("PRAGMA fsqlite.conflict_stats;")
+    let rows = crate::block_on(conn.query("PRAGMA fsqlite.conflict_stats;"))
         .map_err(|e| E2eError::Fsqlite(format!("query `PRAGMA fsqlite.conflict_stats;`: {e}")))?;
 
     let mut page_contentions = 0_u64;
@@ -1047,7 +1046,7 @@ fn configure_connection(
     {
         let mut attempt = 0;
         loop {
-            match conn.execute(pragma) {
+            match crate::block_on(conn.execute(pragma)) {
                 Ok(_) => break,
                 Err(e) if is_retryable_busy(&e) => {
                     attempt += 1;
@@ -1498,9 +1497,7 @@ fn execute_batch_with_executor(
     let mut timing = BatchTiming::default();
 
     let begin_started = Instant::now();
-    executor
-        .conn
-        .begin_transaction()
+    crate::block_on(executor.conn.begin_transaction())
         .map_err(|err| classify_fsqlite_error_as_batch_in_phase(err, BatchPhase::Begin))?;
     timing.begin_boundary = duration_to_u64_ns(begin_started.elapsed());
 
@@ -1545,9 +1542,9 @@ fn execute_batch_with_executor(
 
     let finalize_started = Instant::now();
     let finalize_result = if batch.commit {
-        executor.conn.commit_transaction()
+        crate::block_on(executor.conn.commit_transaction())
     } else {
-        executor.conn.rollback_transaction()
+        crate::block_on(executor.conn.rollback_transaction())
     };
     match finalize_result {
         Ok(()) => {
@@ -1691,7 +1688,7 @@ fn run_records_with_retry(
 }
 
 fn rollback_active_batch(conn: &Connection) -> Result<(), String> {
-    match conn.rollback_transaction() {
+    match crate::block_on(conn.rollback_transaction()) {
         Ok(()) | Err(FrankenError::NoActiveTransaction) => Ok(()),
         Err(err) => Err(err.to_string()),
     }
@@ -1727,17 +1724,12 @@ impl<'conn> PreparedOpExecutor<'conn> {
             OpKind::Update { table, key, values } => {
                 self.execute_update(table, *key, values, rec.expected.as_ref())
             }
-            OpKind::Begin => self
-                .conn
-                .begin_transaction()
+            OpKind::Begin => {
+                crate::block_on(self.conn.begin_transaction()).map_err(classify_fsqlite_error_as_op)
+            }
+            OpKind::Commit => crate::block_on(self.conn.commit_transaction())
                 .map_err(classify_fsqlite_error_as_op),
-            OpKind::Commit => self
-                .conn
-                .commit_transaction()
-                .map_err(classify_fsqlite_error_as_op),
-            OpKind::Rollback => self
-                .conn
-                .rollback_transaction()
+            OpKind::Rollback => crate::block_on(self.conn.rollback_transaction())
                 .map_err(classify_fsqlite_error_as_op),
         }
     }
@@ -1905,7 +1897,7 @@ impl<'conn> PreparedOpExecutor<'conn> {
                     .prepared_dml
                     .get(sql)
                     .expect("prepared DML cache must contain the current scratch SQL");
-                stmt.execute_with_params(params)
+                crate::block_on(stmt.execute_with_params(params))
             };
             match execute_result {
                 Ok(affected) => return Ok(affected),
@@ -1922,7 +1914,7 @@ impl<'conn> PreparedOpExecutor<'conn> {
     fn ensure_prepared_dml_for_scratch(&mut self) -> Result<(), FrankenError> {
         if !self.prepared_dml.contains_key(self.sql_scratch.as_str()) {
             let sql = self.sql_scratch.clone();
-            let stmt = self.conn.prepare(&sql)?;
+            let stmt = crate::block_on(self.conn.prepare(&sql))?;
             self.prepared_dml.insert(sql, stmt);
         }
         Ok(())
@@ -1942,10 +1934,9 @@ impl<'conn> PreparedOpExecutor<'conn> {
                     .get(sql)
                     .expect("prepared SQL cache must contain the current scratch SQL");
                 if is_query {
-                    stmt.query_with_params(params).map(RawSqlExecution::Rows)
+                    crate::block_on(stmt.query_with_params(params)).map(RawSqlExecution::Rows)
                 } else {
-                    stmt.execute_with_params(params)
-                        .map(RawSqlExecution::Affected)
+                    crate::block_on(stmt.execute_with_params(params)).map(RawSqlExecution::Affected)
                 }
             };
             match execute_result {
@@ -1963,7 +1954,7 @@ impl<'conn> PreparedOpExecutor<'conn> {
     fn ensure_prepared_sql_for_scratch(&mut self) -> Result<(), FrankenError> {
         if !self.prepared_sql.contains_key(self.sql_scratch.as_str()) {
             let sql = self.sql_scratch.clone();
-            let stmt = self.conn.prepare(&sql)?;
+            let stmt = crate::block_on(self.conn.prepare(&sql))?;
             self.prepared_sql.insert(sql, stmt);
         }
         Ok(())
@@ -1982,9 +1973,9 @@ impl<'conn> PreparedOpExecutor<'conn> {
                     .get(sql)
                     .expect("prepared SQL cache must contain the requested SQL");
                 if is_query {
-                    stmt.query().map(RawSqlExecution::Rows)
+                    crate::block_on(stmt.query()).map(RawSqlExecution::Rows)
                 } else {
-                    stmt.execute().map(RawSqlExecution::Affected)
+                    crate::block_on(stmt.execute()).map(RawSqlExecution::Affected)
                 }
             };
             match execute_result {
@@ -2001,7 +1992,7 @@ impl<'conn> PreparedOpExecutor<'conn> {
 
     fn ensure_prepared_sql(&mut self, sql: &str) -> Result<(), FrankenError> {
         if !self.prepared_sql.contains_key(sql) {
-            let stmt = self.conn.prepare(sql)?;
+            let stmt = crate::block_on(self.conn.prepare(sql))?;
             self.prepared_sql.insert(sql.to_owned(), stmt);
         }
         Ok(())
@@ -2459,7 +2450,7 @@ fn execute_unprepared_sql(
     trimmed: &str,
     expected: Option<&ExpectedResult>,
 ) -> Result<(), OpError> {
-    match conn.execute(trimmed) {
+    match crate::block_on(conn.execute(trimmed)) {
         Ok(affected) => {
             if matches!(expected, Some(ExpectedResult::Error)) {
                 return Err(OpError::Fatal(format!(

@@ -10,9 +10,12 @@
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+
     use crate::cursor::{BtCursor, MemPageStore};
     use crate::swizzle::{PageTemperature, SwizzlePtr, SwizzleRegistry};
     use crate::traits::BtreeCursorOps;
+    use asupersync::runtime::{Runtime, RuntimeBuilder};
     use fsqlite_types::PageNumber;
     use fsqlite_types::cx::Cx;
     use proptest::prelude::*;
@@ -20,13 +23,23 @@ mod tests {
 
     const USABLE: u32 = 4096;
 
+    std::thread_local! {
+        static TEST_RUNTIME: Runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build B-tree invariant test runtime");
+    }
+
+    fn run_async<F: Future>(future: F) -> F::Output {
+        TEST_RUNTIME.with(|runtime| runtime.block_on(future))
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // 1. B-TREE SORTED ORDER & BALANCE INVARIANTS
     // ────────────────────────────────────────────────────────────────────
 
     /// Insert N rows and verify forward scan produces sorted rowids.
     fn verify_sorted_order(cursor: &mut BtCursor<MemPageStore>, cx: &Cx, expected: &BTreeSet<i64>) {
-        let has = cursor.first(cx).unwrap();
+        let has = run_async(cursor.first(cx)).unwrap();
         if expected.is_empty() {
             assert!(!has, "empty tree should have no rows");
             return;
@@ -39,7 +52,7 @@ mod tests {
             if cursor.eof() {
                 break;
             }
-            let rowid = cursor.rowid(cx).unwrap();
+            let rowid = run_async(cursor.rowid(cx)).unwrap();
             assert!(
                 rowid > prev,
                 "rowids not strictly ascending: prev={prev}, current={rowid}"
@@ -50,7 +63,7 @@ mod tests {
             );
             prev = rowid;
             count += 1;
-            if !cursor.next(cx).unwrap() {
+            if !run_async(cursor.next(cx)).unwrap() {
                 break;
             }
         }
@@ -68,7 +81,7 @@ mod tests {
         cx: &Cx,
         expected: &BTreeSet<i64>,
     ) {
-        let has = cursor.last(cx).unwrap();
+        let has = run_async(cursor.last(cx)).unwrap();
         if expected.is_empty() {
             assert!(!has, "empty tree should have no rows on last()");
             return;
@@ -81,14 +94,14 @@ mod tests {
             if cursor.eof() {
                 break;
             }
-            let rowid = cursor.rowid(cx).unwrap();
+            let rowid = run_async(cursor.rowid(cx)).unwrap();
             assert!(
                 rowid < prev,
                 "rowids not strictly descending: prev={prev}, current={rowid}"
             );
             prev = rowid;
             count += 1;
-            if !cursor.prev(cx).unwrap() {
+            if !run_async(cursor.prev(cx)).unwrap() {
                 break;
             }
         }
@@ -105,7 +118,7 @@ mod tests {
         let mut expected = BTreeSet::new();
         let payload = vec![0xAB; 100];
         for i in 1_i64..=1000 {
-            cursor.table_insert(&cx, i, &payload).unwrap();
+            run_async(cursor.table_insert(&cx, i, &payload)).unwrap();
             expected.insert(i);
         }
 
@@ -123,7 +136,7 @@ mod tests {
         let mut expected = BTreeSet::new();
         let payload = vec![0xCD; 100];
         for i in (1_i64..=1000).rev() {
-            cursor.table_insert(&cx, i, &payload).unwrap();
+            run_async(cursor.table_insert(&cx, i, &payload)).unwrap();
             expected.insert(i);
         }
 
@@ -142,15 +155,15 @@ mod tests {
 
         // Insert 500 rows.
         for i in 1_i64..=500 {
-            cursor.table_insert(&cx, i, &payload).unwrap();
+            run_async(cursor.table_insert(&cx, i, &payload)).unwrap();
             expected.insert(i);
         }
 
         // Delete every other row.
         for i in (1_i64..=500).step_by(2) {
-            let seek = cursor.table_move_to(&cx, i).unwrap();
+            let seek = run_async(cursor.table_move_to(&cx, i)).unwrap();
             assert!(seek.is_found(), "row {i} should exist for deletion");
-            cursor.delete(&cx).unwrap();
+            run_async(cursor.delete(&cx)).unwrap();
             expected.remove(&i);
         }
 
@@ -158,7 +171,7 @@ mod tests {
 
         // Insert more rows in gaps.
         for i in 501_i64..=750 {
-            cursor.table_insert(&cx, i, &payload).unwrap();
+            run_async(cursor.table_insert(&cx, i, &payload)).unwrap();
             expected.insert(i);
         }
 
@@ -178,15 +191,15 @@ mod tests {
 
         // Insert 200 rows.
         for i in 1_i64..=200 {
-            cursor.table_insert(&cx, i, &payload).unwrap();
+            run_async(cursor.table_insert(&cx, i, &payload)).unwrap();
             expected.insert(i);
         }
 
         // Delete all.
         for i in 1_i64..=200 {
-            let seek = cursor.table_move_to(&cx, i).unwrap();
+            let seek = run_async(cursor.table_move_to(&cx, i)).unwrap();
             assert!(seek.is_found());
-            cursor.delete(&cx).unwrap();
+            run_async(cursor.delete(&cx)).unwrap();
             expected.remove(&i);
         }
 
@@ -194,7 +207,7 @@ mod tests {
 
         // Reinsert different rows.
         for i in 301_i64..=500 {
-            cursor.table_insert(&cx, i, &payload).unwrap();
+            run_async(cursor.table_insert(&cx, i, &payload)).unwrap();
             expected.insert(i);
         }
 
@@ -223,13 +236,13 @@ mod tests {
                 if *is_insert || !expected.contains(rowid) {
                     // Insert (or try to insert if not yet present).
                     if expected.insert(*rowid) {
-                        cursor.table_insert(&cx, *rowid, &payload).unwrap();
+                        run_async(cursor.table_insert(&cx, *rowid, &payload)).unwrap();
                     }
                 } else {
                     // Delete.
-                    let seek = cursor.table_move_to(&cx, *rowid).unwrap();
+                    let seek = run_async(cursor.table_move_to(&cx, *rowid)).unwrap();
                     if seek.is_found() {
-                        cursor.delete(&cx).unwrap();
+                        run_async(cursor.delete(&cx)).unwrap();
                         expected.remove(rowid);
                     }
                 }
@@ -257,19 +270,19 @@ mod tests {
 
                 if is_insert || !expected.contains(&key) {
                     if expected.insert(key.clone()) {
-                        cursor.index_insert(&cx, &key).unwrap();
+                        run_async(cursor.index_insert(&cx, &key)).unwrap();
                     }
                 } else {
-                    let seek = cursor.index_move_to(&cx, &key).unwrap();
+                    let seek = run_async(cursor.index_move_to(&cx, &key)).unwrap();
                     if seek.is_found() {
-                        cursor.delete(&cx).unwrap();
+                        run_async(cursor.delete(&cx)).unwrap();
                         expected.remove(&key);
                     }
                 }
             }
 
             // Verify sorted order for index tree.
-            let has = cursor.first(&cx).unwrap();
+            let has = run_async(cursor.first(&cx)).unwrap();
             if expected.is_empty() {
                 assert!(!has, "empty tree should have no rows");
             } else {
@@ -280,14 +293,14 @@ mod tests {
                     if cursor.eof() {
                         break;
                     }
-                    let key = cursor.payload(&cx).unwrap();
+                    let key = run_async(cursor.payload(&cx)).unwrap();
                     if let Some(ref p) = prev {
                         assert!(key > *p, "keys not strictly ascending");
                     }
                     assert!(expected.contains(&key), "unexpected key in tree");
                     prev = Some(key.clone());
                     btree_elements.insert(key);
-                    if !cursor.next(&cx).unwrap() {
+                    if !run_async(cursor.next(&cx)).unwrap() {
                         break;
                     }
                 }
@@ -606,12 +619,12 @@ mod tests {
 
         // Payload larger than a single page (~4KB page, >3KB payload triggers overflow).
         let large_payload = vec![0xBE; 8000];
-        cursor.table_insert(&cx, 1, &large_payload).unwrap();
+        run_async(cursor.table_insert(&cx, 1, &large_payload)).unwrap();
 
         // Seek back and read.
-        let seek = cursor.table_move_to(&cx, 1).unwrap();
+        let seek = run_async(cursor.table_move_to(&cx, 1)).unwrap();
         assert!(seek.is_found());
-        let read_back = cursor.payload(&cx).unwrap();
+        let read_back = run_async(cursor.payload(&cx)).unwrap();
         assert_eq!(
             read_back.len(),
             large_payload.len(),
@@ -634,16 +647,16 @@ mod tests {
         for (i, payload) in payloads.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
             let rowid = (i + 1) as i64;
-            cursor.table_insert(&cx, rowid, payload).unwrap();
+            run_async(cursor.table_insert(&cx, rowid, payload)).unwrap();
         }
 
         // Verify all payloads round-trip.
         for (i, payload) in payloads.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
             let rowid = (i + 1) as i64;
-            let seek = cursor.table_move_to(&cx, rowid).unwrap();
+            let seek = run_async(cursor.table_move_to(&cx, rowid)).unwrap();
             assert!(seek.is_found(), "row {rowid} not found");
-            let read_back = cursor.payload(&cx).unwrap();
+            let read_back = run_async(cursor.payload(&cx)).unwrap();
             assert_eq!(
                 read_back.len(),
                 payload.len(),
@@ -662,11 +675,11 @@ mod tests {
 
         // 100KB payload — spans many overflow pages.
         let huge_payload: Vec<u8> = (0_u8..=255).cycle().take(100_000).collect();
-        cursor.table_insert(&cx, 42, &huge_payload).unwrap();
+        run_async(cursor.table_insert(&cx, 42, &huge_payload)).unwrap();
 
-        let seek = cursor.table_move_to(&cx, 42).unwrap();
+        let seek = run_async(cursor.table_move_to(&cx, 42)).unwrap();
         assert!(seek.is_found());
-        let read_back = cursor.payload(&cx).unwrap();
+        let read_back = run_async(cursor.payload(&cx)).unwrap();
         assert_eq!(read_back.len(), 100_000);
         assert_eq!(read_back, huge_payload);
     }
@@ -690,22 +703,22 @@ mod tests {
 
         // Insert N rows.
         for i in 1..=n {
-            cursor.table_insert(&cx, i, &payload).unwrap();
+            run_async(cursor.table_insert(&cx, i, &payload)).unwrap();
         }
 
         // Verify tree has the root page — we can traverse it.
-        assert!(cursor.first(&cx).unwrap());
+        assert!(run_async(cursor.first(&cx)).unwrap());
 
         // Delete all rows.
         for i in 1..=n {
-            let seek = cursor.table_move_to(&cx, i).unwrap();
+            let seek = run_async(cursor.table_move_to(&cx, i)).unwrap();
             assert!(seek.is_found(), "row {i} should exist");
-            cursor.delete(&cx).unwrap();
+            run_async(cursor.delete(&cx)).unwrap();
         }
 
         // Tree should be empty.
         assert!(
-            !cursor.first(&cx).unwrap(),
+            !run_async(cursor.first(&cx)).unwrap(),
             "tree should be empty after deleting all rows"
         );
     }
@@ -721,19 +734,19 @@ mod tests {
 
         // Phase 1: Insert 300 rows.
         for i in 1_i64..=300 {
-            cursor.table_insert(&cx, i, &payload).unwrap();
+            run_async(cursor.table_insert(&cx, i, &payload)).unwrap();
         }
 
         // Phase 2: Delete first 200.
         for i in 1_i64..=200 {
-            let seek = cursor.table_move_to(&cx, i).unwrap();
+            let seek = run_async(cursor.table_move_to(&cx, i)).unwrap();
             assert!(seek.is_found());
-            cursor.delete(&cx).unwrap();
+            run_async(cursor.delete(&cx)).unwrap();
         }
 
         // Phase 3: Insert 200 new rows.
         for i in 301_i64..=500 {
-            cursor.table_insert(&cx, i, &payload).unwrap();
+            run_async(cursor.table_insert(&cx, i, &payload)).unwrap();
         }
 
         // Verify invariant: 300 rows present (201-500).
@@ -764,12 +777,12 @@ mod tests {
 
             for (is_insert, rowid) in &ops {
                 if *is_insert && !expected.contains(rowid) {
-                    cursor.table_insert(&cx, *rowid, &payload).unwrap();
+                    run_async(cursor.table_insert(&cx, *rowid, &payload)).unwrap();
                     expected.insert(*rowid);
                 } else if !is_insert && expected.contains(rowid) {
-                    let seek = cursor.table_move_to(&cx, *rowid).unwrap();
+                    let seek = run_async(cursor.table_move_to(&cx, *rowid)).unwrap();
                     if seek.is_found() {
-                        cursor.delete(&cx).unwrap();
+                        run_async(cursor.delete(&cx)).unwrap();
                         expected.remove(rowid);
                     }
                 }
@@ -780,9 +793,9 @@ mod tests {
 
             // Verify all expected rows are retrievable with correct payload.
             for &rowid in &expected {
-                let seek = cursor.table_move_to(&cx, rowid).unwrap();
+                let seek = run_async(cursor.table_move_to(&cx, rowid)).unwrap();
                 assert!(seek.is_found(), "row {rowid} should be findable");
-                let data = cursor.payload(&cx).unwrap();
+                let data = run_async(cursor.payload(&cx)).unwrap();
                 assert_eq!(data, payload, "payload mismatch for row {rowid}");
             }
         }

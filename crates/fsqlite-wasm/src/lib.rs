@@ -240,11 +240,19 @@ pub struct FrankenPreparedStatement {
 
 #[wasm_bindgen(js_class = FrankenDB)]
 impl FrankenDb {
-    #[wasm_bindgen(constructor)]
-    pub fn new(name: Option<String>) -> Result<Self, JsValue> {
+    /// Open a database.
+    ///
+    /// NOTE: opening is `async` now that the storage stack is async, and
+    /// `wasm_bindgen` cannot export an `async` constructor. This is therefore a
+    /// static factory returning a `Promise` rather than a JS `new` constructor:
+    /// `await FrankenDB.create(name)`.
+    #[wasm_bindgen(js_name = create)]
+    pub async fn new(name: Option<String>) -> Result<Self, JsValue> {
         install_wasm_runtime();
         let path = name.unwrap_or_else(|| ":memory:".to_owned());
-        let conn = open_core_connection(&path).map_err(franken_error_to_js)?;
+        let conn = open_core_connection(&path)
+            .await
+            .map_err(franken_error_to_js)?;
         #[cfg(feature = "memory-options")]
         {
             Self::from_parts(path, conn, WasmDatabaseOptions::default())
@@ -257,8 +265,8 @@ impl FrankenDb {
 
     #[cfg(feature = "api-extras")]
     #[wasm_bindgen(js_name = open)]
-    pub fn open(name: Option<String>) -> Result<Self, JsValue> {
-        Self::new(name)
+    pub async fn open(name: Option<String>) -> Result<Self, JsValue> {
+        Self::new(name).await
     }
 
     #[cfg(feature = "memory-options")]
@@ -313,38 +321,43 @@ impl FrankenDb {
         let _ = self.state.inner.borrow_mut().take();
     }
 
-    pub fn execute(&self, sql: &str) -> Result<usize, JsValue> {
-        self.with_connection(|conn| conn.execute(sql))
+    pub async fn execute(&self, sql: &str) -> Result<usize, JsValue> {
+        self.with_connection(async |conn| conn.execute(sql).await)
+            .await
     }
 
     #[cfg(feature = "batch-execution")]
     #[wasm_bindgen(js_name = executeBatch)]
-    pub fn execute_batch(&self, sql: &str) -> Result<(), JsValue> {
-        self.with_connection(|conn| conn.execute_batch(sql))
+    pub async fn execute_batch(&self, sql: &str) -> Result<(), JsValue> {
+        self.with_connection(async |conn| conn.execute_batch(sql).await)
+            .await
     }
 
     #[wasm_bindgen(js_name = executeWithParams)]
-    pub fn execute_with_params(&self, sql: &str, params: JsValue) -> Result<usize, JsValue> {
+    pub async fn execute_with_params(&self, sql: &str, params: JsValue) -> Result<usize, JsValue> {
         let params = parse_js_params(params)?;
-        self.with_connection(|conn| conn.execute_with_params(sql, &params))
+        self.with_connection(async |conn| conn.execute_with_params(sql, &params).await)
+            .await
     }
 
-    pub fn query(&self, sql: &str) -> Result<JsValue, JsValue> {
-        self.with_connection(|conn| {
-            let stmt = conn.prepare(sql)?;
-            let rows = stmt.query()?;
+    pub async fn query(&self, sql: &str) -> Result<JsValue, JsValue> {
+        self.with_connection(async |conn| {
+            let stmt = conn.prepare(sql).await?;
+            let rows = stmt.query().await?;
             query_result_to_js(rows, stmt.column_names(), stmt.column_count())
         })
+        .await
     }
 
     #[wasm_bindgen(js_name = queryWithParams)]
-    pub fn query_with_params(&self, sql: &str, params: JsValue) -> Result<JsValue, JsValue> {
+    pub async fn query_with_params(&self, sql: &str, params: JsValue) -> Result<JsValue, JsValue> {
         let params = parse_js_params(params)?;
-        self.with_connection(|conn| {
-            let stmt = conn.prepare(sql)?;
-            let rows = stmt.query_with_params(&params)?;
+        self.with_connection(async |conn| {
+            let stmt = conn.prepare(sql).await?;
+            let rows = stmt.query_with_params(&params).await?;
             query_result_to_js(rows, stmt.column_names(), stmt.column_count())
         })
+        .await
     }
 
     #[cfg(feature = "api-extras")]
@@ -438,25 +451,25 @@ impl FrankenDb {
         Ok(db)
     }
 
-    fn with_connection<T>(
+    async fn with_connection<T>(
         &self,
-        f: impl FnOnce(&CoreConnection) -> Result<T, FrankenError>,
+        f: impl std::ops::AsyncFnOnce(&CoreConnection) -> Result<T, FrankenError>,
     ) -> Result<T, JsValue> {
-        self.state.with_connection(f)
+        self.state.with_connection(f).await
     }
 }
 
 impl FrankenDbState {
-    fn with_connection<T>(
+    async fn with_connection<T>(
         &self,
-        f: impl FnOnce(&CoreConnection) -> Result<T, FrankenError>,
+        f: impl std::ops::AsyncFnOnce(&CoreConnection) -> Result<T, FrankenError>,
     ) -> Result<T, JsValue> {
         install_wasm_runtime();
         let borrow = self.inner.borrow();
         let conn = borrow.as_ref().ok_or_else(|| {
             franken_error_to_js(FrankenError::internal("database handle is closed"))
         })?;
-        match f(conn) {
+        match f(conn).await {
             Ok(value) => {
                 #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
                 self.observe_memory_warning();
@@ -581,8 +594,8 @@ fn import_core_connection_with_options(
     CoreConnection::import_bytes_with_env(bytes, env)
 }
 
-fn open_core_connection(path: &str) -> Result<CoreConnection, FrankenError> {
-    CoreConnection::open(path)
+async fn open_core_connection(path: &str) -> Result<CoreConnection, FrankenError> {
+    CoreConnection::open(path).await
 }
 
 #[cfg(feature = "memory-options")]

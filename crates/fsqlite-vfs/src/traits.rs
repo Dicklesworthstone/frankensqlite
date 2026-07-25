@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::LockLevel;
@@ -682,6 +684,261 @@ pub trait Vfs: Send + Sync {
     }
 }
 
+/// Observable terminal state of one tracked VFS write.
+///
+/// `Pending` is deliberately fail-closed: it means only that the write's
+/// actual completion source has not reported a terminal result. It must never
+/// be interpreted as proof that no bytes reached the file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VfsWriteCompletionState {
+    /// The write has not yet reached a terminal completion source.
+    Pending,
+    /// The complete requested byte range was written.
+    Success,
+    /// The write terminated with an error or cancellation.
+    ///
+    /// This does not prove that zero bytes were written; a caller reconciling
+    /// an append must still validate the on-disk interval before aborting it.
+    Error,
+}
+
+#[derive(Debug)]
+struct VfsWriteCompletionInner {
+    state: VfsWriteCompletionState,
+    next_waiter_id: u64,
+    waiters: Vec<(u64, Waker)>,
+    terminal_relay: Option<(VfsWriteCompletion, VfsWriteCompletionState)>,
+}
+
+/// Cloneable observation handle for one VFS write operation.
+///
+/// Production VFS backends complete this token at the source that owns the
+/// side effect: the blocking I/O closure on Unix and Windows, the io_uring CQE
+/// driver on Linux, or the immediate in-memory mutation path. Consequently a
+/// clone remains useful even when the future returned by
+/// [`VfsFile::write_tracked`] is dropped before it can observe completion.
+///
+/// A token is single-use. The first terminal transition wins.
+#[derive(Clone, Debug)]
+pub struct VfsWriteCompletion {
+    inner: Arc<Mutex<VfsWriteCompletionInner>>,
+}
+
+impl VfsWriteCompletion {
+    /// Create a pending completion token for one logical write.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VfsWriteCompletionInner {
+                state: VfsWriteCompletionState::Pending,
+                next_waiter_id: 0,
+                waiters: Vec::new(),
+                terminal_relay: None,
+            })),
+        }
+    }
+
+    /// Return the currently observable state.
+    #[must_use]
+    pub fn state(&self) -> VfsWriteCompletionState {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state
+    }
+
+    /// Wait until the write reaches `Success` or `Error`.
+    ///
+    /// Dropping the returned future only unregisters that waiter. It neither
+    /// cancels the write nor consumes the terminal result.
+    #[must_use]
+    pub fn wait(&self) -> VfsWriteCompletionWait {
+        VfsWriteCompletionWait {
+            completion: self.clone(),
+            waiter_id: None,
+        }
+    }
+
+    /// Record successful completion at the source that owns the write.
+    ///
+    /// Returns `true` when this call performed the terminal transition.
+    #[doc(hidden)]
+    pub fn complete_success(&self) -> bool {
+        self.complete(VfsWriteCompletionState::Success)
+    }
+
+    /// Record failed or cancelled completion at the source that owns the write.
+    ///
+    /// Returns `true` when this call performed the terminal transition.
+    #[doc(hidden)]
+    pub fn complete_error(&self) -> bool {
+        self.complete(VfsWriteCompletionState::Error)
+    }
+
+    /// Create a child whose source completion terminates this token as Error.
+    ///
+    /// Fault wrappers use this for intentional partial writes: the lower
+    /// backend still owns the completion instant, while the outer operation
+    /// can never truthfully report full-write success.
+    #[doc(hidden)]
+    pub fn error_mapped_child(&self) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VfsWriteCompletionInner {
+                state: VfsWriteCompletionState::Pending,
+                next_waiter_id: 0,
+                waiters: Vec::new(),
+                terminal_relay: Some((self.clone(), VfsWriteCompletionState::Error)),
+            })),
+        }
+    }
+
+    fn complete(&self, terminal: VfsWriteCompletionState) -> bool {
+        debug_assert_ne!(terminal, VfsWriteCompletionState::Pending);
+        let (waiters, terminal_relay) = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if inner.state != VfsWriteCompletionState::Pending {
+                return false;
+            }
+            inner.state = terminal;
+            (
+                std::mem::take(&mut inner.waiters),
+                inner.terminal_relay.take(),
+            )
+        };
+        for (_, waiter) in waiters {
+            waiter.wake();
+        }
+        if let Some((relay, mapped_terminal)) = terminal_relay {
+            relay.complete(mapped_terminal);
+        }
+        true
+    }
+}
+
+impl Default for VfsWriteCompletion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Source-owned guard that fails closed if an accepted write is abandoned.
+///
+/// Blocking-pool cancellation can discard a queued closure before executing
+/// it, and driver teardown can discard an uncompleted request. Keeping this
+/// guard with that source ensures those paths terminate as `Error` instead of
+/// leaving a caller-retained token pending forever.
+#[derive(Debug)]
+pub(crate) struct VfsWriteCompletionSource {
+    completion: VfsWriteCompletion,
+    armed: bool,
+}
+
+impl VfsWriteCompletionSource {
+    pub(crate) fn new(completion: VfsWriteCompletion) -> Self {
+        Self {
+            completion,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn complete_success(&mut self) {
+        self.completion.complete_success();
+        self.armed = false;
+    }
+
+    pub(crate) fn complete_error(&mut self) {
+        self.completion.complete_error();
+        self.armed = false;
+    }
+}
+
+impl Drop for VfsWriteCompletionSource {
+    fn drop(&mut self) {
+        if self.armed {
+            self.completion.complete_error();
+        }
+    }
+}
+
+/// Cancel-safe future returned by [`VfsWriteCompletion::wait`].
+#[derive(Debug)]
+pub struct VfsWriteCompletionWait {
+    completion: VfsWriteCompletion,
+    waiter_id: Option<u64>,
+}
+
+impl std::future::Future for VfsWriteCompletionWait {
+    type Output = VfsWriteCompletionState;
+
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.as_mut().get_mut();
+        let completion_inner = Arc::clone(&this.completion.inner);
+        let mut inner = completion_inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.state != VfsWriteCompletionState::Pending {
+            if let Some(waiter_id) = this.waiter_id.take()
+                && let Some(index) = inner
+                    .waiters
+                    .iter()
+                    .position(|(registered_id, _)| *registered_id == waiter_id)
+            {
+                inner.waiters.swap_remove(index);
+            }
+            return Poll::Ready(inner.state);
+        }
+
+        if let Some(waiter_id) = this.waiter_id {
+            let (_, registered_waker) = inner
+                .waiters
+                .iter_mut()
+                .find(|(registered_id, _)| *registered_id == waiter_id)
+                .expect("pending completion waiter must remain registered");
+            if !registered_waker.will_wake(cx.waker()) {
+                registered_waker.clone_from(cx.waker());
+            }
+        } else {
+            let waiter_id = loop {
+                let candidate = inner.next_waiter_id;
+                inner.next_waiter_id = inner.next_waiter_id.wrapping_add(1);
+                if inner
+                    .waiters
+                    .iter()
+                    .all(|(registered_id, _)| *registered_id != candidate)
+                {
+                    break candidate;
+                }
+            };
+            inner.waiters.push((waiter_id, cx.waker().clone()));
+            this.waiter_id = Some(waiter_id);
+        }
+        Poll::Pending
+    }
+}
+
+impl Drop for VfsWriteCompletionWait {
+    fn drop(&mut self) {
+        let Some(waiter_id) = self.waiter_id.take() else {
+            return;
+        };
+        let mut inner = self
+            .completion
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = inner
+            .waiters
+            .iter()
+            .position(|(registered_id, _)| *registered_id == waiter_id)
+        {
+            inner.waiters.swap_remove(index);
+        }
+    }
+}
+
 /// A file handle opened by a VFS.
 ///
 /// Corresponds to C SQLite's `sqlite3_file` + `sqlite3_io_methods`.
@@ -719,6 +976,32 @@ pub trait VfsFile: Send + Sync {
         buf: &'a [u8],
         offset: u64,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a;
+
+    /// Write `buf` and report terminal side-effect completion through `completion`.
+    ///
+    /// The ordinary [`Self::write`] contract is unchanged. This additive path
+    /// lets durability coordinators retain an observation handle when their
+    /// caller future is externally dropped. Backends whose hidden side effect
+    /// outlives their returned future must override this method and complete
+    /// the token at that hidden source. The conservative default can remain
+    /// `Pending` after such a drop; callers must treat that as in-doubt.
+    fn write_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            let result = self.write(cx, buf, offset).await;
+            if result.is_ok() {
+                completion.complete_success();
+            } else {
+                completion.complete_error();
+            }
+            result
+        }
+    }
 
     /// Write multiple page-sized buffers in one logical operation.
     ///
@@ -1557,7 +1840,56 @@ mod tests {
     }
 
     #[test]
-    fn async_memory_data_path_resolves_immediately_and_writes_real_bytes() {
+    fn write_completion_wait_is_cancel_safe_and_terminal_state_is_sticky() {
+        use std::future::Future as _;
+
+        let completion = VfsWriteCompletion::new();
+        let mut first_waiter = Box::pin(completion.wait());
+        let mut task_cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            first_waiter.as_mut().poll(&mut task_cx),
+            Poll::Pending
+        ));
+        assert_eq!(
+            completion
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .waiters
+                .len(),
+            1
+        );
+        drop(first_waiter);
+        assert!(
+            completion
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .waiters
+                .is_empty(),
+            "dropping a wait future must unregister it"
+        );
+
+        assert!(completion.complete_success());
+        assert!(!completion.complete_error());
+        assert_eq!(completion.state(), VfsWriteCompletionState::Success);
+        assert_eq!(
+            poll_ready(completion.wait()),
+            VfsWriteCompletionState::Success
+        );
+
+        let faulted_write = VfsWriteCompletion::new();
+        let partial_source = faulted_write.error_mapped_child();
+        assert!(partial_source.complete_success());
+        assert_eq!(
+            faulted_write.state(),
+            VfsWriteCompletionState::Error,
+            "a completed partial-write source must map to outer Error"
+        );
+    }
+
+    #[test]
+    fn async_memory_write_completion_is_immediate_and_bytes_are_real() {
         use std::future::Future as _;
         use std::task::{Context, Poll, Waker};
 
@@ -1574,11 +1906,23 @@ mod tests {
         let waker = Waker::noop();
         let mut task_cx = Context::from_waker(waker);
         {
-            let mut write = std::pin::pin!(<MemoryFile as VfsFile>::write(&file, &cx, payload, 0));
+            let completion = VfsWriteCompletion::new();
+            let mut write = std::pin::pin!(<MemoryFile as VfsFile>::write_tracked(
+                &file,
+                &cx,
+                payload,
+                0,
+                completion.clone(),
+            ));
             assert!(matches!(
                 write.as_mut().poll(&mut task_cx),
                 Poll::Ready(Ok(()))
             ));
+            assert_eq!(
+                completion.state(),
+                VfsWriteCompletionState::Success,
+                "the immediate memory mutation source must complete the token before Ready"
+            );
         }
 
         let mut buf = [0u8; 15];

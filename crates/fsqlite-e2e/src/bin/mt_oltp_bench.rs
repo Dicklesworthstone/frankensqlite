@@ -274,23 +274,26 @@ fn run_fsqlite_iter(
     drop(tmp);
 
     {
-        let conn = fsqlite::Connection::open(path.clone()).expect("fsqlite open (seed)");
-        let _ = conn.execute("PRAGMA fsqlite.concurrent_mode=ON;");
-        conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, payload TEXT)")
-            .expect("create table");
-        conn.execute("BEGIN").expect("begin");
-        let stmt = conn
-            .prepare("INSERT INTO bench (id, payload) VALUES (?1, ?2)")
-            .expect("prepare insert");
+        let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.clone()))
+            .expect("fsqlite open (seed)");
+        let _ = fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;"));
+        fsqlite_e2e::block_on(
+            conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, payload TEXT)"),
+        )
+        .expect("create table");
+        fsqlite_e2e::block_on(conn.execute("BEGIN")).expect("begin");
+        let stmt =
+            fsqlite_e2e::block_on(conn.prepare("INSERT INTO bench (id, payload) VALUES (?1, ?2)"))
+                .expect("prepare insert");
         let payload = make_payload();
         for id in 1..=seed_rows {
-            stmt.execute_with_params(&[
+            fsqlite_e2e::block_on(stmt.execute_with_params(&[
                 fsqlite::SqliteValue::Integer(id),
                 fsqlite::SqliteValue::Text(payload.clone().into()),
-            ])
+            ]))
             .expect("seed insert");
         }
-        conn.execute("COMMIT").expect("commit");
+        fsqlite_e2e::block_on(conn.execute("COMMIT")).expect("commit");
     }
 
     let total_threads = num_readers + num_writers;
@@ -304,13 +307,13 @@ fn run_fsqlite_iter(
         let path = Arc::clone(&path);
         let barrier = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
-            let conn =
-                fsqlite::Connection::open(path.as_str().to_owned()).expect("fsqlite open (reader)");
-            let _ = conn.execute("PRAGMA fsqlite.concurrent_mode=ON;");
-            let _ = conn.execute("PRAGMA busy_timeout=5000;");
-            let stmt = conn
-                .prepare("SELECT payload FROM bench WHERE id = ?1")
-                .expect("prepare select");
+            let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.as_str().to_owned()))
+                .expect("fsqlite open (reader)");
+            let _ = fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;"));
+            let _ = fsqlite_e2e::block_on(conn.execute("PRAGMA busy_timeout=5000;"));
+            let stmt =
+                fsqlite_e2e::block_on(conn.prepare("SELECT payload FROM bench WHERE id = ?1"))
+                    .expect("prepare select");
             barrier.wait();
 
             let mut latencies = Vec::with_capacity(ops_per_thread);
@@ -343,10 +346,11 @@ fn run_fsqlite_iter(
         let path = Arc::clone(&path);
         let barrier = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
-            let conn =
-                fsqlite::Connection::open(path.as_str().to_owned()).expect("fsqlite open (writer)");
-            let concurrent_ok = conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").is_ok();
-            let _ = conn.execute("PRAGMA busy_timeout=5000;");
+            let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.as_str().to_owned()))
+                .expect("fsqlite open (writer)");
+            let concurrent_ok =
+                fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")).is_ok();
+            let _ = fsqlite_e2e::block_on(conn.execute("PRAGMA busy_timeout=5000;"));
 
             barrier.wait();
 
@@ -364,20 +368,19 @@ fn run_fsqlite_iter(
                 } else {
                     "BEGIN"
                 };
-                if conn.execute(begin_sql).is_err() {
+                if fsqlite_e2e::block_on(conn.execute(begin_sql)).is_err() {
                     failed += 1;
                     latencies.push(t.elapsed().as_nanos() as u64);
                     continue;
                 }
-                let ok = conn
-                    .execute(&format!(
-                        "INSERT INTO bench (id, payload) VALUES ({id}, '{payload}')"
-                    ))
-                    .is_ok();
+                let ok = fsqlite_e2e::block_on(conn.execute(&format!(
+                    "INSERT INTO bench (id, payload) VALUES ({id}, '{payload}')"
+                )))
+                .is_ok();
                 if ok {
                     let mut committed = false;
                     for _retry in 0..MAX_RETRIES {
-                        match conn.execute("COMMIT") {
+                        match fsqlite_e2e::block_on(conn.execute("COMMIT")) {
                             Ok(_) => {
                                 committed = true;
                                 break;
@@ -389,11 +392,11 @@ fn run_fsqlite_iter(
                         }
                     }
                     if !committed {
-                        let _ = conn.execute("ROLLBACK");
+                        let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
                         failed += 1;
                     }
                 } else {
-                    let _ = conn.execute("ROLLBACK");
+                    let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
                     failed += 1;
                 }
                 latencies.push(t.elapsed().as_nanos() as u64);

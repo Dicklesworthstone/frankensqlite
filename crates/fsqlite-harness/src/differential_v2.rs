@@ -892,18 +892,19 @@ impl FsqliteExecutor {
     ///
     /// Returns an error string if the connection fails.
     pub fn open_in_memory() -> Result<Self, String> {
-        let conn = fsqlite::Connection::open(":memory:").map_err(|e| e.to_string())?;
+        let conn =
+            crate::block_on(fsqlite::Connection::open(":memory:")).map_err(|e| e.to_string())?;
         Ok(Self { conn })
     }
 }
 
 impl SqlExecutor for FsqliteExecutor {
     fn execute(&self, sql: &str) -> Result<usize, String> {
-        self.conn.execute(sql.trim()).map_err(|e| e.to_string())
+        crate::block_on(self.conn.execute(sql.trim())).map_err(|e| e.to_string())
     }
 
     fn query(&self, sql: &str) -> Result<Vec<Vec<NormalizedValue>>, String> {
-        let rows = self.conn.query(sql.trim()).map_err(|e| e.to_string())?;
+        let rows = crate::block_on(self.conn.query(sql.trim())).map_err(|e| e.to_string())?;
         Ok(rows
             .into_iter()
             .map(|row| {

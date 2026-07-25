@@ -1600,6 +1600,10 @@ pub(crate) static CONFLICT_TOPOLOGY_POLICY_TEST_LOCK: std::sync::LazyLock<std::s
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+
+    use asupersync::runtime::RuntimeBuilder;
+
     use super::{
         BtreeOpType, ConflictTopologyPolicyMode, adaptive_fill_factor_enabled,
         adaptive_fill_factor_policy_id, adaptive_fill_factor_target, btree_copy_profile_snapshot,
@@ -1618,6 +1622,13 @@ mod tests {
 
     const TEST_USABLE: u32 = 4096;
     static COPY_PROFILE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn run_async<F: Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("build B-tree instrumentation test runtime")
+            .block_on(future)
+    }
 
     #[test]
     fn adaptive_fill_factor_disabled_is_a_noop() {
@@ -2182,16 +2193,13 @@ mod tests {
         let store = MemPageStore::with_empty_table(root, TEST_USABLE);
         let mut cursor = BtCursor::new(store, root, TEST_USABLE, true);
 
-        cursor
-            .table_insert(&cx, 1, b"copy-kernel-row")
-            .expect("insert should succeed");
+        run_async(cursor.table_insert(&cx, 1, b"copy-kernel-row")).expect("insert should succeed");
         assert!(
-            cursor
-                .table_move_to(&cx, 1)
+            run_async(cursor.table_move_to(&cx, 1))
                 .expect("seek should succeed")
                 .is_found()
         );
-        let payload = cursor.payload(&cx).expect("payload should decode");
+        let payload = run_async(cursor.payload(&cx)).expect("payload should decode");
         assert_eq!(payload, b"copy-kernel-row");
 
         let after = btree_copy_profile_snapshot();
@@ -2234,18 +2242,14 @@ mod tests {
         let mut cursor = BtCursor::new(store, root, TEST_USABLE, true);
         let payload = vec![b'X'; 8_000];
 
-        cursor
-            .table_insert(&cx, 1, &payload)
-            .expect("overflow insert should succeed");
+        run_async(cursor.table_insert(&cx, 1, &payload)).expect("overflow insert should succeed");
         assert!(
-            cursor
-                .table_move_to(&cx, 1)
+            run_async(cursor.table_move_to(&cx, 1))
                 .expect("seek should succeed")
                 .is_found()
         );
         let mut scratch = Vec::new();
-        cursor
-            .payload_into(&cx, &mut scratch)
+        run_async(cursor.payload_into(&cx, &mut scratch))
             .expect("payload_into should decode overflow");
         set_btree_copy_profile_enabled(false);
 

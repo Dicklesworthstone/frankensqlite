@@ -386,8 +386,21 @@ where
 
 /// `conn.execute(sql)` with BusySnapshot/Busy retry.
 fn fs_execute(conn: &fsqlite::Connection, sql: &str) -> usize {
-    retry_on_busy(|| conn.execute(sql))
+    retry_on_busy(|| fsqlite_e2e::block_on(conn.execute(sql)))
         .unwrap_or_else(|e| panic!("fsqlite execute failed after retries: {e} (sql={sql})"))
+}
+
+/// `conn.prepare(sql)` driven to completion on the crate-local runtime.
+///
+/// The storage stack is `async`, but this benchmark driver is a plain
+/// synchronous `main` that also times `rusqlite` in the same process, so every
+/// FrankenSQLite call crosses the boundary through `fsqlite_e2e::block_on`.
+fn fs_prepare<'conn>(
+    conn: &'conn fsqlite::Connection,
+    sql: &str,
+) -> fsqlite::PreparedStatement<'conn> {
+    fsqlite_e2e::block_on(conn.prepare(sql))
+        .unwrap_or_else(|e| panic!("fsqlite prepare failed: {e} (sql={sql})"))
 }
 
 /// `stmt.execute_with_params(params)` with BusySnapshot/Busy retry.
@@ -395,7 +408,7 @@ fn fs_stmt_execute_with_params(
     stmt: &fsqlite::PreparedStatement<'_>,
     params: &[fsqlite::SqliteValue],
 ) -> usize {
-    retry_on_busy(|| stmt.execute_with_params(params)).unwrap_or_else(|e| {
+    retry_on_busy(|| fsqlite_e2e::block_on(stmt.execute_with_params(params))).unwrap_or_else(|e| {
         panic!("fsqlite prepared execute_with_params failed after retries: {e}")
     })
 }
@@ -512,9 +525,12 @@ fn benchmark_page_size_bytes() -> u32 {
 fn open_fsqlite_memory_connection_for_benchmark() -> fsqlite::Connection {
     let page_size = benchmark_page_size_bytes();
     if page_size == DEFAULT_BENCH_PAGE_SIZE_BYTES {
-        fsqlite::Connection::open(":memory:").unwrap()
+        fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap()
     } else {
-        fsqlite::Connection::open_with_page_size(":memory:", page_size).unwrap()
+        fsqlite_e2e::block_on(fsqlite::Connection::open_with_page_size(
+            ":memory:", page_size,
+        ))
+        .unwrap()
     }
 }
 
@@ -540,9 +556,15 @@ const FSQLITE_BENCHMARK_PRAGMAS: &[&str] = &[
 ];
 
 fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
-    let _ = conn.execute(format!("PRAGMA page_size = {};", benchmark_page_size_bytes()).as_str());
+    // Every pragma here is best-effort: an unsupported one must not abort the
+    // run. `drop(block_on(..))` — not `let _ = ..` — because `execute` returns a
+    // future now, and `let _` would bind (and immediately drop) it unpolled,
+    // silently skipping the pragma with no diagnostic.
+    drop(fsqlite_e2e::block_on(conn.execute(
+        format!("PRAGMA page_size = {};", benchmark_page_size_bytes()).as_str(),
+    )));
     for pragma in FSQLITE_BENCHMARK_PRAGMAS {
-        let _ = conn.execute(pragma);
+        drop(fsqlite_e2e::block_on(conn.execute(pragma)));
     }
     // Opt-in LAB_UNSAFE write-merge mode for A/B perf measurement of the
     // SSI e-process skip gate. The gate is safe to leave on: under the
@@ -552,10 +574,14 @@ fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
         .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {
-        let _ = conn.execute("PRAGMA fsqlite.write_merge = LAB_UNSAFE;");
+        drop(fsqlite_e2e::block_on(
+            conn.execute("PRAGMA fsqlite.write_merge = LAB_UNSAFE;"),
+        ));
         // Tight alpha so the gate opens reasonably fast on the short
         // benchmark runs. `alpha = 1e-3` matches the default.
-        let _ = conn.execute("PRAGMA fsqlite.ssi_e_process_alpha = 0.001;");
+        drop(fsqlite_e2e::block_on(
+            conn.execute("PRAGMA fsqlite.ssi_e_process_alpha = 0.001;"),
+        ));
     }
 }
 
@@ -2410,7 +2436,7 @@ fn bench_insert_by_row_count(
                 fs_execute(&conn, create_sql);
                 fs_execute(&conn, "BEGIN");
                 #[allow(clippy::cast_possible_wrap)]
-                let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
+                let stmt = fs_prepare(&conn, record_size.insert_sql_csqlite());
                 for i in 0..count as i64 {
                     fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
                 }
@@ -2472,7 +2498,7 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
                     let conn = open_fsqlite_memory_connection_for_benchmark();
                     apply_pragmas_fsqlite(&conn);
                     fs_execute(&conn, create_sql);
-                    let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
+                    let stmt = fs_prepare(&conn, record_size.insert_sql_csqlite());
                     #[allow(clippy::cast_possible_wrap)]
                     for i in 0..count as i64 {
                         fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
@@ -2527,7 +2553,7 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
                 let conn = open_fsqlite_memory_connection_for_benchmark();
                 apply_pragmas_fsqlite(&conn);
                 fs_execute(&conn, create_sql);
-                let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
+                let stmt = fs_prepare(&conn, record_size.insert_sql_csqlite());
                 let num_batches = count.div_ceil(batch_size);
                 #[allow(clippy::cast_possible_wrap)]
                 for batch in 0..num_batches {
@@ -2589,7 +2615,7 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
                 fs_execute(&conn, create_sql);
                 fs_execute(&conn, "BEGIN");
                 #[allow(clippy::cast_possible_wrap)]
-                let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
+                let stmt = fs_prepare(&conn, record_size.insert_sql_csqlite());
                 for i in 0..count as i64 {
                     fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
                 }
@@ -2656,7 +2682,7 @@ fn bench_insert_by_record_size(report: &mut BenchReport) {
                 fs_execute(&conn, create_sql);
                 fs_execute(&conn, "BEGIN");
                 #[allow(clippy::cast_possible_wrap)]
-                let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
+                let stmt = fs_prepare(&conn, record_size.insert_sql_csqlite());
                 for i in 0..count as i64 {
                     fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
                 }
@@ -3081,7 +3107,7 @@ fn profile_fsqlite_insert_with_strategy(
     };
 
     let prepare_start = Instant::now();
-    let statement = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
+    let statement = fs_prepare(&conn, record_size.insert_sql_csqlite());
     let prepare_us = prepare_start.elapsed().as_secs_f64() * 1_000_000.0;
 
     let mut insert_us = 0.0;
@@ -3513,7 +3539,7 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
             let tmp = tempfile::NamedTempFile::new().unwrap();
             let path = tmp.path().to_str().unwrap().to_owned();
             {
-                let setup = fsqlite::Connection::open(&path).unwrap();
+                let setup = fsqlite_e2e::block_on(fsqlite::Connection::open(&path)).unwrap();
                 apply_pragmas_fsqlite(&setup);
                 fs_execute(
                     &setup,
@@ -3530,14 +3556,20 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                         // Enter the start gate before any fallible setup so one
                         // worker error cannot strand the rest at the barrier.
                         bar.wait();
-                        let conn = fsqlite::Connection::open(&p).unwrap();
+                        let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(&p)).unwrap();
                         apply_pragmas_fsqlite(&conn);
                         if let Some(mode) = concurrent_sync_override() {
-                            let _ = conn.execute(&format!("PRAGMA synchronous={mode};"));
+                            drop(fsqlite_e2e::block_on(
+                                conn.execute(&format!("PRAGMA synchronous={mode};")),
+                            ));
                         }
-                        let concurrent_ok =
-                            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").is_ok();
-                        let _ = conn.execute("PRAGMA busy_timeout=5000;");
+                        let concurrent_ok = fsqlite_e2e::block_on(
+                            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;"),
+                        )
+                        .is_ok();
+                        drop(fsqlite_e2e::block_on(
+                            conn.execute("PRAGMA busy_timeout=5000;"),
+                        ));
 
                         let begin_sql = if concurrent_ok {
                             "BEGIN CONCURRENT"
@@ -3558,7 +3590,7 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                         let jitter_salt =
                             u64::try_from(tid).map_or(u64::MAX, |value| value.saturating_add(1));
                         'txn: loop {
-                            if let Err(e) = conn.execute(begin_sql) {
+                            if let Err(e) = fsqlite_e2e::block_on(conn.execute(begin_sql)) {
                                 if e.is_transient() && retry_count < TXN_MAX_RETRIES {
                                     sleep_bench_busy_backoff(retry_count, jitter_salt);
                                     retry_count += 1;
@@ -3566,17 +3598,18 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                                 }
                                 panic!("fsqlite BEGIN failed after retries: {e}");
                             }
-                            let stmt = conn
-                                .prepare("INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7))")
-                                .unwrap();
+                            let stmt = fs_prepare(
+                                &conn,
+                                "INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7))",
+                            );
                             #[allow(clippy::cast_possible_wrap)]
                             for i in 0..CONCURRENT_ROWS_PER_THREAD as i64 {
-                                match stmt
-                                    .execute_with_params(&[fsqlite::SqliteValue::Integer(base + i)])
-                                {
+                                match fsqlite_e2e::block_on(stmt.execute_with_params(&[
+                                    fsqlite::SqliteValue::Integer(base + i),
+                                ])) {
                                     Ok(_) => {}
                                     Err(e) if e.is_transient() && retry_count < TXN_MAX_RETRIES => {
-                                        let _ = conn.execute("ROLLBACK");
+                                        drop(fsqlite_e2e::block_on(conn.execute("ROLLBACK")));
                                         sleep_bench_busy_backoff(retry_count, jitter_salt);
                                         retry_count += 1;
                                         continue 'txn;
@@ -3587,10 +3620,10 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                                     ),
                                 }
                             }
-                            match conn.execute("COMMIT") {
+                            match fsqlite_e2e::block_on(conn.execute("COMMIT")) {
                                 Ok(_) => break 'txn,
                                 Err(e) if e.is_transient() && retry_count < TXN_MAX_RETRIES => {
-                                    let _ = conn.execute("ROLLBACK");
+                                    drop(fsqlite_e2e::block_on(conn.execute("ROLLBACK")));
                                     sleep_bench_busy_backoff(retry_count, jitter_salt);
                                     retry_count += 1;
                                 }
@@ -4381,7 +4414,7 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
             fs_execute(&conn, record_size.create_table_sql());
             fs_execute(&conn, "BEGIN");
             {
-                let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
+                let stmt = fs_prepare(&conn, record_size.insert_sql_csqlite());
                 #[allow(clippy::cast_possible_wrap)]
                 for i in 0..count as i64 {
                     fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
@@ -4402,9 +4435,9 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
-        let fs_stmt = fs_conn.prepare("SELECT * FROM bench").unwrap();
+        let fs_stmt = fs_prepare(&fs_conn, "SELECT * FROM bench");
         let fs = measure(&format!("fs_scan_{count}"), count, || {
-            let _rows = fs_stmt.query().unwrap();
+            let _rows = fsqlite_e2e::block_on(fs_stmt.query()).unwrap();
         });
         eprintln!(
             "C={} F={}",
@@ -4428,13 +4461,12 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut stmt, rusqlite::params![target_id]).unwrap();
             })
         };
-        let fs_stmt = fs_conn
-            .prepare("SELECT * FROM bench WHERE id = ?1")
-            .unwrap();
+        let fs_stmt = fs_prepare(&fs_conn, "SELECT * FROM bench WHERE id = ?1");
         let fs = measure(&format!("fs_pk_{count}"), 1, || {
-            let _row = fs_stmt
-                .query_row_with_params(&[fsqlite::SqliteValue::Integer(target_id)])
-                .unwrap();
+            let _row = fsqlite_e2e::block_on(
+                fs_stmt.query_row_with_params(&[fsqlite::SqliteValue::Integer(target_id)]),
+            )
+            .unwrap();
         });
         eprintln!(
             "C={} F={}",
@@ -4463,16 +4495,13 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                         .unwrap();
             })
         };
-        let fs_stmt = fs_conn
-            .prepare("SELECT * FROM bench WHERE id >= ?1 AND id < ?2")
-            .unwrap();
+        let fs_stmt = fs_prepare(&fs_conn, "SELECT * FROM bench WHERE id >= ?1 AND id < ?2");
         let fs = measure(&format!("fs_range_{count}"), range_size, || {
-            let _rows = fs_stmt
-                .query_with_params(&[
-                    fsqlite::SqliteValue::Integer(range_start),
-                    fsqlite::SqliteValue::Integer(range_end),
-                ])
-                .unwrap();
+            let _rows = fsqlite_e2e::block_on(fs_stmt.query_with_params(&[
+                fsqlite::SqliteValue::Integer(range_start),
+                fsqlite::SqliteValue::Integer(range_end),
+            ]))
+            .unwrap();
         });
         eprintln!(
             "C={} F={}",
@@ -4493,9 +4522,9 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                 let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
             })
         };
-        let fs_stmt = fs_conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
+        let fs_stmt = fs_prepare(&fs_conn, "SELECT COUNT(*) FROM bench");
         let fs = measure(&format!("fs_count_{count}"), 1, || {
-            let _row = fs_stmt.query_row().unwrap();
+            let _row = fsqlite_e2e::block_on(fs_stmt.query_row()).unwrap();
         });
         eprintln!(
             "C={} F={}",
@@ -4524,9 +4553,9 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
             let sql = format!(
                 "SELECT (id / {group_divisor}), SUM(value) FROM bench GROUP BY (id / {group_divisor})"
             );
-            let stmt = fs_conn.prepare(&sql).unwrap();
+            let stmt = fs_prepare(&fs_conn, &sql);
             measure(&format!("fs_groupby_{count}"), count, || {
-                let _rows = stmt.query().unwrap();
+                let _rows = fsqlite_e2e::block_on(stmt.query()).unwrap();
             })
         };
         eprintln!(
@@ -4553,9 +4582,7 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                         .unwrap();
             })
         };
-        let fs_stmt = fs_conn
-            .prepare("SELECT * FROM bench WHERE name = ?1")
-            .unwrap();
+        let fs_stmt = fs_prepare(&fs_conn, "SELECT * FROM bench WHERE name = ?1");
         let target_name_param = [fsqlite::SqliteValue::Text(target_name.into())];
         let profile_idx_enabled = std::env::var("FSQLITE_BENCH_PROFILE_IDX")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -4566,7 +4593,8 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
         }
         reset_hot_path_profile();
         let fs = measure(&format!("fs_idx_{count}"), 1, || {
-            let _rows = fs_stmt.query_with_params(&target_name_param).unwrap();
+            let _rows =
+                fsqlite_e2e::block_on(fs_stmt.query_with_params(&target_name_param)).unwrap();
         });
         let fs_idx_profile = hot_path_profile_snapshot();
         if profile_idx_enabled {
@@ -4578,7 +4606,8 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
             let start = Instant::now();
             let mut row_count = 0_usize;
             for _ in 0..profile_iters {
-                let rows = fs_stmt.query_with_params(&target_name_param).unwrap();
+                let rows =
+                    fsqlite_e2e::block_on(fs_stmt.query_with_params(&target_name_param)).unwrap();
                 row_count = row_count.saturating_add(rows.len());
                 std::hint::black_box(rows);
             }
@@ -4620,11 +4649,9 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
-        let fs_stmt = fs_conn
-            .prepare("SELECT * FROM bench ORDER BY value DESC LIMIT 20")
-            .unwrap();
+        let fs_stmt = fs_prepare(&fs_conn, "SELECT * FROM bench ORDER BY value DESC LIMIT 20");
         let fs = measure(&format!("fs_order_{count}"), 20, || {
-            let _rows = fs_stmt.query().unwrap();
+            let _rows = fsqlite_e2e::block_on(fs_stmt.query()).unwrap();
         });
         eprintln!(
             "C={} F={}",
@@ -4654,7 +4681,7 @@ fn profile_fsqlite_update_delete_dml(
     fs_execute(&conn, record_size.create_table_sql());
     fs_execute(&conn, "BEGIN");
     #[allow(clippy::cast_possible_wrap)]
-    let insert = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
+    let insert = fs_prepare(&conn, record_size.insert_sql_csqlite());
     #[allow(clippy::cast_possible_wrap)]
     for i in 0..count as i64 {
         fs_stmt_execute_with_params(&insert, &[fsqlite::SqliteValue::Integer(i)]);
@@ -4678,7 +4705,7 @@ fn profile_fsqlite_update_delete_dml(
     let begin_us = begin_start.elapsed().as_secs_f64() * 1_000_000.0;
 
     let prepare_start = Instant::now();
-    let statement = conn.prepare(statement_sql).unwrap();
+    let statement = fs_prepare(&conn, statement_sql);
     let prepare_us = prepare_start.elapsed().as_secs_f64() * 1_000_000.0;
 
     let mutate_start = Instant::now();
@@ -4899,18 +4926,14 @@ fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
             fs_execute(&conn, create_sql);
             fs_execute(&conn, "BEGIN");
             #[allow(clippy::cast_possible_wrap)]
-            let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
+            let stmt = fs_prepare(&conn, record_size.insert_sql_csqlite());
             for i in 0..count as i64 {
                 fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
             }
             drop(stmt);
             fs_execute(&conn, "COMMIT");
-            let update = conn
-                .prepare("UPDATE bench SET value = ?2 WHERE id = ?1")
-                .unwrap();
-            let reset = conn
-                .prepare("UPDATE bench SET value = ?2 WHERE id = ?1")
-                .unwrap();
+            let update = fs_prepare(&conn, "UPDATE bench SET value = ?2 WHERE id = ?1");
+            let reset = fs_prepare(&conn, "UPDATE bench SET value = ?2 WHERE id = ?1");
 
             measure_with_teardown(
                 &format!("fs_update_{count}"),
@@ -5014,14 +5037,14 @@ fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
             fs_execute(&conn, create_sql);
             fs_execute(&conn, "BEGIN");
             #[allow(clippy::cast_possible_wrap)]
-            let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
+            let stmt = fs_prepare(&conn, record_size.insert_sql_csqlite());
             for i in 0..count as i64 {
                 fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
             }
             drop(stmt);
             fs_execute(&conn, "COMMIT");
-            let delete = conn.prepare("DELETE FROM bench WHERE id = ?1").unwrap();
-            let restore = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
+            let delete = fs_prepare(&conn, "DELETE FROM bench WHERE id = ?1");
+            let restore = fs_prepare(&conn, record_size.insert_sql_csqlite());
 
             measure_with_teardown(
                 &format!("fs_delete_{count}"),
@@ -5179,9 +5202,10 @@ fn bench_mixed_oltp(report: &mut BenchReport) {
             &conn,
             "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
         );
-        let seed_insert = conn
-            .prepare("INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))")
-            .unwrap();
+        let seed_insert = fs_prepare(
+            &conn,
+            "INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))",
+        );
         fs_execute(&conn, "BEGIN");
         #[allow(clippy::cast_possible_wrap)]
         for i in 1..=seed_rows as i64 {
@@ -5192,47 +5216,56 @@ fn bench_mixed_oltp(report: &mut BenchReport) {
         let mut rng = Rng64::new(42);
         #[allow(clippy::cast_possible_wrap)]
         let mut next_id = seed_rows as i64 + 1;
-        let select_pt = conn.prepare("SELECT * FROM bench WHERE id = ?1").unwrap();
-        let select_range = conn
-            .prepare("SELECT COUNT(*) FROM bench WHERE id >= ?1 AND id < ?2")
-            .unwrap();
-        let select_agg = conn
-            .prepare("SELECT COUNT(*), SUM(score) FROM bench")
-            .unwrap();
-        let insert = conn
-            .prepare("INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))")
-            .unwrap();
-        let update = conn
-            .prepare("UPDATE bench SET score = ?2 WHERE id = ?1")
-            .unwrap();
-        let delete = conn.prepare("DELETE FROM bench WHERE id = ?1").unwrap();
+        let select_pt = fs_prepare(&conn, "SELECT * FROM bench WHERE id = ?1");
+        let select_range = fs_prepare(
+            &conn,
+            "SELECT COUNT(*) FROM bench WHERE id >= ?1 AND id < ?2",
+        );
+        let select_agg = fs_prepare(&conn, "SELECT COUNT(*), SUM(score) FROM bench");
+        let insert = fs_prepare(
+            &conn,
+            "INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))",
+        );
+        let update = fs_prepare(&conn, "UPDATE bench SET score = ?2 WHERE id = ?1");
+        let delete = fs_prepare(&conn, "DELETE FROM bench WHERE id = ?1");
 
+        // Each op's result is deliberately discarded — the mix is what's being
+        // timed, not the rows. `drop(block_on(..))`, never `let _ = ..`: the
+        // latter would bind the future without polling it and time nothing.
         #[allow(clippy::cast_possible_wrap)]
         for _ in 0..ops {
             let roll = rng.next_usize(100);
             if roll < 40 {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                let _ = select_pt.query_row_with_params(&[fsqlite::SqliteValue::Integer(id)]);
+                drop(fsqlite_e2e::block_on(
+                    select_pt.query_row_with_params(&[fsqlite::SqliteValue::Integer(id)]),
+                ));
             } else if roll < 60 {
                 let start = (rng.next_usize(seed_rows.saturating_sub(50)) + 1) as i64;
-                let _ = select_range.query_row_with_params(&[
-                    fsqlite::SqliteValue::Integer(start),
-                    fsqlite::SqliteValue::Integer(start + 50),
-                ]);
+                drop(fsqlite_e2e::block_on(select_range.query_row_with_params(
+                    &[
+                        fsqlite::SqliteValue::Integer(start),
+                        fsqlite::SqliteValue::Integer(start + 50),
+                    ],
+                )));
             } else if roll < 80 {
-                let _ = select_agg.query_row();
+                drop(fsqlite_e2e::block_on(select_agg.query_row()));
             } else if roll < 95 {
-                let _ = insert.execute_with_params(&[fsqlite::SqliteValue::Integer(next_id)]);
+                drop(fsqlite_e2e::block_on(insert.execute_with_params(&[
+                    fsqlite::SqliteValue::Integer(next_id),
+                ])));
                 next_id += 1;
             } else if roll < 98 {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                let _ = update.execute_with_params(&[
+                drop(fsqlite_e2e::block_on(update.execute_with_params(&[
                     fsqlite::SqliteValue::Integer(id),
                     fsqlite::SqliteValue::Integer(id * 99),
-                ]);
+                ])));
             } else {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                let _ = delete.execute_with_params(&[fsqlite::SqliteValue::Integer(id)]);
+                drop(fsqlite_e2e::block_on(
+                    delete.execute_with_params(&[fsqlite::SqliteValue::Integer(id)]),
+                ));
             }
         }
     });
@@ -5343,11 +5376,12 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
-        let fs_stmt = fs_conn
-            .prepare("SELECT c.name, o.amount FROM customers c INNER JOIN orders o ON o.customer_id = c.id")
-            .unwrap();
+        let fs_stmt = fs_prepare(
+            &fs_conn,
+            "SELECT c.name, o.amount FROM customers c INNER JOIN orders o ON o.customer_id = c.id",
+        );
         let fs = measure(&format!("fs_inner_join_{count}"), count, || {
-            let _ = fs_stmt.query();
+            drop(fsqlite_e2e::block_on(fs_stmt.query()));
         });
         eprintln!(
             "C={} F={}",
@@ -5364,11 +5398,12 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
-        let fs_stmt = fs_conn
-            .prepare("SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON o.customer_id = c.id")
-            .unwrap();
+        let fs_stmt = fs_prepare(
+            &fs_conn,
+            "SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON o.customer_id = c.id",
+        );
         let fs = measure(&format!("fs_left_join_{count}"), count, || {
-            let _ = fs_stmt.query();
+            drop(fsqlite_e2e::block_on(fs_stmt.query()));
         });
         eprintln!(
             "C={} F={}",
@@ -5385,11 +5420,12 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
-        let fs_stmt = fs_conn
-            .prepare("SELECT c.name, COUNT(*), SUM(o.amount) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name")
-            .unwrap();
+        let fs_stmt = fs_prepare(
+            &fs_conn,
+            "SELECT c.name, COUNT(*), SUM(o.amount) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name",
+        );
         let fs = measure(&format!("fs_join_agg_{count}"), customer_count, || {
-            let _ = fs_stmt.query();
+            drop(fsqlite_e2e::block_on(fs_stmt.query()));
         });
         eprintln!(
             "C={} F={}",
@@ -5418,9 +5454,9 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
             let sql = format!(
                 "SELECT c.name, COUNT(*) cnt FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name HAVING cnt > {threshold}"
             );
-            let stmt = fs_conn.prepare(&sql).unwrap();
+            let stmt = fs_prepare(&fs_conn, &sql);
             measure(&format!("fs_join_having_{count}"), customer_count, || {
-                let _ = stmt.query();
+                drop(fsqlite_e2e::block_on(stmt.query()));
             })
         };
         eprintln!(
@@ -5528,13 +5564,12 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
-        let fs_stmt = fs_conn
-            .prepare(
-                "SELECT p.name, (SELECT c.name FROM categories c WHERE c.id = p.category_id) AS cat_name FROM products p LIMIT 100",
-            )
-            .unwrap();
+        let fs_stmt = fs_prepare(
+            &fs_conn,
+            "SELECT p.name, (SELECT c.name FROM categories c WHERE c.id = p.category_id) AS cat_name FROM products p LIMIT 100",
+        );
         let fs = measure(&format!("fs_scalar_sub_{count}"), 100, || {
-            let _ = fs_stmt.query();
+            drop(fsqlite_e2e::block_on(fs_stmt.query()));
         });
         eprintln!(
             "C={} F={}",
@@ -5563,9 +5598,9 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
             let sql = format!(
                 "SELECT COUNT(*) FROM products p WHERE EXISTS (SELECT 1 FROM categories c WHERE c.id = p.category_id AND c.id <= {half})"
             );
-            let stmt = fs_conn.prepare(&sql).unwrap();
+            let stmt = fs_prepare(&fs_conn, &sql);
             measure(&format!("fs_exists_{count}"), 1, || {
-                let _ = stmt.query_row();
+                drop(fsqlite_e2e::block_on(stmt.query_row()));
             })
         };
         eprintln!(
@@ -5588,11 +5623,12 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
                 let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
             })
         };
-        let fs_stmt = fs_conn
-            .prepare("SELECT COUNT(*) FROM products WHERE category_id IN (SELECT id FROM categories WHERE id <= 5)")
-            .unwrap();
+        let fs_stmt = fs_prepare(
+            &fs_conn,
+            "SELECT COUNT(*) FROM products WHERE category_id IN (SELECT id FROM categories WHERE id <= 5)",
+        );
         let fs = measure(&format!("fs_in_sub_{count}"), 1, || {
-            let _ = fs_stmt.query_row();
+            drop(fsqlite_e2e::block_on(fs_stmt.query_row()));
         });
         eprintln!(
             "C={} F={}",
@@ -5612,14 +5648,13 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
-        let fs_stmt = fs_conn
-            .prepare(
-                "WITH top_cats AS (SELECT category_id, SUM(price) AS total FROM products GROUP BY category_id ORDER BY total DESC LIMIT 5) \
-                 SELECT p.name, p.price FROM products p JOIN top_cats tc ON p.category_id = tc.category_id",
-            )
-            .unwrap();
+        let fs_stmt = fs_prepare(
+            &fs_conn,
+            "WITH top_cats AS (SELECT category_id, SUM(price) AS total FROM products GROUP BY category_id ORDER BY total DESC LIMIT 5) \
+             SELECT p.name, p.price FROM products p JOIN top_cats tc ON p.category_id = tc.category_id",
+        );
         let fs = measure(&format!("fs_cte_{count}"), count, || {
-            let _ = fs_stmt.query();
+            drop(fsqlite_e2e::block_on(fs_stmt.query()));
         });
         eprintln!(
             "C={} F={}",
@@ -5642,13 +5677,12 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
     };
     let fs = {
         let fs_conn = open_fsqlite_memory_connection_for_benchmark();
-        let stmt = fs_conn
-            .prepare(
-                "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 1000) SELECT SUM(x) FROM cnt",
-            )
-            .unwrap();
+        let stmt = fs_prepare(
+            &fs_conn,
+            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 1000) SELECT SUM(x) FROM cnt",
+        );
         measure("fs_recursive_cte", 1000, || {
-            let _ = stmt.query_row();
+            drop(fsqlite_e2e::block_on(stmt.query_row()));
         })
     };
     eprintln!(
@@ -5740,11 +5774,12 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
             })
         };
-        let fs_stmt = fs_conn
-            .prepare("SELECT COUNT(*) FROM docs WHERE title LIKE 'Document 1%'")
-            .unwrap();
+        let fs_stmt = fs_prepare(
+            &fs_conn,
+            "SELECT COUNT(*) FROM docs WHERE title LIKE 'Document 1%'",
+        );
         let fs = measure(&format!("fs_like_prefix_{count}"), 1, || {
-            let _ = fs_stmt.query_row();
+            drop(fsqlite_e2e::block_on(fs_stmt.query_row()));
         });
         eprintln!(
             "C={} F={}",
@@ -5767,11 +5802,12 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
             })
         };
-        let fs_stmt = fs_conn
-            .prepare("SELECT COUNT(*) FROM docs WHERE body LIKE '%benchmark%'")
-            .unwrap();
+        let fs_stmt = fs_prepare(
+            &fs_conn,
+            "SELECT COUNT(*) FROM docs WHERE body LIKE '%benchmark%'",
+        );
         let fs = measure(&format!("fs_like_wild_{count}"), 1, || {
-            let _ = fs_stmt.query_row();
+            drop(fsqlite_e2e::block_on(fs_stmt.query_row()));
         });
         eprintln!(
             "C={} F={}",
@@ -5794,11 +5830,12 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
-        let fs_stmt = fs_conn
-            .prepare("SELECT LENGTH(title), UPPER(tag), SUBSTR(body, 1, 50) FROM docs")
-            .unwrap();
+        let fs_stmt = fs_prepare(
+            &fs_conn,
+            "SELECT LENGTH(title), UPPER(tag), SUBSTR(body, 1, 50) FROM docs",
+        );
         let fs = measure(&format!("fs_str_funcs_{count}"), count, || {
-            let _ = fs_stmt.query();
+            drop(fsqlite_e2e::block_on(fs_stmt.query()));
         });
         eprintln!(
             "C={} F={}",
@@ -5821,11 +5858,12 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
-        let fs_stmt = fs_conn
-            .prepare("SELECT tag, GROUP_CONCAT(id, ',') FROM docs GROUP BY tag")
-            .unwrap();
+        let fs_stmt = fs_prepare(
+            &fs_conn,
+            "SELECT tag, GROUP_CONCAT(id, ',') FROM docs GROUP BY tag",
+        );
         let fs = measure(&format!("fs_group_concat_{count}"), count, || {
-            let _ = fs_stmt.query();
+            drop(fsqlite_e2e::block_on(fs_stmt.query()));
         });
         eprintln!(
             "C={} F={}",

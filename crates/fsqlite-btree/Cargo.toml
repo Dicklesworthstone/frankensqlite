@@ -25,6 +25,7 @@ smallvec = { workspace = true }
 xxhash-rust = { workspace = true }
 
 [dev-dependencies]
+asupersync = { workspace = true }
 proptest = { workspace = true }
 
 [[bench]]

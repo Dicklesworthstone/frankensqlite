@@ -1037,6 +1037,7 @@ dependencies = [
  "rand 0.10.1",
  "rusqlite",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -1050,6 +1051,7 @@ dependencies = [
 name = "fsqlite-btree"
 version = "0.1.19"
 dependencies = [
+ "asupersync",
  "foldhash",
  "fsqlite-error",
  "fsqlite-func",
@@ -1067,6 +1069,7 @@ dependencies = [
 name = "fsqlite-c-api"
 version = "0.1.19"
 dependencies = [
+ "asupersync",
  "fsqlite",
  "fsqlite-ast",
  "fsqlite-error",
@@ -1080,6 +1083,7 @@ dependencies = [
 name = "fsqlite-cli"
 version = "0.1.19"
 dependencies = [
+ "asupersync",
  "fsqlite",
  "fsqlite-core",
  "fsqlite-error",
@@ -1114,7 +1118,6 @@ dependencies = [
  "fsqlite-vdbe",
  "fsqlite-vfs",
  "fsqlite-wal",
- "futures-lite",
  "hashbrown 0.17.1",
  "itoa",
  "lazy_static",
@@ -1182,6 +1185,7 @@ dependencies = [
 name = "fsqlite-ext-fts5"
 version = "0.1.19"
 dependencies = [
+ "asupersync",
  "fsqlite-error",
  "fsqlite-func",
  "fsqlite-types",
@@ -1306,7 +1310,6 @@ dependencies = [
  "fsqlite-types",
  "fsqlite-vfs",
  "fsqlite-wal",
- "futures-lite",
  "loom",
  "nix",
  "parking_lot",
@@ -1350,7 +1353,6 @@ dependencies = [
  "fsqlite-types",
  "fsqlite-vfs",
  "fsqlite-wal",
- "futures-lite",
  "hashbrown 0.17.1",
  "parking_lot",
  "proptest",
@@ -1498,6 +1500,7 @@ dependencies = [
  "tracing",
  "tracing-wasm",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "wasm-bindgen-test",
 ]
 

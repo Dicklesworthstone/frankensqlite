@@ -166,7 +166,7 @@ pub fn verify_fsqlite_pragmas(conn: &fsqlite::Connection) -> E2eResult<()> {
 
     for &(pragma, expected) in BENCHMARK_PRAGMAS {
         let query = format!("PRAGMA {pragma};");
-        match conn.query(&query) {
+        match crate::block_on(conn.query(&query)) {
             Ok(rows) => {
                 let raw = rows
                     .first()
@@ -274,12 +274,10 @@ pub fn apply_benchmark_pragmas_rusqlite(conn: &rusqlite::Connection) -> E2eResul
 pub fn apply_benchmark_pragmas_fsqlite(conn: &fsqlite::Connection) -> E2eResult<()> {
     let settings = benchmark_settings();
     for pragma in &settings.to_fsqlite_pragmas() {
-        conn.execute(pragma)
-            .map_err(|e| E2eError::Fsqlite(e.to_string()))?;
+        crate::block_on(conn.execute(pragma)).map_err(|e| E2eError::Fsqlite(e.to_string()))?;
     }
     for pragma in &additional_benchmark_pragmas() {
-        conn.execute(pragma)
-            .map_err(|e| E2eError::Fsqlite(e.to_string()))?;
+        crate::block_on(conn.execute(pragma)).map_err(|e| E2eError::Fsqlite(e.to_string()))?;
     }
     Ok(())
 }

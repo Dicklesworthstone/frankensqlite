@@ -41,7 +41,9 @@ use crate::shm::{
     SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion, WAL_NREADER_USIZE, WAL_TOTAL_LOCKS,
     WAL_WRITE_LOCK, wal_lock_byte, wal_read_lock_slot,
 };
-use crate::traits::{FileIdentity, SyncKind, Vfs, VfsFile};
+use crate::traits::{
+    FileIdentity, SyncKind, Vfs, VfsFile, VfsWriteCompletion, VfsWriteCompletionSource,
+};
 
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
@@ -116,6 +118,22 @@ fn write_owned_at(file: Arc<File>, data: Vec<u8>, offset: u64) -> io::Result<()>
         }
     }
     Ok(())
+}
+
+#[allow(clippy::needless_pass_by_value)] // owns closure inputs for spawn_blocking_io
+fn write_owned_at_tracked(
+    file: Arc<File>,
+    data: Vec<u8>,
+    offset: u64,
+    mut completion: VfsWriteCompletionSource,
+) -> io::Result<()> {
+    let result = write_owned_at(file, data, offset);
+    if result.is_ok() {
+        completion.complete_success();
+    } else {
+        completion.complete_error();
+    }
+    result
 }
 
 /// Write the whole buffer at `offset`, retrying short writes and `EINTR`.
@@ -1980,18 +1998,38 @@ impl VfsFile for UnixFile {
         buf: &'a [u8],
         offset: u64,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        self.write_tracked(cx, buf, offset, VfsWriteCompletion::new())
+    }
+
+    fn write_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
         async move {
-            checkpoint_or_abort(cx)?;
-            checked_io_range(offset, buf.len(), "write")?;
-            let file = Arc::clone(
+            let file = match (|| {
+                checkpoint_or_abort(cx)?;
+                checked_io_range(offset, buf.len(), "write")?;
                 self.file
                     .as_ref()
-                    .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
-            );
+                    .map(Arc::clone)
+                    .ok_or_else(|| FrankenError::internal("unix file is closed"))
+            })() {
+                Ok(file) => file,
+                Err(error) => {
+                    completion.complete_error();
+                    return Err(error);
+                }
+            };
             let data = buf.to_vec();
-            spawn_blocking_io(move || write_owned_at(file, data, offset))
-                .await
-                .map_err(FrankenError::Io)?;
+            let source_completion = VfsWriteCompletionSource::new(completion.clone());
+            spawn_blocking_io(move || {
+                write_owned_at_tracked(file, data, offset, source_completion)
+            })
+            .await
+            .map_err(FrankenError::Io)?;
             checkpoint_or_abort(cx)
         }
     }
@@ -4275,6 +4313,138 @@ mod tests {
             "write",
         );
         assert!(result.is_err(), "non-EINTR errors must still propagate");
+    }
+
+    #[test]
+    fn tracked_blocking_write_completion_survives_observer_future_drop() {
+        use std::future::{Future as _, poll_fn};
+        use std::sync::mpsc;
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().expect("create tracked-write tempdir");
+        let path = directory.path().join("tracked-write.db");
+        let file = Arc::new(
+            File::options()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("open tracked-write target"),
+        );
+        let completion = VfsWriteCompletion::new();
+        let source_completion = VfsWriteCompletionSource::new(completion.clone());
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let payload = b"completion survives observer drop".to_vec();
+        let expected = payload.clone();
+        let cx = Cx::new();
+
+        crate::block_on_test_io(&cx, async {
+            let mut observer = Box::pin(spawn_blocking_io(move || {
+                started_tx.send(()).expect("report source start");
+                release_rx.recv().expect("wait for observer drop");
+                write_owned_at_tracked(file, payload, 0, source_completion)
+            }));
+            poll_fn(|task_cx| match observer.as_mut().poll(task_cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("gated blocking write cannot complete on first poll"),
+            })
+            .await;
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("blocking source must start before observer is dropped");
+            drop(observer);
+
+            release_tx
+                .send(())
+                .expect("release source after observer drop");
+            assert_eq!(
+                completion.wait().await,
+                crate::traits::VfsWriteCompletionState::Success
+            );
+        });
+
+        assert_eq!(
+            std::fs::read(path).expect("read tracked-write target"),
+            expected
+        );
+    }
+
+    #[test]
+    fn tracked_blocking_write_completion_cancelled_while_queued_reports_error() {
+        use std::future::{Future as _, poll_fn};
+        use std::sync::mpsc;
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("build one-worker blocking runtime");
+        let cx = Cx::new();
+        let directory = tempfile::tempdir().expect("create queued-write tempdir");
+        let path = directory.path().join("queued-write.db");
+        let file = Arc::new(
+            File::options()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("open queued-write target"),
+        );
+        let completion = VfsWriteCompletion::new();
+        let source_completion = VfsWriteCompletionSource::new(completion.clone());
+        let (blocker_started_tx, blocker_started_rx) = mpsc::sync_channel(0);
+        let (release_blocker_tx, release_blocker_rx) = mpsc::sync_channel(0);
+
+        runtime.block_on(async {
+            let native_cx =
+                asupersync::Cx::current().expect("runtime must install a capability context");
+            cx.set_native_cx(native_cx);
+
+            let mut blocker = Box::pin(spawn_blocking_io(move || {
+                blocker_started_tx.send(()).expect("report blocker start");
+                release_blocker_rx.recv().expect("wait to release blocker");
+                Ok(())
+            }));
+            poll_fn(|task_cx| match blocker.as_mut().poll(task_cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("blocking-pool blocker cannot finish before release"),
+            })
+            .await;
+            blocker_started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the sole blocking worker must start the blocker");
+
+            let mut observer = Box::pin(spawn_blocking_io(move || {
+                write_owned_at_tracked(file, b"must not be written".to_vec(), 0, source_completion)
+            }));
+            poll_fn(|task_cx| match observer.as_mut().poll(task_cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("tracked write must remain queued behind the blocker"),
+            })
+            .await;
+            drop(observer);
+
+            release_blocker_tx
+                .send(())
+                .expect("release blocking worker");
+            blocker.await.expect("blocking-pool blocker must finish");
+            assert_eq!(
+                completion.wait().await,
+                crate::traits::VfsWriteCompletionState::Error
+            );
+        });
+
+        assert!(
+            std::fs::read(path)
+                .expect("read cancelled queued-write target")
+                .is_empty(),
+            "a write cancelled before its source starts must not mutate the file"
+        );
     }
 
     #[test]

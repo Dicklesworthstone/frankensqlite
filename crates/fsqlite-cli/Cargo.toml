@@ -21,6 +21,10 @@ fsqlite-core = { workspace = true }
 fsqlite-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The CLI is the top-level consumer, so it is the component that owns the async
+# runtime and hands a `Cx` down into the engine (see AGENTS.md: FrankenSQLite
+# itself never builds a runtime).
+asupersync = { workspace = true }
 
 [lints]
 workspace = true

@@ -13,7 +13,6 @@ use fsqlite_error::FrankenError;
 use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
 use fsqlite_types::{Cx, LockLevel};
 use fsqlite_vfs::traits::{SyncKind, Vfs, VfsFile};
-use futures_lite::future;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -647,13 +646,13 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
     }
 
     /// Create and durably publish an empty sidecar, or validate an existing one.
-    pub fn initialize(&self) -> Result<(), HistoryError> {
+    pub async fn initialize(&self) -> Result<(), HistoryError> {
         if self
             .vfs
             .access(self.cx, &self.history_path, AccessFlags::EXISTS)?
         {
             let mut file = self.open_history(false)?;
-            let result = self.validate_header(&file).map(|_| ());
+            let result = self.validate_header(&file).await.map(|_| ());
             let close_result = file.close(self.cx).map_err(HistoryError::from);
             return result.and(close_result);
         }
@@ -664,23 +663,24 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
             | VfsOpenFlags::READWRITE;
         let (mut file, _) = self.vfs.open(self.cx, Some(&self.history_path), flags)?;
         let header = self.expectations.header()?.encode_slot();
-        let result: Result<(), FrankenError> = (|| {
-            future::block_on(file.write(self.cx, &header, 0))?;
+        let result: Result<(), FrankenError> = async {
+            file.write(self.cx, &header, 0).await?;
             file.durable_sync(self.cx, SyncKind::FullDurable)?;
             self.vfs
                 .sync_parent_directory(self.cx, &self.history_path)?;
             Ok(())
-        })();
+        }
+        .await;
         let close_result = file.close(self.cx).map_err(HistoryError::from);
         result.map_err(HistoryError::from).and(close_result)
     }
 
     /// Validate identity, chain, slot boundaries, and recovered horizon;
     /// truncate only a provable invalid/torn tail and durably publish repair.
-    pub fn recover(&self) -> Result<RecoveryReport, HistoryError> {
+    pub async fn recover(&self) -> Result<RecoveryReport, HistoryError> {
         let mut file = self.open_history(false)?;
         file.lock(self.cx, LockLevel::Exclusive)?;
-        let result = self.recover_locked(&mut file);
+        let result = self.recover_locked(&mut file).await;
         let unlock_result = file
             .unlock(self.cx, LockLevel::None)
             .map_err(HistoryError::from);
@@ -689,14 +689,14 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
     }
 
     /// Append one commit record and issue a full-durable barrier.
-    pub fn append(&self, draft: HistoryRecordDraft) -> Result<HistoryRecord, HistoryError> {
-        let mut appended = self.append_batch(std::slice::from_ref(&draft))?;
+    pub async fn append(&self, draft: HistoryRecordDraft) -> Result<HistoryRecord, HistoryError> {
+        let mut appended = self.append_batch(std::slice::from_ref(&draft)).await?;
         Ok(appended.remove(0))
     }
 
     /// Append a batch under one short-lived sidecar lock and one full-durable
     /// barrier. The batch is encoded as individually immutable record slots.
-    pub fn append_batch(
+    pub async fn append_batch(
         &self,
         drafts: &[HistoryRecordDraft],
     ) -> Result<Vec<HistoryRecord>, HistoryError> {
@@ -705,12 +705,12 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         }
         let mut file = self.open_history(false)?;
         file.lock(self.cx, LockLevel::Exclusive)?;
-        let result = (|| {
-            let recovery = self.recover_locked(&mut file)?;
+        let result = async {
+            let recovery = self.recover_locked(&mut file).await?;
             let mut previous = if recovery.valid_records == 0 {
                 None
             } else {
-                Some(self.read_record(&file, recovery.valid_records - 1)?)
+                Some(self.read_record(&file, recovery.valid_records - 1).await?)
             };
             let mut appended = Vec::with_capacity(drafts.len());
             for draft in drafts {
@@ -744,17 +744,15 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
                     .ok_or_else(|| {
                         HistoryError::InvalidInput("record count overflow".to_owned())
                     })?;
-                future::block_on(file.write(
-                    self.cx,
-                    &record.encode_slot(),
-                    record_offset(index)?,
-                ))?;
+                let slot = record.encode_slot();
+                file.write(self.cx, &slot, record_offset(index)?).await?;
                 appended.push(record);
                 previous = Some(record);
             }
             file.durable_sync(self.cx, SyncKind::FullDurable)?;
             Ok(appended)
-        })();
+        }
+        .await;
         let unlock_result = file
             .unlock(self.cx, LockLevel::None)
             .map_err(HistoryError::from);
@@ -764,11 +762,11 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
 
     /// Read every validated retained record. This never mutates a malformed
     /// tail; callers run [`Self::recover`] first when repair is authorized.
-    pub fn read_all(&self) -> Result<Vec<HistoryRecord>, HistoryError> {
+    pub async fn read_all(&self) -> Result<Vec<HistoryRecord>, HistoryError> {
         let mut file = self.open_history(true)?;
         file.lock(self.cx, LockLevel::Shared)?;
-        let result = (|| {
-            self.validate_header(&file)?;
+        let result = async {
+            self.validate_header(&file).await?;
             let (record_count, partial_bytes) = record_count_and_partial(&file, self.cx)?;
             if partial_bytes != 0 {
                 return Err(HistoryError::Corrupt {
@@ -776,8 +774,9 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
                     reason: format!("incomplete final slot ({partial_bytes} bytes)"),
                 });
             }
-            self.read_and_validate_prefix(&file, record_count)
-        })();
+            self.read_and_validate_prefix(&file, record_count).await
+        }
+        .await;
         let unlock_result = file
             .unlock(self.cx, LockLevel::None)
             .map_err(HistoryError::from);
@@ -786,19 +785,19 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
     }
 
     /// Rebuild and durably publish the optional sparse-index cache.
-    pub fn rebuild_sparse_index(&self) -> Result<SparseIndex, HistoryError> {
+    pub async fn rebuild_sparse_index(&self) -> Result<SparseIndex, HistoryError> {
         let mut stats = SearchStats::default();
-        self.rebuild_sparse_index_counted(&mut stats)
+        self.rebuild_sparse_index_counted(&mut stats).await
     }
 
-    fn rebuild_sparse_index_counted(
+    async fn rebuild_sparse_index_counted(
         &self,
         stats: &mut SearchStats,
     ) -> Result<SparseIndex, HistoryError> {
         let mut history = self.open_history(true)?;
         history.lock(self.cx, LockLevel::Shared)?;
-        let result = (|| {
-            self.validate_header_counted(&history, stats)?;
+        let result = async {
+            self.validate_header_counted(&history, stats).await?;
             let (record_count, partial) = record_count_and_partial(&history, self.cx)?;
             if partial != 0 {
                 return Err(HistoryError::Corrupt {
@@ -813,7 +812,7 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
             let mut entries = Vec::with_capacity(capacity);
             let mut previous = None;
             for position in 0..record_count {
-                let record = self.read_record_counted(&history, position, stats)?;
+                let record = self.read_record_counted(&history, position, stats).await?;
                 self.validate_record_position(position, record, previous)?;
                 if position % HISTORY_INDEX_STRIDE == 0 {
                     entries.push(SparseIndexEntry {
@@ -828,9 +827,10 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
                 history_record_count: record_count,
                 last_record_hash: previous.map_or(0, |record| record.this_record_blake3_64),
             };
-            self.write_sparse_index(&index)?;
+            self.write_sparse_index(&index).await?;
             Ok(index)
-        })();
+        }
+        .await;
         let unlock_result = history
             .unlock(self.cx, LockLevel::None)
             .map_err(HistoryError::from);
@@ -840,7 +840,7 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
 
     /// Locate the greatest retained commit no later than `target_commit_seq`,
     /// rebuilding a missing, stale, or corrupt optional index before lookup.
-    pub fn lookup_floor(
+    pub async fn lookup_floor(
         &self,
         target_commit_seq: u64,
     ) -> Result<(HistoryRecord, SearchStats), HistoryError> {
@@ -849,13 +849,13 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         // rather than ever combining an index for one tail with another.
         let mut stats = SearchStats::default();
         for _ in 0..3 {
-            let tail = self.read_tail_snapshot_counted(&mut stats)?;
-            let (mut index_file, binding) = match self.open_sparse_index_for_tail(tail, &mut stats)
-            {
-                Ok(opened) => opened,
-                Err(HistoryError::CorruptIndex(_)) => continue,
-                Err(error) => return Err(error),
-            };
+            let tail = self.read_tail_snapshot_counted(&mut stats).await?;
+            let (mut index_file, binding) =
+                match self.open_sparse_index_for_tail(tail, &mut stats).await {
+                    Ok(opened) => opened,
+                    Err(HistoryError::CorruptIndex(_)) => continue,
+                    Err(error) => return Err(error),
+                };
             let mut history = match self.open_history(true) {
                 Ok(history) => history,
                 Err(error) => {
@@ -868,9 +868,9 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
                 let _ = unlock_and_close(&mut index_file, self.cx);
                 return Err(HistoryError::from(error));
             }
-            let result = (|| {
-                self.validate_header_counted(&history, &mut stats)?;
-                if self.read_tail_locked_counted(&history, &mut stats)? != tail
+            let result = async {
+                self.validate_header_counted(&history, &mut stats).await?;
+                if self.read_tail_locked_counted(&history, &mut stats).await? != tail
                     || binding.tail != tail
                 {
                     return Ok(None);
@@ -882,8 +882,10 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
                     target_commit_seq,
                     &mut stats,
                 )
+                .await
                 .map(Some)
-            })();
+            }
+            .await;
             let unlock_result = history
                 .unlock(self.cx, LockLevel::None)
                 .map_err(HistoryError::from);
@@ -898,7 +900,7 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
                 {
                     Ok(found) => found,
                     Err(HistoryError::CorruptIndex(_)) => {
-                        self.rebuild_sparse_index_counted(&mut stats)?;
+                        self.rebuild_sparse_index_counted(&mut stats).await?;
                         continue;
                     }
                     Err(error) => return Err(error),
@@ -926,9 +928,9 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
             .map_err(HistoryError::from)
     }
 
-    fn validate_header(&self, file: &V::File) -> Result<HistoryHeader, HistoryError> {
+    async fn validate_header(&self, file: &V::File) -> Result<HistoryHeader, HistoryError> {
         let mut slot = [0_u8; HISTORY_SLOT_SIZE];
-        read_exact_at(file, self.cx, &mut slot, 0)?;
+        read_exact_at(file, self.cx, &mut slot, 0).await?;
         let header = HistoryHeader::decode_slot(&slot)?;
         if header.database_history_id != self.expectations.database_history_id {
             return Err(HistoryError::IdentityMismatch {
@@ -951,7 +953,7 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         Ok(header)
     }
 
-    fn validate_header_counted(
+    async fn validate_header_counted(
         &self,
         file: &V::File,
         stats: &mut SearchStats,
@@ -964,7 +966,8 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
             0,
             &mut stats.history_read_calls,
             &mut stats.history_bytes_read,
-        )?;
+        )
+        .await?;
         let header = HistoryHeader::decode_slot(&slot)?;
         if header.database_history_id != self.expectations.database_history_id {
             return Err(HistoryError::IdentityMismatch {
@@ -987,16 +990,17 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         Ok(header)
     }
 
-    fn read_tail_snapshot_counted(
+    async fn read_tail_snapshot_counted(
         &self,
         stats: &mut SearchStats,
     ) -> Result<HistoryTail, HistoryError> {
         let mut history = self.open_history(true)?;
         history.lock(self.cx, LockLevel::Shared)?;
-        let result = (|| {
-            self.validate_header_counted(&history, stats)?;
-            self.read_tail_locked_counted(&history, stats)
-        })();
+        let result = async {
+            self.validate_header_counted(&history, stats).await?;
+            self.read_tail_locked_counted(&history, stats).await
+        }
+        .await;
         let unlock_result = history
             .unlock(self.cx, LockLevel::None)
             .map_err(HistoryError::from);
@@ -1004,7 +1008,7 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         preserve_value_after_cleanup(result, unlock_result, close_result)
     }
 
-    fn read_tail_locked_counted(
+    async fn read_tail_locked_counted(
         &self,
         history: &V::File,
         stats: &mut SearchStats,
@@ -1019,7 +1023,9 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         let last_record_hash = if record_count == 0 {
             0
         } else {
-            let tail = self.read_record_counted(history, record_count - 1, stats)?;
+            let tail = self
+                .read_record_counted(history, record_count - 1, stats)
+                .await?;
             if tail.commit_seq > self.expectations.recovered_commit_horizon {
                 return Err(HistoryError::Corrupt {
                     slot: Some(record_count - 1),
@@ -1046,22 +1052,22 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         })
     }
 
-    fn open_sparse_index_for_tail(
+    async fn open_sparse_index_for_tail(
         &self,
         tail: HistoryTail,
         stats: &mut SearchStats,
     ) -> Result<(V::File, SparseIndexBinding), HistoryError> {
-        match self.try_open_sparse_index_for_tail(tail, stats) {
+        match self.try_open_sparse_index_for_tail(tail, stats).await {
             Ok(opened) => Ok(opened),
             Err(HistoryError::HistoryNotRetained(_) | HistoryError::CorruptIndex(_)) => {
-                self.rebuild_sparse_index_counted(stats)?;
-                self.try_open_sparse_index_for_tail(tail, stats)
+                self.rebuild_sparse_index_counted(stats).await?;
+                self.try_open_sparse_index_for_tail(tail, stats).await
             }
             Err(error) => Err(error),
         }
     }
 
-    fn try_open_sparse_index_for_tail(
+    async fn try_open_sparse_index_for_tail(
         &self,
         tail: HistoryTail,
         stats: &mut SearchStats,
@@ -1078,7 +1084,7 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
             let _ = file.close(self.cx);
             return Err(HistoryError::from(error));
         }
-        match self.read_sparse_index_binding(&file, tail, stats) {
+        match self.read_sparse_index_binding(&file, tail, stats).await {
             Ok(binding) => Ok((file, binding)),
             Err(error) => {
                 let unlock_result = file
@@ -1094,7 +1100,7 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         }
     }
 
-    fn read_sparse_index_binding(
+    async fn read_sparse_index_binding(
         &self,
         file: &V::File,
         tail: HistoryTail,
@@ -1108,11 +1114,12 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
             0,
             &mut stats.index_read_calls,
             &mut stats.index_bytes_read,
-        )?;
+        )
+        .await?;
         decode_index_binding(&header, file.file_size(self.cx)?, self.expectations, tail)
     }
 
-    fn read_index_entry(
+    async fn read_index_entry(
         &self,
         file: &V::File,
         binding: SparseIndexBinding,
@@ -1133,11 +1140,12 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
             offset,
             &mut stats.index_read_calls,
             &mut stats.index_bytes_read,
-        )?;
+        )
+        .await?;
         decode_index_entry(&bytes, self.expectations, binding.tail, ordinal)
     }
 
-    fn read_validated_index_probe(
+    async fn read_validated_index_probe(
         &self,
         history: &V::File,
         index_file: &V::File,
@@ -1145,11 +1153,15 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         ordinal: u64,
         stats: &mut SearchStats,
     ) -> Result<SparseIndexEntry, HistoryError> {
-        let entry = self.read_index_entry(index_file, binding, ordinal, stats)?;
+        let entry = self
+            .read_index_entry(index_file, binding, ordinal, stats)
+            .await?;
         let record_index = ordinal
             .checked_mul(HISTORY_INDEX_STRIDE)
             .ok_or_else(|| HistoryError::CorruptIndex("sample position overflow".to_owned()))?;
-        let record = self.read_record_counted(history, record_index, stats)?;
+        let record = self
+            .read_record_counted(history, record_index, stats)
+            .await?;
         if record.commit_seq != entry.commit_seq {
             return Err(HistoryError::CorruptIndex(format!(
                 "sample {ordinal} does not match authoritative history"
@@ -1167,7 +1179,7 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         Ok(entry)
     }
 
-    fn lookup_with_index_files(
+    async fn lookup_with_index_files(
         &self,
         history: &V::File,
         index_file: &V::File,
@@ -1182,8 +1194,9 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         let mut high = binding.entry_count;
         while low < high {
             let mid = low + (high - low) / 2;
-            let entry =
-                self.read_validated_index_probe(history, index_file, binding, mid, stats)?;
+            let entry = self
+                .read_validated_index_probe(history, index_file, binding, mid, stats)
+                .await?;
             stats.index_probes += 1;
             if entry.commit_seq <= target_commit_seq {
                 low = mid + 1;
@@ -1204,11 +1217,14 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         let mut previous = if start_index == 0 {
             None
         } else {
-            Some(self.read_record_counted(history, start_index - 1, stats)?)
+            Some(
+                self.read_record_counted(history, start_index - 1, stats)
+                    .await?,
+            )
         };
         let mut candidate = None;
         for position in start_index..end_index {
-            let record = self.read_record_counted(history, position, stats)?;
+            let record = self.read_record_counted(history, position, stats).await?;
             self.validate_record_position(position, record, previous)?;
             stats.record_probes += 1;
             previous = Some(record);
@@ -1260,14 +1276,14 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         Ok(())
     }
 
-    fn recover_locked(&self, file: &mut V::File) -> Result<RecoveryReport, HistoryError> {
-        self.validate_header(file)?;
+    async fn recover_locked(&self, file: &mut V::File) -> Result<RecoveryReport, HistoryError> {
+        self.validate_header(file).await?;
         let original_len = file.file_size(self.cx)?;
         let (record_count, partial_bytes) = record_count_and_partial(file, self.cx)?;
         let mut records: Vec<HistoryRecord> = Vec::new();
         let mut valid_records = record_count;
         for index in 0..record_count {
-            match self.read_record(file, index) {
+            match self.read_record(file, index).await {
                 Ok(record) => {
                     if let Some(previous) = records.last() {
                         if record.prev_record_blake3_64 != previous.this_record_blake3_64 {
@@ -1330,13 +1346,13 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         })
     }
 
-    fn read_record(&self, file: &V::File, index: u64) -> Result<HistoryRecord, HistoryError> {
+    async fn read_record(&self, file: &V::File, index: u64) -> Result<HistoryRecord, HistoryError> {
         let mut bytes = [0_u8; HISTORY_RECORD_V1_SIZE];
-        read_exact_at(file, self.cx, &mut bytes, record_offset(index)?)?;
+        read_exact_at(file, self.cx, &mut bytes, record_offset(index)?).await?;
         HistoryRecord::decode(&bytes).map_err(|error| error_at_slot(error, index))
     }
 
-    fn read_record_counted(
+    async fn read_record_counted(
         &self,
         file: &V::File,
         index: u64,
@@ -1350,11 +1366,12 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
             record_offset(index)?,
             &mut stats.history_read_calls,
             &mut stats.history_bytes_read,
-        )?;
+        )
+        .await?;
         HistoryRecord::decode(&bytes).map_err(|error| error_at_slot(error, index))
     }
 
-    fn read_and_validate_prefix(
+    async fn read_and_validate_prefix(
         &self,
         file: &V::File,
         record_count: u64,
@@ -1364,14 +1381,14 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         })?;
         let mut records: Vec<HistoryRecord> = Vec::with_capacity(capacity);
         for index in 0..record_count {
-            let record = self.read_record(file, index)?;
+            let record = self.read_record(file, index).await?;
             self.validate_record_position(index, record, records.last().copied())?;
             records.push(record);
         }
         Ok(records)
     }
 
-    fn write_sparse_index(&self, index: &SparseIndex) -> Result<(), HistoryError> {
+    async fn write_sparse_index(&self, index: &SparseIndex) -> Result<(), HistoryError> {
         let bytes = encode_index(self.expectations, index)?;
         let exists = self
             .vfs
@@ -1385,22 +1402,23 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
             };
         let (mut file, _) = self.vfs.open(self.cx, Some(&self.index_path), flags)?;
         file.lock(self.cx, LockLevel::Exclusive)?;
-        let result: Result<(), FrankenError> = (|| {
+        let result: Result<(), FrankenError> = async {
             let unpublished = {
                 let mut bytes = bytes.clone();
                 bytes[INDEX_HEADER_CHECKSUM_RANGE].fill(0);
                 bytes
             };
             file.truncate(self.cx, 0)?;
-            future::block_on(file.write(self.cx, &unpublished, 0))?;
+            file.write(self.cx, &unpublished, 0).await?;
             file.durable_sync(self.cx, SyncKind::FullDurable)?;
-            future::block_on(file.write(self.cx, &bytes[..HISTORY_SLOT_SIZE], 0))?;
+            file.write(self.cx, &bytes[..HISTORY_SLOT_SIZE], 0).await?;
             file.durable_sync(self.cx, SyncKind::FullDurable)?;
             if !exists {
                 self.vfs.sync_parent_directory(self.cx, &self.index_path)?;
             }
             Ok(())
-        })();
+        }
+        .await;
         let unlock_result = file
             .unlock(self.cx, LockLevel::None)
             .map_err(HistoryError::from);
@@ -1412,7 +1430,7 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
     }
 
     #[cfg(test)]
-    fn read_sparse_index(
+    async fn read_sparse_index(
         &self,
         expected_record_count: u64,
         expected_last_hash: u64,
@@ -1426,21 +1444,22 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         let flags = VfsOpenFlags::MAIN_JOURNAL | VfsOpenFlags::READONLY;
         let (mut file, _) = self.vfs.open(self.cx, Some(&self.index_path), flags)?;
         file.lock(self.cx, LockLevel::Shared)?;
-        let result = (|| {
+        let result = async {
             let file_len = file.file_size(self.cx)?;
             let byte_len = usize::try_from(file_len).map_err(|_| HistoryError::Corrupt {
                 slot: None,
                 reason: "sparse index exceeds address space".to_owned(),
             })?;
             let mut bytes = vec![0_u8; byte_len];
-            read_exact_at(&file, self.cx, &mut bytes, 0)?;
+            read_exact_at(&file, self.cx, &mut bytes, 0).await?;
             decode_index(
                 &bytes,
                 self.expectations,
                 expected_record_count,
                 expected_last_hash,
             )
-        })();
+        }
+        .await;
         let unlock_result = file
             .unlock(self.cx, LockLevel::None)
             .map_err(HistoryError::from);
@@ -1787,7 +1806,7 @@ fn index_entry_offset(ordinal: u64) -> Result<u64, HistoryError> {
         .ok_or_else(|| HistoryError::CorruptIndex("sparse index entry offset overflow".to_owned()))
 }
 
-fn read_exact_at_counted<F: VfsFile>(
+async fn read_exact_at_counted<F: VfsFile>(
     file: &F,
     cx: &Cx,
     buffer: &mut [u8],
@@ -1797,16 +1816,16 @@ fn read_exact_at_counted<F: VfsFile>(
 ) -> Result<(), HistoryError> {
     *read_calls = read_calls.saturating_add(1);
     *bytes_read = bytes_read.saturating_add(u64::try_from(buffer.len()).unwrap_or(u64::MAX));
-    read_exact_at(file, cx, buffer, offset)
+    read_exact_at(file, cx, buffer, offset).await
 }
 
-fn read_exact_at<F: VfsFile>(
+async fn read_exact_at<F: VfsFile>(
     file: &F,
     cx: &Cx,
     buffer: &mut [u8],
     offset: u64,
 ) -> Result<(), HistoryError> {
-    let read = future::block_on(file.read(cx, buffer, offset))?;
+    let read = file.read(cx, buffer, offset).await?;
     if read != buffer.len() {
         return Err(HistoryError::Storage(FrankenError::ShortRead {
             expected: buffer.len(),
@@ -2026,17 +2045,22 @@ mod tests {
             self.inner.file_identity()
         }
 
-        fn read(&self, cx: &Cx, buffer: &mut [u8], offset: u64) -> Result<usize, FrankenError> {
+        async fn read(
+            &self,
+            cx: &Cx,
+            buffer: &mut [u8],
+            offset: u64,
+        ) -> Result<usize, FrankenError> {
             if self.fail_offset.load(Ordering::SeqCst) == offset {
                 return Err(FrankenError::Io(std::io::Error::other(
                     "injected history read failure",
                 )));
             }
-            self.inner.read(cx, buffer, offset)
+            self.inner.read(cx, buffer, offset).await
         }
 
-        fn write(&self, cx: &Cx, buffer: &[u8], offset: u64) -> Result<(), FrankenError> {
-            self.inner.write(cx, buffer, offset)
+        async fn write(&self, cx: &Cx, buffer: &[u8], offset: u64) -> Result<(), FrankenError> {
+            self.inner.write(cx, buffer, offset).await
         }
 
         fn truncate(&mut self, cx: &Cx, size: u64) -> Result<(), FrankenError> {
@@ -2110,266 +2134,306 @@ mod tests {
 
     #[test]
     fn file_image_encoding_is_canonical_little_endian() {
-        let draft = HistoryRecordDraft {
-            commit_seq: 0x0102_0304_0506_0708,
-            catalog_root_page: 0x1112_1314_1516_1718,
-            wall_ts_unix_nanos: 0x2122_2324_2526_2728,
-            schema_epoch: 0x3132_3334_3536_3738,
-            flags: HISTORY_FLAG_CHECKPOINT_ANCHOR,
-        };
-        let record = HistoryRecord::from_draft(draft, 0).expect("record");
-        assert_eq!(record.this_record_blake3_64, 0xee30_7fc1_7b69_10bb);
-        let bytes = record.encode();
-        let expected = [
-            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13,
-            0x12, 0x11, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0xbb, 0x10, 0x69, 0x7b, 0xc1, 0x7f, 0x30, 0xee, 0x38, 0x37,
-            0x36, 0x35, 0x34, 0x33, 0x32, 0x31, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ];
-        assert_eq!(bytes, expected);
-        assert_eq!(HistoryRecord::decode(&bytes).expect("decode"), record);
+        asupersync::test_utils::run_test(|| async {
+            let draft = HistoryRecordDraft {
+                commit_seq: 0x0102_0304_0506_0708,
+                catalog_root_page: 0x1112_1314_1516_1718,
+                wall_ts_unix_nanos: 0x2122_2324_2526_2728,
+                schema_epoch: 0x3132_3334_3536_3738,
+                flags: HISTORY_FLAG_CHECKPOINT_ANCHOR,
+            };
+            let record = HistoryRecord::from_draft(draft, 0).expect("record");
+            assert_eq!(record.this_record_blake3_64, 0xee30_7fc1_7b69_10bb);
+            let bytes = record.encode();
+            let expected = [
+                0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13,
+                0x12, 0x11, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0xbb, 0x10, 0x69, 0x7b, 0xc1, 0x7f, 0x30, 0xee, 0x38, 0x37,
+                0x36, 0x35, 0x34, 0x33, 0x32, 0x31, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ];
+            assert_eq!(bytes, expected);
+            assert_eq!(HistoryRecord::decode(&bytes).expect("decode"), record);
 
-        let cx = Cx::new();
-        let vfs = MemoryVfs::new();
-        let path = Path::new("cross-endian-golden.db");
-        let log = HistoryLog::new(&cx, &vfs, path, expectations(draft.commit_seq));
-        log.initialize().expect("initialize golden file");
-        assert_eq!(log.append(draft).expect("append golden record"), record);
-        let mut file = raw_open(&vfs, &cx, log.history_path()).expect("open golden file");
-        let mut image = [0_u8; HISTORY_SLOT_SIZE * 2];
-        assert_eq!(
-            file.read(&cx, &mut image, 0).expect("read golden file"),
-            image.len()
-        );
-        file.close(&cx).expect("close golden file");
-        assert_eq!(
-            blake3::hash(&image).to_hex().as_str(),
-            "5cf4cdfbcc7f6256ba3a836e7f0c18111cb63112a24cf367a9fe27bcd156eb33"
-        );
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let path = Path::new("cross-endian-golden.db");
+            let log = HistoryLog::new(&cx, &vfs, path, expectations(draft.commit_seq));
+            log.initialize().await.expect("initialize golden file");
+            assert_eq!(
+                log.append(draft).await.expect("append golden record"),
+                record
+            );
+            let mut file = raw_open(&vfs, &cx, log.history_path()).expect("open golden file");
+            let mut image = [0_u8; HISTORY_SLOT_SIZE * 2];
+            assert_eq!(
+                file.read(&cx, &mut image, 0)
+                    .await
+                    .expect("read golden file"),
+                image.len()
+            );
+            file.close(&cx).expect("close golden file");
+            assert_eq!(
+                blake3::hash(&image).to_hex().as_str(),
+                "5cf4cdfbcc7f6256ba3a836e7f0c18111cb63112a24cf367a9fe27bcd156eb33"
+            );
+        });
     }
 
     #[test]
     fn first_record_requires_catalog_anchor() {
-        let cx = Cx::new();
-        let vfs = MemoryVfs::new();
-        let log = HistoryLog::new(&cx, &vfs, Path::new("anchor.db"), expectations(2));
-        log.initialize().expect("initialize");
-        let mut first = draft(2);
-        first.flags = 0;
-        assert!(matches!(
-            log.append(first),
-            Err(HistoryError::InvalidInput(message)) if message.contains("checkpoint anchor")
-        ));
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let log = HistoryLog::new(&cx, &vfs, Path::new("anchor.db"), expectations(2));
+            log.initialize().await.expect("initialize");
+            let mut first = draft(2);
+            first.flags = 0;
+            assert!(matches!(
+                log.append(first).await,
+                Err(HistoryError::InvalidInput(message)) if message.contains("checkpoint anchor")
+            ));
+        });
     }
 
     #[test]
     fn recovery_rejects_identity_and_generation_mismatches() {
-        let cx = Cx::new();
-        let vfs = MemoryVfs::new();
-        let path = Path::new("identity.db");
-        let log = HistoryLog::new(&cx, &vfs, path, expectations(1));
-        log.initialize().expect("initialize");
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let path = Path::new("identity.db");
+            let log = HistoryLog::new(&cx, &vfs, path, expectations(1));
+            log.initialize().await.expect("initialize");
 
-        let wrong_identity = HistoryLog::new(
-            &cx,
-            &vfs,
-            path,
-            HistoryExpectations {
-                database_history_id: DatabaseHistoryId([0x44; 16]),
-                ..expectations(1)
-            },
-        );
-        assert!(matches!(
-            wrong_identity.recover(),
-            Err(HistoryError::IdentityMismatch { .. })
-        ));
+            let wrong_identity = HistoryLog::new(
+                &cx,
+                &vfs,
+                path,
+                HistoryExpectations {
+                    database_history_id: DatabaseHistoryId([0x44; 16]),
+                    ..expectations(1)
+                },
+            );
+            assert!(matches!(
+                wrong_identity.recover().await,
+                Err(HistoryError::IdentityMismatch { .. })
+            ));
 
-        let wrong_format = HistoryLog::new(
-            &cx,
-            &vfs,
-            path,
-            HistoryExpectations {
-                format_generation: 8,
-                ..expectations(1)
-            },
-        );
-        assert!(matches!(
-            wrong_format.recover(),
-            Err(HistoryError::FormatGenerationMismatch { .. })
-        ));
+            let wrong_format = HistoryLog::new(
+                &cx,
+                &vfs,
+                path,
+                HistoryExpectations {
+                    format_generation: 8,
+                    ..expectations(1)
+                },
+            );
+            assert!(matches!(
+                wrong_format.recover().await,
+                Err(HistoryError::FormatGenerationMismatch { .. })
+            ));
 
-        let wrong_database = HistoryLog::new(
-            &cx,
-            &vfs,
-            path,
-            HistoryExpectations {
-                database_generation: 12,
-                ..expectations(1)
-            },
-        );
-        assert!(matches!(
-            wrong_database.recover(),
-            Err(HistoryError::DatabaseGenerationMismatch { .. })
-        ));
+            let wrong_database = HistoryLog::new(
+                &cx,
+                &vfs,
+                path,
+                HistoryExpectations {
+                    database_generation: 12,
+                    ..expectations(1)
+                },
+            );
+            assert!(matches!(
+                wrong_database.recover().await,
+                Err(HistoryError::DatabaseGenerationMismatch { .. })
+            ));
+        });
     }
 
     #[test]
     fn recovered_commit_horizon_truncates_only_valid_suffix() {
-        let cx = Cx::new();
-        let vfs = MemoryVfs::new();
-        let path = Path::new("horizon.db");
-        let writer = HistoryLog::new(&cx, &vfs, path, expectations(3));
-        writer.initialize().expect("initialize");
-        writer
-            .append_batch(&[draft(1), draft(2), draft(3)])
-            .expect("append");
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let path = Path::new("horizon.db");
+            let writer = HistoryLog::new(&cx, &vfs, path, expectations(3));
+            writer.initialize().await.expect("initialize");
+            writer
+                .append_batch(&[draft(1), draft(2), draft(3)])
+                .await
+                .expect("append");
 
-        let recovered = HistoryLog::new(&cx, &vfs, path, expectations(2));
-        let report = recovered.recover().expect("recover");
-        assert_eq!(report.valid_records, 2);
-        assert_eq!(report.truncated_records, 1);
-        assert_eq!(
-            report.final_file_len,
-            u64::try_from(HISTORY_SLOT_SIZE * 3).expect("file length")
-        );
-        assert_eq!(
-            recovered
-                .read_all()
-                .expect("read")
-                .iter()
-                .map(|record| record.commit_seq)
-                .collect::<Vec<_>>(),
-            vec![1, 2]
-        );
+            let recovered = HistoryLog::new(&cx, &vfs, path, expectations(2));
+            let report = recovered.recover().await.expect("recover");
+            assert_eq!(report.valid_records, 2);
+            assert_eq!(report.truncated_records, 1);
+            assert_eq!(
+                report.final_file_len,
+                u64::try_from(HISTORY_SLOT_SIZE * 3).expect("file length")
+            );
+            assert_eq!(
+                recovered
+                    .read_all()
+                    .await
+                    .expect("read")
+                    .iter()
+                    .map(|record| record.commit_seq)
+                    .collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+        });
     }
 
     #[test]
     fn interior_corruption_is_never_truncated_as_a_torn_tail() {
-        let cx = Cx::new();
-        let vfs = MemoryVfs::new();
-        let path = Path::new("interior-corruption.db");
-        let log = HistoryLog::new(&cx, &vfs, path, expectations(2));
-        log.initialize().expect("initialize");
-        log.append_batch(&[draft(1), draft(2)]).expect("append");
-        let original_len = u64::try_from(HISTORY_SLOT_SIZE * 3).expect("file length");
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let path = Path::new("interior-corruption.db");
+            let log = HistoryLog::new(&cx, &vfs, path, expectations(2));
+            log.initialize().await.expect("initialize");
+            log.append_batch(&[draft(1), draft(2)])
+                .await
+                .expect("append");
+            let original_len = u64::try_from(HISTORY_SLOT_SIZE * 3).expect("file length");
 
-        let mut file = raw_open(&vfs, &cx, log.history_path()).expect("open raw");
-        file.write(
-            &cx,
-            &[0xff],
-            u64::try_from(HISTORY_SLOT_SIZE).expect("offset"),
-        )
-        .expect("corrupt first record");
-        file.close(&cx).expect("close raw");
+            let mut file = raw_open(&vfs, &cx, log.history_path()).expect("open raw");
+            file.write(
+                &cx,
+                &[0xff],
+                u64::try_from(HISTORY_SLOT_SIZE).expect("offset"),
+            )
+            .await
+            .expect("corrupt first record");
+            file.close(&cx).expect("close raw");
 
-        assert!(matches!(
-            log.recover(),
-            Err(HistoryError::Corrupt { slot: Some(0), .. })
-        ));
-        let file = raw_open(&vfs, &cx, log.history_path()).expect("reopen raw");
-        assert_eq!(file.file_size(&cx).expect("size"), original_len);
+            assert!(matches!(
+                log.recover().await,
+                Err(HistoryError::Corrupt { slot: Some(0), .. })
+            ));
+            let file = raw_open(&vfs, &cx, log.history_path()).expect("reopen raw");
+            assert_eq!(file.file_size(&cx).expect("size"), original_len);
+        });
     }
 
     #[test]
     fn unsupported_final_record_version_is_not_truncated() {
-        let cx = Cx::new();
-        let vfs = MemoryVfs::new();
-        let path = Path::new("unsupported-tail-version.db");
-        let log = HistoryLog::new(&cx, &vfs, path, expectations(2));
-        log.initialize().expect("initialize");
-        log.append_batch(&[draft(1), draft(2)]).expect("append");
-        let original_len = record_offset(2).expect("file length");
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let path = Path::new("unsupported-tail-version.db");
+            let log = HistoryLog::new(&cx, &vfs, path, expectations(2));
+            log.initialize().await.expect("initialize");
+            log.append_batch(&[draft(1), draft(2)])
+                .await
+                .expect("append");
+            let original_len = record_offset(2).expect("file length");
 
-        let mut file = raw_open(&vfs, &cx, log.history_path()).expect("open raw");
-        file.write(
-            &cx,
-            &2_u16.to_le_bytes(),
-            record_offset(1).expect("final record offset") + 52,
-        )
-        .expect("write unsupported version");
-        file.close(&cx).expect("close raw");
+            let mut file = raw_open(&vfs, &cx, log.history_path()).expect("open raw");
+            file.write(
+                &cx,
+                &2_u16.to_le_bytes(),
+                record_offset(1).expect("final record offset") + 52,
+            )
+            .await
+            .expect("write unsupported version");
+            file.close(&cx).expect("close raw");
 
-        assert!(matches!(
-            log.recover(),
-            Err(HistoryError::UnsupportedRecordVersion(2))
-        ));
-        let file = raw_open(&vfs, &cx, log.history_path()).expect("reopen raw");
-        assert_eq!(file.file_size(&cx).expect("size"), original_len);
+            assert!(matches!(
+                log.recover().await,
+                Err(HistoryError::UnsupportedRecordVersion(2))
+            ));
+            let file = raw_open(&vfs, &cx, log.history_path()).expect("reopen raw");
+            assert_eq!(file.file_size(&cx).expect("size"), original_len);
+        });
     }
 
     #[test]
     fn final_record_storage_error_is_not_truncated() {
-        let cx = Cx::new();
-        let vfs = ReadFaultVfs::new();
-        let path = Path::new("storage-error-tail.db");
-        let log = HistoryLog::new(&cx, &vfs, path, expectations(2));
-        log.initialize().expect("initialize");
-        log.append_batch(&[draft(1), draft(2)]).expect("append");
-        let original_len = record_offset(2).expect("file length");
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = ReadFaultVfs::new();
+            let path = Path::new("storage-error-tail.db");
+            let log = HistoryLog::new(&cx, &vfs, path, expectations(2));
+            log.initialize().await.expect("initialize");
+            log.append_batch(&[draft(1), draft(2)])
+                .await
+                .expect("append");
+            let original_len = record_offset(2).expect("file length");
 
-        vfs.fail_reads_at(record_offset(1).expect("final record offset"));
-        assert!(matches!(log.recover(), Err(HistoryError::Storage(_))));
-        vfs.clear_read_fault();
+            vfs.fail_reads_at(record_offset(1).expect("final record offset"));
+            assert!(matches!(log.recover().await, Err(HistoryError::Storage(_))));
+            vfs.clear_read_fault();
 
-        let file = raw_open(&vfs, &cx, log.history_path()).expect("reopen raw");
-        assert_eq!(file.file_size(&cx).expect("size"), original_len);
-        assert_eq!(
-            log.read_all()
-                .expect("read intact history")
-                .iter()
-                .map(|record| record.commit_seq)
-                .collect::<Vec<_>>(),
-            vec![1, 2]
-        );
+            let file = raw_open(&vfs, &cx, log.history_path()).expect("reopen raw");
+            assert_eq!(file.file_size(&cx).expect("size"), original_len);
+            assert_eq!(
+                log.read_all()
+                    .await
+                    .expect("read intact history")
+                    .iter()
+                    .map(|record| record.commit_seq)
+                    .collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+        });
     }
 
     #[test]
     fn crash_mid_append_every_byte_offset_truncates_exactly_one_slot() {
-        let cx = Cx::new();
-        let vfs = MemoryVfs::new();
-        let path = Path::new("every-byte-crash.db");
-        let log = HistoryLog::new(&cx, &vfs, path, expectations(2));
-        log.initialize().expect("initialize");
-        let first = log.append(draft(1)).expect("first record");
-        let second = HistoryRecord::from_draft(draft(2), first.this_record_blake3_64)
-            .expect("second record")
-            .encode_slot();
-        let stable_len = record_offset(1).expect("stable length");
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let path = Path::new("every-byte-crash.db");
+            let log = HistoryLog::new(&cx, &vfs, path, expectations(2));
+            log.initialize().await.expect("initialize");
+            let first = log.append(draft(1)).await.expect("first record");
+            let second = HistoryRecord::from_draft(draft(2), first.this_record_blake3_64)
+                .expect("second record")
+                .encode_slot();
+            let stable_len = record_offset(1).expect("stable length");
 
-        // Exhaustive rather than sampled: model SIGKILL after every byte of
-        // the 4096-byte slot write and run the ordinary restart repair path.
-        for partial_len in 0..HISTORY_SLOT_SIZE {
-            let mut file = raw_open(&vfs, &cx, log.history_path()).expect("open raw");
-            file.truncate(&cx, stable_len).expect("reset tail");
-            if partial_len != 0 {
-                file.write(
-                    &cx,
-                    &second[..partial_len],
-                    record_offset(1).expect("second offset"),
-                )
-                .expect("write partial record");
+            // Exhaustive rather than sampled: model SIGKILL after every byte of
+            // the 4096-byte slot write and run the ordinary restart repair path.
+            for partial_len in 0..HISTORY_SLOT_SIZE {
+                let mut file = raw_open(&vfs, &cx, log.history_path()).expect("open raw");
+                file.truncate(&cx, stable_len).expect("reset tail");
+                if partial_len != 0 {
+                    file.write(
+                        &cx,
+                        &second[..partial_len],
+                        record_offset(1).expect("second offset"),
+                    )
+                    .await
+                    .expect("write partial record");
+                }
+                file.close(&cx).expect("close raw");
+
+                let report = log.recover().await.expect("restart recovery");
+                assert_eq!(report.valid_records, 1, "partial_len={partial_len}");
+                assert_eq!(
+                    report.final_file_len, stable_len,
+                    "partial_len={partial_len}"
+                );
+                assert_eq!(
+                    report.truncated_partial_bytes,
+                    u64::try_from(partial_len).expect("partial length"),
+                    "partial_len={partial_len}"
+                );
             }
+
+            let mut file = raw_open(&vfs, &cx, log.history_path()).expect("open raw");
+            file.write(&cx, &second, record_offset(1).expect("second offset"))
+                .await
+                .expect("write full slot");
             file.close(&cx).expect("close raw");
-
-            let report = log.recover().expect("restart recovery");
-            assert_eq!(report.valid_records, 1, "partial_len={partial_len}");
             assert_eq!(
-                report.final_file_len, stable_len,
-                "partial_len={partial_len}"
+                log.recover()
+                    .await
+                    .expect("recover full slot")
+                    .valid_records,
+                2
             );
-            assert_eq!(
-                report.truncated_partial_bytes,
-                u64::try_from(partial_len).expect("partial length"),
-                "partial_len={partial_len}"
-            );
-        }
-
-        let mut file = raw_open(&vfs, &cx, log.history_path()).expect("open raw");
-        file.write(&cx, &second, record_offset(1).expect("second offset"))
-            .expect("write full slot");
-        file.close(&cx).expect("close raw");
-        assert_eq!(log.recover().expect("recover full slot").valid_records, 2);
+        });
     }
 
     proptest! {
@@ -2377,12 +2441,13 @@ mod tests {
 
         #[test]
         fn crash_prefix_property_never_exposes_torn_record(partial_len in 0_usize..HISTORY_SLOT_SIZE) {
+            asupersync::test_utils::run_test(|| async {
             let cx = Cx::new();
             let vfs = MemoryVfs::new();
             let path = Path::new("proptest-crash.db");
             let log = HistoryLog::new(&cx, &vfs, path, expectations(2));
-            log.initialize().expect("initialize");
-            let first = log.append(draft(1)).expect("first record");
+            log.initialize().await.expect("initialize");
+            let first = log.append(draft(1)).await.expect("first record");
             let second = HistoryRecord::from_draft(draft(2), first.this_record_blake3_64)
                 .expect("second record")
                 .encode_slot();
@@ -2393,85 +2458,96 @@ mod tests {
                     &second[..partial_len],
                     record_offset(1).expect("second offset"),
                 )
+                .await
                 .expect("write partial slot");
             }
             file.close(&cx).expect("close raw");
-            let report = log.recover().expect("restart recovery");
-            prop_assert_eq!(report.valid_records, 1);
-            prop_assert_eq!(report.final_file_len, record_offset(1).expect("stable length"));
+            let report = log.recover().await.expect("restart recovery");
+            assert_eq!(report.valid_records, 1);
+            assert_eq!(report.final_file_len, record_offset(1).expect("stable length"));
+            });
         }
     }
 
     #[test]
     fn v1_reader_ignores_hypothetical_v2_slot_extension() {
-        let cx = Cx::new();
-        let vfs = MemoryVfs::new();
-        let path = Path::new("forward-compatible.db");
-        let log = HistoryLog::new(&cx, &vfs, path, expectations(1));
-        log.initialize().expect("initialize");
-        let record = HistoryRecord::from_draft(draft(1), 0).expect("record");
-        let mut extended_slot = record.encode_slot();
-        extended_slot[HISTORY_RECORD_V1_SIZE..128].fill(0xa5);
-        let mut file = raw_open(&vfs, &cx, log.history_path()).expect("open raw");
-        file.write(
-            &cx,
-            &extended_slot,
-            record_offset(0).expect("record offset"),
-        )
-        .expect("write extended slot");
-        file.close(&cx).expect("close raw");
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let path = Path::new("forward-compatible.db");
+            let log = HistoryLog::new(&cx, &vfs, path, expectations(1));
+            log.initialize().await.expect("initialize");
+            let record = HistoryRecord::from_draft(draft(1), 0).expect("record");
+            let mut extended_slot = record.encode_slot();
+            extended_slot[HISTORY_RECORD_V1_SIZE..128].fill(0xa5);
+            let mut file = raw_open(&vfs, &cx, log.history_path()).expect("open raw");
+            file.write(
+                &cx,
+                &extended_slot,
+                record_offset(0).expect("record offset"),
+            )
+            .await
+            .expect("write extended slot");
+            file.close(&cx).expect("close raw");
 
-        assert_eq!(log.recover().expect("recover").valid_records, 1);
-        assert_eq!(log.read_all().expect("read"), vec![record]);
+            assert_eq!(log.recover().await.expect("recover").valid_records, 1);
+            assert_eq!(log.read_all().await.expect("read"), vec![record]);
+        });
     }
 
     #[test]
     fn sparse_index_is_bound_to_exact_tail_and_caps_refinement() {
-        let cx = Cx::new();
-        let vfs = MemoryVfs::new();
-        let path = Path::new("index.db");
-        let log = HistoryLog::new(&cx, &vfs, path, expectations(4097));
-        log.initialize().expect("initialize");
-        let drafts: Vec<_> = (1..=4096).map(draft).collect();
-        log.append_batch(&drafts).expect("append");
-        let index = log.rebuild_sparse_index().expect("build index");
-        assert_eq!(index.entries().len(), 4);
-        let (record, stats) = log.lookup_floor(3500).expect("lookup");
-        assert_eq!(record.commit_seq, 3500);
-        assert!(stats.index_probes <= 3);
-        assert!(stats.record_probes <= HISTORY_INDEX_STRIDE);
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let path = Path::new("index.db");
+            let log = HistoryLog::new(&cx, &vfs, path, expectations(4097));
+            log.initialize().await.expect("initialize");
+            let drafts: Vec<_> = (1..=4096).map(draft).collect();
+            log.append_batch(&drafts).await.expect("append");
+            let index = log.rebuild_sparse_index().await.expect("build index");
+            assert_eq!(index.entries().len(), 4);
+            let (record, stats) = log.lookup_floor(3500).await.expect("lookup");
+            assert_eq!(record.commit_seq, 3500);
+            assert!(stats.index_probes <= 3);
+            assert!(stats.record_probes <= HISTORY_INDEX_STRIDE);
 
-        log.append(draft(4097)).expect("append after index");
-        let (record, _) = log.lookup_floor(4097).expect("rebuild stale index");
-        assert_eq!(record.commit_seq, 4097);
+            log.append(draft(4097)).await.expect("append after index");
+            let (record, _) = log.lookup_floor(4097).await.expect("rebuild stale index");
+            assert_eq!(record.commit_seq, 4097);
+        });
     }
 
     #[test]
     fn sparse_index_entry_must_match_history_record_even_with_valid_checksum() {
-        let cx = Cx::new();
-        let vfs = MemoryVfs::new();
-        let path = Path::new("index-entry-validation.db");
-        let log = HistoryLog::new(&cx, &vfs, path, expectations(2048));
-        log.initialize().expect("initialize");
-        let drafts: Vec<_> = (1..=2048).map(draft).collect();
-        log.append_batch(&drafts).expect("append");
-        let mut index = log.rebuild_sparse_index().expect("build index");
-        index.entries[0].commit_seq = 2;
-        log.write_sparse_index(&index)
-            .expect("publish internally consistent but incorrect index");
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let path = Path::new("index-entry-validation.db");
+            let log = HistoryLog::new(&cx, &vfs, path, expectations(2048));
+            log.initialize().await.expect("initialize");
+            let drafts: Vec<_> = (1..=2048).map(draft).collect();
+            log.append_batch(&drafts).await.expect("append");
+            let mut index = log.rebuild_sparse_index().await.expect("build index");
+            index.entries[0].commit_seq = 2;
+            log.write_sparse_index(&index)
+                .await
+                .expect("publish internally consistent but incorrect index");
 
-        // The disk binary search compares each probed entry with the
-        // authoritative history record. It rejects the wrong entry despite
-        // its valid tail-bound checksum and rebuilds before answering.
-        let (record, _) = log.lookup_floor(1).expect("lookup rebuilds index");
-        assert_eq!(record.commit_seq, 1);
-        let repaired = log
-            .read_sparse_index(
-                2048,
-                log.read_all().expect("records")[2047].this_record_blake3_64,
-            )
-            .expect("read repaired index");
-        assert_eq!(repaired.entries()[0].commit_seq, 1);
+            // The disk binary search compares each probed entry with the
+            // authoritative history record. It rejects the wrong entry despite
+            // its valid tail-bound checksum and rebuilds before answering.
+            let (record, _) = log.lookup_floor(1).await.expect("lookup rebuilds index");
+            assert_eq!(record.commit_seq, 1);
+            let repaired = log
+                .read_sparse_index(
+                    2048,
+                    log.read_all().await.expect("records")[2047].this_record_blake3_64,
+                )
+                .await
+                .expect("read repaired index");
+            assert_eq!(repaired.entries()[0].commit_seq, 1);
+        });
     }
 
     #[test]
@@ -2496,117 +2572,128 @@ mod tests {
     fn ten_million_record_vfs_lookup_does_not_scan_the_full_history() {
         use fsqlite_vfs::unix::UnixVfs;
 
-        const RECORD_COUNT: u64 = 10_000_000;
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let database_path = directory.path().join("ten-million-lookup.db");
-        let cx = Cx::new();
-        let vfs = UnixVfs::new();
-        let log = HistoryLog::new(&cx, &vfs, &database_path, expectations(RECORD_COUNT));
-        log.initialize().expect("initialize sparse history");
+        asupersync::test_utils::run_test(|| async {
+            const RECORD_COUNT: u64 = 10_000_000;
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let database_path = directory.path().join("ten-million-lookup.db");
+            let cx = Cx::new();
+            let vfs = UnixVfs::new();
+            let log = HistoryLog::new(&cx, &vfs, &database_path, expectations(RECORD_COUNT));
+            log.initialize().await.expect("initialize sparse history");
 
-        let mut file = raw_open(&vfs, &cx, log.history_path()).expect("open sparse history");
-        file.truncate(
-            &cx,
-            record_offset(RECORD_COUNT).expect("logical file length"),
-        )
-        .expect("create 40.96 GB sparse extent");
+            let mut file = raw_open(&vfs, &cx, log.history_path()).expect("open sparse history");
+            file.truncate(
+                &cx,
+                record_offset(RECORD_COUNT).expect("logical file length"),
+            )
+            .expect("create 40.96 GB sparse extent");
 
-        // Materialize each sample and its predecessor. All other early slots
-        // remain sparse holes, so this test would fail immediately if the
-        // production lookup regressed to `read_all` or another full scan.
-        let mut position = 0;
-        while position < RECORD_COUNT {
-            if position == 0 {
-                let anchor = HistoryRecord::from_draft(draft(1), 0).expect("anchor");
-                file.write(
-                    &cx,
-                    &anchor.encode_slot(),
-                    record_offset(0).expect("anchor offset"),
-                )
-                .expect("write anchor sample");
-            } else {
-                let predecessor =
-                    HistoryRecord::from_draft(draft(position), position.rotate_left(17).max(1))
-                        .expect("sample predecessor");
-                file.write(
-                    &cx,
-                    &predecessor.encode_slot(),
-                    record_offset(position - 1).expect("predecessor offset"),
-                )
-                .expect("write sample predecessor");
-                let sample = HistoryRecord::from_draft(
-                    draft(position + 1),
-                    predecessor.this_record_blake3_64,
-                )
-                .expect("sample");
-                file.write(
-                    &cx,
-                    &sample.encode_slot(),
-                    record_offset(position).expect("sample offset"),
-                )
-                .expect("write sample");
+            // Materialize each sample and its predecessor. All other early slots
+            // remain sparse holes, so this test would fail immediately if the
+            // production lookup regressed to `read_all` or another full scan.
+            let mut position = 0;
+            while position < RECORD_COUNT {
+                if position == 0 {
+                    let anchor = HistoryRecord::from_draft(draft(1), 0).expect("anchor");
+                    let anchor_slot = anchor.encode_slot();
+                    file.write(&cx, &anchor_slot, record_offset(0).expect("anchor offset"))
+                        .await
+                        .expect("write anchor sample");
+                } else {
+                    let predecessor =
+                        HistoryRecord::from_draft(draft(position), position.rotate_left(17).max(1))
+                            .expect("sample predecessor");
+                    let predecessor_slot = predecessor.encode_slot();
+                    file.write(
+                        &cx,
+                        &predecessor_slot,
+                        record_offset(position - 1).expect("predecessor offset"),
+                    )
+                    .await
+                    .expect("write sample predecessor");
+                    let sample = HistoryRecord::from_draft(
+                        draft(position + 1),
+                        predecessor.this_record_blake3_64,
+                    )
+                    .expect("sample");
+                    let sample_slot = sample.encode_slot();
+                    file.write(
+                        &cx,
+                        &sample_slot,
+                        record_offset(position).expect("sample offset"),
+                    )
+                    .await
+                    .expect("write sample");
+                }
+                position = position
+                    .checked_add(HISTORY_INDEX_STRIDE)
+                    .expect("sample position");
             }
-            position = position
-                .checked_add(HISTORY_INDEX_STRIDE)
-                .expect("sample position");
-        }
 
-        // The final lookup window is a real contiguous hash chain. It
-        // overwrites the last independently materialized sample pair.
-        let final_sample = (RECORD_COUNT - 1) / HISTORY_INDEX_STRIDE * HISTORY_INDEX_STRIDE;
-        let predecessor_position = final_sample - 1;
-        let mut previous =
-            HistoryRecord::from_draft(draft(predecessor_position + 1), 0xa5a5_5a5a_f00d_cafe)
-                .expect("final-window predecessor");
-        file.write(
-            &cx,
-            &previous.encode_slot(),
-            record_offset(predecessor_position).expect("final predecessor offset"),
-        )
-        .expect("write final predecessor");
-        for position in final_sample..RECORD_COUNT {
-            let record =
-                HistoryRecord::from_draft(draft(position + 1), previous.this_record_blake3_64)
-                    .expect("final-window record");
+            // The final lookup window is a real contiguous hash chain. It
+            // overwrites the last independently materialized sample pair.
+            let final_sample = (RECORD_COUNT - 1) / HISTORY_INDEX_STRIDE * HISTORY_INDEX_STRIDE;
+            let predecessor_position = final_sample - 1;
+            let mut previous =
+                HistoryRecord::from_draft(draft(predecessor_position + 1), 0xa5a5_5a5a_f00d_cafe)
+                    .expect("final-window predecessor");
+            let previous_slot = previous.encode_slot();
             file.write(
                 &cx,
-                &record.encode_slot(),
-                record_offset(position).expect("final-window offset"),
+                &previous_slot,
+                record_offset(predecessor_position).expect("final predecessor offset"),
             )
-            .expect("write final-window record");
-            previous = record;
-        }
-        assert_eq!(
-            file.file_size(&cx).expect("sparse history size"),
-            record_offset(RECORD_COUNT).expect("logical file length")
-        );
-        file.close(&cx).expect("close sparse history");
-
-        let index = SparseIndex::build_with(
-            RECORD_COUNT,
-            previous.this_record_blake3_64,
-            |sample_position| Ok(sample_position + 1),
-        )
-        .expect("build exact-tail sparse index");
-        log.write_sparse_index(&index)
-            .expect("publish sparse index");
-
-        let target = RECORD_COUNT - 17;
-        let (cold_record, cold_stats) = log.lookup_floor(target).expect("cold VFS lookup");
-        let (second_record, second_stats) = log.lookup_floor(target).expect("second VFS lookup");
-        assert_eq!(cold_record.commit_seq, target);
-        assert_eq!(second_record, cold_record);
-        for stats in [cold_stats, second_stats] {
-            assert!(stats.index_probes <= 14);
-            assert!(stats.record_probes <= HISTORY_INDEX_STRIDE);
-            assert!(stats.index_read_calls <= 15, "{stats:?}");
-            assert!(
-                stats.history_read_calls <= HISTORY_INDEX_STRIDE + 20,
-                "{stats:?}"
+            .await
+            .expect("write final predecessor");
+            for position in final_sample..RECORD_COUNT {
+                let record =
+                    HistoryRecord::from_draft(draft(position + 1), previous.this_record_blake3_64)
+                        .expect("final-window record");
+                let record_slot = record.encode_slot();
+                file.write(
+                    &cx,
+                    &record_slot,
+                    record_offset(position).expect("final-window offset"),
+                )
+                .await
+                .expect("write final-window record");
+                previous = record;
+            }
+            assert_eq!(
+                file.file_size(&cx).expect("sparse history size"),
+                record_offset(RECORD_COUNT).expect("logical file length")
             );
-            assert!(stats.index_bytes_read <= 4_432, "{stats:?}");
-            assert!(stats.history_bytes_read <= 80_000, "{stats:?}");
-        }
+            file.close(&cx).expect("close sparse history");
+
+            let index = SparseIndex::build_with(
+                RECORD_COUNT,
+                previous.this_record_blake3_64,
+                |sample_position| Ok(sample_position + 1),
+            )
+            .expect("build exact-tail sparse index");
+            log.write_sparse_index(&index)
+                .await
+                .expect("publish sparse index");
+
+            let target = RECORD_COUNT - 17;
+            let (cold_record, cold_stats) =
+                log.lookup_floor(target).await.expect("cold VFS lookup");
+            let (second_record, second_stats) =
+                log.lookup_floor(target).await.expect("second VFS lookup");
+            assert_eq!(cold_record.commit_seq, target);
+            assert_eq!(second_record, cold_record);
+            for stats in [cold_stats, second_stats] {
+                assert!(stats.index_probes <= 14);
+                assert!(stats.record_probes <= HISTORY_INDEX_STRIDE);
+                assert!(stats.index_read_calls <= 15, "{stats:?}");
+                assert!(
+                    stats.history_read_calls <= HISTORY_INDEX_STRIDE + 20,
+                    "{stats:?}"
+                );
+                assert!(stats.index_bytes_read <= 4_432, "{stats:?}");
+                assert!(stats.history_bytes_read <= 80_000, "{stats:?}");
+            }
+        });
     }
 
     #[cfg(all(feature = "native", unix))]
@@ -2614,39 +2701,45 @@ mod tests {
     fn ten_thousand_random_records_survive_full_durable_round_trip() {
         use fsqlite_vfs::unix::UnixVfs;
 
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let database_path = directory.path().join("round-trip.db");
-        let cx = Cx::new();
-        let vfs = UnixVfs::new();
-        let log = HistoryLog::new(&cx, &vfs, &database_path, expectations(10_000));
-        log.initialize().expect("durable initialize");
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let database_path = directory.path().join("round-trip.db");
+            let cx = Cx::new();
+            let vfs = UnixVfs::new();
+            let log = HistoryLog::new(&cx, &vfs, &database_path, expectations(10_000));
+            log.initialize().await.expect("durable initialize");
 
-        let mut state = 0x3b5d_6f71_8293_a4b5_u64;
-        let mut drafts = Vec::with_capacity(10_000);
-        for commit_seq in 1..=10_000 {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            drafts.push(HistoryRecordDraft {
-                commit_seq,
-                catalog_root_page: state.max(1),
-                wall_ts_unix_nanos: state.rotate_left(19),
-                schema_epoch: state.rotate_right(11),
-                flags: u32::from(commit_seq == 1) * HISTORY_FLAG_CHECKPOINT_ANCHOR,
-            });
-        }
-        let expected = log.append_batch(&drafts).expect("append and fsync");
-        let serialized = serde_json::to_vec(&expected).expect("serialize records");
-        let serde_round_trip: Vec<HistoryRecord> =
-            serde_json::from_slice(&serialized).expect("deserialize records");
-        assert_eq!(serde_round_trip, expected);
-        drop(log);
+            let mut state = 0x3b5d_6f71_8293_a4b5_u64;
+            let mut drafts = Vec::with_capacity(10_000);
+            for commit_seq in 1..=10_000 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                drafts.push(HistoryRecordDraft {
+                    commit_seq,
+                    catalog_root_page: state.max(1),
+                    wall_ts_unix_nanos: state.rotate_left(19),
+                    schema_epoch: state.rotate_right(11),
+                    flags: u32::from(commit_seq == 1) * HISTORY_FLAG_CHECKPOINT_ANCHOR,
+                });
+            }
+            let expected = log.append_batch(&drafts).await.expect("append and fsync");
+            let serialized = serde_json::to_vec(&expected).expect("serialize records");
+            let serde_round_trip: Vec<HistoryRecord> =
+                serde_json::from_slice(&serialized).expect("deserialize records");
+            assert_eq!(serde_round_trip, expected);
+            drop(log);
 
-        let reopened = HistoryLog::new(&cx, &vfs, &database_path, expectations(10_000));
-        assert_eq!(
-            reopened.recover().expect("restart recovery").valid_records,
-            10_000
-        );
-        assert_eq!(reopened.read_all().expect("read back"), expected);
+            let reopened = HistoryLog::new(&cx, &vfs, &database_path, expectations(10_000));
+            assert_eq!(
+                reopened
+                    .recover()
+                    .await
+                    .expect("restart recovery")
+                    .valid_records,
+                10_000
+            );
+            assert_eq!(reopened.read_all().await.expect("read back"), expected);
+        });
     }
 }

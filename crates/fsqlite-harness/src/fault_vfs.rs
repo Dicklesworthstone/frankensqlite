@@ -28,7 +28,7 @@ use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_vfs::shm::ShmRegion;
-use fsqlite_vfs::traits::{FileIdentity, Vfs, VfsFile};
+use fsqlite_vfs::traits::{FileIdentity, Vfs, VfsFile, VfsWriteCompletion};
 use tracing::{debug, debug_span};
 
 /// Bead identifier for tracing/log correlation.
@@ -656,6 +656,45 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
                 WriteDecision::IoError => Err(io_failure_error("fault injection: write failure")),
                 WriteDecision::DiskFull => Err(FrankenError::DatabaseFull),
                 WriteDecision::PoweredOff => Err(power_cut_error()),
+            }
+        }
+    }
+
+    fn write_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            match self.state.check_write(&self.path, offset, buf.len()) {
+                WriteDecision::Allow => self.inner.write_tracked(cx, buf, offset, completion).await,
+                WriteDecision::TornWrite { valid_bytes }
+                | WriteDecision::PartialWrite { valid_bytes } => {
+                    let applied = valid_bytes.min(buf.len());
+                    if applied > 0 {
+                        let partial_completion = completion.error_mapped_child();
+                        self.inner
+                            .write_tracked(cx, &buf[..applied], offset, partial_completion)
+                            .await?;
+                    } else {
+                        completion.complete_error();
+                    }
+                    Err(io_failure_error("fault injection: partial write"))
+                }
+                WriteDecision::IoError => {
+                    completion.complete_error();
+                    Err(io_failure_error("fault injection: write failure"))
+                }
+                WriteDecision::DiskFull => {
+                    completion.complete_error();
+                    Err(FrankenError::DatabaseFull)
+                }
+                WriteDecision::PoweredOff => {
+                    completion.complete_error();
+                    Err(power_cut_error())
+                }
             }
         }
     }

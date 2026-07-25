@@ -134,17 +134,16 @@ fn check_golden_copies() -> E2eResult<String> {
 // ── Check 2: FrankenSQLite Backend ──────────────────────────────────────
 
 fn check_frankensqlite() -> E2eResult<String> {
-    let conn = fsqlite::Connection::open(":memory:")
+    let conn = crate::block_on(fsqlite::Connection::open(":memory:"))
         .map_err(|e| E2eError::Fsqlite(format!("open: {e}")))?;
 
-    conn.execute("CREATE TABLE smoke_test (id INTEGER PRIMARY KEY, val TEXT);")
+    crate::block_on(conn.execute("CREATE TABLE smoke_test (id INTEGER PRIMARY KEY, val TEXT);"))
         .map_err(|e| E2eError::Fsqlite(format!("create: {e}")))?;
 
-    conn.execute("INSERT INTO smoke_test VALUES (1, 'hello');")
+    crate::block_on(conn.execute("INSERT INTO smoke_test VALUES (1, 'hello');"))
         .map_err(|e| E2eError::Fsqlite(format!("insert: {e}")))?;
 
-    let rows = conn
-        .query("SELECT id, val FROM smoke_test;")
+    let rows = crate::block_on(conn.query("SELECT id, val FROM smoke_test;"))
         .map_err(|e| E2eError::Fsqlite(format!("select: {e}")))?;
 
     if rows.is_empty() {

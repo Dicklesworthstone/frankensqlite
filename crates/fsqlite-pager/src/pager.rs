@@ -7,7 +7,7 @@
 #[cfg(target_arch = "x86_64")]
 use core::intrinsics::prefetch_read_data;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
@@ -34,7 +34,9 @@ use fsqlite_vfs::{
     DatabaseNamespaceBinding, NamespaceOpenIntent, PendingNamespaceOpen, WindowsLockSidecarPolicy,
     validate_reserved_database_artifacts,
 };
-use fsqlite_vfs::{FileIdentity, SyncKind, Vfs, VfsFile};
+use fsqlite_vfs::{
+    FileIdentity, SyncKind, Vfs, VfsFile, VfsWriteCompletion, VfsWriteCompletionState,
+};
 use smallvec::SmallVec;
 
 use crate::journal::{JOURNAL_MAGIC, JournalHeader, JournalPageRecord};
@@ -59,19 +61,18 @@ use fsqlite_wal::{
     ConsolidationPhase, FrameSubmission, GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig,
     GroupCommitConsolidator, PARALLEL_WAL_COMPATIBILITY_SELECTOR, PARALLEL_WAL_FLUSH_SCENARIO_ID,
     PARALLEL_WAL_LANE_POLICY_VERSION, PARALLEL_WAL_PUBLICATION_SCENARIO_ID,
-    PARALLEL_WAL_STAGE_SCENARIO_ID, ParallelWalCommitCertificate,
+    PARALLEL_WAL_STAGE_SCENARIO_ID, ParallelWalCombinerError, ParallelWalCommitCertificate,
     ParallelWalConservativeShadowEvidence, ParallelWalControlSurface,
     ParallelWalDurabilityCombiner, ParallelWalDurabilityReceipt, ParallelWalDurabilityRequest,
-    ParallelWalFallbackReason, ParallelWalLaneBatch, ParallelWalLaneStager,
-    ParallelWalOperatingMode, ParallelWalShadowVerdict, ParallelWalVisibilitySnapshot,
-    RecoveryFence, SubmitOutcome, TransactionConflictPageBaseline, TransactionConflictSnapshot,
-    TransactionFrameBatch, TransactionFrameBatchContext, WalFile, WalGenerationIdentity,
-    commit_phase_timing_enabled, detailed_consolidation_metrics_enabled,
-    parallel_wal_fallback_reason_name, parallel_wal_mode_name, parallel_wal_shadow_verdict_name,
-    parallel_wal_should_shadow_compare, resolve_parallel_wal_control_surface_from_env,
+    ParallelWalFallbackReason, ParallelWalFramePayloadDigestBuilder, ParallelWalLaneBatch,
+    ParallelWalLaneStager, ParallelWalOperatingMode, ParallelWalPendingPublication,
+    ParallelWalShadowVerdict, ParallelWalVisibilitySnapshot, RecoveryFence, SubmitOutcome,
+    TransactionConflictPageBaseline, TransactionConflictSnapshot, TransactionFrameBatch,
+    TransactionFrameBatchContext, WalFile, WalGenerationIdentity, commit_phase_timing_enabled,
+    detailed_consolidation_metrics_enabled, parallel_wal_fallback_reason_name,
+    parallel_wal_mode_name, parallel_wal_shadow_verdict_name, parallel_wal_should_shadow_compare,
+    resolve_parallel_wal_control_surface_from_env,
 };
-use futures_lite::future;
-
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn prefetch_l1_read<T>(ptr: *const T) {
@@ -703,6 +704,8 @@ struct KeyedWaitSlot {
     state: Mutex<u64>,
     cv: Condvar,
     notify: Notify,
+    #[cfg(test)]
+    drop_next_async_notify: AtomicBool,
 }
 
 impl Default for KeyedWaitSlot {
@@ -711,6 +714,8 @@ impl Default for KeyedWaitSlot {
             state: Mutex::new(0),
             cv: Condvar::new(),
             notify: Notify::new(),
+            #[cfg(test)]
+            drop_next_async_notify: AtomicBool::new(false),
         }
     }
 }
@@ -748,6 +753,13 @@ impl KeyedWaitSlot {
         if self.generation() != observed_generation {
             return KeyedWaitResult::Signaled;
         }
+        #[cfg(test)]
+        if self
+            .drop_next_async_notify
+            .swap(false, AtomicOrdering::AcqRel)
+        {
+            self.advance_generation_without_notify();
+        }
         match asupersync::time::timeout(
             asupersync::time::wall_now(),
             GROUP_COMMIT_WAIT_TIMEOUT_FALLBACK,
@@ -756,8 +768,24 @@ impl KeyedWaitSlot {
         .await
         {
             Ok(()) => KeyedWaitResult::Signaled,
+            Err(_) if self.generation() != observed_generation => KeyedWaitResult::Signaled,
             Err(_) => KeyedWaitResult::TimedOut,
         }
+    }
+
+    #[cfg(test)]
+    fn advance_generation_without_notify(&self) {
+        let mut generation = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *generation = generation.wrapping_add(1);
+    }
+
+    #[cfg(test)]
+    fn arm_drop_next_async_notify(&self) {
+        self.drop_next_async_notify
+            .store(true, AtomicOrdering::Release);
     }
 
     fn signal(&self) {
@@ -853,6 +881,27 @@ struct GroupCommitQueue {
     commit_service_mode: AtomicU8,
     /// WAL-owned lane-local staging state for prepared batches.
     parallel_wal_lanes: ParallelWalLaneStager<traits::PreparedWalFrameBatch>,
+    /// External database-lock restorations whose owning flusher future was
+    /// dropped while the shared file handle was contended.
+    ///
+    /// Each entry is type-erased above the concrete `VfsFile` so the
+    /// identity-bound queue can retain the cleanup obligation. A claimant
+    /// removes exactly one entry and returns it on Drop until restoration is
+    /// terminal; no detached cleanup task is required.
+    pending_external_unlocks: Mutex<VecDeque<PendingExternalUnlock>>,
+    /// Shared ownership records for queued external locks.
+    ///
+    /// The record remains present while a cleanup claimant temporarily owns
+    /// the queue entry. Transaction Drop can therefore hand its eventual lock
+    /// target to the same obligation without racing a claim/requeue cycle.
+    pending_external_unlock_ownership: Mutex<HashMap<u64, PendingExternalUnlockOwnership>>,
+    /// Epochs whose flusher was dropped after durable mutation started but
+    /// before the lower I/O layer reported a terminal durable result.
+    ///
+    /// These remain fail-closed in FLUSHING. The shared completion signal is
+    /// retained so a waiter, subsequent commit, or future lower-layer
+    /// reconciler can publish the epoch once durability becomes terminal.
+    in_doubt_epochs: Mutex<HashMap<u64, Arc<AtomicBool>>>,
 }
 
 type LaneStagedPreparedBatch = ParallelWalLaneBatch<traits::PreparedWalFrameBatch>;
@@ -897,6 +946,158 @@ struct PersistedGroupCommitInput<'a> {
     checkpoint_active: bool,
     fallback_reason: Option<ParallelWalFallbackReason>,
     authorized_seed: Option<ParallelWalCommitCertificate>,
+    wal_frame_payload_digest: [u8; 32],
+}
+
+struct PreparedPersistedGroupCommitEpoch {
+    epoch: u64,
+    members: HashSet<u64>,
+    frames_start: u64,
+    frames_end: u64,
+    fsync_seq: u64,
+    combiner: Arc<ParallelWalDurabilityCombiner>,
+    pending_publication: ParallelWalPendingPublication,
+}
+
+struct PendingGroupCommitPublicationState {
+    prepared: Option<PreparedPersistedGroupCommitEpoch>,
+    receipt: Option<ParallelWalDurabilityReceipt>,
+}
+
+struct PendingGroupCommitPublication {
+    state: Mutex<PendingGroupCommitPublicationState>,
+}
+
+impl PendingGroupCommitPublication {
+    fn new(prepared: PreparedPersistedGroupCommitEpoch) -> Self {
+        Self {
+            state: Mutex::new(PendingGroupCommitPublicationState {
+                prepared: Some(prepared),
+                receipt: None,
+            }),
+        }
+    }
+
+    fn certificate(&self) -> Result<ParallelWalCommitCertificate> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .prepared
+            .as_ref()
+            .map(|prepared| prepared.pending_publication.certificate().clone())
+            .or_else(|| {
+                state
+                    .receipt
+                    .as_ref()
+                    .map(|receipt| receipt.certificate.clone())
+            })
+            .ok_or_else(|| FrankenError::internal("parallel WAL publication was already aborted"))
+    }
+
+    fn interval(&self) -> Result<(u64, u64)> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .prepared
+            .as_ref()
+            .map(|prepared| (prepared.frames_start, prepared.frames_end))
+            .ok_or_else(|| {
+                FrankenError::internal("parallel WAL publication has no pending interval")
+            })
+    }
+
+    fn finalize(&self, queue: &GroupCommitQueue) -> Result<ParallelWalDurabilityReceipt> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(receipt) = state.receipt.as_ref() {
+            return Ok(receipt.clone());
+        }
+        let prepared = state.prepared.as_ref().ok_or_else(|| {
+            FrankenError::internal("parallel WAL publication was already aborted")
+        })?;
+        let durability_receipt = prepared
+            .combiner
+            .finalize_pending_publication(&prepared.pending_publication)
+            .map_err(|error| {
+                FrankenError::internal(format!(
+                    "parallel WAL pending publication failed for epoch {}: {error}",
+                    prepared.epoch
+                ))
+            })?;
+        let mut members_display = prepared.members.iter().copied().collect::<Vec<_>>();
+        members_display.sort_unstable();
+        let members_display = members_display
+            .into_iter()
+            .map(|member| member.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        queue
+            .persisted_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                prepared.epoch,
+                PersistedGroupCommitEpoch {
+                    members: prepared.members.clone(),
+                    frames_start: prepared.frames_start,
+                    frames_end: prepared.frames_end,
+                    fsync_seq: prepared.fsync_seq,
+                    durability_receipt: durability_receipt.clone(),
+                },
+            );
+        if group_commit_trace_enabled() {
+            trace_group_commit(format_args!(
+                "batch epoch={} members=[{members_display}] frames_written_range={}..={} fsync_seq={} commit_certificate={} durability_seq={} publication_generation={} ordered_region_ns={} batch_size={} lookup_mode={:?} control_mode={} shadow_certificate_verdict={} compatibility_selector={} fallback_reason={}",
+                prepared.epoch,
+                prepared.frames_start,
+                prepared.frames_end,
+                prepared.fsync_seq,
+                durability_receipt.certificate.certificate_crc32c,
+                durability_receipt.durability_seq,
+                durability_receipt.publication_generation,
+                durability_receipt.ordered_region_ns,
+                durability_receipt.batch_size,
+                durability_receipt.lookup_mode,
+                parallel_wal_mode_name(durability_receipt.control_mode),
+                parallel_wal_shadow_verdict_name(durability_receipt.shadow_certificate_verdict),
+                PARALLEL_WAL_COMPATIBILITY_SELECTOR,
+                parallel_wal_fallback_reason_name(durability_receipt.fallback_reason),
+            ));
+        }
+        state.receipt = Some(durability_receipt.clone());
+        state.prepared = None;
+        Ok(durability_receipt)
+    }
+
+    fn abort(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.receipt.is_some() {
+            return Err(FrankenError::internal(
+                "cannot abort an already-published parallel WAL interval",
+            ));
+        }
+        let Some(prepared) = state.prepared.take() else {
+            return Ok(());
+        };
+        prepared
+            .combiner
+            .abort_pending_publication(&prepared.pending_publication)
+            .map_err(|error| {
+                FrankenError::internal(format!(
+                    "parallel WAL pending publication abort failed for epoch {}: {error}",
+                    prepared.epoch
+                ))
+            })
+    }
 }
 
 #[derive(Debug)]
@@ -992,6 +1193,9 @@ impl GroupCommitQueue {
             commit_service_control_epoch: AtomicU64::new(0),
             commit_service_mode: AtomicU8::new(CommitServiceMode::Balanced.as_u8()),
             parallel_wal_lanes: ParallelWalLaneStager::new(parallel_wal_control),
+            pending_external_unlocks: Mutex::new(VecDeque::new()),
+            pending_external_unlock_ownership: Mutex::new(HashMap::new()),
+            in_doubt_epochs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1069,16 +1273,11 @@ impl GroupCommitQueue {
         }))
     }
 
-    async fn record_persisted_epoch<F, Fut>(
+    async fn prepare_persisted_epoch(
         &self,
         cx: &Cx,
         input: PersistedGroupCommitInput<'_>,
-        durable_write: F,
-    ) -> Result<ParallelWalDurabilityReceipt>
-    where
-        F: FnOnce(fsqlite_wal::ParallelWalCommitCertificate) -> Fut,
-        Fut: Future<Output = Result<()>>,
-    {
+    ) -> Result<Arc<PendingGroupCommitPublication>> {
         let members = input
             .batches
             .iter()
@@ -1129,6 +1328,7 @@ impl GroupCommitQueue {
             control_mode,
             fallback_reason: input.fallback_reason,
             checkpoint_active: input.checkpoint_active,
+            wal_frame_payload_digest: input.wal_frame_payload_digest,
         };
         let conservative_shadow_evidence =
             matches!(control_mode, ParallelWalOperatingMode::ShadowCompare).then(|| {
@@ -1173,88 +1373,34 @@ impl GroupCommitQueue {
                     checkpoint_active: input.checkpoint_active,
                     wal_frame_start: input.frames_start,
                     wal_frame_end: input.frames_end,
+                    wal_frame_payload_digest: input.wal_frame_payload_digest,
                 }
             });
-        let durability_error = Arc::new(Mutex::new(None));
-        let durability_error_slot = Arc::clone(&durability_error);
-        let wrapped_durable_write = move |certificate| {
-            let write = durable_write(certificate);
-            let error_slot = Arc::clone(&durability_error_slot);
-            async move {
-                write.await.map_err(|error| {
-                    let detail = error.to_string();
-                    *error_slot
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
-                    detail
-                })
-            }
-        };
-        let durability_receipt_result = if let Some(evidence) = conservative_shadow_evidence {
+        let pending_publication = if let Some(evidence) = conservative_shadow_evidence {
             combiner
-                .certify_and_publish_with_conservative_shadow_async(
-                    cx,
-                    request,
-                    evidence,
-                    wrapped_durable_write,
-                )
+                .prepare_pending_publication_with_conservative_shadow(cx, request, evidence)
                 .await
         } else {
-            combiner
-                .certify_and_publish_async(cx, request, wrapped_durable_write)
-                .await
-        };
-        if let Some(error) = durability_error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            return Err(error);
+            combiner.prepare_pending_publication(cx, request).await
         }
-        let durability_receipt = durability_receipt_result.map_err(|error| {
-            FrankenError::internal(format!(
-                "parallel WAL durability certificate failed for epoch {}: {error}",
+        .map_err(|error| match error {
+            ParallelWalCombinerError::Cancelled => FrankenError::Abort,
+            error => FrankenError::internal(format!(
+                "parallel WAL publication preparation failed for epoch {}: {error}",
                 input.epoch
-            ))
+            )),
         })?;
-        let mut members_display = members.iter().copied().collect::<Vec<_>>();
-        members_display.sort_unstable();
-        let members_display = members_display
-            .into_iter()
-            .map(|member| member.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let record = PersistedGroupCommitEpoch {
-            members,
-            frames_start: input.frames_start,
-            frames_end: input.frames_end,
-            fsync_seq: input.fsync_seq,
-            durability_receipt: durability_receipt.clone(),
-        };
-        self.persisted_epochs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(input.epoch, record);
-        if group_commit_trace_enabled() {
-            trace_group_commit(format_args!(
-                "batch epoch={} members=[{members_display}] frames_written_range={}..={} fsync_seq={} commit_certificate={} durability_seq={} publication_generation={} ordered_region_ns={} batch_size={} lookup_mode={:?} control_mode={} shadow_certificate_verdict={} compatibility_selector={} fallback_reason={}",
-                input.epoch,
-                input.frames_start,
-                input.frames_end,
-                input.fsync_seq,
-                durability_receipt.certificate.certificate_crc32c,
-                durability_receipt.durability_seq,
-                durability_receipt.publication_generation,
-                durability_receipt.ordered_region_ns,
-                durability_receipt.batch_size,
-                durability_receipt.lookup_mode,
-                parallel_wal_mode_name(durability_receipt.control_mode),
-                parallel_wal_shadow_verdict_name(durability_receipt.shadow_certificate_verdict),
-                PARALLEL_WAL_COMPATIBILITY_SELECTOR,
-                parallel_wal_fallback_reason_name(durability_receipt.fallback_reason),
-            ));
-        }
-        Ok(durability_receipt)
+        Ok(Arc::new(PendingGroupCommitPublication::new(
+            PreparedPersistedGroupCommitEpoch {
+                epoch: input.epoch,
+                members,
+                frames_start: input.frames_start,
+                frames_end: input.frames_end,
+                fsync_seq: input.fsync_seq,
+                combiner,
+                pending_publication,
+            },
+        )))
     }
 
     fn persisted_epoch_for(&self, epoch: u64) -> Option<PersistedGroupCommitEpoch> {
@@ -1340,22 +1486,245 @@ impl GroupCommitQueue {
         self.publish_failed_epoch(epoch, &FrankenError::Abort, wake_next_epoch);
     }
 
+    fn complete_cancelled_durable_flush(&self, epoch: u64) {
+        let has_promoted = {
+            let mut consolidator = self
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if consolidator.phase() != ConsolidationPhase::Flushing || consolidator.epoch() != epoch
+            {
+                return;
+            }
+            match consolidator.complete_flush() {
+                Ok(has_promoted) => has_promoted,
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        epoch,
+                        "cancelled durable group-commit flusher could not complete its epoch"
+                    );
+                    return;
+                }
+            }
+        };
+        // The certificate, frames, and requested sync are already durable.
+        // Never reinterpret that commit as an Abort merely because its caller
+        // was cancelled during local cleanup/publication.
+        self.publish_completed_epoch(epoch, has_promoted);
+    }
+
+    fn enqueue_pending_external_unlock(&self, pending: PendingExternalUnlock) {
+        let epoch = pending.epoch;
+        self.remember_pending_external_unlock_owner(&pending);
+        self.pending_external_unlocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(pending);
+        // A waiter already parked on the stranded epoch is the preferred
+        // structured cleanup owner. The bounded eventcount fallback still
+        // covers a signal that races registration.
+        let _ = self.epoch_waiters.signal(epoch);
+        if GROUP_COMMIT_WAIT_PATH_MODE == WaitPathMode::LegacyCondvarTimeout {
+            self.flush_complete.notify_all();
+        }
+    }
+
+    fn requeue_pending_external_unlock_front(&self, pending: PendingExternalUnlock) {
+        let epoch = pending.epoch;
+        self.remember_pending_external_unlock_owner(&pending);
+        self.pending_external_unlocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_front(pending);
+        let _ = self.epoch_waiters.signal(epoch);
+        if GROUP_COMMIT_WAIT_PATH_MODE == WaitPathMode::LegacyCondvarTimeout {
+            self.flush_complete.notify_all();
+        }
+    }
+
+    fn remember_pending_external_unlock_owner(&self, pending: &PendingExternalUnlock) {
+        self.pending_external_unlock_ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(pending.epoch)
+            .or_insert_with(|| PendingExternalUnlockOwnership {
+                durability_started: Arc::clone(&pending.durability_started),
+                durable_io_completed: Arc::clone(&pending.durable_io_completed),
+                restored: Arc::clone(&pending.restored),
+                restore_target: Arc::clone(&pending.restore_target),
+            });
+    }
+
+    fn forget_pending_external_unlock_owner(&self, epoch: u64) {
+        self.pending_external_unlock_ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&epoch);
+    }
+
+    /// Transfer a transaction's final external-lock transition to the queued
+    /// in-doubt flusher that already owns RESERVED.
+    ///
+    /// This record is independent of the queue lease so transaction Drop can
+    /// update it even while an async cleanup claimant is inspecting the entry.
+    fn handoff_transaction_unlock_to_in_doubt_owner(
+        &self,
+        restore_target: PendingExternalUnlockTarget,
+    ) -> bool {
+        let owners = self
+            .pending_external_unlock_ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut matched = 0_usize;
+        for ownership in owners.values() {
+            if ownership.durability_state() != GroupCommitFlushDurability::InDoubt
+                || ownership.restored.load(AtomicOrdering::Acquire)
+            {
+                continue;
+            }
+            let mut target = ownership
+                .restore_target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if ownership.restored.load(AtomicOrdering::Acquire) {
+                continue;
+            }
+            *target = restore_target;
+            matched = matched.saturating_add(1);
+        }
+        if matched > 1 {
+            tracing::error!(
+                matched,
+                "multiple in-doubt group-commit epochs claimed one transaction unlock"
+            );
+        }
+        matched != 0
+    }
+
+    fn claim_pending_external_unlock(self: &Arc<Self>) -> Option<PendingExternalUnlockClaim> {
+        let pending = self
+            .pending_external_unlocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()?;
+        Some(PendingExternalUnlockClaim {
+            queue: Arc::clone(self),
+            pending: Some(pending),
+        })
+    }
+
+    async fn resolve_one_pending_external_unlock(self: &Arc<Self>) -> Result<bool> {
+        let Some(mut claim) = self.claim_pending_external_unlock() else {
+            return Ok(false);
+        };
+        if claim.durability_state() == GroupCommitFlushDurability::InDoubt {
+            // The dropped callback's lower I/O may still own and mutate the
+            // ordered WAL residue. The recovery object first waits for both
+            // source tokens, then validates the exact on-disk interval while
+            // RESERVED remains held.
+            if claim.reconcile_durability().await? == GroupCommitFlushDurability::InDoubt {
+                return Ok(false);
+            }
+        }
+        claim.restore().await?;
+        let restored = claim.finish();
+        self.resolve_cancelled_flush_after_external_unlock(restored);
+        Ok(true)
+    }
+
+    fn try_resolve_one_pending_external_unlock(self: &Arc<Self>) -> Result<bool> {
+        let Some(mut claim) = self.claim_pending_external_unlock() else {
+            return Ok(false);
+        };
+        if claim.durability_state() == GroupCommitFlushDurability::InDoubt {
+            // Synchronous Drop paths must obey the same cross-process
+            // fail-closed rule as async cleanup claimants.
+            return Ok(false);
+        }
+        if !claim.try_restore()? {
+            return Ok(false);
+        }
+        let restored = claim.finish();
+        self.resolve_cancelled_flush_after_external_unlock(restored);
+        Ok(true)
+    }
+
+    fn resolve_cancelled_flush_after_external_unlock(&self, pending: PendingExternalUnlock) {
+        match pending.durability_state() {
+            GroupCommitFlushDurability::PreDurable => {
+                self.abort_cancelled_flush(pending.epoch);
+            }
+            GroupCommitFlushDurability::Durable => {
+                self.complete_cancelled_durable_flush(pending.epoch);
+            }
+            GroupCommitFlushDurability::InDoubt => {
+                self.register_in_doubt_epoch(pending.epoch, pending.durable_io_completed);
+            }
+        }
+    }
+
+    fn register_in_doubt_epoch(&self, epoch: u64, durable_io_completed: Arc<AtomicBool>) {
+        self.in_doubt_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(epoch, durable_io_completed);
+        tracing::warn!(
+            epoch,
+            "restored dropped group-commit database lock while durability remains in doubt"
+        );
+        // A completion token may have become terminal between the state check
+        // and insertion.
+        self.reconcile_durable_in_doubt_epochs();
+    }
+
+    fn reconcile_durable_in_doubt_epochs(&self) {
+        let durable_epochs = {
+            let mut in_doubt = self
+                .in_doubt_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let durable_epochs = in_doubt
+                .iter()
+                .filter_map(|(&epoch, durable)| {
+                    durable.load(AtomicOrdering::Acquire).then_some(epoch)
+                })
+                .collect::<Vec<_>>();
+            for epoch in &durable_epochs {
+                in_doubt.remove(epoch);
+            }
+            durable_epochs
+        };
+        for epoch in durable_epochs {
+            self.complete_cancelled_durable_flush(epoch);
+        }
+    }
+
+    fn has_unresolved_in_doubt_epoch(&self) -> bool {
+        self.reconcile_durable_in_doubt_epochs();
+        if !self
+            .in_doubt_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+        {
+            return true;
+        }
+        self.pending_external_unlocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|pending| pending.durability_state() == GroupCommitFlushDurability::InDoubt)
+    }
+
     fn abort_cancelled_filling(&self, target_epoch: u64) {
         let failed_epoch = {
             let mut consolidator = self
                 .consolidator
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match consolidator.abort_filling() {
-                Ok(failed_epoch) if failed_epoch == target_epoch => failed_epoch,
-                Ok(failed_epoch) => {
-                    tracing::error!(
-                        target_epoch,
-                        failed_epoch,
-                        "cancelled group-commit flusher consumed an unexpected filling epoch"
-                    );
-                    failed_epoch
-                }
+            match consolidator.abort_filling(target_epoch) {
+                Ok(failed_epoch) => failed_epoch,
                 Err(error) => {
                     tracing::debug!(
                         target_epoch,
@@ -1601,11 +1970,15 @@ impl GroupCommitQueue {
     /// and registration is observed by `wait_for_change_async` without a lost
     /// wake. No executor thread blocks on a condition variable.
     async fn wait_for_epoch_outcome_async(
-        &self,
+        self: &Arc<Self>,
         cx: &Cx,
         target_epoch: u64,
     ) -> Result<WaitForEpochOutcome> {
         loop {
+            while self.resolve_one_pending_external_unlock().await? {}
+            if self.has_unresolved_in_doubt_epoch() {
+                return Err(FrankenError::BusyRecovery);
+            }
             let slot = self.epoch_waiters.slot(target_epoch);
             let observed_generation = slot.generation();
             let outcome = {
@@ -1671,7 +2044,27 @@ impl Drop for GroupCommitFillingObligation {
 struct GroupCommitFlushObligation {
     queue: Arc<GroupCommitQueue>,
     epoch: u64,
-    armed: bool,
+    phase: GroupCommitFlushObligationPhase,
+    durability_started: Arc<AtomicBool>,
+    durable_io_completed: Arc<AtomicBool>,
+    external_lock_restored: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupCommitFlushObligationPhase {
+    PreDurable,
+    Durable,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupCommitFlushDurability {
+    /// The callback had not reached its first side-effecting await.
+    PreDurable,
+    /// Durable mutation started, but the lower I/O layer is not terminal.
+    InDoubt,
+    /// WAL append and the selected sync boundary are terminally durable.
+    Durable,
 }
 
 impl GroupCommitFlushObligation {
@@ -1679,19 +2072,543 @@ impl GroupCommitFlushObligation {
         Self {
             queue: Arc::clone(queue),
             epoch,
-            armed: true,
+            phase: GroupCommitFlushObligationPhase::PreDurable,
+            durability_started: Arc::new(AtomicBool::new(false)),
+            durable_io_completed: Arc::new(AtomicBool::new(false)),
+            external_lock_restored: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn durability_started_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.durability_started)
+    }
+
+    fn durable_io_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.durable_io_completed)
+    }
+
+    fn external_lock_state(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.external_lock_restored)
+    }
+
+    #[cfg(test)]
+    fn mark_durable(&mut self) {
+        debug_assert_eq!(
+            self.phase,
+            GroupCommitFlushObligationPhase::PreDurable,
+            "group-commit flush may become durable only once"
+        );
+        self.durable_io_completed
+            .store(true, AtomicOrdering::Release);
+        self.phase = GroupCommitFlushObligationPhase::Durable;
+    }
+
+    fn is_durable(&self) -> bool {
+        self.phase == GroupCommitFlushObligationPhase::Durable
+            || self.durable_io_completed.load(AtomicOrdering::Acquire)
+    }
+
+    fn durability_state(&self) -> GroupCommitFlushDurability {
+        if self.durable_io_completed.load(AtomicOrdering::Acquire) {
+            GroupCommitFlushDurability::Durable
+        } else if self.durability_started.load(AtomicOrdering::Acquire) {
+            GroupCommitFlushDurability::InDoubt
+        } else {
+            GroupCommitFlushDurability::PreDurable
         }
     }
 
     fn disarm(&mut self) {
-        self.armed = false;
+        self.phase = GroupCommitFlushObligationPhase::Completed;
     }
 }
 
 impl Drop for GroupCommitFlushObligation {
     fn drop(&mut self) {
-        if self.armed {
-            self.queue.abort_cancelled_flush(self.epoch);
+        if self.phase == GroupCommitFlushObligationPhase::Completed {
+            return;
+        }
+        if !self.external_lock_restored.load(AtomicOrdering::Acquire) {
+            // GroupCommitDbLockObligation queued the type-erased restoration
+            // before this outer obligation was dropped. Its eventual claimant
+            // owns both lock cleanup and epoch resolution.
+            tracing::warn!(
+                epoch = self.epoch,
+                durability_state = ?self.durability_state(),
+                "dropped group-commit future deferred epoch resolution until external lock restoration"
+            );
+            return;
+        }
+        match self.durability_state() {
+            GroupCommitFlushDurability::PreDurable => {
+                self.queue.abort_cancelled_flush(self.epoch);
+            }
+            GroupCommitFlushDurability::InDoubt => {
+                self.queue
+                    .register_in_doubt_epoch(self.epoch, Arc::clone(&self.durable_io_completed));
+            }
+            GroupCommitFlushDurability::Durable => {
+                self.queue.complete_cancelled_durable_flush(self.epoch);
+            }
+        }
+    }
+}
+
+trait PendingGroupCommitRecoveryOperation: Send + Sync {
+    fn reconcile<'a>(&'a self) -> LocalPagerFuture<'a, GroupCommitFlushDurability>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingGroupCommitRecoveryResolution {
+    Authorized,
+    NotCommitted,
+}
+
+struct PendingGroupCommitRecovery<F: VfsFile + 'static> {
+    queue: Arc<GroupCommitQueue>,
+    publication: Arc<PendingGroupCommitPublication>,
+    wal_backend: SharedWalBackend,
+    inner: Arc<Mutex<PagerInner<F>>>,
+    published: Option<Arc<PublishedPagerState>>,
+    batches: Vec<TransactionFrameBatch>,
+    final_db_size: u32,
+    publication_journal_mode: JournalMode,
+    publication_freelist_count: usize,
+    checkpoint_active: bool,
+    sync: bool,
+    sidecar_completion: Arc<Mutex<Option<VfsWriteCompletion>>>,
+    wal_completion: Arc<Mutex<Option<VfsWriteCompletion>>>,
+    cleanup_cx: Cx,
+    durability_started: Arc<AtomicBool>,
+    durable_io_completed: Arc<AtomicBool>,
+    resolution: Mutex<Option<PendingGroupCommitRecoveryResolution>>,
+}
+
+impl<F: VfsFile + 'static> PendingGroupCommitRecovery<F> {
+    fn writes_are_terminal(&self) -> bool {
+        let sidecar_terminal = self
+            .sidecar_completion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_none_or(|completion| completion.state() != VfsWriteCompletionState::Pending);
+        let wal_terminal = self
+            .wal_completion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_none_or(|completion| completion.state() != VfsWriteCompletionState::Pending);
+        sidecar_terminal && wal_terminal
+    }
+
+    fn complete_authorized(&self, cx: &Cx) -> Result<ParallelWalDurabilityReceipt> {
+        if self
+            .resolution
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|resolution| {
+                resolution == PendingGroupCommitRecoveryResolution::NotCommitted
+            })
+        {
+            return Err(FrankenError::internal(
+                "cannot publish a parallel WAL interval already proven not committed",
+            ));
+        }
+        // Validate and materialize the full page plane before consuming the
+        // combiner's exact pending handle. Once `finalize` succeeds, every
+        // remaining operation in this method is deliberately infallible so a
+        // recovery retry can never need a handle that has already been spent.
+        let prepared_pages = self
+            .published
+            .as_ref()
+            .map(|_| PublishedPagerState::prepare_parallel_wal_group_pages(&self.batches))
+            .transpose()?;
+        let receipt = self.publication.finalize(&self.queue)?;
+        if let (Some(published), Some(prepared_pages)) = (self.published.as_ref(), prepared_pages) {
+            published.publish_prepared_parallel_wal_group(
+                cx,
+                PublishedPagerUpdate {
+                    visible_commit_seq: receipt.certificate.commit_seq_hi,
+                    db_size: self.final_db_size,
+                    journal_mode: self.publication_journal_mode,
+                    freelist_count: self.publication_freelist_count,
+                    checkpoint_active: self.checkpoint_active,
+                },
+                prepared_pages,
+            );
+        }
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Concurrent transactions may reserve later EOF pages while the
+            // physical writer is in flight. Never erase those reservations.
+            inner.db_size = inner.db_size.max(self.final_db_size);
+        }
+        *self
+            .resolution
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(PendingGroupCommitRecoveryResolution::Authorized);
+        self.durable_io_completed
+            .store(true, AtomicOrdering::Release);
+        Ok(receipt)
+    }
+}
+
+impl<F: VfsFile + 'static> PendingGroupCommitRecoveryOperation for PendingGroupCommitRecovery<F> {
+    fn reconcile<'a>(&'a self) -> LocalPagerFuture<'a, GroupCommitFlushDurability> {
+        Box::pin(async move {
+            if let Some(resolution) = *self
+                .resolution
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                return Ok(match resolution {
+                    PendingGroupCommitRecoveryResolution::Authorized => {
+                        GroupCommitFlushDurability::Durable
+                    }
+                    PendingGroupCommitRecoveryResolution::NotCommitted => {
+                        GroupCommitFlushDurability::PreDurable
+                    }
+                });
+            }
+            if !self.writes_are_terminal() {
+                return Ok(GroupCommitFlushDurability::InDoubt);
+            }
+
+            // Recovery owns a masked child context for its entire external-lock
+            // and storage-reconciliation window. Parent cancellation may wake
+            // the claimant, but it must not prevent the claimant from reaching
+            // a terminal durability verdict and releasing RESERVED.
+            let _recovery_mask = self.cleanup_cx.masked();
+            let certificate = self.publication.certificate()?;
+            let (frames_start, frames_end) = self.publication.interval()?;
+            let backend = wal_backend_handle(&self.wal_backend)?;
+            let mut wal =
+                async_rwlock_write(&backend, &self.cleanup_cx, "WAL recovery backend").await?;
+            let verdict = wal
+                .reconcile_parallel_wal_commit(
+                    &self.cleanup_cx,
+                    &certificate,
+                    frames_start,
+                    frames_end,
+                    self.sync,
+                )
+                .await?;
+            drop(wal);
+
+            match verdict {
+                traits::ParallelWalCommitReconciliation::Authorized => {
+                    self.complete_authorized(&self.cleanup_cx)?;
+                    Ok(GroupCommitFlushDurability::Durable)
+                }
+                traits::ParallelWalCommitReconciliation::NotCommitted => {
+                    self.publication.abort()?;
+                    *self
+                        .resolution
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(PendingGroupCommitRecoveryResolution::NotCommitted);
+                    self.durability_started
+                        .store(false, AtomicOrdering::Release);
+                    self.durable_io_completed
+                        .store(false, AtomicOrdering::Release);
+                    Ok(GroupCommitFlushDurability::PreDurable)
+                }
+            }
+        })
+    }
+}
+
+trait PendingExternalUnlockOperation: Send {
+    fn restore<'a>(&'a mut self) -> LocalPagerFuture<'a, ()>;
+
+    /// Try the synchronous portion of restoration without waiting for the
+    /// shared file handle. `Ok(false)` means the handle is still contended.
+    fn try_restore(&mut self) -> Result<bool>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingExternalUnlockTarget {
+    /// Restore the ordinary SQLite lock state while other transactions remain.
+    LockLevel(LockLevel),
+    /// Release the last transaction's external snapshot fence. This is
+    /// distinct from `LockLevel::None` on VFSes that track the fence's prior
+    /// lock level separately.
+    ExternalSnapshot,
+}
+
+impl PendingExternalUnlockTarget {
+    fn restore<F: VfsFile>(self, file: &mut F, cx: &Cx) -> Result<()> {
+        match self {
+            Self::LockLevel(level) => file.unlock(cx, level),
+            Self::ExternalSnapshot => file.unlock_external_shared_snapshot(cx),
+        }
+    }
+}
+
+struct PendingExternalUnlockOwnership {
+    durability_started: Arc<AtomicBool>,
+    durable_io_completed: Arc<AtomicBool>,
+    restored: Arc<AtomicBool>,
+    restore_target: Arc<Mutex<PendingExternalUnlockTarget>>,
+}
+
+impl PendingExternalUnlockOwnership {
+    fn durability_state(&self) -> GroupCommitFlushDurability {
+        if self.durable_io_completed.load(AtomicOrdering::Acquire) {
+            GroupCommitFlushDurability::Durable
+        } else if self.durability_started.load(AtomicOrdering::Acquire) {
+            GroupCommitFlushDurability::InDoubt
+        } else {
+            GroupCommitFlushDurability::PreDurable
+        }
+    }
+}
+
+struct SharedDbPendingExternalUnlock<F: VfsFile> {
+    db_file: SharedDbFile<F>,
+    cleanup_cx: Cx,
+    restore_target: Arc<Mutex<PendingExternalUnlockTarget>>,
+    restored: Arc<AtomicBool>,
+}
+
+impl<F: VfsFile> SharedDbPendingExternalUnlock<F> {
+    fn mark_restored(&self) {
+        self.restored.store(true, AtomicOrdering::Release);
+    }
+}
+
+impl<F: VfsFile + 'static> PendingExternalUnlockOperation for SharedDbPendingExternalUnlock<F> {
+    fn restore<'a>(&'a mut self) -> LocalPagerFuture<'a, ()> {
+        Box::pin(async move {
+            let restore_result = {
+                let _cleanup_mask = self.cleanup_cx.masked();
+                let mut file = shared_db_file_write(&self.db_file, &self.cleanup_cx).await?;
+                let restore_target = self
+                    .restore_target
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let result = restore_target.restore(&mut *file, &self.cleanup_cx);
+                if result.is_ok() {
+                    self.mark_restored();
+                }
+                result
+            };
+            restore_result
+        })
+    }
+
+    fn try_restore(&mut self) -> Result<bool> {
+        let _cleanup_mask = self.cleanup_cx.masked();
+        let mut file = match self.db_file.try_write() {
+            Ok(file) => file,
+            Err(asupersync::sync::TryWriteError::Locked) => return Ok(false),
+            Err(asupersync::sync::TryWriteError::Poisoned) => {
+                return Err(FrankenError::internal(
+                    "pending group-commit database-file lock is poisoned",
+                ));
+            }
+        };
+        let restore_target = self
+            .restore_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        restore_target.restore(&mut *file, &self.cleanup_cx)?;
+        self.mark_restored();
+        Ok(true)
+    }
+}
+
+struct PendingExternalUnlock {
+    epoch: u64,
+    durability_started: Arc<AtomicBool>,
+    durable_io_completed: Arc<AtomicBool>,
+    restored: Arc<AtomicBool>,
+    restore_target: Arc<Mutex<PendingExternalUnlockTarget>>,
+    recovery: Option<Arc<dyn PendingGroupCommitRecoveryOperation>>,
+    operation: Box<dyn PendingExternalUnlockOperation>,
+}
+
+impl PendingExternalUnlock {
+    fn durability_state(&self) -> GroupCommitFlushDurability {
+        if self.durable_io_completed.load(AtomicOrdering::Acquire) {
+            GroupCommitFlushDurability::Durable
+        } else if self.durability_started.load(AtomicOrdering::Acquire) {
+            GroupCommitFlushDurability::InDoubt
+        } else {
+            GroupCommitFlushDurability::PreDurable
+        }
+    }
+}
+
+struct PendingExternalUnlockClaim {
+    queue: Arc<GroupCommitQueue>,
+    pending: Option<PendingExternalUnlock>,
+}
+
+impl PendingExternalUnlockClaim {
+    fn durability_state(&self) -> GroupCommitFlushDurability {
+        self.pending
+            .as_ref()
+            .expect("pending external unlock claim must own its operation")
+            .durability_state()
+    }
+
+    async fn restore(&mut self) -> Result<()> {
+        self.pending
+            .as_mut()
+            .expect("pending external unlock claim must own its operation")
+            .operation
+            .restore()
+            .await
+    }
+
+    async fn reconcile_durability(&self) -> Result<GroupCommitFlushDurability> {
+        let pending = self
+            .pending
+            .as_ref()
+            .expect("pending external unlock claim must own its operation");
+        let Some(recovery) = pending.recovery.as_ref() else {
+            return Ok(pending.durability_state());
+        };
+        recovery.reconcile().await
+    }
+
+    fn try_restore(&mut self) -> Result<bool> {
+        self.pending
+            .as_mut()
+            .expect("pending external unlock claim must own its operation")
+            .operation
+            .try_restore()
+    }
+
+    fn finish(mut self) -> PendingExternalUnlock {
+        let pending = self
+            .pending
+            .take()
+            .expect("finished external unlock claim must own its operation");
+        self.queue
+            .forget_pending_external_unlock_owner(pending.epoch);
+        pending
+    }
+}
+
+impl Drop for PendingExternalUnlockClaim {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            self.queue.requeue_pending_external_unlock_front(pending);
+        }
+    }
+}
+
+struct GroupCommitDbLockObligation<F: VfsFile + 'static> {
+    queue: Arc<GroupCommitQueue>,
+    epoch: u64,
+    db_file: SharedDbFile<F>,
+    cleanup_cx: Cx,
+    restore_lock_level: LockLevel,
+    durability_started: Arc<AtomicBool>,
+    durable_io_completed: Arc<AtomicBool>,
+    restored: Arc<AtomicBool>,
+    recovery: Option<Arc<dyn PendingGroupCommitRecoveryOperation>>,
+    armed: bool,
+}
+
+impl<F: VfsFile + 'static> GroupCommitDbLockObligation<F> {
+    fn new(
+        queue: &Arc<GroupCommitQueue>,
+        epoch: u64,
+        db_file: &SharedDbFile<F>,
+        cx: &Cx,
+        restore_lock_level: LockLevel,
+        durability_started: Arc<AtomicBool>,
+        durable_io_completed: Arc<AtomicBool>,
+        restored: Arc<AtomicBool>,
+    ) -> Self {
+        restored.store(false, AtomicOrdering::Release);
+        Self {
+            queue: Arc::clone(queue),
+            epoch,
+            db_file: Arc::clone(db_file),
+            cleanup_cx: cleanup_child_cx(cx),
+            restore_lock_level,
+            durability_started,
+            durable_io_completed,
+            restored,
+            recovery: None,
+            armed: true,
+        }
+    }
+
+    fn set_recovery(&mut self, recovery: Arc<dyn PendingGroupCommitRecoveryOperation>) {
+        self.recovery = Some(recovery);
+    }
+
+    async fn restore(&mut self) -> Result<()> {
+        let restore_result = {
+            let _cleanup_mask = self.cleanup_cx.masked();
+            shared_db_unlock(&self.db_file, &self.cleanup_cx, self.restore_lock_level).await
+        };
+        if restore_result.is_ok() {
+            self.restored.store(true, AtomicOrdering::Release);
+            self.armed = false;
+        }
+        restore_result
+    }
+}
+
+impl<F: VfsFile + 'static> Drop for GroupCommitDbLockObligation<F> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let restore_target = Arc::new(Mutex::new(PendingExternalUnlockTarget::LockLevel(
+            self.restore_lock_level,
+        )));
+        let operation = SharedDbPendingExternalUnlock {
+            db_file: Arc::clone(&self.db_file),
+            cleanup_cx: self.cleanup_cx.clone(),
+            restore_target: Arc::clone(&restore_target),
+            restored: Arc::clone(&self.restored),
+        };
+        let mut pending = PendingExternalUnlock {
+            epoch: self.epoch,
+            durability_started: Arc::clone(&self.durability_started),
+            durable_io_completed: Arc::clone(&self.durable_io_completed),
+            restored: Arc::clone(&self.restored),
+            restore_target,
+            recovery: self.recovery.clone(),
+            operation: Box::new(operation),
+        };
+        if pending.durability_state() == GroupCommitFlushDurability::InDoubt {
+            // Do not even attempt to acquire the shared handle here. The
+            // lower write may still be running after its parent future was
+            // dropped, so RESERVED remains the cross-process ownership token
+            // until durable completion can be reconciled.
+            self.queue.enqueue_pending_external_unlock(pending);
+            self.armed = false;
+            return;
+        }
+        match pending.operation.try_restore() {
+            Ok(true) => {
+                self.armed = false;
+            }
+            Ok(false) => {
+                self.queue.enqueue_pending_external_unlock(pending);
+                self.armed = false;
+            }
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    epoch = self.epoch,
+                    "drop-time group-commit lock restoration failed; queued for structured retry"
+                );
+                self.queue.enqueue_pending_external_unlock(pending);
+                self.armed = false;
+            }
         }
     }
 }
@@ -5275,15 +6192,9 @@ impl PublishedPagerState {
         self.finalize_publish(cx, update, page_set_size, start, true);
     }
 
-    /// Publish every page image covered by one durable group certificate in a
-    /// single seqlock generation before any individual Phase C waiter can
-    /// expose the certificate high-water mark.
-    fn publish_parallel_wal_group(
-        &self,
-        cx: &Cx,
-        update: PublishedPagerUpdate,
+    fn prepare_parallel_wal_group_pages(
         batches: &[TransactionFrameBatch],
-    ) -> Result<()> {
+    ) -> Result<HashMap<PageNumber, PageData>> {
         let mut complete_group_pages = HashMap::with_capacity(
             batches
                 .iter()
@@ -5303,12 +6214,27 @@ impl PublishedPagerState {
                 complete_group_pages.insert(page_no, PageData::from_vec(frame.page_data.clone()));
             }
         }
+        Ok(complete_group_pages)
+    }
+
+    /// Publish already-validated page images covered by one durable group
+    /// certificate in a single seqlock generation.
+    ///
+    /// This function is infallible by construction. Recovery prepares the map
+    /// before finalizing its exact combiner handle, so consuming that handle
+    /// cannot be followed by a retry-requiring publication error.
+    fn publish_prepared_parallel_wal_group(
+        &self,
+        cx: &Cx,
+        update: PublishedPagerUpdate,
+        complete_group_pages: HashMap<PageNumber, PageData>,
+    ) {
         let _publish_guard = self
             .publish_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.should_skip_stale_publish(cx, update, "stale_parallel_wal_group_publish_skip") {
-            return Ok(());
+            return;
         }
 
         let start = Instant::now();
@@ -5326,6 +6252,20 @@ impl PublishedPagerState {
         self.pages.insert_batch(complete_group_pages);
         let page_set_size = self.pages.len();
         self.finalize_publish(cx, update, page_set_size, start, true);
+    }
+
+    /// Validate and publish every page image covered by one durable group
+    /// certificate. Direct callers use this convenience wrapper; retained
+    /// recovery splits the two phases around exact-handle finalization.
+    #[cfg(test)]
+    fn publish_parallel_wal_group(
+        &self,
+        cx: &Cx,
+        update: PublishedPagerUpdate,
+        batches: &[TransactionFrameBatch],
+    ) -> Result<()> {
+        let complete_group_pages = Self::prepare_parallel_wal_group_pages(batches)?;
+        self.publish_prepared_parallel_wal_group(cx, update, complete_group_pages);
         Ok(())
     }
 
@@ -6133,12 +7073,24 @@ fn bootstrap_header_from_stale_main_file(
 impl<V> MvccPager for SimplePager<V>
 where
     V: Vfs + Send + Sync,
-    V::File: Send + Sync,
+    V::File: Send + Sync + 'static,
 {
     type Txn = SimpleTransaction<V>;
 
-    fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<Self::Txn> {
-        future::block_on(async move {
+    fn begin<'a>(
+        &'a self,
+        cx: &'a Cx,
+        mode: TransactionMode,
+    ) -> impl Future<Output = Result<Self::Txn>> + 'a {
+        async move {
+            while self
+                .group_commit_queue
+                .resolve_one_pending_external_unlock()
+                .await?
+            {}
+            if self.group_commit_queue.has_unresolved_in_doubt_epoch() {
+                return Err(FrankenError::BusyRecovery);
+            }
             let mut maintenance_lease = self.maintenance_gate.enter_transaction()?;
             self.validate_namespace_binding()?;
             let mut inner = self
@@ -6475,7 +7427,7 @@ where
                 retained_memory_overlay_dirty_pages: BTreeSet::new(),
                 scratch_arena: bumpalo::Bump::new(),
             })
-        })
+        }
     }
 
     fn journal_mode(&self) -> JournalMode {
@@ -6490,8 +7442,12 @@ where
         inner.access_mode.is_readonly()
     }
 
-    fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
-        future::block_on(async move {
+    fn set_journal_mode<'a>(
+        &'a self,
+        cx: &'a Cx,
+        mode: JournalMode,
+    ) -> impl Future<Output = Result<JournalMode>> + 'a {
+        async move {
             let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
             self.validate_namespace_binding()?;
             let mut inner = self
@@ -6565,7 +7521,7 @@ where
             );
             drop(inner);
             Ok(mode)
-        })
+        }
     }
 
     fn set_wal_backend(&self, backend: Box<dyn WalBackend>) -> Result<()> {
@@ -6833,33 +7789,29 @@ where
     ///
     /// The VFS implementation determines whether a stable descriptor identity
     /// is available. The pager never re-resolves [`Self::db_path`] here.
-    pub fn file_identity(&self, cx: &Cx) -> Result<Option<FileIdentity>> {
-        future::block_on(async {
-            let inner = self
-                .inner
-                .lock()
-                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
-            let db_file = shared_db_file_read(&inner.db_file, cx).await?;
-            db_file.file_identity()
-        })
+    pub async fn file_identity(&self, cx: &Cx) -> Result<Option<FileIdentity>> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+        let db_file = shared_db_file_read(&inner.db_file, cx).await?;
+        db_file.file_identity()
     }
 
     /// Propagate the connection's busy-timeout to the underlying VFS file so
     /// that `posix_lock` retries with backoff instead of returning BUSY
     /// immediately on cross-process contention.
-    pub fn set_vfs_busy_timeout_ms(&self, cx: &Cx, ms: u64) {
-        future::block_on(async {
-            let db_file = self
-                .inner
-                .lock()
-                .ok()
-                .map(|inner| Arc::clone(&inner.db_file));
-            if let Some(db_file) = db_file
-                && let Ok(mut db_file) = shared_db_file_write(&db_file, cx).await
-            {
-                db_file.set_busy_timeout_ms(ms);
-            }
-        });
+    pub async fn set_vfs_busy_timeout_ms(&self, cx: &Cx, ms: u64) {
+        let db_file = self
+            .inner
+            .lock()
+            .ok()
+            .map(|inner| Arc::clone(&inner.db_file));
+        if let Some(db_file) = db_file
+            && let Ok(mut db_file) = shared_db_file_write(&db_file, cx).await
+        {
+            db_file.set_busy_timeout_ms(ms);
+        }
     }
 
     /// Install a concrete WAL backend while preserving ownership on failure.
@@ -6925,22 +7877,19 @@ where
     /// Inspect a fully-written candidate database image without creating any
     /// SQLite sidecars. Callers should perform semantic validation first, then
     /// retain this receipt for identity/hash verification at publication.
-    pub fn inspect_database_image(
+    pub async fn inspect_database_image(
         &self,
         cx: &Cx,
         image_path: &Path,
     ) -> Result<DatabaseImageReceipt> {
-        future::block_on(async move {
-            let full_path = self.vfs.full_pathname(cx, image_path)?;
-            let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
-            let (mut file, _) = self.vfs.open(cx, Some(&full_path), flags)?;
-            let result =
-                database_image_receipt_for_open_file(cx, &file, Some(self.page_size())).await;
-            let close_result = file.close(cx);
-            let receipt = result?;
-            close_result?;
-            Ok(receipt)
-        })
+        let full_path = self.vfs.full_pathname(cx, image_path)?;
+        let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
+        let (mut file, _) = self.vfs.open(cx, Some(&full_path), flags)?;
+        let result = database_image_receipt_for_open_file(cx, &file, Some(self.page_size())).await;
+        let close_result = file.close(cx);
+        let receipt = result?;
+        close_result?;
+        Ok(receipt)
     }
 
     /// Inspect a private database image and prove that no recovery sidecar is
@@ -6951,14 +7900,14 @@ where
     /// digest closes the window in which a cooperating opener could switch a
     /// nominally complete main file into a WAL- or journal-backed generation
     /// without changing the main-file bytes themselves.
-    pub fn inspect_self_contained_database_image(
+    pub async fn inspect_self_contained_database_image(
         &self,
         cx: &Cx,
         image_path: &Path,
     ) -> Result<DatabaseImageReceipt> {
         let full_path = self.vfs.full_pathname(cx, image_path)?;
         self.ensure_vacuum_candidate_is_self_contained(cx, &full_path)?;
-        let receipt = self.inspect_database_image(cx, &full_path)?;
+        let receipt = self.inspect_database_image(cx, &full_path).await?;
         self.ensure_vacuum_candidate_is_self_contained(cx, &full_path)?;
         Ok(receipt)
     }
@@ -6971,22 +7920,7 @@ where
     /// complete page-1 image, durably syncs it, verifies that every byte outside
     /// offsets 24..28 and 92..96 is unchanged, and returns the final full-image
     /// receipt for later semantic validation and publication CAS.
-    pub fn restore_vacuum_candidate_change_counter(
-        &self,
-        cx: &Cx,
-        image_path: &Path,
-        provisional: &DatabaseImageReceipt,
-        change_counter: u32,
-    ) -> Result<DatabaseImageReceipt> {
-        future::block_on(self.restore_vacuum_candidate_change_counter_async(
-            cx,
-            image_path,
-            provisional,
-            change_counter,
-        ))
-    }
-
-    async fn restore_vacuum_candidate_change_counter_async(
+    pub async fn restore_vacuum_candidate_change_counter(
         &self,
         cx: &Cx,
         image_path: &Path,
@@ -7098,11 +8032,7 @@ where
     /// Capture the exact post-checkpoint source image used to build VACUUM's
     /// candidate. Publication later recomputes this logical digest under the
     /// same exclusive maintenance protocol and aborts if any page changed.
-    pub fn capture_vacuum_source_image(&self, cx: &Cx) -> Result<DatabaseImageReceipt> {
-        future::block_on(self.capture_vacuum_source_image_async(cx))
-    }
-
-    async fn capture_vacuum_source_image_async(&self, cx: &Cx) -> Result<DatabaseImageReceipt> {
+    pub async fn capture_vacuum_source_image(&self, cx: &Cx) -> Result<DatabaseImageReceipt> {
         self.with_exclusive_maintenance(cx, &mut (), |_, cx, inner, _| {
             Box::pin(async move {
                 let db_file = shared_db_file_read(&inner.db_file, cx).await?;
@@ -7138,20 +8068,7 @@ where
     /// recomputed from their original open handles inside the exclusive
     /// maintenance epoch before any durable source byte is changed.
     #[allow(clippy::too_many_lines)]
-    pub fn publish_validated_database_image(
-        &self,
-        cx: &Cx,
-        image_path: &Path,
-        source: &DatabaseImageReceipt,
-        candidate: &DatabaseImageReceipt,
-    ) -> Result<()> {
-        future::block_on(
-            self.publish_validated_database_image_async(cx, image_path, source, candidate),
-        )
-    }
-
-    #[allow(clippy::too_many_lines)]
-    async fn publish_validated_database_image_async(
+    pub async fn publish_validated_database_image(
         &self,
         cx: &Cx,
         image_path: &Path,
@@ -7690,11 +8607,7 @@ where
     ///
     /// The pager must be quiescent. In WAL mode we first checkpoint and
     /// truncate the WAL so the returned bytes contain the durable main image.
-    pub fn export_database_bytes(&self, cx: &Cx) -> Result<Vec<u8>> {
-        future::block_on(self.export_database_bytes_async(cx))
-    }
-
-    async fn export_database_bytes_async(&self, cx: &Cx) -> Result<Vec<u8>> {
+    pub async fn export_database_bytes(&self, cx: &Cx) -> Result<Vec<u8>> {
         let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let source_full = self.vfs.full_pathname(cx, &self.db_path)?;
@@ -7711,7 +8624,7 @@ where
         };
 
         if journal_mode == JournalMode::Wal {
-            self.checkpoint_async(cx, traits::CheckpointMode::Truncate)
+            self.checkpoint(cx, traits::CheckpointMode::Truncate)
                 .await?;
         }
 
@@ -7757,11 +8670,7 @@ where
     /// like `VACUUM INTO` and backup/canonicalization flows. The copy is only
     /// allowed when the pager is quiescent. In WAL mode we first checkpoint and
     /// truncate the WAL so the destination contains a self-contained main DB.
-    pub fn copy_database_to(&self, cx: &Cx, target_path: &Path) -> Result<()> {
-        future::block_on(self.copy_database_to_async(cx, target_path))
-    }
-
-    async fn copy_database_to_async(&self, cx: &Cx, target_path: &Path) -> Result<()> {
+    pub async fn copy_database_to(&self, cx: &Cx, target_path: &Path) -> Result<()> {
         let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let source_path = self.db_path.clone();
@@ -7786,7 +8695,7 @@ where
         };
 
         if journal_mode == JournalMode::Wal {
-            self.checkpoint_async(cx, traits::CheckpointMode::Truncate)
+            self.checkpoint(cx, traits::CheckpointMode::Truncate)
                 .await?;
         }
 
@@ -7880,11 +8789,7 @@ where
     /// This is used by upper layers that need a coherent published visibility
     /// snapshot before starting a new transaction or deciding whether a
     /// connection-local execution image is stale.
-    pub fn refresh_published_snapshot(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
-        future::block_on(self.refresh_published_snapshot_async(cx))
-    }
-
-    async fn refresh_published_snapshot_async(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
+    pub async fn refresh_published_snapshot(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
         let mut maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let mut inner = self
@@ -7930,11 +8835,11 @@ where
     /// required cross-process visibility probe; taking the database-file shared
     /// lock and probing the rollback journal only adds work to the hot read
     /// path.
-    pub fn refresh_published_snapshot_for_clean_wal_read(
+    pub async fn refresh_published_snapshot_for_clean_wal_read(
         &self,
         cx: &Cx,
     ) -> Result<PagerPublishedSnapshot> {
-        self.refresh_published_snapshot(cx)
+        self.refresh_published_snapshot(cx).await
     }
 
     /// Number of snapshot retries steady-state readers have taken.
@@ -8032,16 +8937,12 @@ where
     /// on every commit, so under MT-writer workloads it turned each
     /// post-commit poll into a global WAL RwLock write-contention
     /// point.
-    pub fn wal_frame_count(&self) -> usize {
-        let wal = self
-            .wal_backend
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().cloned());
-        let Some(wal) = wal else {
-            return 0;
-        };
-        wal.try_read().map_or(0, |wal| wal.frame_count())
+    pub async fn wal_frame_count(&self, cx: &Cx) -> usize {
+        with_wal_backend_read(&self.wal_backend, cx, |wal, _| {
+            Box::pin(async move { Ok(wal.frame_count()) })
+        })
+        .await
+        .unwrap_or(0)
     }
 
     /// Compute the journal path from the database path.
@@ -8407,26 +9308,7 @@ where
     /// successfully initialized connection.
     #[doc(hidden)]
     #[allow(clippy::too_many_lines)]
-    pub fn open_for_connection_with_cx_and_page_buffer_max(
-        cx: &Cx,
-        vfs: V,
-        path: &Path,
-        requested_page_size: PageSize,
-        page_buffer_max: Option<usize>,
-        mode: ConnectionPagerOpenMode,
-    ) -> Result<Self> {
-        future::block_on(Self::open_for_connection_with_cx_and_page_buffer_max_async(
-            cx,
-            vfs,
-            path,
-            requested_page_size,
-            page_buffer_max,
-            mode,
-        ))
-    }
-
-    #[allow(clippy::too_many_lines)]
-    async fn open_for_connection_with_cx_and_page_buffer_max_async(
+    pub async fn open_for_connection_with_cx_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
         path: &Path,
@@ -8506,13 +9388,13 @@ where
     /// If a hot journal is detected (leftover from a crash), it is replayed
     /// to restore the database to a consistent state before returning.
     #[allow(clippy::too_many_lines)]
-    pub fn open_with_cx(
+    pub async fn open_with_cx(
         cx: &Cx,
         vfs: V,
         path: &Path,
         requested_page_size: PageSize,
     ) -> Result<Self> {
-        Self::open_with_cx_and_page_buffer_max(cx, vfs, path, requested_page_size, None)
+        Self::open_with_cx_and_page_buffer_max(cx, vfs, path, requested_page_size, None).await
     }
 
     /// Like [`open_with_cx`](Self::open_with_cx) but allows overriding the
@@ -8522,14 +9404,14 @@ where
     /// uses that value directly, `None` checks the `FSQLITE_PAGE_BUFFER_MAX`
     /// env var, then falls back to [`crate::DEFAULT_PAGE_BUFFER_MAX`] (262 144).
     #[allow(clippy::too_many_lines)]
-    pub fn open_with_cx_and_page_buffer_max(
+    pub async fn open_with_cx_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
         path: &Path,
         requested_page_size: PageSize,
         page_buffer_max: Option<usize>,
     ) -> Result<Self> {
-        future::block_on(Self::open_readwrite_with_cx_and_page_buffer_max(
+        Self::open_readwrite_with_cx_and_page_buffer_max(
             cx,
             vfs,
             path,
@@ -8540,7 +9422,8 @@ where
                 expected_identity: None,
                 finish_namespace_bootstrap: true,
             },
-        ))
+        )
+        .await
     }
 
     /// Initialize a caller-reserved empty file only if the opened VFS handle
@@ -8551,7 +9434,7 @@ where
     /// pre-existing rollback journal, WAL, WAL-FEC, or shared-memory sidecar.
     /// The identity and sidecar checks precede database initialization, and
     /// this path never performs recovery.
-    pub fn open_reserved_with_cx_and_page_buffer_max(
+    pub async fn open_reserved_with_cx_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
         path: &Path,
@@ -8559,7 +9442,7 @@ where
         expected_identity: FileIdentity,
         page_buffer_max: Option<usize>,
     ) -> Result<Self> {
-        future::block_on(Self::open_readwrite_with_cx_and_page_buffer_max(
+        Self::open_readwrite_with_cx_and_page_buffer_max(
             cx,
             vfs,
             path,
@@ -8570,7 +9453,8 @@ where
                 expected_identity: Some(expected_identity),
                 finish_namespace_bootstrap: true,
             },
-        ))
+        )
+        .await
     }
 
     /// Open an existing database for reading and writing without creating or
@@ -8582,7 +9466,7 @@ where
     /// When `expected_identity` is present, it is compared with the identity
     /// of the already-open VFS handle before any file read or recovery action.
     #[allow(clippy::too_many_lines)]
-    pub fn open_existing_with_cx_and_page_buffer_max(
+    pub async fn open_existing_with_cx_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
         path: &Path,
@@ -8590,7 +9474,7 @@ where
         expected_identity: Option<FileIdentity>,
         page_buffer_max: Option<usize>,
     ) -> Result<Self> {
-        future::block_on(Self::open_readwrite_with_cx_and_page_buffer_max(
+        Self::open_readwrite_with_cx_and_page_buffer_max(
             cx,
             vfs,
             path,
@@ -8601,7 +9485,8 @@ where
                 expected_identity,
                 finish_namespace_bootstrap: true,
             },
-        ))
+        )
+        .await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -9154,13 +10039,14 @@ where
     /// minutes, because it avoids the expensive freelist scan and journal
     /// recovery that the read-write path performs.
     #[allow(clippy::too_many_lines)]
-    pub fn open_readonly_with_cx(
+    pub async fn open_readonly_with_cx(
         cx: &Cx,
         vfs: V,
         path: &Path,
         _requested_page_size: PageSize,
     ) -> Result<Self> {
         Self::open_readonly_with_cx_and_page_buffer_max(cx, vfs, path, _requested_page_size, None)
+            .await
     }
 
     /// Like [`open_readonly_with_cx`](Self::open_readonly_with_cx) but allows
@@ -9168,14 +10054,14 @@ where
     ///
     /// See [`open_with_cx_and_page_buffer_max`](Self::open_with_cx_and_page_buffer_max)
     /// for parameter semantics.
-    pub fn open_readonly_with_cx_and_page_buffer_max(
+    pub async fn open_readonly_with_cx_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
         path: &Path,
         _requested_page_size: PageSize,
         page_buffer_max: Option<usize>,
     ) -> Result<Self> {
-        future::block_on(Self::open_readonly_with_optional_expected_identity(
+        Self::open_readonly_with_optional_expected_identity(
             cx,
             vfs,
             path,
@@ -9183,7 +10069,8 @@ where
             None,
             page_buffer_max,
             true,
-        ))
+        )
+        .await
     }
 
     /// Open an existing database read-only only if its VFS handle has
@@ -9191,7 +10078,7 @@ where
     ///
     /// The identity-bound VFS open occurs before the header or any live-WAL
     /// sidecar is inspected.
-    pub fn open_readonly_with_expected_identity_and_page_buffer_max(
+    pub async fn open_readonly_with_expected_identity_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
         path: &Path,
@@ -9199,7 +10086,7 @@ where
         expected_identity: FileIdentity,
         page_buffer_max: Option<usize>,
     ) -> Result<Self> {
-        future::block_on(Self::open_readonly_with_optional_expected_identity(
+        Self::open_readonly_with_optional_expected_identity(
             cx,
             vfs,
             path,
@@ -9207,7 +10094,8 @@ where
             Some(expected_identity),
             page_buffer_max,
             true,
-        ))
+        )
+        .await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -9461,9 +10349,9 @@ where
     /// Open (or create) a database and return a pager using a detached test context.
     #[cfg(test)]
     #[allow(clippy::too_many_lines)]
-    pub fn open(vfs: V, path: &Path, page_size: PageSize) -> Result<Self> {
+    pub async fn open(vfs: V, path: &Path, page_size: PageSize) -> Result<Self> {
         let cx = Cx::new();
-        Self::open_with_cx(&cx, vfs, path, page_size)
+        Self::open_with_cx(&cx, vfs, path, page_size).await
     }
 
     /// Replay a hot journal by writing original pages back to the database.
@@ -11250,7 +12138,7 @@ fn cleanup_child_cx(cx: &Cx) -> Cx {
 impl<V> SimpleTransaction<V>
 where
     V: Vfs + Send,
-    V::File: Send + Sync,
+    V::File: Send + Sync + 'static,
 {
     async fn invalidate_journal_after_commit(cx: &Cx, journal_file: &mut V::File) -> Result<()> {
         durable_invalidate_journal(cx, journal_file, JournalInvalidation::ZeroMagic).await
@@ -11671,7 +12559,7 @@ where
         cx: &Cx,
         wal_backend: &SharedWalBackend,
         inner_arc: &Arc<Mutex<PagerInner<V::File>>>,
-        published: Option<&PublishedPagerState>,
+        published: Option<Arc<PublishedPagerState>>,
         current_db_size: u32,
         sync_policy: WalCommitSyncPolicy,
         write_set: &HashMap<PageNumber, StagedPage, S>,
@@ -11681,6 +12569,15 @@ where
         queue: &GroupCommitQueueRef,
         publication_authorization: &mut Option<ParallelWalPublicationAuthorization>,
     ) -> Result<()> {
+        // A prior flusher may have been dropped while the shared database-file
+        // handle was contended. The next commit is an existing structured
+        // owner for that cleanup; it must restore the external lock before it
+        // submits another physical-write obligation.
+        while queue.resolve_one_pending_external_unlock().await? {}
+        if queue.has_unresolved_in_doubt_epoch() {
+            return Err(FrankenError::BusyRecovery);
+        }
+
         let detailed_metrics = detailed_consolidation_metrics_enabled();
         let lane_staging_debug_enabled =
             tracing::enabled!(target: "fsqlite::wal::lane_staging", tracing::Level::DEBUG);
@@ -12074,6 +12971,19 @@ where
                     flatten_group_commit_batches(flush_base_db_size, &batches);
                 debug_assert_eq!(final_db_size, consolidated_db_size);
                 let frame_count = frame_refs.len();
+                let wal_frame_payload_digest = {
+                    let mut digest = ParallelWalFramePayloadDigestBuilder::new();
+                    for frame in &frame_refs {
+                        let page_number = PageNumber::new(frame.page_number).ok_or_else(|| {
+                            FrankenError::internal(format!(
+                                "group commit contains invalid WAL page number {}",
+                                frame.page_number
+                            ))
+                        })?;
+                        digest.update(page_number, frame.db_size_if_commit, frame.page_data);
+                    }
+                    digest.finalize()
+                };
                 let mut fallback_reason = if matches!(
                     parallel_wal_control.mode,
                     ParallelWalOperatingMode::Conservative
@@ -12209,19 +13119,39 @@ where
                 let mut frames_written_start: u64 = 0;
                 let mut frames_written_end: u64 = 0;
                 let mut fsync_seq: u64 = 0;
-                let mut initial_visible_commit_seq = CommitSeq::ZERO;
-                let mut checkpoint_active = false;
-
                 for attempt in 0..MAX_FLUSH_RETRIES {
                     let t_inner_lock_start = phase_timing.then(Instant::now);
-                    flush_result = async {
-                        let mut inner = inner_arc.lock().map_err(|_| {
+                    let (
+                        db_file,
+                        restore_lock_level,
+                        publication_journal_mode,
+                        publication_freelist_count,
+                        initial_visible_commit_seq,
+                        checkpoint_active,
+                    ) = {
+                        let inner = inner_arc.lock().map_err(|_| {
                             FrankenError::internal("SimpleTransaction lock poisoned")
                         })?;
                         inner_lock_wait_us = elapsed_profile_us(t_inner_lock_start);
-                        initial_visible_commit_seq = inner.commit_seq;
-                        checkpoint_active = inner.checkpoint_active;
-
+                        (
+                            Arc::clone(&inner.db_file),
+                            if inner.writer_active {
+                                // Immediate/exclusive transactions enter commit
+                                // already owning RESERVED. If WAL append fails,
+                                // the caller must keep that writer lock so a
+                                // retry or rollback cannot be interleaved by a
+                                // different writer.
+                                LockLevel::Reserved
+                            } else {
+                                LockLevel::Shared
+                            },
+                            inner.journal_mode,
+                            inner.freelist.len(),
+                            inner.commit_seq,
+                            inner.checkpoint_active,
+                        )
+                    };
+                    flush_result = async {
                         let t_excl_start = phase_timing.then(Instant::now);
                         // WAL appends need a cross-process writer gate, but
                         // they must not wait for every concurrent reader or
@@ -12229,18 +13159,18 @@ where
                         // main database file. SQLite's RESERVED byte is the
                         // narrow lock for this: one appender at a time, while
                         // peer SHARED holders keep running.
-                        shared_db_lock(&inner.db_file, cx, LockLevel::Reserved).await?;
+                        shared_db_lock(&db_file, cx, LockLevel::Reserved).await?;
+                        let mut db_lock_obligation = GroupCommitDbLockObligation::new(
+                            queue,
+                            flush_epoch,
+                            &db_file,
+                            cx,
+                            restore_lock_level,
+                            flush_obligation.durability_started_signal(),
+                            flush_obligation.durable_io_signal(),
+                            flush_obligation.external_lock_state(),
+                        );
                         exclusive_lock_us = elapsed_profile_us(t_excl_start);
-                        let restore_lock_level = if inner.writer_active {
-                            // Immediate/exclusive transactions enter commit
-                            // already owning RESERVED. If WAL append fails,
-                            // the caller must keep that writer lock so a
-                            // retry or rollback cannot be interleaved by a
-                            // different writer.
-                            LockLevel::Reserved
-                        } else {
-                            LockLevel::Shared
-                        };
 
                         let flush_io_result = async {
                             let backend = wal_backend_handle(wal_backend)?;
@@ -12291,104 +13221,167 @@ where
                                         .saturating_add(1);
                                 }
 
-                                let wal_ref = &mut *wal;
-                                let prepared_ref = &mut prepared_batch;
-                                let frame_refs_ref = &frame_refs;
-                                let append_frames_us_ref = &mut append_frames_us;
-                                let wal_append_us_ref = &mut wal_append_us;
-                                let wal_sync_us_ref = &mut wal_sync_us;
-                                let receipt = queue.record_persisted_epoch(
-                                    cx,
-                                    PersistedGroupCommitInput {
-                                        trace_id: cx.trace_id(),
-                                        epoch: flush_epoch,
-                                        batches: &batches,
-                                        frames_start: frames_written_start,
-                                        frames_end: frames_written_end,
-                                        fsync_seq,
-                                        initial_visible_commit_seq,
-                                        db_size_pages: final_db_size,
-                                        page_set_size: frame_count,
+                                let durability_started =
+                                    flush_obligation.durability_started_signal();
+                                let durable_io_signal = flush_obligation.durable_io_signal();
+                                let publication = queue
+                                    .prepare_persisted_epoch(
+                                        cx,
+                                        PersistedGroupCommitInput {
+                                            trace_id: cx.trace_id(),
+                                            epoch: flush_epoch,
+                                            batches: &batches,
+                                            frames_start: frames_written_start,
+                                            frames_end: frames_written_end,
+                                            fsync_seq,
+                                            initial_visible_commit_seq,
+                                            db_size_pages: final_db_size,
+                                            page_set_size: frame_count,
+                                            checkpoint_active,
+                                            fallback_reason,
+                                            authorized_seed,
+                                            wal_frame_payload_digest,
+                                        },
+                                    )
+                                    .await;
+                                let publication = match publication {
+                                    Ok(publication) => publication,
+                                    Err(error) => return Err(error),
+                                };
+                                let sidecar_completion =
+                                    Arc::new(Mutex::new(None::<VfsWriteCompletion>));
+                                let wal_completion =
+                                    Arc::new(Mutex::new(None::<VfsWriteCompletion>));
+                                let recovery =
+                                    Arc::new(PendingGroupCommitRecovery::<V::File> {
+                                        queue: Arc::clone(queue),
+                                        publication: Arc::clone(&publication),
+                                        wal_backend: Arc::clone(wal_backend),
+                                        inner: Arc::clone(inner_arc),
+                                        published: published.clone(),
+                                        batches: batches.clone(),
+                                        final_db_size,
+                                        publication_journal_mode,
+                                        publication_freelist_count,
                                         checkpoint_active,
-                                        fallback_reason,
-                                        authorized_seed,
-                                    },
-                                    move |certificate| async move {
-                                        match wal_ref.persist_parallel_wal_commit_certificate(
-                                            cx,
-                                            &certificate,
-                                            frames_written_start,
-                                            frames_written_end,
-                                            sync_policy.should_sync_on_commit(),
-                                        ).await {
-                                            Ok(()) => {}
-                                            #[cfg(test)]
-                                            Err(FrankenError::Unsupported) => {
-                                                // Pager unit-test backends are
-                                                // process-local fakes with no
-                                                // durable namespace. Production
-                                                // backends fail closed unless
-                                                // they implement the sidecar.
-                                            }
-                                            Err(error) => return Err(error),
-                                        }
+                                        sync: sync_policy.should_sync_on_commit(),
+                                        sidecar_completion: Arc::clone(&sidecar_completion),
+                                        wal_completion: Arc::clone(&wal_completion),
+                                        cleanup_cx: cleanup_child_cx(cx),
+                                        durability_started: Arc::clone(&durability_started),
+                                        durable_io_completed: Arc::clone(&durable_io_signal),
+                                        resolution: Mutex::new(None),
+                                    });
+                                let recovery_operation: Arc<
+                                    dyn PendingGroupCommitRecoveryOperation,
+                                > = recovery.clone();
 
-                                        let t_append_frames_start =
-                                            detailed_metrics.then(Instant::now);
-                                        if let Some(prepared) = prepared_ref.as_mut() {
-                                            wal_ref.append_prepared_frames(cx, prepared).await?;
-                                        } else {
-                                            wal_ref.append_frames(cx, frame_refs_ref).await?;
-                                        }
-                                        *append_frames_us_ref =
-                                            elapsed_profile_us(t_append_frames_start);
-                                        *wal_append_us_ref = *append_frames_us_ref;
-                                        let actual_frames_written_end =
-                                            u64::try_from(wal_ref.frame_count()).unwrap_or(u64::MAX);
-                                        if actual_frames_written_end != frames_written_end {
-                                            return Err(FrankenError::internal(format!(
-                                                "parallel WAL certificate covers frames {frames_written_start}..={frames_written_end}, append ended at {actual_frames_written_end}"
-                                            )));
-                                        }
+                                if cx.checkpoint().is_err() {
+                                    publication.abort()?;
+                                    return Err(FrankenError::Abort);
+                                }
+                                db_lock_obligation.set_recovery(recovery_operation);
+                                let durability_cx = cleanup_child_cx(cx);
+                                let _durability_mask = durability_cx.masked();
 
-                                        if sync_policy.should_sync_on_commit() {
-                                            let t_sync_start = phase_timing.then(Instant::now);
-                                            wal_ref.sync(cx)?;
-                                            *wal_sync_us_ref = elapsed_profile_us(t_sync_start);
-                                            GLOBAL_CONSOLIDATION_METRICS
-                                                .fsyncs_total
-                                                .fetch_add(1, AtomicOrdering::Relaxed);
-                                        }
-                                        #[cfg(any(test, feature = "fault-injection"))]
-                                        crate::fault_hooks::maybe_inject_after_flush_before_publish(
-                                            flush_epoch,
-                                            batch_count,
-                                            frame_count,
-                                        )?;
-                                        Ok(())
-                                    },
-                                ).await?;
-                            drop(wal_guard);
-                            if let Some(published) = published {
-                                published.publish_parallel_wal_group(
-                                    cx,
-                                    PublishedPagerUpdate {
-                                        visible_commit_seq: receipt.certificate.commit_seq_hi,
-                                        db_size: final_db_size,
-                                        journal_mode: inner.journal_mode,
-                                        freelist_count: inner.freelist.len(),
-                                        checkpoint_active,
-                                    },
-                                    &batches,
+                                let certificate = publication.certificate()?;
+                                let certificate_completion = VfsWriteCompletion::new();
+                                *sidecar_completion
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(certificate_completion.clone());
+                                durability_started.store(true, AtomicOrdering::Release);
+                                match wal
+                                    .persist_parallel_wal_commit_certificate_tracked(
+                                        &durability_cx,
+                                        &certificate,
+                                        frames_written_start,
+                                        frames_written_end,
+                                        sync_policy.should_sync_on_commit(),
+                                        certificate_completion.clone(),
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {}
+                                    #[cfg(test)]
+                                    Err(FrankenError::Unsupported) => {
+                                        // Process-local unit backends have no
+                                        // sidecar namespace. Their successful
+                                        // in-process path remains test-only.
+                                        certificate_completion.complete_success();
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+
+                                let frame_completion = VfsWriteCompletion::new();
+                                *wal_completion
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(frame_completion.clone());
+                                let t_append_frames_start =
+                                    detailed_metrics.then(Instant::now);
+                                if let Some(prepared) = prepared_batch.as_mut() {
+                                    wal.append_prepared_frames_tracked(
+                                        &durability_cx,
+                                        prepared,
+                                        frame_completion,
+                                    )
+                                    .await?;
+                                } else {
+                                    wal.append_frames_tracked(
+                                        &durability_cx,
+                                        &frame_refs,
+                                        frame_completion,
+                                    )
+                                    .await?;
+                                }
+                                append_frames_us =
+                                    elapsed_profile_us(t_append_frames_start);
+                                wal_append_us = append_frames_us;
+                                let actual_frames_written_end =
+                                    u64::try_from(wal.frame_count()).unwrap_or(u64::MAX);
+                                if actual_frames_written_end != frames_written_end {
+                                    return Err(FrankenError::internal(format!(
+                                        "parallel WAL certificate covers frames {frames_written_start}..={frames_written_end}, append ended at {actual_frames_written_end}"
+                                    )));
+                                }
+
+                                if sync_policy.should_sync_on_commit() {
+                                    let t_sync_start = phase_timing.then(Instant::now);
+                                    wal.sync(&durability_cx)?;
+                                    wal_sync_us = elapsed_profile_us(t_sync_start);
+                                    GLOBAL_CONSOLIDATION_METRICS
+                                        .fsyncs_total
+                                        .fetch_add(1, AtomicOrdering::Relaxed);
+                                }
+                                drop(wal_guard);
+                                recovery.complete_authorized(&durability_cx)?;
+                                #[cfg(any(test, feature = "fault-injection"))]
+                                crate::fault_hooks::maybe_inject_after_flush_before_publish(
+                                    flush_epoch,
+                                    batch_count,
+                                    frame_count,
                                 )?;
-                            }
-                            inner.db_size = final_db_size;
-                            Ok(())
+                                Ok(())
                         }
                         .await;
 
-                        let restore_result =
-                            shared_db_unlock(&inner.db_file, cx, restore_lock_level).await;
+                        if flush_io_result.is_err()
+                            && flush_obligation.durability_state()
+                                == GroupCommitFlushDurability::InDoubt
+                        {
+                            // A terminal callback error does not prove that a
+                            // completed WAL marker was never written. Keep
+                            // RESERVED fail-closed and let the lock obligation
+                            // transfer ownership to the queue on Drop.
+                            return flush_io_result;
+                        }
+
+                        // Lock restoration is mandatory even when the caller
+                        // was cancelled. In particular, once the flush is
+                        // durable, cancellation must not strand RESERVED or
+                        // turn the completed epoch into Abort.
+                        let restore_result = db_lock_obligation.restore().await;
                         match (flush_io_result, restore_result) {
                             (Ok(()), Ok(())) => Ok(()),
                             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -12401,6 +13394,12 @@ where
                     }
                     .await;
 
+                    if flush_obligation.durability_state() == GroupCommitFlushDurability::InDoubt {
+                        // An in-doubt physical writer is never retryable: a
+                        // retry could append a second copy while the first
+                        // callback's bytes remain unresolved.
+                        break;
+                    }
                     match &flush_result {
                         Err(
                             FrankenError::Busy
@@ -12417,6 +13416,50 @@ where
                         }
                         _ => break,
                     }
+                }
+
+                if flush_result.is_err()
+                    && flush_obligation.durability_state() == GroupCommitFlushDurability::InDoubt
+                {
+                    let error =
+                        flush_result.expect_err("in-doubt group-commit branch requires an error");
+                    tracing::error!(
+                        epoch = flush_epoch,
+                        %error,
+                        "group-commit callback failed after durable mutation started; retaining RESERVED and leaving epoch FLUSHING"
+                    );
+                    // Do not publish a failed epoch or abort FLUSHING. Dropping
+                    // the outer obligation observes the queued external-lock
+                    // owner and defers resolution to durable reconciliation.
+                    return Err(error);
+                }
+
+                if flush_result.is_err() && flush_obligation.is_durable() {
+                    let error = flush_result
+                        .expect_err("durable group-commit failure branch requires an error");
+                    let (completed_epoch, has_promoted) = {
+                        let mut consolidator = queue
+                            .consolidator
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let promoted = consolidator.complete_flush()?;
+                        (consolidator.epoch(), promoted)
+                    };
+                    let caller_target_completed = completed_epoch >= target_epoch;
+                    queue.publish_completed_epoch(
+                        completed_epoch,
+                        has_promoted && caller_target_completed,
+                    );
+                    flush_obligation.disarm();
+                    tracing::error!(
+                        epoch = flush_epoch,
+                        %error,
+                        "durable group-commit epoch completed despite local publication or lock-restoration failure"
+                    );
+                    if flush_epoch != target_epoch {
+                        return Ok(());
+                    }
+                    return Err(error);
                 }
 
                 match flush_result {
@@ -12968,10 +14011,14 @@ async fn release_retained_snapshot_after_txn_exit<F: VfsFile>(
 impl<V> TransactionHandle for SimpleTransaction<V>
 where
     V: Vfs + Send,
-    V::File: Send + Sync,
+    V::File: Send + Sync + 'static,
 {
-    fn get_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
-        future::block_on(async move {
+    fn get_page<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a {
+        async move {
             if self.contains_freed_page(page_no) {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -13180,7 +14227,7 @@ where
                 .borrow_mut()
                 .insert(page_no, page.clone());
             Ok(page)
-        })
+        }
     }
 
     fn prefetch_page_hint(&self, _cx: &Cx, page_no: PageNumber) {
@@ -13203,8 +14250,13 @@ where
         self.cache.prefetch_page_hint(page_no);
     }
 
-    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-        future::block_on(async move {
+    fn write_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
             self.ensure_writer(cx).await?;
 
             // Fast path: a second (or Nth) write to the same page within the
@@ -13234,11 +14286,16 @@ where
                 staged,
             );
             Ok(())
-        })
+        }
     }
 
-    fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
-        future::block_on(async move {
+    fn write_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
             self.ensure_writer(cx).await?;
 
             // Same-page steal fast path (see `write_page`). If the existing staged
@@ -13275,7 +14332,7 @@ where
                 staged,
             );
             Ok(())
-        })
+        }
     }
 
     fn try_take_staged_page_data(&mut self, page_no: PageNumber) -> Option<PageData> {
@@ -13310,13 +14367,13 @@ where
         true
     }
 
-    fn restore_staged_page_data(
-        &mut self,
-        cx: &Cx,
+    fn restore_staged_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
         page_no: PageNumber,
         data: PageData,
-    ) -> Result<()> {
-        future::block_on(async move {
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
             self.ensure_writer(cx).await?;
             let staged = StagedPage::from_page_data_with_cache_recovery(
                 &self.pool,
@@ -13333,11 +14390,14 @@ where
                 staged,
             );
             Ok(())
-        })
+        }
     }
 
-    fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
-        future::block_on(async move {
+    fn allocate_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> impl Future<Output = Result<PageNumber>> + 'a {
+        async move {
             self.ensure_writer(cx).await?;
 
             // ── Local lease fast path ──────────────────────────────────────
@@ -13433,11 +14493,15 @@ where
             })?;
             self.allocated_from_eof.push(page);
             Ok(page)
-        })
+        }
     }
 
-    fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-        future::block_on(async move {
+    fn free_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
             self.ensure_writer(cx).await?;
             if page_no == PageNumber::ONE {
                 return Err(FrankenError::OutOfRange {
@@ -13453,14 +14517,24 @@ where
                 remove_page_sorted(&mut self.write_pages_sorted, page_no);
             }
             Ok(())
-        })
+        }
     }
 
     #[allow(clippy::too_many_lines)]
-    fn commit(&mut self, cx: &Cx) -> Result<()> {
-        future::block_on(async move {
+    fn commit<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
+        async move {
             if self.finished {
                 return Ok(());
+            }
+            // Rollback/close is another structured owner for a lock
+            // restoration stranded by a dropped commit future.
+            while self
+                .group_commit_queue
+                .resolve_one_pending_external_unlock()
+                .await?
+            {}
+            if self.group_commit_queue.has_unresolved_in_doubt_epoch() {
+                return Err(FrankenError::BusyRecovery);
             }
             self.validate_namespace_binding()?;
             if !self.is_writer {
@@ -13713,7 +14787,7 @@ where
                     cx,
                     &self.wal_backend,
                     &self.inner,
-                    Some(self.published.as_ref()),
+                    Some(Arc::clone(&self.published)),
                     wal_current_db_size,
                     wal_sync_policy,
                     &self.write_set,
@@ -13996,21 +15070,40 @@ where
                 return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                 drop(inner);
             }
-            commit_result
-        })
+            match commit_result {
+                Ok(()) => Ok(()),
+                Err(commit_error) => {
+                    // A failed rollback-journal commit may have changed durable
+                    // database pages after making the pre-image journal hot.
+                    // Finish that recovery epoch before the async commit future
+                    // resolves so callers never observe a half-published image
+                    // and Drop does not need to block an executor.
+                    let cleanup_cx = self.cleanup_cx.clone();
+                    let _cleanup_mask = cleanup_cx.masked();
+                    if let Err(recovery_error) =
+                        self.recover_pending_rollback_journal(&cleanup_cx).await
+                    {
+                        return Err(FrankenError::internal(format!(
+                            "commit failed and rollback-journal recovery did not complete: commit={commit_error}; recovery={recovery_error}"
+                        )));
+                    }
+                    Err(commit_error)
+                }
+            }
+        }
     }
 
-    fn commit_and_retain(&mut self, cx: &Cx) -> Result<bool> {
-        future::block_on(async move {
+    fn commit_and_retain<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<bool>> + 'a {
+        async move {
             // Only supported for in-memory pagers where we can skip I/O.
             if !self.vfs.is_memory() {
-                self.commit(cx)?;
+                self.commit(cx).await?;
                 return Ok(false);
             }
 
             // If not a writer or no pending writes, just commit normally.
             if !self.is_writer || !self.has_pending_writes() {
-                self.commit(cx)?;
+                self.commit(cx).await?;
                 return Ok(false);
             }
 
@@ -14175,7 +15268,7 @@ where
                         cx,
                         &self.wal_backend,
                         &self.inner,
-                        Some(self.published.as_ref()),
+                        Some(Arc::clone(&self.published)),
                         wal_current_db_size,
                         wal_sync_policy,
                         &self.write_set,
@@ -14357,7 +15450,7 @@ where
                 commit_result?;
                 unreachable!()
             }
-        })
+        }
     }
 
     fn is_writer(&self) -> bool {
@@ -14472,8 +15565,8 @@ where
         Ok(self.write_page_requires_page_one_conflict_tracking_with_inner(&inner, page_no))
     }
 
-    fn rollback(&mut self, cx: &Cx) -> Result<()> {
-        future::block_on(async move {
+    fn rollback<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
+        async move {
             if self.finished {
                 return Ok(());
             }
@@ -14592,7 +15685,7 @@ where
             // carry across transaction boundaries.
             self.scratch_arena.reset();
             Ok(())
-        })
+        }
     }
 
     fn record_write_witness(&mut self, _cx: &Cx, _key: fsqlite_types::WitnessKey) {}
@@ -14742,12 +15835,20 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
         if self.finished {
             return;
         }
+        if let Err(error) = self
+            .group_commit_queue
+            .try_resolve_one_pending_external_unlock()
+        {
+            tracing::error!(
+                %error,
+                "transaction drop could not claim a pending group-commit external unlock"
+            );
+        }
         let mut notify_writer_idle = false;
-        // Drop is the last fail-safe after a caller abandons a failed commit.
-        // Keep recovery and lock release alive even if that caller's context
-        // was cancelled while the journal was hot. The pager-facing contract
-        // is deliberately synchronous until the B-tree/VDBE async migration
-        // lands atomically, so Drop must not defer recovery to a later epoch.
+        // Drop is the last synchronous fail-safe after a caller abandons a
+        // transaction. A hot journal stays marked pending for the pager's next
+        // explicit async recovery epoch; Drop only restores in-memory state and
+        // releases the already-held snapshot lock without blocking an executor.
         let cleanup_cx = self.cleanup_cx.clone();
         let _cleanup_mask = cleanup_cx.masked();
         let recovery_was_pending = self
@@ -14759,31 +15860,13 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
                     && inner.rollback_journal_recovery_state.is_pending()
             })
             .unwrap_or(false);
-        let restored_from_journal = if recovery_was_pending {
-            match future::block_on(self.recover_pending_rollback_journal(&cleanup_cx)) {
-                Ok(restored) => restored,
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        "drop-time recovery could not finish the pending rollback journal"
-                    );
-                    false
-                }
-            }
-        } else {
-            false
-        };
+        if recovery_was_pending {
+            tracing::warn!(
+                "drop left a pending rollback journal for the pager's next recovery epoch"
+            );
+        }
         if let Ok(mut inner) = self.inner.lock() {
-            if restored_from_journal {
-                // The refreshed durable freelist is authoritative; transaction
-                // allocations belong to the discarded candidate image.
-                self.allocated_from_freelist.clear();
-                self.allocated_from_eof.clear();
-                self.page_lease.clear();
-                if self.mode != TransactionMode::Concurrent {
-                    notify_writer_idle = release_single_writer_baton(&mut inner);
-                }
-            } else if recovery_was_pending {
+            if recovery_was_pending {
                 // Never merge transaction-local allocation state into an
                 // image whose recovery failed. Keep Pending set so every
                 // subsequent begin retries or fails closed.
@@ -14828,24 +15911,39 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
             let preserve_level =
                 retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
-            match inner.db_file.try_write() {
-                Ok(mut db_file) => {
-                    let release_result = if inner.active_transactions == 0 {
-                        db_file.unlock_external_shared_snapshot(&cleanup_cx)
-                    } else {
-                        db_file.unlock(&cleanup_cx, preserve_level)
-                    };
-                    if let Err(error) = release_result {
-                        tracing::error!(
-                            %error,
-                            "drop-time transaction snapshot lock release failed"
-                        );
+            let pending_restore_target = if inner.active_transactions == 0 {
+                PendingExternalUnlockTarget::ExternalSnapshot
+            } else {
+                PendingExternalUnlockTarget::LockLevel(preserve_level)
+            };
+            let handed_off_unlock = self
+                .group_commit_queue
+                .handoff_transaction_unlock_to_in_doubt_owner(pending_restore_target);
+            if handed_off_unlock {
+                tracing::warn!(
+                    restore_target = ?pending_restore_target,
+                    "transaction Drop transferred its final lock transition to an in-doubt group-commit owner"
+                );
+            } else {
+                match inner.db_file.try_write() {
+                    Ok(mut db_file) => {
+                        let release_result = if inner.active_transactions == 0 {
+                            db_file.unlock_external_shared_snapshot(&cleanup_cx)
+                        } else {
+                            db_file.unlock(&cleanup_cx, preserve_level)
+                        };
+                        if let Err(error) = release_result {
+                            tracing::error!(
+                                %error,
+                                "drop-time transaction snapshot lock release failed"
+                            );
+                        }
                     }
+                    Err(error) => tracing::error!(
+                        %error,
+                        "drop-time transaction snapshot lock was still in use"
+                    ),
                 }
-                Err(error) => tracing::error!(
-                    %error,
-                    "drop-time transaction snapshot lock was still in use"
-                ),
             }
         }
         if notify_writer_idle {
@@ -15131,15 +16229,7 @@ where
     /// to `FULL` so we never reset or truncate WAL based on incomplete reader
     /// visibility. For incremental, reader-aware checkpointing, use the
     /// lower-level WAL backend API.
-    pub fn checkpoint(
-        &self,
-        cx: &Cx,
-        mode: traits::CheckpointMode,
-    ) -> Result<traits::CheckpointResult> {
-        future::block_on(self.checkpoint_async(cx, mode))
-    }
-
-    async fn checkpoint_async(
+    pub async fn checkpoint(
         &self,
         cx: &Cx,
         mode: traits::CheckpointMode,
@@ -16011,18 +17101,22 @@ mod tests {
     }
 
     impl crate::traits::WalBackend for DropAwareWalBackend {
-        fn append_frame(
-            &mut self,
-            _cx: &Cx,
+        fn append_frame<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             _page_number: u32,
-            _page_data: &[u8],
+            _page_data: &'a [u8],
             _db_size_if_commit: u32,
-        ) -> Result<()> {
-            Ok(())
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
         }
 
-        fn read_page(&mut self, _cx: &Cx, _page_number: u32) -> Result<Option<Vec<u8>>> {
-            Ok(None)
+        fn read_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _page_number: u32,
+        ) -> WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async { Ok(None) })
         }
 
         fn sync(&mut self, _cx: &Cx) -> Result<()> {
@@ -16033,21 +17127,23 @@ mod tests {
             0
         }
 
-        fn checkpoint(
-            &mut self,
-            _cx: &Cx,
+        fn checkpoint<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             _mode: crate::traits::CheckpointMode,
-            _writer: &mut dyn crate::traits::CheckpointPageWriter,
+            _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
             _backfilled_frames: u32,
             _oldest_reader_frame: Option<u32>,
-        ) -> Result<crate::traits::CheckpointResult> {
-            Ok(crate::traits::CheckpointResult {
-                total_frames: 0,
-                frames_backfilled: 0,
-                completed: false,
-                wal_was_reset: false,
-                requested_mode: _mode,
-                effective_mode: _mode,
+        ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+            Box::pin(async move {
+                Ok(crate::traits::CheckpointResult {
+                    total_frames: 0,
+                    frames_backfilled: 0,
+                    completed: false,
+                    wal_was_reset: false,
+                    requested_mode: _mode,
+                    effective_mode: _mode,
+                })
             })
         }
     }
@@ -16283,11 +17379,21 @@ mod tests {
             result
         }
 
-        fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        fn read<'a>(
+            &'a self,
+            cx: &'a Cx,
+            buf: &'a mut [u8],
+            offset: u64,
+        ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
             self.inner.read(cx, buf, offset)
         }
 
-        fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        fn write<'a>(
+            &'a self,
+            cx: &'a Cx,
+            buf: &'a [u8],
+            offset: u64,
+        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
             self.inner.write(cx, buf, offset)
         }
 
@@ -16521,11 +17627,21 @@ mod tests {
             result
         }
 
-        fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        fn read<'a>(
+            &'a self,
+            cx: &'a Cx,
+            buf: &'a mut [u8],
+            offset: u64,
+        ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
             self.inner.read(cx, buf, offset)
         }
 
-        fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        fn write<'a>(
+            &'a self,
+            cx: &'a Cx,
+            buf: &'a [u8],
+            offset: u64,
+        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
             self.inner.write(cx, buf, offset)
         }
 
@@ -16718,27 +17834,39 @@ mod tests {
             self.inner.close(cx)
         }
 
-        fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        fn read<'a>(
+            &'a self,
+            cx: &'a Cx,
+            buf: &'a mut [u8],
+            offset: u64,
+        ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
             self.inner.read(cx, buf, offset)
         }
 
-        fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-            if self.is_target_db {
-                let mut state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if state.armed {
-                    if state.remaining_successful_db_writes == 0 {
-                        state.armed = false;
-                        return Err(FrankenError::Io(std::io::Error::other(
-                            "simulated main-db write failure",
-                        )));
+        fn write<'a>(
+            &'a self,
+            cx: &'a Cx,
+            buf: &'a [u8],
+            offset: u64,
+        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+            async move {
+                if self.is_target_db {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if state.armed {
+                        if state.remaining_successful_db_writes == 0 {
+                            state.armed = false;
+                            return Err(FrankenError::Io(std::io::Error::other(
+                                "simulated main-db write failure",
+                            )));
+                        }
+                        state.remaining_successful_db_writes -= 1;
                     }
-                    state.remaining_successful_db_writes -= 1;
                 }
+                self.inner.write(cx, buf, offset).await
             }
-            self.inner.write(cx, buf, offset)
         }
 
         fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
@@ -16922,37 +18050,51 @@ mod tests {
             self.inner.file_identity()
         }
 
-        fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        fn read<'a>(
+            &'a self,
+            cx: &'a Cx,
+            buf: &'a mut [u8],
+            offset: u64,
+        ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
             self.inner.read(cx, buf, offset)
         }
 
-        fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-            let mut corrupted = None;
-            if self.is_target_journal && offset == 0 {
-                let mut state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if state.armed {
-                    if state.plan.ignore_zero_magic_write
-                        && buf.len() == JOURNAL_MAGIC.len()
-                        && buf.iter().all(|byte| *byte == 0)
-                    {
-                        return Ok(());
-                    }
-                    if buf.starts_with(&JOURNAL_MAGIC) {
-                        state.hot_header_writes = state.hot_header_writes.saturating_add(1);
-                        if state.plan.corrupt_hot_header_restore && state.hot_header_writes == 2 {
-                            let mut damaged = buf.to_vec();
-                            damaged[crate::journal::JOURNAL_HEADER_SIZE] ^= 0x80;
-                            corrupted = Some(damaged);
+        fn write<'a>(
+            &'a self,
+            cx: &'a Cx,
+            buf: &'a [u8],
+            offset: u64,
+        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+            async move {
+                let mut corrupted = None;
+                if self.is_target_journal && offset == 0 {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if state.armed {
+                        if state.plan.ignore_zero_magic_write
+                            && buf.len() == JOURNAL_MAGIC.len()
+                            && buf.iter().all(|byte| *byte == 0)
+                        {
+                            return Ok(());
+                        }
+                        if buf.starts_with(&JOURNAL_MAGIC) {
+                            state.hot_header_writes = state.hot_header_writes.saturating_add(1);
+                            if state.plan.corrupt_hot_header_restore && state.hot_header_writes == 2
+                            {
+                                let mut damaged = buf.to_vec();
+                                damaged[crate::journal::JOURNAL_HEADER_SIZE] ^= 0x80;
+                                corrupted = Some(damaged);
+                            }
                         }
                     }
                 }
-            }
 
-            self.inner
-                .write(cx, corrupted.as_deref().unwrap_or(buf), offset)
+                self.inner
+                    .write(cx, corrupted.as_deref().unwrap_or(buf), offset)
+                    .await
+            }
         }
 
         fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
@@ -19713,6 +20855,17 @@ mod tests {
     type SharedCounter = StdArc<StdMutex<usize>>;
     type SharedLockLevels = StdArc<StdMutex<Vec<LockLevel>>>;
     type SharedGate = StdArc<(StdMutex<bool>, StdCondvar)>;
+
+    #[derive(Clone)]
+    struct MockPersistedParallelWalCommit {
+        certificate: ParallelWalCommitCertificate,
+        wal_frame_start: u64,
+        wal_frame_end: u64,
+        sync: bool,
+    }
+
+    type SharedPersistedParallelWalCommit =
+        StdArc<StdMutex<Option<MockPersistedParallelWalCommit>>>;
     static PARALLEL_WAL_LANE_TEST_LOCK: StdLazyLock<StdMutex<()>> =
         StdLazyLock::new(|| StdMutex::new(()));
 
@@ -19839,6 +20992,10 @@ mod tests {
         batch_calls: SharedCounter,
         sync_calls: SharedCounter,
         read_page_calls: SharedCounter,
+        reconcile_calls: SharedCounter,
+        persisted_parallel_wal_commit: SharedPersistedParallelWalCommit,
+        fail_append_before_write: bool,
+        fail_sync_after_append: bool,
     }
 
     impl MockWalBackend {
@@ -19848,6 +21005,8 @@ mod tests {
             let batch_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             let sync_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             let read_page_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let reconcile_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let persisted_parallel_wal_commit = StdArc::new(StdMutex::new(None));
             (
                 Self {
                     frames: StdArc::clone(&frames),
@@ -19855,6 +21014,10 @@ mod tests {
                     batch_calls: StdArc::clone(&batch_calls),
                     sync_calls,
                     read_page_calls,
+                    reconcile_calls,
+                    persisted_parallel_wal_commit,
+                    fail_append_before_write: false,
+                    fail_sync_after_append: false,
                 },
                 frames,
                 begin_calls,
@@ -19874,6 +21037,8 @@ mod tests {
             let batch_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             let sync_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             let read_page_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let reconcile_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let persisted_parallel_wal_commit = StdArc::new(StdMutex::new(None));
             (
                 Self {
                     frames: StdArc::clone(&frames),
@@ -19881,6 +21046,10 @@ mod tests {
                     batch_calls: StdArc::clone(&batch_calls),
                     sync_calls: StdArc::clone(&sync_calls),
                     read_page_calls,
+                    reconcile_calls,
+                    persisted_parallel_wal_commit,
+                    fail_append_before_write: false,
+                    fail_sync_after_append: false,
                 },
                 frames,
                 begin_calls,
@@ -19894,6 +21063,8 @@ mod tests {
             let batch_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             let sync_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             let read_page_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let reconcile_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let persisted_parallel_wal_commit = StdArc::new(StdMutex::new(None));
             (
                 Self {
                     frames,
@@ -19901,6 +21072,10 @@ mod tests {
                     batch_calls: StdArc::clone(&batch_calls),
                     sync_calls,
                     read_page_calls,
+                    reconcile_calls,
+                    persisted_parallel_wal_commit,
+                    fail_append_before_write: false,
+                    fail_sync_after_append: false,
                 },
                 begin_calls,
                 batch_calls,
@@ -19919,6 +21094,8 @@ mod tests {
             let batch_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             let sync_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             let read_page_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let reconcile_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let persisted_parallel_wal_commit = StdArc::new(StdMutex::new(None));
             (
                 Self {
                     frames: StdArc::clone(&frames),
@@ -19926,11 +21103,68 @@ mod tests {
                     batch_calls: StdArc::clone(&batch_calls),
                     sync_calls,
                     read_page_calls: StdArc::clone(&read_page_calls),
+                    reconcile_calls,
+                    persisted_parallel_wal_commit,
+                    fail_append_before_write: false,
+                    fail_sync_after_append: false,
                 },
                 frames,
                 begin_calls,
                 batch_calls,
                 read_page_calls,
+            )
+        }
+
+        fn new_with_failing_sync() -> (Self, SharedFrames, SharedCounter, SharedCounter) {
+            let frames: SharedFrames = StdArc::new(StdMutex::new(Vec::new()));
+            let begin_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let batch_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let sync_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let read_page_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let reconcile_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let persisted_parallel_wal_commit = StdArc::new(StdMutex::new(None));
+            (
+                Self {
+                    frames: StdArc::clone(&frames),
+                    begin_calls,
+                    batch_calls,
+                    sync_calls: StdArc::clone(&sync_calls),
+                    read_page_calls,
+                    reconcile_calls: StdArc::clone(&reconcile_calls),
+                    persisted_parallel_wal_commit,
+                    fail_append_before_write: false,
+                    fail_sync_after_append: true,
+                },
+                frames,
+                sync_calls,
+                reconcile_calls,
+            )
+        }
+
+        fn new_with_failing_append_before_write()
+        -> (Self, SharedFrames, SharedCounter, SharedCounter) {
+            let frames: SharedFrames = StdArc::new(StdMutex::new(Vec::new()));
+            let begin_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let batch_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let sync_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let read_page_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let reconcile_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let persisted_parallel_wal_commit = StdArc::new(StdMutex::new(None));
+            (
+                Self {
+                    frames: StdArc::clone(&frames),
+                    begin_calls,
+                    batch_calls,
+                    sync_calls: StdArc::clone(&sync_calls),
+                    read_page_calls,
+                    reconcile_calls: StdArc::clone(&reconcile_calls),
+                    persisted_parallel_wal_commit,
+                    fail_append_before_write: true,
+                    fail_sync_after_append: false,
+                },
+                frames,
+                sync_calls,
+                reconcile_calls,
             )
         }
     }
@@ -20161,68 +21395,74 @@ mod tests {
     }
 
     impl crate::traits::WalBackend for TrackCBenchmarkWalBackend {
-        fn append_frame(
-            &mut self,
-            cx: &Cx,
+        fn append_frame<'a>(
+            &'a mut self,
+            cx: &'a Cx,
             page_number: u32,
-            page_data: &[u8],
+            page_data: &'a [u8],
             db_size_if_commit: u32,
-        ) -> fsqlite_error::Result<()> {
-            self.wal
-                .append_frame(cx, page_number, page_data, db_size_if_commit)
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                self.wal
+                    .append_frame(cx, page_number, page_data, db_size_if_commit)
+            })
         }
 
-        fn append_frames(
-            &mut self,
-            cx: &Cx,
-            frames: &[crate::traits::WalFrameRef<'_>],
-        ) -> fsqlite_error::Result<()> {
-            match self.mode {
-                TrackCBatchMode::SingleFrame => {
-                    for frame in frames {
-                        self.wal.append_frame(
-                            cx,
-                            frame.page_number,
-                            frame.page_data,
-                            frame.db_size_if_commit,
-                        )?;
+        fn append_frames<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            frames: &'a [crate::traits::WalFrameRef<'a>],
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                match self.mode {
+                    TrackCBatchMode::SingleFrame => {
+                        for frame in frames {
+                            self.wal.append_frame(
+                                cx,
+                                frame.page_number,
+                                frame.page_data,
+                                frame.db_size_if_commit,
+                            )?;
+                        }
+                        Ok(())
                     }
-                    Ok(())
+                    TrackCBatchMode::Batched => {
+                        let wal_frames: Vec<_> = frames
+                            .iter()
+                            .map(|frame| WalAppendFrameRef {
+                                page_number: frame.page_number,
+                                page_data: frame.page_data,
+                                db_size_if_commit: frame.db_size_if_commit,
+                            })
+                            .collect();
+                        self.wal.append_frames(cx, &wal_frames)
+                    }
                 }
-                TrackCBatchMode::Batched => {
-                    let wal_frames: Vec<_> = frames
-                        .iter()
-                        .map(|frame| WalAppendFrameRef {
-                            page_number: frame.page_number,
-                            page_data: frame.page_data,
-                            db_size_if_commit: frame.db_size_if_commit,
-                        })
-                        .collect();
-                    self.wal.append_frames(cx, &wal_frames)
-                }
-            }
+            })
         }
 
-        fn read_page(
-            &mut self,
-            _cx: &Cx,
+        fn read_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             _page_number: u32,
-        ) -> fsqlite_error::Result<Option<Vec<u8>>> {
-            Ok(None)
+        ) -> WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async { Ok(None) })
         }
 
-        fn committed_txn_count(&mut self, cx: &Cx) -> fsqlite_error::Result<u64> {
-            let Some(last_commit_frame) = self.wal.last_commit_frame(cx)? else {
-                return Ok(0);
-            };
+        fn committed_txn_count<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, u64> {
+            Box::pin(async move {
+                let Some(last_commit_frame) = self.wal.last_commit_frame(cx)? else {
+                    return Ok(0);
+                };
 
-            let mut commit_count = 0_u64;
-            for frame_index in 0..=last_commit_frame {
-                if self.wal.read_frame_header(cx, frame_index)?.is_commit() {
-                    commit_count = commit_count.saturating_add(1);
+                let mut commit_count = 0_u64;
+                for frame_index in 0..=last_commit_frame {
+                    if self.wal.read_frame_header(cx, frame_index)?.is_commit() {
+                        commit_count = commit_count.saturating_add(1);
+                    }
                 }
-            }
-            Ok(commit_count)
+                Ok(commit_count)
+            })
         }
 
         fn sync(&mut self, cx: &Cx) -> fsqlite_error::Result<()> {
@@ -20233,71 +21473,77 @@ mod tests {
             self.wal.frame_count()
         }
 
-        fn checkpoint(
-            &mut self,
-            _cx: &Cx,
+        fn checkpoint<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             _mode: crate::traits::CheckpointMode,
-            _writer: &mut dyn crate::traits::CheckpointPageWriter,
+            _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
             _backfilled_frames: u32,
             _oldest_reader_frame: Option<u32>,
-        ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
-            let total_frames = u32::try_from(self.wal.frame_count()).unwrap_or(u32::MAX);
-            Ok(crate::traits::CheckpointResult {
-                total_frames,
-                frames_backfilled: 0,
-                completed: false,
-                wal_was_reset: false,
-                requested_mode: _mode,
-                effective_mode: _mode,
+        ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+            Box::pin(async move {
+                let total_frames = u32::try_from(self.wal.frame_count()).unwrap_or(u32::MAX);
+                Ok(crate::traits::CheckpointResult {
+                    total_frames,
+                    frames_backfilled: 0,
+                    completed: false,
+                    wal_was_reset: false,
+                    requested_mode: _mode,
+                    effective_mode: _mode,
+                })
             })
         }
     }
 
     impl crate::traits::WalBackend for TrackCPublishWindowBenchWalBackend {
-        fn append_frame(
-            &mut self,
-            cx: &Cx,
+        fn append_frame<'a>(
+            &'a mut self,
+            cx: &'a Cx,
             page_number: u32,
-            page_data: &[u8],
+            page_data: &'a [u8],
             db_size_if_commit: u32,
-        ) -> fsqlite_error::Result<()> {
-            self.wal.file_mut().lock(cx, LockLevel::Exclusive)?;
-            let append_result =
-                self.wal
-                    .append_frame(cx, page_number, page_data, db_size_if_commit);
-            let unlock_result = self.wal.file_mut().unlock(cx, LockLevel::None);
-            match (append_result, unlock_result) {
-                (Ok(()), Ok(())) => Ok(()),
-                (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-                (Err(append_error), Err(unlock_error)) => Err(FrankenError::internal(format!(
-                    "publish-window WAL append failed and unlock failed: append={append_error}; unlock={unlock_error}"
-                ))),
-            }
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                self.wal.file_mut().lock(cx, LockLevel::Exclusive)?;
+                let append_result =
+                    self.wal
+                        .append_frame(cx, page_number, page_data, db_size_if_commit);
+                let unlock_result = self.wal.file_mut().unlock(cx, LockLevel::None);
+                match (append_result, unlock_result) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                    (Err(append_error), Err(unlock_error)) => Err(FrankenError::internal(format!(
+                        "publish-window WAL append failed and unlock failed: append={append_error}; unlock={unlock_error}"
+                    ))),
+                }
+            })
         }
 
-        fn append_frames(
-            &mut self,
-            cx: &Cx,
-            frames: &[crate::traits::WalFrameRef<'_>],
-        ) -> fsqlite_error::Result<()> {
-            let wal_frames: Vec<_> = frames
-                .iter()
-                .map(|frame| WalAppendFrameRef {
-                    page_number: frame.page_number,
-                    page_data: frame.page_data,
-                    db_size_if_commit: frame.db_size_if_commit,
-                })
-                .collect();
-            self.wal.file_mut().lock(cx, LockLevel::Exclusive)?;
-            let append_result = self.wal.append_frames(cx, &wal_frames);
-            let unlock_result = self.wal.file_mut().unlock(cx, LockLevel::None);
-            match (append_result, unlock_result) {
-                (Ok(()), Ok(())) => Ok(()),
-                (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-                (Err(append_error), Err(unlock_error)) => Err(FrankenError::internal(format!(
-                    "publish-window WAL append failed and unlock failed: append={append_error}; unlock={unlock_error}"
-                ))),
-            }
+        fn append_frames<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            frames: &'a [crate::traits::WalFrameRef<'a>],
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                let wal_frames: Vec<_> = frames
+                    .iter()
+                    .map(|frame| WalAppendFrameRef {
+                        page_number: frame.page_number,
+                        page_data: frame.page_data,
+                        db_size_if_commit: frame.db_size_if_commit,
+                    })
+                    .collect();
+                self.wal.file_mut().lock(cx, LockLevel::Exclusive)?;
+                let append_result = self.wal.append_frames(cx, &wal_frames);
+                let unlock_result = self.wal.file_mut().unlock(cx, LockLevel::None);
+                match (append_result, unlock_result) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                    (Err(append_error), Err(unlock_error)) => Err(FrankenError::internal(format!(
+                        "publish-window WAL append failed and unlock failed: append={append_error}; unlock={unlock_error}"
+                    ))),
+                }
+            })
         }
 
         fn prepare_append_frames(
@@ -20365,59 +21611,63 @@ mod tests {
             }))
         }
 
-        fn append_prepared_frames(
-            &mut self,
-            cx: &Cx,
-            prepared: &mut crate::traits::PreparedWalFrameBatch,
-        ) -> fsqlite_error::Result<()> {
-            let checksum_transforms: Vec<_> = prepared
-                .checksum_transforms
-                .iter()
-                .map(|transform| WalChecksumTransform {
-                    a11: transform.a11,
-                    a12: transform.a12,
-                    a21: transform.a21,
-                    a22: transform.a22,
-                    c1: transform.c1,
-                    c2: transform.c2,
-                })
-                .collect();
-            self.wal.file_mut().lock(cx, LockLevel::Exclusive)?;
-            let append_result = self.wal.append_prepared_frame_bytes(
-                cx,
-                &mut prepared.frame_bytes,
-                &checksum_transforms,
-            );
-            let unlock_result = self.wal.file_mut().unlock(cx, LockLevel::None);
-            match (append_result, unlock_result) {
-                (Ok(()), Ok(())) => Ok(()),
-                (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-                (Err(append_error), Err(unlock_error)) => Err(FrankenError::internal(format!(
-                    "publish-window prepared WAL append failed and unlock failed: append={append_error}; unlock={unlock_error}"
-                ))),
-            }
-        }
-
-        fn read_page(
-            &mut self,
-            _cx: &Cx,
-            _page_number: u32,
-        ) -> fsqlite_error::Result<Option<Vec<u8>>> {
-            Ok(None)
-        }
-
-        fn committed_txn_count(&mut self, cx: &Cx) -> fsqlite_error::Result<u64> {
-            let Some(last_commit_frame) = self.wal.last_commit_frame(cx)? else {
-                return Ok(0);
-            };
-
-            let mut commit_count = 0_u64;
-            for frame_index in 0..=last_commit_frame {
-                if self.wal.read_frame_header(cx, frame_index)?.is_commit() {
-                    commit_count = commit_count.saturating_add(1);
+        fn append_prepared_frames<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            prepared: &'a mut crate::traits::PreparedWalFrameBatch,
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                let checksum_transforms: Vec<_> = prepared
+                    .checksum_transforms
+                    .iter()
+                    .map(|transform| WalChecksumTransform {
+                        a11: transform.a11,
+                        a12: transform.a12,
+                        a21: transform.a21,
+                        a22: transform.a22,
+                        c1: transform.c1,
+                        c2: transform.c2,
+                    })
+                    .collect();
+                self.wal.file_mut().lock(cx, LockLevel::Exclusive)?;
+                let append_result = self.wal.append_prepared_frame_bytes(
+                    cx,
+                    &mut prepared.frame_bytes,
+                    &checksum_transforms,
+                );
+                let unlock_result = self.wal.file_mut().unlock(cx, LockLevel::None);
+                match (append_result, unlock_result) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                    (Err(append_error), Err(unlock_error)) => Err(FrankenError::internal(format!(
+                        "publish-window prepared WAL append failed and unlock failed: append={append_error}; unlock={unlock_error}"
+                    ))),
                 }
-            }
-            Ok(commit_count)
+            })
+        }
+
+        fn read_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _page_number: u32,
+        ) -> WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn committed_txn_count<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, u64> {
+            Box::pin(async move {
+                let Some(last_commit_frame) = self.wal.last_commit_frame(cx)? else {
+                    return Ok(0);
+                };
+
+                let mut commit_count = 0_u64;
+                for frame_index in 0..=last_commit_frame {
+                    if self.wal.read_frame_header(cx, frame_index)?.is_commit() {
+                        commit_count = commit_count.saturating_add(1);
+                    }
+                }
+                Ok(commit_count)
+            })
         }
 
         fn sync(&mut self, cx: &Cx) -> fsqlite_error::Result<()> {
@@ -20428,39 +21678,45 @@ mod tests {
             self.wal.frame_count()
         }
 
-        fn checkpoint(
-            &mut self,
-            _cx: &Cx,
+        fn checkpoint<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             _mode: crate::traits::CheckpointMode,
-            _writer: &mut dyn crate::traits::CheckpointPageWriter,
+            _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
             _backfilled_frames: u32,
             _oldest_reader_frame: Option<u32>,
-        ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
-            let total_frames = u32::try_from(self.wal.frame_count()).unwrap_or(u32::MAX);
-            Ok(crate::traits::CheckpointResult {
-                total_frames,
-                frames_backfilled: 0,
-                completed: false,
-                wal_was_reset: false,
-                requested_mode: _mode,
-                effective_mode: _mode,
+        ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+            Box::pin(async move {
+                let total_frames = u32::try_from(self.wal.frame_count()).unwrap_or(u32::MAX);
+                Ok(crate::traits::CheckpointResult {
+                    total_frames,
+                    frames_backfilled: 0,
+                    completed: false,
+                    wal_was_reset: false,
+                    requested_mode: _mode,
+                    effective_mode: _mode,
+                })
             })
         }
     }
 
     impl crate::traits::WalBackend for FailingCheckpointWalBackend {
-        fn append_frame(
-            &mut self,
-            _cx: &Cx,
+        fn append_frame<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             _page_number: u32,
-            _page_data: &[u8],
+            _page_data: &'a [u8],
             _db_size_if_commit: u32,
-        ) -> Result<()> {
-            Ok(())
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
         }
 
-        fn read_page(&mut self, _cx: &Cx, _page_number: u32) -> Result<Option<Vec<u8>>> {
-            Ok(None)
+        fn read_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _page_number: u32,
+        ) -> WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async { Ok(None) })
         }
 
         fn sync(&mut self, _cx: &Cx) -> Result<()> {
@@ -20477,15 +21733,15 @@ mod tests {
             1
         }
 
-        fn checkpoint(
-            &mut self,
-            _cx: &Cx,
+        fn checkpoint<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             _mode: crate::traits::CheckpointMode,
-            _writer: &mut dyn crate::traits::CheckpointPageWriter,
+            _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
             _backfilled_frames: u32,
             _oldest_reader_frame: Option<u32>,
-        ) -> Result<crate::traits::CheckpointResult> {
-            Err(FrankenError::BusyRecovery)
+        ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+            Box::pin(async { Err(FrankenError::BusyRecovery) })
         }
     }
 
@@ -20869,176 +22125,310 @@ mod tests {
     }
 
     impl crate::traits::WalBackend for MockWalBackend {
-        fn begin_transaction(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
-            let mut begin_calls = self.begin_calls.lock().unwrap();
-            *begin_calls += 1;
-            Ok(())
+        fn begin_transaction<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                let mut begin_calls = self.begin_calls.lock().unwrap();
+                *begin_calls += 1;
+                Ok(())
+            })
         }
 
-        fn append_frame(
-            &mut self,
-            _cx: &Cx,
+        fn append_frame<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             page_number: u32,
-            page_data: &[u8],
+            page_data: &'a [u8],
             db_size_if_commit: u32,
-        ) -> fsqlite_error::Result<()> {
-            self.frames
-                .lock()
-                .unwrap()
-                .push((page_number, page_data.to_vec(), db_size_if_commit));
-            Ok(())
-        }
-
-        fn append_frames(
-            &mut self,
-            _cx: &Cx,
-            frames: &[crate::traits::WalFrameRef<'_>],
-        ) -> fsqlite_error::Result<()> {
-            let mut batch_calls = self.batch_calls.lock().unwrap();
-            *batch_calls += 1;
-            drop(batch_calls);
-
-            let mut written = self.frames.lock().unwrap();
-            for frame in frames {
-                written.push((
-                    frame.page_number,
-                    frame.page_data.to_vec(),
-                    frame.db_size_if_commit,
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                self.frames.lock().unwrap().push((
+                    page_number,
+                    page_data.to_vec(),
+                    db_size_if_commit,
                 ));
-            }
-            Ok(())
+                Ok(())
+            })
         }
 
-        fn read_page(
-            &mut self,
-            _cx: &Cx,
-            page_number: u32,
-        ) -> fsqlite_error::Result<Option<Vec<u8>>> {
-            *self.read_page_calls.lock().unwrap() += 1;
-            let frames = self.frames.lock().unwrap();
-            // Scan backwards for the latest version of the page.
-            let result = frames
-                .iter()
-                .rev()
-                .find(|(pn, _, _)| *pn == page_number)
-                .map(|(_, data, _)| data.clone());
-            drop(frames);
-            Ok(result)
+        fn append_frames<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            frames: &'a [crate::traits::WalFrameRef<'a>],
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                let mut batch_calls = self.batch_calls.lock().unwrap();
+                *batch_calls += 1;
+                drop(batch_calls);
+                if self.fail_append_before_write {
+                    self.fail_append_before_write = false;
+                    return Err(FrankenError::internal(
+                        "forced group-commit append failure before WAL write",
+                    ));
+                }
+
+                let mut written = self.frames.lock().unwrap();
+                for frame in frames {
+                    written.push((
+                        frame.page_number,
+                        frame.page_data.to_vec(),
+                        frame.db_size_if_commit,
+                    ));
+                }
+                Ok(())
+            })
         }
 
-        fn committed_txns_since_page(
-            &mut self,
-            _cx: &Cx,
+        fn persist_parallel_wal_commit_certificate<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            certificate: &'a ParallelWalCommitCertificate,
+            wal_frame_start: u64,
+            wal_frame_end: u64,
+            sync: bool,
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                *self.persisted_parallel_wal_commit.lock().unwrap() =
+                    Some(MockPersistedParallelWalCommit {
+                        certificate: certificate.clone(),
+                        wal_frame_start,
+                        wal_frame_end,
+                        sync,
+                    });
+                Ok(())
+            })
+        }
+
+        fn reconcile_parallel_wal_commit<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            certificate: &'a ParallelWalCommitCertificate,
+            wal_frame_start: u64,
+            wal_frame_end: u64,
+            sync: bool,
+        ) -> WalFuture<'a, crate::traits::ParallelWalCommitReconciliation> {
+            Box::pin(async move {
+                *self.reconcile_calls.lock().unwrap() += 1;
+                let persisted = self
+                    .persisted_parallel_wal_commit
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or_else(|| {
+                        FrankenError::internal(
+                            "mock WAL recovery has no persisted commit certificate",
+                        )
+                    })?;
+                if &persisted.certificate != certificate
+                    || persisted.wal_frame_start != wal_frame_start
+                    || persisted.wal_frame_end != wal_frame_end
+                    || persisted.sync != sync
+                {
+                    return Err(FrankenError::internal(
+                        "mock WAL recovery certificate or interval mismatch",
+                    ));
+                }
+
+                let start_index =
+                    usize::try_from(wal_frame_start.checked_sub(1).ok_or_else(|| {
+                        FrankenError::internal("mock WAL recovery interval must be one-based")
+                    })?)
+                    .map_err(|_| FrankenError::internal("mock WAL frame start exceeds usize"))?;
+                let end_index = usize::try_from(wal_frame_end)
+                    .map_err(|_| FrankenError::internal("mock WAL frame end exceeds usize"))?;
+                if end_index <= start_index {
+                    return Err(FrankenError::internal(
+                        "mock WAL recovery interval must be non-empty",
+                    ));
+                }
+                let mut frames = self.frames.lock().unwrap();
+                if frames.len() < start_index {
+                    return Err(FrankenError::internal(
+                        "mock WAL recovery committed prefix is missing",
+                    ));
+                }
+                if end_index > frames.len() {
+                    frames.truncate(start_index);
+                    return Ok(crate::traits::ParallelWalCommitReconciliation::NotCommitted);
+                }
+                if frames[start_index..end_index]
+                    .last()
+                    .is_none_or(|(_, _, db_size_if_commit)| *db_size_if_commit == 0)
+                {
+                    frames.truncate(start_index);
+                    return Ok(crate::traits::ParallelWalCommitReconciliation::NotCommitted);
+                }
+                let interval = &frames[start_index..end_index];
+                let mut digest = ParallelWalFramePayloadDigestBuilder::new();
+                for (page_number, page_data, db_size_if_commit) in interval {
+                    let page_number = PageNumber::new(*page_number).ok_or_else(|| {
+                        FrankenError::internal("mock WAL recovery interval contains page zero")
+                    })?;
+                    digest.update(page_number, *db_size_if_commit, page_data);
+                }
+                if digest.finalize() != certificate.wal_frame_payload_digest {
+                    return Err(FrankenError::internal(
+                        "mock WAL recovery frame payload digest mismatch",
+                    ));
+                }
+                drop(frames);
+                if sync {
+                    self.sync(cx)?;
+                }
+
+                Ok(crate::traits::ParallelWalCommitReconciliation::Authorized)
+            })
+        }
+
+        fn read_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             page_number: u32,
-        ) -> fsqlite_error::Result<u64> {
-            let frames = self.frames.lock().unwrap();
-            let last_page_frame = frames.iter().rposition(|(pn, _, _)| *pn == page_number);
-            let Some(last_page_frame) = last_page_frame else {
-                return Ok(frames
+        ) -> WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async move {
+                *self.read_page_calls.lock().unwrap() += 1;
+                let frames = self.frames.lock().unwrap();
+                // Scan backwards for the latest version of the page.
+                let result = frames
+                    .iter()
+                    .rev()
+                    .find(|(pn, _, _)| *pn == page_number)
+                    .map(|(_, data, _)| data.clone());
+                drop(frames);
+                Ok(result)
+            })
+        }
+
+        fn committed_txns_since_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            page_number: u32,
+        ) -> WalFuture<'a, u64> {
+            Box::pin(async move {
+                let frames = self.frames.lock().unwrap();
+                let last_page_frame = frames.iter().rposition(|(pn, _, _)| *pn == page_number);
+                let Some(last_page_frame) = last_page_frame else {
+                    return Ok(frames
+                        .iter()
+                        .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)
+                        .count() as u64);
+                };
+
+                let mut page_commit_seen = false;
+                let mut committed_txns_after_page = 0_u64;
+                for (frame_index, (_, _, db_size_if_commit)) in frames.iter().enumerate() {
+                    if *db_size_if_commit == 0 {
+                        continue;
+                    }
+                    if !page_commit_seen && frame_index >= last_page_frame {
+                        page_commit_seen = true;
+                        continue;
+                    }
+                    if page_commit_seen {
+                        committed_txns_after_page = committed_txns_after_page.saturating_add(1);
+                    }
+                }
+                Ok(committed_txns_after_page)
+            })
+        }
+
+        fn committed_txn_count<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, u64> {
+            Box::pin(async move {
+                Ok(self
+                    .frames
+                    .lock()
+                    .unwrap()
                     .iter()
                     .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)
-                    .count() as u64);
-            };
-
-            let mut page_commit_seen = false;
-            let mut committed_txns_after_page = 0_u64;
-            for (frame_index, (_, _, db_size_if_commit)) in frames.iter().enumerate() {
-                if *db_size_if_commit == 0 {
-                    continue;
-                }
-                if !page_commit_seen && frame_index >= last_page_frame {
-                    page_commit_seen = true;
-                    continue;
-                }
-                if page_commit_seen {
-                    committed_txns_after_page = committed_txns_after_page.saturating_add(1);
-                }
-            }
-            Ok(committed_txns_after_page)
-        }
-
-        fn committed_txn_count(&mut self, _cx: &Cx) -> fsqlite_error::Result<u64> {
-            Ok(self
-                .frames
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)
-                .count() as u64)
+                    .count() as u64)
+            })
         }
 
         fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
             *self.sync_calls.lock().unwrap() += 1;
-            Ok(())
+            if self.fail_sync_after_append {
+                self.fail_sync_after_append = false;
+                Err(FrankenError::internal(
+                    "forced group-commit sync failure after full WAL append",
+                ))
+            } else {
+                Ok(())
+            }
         }
 
         fn frame_count(&self) -> usize {
             self.frames.lock().unwrap().len()
         }
 
-        fn checkpoint(
-            &mut self,
-            _cx: &Cx,
+        fn checkpoint<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             _mode: crate::traits::CheckpointMode,
-            _writer: &mut dyn crate::traits::CheckpointPageWriter,
+            _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
             _backfilled_frames: u32,
             _oldest_reader_frame: Option<u32>,
-        ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
-            let total_frames = u32::try_from(self.frames.lock().unwrap().len()).map_err(|_| {
-                fsqlite_error::FrankenError::internal("mock wal frame count exceeds u32")
-            })?;
-            Ok(crate::traits::CheckpointResult {
-                total_frames,
-                frames_backfilled: total_frames,
-                completed: true,
-                wal_was_reset: false,
-                requested_mode: _mode,
-                effective_mode: _mode,
+        ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+            Box::pin(async move {
+                let total_frames =
+                    u32::try_from(self.frames.lock().unwrap().len()).map_err(|_| {
+                        fsqlite_error::FrankenError::internal("mock wal frame count exceeds u32")
+                    })?;
+                Ok(crate::traits::CheckpointResult {
+                    total_frames,
+                    frames_backfilled: total_frames,
+                    completed: true,
+                    wal_was_reset: false,
+                    requested_mode: _mode,
+                    effective_mode: _mode,
+                })
             })
         }
     }
 
     impl crate::traits::WalBackend for FailingGroupCommitWalBackend {
-        fn begin_transaction(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
-            Ok(())
+        fn begin_transaction<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
         }
 
-        fn append_frame(
-            &mut self,
-            _cx: &Cx,
+        fn append_frame<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             _page_number: u32,
-            _page_data: &[u8],
+            _page_data: &'a [u8],
             _db_size_if_commit: u32,
-        ) -> fsqlite_error::Result<()> {
-            Err(FrankenError::internal(
-                "forced single-frame group commit failure",
-            ))
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async {
+                Err(FrankenError::internal(
+                    "forced single-frame group commit failure",
+                ))
+            })
         }
 
-        fn append_frames(
-            &mut self,
-            _cx: &Cx,
-            _frames: &[crate::traits::WalFrameRef<'_>],
-        ) -> fsqlite_error::Result<()> {
-            let mut append_frames_calls = self.append_frames_calls.lock().unwrap();
-            *append_frames_calls += 1;
-            drop(append_frames_calls);
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            Err(FrankenError::internal(
-                "forced batched group commit append failure",
-            ))
+        fn append_frames<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _frames: &'a [crate::traits::WalFrameRef<'a>],
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                let mut append_frames_calls = self.append_frames_calls.lock().unwrap();
+                *append_frames_calls += 1;
+                drop(append_frames_calls);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                Err(FrankenError::internal(
+                    "forced batched group commit append failure",
+                ))
+            })
         }
 
-        fn read_page(
-            &mut self,
-            _cx: &Cx,
+        fn read_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             _page_number: u32,
-        ) -> fsqlite_error::Result<Option<Vec<u8>>> {
-            Ok(None)
+        ) -> WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async { Ok(None) })
         }
 
-        fn committed_txn_count(&mut self, _cx: &Cx) -> fsqlite_error::Result<u64> {
-            Ok(0)
+        fn committed_txn_count<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, u64> {
+            Box::pin(async { Ok(0) })
         }
 
         fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
@@ -21049,56 +22439,63 @@ mod tests {
             0
         }
 
-        fn checkpoint(
-            &mut self,
-            _cx: &Cx,
+        fn checkpoint<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             _mode: crate::traits::CheckpointMode,
-            _writer: &mut dyn crate::traits::CheckpointPageWriter,
+            _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
             _backfilled_frames: u32,
             _oldest_reader_frame: Option<u32>,
-        ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
-            Ok(crate::traits::CheckpointResult {
-                total_frames: 0,
-                frames_backfilled: 0,
-                completed: true,
-                wal_was_reset: false,
-                requested_mode: _mode,
-                effective_mode: _mode,
+        ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+            Box::pin(async move {
+                Ok(crate::traits::CheckpointResult {
+                    total_frames: 0,
+                    frames_backfilled: 0,
+                    completed: true,
+                    wal_was_reset: false,
+                    requested_mode: _mode,
+                    effective_mode: _mode,
+                })
             })
         }
     }
 
     impl crate::traits::WalBackend for PreparedBatchObservedWalBackend {
-        fn append_frame(
-            &mut self,
-            _cx: &Cx,
+        fn append_frame<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             page_number: u32,
-            page_data: &[u8],
+            page_data: &'a [u8],
             db_size_if_commit: u32,
-        ) -> fsqlite_error::Result<()> {
-            self.frames
-                .lock()
-                .unwrap()
-                .push((page_number, page_data.to_vec(), db_size_if_commit));
-            Ok(())
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                self.frames.lock().unwrap().push((
+                    page_number,
+                    page_data.to_vec(),
+                    db_size_if_commit,
+                ));
+                Ok(())
+            })
         }
 
-        fn append_frames(
-            &mut self,
-            _cx: &Cx,
-            frames: &[crate::traits::WalFrameRef<'_>],
-        ) -> fsqlite_error::Result<()> {
-            *self.append_frames_calls.lock().unwrap() += 1;
+        fn append_frames<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            frames: &'a [crate::traits::WalFrameRef<'a>],
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                *self.append_frames_calls.lock().unwrap() += 1;
 
-            let mut written = self.frames.lock().unwrap();
-            for frame in frames {
-                written.push((
-                    frame.page_number,
-                    frame.page_data.to_vec(),
-                    frame.db_size_if_commit,
-                ));
-            }
-            Ok(())
+                let mut written = self.frames.lock().unwrap();
+                for frame in frames {
+                    written.push((
+                        frame.page_number,
+                        frame.page_data.to_vec(),
+                        frame.db_size_if_commit,
+                    ));
+                }
+                Ok(())
+            })
         }
 
         fn prepare_append_frames(
@@ -21154,49 +22551,55 @@ mod tests {
             }))
         }
 
-        fn append_prepared_frames(
-            &mut self,
-            _cx: &Cx,
-            prepared: &mut crate::traits::PreparedWalFrameBatch,
-        ) -> fsqlite_error::Result<()> {
-            self.append_lock_levels
-                .lock()
-                .unwrap()
-                .push(*self.observed_lock_level.lock().unwrap());
-            *self.append_prepared_calls.lock().unwrap() += 1;
+        fn append_prepared_frames<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            prepared: &'a mut crate::traits::PreparedWalFrameBatch,
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                self.append_lock_levels
+                    .lock()
+                    .unwrap()
+                    .push(*self.observed_lock_level.lock().unwrap());
+                *self.append_prepared_calls.lock().unwrap() += 1;
 
-            let mut written = self.frames.lock().unwrap();
-            for frame in prepared.frame_refs() {
-                written.push((
-                    frame.page_number,
-                    frame.page_data.to_vec(),
-                    frame.db_size_if_commit,
-                ));
-            }
-            Ok(())
+                let mut written = self.frames.lock().unwrap();
+                for frame in prepared.frame_refs() {
+                    written.push((
+                        frame.page_number,
+                        frame.page_data.to_vec(),
+                        frame.db_size_if_commit,
+                    ));
+                }
+                Ok(())
+            })
         }
 
-        fn read_page(
-            &mut self,
-            _cx: &Cx,
+        fn read_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             page_number: u32,
-        ) -> fsqlite_error::Result<Option<Vec<u8>>> {
-            let frames = self.frames.lock().unwrap();
-            Ok(frames
-                .iter()
-                .rev()
-                .find(|(pn, _, _)| *pn == page_number)
-                .map(|(_, data, _)| data.clone()))
+        ) -> WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async move {
+                let frames = self.frames.lock().unwrap();
+                Ok(frames
+                    .iter()
+                    .rev()
+                    .find(|(pn, _, _)| *pn == page_number)
+                    .map(|(_, data, _)| data.clone()))
+            })
         }
 
-        fn committed_txn_count(&mut self, _cx: &Cx) -> fsqlite_error::Result<u64> {
-            Ok(self
-                .frames
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)
-                .count() as u64)
+        fn committed_txn_count<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, u64> {
+            Box::pin(async move {
+                Ok(self
+                    .frames
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)
+                    .count() as u64)
+            })
         }
 
         fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
@@ -21207,58 +22610,68 @@ mod tests {
             self.frames.lock().unwrap().len()
         }
 
-        fn checkpoint(
-            &mut self,
-            _cx: &Cx,
+        fn checkpoint<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             _mode: crate::traits::CheckpointMode,
-            _writer: &mut dyn crate::traits::CheckpointPageWriter,
+            _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
             _backfilled_frames: u32,
             _oldest_reader_frame: Option<u32>,
-        ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
-            let total_frames = u32::try_from(self.frames.lock().unwrap().len()).map_err(|_| {
-                fsqlite_error::FrankenError::internal("observed wal frame count exceeds u32")
-            })?;
-            Ok(crate::traits::CheckpointResult {
-                total_frames,
-                frames_backfilled: total_frames,
-                completed: true,
-                wal_was_reset: false,
-                requested_mode: _mode,
-                effective_mode: _mode,
+        ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+            Box::pin(async move {
+                let total_frames =
+                    u32::try_from(self.frames.lock().unwrap().len()).map_err(|_| {
+                        fsqlite_error::FrankenError::internal(
+                            "observed wal frame count exceeds u32",
+                        )
+                    })?;
+                Ok(crate::traits::CheckpointResult {
+                    total_frames,
+                    frames_backfilled: total_frames,
+                    completed: true,
+                    wal_was_reset: false,
+                    requested_mode: _mode,
+                    effective_mode: _mode,
+                })
             })
         }
     }
 
     impl crate::traits::WalBackend for ShadowCompareMismatchWalBackend {
-        fn append_frame(
-            &mut self,
-            _cx: &Cx,
+        fn append_frame<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             page_number: u32,
-            page_data: &[u8],
+            page_data: &'a [u8],
             db_size_if_commit: u32,
-        ) -> fsqlite_error::Result<()> {
-            self.frames
-                .lock()
-                .unwrap()
-                .push((page_number, page_data.to_vec(), db_size_if_commit));
-            Ok(())
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                self.frames.lock().unwrap().push((
+                    page_number,
+                    page_data.to_vec(),
+                    db_size_if_commit,
+                ));
+                Ok(())
+            })
         }
 
-        fn append_frames(
-            &mut self,
-            _cx: &Cx,
-            frames: &[crate::traits::WalFrameRef<'_>],
-        ) -> fsqlite_error::Result<()> {
-            *self.append_frames_calls.lock().unwrap() += 1;
-            let mut written = self.frames.lock().unwrap();
-            for frame in frames {
-                written.push((
-                    frame.page_number,
-                    frame.page_data.to_vec(),
-                    frame.db_size_if_commit,
-                ));
-            }
-            Ok(())
+        fn append_frames<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            frames: &'a [crate::traits::WalFrameRef<'a>],
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                *self.append_frames_calls.lock().unwrap() += 1;
+                let mut written = self.frames.lock().unwrap();
+                for frame in frames {
+                    written.push((
+                        frame.page_number,
+                        frame.page_data.to_vec(),
+                        frame.db_size_if_commit,
+                    ));
+                }
+                Ok(())
+            })
         }
 
         fn prepare_append_frames(
@@ -21281,44 +22694,50 @@ mod tests {
             }
         }
 
-        fn append_prepared_frames(
-            &mut self,
-            _cx: &Cx,
-            prepared: &mut crate::traits::PreparedWalFrameBatch,
-        ) -> fsqlite_error::Result<()> {
-            *self.append_prepared_calls.lock().unwrap() += 1;
-            let mut written = self.frames.lock().unwrap();
-            for frame in prepared.frame_refs() {
-                written.push((
-                    frame.page_number,
-                    frame.page_data.to_vec(),
-                    frame.db_size_if_commit,
-                ));
-            }
-            Ok(())
+        fn append_prepared_frames<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            prepared: &'a mut crate::traits::PreparedWalFrameBatch,
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                *self.append_prepared_calls.lock().unwrap() += 1;
+                let mut written = self.frames.lock().unwrap();
+                for frame in prepared.frame_refs() {
+                    written.push((
+                        frame.page_number,
+                        frame.page_data.to_vec(),
+                        frame.db_size_if_commit,
+                    ));
+                }
+                Ok(())
+            })
         }
 
-        fn read_page(
-            &mut self,
-            _cx: &Cx,
+        fn read_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             page_number: u32,
-        ) -> fsqlite_error::Result<Option<Vec<u8>>> {
-            let frames = self.frames.lock().unwrap();
-            Ok(frames
-                .iter()
-                .rev()
-                .find(|(pn, _, _)| *pn == page_number)
-                .map(|(_, data, _)| data.clone()))
+        ) -> WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async move {
+                let frames = self.frames.lock().unwrap();
+                Ok(frames
+                    .iter()
+                    .rev()
+                    .find(|(pn, _, _)| *pn == page_number)
+                    .map(|(_, data, _)| data.clone()))
+            })
         }
 
-        fn committed_txn_count(&mut self, _cx: &Cx) -> fsqlite_error::Result<u64> {
-            Ok(self
-                .frames
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)
-                .count() as u64)
+        fn committed_txn_count<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, u64> {
+            Box::pin(async move {
+                Ok(self
+                    .frames
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)
+                    .count() as u64)
+            })
         }
 
         fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
@@ -21329,55 +22748,63 @@ mod tests {
             self.frames.lock().unwrap().len()
         }
 
-        fn checkpoint(
-            &mut self,
-            _cx: &Cx,
+        fn checkpoint<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             _mode: crate::traits::CheckpointMode,
-            _writer: &mut dyn crate::traits::CheckpointPageWriter,
+            _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
             _backfilled_frames: u32,
             _oldest_reader_frame: Option<u32>,
-        ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
-            let total_frames = u32::try_from(self.frames.lock().unwrap().len()).unwrap_or(u32::MAX);
-            Ok(crate::traits::CheckpointResult {
-                total_frames,
-                frames_backfilled: total_frames,
-                completed: true,
-                wal_was_reset: false,
-                requested_mode: _mode,
-                effective_mode: _mode,
+        ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+            Box::pin(async move {
+                let total_frames =
+                    u32::try_from(self.frames.lock().unwrap().len()).unwrap_or(u32::MAX);
+                Ok(crate::traits::CheckpointResult {
+                    total_frames,
+                    frames_backfilled: total_frames,
+                    completed: true,
+                    wal_was_reset: false,
+                    requested_mode: _mode,
+                    effective_mode: _mode,
+                })
             })
         }
     }
 
     impl crate::traits::WalBackend for BlockingFirstPrepareWalBackend {
-        fn append_frame(
-            &mut self,
-            _cx: &Cx,
+        fn append_frame<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             page_number: u32,
-            page_data: &[u8],
+            page_data: &'a [u8],
             db_size_if_commit: u32,
-        ) -> fsqlite_error::Result<()> {
-            self.frames
-                .lock()
-                .unwrap()
-                .push((page_number, page_data.to_vec(), db_size_if_commit));
-            Ok(())
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                self.frames.lock().unwrap().push((
+                    page_number,
+                    page_data.to_vec(),
+                    db_size_if_commit,
+                ));
+                Ok(())
+            })
         }
 
-        fn append_frames(
-            &mut self,
-            _cx: &Cx,
-            frames: &[crate::traits::WalFrameRef<'_>],
-        ) -> fsqlite_error::Result<()> {
-            let mut written = self.frames.lock().unwrap();
-            for frame in frames {
-                written.push((
-                    frame.page_number,
-                    frame.page_data.to_vec(),
-                    frame.db_size_if_commit,
-                ));
-            }
-            Ok(())
+        fn append_frames<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            frames: &'a [crate::traits::WalFrameRef<'a>],
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                let mut written = self.frames.lock().unwrap();
+                for frame in frames {
+                    written.push((
+                        frame.page_number,
+                        frame.page_data.to_vec(),
+                        frame.db_size_if_commit,
+                    ));
+                }
+                Ok(())
+            })
         }
 
         fn prepare_append_frames(
@@ -21396,27 +22823,31 @@ mod tests {
             Ok(None)
         }
 
-        fn read_page(
-            &mut self,
-            _cx: &Cx,
+        fn read_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             page_number: u32,
-        ) -> fsqlite_error::Result<Option<Vec<u8>>> {
-            let frames = self.frames.lock().unwrap();
-            Ok(frames
-                .iter()
-                .rev()
-                .find(|(pn, _, _)| *pn == page_number)
-                .map(|(_, data, _)| data.clone()))
+        ) -> WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async move {
+                let frames = self.frames.lock().unwrap();
+                Ok(frames
+                    .iter()
+                    .rev()
+                    .find(|(pn, _, _)| *pn == page_number)
+                    .map(|(_, data, _)| data.clone()))
+            })
         }
 
-        fn committed_txn_count(&mut self, _cx: &Cx) -> fsqlite_error::Result<u64> {
-            Ok(self
-                .frames
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)
-                .count() as u64)
+        fn committed_txn_count<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, u64> {
+            Box::pin(async move {
+                Ok(self
+                    .frames
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)
+                    .count() as u64)
+            })
         }
 
         fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
@@ -21427,22 +22858,25 @@ mod tests {
             self.frames.lock().unwrap().len()
         }
 
-        fn checkpoint(
-            &mut self,
-            _cx: &Cx,
+        fn checkpoint<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             _mode: crate::traits::CheckpointMode,
-            _writer: &mut dyn crate::traits::CheckpointPageWriter,
+            _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
             _backfilled_frames: u32,
             _oldest_reader_frame: Option<u32>,
-        ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
-            let total_frames = u32::try_from(self.frames.lock().unwrap().len()).unwrap_or(u32::MAX);
-            Ok(crate::traits::CheckpointResult {
-                total_frames,
-                frames_backfilled: total_frames,
-                completed: true,
-                wal_was_reset: false,
-                requested_mode: _mode,
-                effective_mode: _mode,
+        ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+            Box::pin(async move {
+                let total_frames =
+                    u32::try_from(self.frames.lock().unwrap().len()).unwrap_or(u32::MAX);
+                Ok(crate::traits::CheckpointResult {
+                    total_frames,
+                    frames_backfilled: total_frames,
+                    completed: true,
+                    wal_was_reset: false,
+                    requested_mode: _mode,
+                    effective_mode: _mode,
+                })
             })
         }
     }
@@ -21708,17 +23142,29 @@ mod tests {
             self.inner.close(cx)
         }
 
-        fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        fn read<'a>(
+            &'a self,
+            cx: &'a Cx,
+            buf: &'a mut [u8],
+            offset: u64,
+        ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
             self.inner.read(cx, buf, offset)
         }
 
-        fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-            if self.is_main_db && self.fail_next_write.swap(false, AtomicOrdering::AcqRel) {
-                return Err(FrankenError::internal(
-                    "injected checkpoint db write failure",
-                ));
+        fn write<'a>(
+            &'a self,
+            cx: &'a Cx,
+            buf: &'a [u8],
+            offset: u64,
+        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+            async move {
+                if self.is_main_db && self.fail_next_write.swap(false, AtomicOrdering::AcqRel) {
+                    return Err(FrankenError::internal(
+                        "injected checkpoint db write failure",
+                    ));
+                }
+                self.inner.write(cx, buf, offset).await
             }
-            self.inner.write(cx, buf, offset)
         }
 
         fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
@@ -22369,7 +23815,7 @@ mod tests {
     }
 
     #[test]
-    fn test_group_commit_flush_failure_wakes_waiters_with_error() {
+    fn test_group_commit_in_doubt_failure_fails_waiter_closed() {
         for attempt in 0..32 {
             let vfs = MemoryVfs::new();
             let path = PathBuf::from(format!("/wal_group_commit_failure_waiter_{attempt}.db"));
@@ -22427,7 +23873,9 @@ mod tests {
             }
 
             let error_a = result_a.expect_err("flusher should observe append failure");
-            let error_b = result_b.expect_err("waiter should observe propagated failure");
+            let error_b = result_b.expect_err("waiter should fail closed");
+            let saw_busy_recovery = matches!(&error_a, FrankenError::BusyRecovery)
+                || matches!(&error_b, FrankenError::BusyRecovery);
             let error_a = error_a.to_string();
             let error_b = error_b.to_string();
             assert!(
@@ -22436,63 +23884,331 @@ mod tests {
                 "bead_id={BEAD_ID} case=group_commit_flusher_reports_backend_failure error_a={error_a} error_b={error_b}"
             );
             assert!(
-                error_a.contains("group commit flush failed")
-                    || error_b.contains("group commit flush failed"),
-                "bead_id={BEAD_ID} case=group_commit_waiter_reports_epoch_failure error_a={error_a} error_b={error_b}"
+                saw_busy_recovery,
+                "bead_id={BEAD_ID} case=group_commit_waiter_fails_closed error_a={error_a} error_b={error_b}"
+            );
+            let consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let flush_epoch = consolidator.epoch();
+            assert_eq!(consolidator.phase(), ConsolidationPhase::Flushing);
+            drop(consolidator);
+            assert!(
+                !queue
+                    .failed_epochs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&flush_epoch),
+                "an awaited in-doubt failure must not publish Abort"
             );
             return;
         }
 
         panic!(
-            "bead_id={BEAD_ID} case=group_commit_flush_failure_wakes_waiters could not coalesce flusher+waiter in allotted attempts"
+            "bead_id={BEAD_ID} case=group_commit_in_doubt_failure_fails_waiter_closed could not coalesce flusher+waiter in allotted attempts"
         );
     }
 
     #[test]
-    fn test_group_commit_flush_failure_restores_reserved_lock_level() {
-        let vfs = BlockingObservedLockVfs::new();
+    fn test_group_commit_awaited_error_hands_transaction_unlock_to_reconciliation() {
+        let vfs = ObservedLockVfs::new();
         let observed_lock_level = vfs.observed_lock_level();
-        let path = PathBuf::from("/wal_group_commit_failure_restores_reserved.db");
+        let observed_unlock_trace_ids = vfs.observed_unlock_trace_ids();
+        let path = PathBuf::from("/wal_group_commit_awaited_error_handoff.db");
         let pager = vfs.open_file_backed_pager(&path).unwrap();
         let cx = Cx::new();
-        let (backend, _append_frames_calls) = FailingGroupCommitWalBackend::new();
+        let (backend, frames, sync_calls, reconcile_calls) =
+            MockWalBackend::new_with_failing_sync();
         pager.set_wal_backend(Box::new(backend)).unwrap();
         pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
         pager
-            .set_wal_commit_sync_policy(WalCommitSyncPolicy::Deferred)
+            .set_wal_commit_sync_policy(WalCommitSyncPolicy::PerCommit)
             .unwrap();
+        let queue = Arc::clone(&pager.group_commit_queue);
 
         let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
         let page = txn.allocate_page(&cx).unwrap();
-        txn.write_page(&cx, page, &vec![0x77; PageSize::DEFAULT.as_usize()])
-            .unwrap();
+        let committed_page = vec![0x77; PageSize::DEFAULT.as_usize()];
+        txn.write_page(&cx, page, &committed_page).unwrap();
+        observed_unlock_trace_ids.lock().unwrap().clear();
 
-        let error = txn.commit(&cx).expect_err(
-            "failing WAL backend should surface a group commit error instead of committing",
-        );
+        let error = txn
+            .commit(&cx)
+            .expect_err("post-append sync failure must surface its original error");
         assert!(
             error
                 .to_string()
-                .contains("forced batched group commit append failure"),
-            "bead_id={BEAD_ID} case=group_commit_failure_surfaces_backend_error error={error}"
+                .contains("forced group-commit sync failure after full WAL append"),
+            "awaited-error path must preserve the original callback error: {error}"
+        );
+        assert_eq!(
+            *sync_calls.lock().unwrap(),
+            1,
+            "the injected awaited error must occur at the first sync"
+        );
+        let frames = frames.lock().unwrap();
+        assert!(
+            frames.last().is_some_and(|frame| frame.2 != 0),
+            "the failure fixture must contain a full WAL commit marker"
+        );
+        drop(frames);
+
+        let flush_epoch = {
+            let consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                consolidator.phase(),
+                ConsolidationPhase::Flushing,
+                "awaited in-doubt error must leave the epoch FLUSHING"
+            );
+            consolidator.epoch()
+        };
+        assert!(
+            !queue
+                .failed_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&flush_epoch),
+            "awaited in-doubt error must not publish Abort"
+        );
+        assert_eq!(
+            queue
+                .pending_external_unlocks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "database-lock obligation must transfer ownership to the queue"
+        );
+        assert!(
+            queue.has_unresolved_in_doubt_epoch(),
+            "queued awaited error must enter BusyRecovery"
+        );
+        let busy_error = match pager.begin(&cx, TransactionMode::ReadOnly) {
+            Ok(_) => panic!("new begin must fail closed while durability is unresolved"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(busy_error, FrankenError::BusyRecovery),
+            "unresolved awaited error must surface BusyRecovery, got {busy_error}"
+        );
+        assert!(
+            observed_unlock_trace_ids.lock().unwrap().is_empty(),
+            "neither normal error handling nor BusyRecovery may call unlock"
         );
         assert_eq!(
             *observed_lock_level.lock().unwrap(),
             LockLevel::Reserved,
-            "bead_id={BEAD_ID} case=group_commit_failure_restores_writer_lock_after_exclusive_error"
+            "awaited in-doubt error must retain RESERVED"
         );
 
         drop(txn);
+        assert!(
+            observed_unlock_trace_ids.lock().unwrap().is_empty(),
+            "transaction Drop must hand off instead of independently unlocking"
+        );
+        assert_eq!(
+            *observed_lock_level.lock().unwrap(),
+            LockLevel::Reserved,
+            "queued obligation must still own RESERVED after caller Drop"
+        );
+        let restore_target = {
+            let owners = queue
+                .pending_external_unlock_ownership
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ownership = owners
+                .get(&flush_epoch)
+                .expect("queued epoch must retain explicit external-lock ownership");
+            let target = *ownership
+                .restore_target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            target
+        };
+        assert_eq!(
+            restore_target,
+            PendingExternalUnlockTarget::ExternalSnapshot,
+            "last transaction Drop must record the eventual snapshot-fence release"
+        );
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("awaited-error reconciliation runtime should build");
+        runtime.block_on(async {
+            assert!(
+                queue.resolve_one_pending_external_unlock().await.unwrap(),
+                "durable reconciliation must claim the queued external lock"
+            );
+        });
+
+        assert_eq!(
+            *reconcile_calls.lock().unwrap(),
+            1,
+            "the retained recovery object must reconcile the exact certificate and WAL interval"
+        );
+        assert_eq!(
+            *sync_calls.lock().unwrap(),
+            2,
+            "authorized synchronous recovery must re-establish the WAL durability fence"
+        );
+        assert_eq!(
+            observed_unlock_trace_ids.lock().unwrap().len(),
+            1,
+            "reconciliation must perform exactly one final unlock transition"
+        );
         assert_eq!(
             *observed_lock_level.lock().unwrap(),
             LockLevel::None,
-            "bead_id={BEAD_ID} case=group_commit_failure_drop_releases_retained_writer_lock"
+            "recorded final target must release the last snapshot fence"
         );
+        assert!(queue.is_epoch_complete(flush_epoch));
+        assert!(
+            queue.persisted_epoch_for(flush_epoch).is_some(),
+            "authorized recovery must finalize and publish the pending durability receipt"
+        );
+        assert!(
+            !queue
+                .failed_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&flush_epoch),
+            "durable reconciliation must complete without publishing Abort"
+        );
+        assert!(!queue.has_unresolved_in_doubt_epoch());
+        let reader = pager
+            .begin(&cx, TransactionMode::ReadOnly)
+            .expect("post-reconciliation begin must not require a BusyRecovery retry");
+        assert_eq!(
+            reader.get_page(&cx, page).unwrap().as_bytes(),
+            committed_page.as_slice(),
+            "authorized recovery must publish the retained page batch"
+        );
+        assert_eq!(
+            observed_unlock_trace_ids.lock().unwrap().len(),
+            1,
+            "successful post-reconciliation begin must not add an unlock"
+        );
+        drop(reader);
     }
 
     #[test]
-    fn test_group_commit_fault_hook_after_flush_before_publish_wakes_waiters_with_error_and_records_context()
-     {
+    fn test_group_commit_prewrite_error_reconciles_not_committed_and_unlocks_once() {
+        let vfs = ObservedLockVfs::new();
+        let observed_lock_level = vfs.observed_lock_level();
+        let observed_unlock_trace_ids = vfs.observed_unlock_trace_ids();
+        let path = PathBuf::from("/wal_group_commit_prewrite_error_reconciliation.db");
+        let pager = vfs.open_file_backed_pager(&path).unwrap();
+        let cx = Cx::new();
+        let (backend, frames, sync_calls, reconcile_calls) =
+            MockWalBackend::new_with_failing_append_before_write();
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+        pager
+            .set_wal_commit_sync_policy(WalCommitSyncPolicy::PerCommit)
+            .unwrap();
+        let queue = Arc::clone(&pager.group_commit_queue);
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, page, &vec![0x55; PageSize::DEFAULT.as_usize()])
+            .unwrap();
+        observed_unlock_trace_ids.lock().unwrap().clear();
+
+        let error = txn
+            .commit(&cx)
+            .expect_err("pre-write WAL append failure must surface");
+        assert!(
+            error
+                .to_string()
+                .contains("forced group-commit append failure before WAL write"),
+            "pre-write reconciliation fixture must preserve its source error: {error}"
+        );
+        assert!(
+            frames.lock().unwrap().is_empty(),
+            "pre-write failure must leave the certified WAL interval absent"
+        );
+        assert_eq!(
+            *sync_calls.lock().unwrap(),
+            0,
+            "an absent WAL interval must never reach the commit sync"
+        );
+
+        let flush_epoch = {
+            let consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(consolidator.phase(), ConsolidationPhase::Flushing);
+            consolidator.epoch()
+        };
+        assert_eq!(
+            queue
+                .pending_external_unlocks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "pre-write callback error must retain RESERVED until exact reconciliation"
+        );
+        assert_eq!(*observed_lock_level.lock().unwrap(), LockLevel::Reserved);
+        assert!(observed_unlock_trace_ids.lock().unwrap().is_empty());
+
+        drop(txn);
+        assert!(
+            observed_unlock_trace_ids.lock().unwrap().is_empty(),
+            "transaction Drop must transfer the final unlock to recovery"
+        );
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("not-committed reconciliation runtime should build");
+        runtime.block_on(async {
+            assert!(
+                queue.resolve_one_pending_external_unlock().await.unwrap(),
+                "exact reconciliation must classify and release the absent interval"
+            );
+        });
+
+        assert_eq!(
+            *reconcile_calls.lock().unwrap(),
+            1,
+            "the retained recovery object must reconcile the exact absent interval"
+        );
+        assert_eq!(
+            *sync_calls.lock().unwrap(),
+            0,
+            "NotCommitted recovery must not manufacture a durability fence"
+        );
+        assert_eq!(
+            observed_unlock_trace_ids.lock().unwrap().len(),
+            1,
+            "NotCommitted recovery must perform exactly one unlock transition"
+        );
+        assert_eq!(*observed_lock_level.lock().unwrap(), LockLevel::None);
+        assert!(
+            queue.persisted_epoch_for(flush_epoch).is_none(),
+            "NotCommitted recovery must not publish a durability receipt"
+        );
+        assert!(!queue.is_epoch_complete(flush_epoch));
+        assert!(
+            queue
+                .failed_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&flush_epoch),
+            "NotCommitted recovery must publish Abort for the failed epoch"
+        );
+        assert!(!queue.has_unresolved_in_doubt_epoch());
+    }
+
+    #[test]
+    fn test_group_commit_fault_hook_after_durability_completes_without_abort_and_records_context() {
         let _guard = FAULT_HOOK_TEST_GUARD
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -22582,9 +24298,31 @@ mod tests {
                 "bead_id={BEAD_ID} case=group_commit_publish_hook_reports_primary_failure error_a={error_a} error_b={error_b}"
             );
             assert!(
-                error_a.contains("group commit flush failed")
-                    || error_b.contains("group commit flush failed"),
-                "bead_id={BEAD_ID} case=group_commit_publish_hook_reports_epoch_failure error_a={error_a} error_b={error_b}"
+                error_a.contains("completed without a durability certificate")
+                    || error_b.contains("completed without a durability certificate"),
+                "bead_id={BEAD_ID} case=group_commit_publish_hook_waiter_reports_recovery_boundary error_a={error_a} error_b={error_b}"
+            );
+            let completed_epoch = queue.completed_epoch.load(AtomicOrdering::Acquire);
+            assert!(
+                completed_epoch >= 1,
+                "bead_id={BEAD_ID} case=group_commit_post_durable_fault_completes_epoch completed_epoch={completed_epoch}"
+            );
+            assert!(
+                queue
+                    .failed_epochs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty(),
+                "bead_id={BEAD_ID} case=group_commit_post_durable_fault_must_not_publish_abort"
+            );
+            assert_eq!(
+                queue
+                    .consolidator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .phase(),
+                ConsolidationPhase::Complete,
+                "post-durable publication fault must not strand the epoch in Flushing"
             );
 
             let records = crate::fault_hooks::take_records();
@@ -23466,29 +25204,31 @@ mod tests {
         }
 
         impl crate::traits::WalBackend for WaiterStressBackend {
-            fn append_frame(
-                &mut self,
-                _cx: &Cx,
+            fn append_frame<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 _page_number: u32,
-                _page_data: &[u8],
+                _page_data: &'a [u8],
                 _db_size_if_commit: u32,
-            ) -> fsqlite_error::Result<()> {
-                Ok(())
+            ) -> WalFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
 
-            fn append_frames(
-                &mut self,
-                _cx: &Cx,
-                frames: &[crate::traits::WalFrameRef<'_>],
-            ) -> fsqlite_error::Result<()> {
-                // Non-prepared fallback path: count meta-only (no frame bytes to inspect).
-                let meta_commits = frames.iter().filter(|f| f.db_size_if_commit != 0).count();
-                self.per_batch
-                    .lock()
-                    .unwrap()
-                    .push((meta_commits, meta_commits, frames.len()));
-                *self.total_frames.lock().unwrap() += frames.len();
-                Ok(())
+            fn append_frames<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
+                frames: &'a [crate::traits::WalFrameRef<'a>],
+            ) -> WalFuture<'a, ()> {
+                Box::pin(async move {
+                    // Non-prepared fallback path: count meta-only (no frame bytes to inspect).
+                    let meta_commits = frames.iter().filter(|f| f.db_size_if_commit != 0).count();
+                    self.per_batch
+                        .lock()
+                        .unwrap()
+                        .push((meta_commits, meta_commits, frames.len()));
+                    *self.total_frames.lock().unwrap() += frames.len();
+                    Ok(())
+                })
             }
 
             fn prepare_append_frames(
@@ -23539,40 +25279,43 @@ mod tests {
                 }))
             }
 
-            fn append_prepared_frames(
-                &mut self,
-                _cx: &Cx,
-                prepared: &mut crate::traits::PreparedWalFrameBatch,
-            ) -> fsqlite_error::Result<()> {
-                *self.append_prepared_calls.lock().unwrap() += 1;
-                let meta_commits = prepared
-                    .frame_metas
-                    .iter()
-                    .filter(|meta| meta.db_size_if_commit != 0)
-                    .count();
-                let mut byte_commits = 0_usize;
-                for i in 0..prepared.frame_count() {
-                    let slice = prepared.frame_slice(i);
-                    let byte_db_size = u32::from_be_bytes([slice[4], slice[5], slice[6], slice[7]]);
-                    if byte_db_size != 0 {
-                        byte_commits += 1;
+            fn append_prepared_frames<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
+                prepared: &'a mut crate::traits::PreparedWalFrameBatch,
+            ) -> WalFuture<'a, ()> {
+                Box::pin(async move {
+                    *self.append_prepared_calls.lock().unwrap() += 1;
+                    let meta_commits = prepared
+                        .frame_metas
+                        .iter()
+                        .filter(|meta| meta.db_size_if_commit != 0)
+                        .count();
+                    let mut byte_commits = 0_usize;
+                    for i in 0..prepared.frame_count() {
+                        let slice = prepared.frame_slice(i);
+                        let byte_db_size =
+                            u32::from_be_bytes([slice[4], slice[5], slice[6], slice[7]]);
+                        if byte_db_size != 0 {
+                            byte_commits += 1;
+                        }
                     }
-                }
-                self.per_batch.lock().unwrap().push((
-                    meta_commits,
-                    byte_commits,
-                    prepared.frame_count(),
-                ));
-                *self.total_frames.lock().unwrap() += prepared.frame_count();
-                Ok(())
+                    self.per_batch.lock().unwrap().push((
+                        meta_commits,
+                        byte_commits,
+                        prepared.frame_count(),
+                    ));
+                    *self.total_frames.lock().unwrap() += prepared.frame_count();
+                    Ok(())
+                })
             }
 
-            fn read_page(
-                &mut self,
-                _cx: &Cx,
+            fn read_page<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 _page_number: u32,
-            ) -> fsqlite_error::Result<Option<Vec<u8>>> {
-                Ok(None)
+            ) -> WalFuture<'a, Option<Vec<u8>>> {
+                Box::pin(async { Ok(None) })
             }
 
             fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
@@ -23583,21 +25326,23 @@ mod tests {
                 *self.total_frames.lock().unwrap()
             }
 
-            fn checkpoint(
-                &mut self,
-                _cx: &Cx,
+            fn checkpoint<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 mode: crate::traits::CheckpointMode,
-                _writer: &mut dyn crate::traits::CheckpointPageWriter,
+                _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
                 _backfilled_frames: u32,
                 _oldest_reader_frame: Option<u32>,
-            ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
-                Ok(crate::traits::CheckpointResult {
-                    total_frames: 0,
-                    frames_backfilled: 0,
-                    completed: true,
-                    wal_was_reset: false,
-                    requested_mode: mode,
-                    effective_mode: mode,
+            ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+                Box::pin(async move {
+                    Ok(crate::traits::CheckpointResult {
+                        total_frames: 0,
+                        frames_backfilled: 0,
+                        completed: true,
+                        wal_was_reset: false,
+                        requested_mode: mode,
+                        effective_mode: mode,
+                    })
                 })
             }
         }
@@ -24282,6 +26027,405 @@ mod tests {
     }
 
     #[test]
+    fn test_group_commit_filling_obligation_drop_aborts_exact_target_epoch() {
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+        let receipt = {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            consolidator
+                .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+                    page_number: 1,
+                    page_data: sample_page(0x61),
+                    db_size_if_commit: 1,
+                }]))
+                .unwrap()
+        };
+        assert_eq!(receipt.outcome, SubmitOutcome::Flusher);
+        drop(GroupCommitFillingObligation::new(
+            &queue,
+            receipt.target_epoch,
+        ));
+
+        let consolidator = queue
+            .consolidator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(consolidator.phase(), ConsolidationPhase::Complete);
+        assert_eq!(consolidator.epoch(), receipt.target_epoch);
+        assert_eq!(consolidator.pending_batch_count(), 0);
+        drop(consolidator);
+        assert!(
+            queue
+                .failed_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&receipt.target_epoch),
+            "cancelled filling epoch must publish one atomic Abort outcome"
+        );
+    }
+
+    #[test]
+    fn test_group_commit_durable_signal_survives_future_drop_before_await_returns() {
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+        let flush_epoch = {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            consolidator
+                .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+                    page_number: 1,
+                    page_data: sample_page(0x62),
+                    db_size_if_commit: 1,
+                }]))
+                .unwrap();
+            let _ = consolidator.begin_flush().unwrap();
+            consolidator.epoch()
+        };
+        let obligation = GroupCommitFlushObligation::new(&queue, flush_epoch);
+        obligation
+            .durable_io_signal()
+            .store(true, AtomicOrdering::Release);
+        drop(obligation);
+
+        let consolidator = queue
+            .consolidator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(consolidator.phase(), ConsolidationPhase::Complete);
+        drop(consolidator);
+        assert!(queue.is_epoch_complete(flush_epoch));
+        assert!(
+            !queue
+                .failed_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&flush_epoch),
+            "durable cancellation must never be published as Abort"
+        );
+    }
+
+    #[test]
+    fn test_group_commit_durable_obligation_does_not_complete_before_external_unlock() {
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+        let flush_epoch = {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            consolidator
+                .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+                    page_number: 1,
+                    page_data: sample_page(0x63),
+                    db_size_if_commit: 1,
+                }]))
+                .unwrap();
+            let _ = consolidator.begin_flush().unwrap();
+            consolidator.epoch()
+        };
+        let mut obligation = GroupCommitFlushObligation::new(&queue, flush_epoch);
+        obligation
+            .external_lock_restored
+            .store(false, AtomicOrdering::Release);
+        obligation.mark_durable();
+        drop(obligation);
+
+        let consolidator = queue
+            .consolidator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(consolidator.phase(), ConsolidationPhase::Flushing);
+        drop(consolidator);
+        assert!(!queue.is_epoch_complete(flush_epoch));
+        assert!(
+            !queue
+                .failed_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&flush_epoch),
+            "an unresolved durable cleanup is neither complete nor Abort"
+        );
+    }
+
+    fn begin_pending_unlock_test_epoch(queue: &GroupCommitQueueRef) -> u64 {
+        let mut consolidator = queue
+            .consolidator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        consolidator
+            .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 1,
+                page_data: sample_page(0x64),
+                db_size_if_commit: 1,
+            }]))
+            .unwrap();
+        let _ = consolidator.begin_flush().unwrap();
+        consolidator.epoch()
+    }
+
+    fn pending_unlock_test_db_file(
+        cx: &Cx,
+        path: &Path,
+    ) -> (
+        SharedDbFile<ObservedLockFile>,
+        ObservedLockLevel,
+        ObservedUnlockTraceIds,
+    ) {
+        let vfs = ObservedLockVfs::new();
+        let observed_lock_level = vfs.observed_lock_level();
+        let observed_unlock_trace_ids = vfs.observed_unlock_trace_ids();
+        let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut file, _) = vfs.open(cx, Some(path), flags).unwrap();
+        file.lock(cx, LockLevel::Reserved).unwrap();
+        assert_eq!(
+            *observed_lock_level
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            LockLevel::Reserved,
+            "test fixture must begin with an external RESERVED lock"
+        );
+        (
+            Arc::new(AsyncRwLock::new(file)),
+            observed_lock_level,
+            observed_unlock_trace_ids,
+        )
+    }
+
+    #[test]
+    fn test_dropped_pending_unlock_claim_requeues_until_waiter_restores_lock() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("pending external unlock test runtime should build");
+        runtime.block_on(async {
+            let cx = Cx::new();
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let flush_epoch = begin_pending_unlock_test_epoch(&queue);
+            let (db_file, observed_lock_level, _) =
+                pending_unlock_test_db_file(&cx, Path::new("/pending-unlock-requeue.db"));
+            let held_file = db_file
+                .try_write()
+                .expect("test should hold the shared database-file handle");
+            let flush_obligation = GroupCommitFlushObligation::new(&queue, flush_epoch);
+            let db_lock_obligation = GroupCommitDbLockObligation::new(
+                &queue,
+                flush_epoch,
+                &db_file,
+                &cx,
+                LockLevel::Shared,
+                flush_obligation.durability_started_signal(),
+                flush_obligation.durable_io_signal(),
+                flush_obligation.external_lock_state(),
+            );
+
+            drop(db_lock_obligation);
+            drop(flush_obligation);
+            assert_eq!(
+                queue
+                    .pending_external_unlocks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                1,
+                "contended Drop must transfer its external unlock into the queue"
+            );
+
+            let mut first_claim = Box::pin(queue.resolve_one_pending_external_unlock());
+            std::future::poll_fn(|poll_cx| match first_claim.as_mut().poll(poll_cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("contended pending unlock unexpectedly completed: {result:?}")
+                }
+            })
+            .await;
+            assert!(
+                queue.claim_pending_external_unlock().is_none(),
+                "exactly one cleanup path may own the pending unlock"
+            );
+            drop(first_claim);
+            assert_eq!(
+                queue
+                    .pending_external_unlocks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                1,
+                "dropping the cleanup future must requeue its leased obligation"
+            );
+
+            drop(held_file);
+            assert!(queue.resolve_one_pending_external_unlock().await.unwrap());
+            assert_eq!(
+                *observed_lock_level
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                LockLevel::Shared,
+                "structured cleanup must downgrade the external RESERVED lock"
+            );
+            assert!(
+                queue
+                    .failed_epochs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&flush_epoch),
+                "a pre-side-effect dropped flusher resolves as Abort after unlock"
+            );
+        });
+    }
+
+    #[test]
+    fn test_pending_unlock_stays_queued_without_unlock_while_in_doubt() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("in-doubt pending unlock test runtime should build");
+        runtime.block_on(async {
+            let cx = Cx::new();
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let flush_epoch = begin_pending_unlock_test_epoch(&queue);
+            let (db_file, observed_lock_level, observed_unlock_trace_ids) =
+                pending_unlock_test_db_file(&cx, Path::new("/pending-unlock-in-doubt.db"));
+            let flush_obligation = GroupCommitFlushObligation::new(&queue, flush_epoch);
+            let durability_started = flush_obligation.durability_started_signal();
+            let durable_io_completed = flush_obligation.durable_io_signal();
+            durability_started.store(true, AtomicOrdering::Release);
+            let db_lock_obligation = GroupCommitDbLockObligation::new(
+                &queue,
+                flush_epoch,
+                &db_file,
+                &cx,
+                LockLevel::Shared,
+                Arc::clone(&durability_started),
+                Arc::clone(&durable_io_completed),
+                flush_obligation.external_lock_state(),
+            );
+
+            drop(db_lock_obligation);
+            drop(flush_obligation);
+            assert_eq!(
+                queue
+                    .pending_external_unlocks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                1,
+                "an in-doubt Drop must queue even when the shared handle is uncontended"
+            );
+            assert!(
+                !queue.try_resolve_one_pending_external_unlock().unwrap(),
+                "nonblocking cleanup must leave an in-doubt unlock queued"
+            );
+            assert!(
+                !queue.resolve_one_pending_external_unlock().await.unwrap(),
+                "async cleanup must leave an in-doubt unlock queued"
+            );
+            assert_eq!(
+                queue
+                    .pending_external_unlocks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                1,
+                "both cleanup claim types must requeue the same unlock obligation"
+            );
+            assert!(
+                observed_unlock_trace_ids.lock().unwrap().is_empty(),
+                "no external unlock operation may run while durability is in doubt"
+            );
+            assert_eq!(
+                *observed_lock_level
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                LockLevel::Reserved,
+                "RESERVED must remain held while the lower WAL write may still run"
+            );
+            assert!(
+                queue.has_unresolved_in_doubt_epoch(),
+                "a queued in-doubt unlock must block new pager work"
+            );
+            let consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(consolidator.phase(), ConsolidationPhase::Flushing);
+            drop(consolidator);
+            assert!(
+                !queue
+                    .failed_epochs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&flush_epoch),
+                "an in-doubt side effect must never be reinterpreted as Abort"
+            );
+
+            durable_io_completed.store(true, AtomicOrdering::Release);
+            assert!(queue.resolve_one_pending_external_unlock().await.unwrap());
+            assert_eq!(
+                observed_unlock_trace_ids.lock().unwrap().len(),
+                1,
+                "durable completion permits exactly one external unlock operation"
+            );
+            assert_eq!(
+                *observed_lock_level
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                LockLevel::Shared,
+                "durable cleanup may downgrade RESERVED after the lower write is terminal"
+            );
+            assert!(queue.is_epoch_complete(flush_epoch));
+            assert!(!queue.has_unresolved_in_doubt_epoch());
+        });
+    }
+
+    #[test]
+    fn test_pending_unlock_completes_durable_epoch_only_after_lock_restoration() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("durable pending unlock test runtime should build");
+        runtime.block_on(async {
+            let cx = Cx::new();
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let flush_epoch = begin_pending_unlock_test_epoch(&queue);
+            let (db_file, _, _) =
+                pending_unlock_test_db_file(&cx, Path::new("/pending-unlock-durable.db"));
+            let held_file = db_file
+                .try_write()
+                .expect("test should hold the shared database-file handle");
+            let flush_obligation = GroupCommitFlushObligation::new(&queue, flush_epoch);
+            let durability_started = flush_obligation.durability_started_signal();
+            let durable_io_completed = flush_obligation.durable_io_signal();
+            durability_started.store(true, AtomicOrdering::Release);
+            durable_io_completed.store(true, AtomicOrdering::Release);
+            let db_lock_obligation = GroupCommitDbLockObligation::new(
+                &queue,
+                flush_epoch,
+                &db_file,
+                &cx,
+                LockLevel::Shared,
+                durability_started,
+                durable_io_completed,
+                flush_obligation.external_lock_state(),
+            );
+
+            drop(db_lock_obligation);
+            drop(flush_obligation);
+            assert!(
+                !queue.is_epoch_complete(flush_epoch),
+                "durability alone must not publish before external unlock"
+            );
+            drop(held_file);
+            assert!(queue.resolve_one_pending_external_unlock().await.unwrap());
+            assert!(
+                queue.is_epoch_complete(flush_epoch),
+                "the cleanup claimant publishes a durable epoch after restoring the lock"
+            );
+        });
+    }
+
+    #[test]
     fn test_group_commit_queue_publish_synchronizes_with_waiter_mutex() {
         let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
         let guard = queue
@@ -24439,6 +26583,29 @@ mod tests {
             KeyedWaitResult::Signaled,
             "bead_id={BEAD_ID} case=keyed_wait_slot_pre_signaled_generation_must_not_timeout"
         );
+    }
+
+    #[test]
+    fn test_keyed_wait_slot_async_rechecks_generation_after_dropped_notify_race() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("async keyed-wait test runtime should build");
+        runtime.block_on(async {
+            let slot = KeyedWaitSlot::default();
+            let observed_generation = slot.generation();
+            // Inject the publication after the async waiter's fast-path
+            // generation check, but deliberately omit Notify. The bounded
+            // fallback must recheck the eventcount and classify this as a
+            // signal rather than lose the wake forever.
+            slot.arm_drop_next_async_notify();
+            assert_eq!(
+                slot.wait_for_change_async(observed_generation).await,
+                KeyedWaitResult::Signaled,
+                "bead_id={BEAD_ID} case=async_keyed_waiter_recovers_dropped_notify_race"
+            );
+            assert_ne!(slot.generation(), observed_generation);
+        });
     }
 
     #[test]
@@ -31929,26 +34096,30 @@ mod tests {
         }
 
         impl WalBackend for ZeroFrameWalBackend {
-            fn begin_transaction(&mut self, _cx: &Cx) -> Result<()> {
-                Ok(())
+            fn begin_transaction<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
 
             fn pinned_read_snapshot(&self) -> Option<WalPublicationSnapshot> {
                 Some(self.snapshot)
             }
 
-            fn append_frame(
-                &mut self,
-                _cx: &Cx,
+            fn append_frame<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 _page_number: u32,
-                _page_data: &[u8],
+                _page_data: &'a [u8],
                 _db_size_if_commit: u32,
-            ) -> Result<()> {
-                Ok(())
+            ) -> WalFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
 
-            fn read_page(&mut self, _cx: &Cx, _page_number: u32) -> Result<Option<Vec<u8>>> {
-                Ok(None)
+            fn read_page<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
+                _page_number: u32,
+            ) -> WalFuture<'a, Option<Vec<u8>>> {
+                Box::pin(async { Ok(None) })
             }
 
             fn sync(&mut self, _cx: &Cx) -> Result<()> {
@@ -31959,21 +34130,23 @@ mod tests {
                 0
             }
 
-            fn checkpoint(
-                &mut self,
-                _cx: &Cx,
+            fn checkpoint<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 mode: crate::traits::CheckpointMode,
-                _writer: &mut dyn crate::traits::CheckpointPageWriter,
+                _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
                 _backfilled_frames: u32,
                 _oldest_reader_frame: Option<u32>,
-            ) -> Result<crate::traits::CheckpointResult> {
-                Ok(crate::traits::CheckpointResult {
-                    total_frames: 0,
-                    frames_backfilled: 0,
-                    completed: true,
-                    wal_was_reset: false,
-                    requested_mode: mode,
-                    effective_mode: mode,
+            ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+                Box::pin(async move {
+                    Ok(crate::traits::CheckpointResult {
+                        total_frames: 0,
+                        frames_backfilled: 0,
+                        completed: true,
+                        wal_was_reset: false,
+                        requested_mode: mode,
+                        effective_mode: mode,
+                    })
                 })
             }
         }
@@ -32039,28 +34212,34 @@ mod tests {
         }
 
         impl WalBackend for PageOneReadFailWalBackend {
-            fn begin_transaction(&mut self, _cx: &Cx) -> Result<()> {
-                Ok(())
+            fn begin_transaction<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
 
             fn pinned_read_snapshot(&self) -> Option<WalPublicationSnapshot> {
                 Some(self.snapshot)
             }
 
-            fn append_frame(
-                &mut self,
-                _cx: &Cx,
+            fn append_frame<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 _page_number: u32,
-                _page_data: &[u8],
+                _page_data: &'a [u8],
                 _db_size_if_commit: u32,
-            ) -> Result<()> {
-                Ok(())
+            ) -> WalFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
 
-            fn read_page(&mut self, _cx: &Cx, _page_number: u32) -> Result<Option<Vec<u8>>> {
-                Err(FrankenError::internal(
-                    "forced committed page-1 materialization failure",
-                ))
+            fn read_page<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
+                _page_number: u32,
+            ) -> WalFuture<'a, Option<Vec<u8>>> {
+                Box::pin(async {
+                    Err(FrankenError::internal(
+                        "forced committed page-1 materialization failure",
+                    ))
+                })
             }
 
             fn sync(&mut self, _cx: &Cx) -> Result<()> {
@@ -32071,21 +34250,23 @@ mod tests {
                 1
             }
 
-            fn checkpoint(
-                &mut self,
-                _cx: &Cx,
+            fn checkpoint<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 _mode: crate::traits::CheckpointMode,
-                _writer: &mut dyn crate::traits::CheckpointPageWriter,
+                _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
                 _backfilled_frames: u32,
                 _oldest_reader_frame: Option<u32>,
-            ) -> Result<crate::traits::CheckpointResult> {
-                Ok(crate::traits::CheckpointResult {
-                    total_frames: 1,
-                    frames_backfilled: 0,
-                    completed: false,
-                    wal_was_reset: false,
-                    requested_mode: _mode,
-                    effective_mode: _mode,
+            ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+                Box::pin(async move {
+                    Ok(crate::traits::CheckpointResult {
+                        total_frames: 1,
+                        frames_backfilled: 0,
+                        completed: false,
+                        wal_was_reset: false,
+                        requested_mode: _mode,
+                        effective_mode: _mode,
+                    })
                 })
             }
         }
@@ -32823,36 +35004,40 @@ mod tests {
         }
 
         impl WalBackend for PinnedReadBackend {
-            fn begin_transaction(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
-                Ok(())
+            fn begin_transaction<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
 
-            fn append_frame(
-                &mut self,
-                _cx: &Cx,
+            fn append_frame<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 _page_number: u32,
-                _page_data: &[u8],
+                _page_data: &'a [u8],
                 _db_size_if_commit: u32,
-            ) -> fsqlite_error::Result<()> {
-                Ok(())
+            ) -> WalFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
 
-            fn read_page(
-                &mut self,
-                _cx: &Cx,
+            fn read_page<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 _page_number: u32,
-            ) -> fsqlite_error::Result<Option<Vec<u8>>> {
-                *self.fallback_calls.lock().unwrap() += 1;
-                Ok(Some(vec![0xEE]))
+            ) -> WalFuture<'a, Option<Vec<u8>>> {
+                Box::pin(async move {
+                    *self.fallback_calls.lock().unwrap() += 1;
+                    Ok(Some(vec![0xEE]))
+                })
             }
 
-            fn read_page_pinned(
-                &self,
-                _cx: &Cx,
+            fn read_page_pinned<'a>(
+                &'a self,
+                _cx: &'a Cx,
                 _page_number: u32,
-            ) -> fsqlite_error::Result<Option<Vec<u8>>> {
-                *self.pinned_calls.lock().unwrap() += 1;
-                Ok(Some(self.response.clone()))
+            ) -> WalFuture<'a, Option<Vec<u8>>> {
+                Box::pin(async move {
+                    *self.pinned_calls.lock().unwrap() += 1;
+                    Ok(Some(self.response.clone()))
+                })
             }
 
             fn supports_pinned_reads(&self) -> bool {
@@ -32867,21 +35052,23 @@ mod tests {
                 0
             }
 
-            fn checkpoint(
-                &mut self,
-                _cx: &Cx,
+            fn checkpoint<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 _mode: crate::traits::CheckpointMode,
-                _writer: &mut dyn crate::traits::CheckpointPageWriter,
+                _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
                 _backfilled_frames: u32,
                 _oldest_reader_frame: Option<u32>,
-            ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
-                Ok(crate::traits::CheckpointResult {
-                    total_frames: 0,
-                    frames_backfilled: 0,
-                    completed: true,
-                    wal_was_reset: false,
-                    requested_mode: _mode,
-                    effective_mode: _mode,
+            ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+                Box::pin(async move {
+                    Ok(crate::traits::CheckpointResult {
+                        total_frames: 0,
+                        frames_backfilled: 0,
+                        completed: true,
+                        wal_was_reset: false,
+                        requested_mode: _mode,
+                        effective_mode: _mode,
+                    })
                 })
             }
         }
@@ -32928,40 +35115,44 @@ mod tests {
         struct CorruptPinnedReadBackend;
 
         impl WalBackend for CorruptPinnedReadBackend {
-            fn begin_transaction(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
-                Ok(())
+            fn begin_transaction<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
 
-            fn append_frame(
-                &mut self,
-                _cx: &Cx,
+            fn append_frame<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 _page_number: u32,
-                _page_data: &[u8],
+                _page_data: &'a [u8],
                 _db_size_if_commit: u32,
-            ) -> fsqlite_error::Result<()> {
-                Ok(())
+            ) -> WalFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
 
-            fn read_page(
-                &mut self,
-                _cx: &Cx,
+            fn read_page<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 _page_number: u32,
-            ) -> fsqlite_error::Result<Option<Vec<u8>>> {
-                // This should NEVER be called if pinned reads are supported
-                // and the pinned read fails with a real error.
-                panic!(
-                    "bead_id=bd-db300.3.8.7 MUST NOT fall back to read_page \
-                     when read_page_pinned returns a real error"
-                );
+            ) -> WalFuture<'a, Option<Vec<u8>>> {
+                Box::pin(async {
+                    // This should NEVER be called if pinned reads are supported
+                    // and the pinned read fails with a real error.
+                    panic!(
+                        "bead_id=bd-db300.3.8.7 MUST NOT fall back to read_page \
+                         when read_page_pinned returns a real error"
+                    );
+                })
             }
 
-            fn read_page_pinned(
-                &self,
-                _cx: &Cx,
+            fn read_page_pinned<'a>(
+                &'a self,
+                _cx: &'a Cx,
                 _page_number: u32,
-            ) -> fsqlite_error::Result<Option<Vec<u8>>> {
-                Err(fsqlite_error::FrankenError::WalCorrupt {
-                    detail: "simulated corruption in pinned read".to_owned(),
+            ) -> WalFuture<'a, Option<Vec<u8>>> {
+                Box::pin(async {
+                    Err(fsqlite_error::FrankenError::WalCorrupt {
+                        detail: "simulated corruption in pinned read".to_owned(),
+                    })
                 })
             }
 
@@ -32977,21 +35168,23 @@ mod tests {
                 0
             }
 
-            fn checkpoint(
-                &mut self,
-                _cx: &Cx,
+            fn checkpoint<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 _mode: crate::traits::CheckpointMode,
-                _writer: &mut dyn crate::traits::CheckpointPageWriter,
+                _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
                 _backfilled_frames: u32,
                 _oldest_reader_frame: Option<u32>,
-            ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
-                Ok(crate::traits::CheckpointResult {
-                    total_frames: 0,
-                    frames_backfilled: 0,
-                    completed: true,
-                    wal_was_reset: false,
-                    requested_mode: _mode,
-                    effective_mode: _mode,
+            ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+                Box::pin(async move {
+                    Ok(crate::traits::CheckpointResult {
+                        total_frames: 0,
+                        frames_backfilled: 0,
+                        completed: true,
+                        wal_was_reset: false,
+                        requested_mode: _mode,
+                        effective_mode: _mode,
+                    })
                 })
             }
         }
@@ -33488,25 +35681,27 @@ mod tests {
         }
 
         impl crate::traits::WalBackend for SlowWalBackend {
-            fn append_frame(
-                &mut self,
-                _cx: &Cx,
+            fn append_frame<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 _page_number: u32,
-                _page_data: &[u8],
+                _page_data: &'a [u8],
                 _db_size_if_commit: u32,
-            ) -> fsqlite_error::Result<()> {
-                Ok(())
+            ) -> WalFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
 
-            fn append_frames(
-                &mut self,
-                _cx: &Cx,
-                frames: &[crate::traits::WalFrameRef<'_>],
-            ) -> fsqlite_error::Result<()> {
-                *self.append_calls.lock().unwrap() += 1;
-                std::thread::sleep(self.io_delay);
-                let _ = frames;
-                Ok(())
+            fn append_frames<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
+                frames: &'a [crate::traits::WalFrameRef<'a>],
+            ) -> WalFuture<'a, ()> {
+                Box::pin(async move {
+                    *self.append_calls.lock().unwrap() += 1;
+                    std::thread::sleep(self.io_delay);
+                    let _ = frames;
+                    Ok(())
+                })
             }
 
             fn prepare_append_frames(
@@ -33557,22 +35752,24 @@ mod tests {
                 }))
             }
 
-            fn append_prepared_frames(
-                &mut self,
-                _cx: &Cx,
-                _prepared: &mut crate::traits::PreparedWalFrameBatch,
-            ) -> fsqlite_error::Result<()> {
-                *self.append_calls.lock().unwrap() += 1;
-                std::thread::sleep(self.io_delay);
-                Ok(())
+            fn append_prepared_frames<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
+                _prepared: &'a mut crate::traits::PreparedWalFrameBatch,
+            ) -> WalFuture<'a, ()> {
+                Box::pin(async move {
+                    *self.append_calls.lock().unwrap() += 1;
+                    std::thread::sleep(self.io_delay);
+                    Ok(())
+                })
             }
 
-            fn read_page(
-                &mut self,
-                _cx: &Cx,
+            fn read_page<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 _page_number: u32,
-            ) -> fsqlite_error::Result<Option<Vec<u8>>> {
-                Ok(None)
+            ) -> WalFuture<'a, Option<Vec<u8>>> {
+                Box::pin(async { Ok(None) })
             }
 
             fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
@@ -33583,21 +35780,23 @@ mod tests {
                 0
             }
 
-            fn checkpoint(
-                &mut self,
-                _cx: &Cx,
+            fn checkpoint<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 mode: crate::traits::CheckpointMode,
-                _writer: &mut dyn crate::traits::CheckpointPageWriter,
+                _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
                 _backfilled_frames: u32,
                 _oldest_reader_frame: Option<u32>,
-            ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
-                Ok(crate::traits::CheckpointResult {
-                    total_frames: 0,
-                    frames_backfilled: 0,
-                    completed: true,
-                    wal_was_reset: false,
-                    requested_mode: mode,
-                    effective_mode: mode,
+            ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+                Box::pin(async move {
+                    Ok(crate::traits::CheckpointResult {
+                        total_frames: 0,
+                        frames_backfilled: 0,
+                        completed: true,
+                        wal_was_reset: false,
+                        requested_mode: mode,
+                        effective_mode: mode,
+                    })
                 })
             }
         }
@@ -33689,24 +35888,26 @@ mod tests {
         }
 
         impl crate::traits::WalBackend for CountingWalBackend {
-            fn append_frame(
-                &mut self,
-                _cx: &Cx,
+            fn append_frame<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 _page_number: u32,
-                _page_data: &[u8],
+                _page_data: &'a [u8],
                 _db_size_if_commit: u32,
-            ) -> fsqlite_error::Result<()> {
-                Ok(())
+            ) -> WalFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
 
-            fn append_frames(
-                &mut self,
-                _cx: &Cx,
-                frames: &[crate::traits::WalFrameRef<'_>],
-            ) -> fsqlite_error::Result<()> {
-                *self.append_calls.lock().unwrap() += 1;
-                *self.total_frames.lock().unwrap() += frames.len();
-                Ok(())
+            fn append_frames<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
+                frames: &'a [crate::traits::WalFrameRef<'a>],
+            ) -> WalFuture<'a, ()> {
+                Box::pin(async move {
+                    *self.append_calls.lock().unwrap() += 1;
+                    *self.total_frames.lock().unwrap() += frames.len();
+                    Ok(())
+                })
             }
 
             fn prepare_append_frames(
@@ -33757,22 +35958,24 @@ mod tests {
                 }))
             }
 
-            fn append_prepared_frames(
-                &mut self,
-                _cx: &Cx,
-                prepared: &mut crate::traits::PreparedWalFrameBatch,
-            ) -> fsqlite_error::Result<()> {
-                *self.append_calls.lock().unwrap() += 1;
-                *self.total_frames.lock().unwrap() += prepared.frame_count();
-                Ok(())
+            fn append_prepared_frames<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
+                prepared: &'a mut crate::traits::PreparedWalFrameBatch,
+            ) -> WalFuture<'a, ()> {
+                Box::pin(async move {
+                    *self.append_calls.lock().unwrap() += 1;
+                    *self.total_frames.lock().unwrap() += prepared.frame_count();
+                    Ok(())
+                })
             }
 
-            fn read_page(
-                &mut self,
-                _cx: &Cx,
+            fn read_page<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 _page_number: u32,
-            ) -> fsqlite_error::Result<Option<Vec<u8>>> {
-                Ok(None)
+            ) -> WalFuture<'a, Option<Vec<u8>>> {
+                Box::pin(async { Ok(None) })
             }
 
             fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
@@ -33783,21 +35986,23 @@ mod tests {
                 *self.total_frames.lock().unwrap()
             }
 
-            fn checkpoint(
-                &mut self,
-                _cx: &Cx,
+            fn checkpoint<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 mode: crate::traits::CheckpointMode,
-                _writer: &mut dyn crate::traits::CheckpointPageWriter,
+                _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
                 _backfilled_frames: u32,
                 _oldest_reader_frame: Option<u32>,
-            ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
-                Ok(crate::traits::CheckpointResult {
-                    total_frames: 0,
-                    frames_backfilled: 0,
-                    completed: true,
-                    wal_was_reset: false,
-                    requested_mode: mode,
-                    effective_mode: mode,
+            ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+                Box::pin(async move {
+                    Ok(crate::traits::CheckpointResult {
+                        total_frames: 0,
+                        frames_backfilled: 0,
+                        completed: true,
+                        wal_was_reset: false,
+                        requested_mode: mode,
+                        effective_mode: mode,
+                    })
                 })
             }
         }
@@ -33967,26 +36172,28 @@ mod tests {
         }
 
         impl crate::traits::WalBackend for RecordingWalBackend {
-            fn append_frame(
-                &mut self,
-                _cx: &Cx,
+            fn append_frame<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 _page_number: u32,
-                _page_data: &[u8],
+                _page_data: &'a [u8],
                 _db_size_if_commit: u32,
-            ) -> fsqlite_error::Result<()> {
-                Ok(())
+            ) -> WalFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
 
-            fn append_frames(
-                &mut self,
-                _cx: &Cx,
-                frames: &[crate::traits::WalFrameRef<'_>],
-            ) -> fsqlite_error::Result<()> {
-                let mut committed = self.committed_pages.lock().unwrap();
-                for frame in frames {
-                    committed.insert(frame.page_number, frame.page_data.to_vec());
-                }
-                Ok(())
+            fn append_frames<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
+                frames: &'a [crate::traits::WalFrameRef<'a>],
+            ) -> WalFuture<'a, ()> {
+                Box::pin(async move {
+                    let mut committed = self.committed_pages.lock().unwrap();
+                    for frame in frames {
+                        committed.insert(frame.page_number, frame.page_data.to_vec());
+                    }
+                    Ok(())
+                })
             }
 
             fn prepare_append_frames(
@@ -34037,26 +36244,28 @@ mod tests {
                 }))
             }
 
-            fn append_prepared_frames(
-                &mut self,
-                _cx: &Cx,
-                prepared: &mut crate::traits::PreparedWalFrameBatch,
-            ) -> fsqlite_error::Result<()> {
-                let mut committed = self.committed_pages.lock().unwrap();
-                for i in 0..prepared.frame_count() {
-                    let meta = &prepared.frame_metas[i];
-                    let data = prepared.page_data(i).to_vec();
-                    committed.insert(meta.page_number, data);
-                }
-                Ok(())
+            fn append_prepared_frames<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
+                prepared: &'a mut crate::traits::PreparedWalFrameBatch,
+            ) -> WalFuture<'a, ()> {
+                Box::pin(async move {
+                    let mut committed = self.committed_pages.lock().unwrap();
+                    for i in 0..prepared.frame_count() {
+                        let meta = &prepared.frame_metas[i];
+                        let data = prepared.page_data(i).to_vec();
+                        committed.insert(meta.page_number, data);
+                    }
+                    Ok(())
+                })
             }
 
-            fn read_page(
-                &mut self,
-                _cx: &Cx,
+            fn read_page<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 _page_number: u32,
-            ) -> fsqlite_error::Result<Option<Vec<u8>>> {
-                Ok(None)
+            ) -> WalFuture<'a, Option<Vec<u8>>> {
+                Box::pin(async { Ok(None) })
             }
 
             fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
@@ -34067,21 +36276,23 @@ mod tests {
                 self.committed_pages.lock().unwrap().len()
             }
 
-            fn checkpoint(
-                &mut self,
-                _cx: &Cx,
+            fn checkpoint<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
                 mode: crate::traits::CheckpointMode,
-                _writer: &mut dyn crate::traits::CheckpointPageWriter,
+                _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
                 _backfilled_frames: u32,
                 _oldest_reader_frame: Option<u32>,
-            ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
-                Ok(crate::traits::CheckpointResult {
-                    total_frames: 0,
-                    frames_backfilled: 0,
-                    completed: true,
-                    wal_was_reset: false,
-                    requested_mode: mode,
-                    effective_mode: mode,
+            ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+                Box::pin(async move {
+                    Ok(crate::traits::CheckpointResult {
+                        total_frames: 0,
+                        frames_backfilled: 0,
+                        completed: true,
+                        wal_was_reset: false,
+                        requested_mode: mode,
+                        effective_mode: mode,
+                    })
                 })
             }
         }
@@ -34448,6 +36659,7 @@ mod tests {
                     control_mode: ParallelWalOperatingMode::Auto,
                     fallback_reason: None,
                     checkpoint_active,
+                    wal_frame_payload_digest: [0xA5; 32],
                 },
                 |_| Ok(()),
             )
