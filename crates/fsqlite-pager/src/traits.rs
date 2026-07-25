@@ -1832,6 +1832,42 @@ mod tests {
         ) -> WalFuture<'a, ()> {
             Box::pin(std::future::pending())
         }
+
+        fn read_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _page_number: u32,
+        ) -> WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn sync(&mut self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+
+        fn frame_count(&self) -> usize {
+            0
+        }
+
+        fn checkpoint<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            mode: CheckpointMode,
+            _writer: &'a mut dyn CheckpointPageWriter,
+            _backfilled_frames: u32,
+            _oldest_reader_frame: Option<u32>,
+        ) -> WalFuture<'a, CheckpointResult> {
+            Box::pin(async move {
+                Ok(CheckpointResult {
+                    total_frames: 0,
+                    frames_backfilled: 0,
+                    completed: true,
+                    wal_was_reset: false,
+                    requested_mode: mode,
+                    effective_mode: mode,
+                })
+            })
+        }
     }
 
     #[test]
@@ -1881,55 +1917,63 @@ mod tests {
 
     #[test]
     fn test_pager_trait_is_sealed_mock_impl() {
-        // This compiles because MockPager is in the same crate.
-        // External crates cannot impl Sealed, so they cannot impl MvccPager.
-        let pager = MockMvccPager;
-        let cx = Cx::new();
-        let _txn = pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        asupersync::test_utils::run_test(|| async {
+            // This compiles because MockPager is in the same crate.
+            // External crates cannot impl Sealed, so they cannot impl MvccPager.
+            let pager = MockMvccPager;
+            let cx = Cx::new();
+            let _txn = pager.begin(&cx, TransactionMode::Deferred).await.unwrap();
+        });
     }
 
     #[test]
     fn test_mvccpager_begin_commit_rollback_signatures() {
-        let pager = MockMvccPager;
-        let cx = Cx::new();
+        asupersync::test_utils::run_test(|| async {
+            let pager = MockMvccPager;
+            let cx = Cx::new();
 
-        // Begin takes &Cx and returns Result.
-        let mut txn = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+            // Begin takes &Cx and returns Result.
+            let mut txn = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
 
-        // All blocking/I/O methods take &Cx and return Result.
-        let page_no = PageNumber::new(1).unwrap();
-        let data = txn.get_page(&cx, page_no).unwrap();
-        assert_eq!(
-            u32::from_le_bytes(data.as_bytes()[..4].try_into().unwrap()),
-            1
-        );
+            // All blocking/I/O methods take &Cx and return Result.
+            let page_no = PageNumber::new(1).unwrap();
+            let data = txn.get_page(&cx, page_no).await.unwrap();
+            assert_eq!(
+                u32::from_le_bytes(data.as_bytes()[..4].try_into().unwrap()),
+                1
+            );
 
-        txn.write_page(&cx, page_no, &[0u8; 4096]).unwrap();
-        let new_page = txn.allocate_page(&cx).unwrap();
-        assert_eq!(new_page.get(), 2);
-        txn.free_page(&cx, new_page).unwrap();
+            txn.write_page(&cx, page_no, &[0u8; 4096]).await.unwrap();
+            let new_page = txn.allocate_page(&cx).await.unwrap();
+            assert_eq!(new_page.get(), 2);
+            txn.free_page(&cx, new_page).await.unwrap();
 
-        txn.commit(&cx).unwrap();
+            txn.commit(&cx).await.unwrap();
+        });
     }
 
     #[test]
     fn test_transaction_rollback_is_infallible() {
-        let pager = MockMvccPager;
-        let cx = Cx::new();
-        let mut txn = pager.begin(&cx, TransactionMode::Deferred).unwrap();
-        // Rollback should succeed without error.
-        txn.rollback(&cx).unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let pager = MockMvccPager;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Deferred).await.unwrap();
+            // Rollback should succeed without error.
+            txn.rollback(&cx).await.unwrap();
+        });
     }
 
     #[test]
     fn test_checkpoint_page_writer_signatures() {
-        let mut writer = MockCheckpointPageWriter;
-        let cx = Cx::new();
-        let page1 = PageNumber::new(1).unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let mut writer = MockCheckpointPageWriter;
+            let cx = Cx::new();
+            let page1 = PageNumber::new(1).unwrap();
 
-        writer.write_page(&cx, page1, &[0u8; 4096]).unwrap();
-        writer.truncate(&cx, 10).unwrap();
-        writer.sync(&cx).unwrap();
+            writer.write_page(&cx, page1, &[0u8; 4096]).await.unwrap();
+            writer.truncate(&cx, 10).await.unwrap();
+            writer.sync(&cx).await.unwrap();
+        });
     }
 
     #[test]
@@ -1946,60 +1990,70 @@ mod tests {
         //
         // Since we can't directly test "external crate fails to compile"
         // in a unit test, we verify that our mock impls compile and work.
+        //
+        // `MvccPager` uses `-> impl Future` in its method signatures, so it is
+        // not dyn compatible; the bound is asserted generically instead.
+        fn assert_is_mvcc_pager<P: MvccPager<Txn = MockTransaction>>(_pager: &P) {}
         let pager = MockMvccPager;
-        let _: &dyn MvccPager<Txn = MockTransaction> = &pager;
+        assert_is_mvcc_pager(&pager);
     }
 
     #[test]
     fn test_memory_mock_transaction_persists_writes() {
-        let pager = MemoryMockMvccPager;
-        let cx = Cx::new();
-        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
-        let page_no = PageNumber::new(256).unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let pager = MemoryMockMvccPager;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page_no = PageNumber::new(256).unwrap();
 
-        let mut bytes = vec![0_u8; fsqlite_types::PageSize::default().as_usize()];
-        bytes[0] = 0x0A;
-        txn.write_page(&cx, page_no, &bytes).unwrap();
+            let mut bytes = vec![0_u8; fsqlite_types::PageSize::default().as_usize()];
+            bytes[0] = 0x0A;
+            txn.write_page(&cx, page_no, &bytes).await.unwrap();
 
-        let page = txn.get_page(&cx, page_no).unwrap();
-        assert_eq!(page.as_bytes()[0], 0x0A);
-        assert!(txn.has_pending_writes());
-        assert!(txn.is_writer());
+            let page = txn.get_page(&cx, page_no).await.unwrap();
+            assert_eq!(page.as_bytes()[0], 0x0A);
+            assert!(txn.has_pending_writes());
+            assert!(txn.is_writer());
+        });
     }
 
     #[test]
     fn test_memory_mock_transaction_commit_clears_pending_writes() {
-        let pager = MemoryMockMvccPager;
-        let cx = Cx::new();
-        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
-        let page_no = PageNumber::new(2).unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let pager = MemoryMockMvccPager;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page_no = PageNumber::new(2).unwrap();
 
-        txn.write_page(&cx, page_no, &[1_u8; 4096]).unwrap();
-        assert!(txn.has_pending_writes());
+            txn.write_page(&cx, page_no, &[1_u8; 4096]).await.unwrap();
+            assert!(txn.has_pending_writes());
 
-        txn.commit(&cx).unwrap();
-        assert!(
-            !txn.has_pending_writes(),
-            "committed mock transactions must not report pending writes"
-        );
+            txn.commit(&cx).await.unwrap();
+            assert!(
+                !txn.has_pending_writes(),
+                "committed mock transactions must not report pending writes"
+            );
+        });
     }
 
     #[test]
     fn test_memory_mock_transaction_rollback_resets_allocator() {
-        let pager = MemoryMockMvccPager;
-        let cx = Cx::new();
-        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let pager = MemoryMockMvccPager;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
 
-        assert_eq!(txn.allocate_page(&cx).unwrap().get(), 2);
-        assert_eq!(txn.allocate_page(&cx).unwrap().get(), 3);
+            assert_eq!(txn.allocate_page(&cx).await.unwrap().get(), 2);
+            assert_eq!(txn.allocate_page(&cx).await.unwrap().get(), 3);
 
-        txn.rollback(&cx).unwrap();
+            txn.rollback(&cx).await.unwrap();
 
-        assert_eq!(
-            txn.allocate_page(&cx).unwrap().get(),
-            2,
-            "rollback should restore the mock allocator to its initial state"
-        );
+            assert_eq!(
+                txn.allocate_page(&cx).await.unwrap().get(),
+                2,
+                "rollback should restore the mock allocator to its initial state"
+            );
+        });
     }
 
     #[test]
@@ -2110,39 +2164,43 @@ mod tests {
 
     #[test]
     fn test_mock_release_savepoint_unknown_name_returns_error() {
-        let pager = MockMvccPager;
-        let cx = Cx::new();
-        let mut txn = pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let pager = MockMvccPager;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Deferred).await.unwrap();
 
-        let result = txn.release_savepoint(&cx, "nonexistent");
-        assert!(result.is_err(), "releasing unknown savepoint must fail");
+            let result = txn.release_savepoint(&cx, "nonexistent");
+            assert!(result.is_err(), "releasing unknown savepoint must fail");
+        });
     }
 
     #[test]
     fn test_memory_mock_savepoint_rollback_restores_pages() {
-        let pager = MemoryMockMvccPager;
-        let cx = Cx::new();
-        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let pager = MemoryMockMvccPager;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
 
-        let p1 = PageNumber::new(1).unwrap();
-        let page_size = fsqlite_types::PageSize::default().as_usize();
-        let mut data_a = vec![0u8; page_size];
-        data_a[0] = 0xAA;
-        txn.write_page(&cx, p1, &data_a).unwrap();
+            let p1 = PageNumber::new(1).unwrap();
+            let page_size = fsqlite_types::PageSize::default().as_usize();
+            let mut data_a = vec![0u8; page_size];
+            data_a[0] = 0xAA;
+            txn.write_page(&cx, p1, &data_a).await.unwrap();
 
-        txn.savepoint(&cx, "sp1").unwrap();
+            txn.savepoint(&cx, "sp1").unwrap();
 
-        let mut data_b = vec![0u8; page_size];
-        data_b[0] = 0xBB;
-        txn.write_page(&cx, p1, &data_b).unwrap();
-        assert_eq!(txn.get_page(&cx, p1).unwrap().as_bytes()[0], 0xBB);
+            let mut data_b = vec![0u8; page_size];
+            data_b[0] = 0xBB;
+            txn.write_page(&cx, p1, &data_b).await.unwrap();
+            assert_eq!(txn.get_page(&cx, p1).await.unwrap().as_bytes()[0], 0xBB);
 
-        txn.rollback_to_savepoint(&cx, "sp1").unwrap();
-        assert_eq!(
-            txn.get_page(&cx, p1).unwrap().as_bytes()[0],
-            0xAA,
-            "rollback_to_savepoint must restore page state"
-        );
+            txn.rollback_to_savepoint(&cx, "sp1").unwrap();
+            assert_eq!(
+                txn.get_page(&cx, p1).await.unwrap().as_bytes()[0],
+                0xAA,
+                "rollback_to_savepoint must restore page state"
+            );
+        });
     }
 
     #[test]
@@ -2358,14 +2416,16 @@ mod tests {
 
     #[test]
     fn mock_checkpoint_page_writer_default_and_trait_methods() {
-        let mut writer = MockCheckpointPageWriter;
-        let cx = Cx::new();
-        let page = PageNumber::new(1).unwrap();
-        writer.write_page(&cx, page, &[0u8; 4096]).unwrap();
-        writer.truncate(&cx, 10).unwrap();
-        writer.sync(&cx).unwrap();
-        let dbg = format!("{writer:?}");
-        assert!(dbg.contains("MockCheckpointPageWriter"));
+        asupersync::test_utils::run_test(|| async {
+            let mut writer = MockCheckpointPageWriter;
+            let cx = Cx::new();
+            let page = PageNumber::new(1).unwrap();
+            writer.write_page(&cx, page, &[0u8; 4096]).await.unwrap();
+            writer.truncate(&cx, 10).await.unwrap();
+            writer.sync(&cx).await.unwrap();
+            let dbg = format!("{writer:?}");
+            assert!(dbg.contains("MockCheckpointPageWriter"));
+        });
     }
 
     #[test]

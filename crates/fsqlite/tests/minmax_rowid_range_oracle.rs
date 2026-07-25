@@ -12,8 +12,9 @@ fn render(v: &SqliteValue) -> String {
         SqliteValue::Blob(_) => "blob".into(),
     }
 }
-fn fr(c: &Connection, s: &str) -> Vec<Vec<String>> {
+async fn fr(c: &Connection, s: &str) -> Vec<Vec<String>> {
     c.query(s)
+        .await
         .unwrap_or_else(|e| panic!("frank `{s}`: {e}"))
         .iter()
         .map(|r| r.values().iter().map(render).collect())
@@ -39,52 +40,54 @@ fn sq(c: &rusqlite::Connection, s: &str) -> Vec<Vec<String>> {
     .map(Result::unwrap)
     .collect()
 }
-fn has_op(c: &Connection, s: &str, w: &str) -> bool {
+async fn has_op(c: &Connection, s: &str, w: &str) -> bool {
     c.query(&format!("EXPLAIN {s}"))
+        .await
         .unwrap()
         .iter()
         .any(|r| matches!(r.values().get(1), Some(SqliteValue::Text(op)) if op.to_string() == w))
 }
 #[test]
 fn minmax_rowid_range_matches_sqlite() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    let ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);";
-    f.execute(ddl).unwrap();
-    r.execute_batch(ddl).unwrap();
-    for i in 1..=400_i64 {
-        // ids with gaps: 3,6,9,...
-        let s = format!("INSERT INTO t VALUES ({}, {});", i * 3, i % 50);
-        f.execute(&s).unwrap();
-        r.execute_batch(&s).unwrap();
-    }
-    let cmp = |s: &str| assert_eq!(fr(&f, s), sq(&r, s), "diverged: `{s}`");
-    for s in [
-        "SELECT MIN(id) FROM t WHERE id > 300",
-        "SELECT MIN(id) FROM t WHERE id >= 300",
-        "SELECT MAX(id) FROM t WHERE id < 300",
-        "SELECT MAX(id) FROM t WHERE id <= 300",
-        "SELECT MIN(id) FROM t WHERE id > 301", // between gaps
-        "SELECT MAX(id) FROM t WHERE id < 301",
-        "SELECT MIN(id) FROM t WHERE 300 < id", // reversed
-        "SELECT MAX(id) FROM t WHERE 300 > id",
-        "SELECT MIN(id) FROM t WHERE id > 100000", // empty -> NULL
-        "SELECT MAX(id) FROM t WHERE id < 0",      // empty -> NULL
-        "SELECT COALESCE(MIN(id), -1) FROM t WHERE id > 100000",
-        "SELECT COALESCE(MAX(id), -1) FROM t WHERE id < 0",
-        // declines: unnatural pairing; non-integer bound
-        "SELECT MIN(id) FROM t WHERE id < 300",
-        "SELECT MAX(id) FROM t WHERE id > 300",
-        "SELECT MIN(id) FROM t WHERE id > 2.5",
-    ] {
-        cmp(s);
-    }
-    assert!(
-        has_op(&f, "SELECT MIN(id) FROM t WHERE id > 300", "SeekGT"),
-        "MIN(id) id>c must SeekGT"
-    );
-    assert!(
-        has_op(&f, "SELECT MAX(id) FROM t WHERE id < 300", "SeekLT"),
-        "MAX(id) id<c must SeekLT"
-    );
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);";
+        f.execute(ddl).await.unwrap();
+        r.execute_batch(ddl).unwrap();
+        for i in 1..=400_i64 {
+            // ids with gaps: 3,6,9,...
+            let s = format!("INSERT INTO t VALUES ({}, {});", i * 3, i % 50);
+            f.execute(&s).await.unwrap();
+            r.execute_batch(&s).unwrap();
+        }
+        for s in [
+            "SELECT MIN(id) FROM t WHERE id > 300",
+            "SELECT MIN(id) FROM t WHERE id >= 300",
+            "SELECT MAX(id) FROM t WHERE id < 300",
+            "SELECT MAX(id) FROM t WHERE id <= 300",
+            "SELECT MIN(id) FROM t WHERE id > 301", // between gaps
+            "SELECT MAX(id) FROM t WHERE id < 301",
+            "SELECT MIN(id) FROM t WHERE 300 < id", // reversed
+            "SELECT MAX(id) FROM t WHERE 300 > id",
+            "SELECT MIN(id) FROM t WHERE id > 100000", // empty -> NULL
+            "SELECT MAX(id) FROM t WHERE id < 0",      // empty -> NULL
+            "SELECT COALESCE(MIN(id), -1) FROM t WHERE id > 100000",
+            "SELECT COALESCE(MAX(id), -1) FROM t WHERE id < 0",
+            // declines: unnatural pairing; non-integer bound
+            "SELECT MIN(id) FROM t WHERE id < 300",
+            "SELECT MAX(id) FROM t WHERE id > 300",
+            "SELECT MIN(id) FROM t WHERE id > 2.5",
+        ] {
+            assert_eq!(fr(&f, s).await, sq(&r, s), "diverged: `{s}`");
+        }
+        assert!(
+            has_op(&f, "SELECT MIN(id) FROM t WHERE id > 300", "SeekGT").await,
+            "MIN(id) id>c must SeekGT"
+        );
+        assert!(
+            has_op(&f, "SELECT MAX(id) FROM t WHERE id < 300", "SeekLT").await,
+            "MAX(id) id<c must SeekLT"
+        );
+    });
 }

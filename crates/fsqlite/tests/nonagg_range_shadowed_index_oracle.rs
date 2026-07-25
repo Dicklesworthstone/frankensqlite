@@ -30,8 +30,9 @@ fn render(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+async fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     conn.query(sql)
+        .await
         .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"))
         .iter()
         .map(|row| row.values().iter().map(render).collect())
@@ -63,8 +64,9 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
 }
 
 /// True if the plan opens an `OpenRead` whose P4 text is one of `idx_names`.
-fn opens_index(conn: &Connection, sql: &str, idx_names: &[&str]) -> bool {
+async fn opens_index(conn: &Connection, sql: &str, idx_names: &[&str]) -> bool {
     conn.query(&format!("EXPLAIN {sql}"))
+        .await
         .unwrap()
         .iter()
         .any(|row| {
@@ -102,11 +104,11 @@ const UNORDERED: &[&str] = &[
     "SELECT id FROM t WHERE a BETWEEN 5 AND 9",
 ];
 
-fn check_schema(label: &str, ddl: &[&str]) {
-    let f = Connection::open(":memory:").expect("frank");
+async fn check_schema(label: &str, ddl: &[&str]) {
+    let f = Connection::open(":memory:").await.expect("frank");
     let r = rusqlite::Connection::open_in_memory().expect("sqlite");
     for stmt in ddl {
-        f.execute(stmt).unwrap();
+        f.execute(stmt).await.unwrap();
         r.execute_batch(stmt).unwrap();
     }
     for i in 1..=3000_i64 {
@@ -117,29 +119,29 @@ fn check_schema(label: &str, ddl: &[&str]) {
             format!("{}", i % 10)
         };
         let stmt = format!("INSERT INTO t VALUES ({i}, {a}, {b}, {});", i % 100);
-        f.execute(&stmt).unwrap();
+        f.execute(&stmt).await.unwrap();
         r.execute_batch(&stmt).unwrap();
     }
 
     for sql in ORDERED {
         assert_eq!(
-            frank_rows(&f, sql),
+            frank_rows(&f, sql).await,
             sqlite_rows(&r, sql),
             "[{label}] ordered diverged: `{sql}`"
         );
         assert!(
-            opens_index(&f, sql, &["idx_a"]),
+            opens_index(&f, sql, &["idx_a"]).await,
             "[{label}] range scan must open idx_a: `{sql}`"
         );
     }
     for sql in UNORDERED {
         assert_eq!(
-            sorted(frank_rows(&f, sql)),
+            sorted(frank_rows(&f, sql).await),
             sorted(sqlite_rows(&r, sql)),
             "[{label}] unordered set diverged: `{sql}`"
         );
         assert!(
-            opens_index(&f, sql, &["idx_a"]),
+            opens_index(&f, sql, &["idx_a"]).await,
             "[{label}] bare range scan must open idx_a (not table-scan): `{sql}`"
         );
     }
@@ -147,21 +149,25 @@ fn check_schema(label: &str, ddl: &[&str]) {
 
 #[test]
 fn nonagg_range_shadowed_index_matches_sqlite() {
-    // Single-column index only: control (already seeked before the fix).
-    check_schema(
-        "single idx_a",
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER);",
-            "CREATE INDEX idx_a ON t(a);",
-        ],
-    );
-    // Composite index declared FIRST, shadowing idx_a: the regressing case.
-    check_schema(
-        "idx_ab shadows idx_a",
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER);",
-            "CREATE INDEX idx_ab ON t(a, b);",
-            "CREATE INDEX idx_a ON t(a);",
-        ],
-    );
+    asupersync::test_utils::run_test(|| async {
+        // Single-column index only: control (already seeked before the fix).
+        check_schema(
+            "single idx_a",
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER);",
+                "CREATE INDEX idx_a ON t(a);",
+            ],
+        )
+        .await;
+        // Composite index declared FIRST, shadowing idx_a: the regressing case.
+        check_schema(
+            "idx_ab shadows idx_a",
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER);",
+                "CREATE INDEX idx_ab ON t(a, b);",
+                "CREATE INDEX idx_a ON t(a);",
+            ],
+        )
+        .await;
+    });
 }

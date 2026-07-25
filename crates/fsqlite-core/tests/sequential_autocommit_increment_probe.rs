@@ -22,8 +22,9 @@ use fsqlite_types::SqliteValue;
 
 const TXNS: i64 = 64;
 
-fn read_value(conn: &Connection) -> Option<i64> {
+async fn read_value(conn: &Connection) -> Option<i64> {
     conn.query_row("SELECT v FROM t WHERE id = 1;")
+        .await
         .ok()
         .and_then(|row| row.get(0).cloned())
         .and_then(|value| match value {
@@ -34,6 +35,7 @@ fn read_value(conn: &Connection) -> Option<i64> {
 
 #[test]
 fn autocommit_increments_persist_without_external_oracle() {
+    asupersync::test_utils::run_test(|| async {
     let dir = tempfile::tempdir().unwrap();
     let db = dir
         .path()
@@ -41,39 +43,46 @@ fn autocommit_increments_persist_without_external_oracle() {
         .to_string_lossy()
         .into_owned();
 
-    let conn = Connection::open(&db).unwrap();
-    conn.execute("PRAGMA busy_timeout=5000;").unwrap();
-    conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+    let conn = Connection::open(&db).await.unwrap();
+    conn.execute("PRAGMA busy_timeout=5000;").await.unwrap();
+    conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")
+        .await
+        .unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+        .await
         .unwrap();
     conn.execute("INSERT INTO t (id, v) VALUES (1, 0);")
+        .await
         .unwrap();
 
     for step in 0..TXNS {
         assert_eq!(
             conn.execute("UPDATE t SET v = v + 1 WHERE id = 1;")
+                .await
                 .unwrap(),
             1,
             "autocommit increment {step} should affect exactly one row"
         );
         assert_eq!(
-            read_value(&conn),
+            read_value(&conn).await,
             Some(step + 1),
             "autocommit increment {step} must be visible to the writing connection"
         );
     }
     drop(conn);
 
-    let verifier = Connection::open(&db).unwrap();
+    let verifier = Connection::open(&db).await.unwrap();
     assert_eq!(
-        read_value(&verifier),
+        read_value(&verifier).await,
         Some(TXNS),
         "every autocommit increment must be durable for a fresh connection"
     );
+    });
 }
 
 #[test]
 fn autocommit_increments_persist_without_reads_or_external_oracle() {
+    asupersync::test_utils::run_test(|| async {
     let dir = tempfile::tempdir().unwrap();
     let db = dir
         .path()
@@ -81,17 +90,22 @@ fn autocommit_increments_persist_without_reads_or_external_oracle() {
         .to_string_lossy()
         .into_owned();
 
-    let conn = Connection::open(&db).unwrap();
-    conn.execute("PRAGMA busy_timeout=5000;").unwrap();
-    conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+    let conn = Connection::open(&db).await.unwrap();
+    conn.execute("PRAGMA busy_timeout=5000;").await.unwrap();
+    conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")
+        .await
+        .unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+        .await
         .unwrap();
     conn.execute("INSERT INTO t (id, v) VALUES (1, 0);")
+        .await
         .unwrap();
 
     for step in 0..TXNS {
         assert_eq!(
             conn.execute("UPDATE t SET v = v + 1 WHERE id = 1;")
+                .await
                 .unwrap(),
             1,
             "autocommit increment {step} should affect exactly one row"
@@ -99,16 +113,18 @@ fn autocommit_increments_persist_without_reads_or_external_oracle() {
     }
     drop(conn);
 
-    let verifier = Connection::open(&db).unwrap();
+    let verifier = Connection::open(&db).await.unwrap();
     assert_eq!(
-        read_value(&verifier),
+        read_value(&verifier).await,
         Some(TXNS),
         "every autocommit increment must be durable without read-boundary refreshes"
     );
+    });
 }
 
 #[test]
 fn autocommit_increments_survive_interleaved_rusqlite_oracle() {
+    asupersync::test_utils::run_test(|| async {
     let dir = tempfile::tempdir().unwrap();
     let db = dir
         .path()
@@ -116,17 +132,22 @@ fn autocommit_increments_survive_interleaved_rusqlite_oracle() {
         .to_string_lossy()
         .into_owned();
 
-    let conn = Connection::open(&db).unwrap();
-    conn.execute("PRAGMA busy_timeout=5000;").unwrap();
-    conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+    let conn = Connection::open(&db).await.unwrap();
+    conn.execute("PRAGMA busy_timeout=5000;").await.unwrap();
+    conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")
+        .await
+        .unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+        .await
         .unwrap();
     conn.execute("INSERT INTO t (id, v) VALUES (1, 0);")
+        .await
         .unwrap();
 
     for step in 0..TXNS {
         assert_eq!(
             conn.execute("UPDATE t SET v = v + 1 WHERE id = 1;")
+                .await
                 .unwrap(),
             1,
             "autocommit increment {step} should affect exactly one row"
@@ -147,11 +168,12 @@ fn autocommit_increments_survive_interleaved_rusqlite_oracle() {
     }
     drop(conn);
 
-    let verifier = Connection::open(&db).unwrap();
+    let verifier = Connection::open(&db).await.unwrap();
     assert_eq!(
-        read_value(&verifier),
+        read_value(&verifier).await,
         Some(TXNS),
         "autocommit increments must remain durable even after an external SQLite \
          connection opened (and possibly reset the WAL) mid-loop"
     );
+    });
 }

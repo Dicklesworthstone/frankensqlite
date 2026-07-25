@@ -16,9 +16,10 @@ fn render(v: &SqliteValue) -> String {
         ),
     }
 }
-fn frank_state(c: &Connection, sql: &str) -> Vec<Vec<String>> {
+async fn frank_state(c: &Connection, sql: &str) -> Vec<Vec<String>> {
     let mut r: Vec<Vec<String>> = c
         .query(sql)
+        .await
         .unwrap()
         .iter()
         .map(|row| row.values().iter().map(render).collect())
@@ -49,11 +50,12 @@ fn sqlite_state(c: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
     r.sort();
     r
 }
-fn has_op(c: &Connection, sql: &str, prefix: &str) -> bool {
-    c.query(&format!("EXPLAIN {sql}")).unwrap().iter().any(|row| matches!(row.values().get(1), Some(SqliteValue::Text(o)) if o.to_string().starts_with(prefix)))
+async fn has_op(c: &Connection, sql: &str, prefix: &str) -> bool {
+    c.query(&format!("EXPLAIN {sql}")).await.unwrap().iter().any(|row| matches!(row.values().get(1), Some(SqliteValue::Text(o)) if o.to_string().starts_with(prefix)))
 }
-fn op_count(c: &Connection, sql: &str, opcode: &str) -> usize {
+async fn op_count(c: &Connection, sql: &str, opcode: &str) -> usize {
     c.query(&format!("EXPLAIN {sql}"))
+        .await
         .unwrap()
         .iter()
         .filter(
@@ -61,14 +63,14 @@ fn op_count(c: &Connection, sql: &str, opcode: &str) -> usize {
         )
         .count()
 }
-fn fresh() -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").unwrap();
+async fn fresh() -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER, x TEXT);",
         "CREATE INDEX idx_c ON t(c);",
     ] {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
     for i in 1..=300_i64 {
@@ -78,35 +80,35 @@ fn fresh() -> (Connection, rusqlite::Connection) {
             i % 12,
             i % 7
         );
-        f.execute(&s).unwrap();
+        f.execute(&s).await.unwrap();
         r.execute_batch(&s).unwrap();
     }
     (f, r)
 }
-fn check_delete(del: &str, unique_rowids: Option<usize>) {
-    let (f, r) = fresh();
+async fn check_delete(del: &str, unique_rowids: Option<usize>) {
+    let (f, r) = fresh().await;
     if let Some(unique_rowids) = unique_rowids {
         assert!(
-            !has_op(&f, del, "Rewind"),
+            !has_op(&f, del, "Rewind").await,
             "rowid-IN DELETE must not full-scan (Rewind): `{del}`"
         );
         assert_eq!(
-            op_count(&f, del, "RowSetAdd"),
+            op_count(&f, del, "RowSetAdd").await,
             unique_rowids,
             "optimized DELETE must add each unique literal rowid exactly once: `{del}`"
         );
         assert_eq!(
-            op_count(&f, del, "SeekRowid"),
+            op_count(&f, del, "SeekRowid").await,
             unique_rowids + 1,
             "optimized DELETE needs one probe per unique literal plus the shared Pass-2 seek: `{del}`"
         );
     } else {
         assert!(
-            has_op(&f, del, "Rewind"),
+            has_op(&f, del, "Rewind").await,
             "control DELETE should full-scan: `{del}`"
         );
     }
-    let f_affected = f.execute(del).unwrap();
+    let f_affected = f.execute(del).await.unwrap();
     let r_affected = r.execute(del, []).unwrap();
     assert_eq!(
         f_affected as u64, r_affected as u64,
@@ -120,12 +122,12 @@ fn check_delete(del: &str, unique_rowids: Option<usize>) {
         ),
     ] {
         assert_eq!(
-            frank_state(&f, state_sql),
+            frank_state(&f, state_sql).await,
             sqlite_state(&r, state_sql),
             "{label} state diverged after `{del}`"
         );
     }
-    let f_integrity = f.query("PRAGMA integrity_check").unwrap();
+    let f_integrity = f.query("PRAGMA integrity_check").await.unwrap();
     assert!(
         matches!(
             f_integrity.first().and_then(|row| row.values().first()),
@@ -143,45 +145,52 @@ fn check_delete(del: &str, unique_rowids: Option<usize>) {
 }
 #[test]
 fn delete_rowid_in_matches_sqlite() {
-    // rowid IN: SeekRowid loop, no Rewind, byte-exact resulting table.
-    check_delete("DELETE FROM t WHERE id IN (5, 25, 45)", Some(3));
-    check_delete("DELETE FROM t WHERE id IN (99999, 5, 250)", Some(3)); // one absent, two present
-    check_delete("DELETE FROM t WHERE id IN (5, 5, 25, 25, 45)", Some(3)); // duplicates in list
-    check_delete("DELETE FROM t WHERE id IN (1)", Some(1)); // single value
-    check_delete("DELETE FROM t WHERE id IN (99999, 88888)", Some(2)); // all absent -> deletes nothing
-    check_delete(
-        "DELETE FROM t WHERE id IN (1, 2, 3, 298, 299, 300)",
-        Some(6),
-    );
-    // The shared extractor also normalizes OR equalities, including rowid on the RHS.
-    check_delete("DELETE FROM t WHERE id = 7 OR 8 = id OR id = 7", Some(2));
+    asupersync::test_utils::run_test(|| async {
+        // rowid IN: SeekRowid loop, no Rewind, byte-exact resulting table.
+        check_delete("DELETE FROM t WHERE id IN (5, 25, 45)", Some(3)).await;
+        check_delete("DELETE FROM t WHERE id IN (99999, 5, 250)", Some(3)).await; // one absent, two present
+        check_delete("DELETE FROM t WHERE id IN (5, 5, 25, 25, 45)", Some(3)).await; // duplicates in list
+        check_delete("DELETE FROM t WHERE id IN (1)", Some(1)).await; // single value
+        check_delete("DELETE FROM t WHERE id IN (99999, 88888)", Some(2)).await; // all absent -> deletes nothing
+        check_delete(
+            "DELETE FROM t WHERE id IN (1, 2, 3, 298, 299, 300)",
+            Some(6),
+        )
+        .await;
+        // The shared extractor also normalizes OR equalities, including rowid on the RHS.
+        check_delete("DELETE FROM t WHERE id = 7 OR 8 = id OR id = 7", Some(2)).await;
 
-    // Residual rowid-IN plans still seek each listed rowid, then filter before RowSetAdd.
-    check_delete("DELETE FROM t WHERE id IN (5, 25, 45) AND c = 5", Some(3));
-    check_delete(
-        "DELETE FROM t WHERE id IN (10, 20, 30, 40) AND c > 3",
-        Some(4),
-    );
-    check_delete(
-        "DELETE FROM t WHERE id IN (100, 200, 300) AND c != 5 AND x = 'v3'",
-        Some(3),
-    );
-    check_delete("DELETE FROM t WHERE id IN (5, 25, 45) AND c = 999", Some(3));
-    check_delete(
-        "DELETE FROM t WHERE id IN (99999, 5, 25) AND c IS NOT NULL",
-        Some(3),
-    );
+        // Residual rowid-IN plans still seek each listed rowid, then filter before RowSetAdd.
+        check_delete("DELETE FROM t WHERE id IN (5, 25, 45) AND c = 5", Some(3)).await;
+        check_delete(
+            "DELETE FROM t WHERE id IN (10, 20, 30, 40) AND c > 3",
+            Some(4),
+        )
+        .await;
+        check_delete(
+            "DELETE FROM t WHERE id IN (100, 200, 300) AND c != 5 AND x = 'v3'",
+            Some(3),
+        )
+        .await;
+        check_delete("DELETE FROM t WHERE id IN (5, 25, 45) AND c = 999", Some(3)).await;
+        check_delete(
+            "DELETE FROM t WHERE id IN (99999, 5, 25) AND c IS NOT NULL",
+            Some(3),
+        )
+        .await;
 
-    // Controls that are not exact integer-literal rowid sets must retain the filtered scan.
-    check_delete("DELETE FROM t WHERE a IN (3, 5)", None); // a is not the rowid
-    check_delete("DELETE FROM t WHERE id = 5 OR a = 6", None); // mixed-column OR
-    check_delete("DELETE FROM t WHERE id = 5 OR id > 7", None); // mixed-operator OR
-    check_delete("DELETE FROM t WHERE id IN (-5, 2)", None); // negative literal
-    check_delete("DELETE FROM t WHERE id IN (NULL, 5)", None); // NULL changes IN semantics
-    check_delete("DELETE FROM t WHERE id IN (2.0, 5)", None); // non-integer literal
-    check_delete("DELETE FROM t WHERE id NOT IN (5, 25)", None);
-    check_delete(
-        "DELETE FROM t WHERE id IN (SELECT id FROM t WHERE id < 3)",
-        None,
-    );
+        // Controls that are not exact integer-literal rowid sets must retain the filtered scan.
+        check_delete("DELETE FROM t WHERE a IN (3, 5)", None).await; // a is not the rowid
+        check_delete("DELETE FROM t WHERE id = 5 OR a = 6", None).await; // mixed-column OR
+        check_delete("DELETE FROM t WHERE id = 5 OR id > 7", None).await; // mixed-operator OR
+        check_delete("DELETE FROM t WHERE id IN (-5, 2)", None).await; // negative literal
+        check_delete("DELETE FROM t WHERE id IN (NULL, 5)", None).await; // NULL changes IN semantics
+        check_delete("DELETE FROM t WHERE id IN (2.0, 5)", None).await; // non-integer literal
+        check_delete("DELETE FROM t WHERE id NOT IN (5, 25)", None).await;
+        check_delete(
+            "DELETE FROM t WHERE id IN (SELECT id FROM t WHERE id < 3)",
+            None,
+        )
+        .await;
+    });
 }

@@ -29,34 +29,40 @@ const CREATE_RUNS: &str = "CREATE TABLE runs (
 /// Assert the CHECK constraint from issue #122 behaves like C SQLite on a
 /// given (already-created) connection: rows where both columns are NULL or
 /// both are non-NULL pass; mixed rows fail.
-fn assert_check_semantics(conn: &Connection, id_base: i64) {
+async fn assert_check_semantics(conn: &Connection, id_base: i64) {
     // Both non-NULL: satisfies the constraint. Was REJECTED before the fix.
     conn.execute(&format!(
         "INSERT INTO runs (id, t_end, outcome) VALUES ({}, 200, 'ok')",
         id_base
     ))
+    .await
     .expect("row with both columns non-NULL must satisfy the CHECK");
 
     // Both NULL: satisfies the constraint.
     conn.execute(&format!("INSERT INTO runs (id) VALUES ({})", id_base + 1))
+        .await
         .expect("row with both columns NULL must satisfy the CHECK");
 
     // t_end set, outcome NULL: VIOLATES the constraint. Was ACCEPTED before
     // the fix.
-    let err = conn.execute(&format!(
-        "INSERT INTO runs (id, t_end) VALUES ({}, 300)",
-        id_base + 2
-    ));
+    let err = conn
+        .execute(&format!(
+            "INSERT INTO runs (id, t_end) VALUES ({}, 300)",
+            id_base + 2
+        ))
+        .await;
     assert!(
         err.is_err(),
         "row with t_end set and outcome NULL must violate the CHECK, got {err:?}"
     );
 
     // outcome set, t_end NULL: also violates.
-    let err = conn.execute(&format!(
-        "INSERT INTO runs (id, outcome) VALUES ({}, 'late')",
-        id_base + 3
-    ));
+    let err = conn
+        .execute(&format!(
+            "INSERT INTO runs (id, outcome) VALUES ({}, 'late')",
+            id_base + 3
+        ))
+        .await;
     assert!(
         err.is_err(),
         "row with outcome set and t_end NULL must violate the CHECK, got {err:?}"
@@ -65,9 +71,13 @@ fn assert_check_semantics(conn: &Connection, id_base: i64) {
 
 #[test]
 fn test_issue_122_check_isnull_eq_isnull_in_memory() {
-    let conn = Connection::open(":memory:").expect("open in-memory db");
-    conn.execute(CREATE_RUNS).expect("create table");
-    assert_check_semantics(&conn, 1);
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:")
+            .await
+            .expect("open in-memory db");
+        conn.execute(CREATE_RUNS).await.expect("create table");
+        assert_check_semantics(&conn, 1).await;
+    });
 }
 
 /// The stored schema text must preserve the semantically necessary
@@ -75,20 +85,22 @@ fn test_issue_122_check_isnull_eq_isnull_in_memory() {
 /// re-loaded from disk by a fresh connection.
 #[test]
 fn test_issue_122_check_survives_schema_round_trip_through_file() {
+    asupersync::test_utils::run_test(|| async {
     let tmp = tempfile::NamedTempFile::new().expect("temp file");
     let path = tmp.path().to_str().expect("utf-8 temp path");
 
     {
-        let conn = Connection::open(path).expect("open file db");
-        conn.execute(CREATE_RUNS).expect("create table");
-        assert_check_semantics(&conn, 1);
+        let conn = Connection::open(path).await.expect("open file db");
+        conn.execute(CREATE_RUNS).await.expect("create table");
+        assert_check_semantics(&conn, 1).await;
     }
 
     // Reopen: the schema is re-parsed from the stored (normalized) text.
-    let conn = Connection::open(path).expect("reopen file db");
+    let conn = Connection::open(path).await.expect("reopen file db");
 
     let rows = conn
         .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'runs'")
+        .await
         .expect("read stored schema text");
     assert_eq!(rows.len(), 1, "expected exactly one schema row");
     let stored_sql = match &rows[0].values()[0] {
@@ -100,7 +112,8 @@ fn test_issue_122_check_survives_schema_round_trip_through_file() {
         "stored schema text must keep the grouping parentheses, got: {stored_sql}"
     );
 
-    assert_check_semantics(&conn, 11);
+    assert_check_semantics(&conn, 11).await;
+    });
 }
 
 /// Expression-level oracle: fsqlite must agree with C SQLite on how the
@@ -108,6 +121,7 @@ fn test_issue_122_check_survives_schema_round_trip_through_file() {
 /// the sqlite3 CLI (3.46.1) and are re-checked here against rusqlite.
 #[test]
 fn test_issue_122_null_test_precedence_matches_c_sqlite() {
+    asupersync::test_utils::run_test(|| async {
     // (sql, expected result from the sqlite3 CLI)
     let cases: &[(&str, i64)] = &[
         // Explicit grouping: (0) = (0) -> 1.
@@ -125,11 +139,11 @@ fn test_issue_122_null_test_precedence_matches_c_sqlite() {
         ("SELECT 0 IS (NULL)", 0),
     ];
 
-    let fconn = Connection::open(":memory:").expect("open fsqlite");
+    let fconn = Connection::open(":memory:").await.expect("open fsqlite");
     let rconn = rusqlite::Connection::open_in_memory().expect("open rusqlite");
 
     for (sql, expected) in cases {
-        let rows = fconn.query(sql).expect("fsqlite query");
+        let rows = fconn.query(sql).await.expect("fsqlite query");
         assert_eq!(rows.len(), 1, "{sql}: expected one row");
         let got = match rows[0].values()[0] {
             SqliteValue::Integer(n) => n,
@@ -142,4 +156,5 @@ fn test_issue_122_null_test_precedence_matches_c_sqlite() {
             .expect("rusqlite query");
         assert_eq!(got, oracle, "fsqlite disagrees with rusqlite oracle: {sql}");
     }
+    });
 }

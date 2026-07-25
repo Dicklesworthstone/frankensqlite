@@ -55,13 +55,13 @@ fn rusqlite_rows(conn: &rusqlite::Connection, sql: &str) -> TestResult<Vec<Vec<S
     Ok(rows)
 }
 
-fn assert_query_matches_rusqlite(
+async fn assert_query_matches_rusqlite(
     fconn: &Connection,
     rconn: &rusqlite::Connection,
     sql: &str,
 ) -> TestResult {
     assert_eq!(
-        format_fsqlite_rows(fconn.query(sql)?),
+        format_fsqlite_rows(fconn.query(sql).await?),
         rusqlite_rows(rconn, sql)?,
         "{sql}"
     );
@@ -70,7 +70,10 @@ fn assert_query_matches_rusqlite(
 
 #[test]
 fn update_multicolumn_set_matches_rusqlite() -> TestResult {
-    let fconn = Connection::open(":memory:")?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+    let fconn = Connection::open(":memory:").await?;
     let rconn = rusqlite::Connection::open_in_memory()?;
 
     for sql in [
@@ -81,7 +84,7 @@ fn update_multicolumn_set_matches_rusqlite() -> TestResult {
             (2, 20, 200, 'beta'),
             (3, NULL, 300, 'gamma');",
     ] {
-        fconn.execute(sql)?;
+        fconn.execute(sql).await?;
         rconn.execute_batch(sql)?;
     }
 
@@ -99,14 +102,19 @@ fn update_multicolumn_set_matches_rusqlite() -> TestResult {
          WHERE id = 3
          RETURNING id, typeof(a), a, b, label",
     ] {
-        assert_query_matches_rusqlite(&fconn, &rconn, sql)?;
+        assert_query_matches_rusqlite(&fconn, &rconn, sql).await?;
     }
 
     assert_query_matches_rusqlite(
         &fconn,
         &rconn,
         "SELECT id, typeof(a), a, b, label FROM items ORDER BY id",
-    )?;
+    )
+    .await?;
 
     Ok(())
+        }
+        .await;
+    });
+    outcome
 }

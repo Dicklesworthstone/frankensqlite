@@ -21,9 +21,10 @@ fn render(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+async fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     let mut rows: Vec<Vec<String>> = conn
         .query(sql)
+        .await
         .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"))
         .iter()
         .map(|row| row.values().iter().map(render).collect())
@@ -62,30 +63,30 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
 }
 
 /// True if the plan emits any `Seek*` opcode (proves the rowid range seek positioned on a bound).
-fn has_seek(conn: &Connection, sql: &str) -> bool {
-    conn.query(&format!("EXPLAIN {sql}")).unwrap().iter().any(|row| {
+async fn has_seek(conn: &Connection, sql: &str) -> bool {
+    conn.query(&format!("EXPLAIN {sql}")).await.unwrap().iter().any(|row| {
         matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.to_string().starts_with("Seek"))
     })
 }
 
-fn setup(ddl: &[&str]) -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").expect("frank");
+async fn setup(ddl: &[&str]) -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.expect("frank");
     let r = rusqlite::Connection::open_in_memory().expect("sqlite");
     for stmt in ddl {
-        f.execute(stmt).unwrap();
+        f.execute(stmt).await.unwrap();
         r.execute_batch(stmt).unwrap();
     }
     (f, r)
 }
 
-fn insert_both(f: &Connection, r: &rusqlite::Connection, sql: &str) {
-    f.execute(sql).unwrap();
+async fn insert_both(f: &Connection, r: &rusqlite::Connection, sql: &str) {
+    f.execute(sql).await.unwrap();
     r.execute_batch(sql).unwrap();
 }
 
-fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, label: &str) {
+async fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, label: &str) {
     assert_eq!(
-        frank_rows(f, sql),
+        frank_rows(f, sql).await,
         sqlite_rows(r, sql),
         "[{label}] diverged: `{sql}`"
     );
@@ -93,65 +94,71 @@ fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, label: &str) {
 
 #[test]
 fn rowid_range_before_directive_matches_sqlite() {
-    let (f, r) = setup(&["CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, x TEXT);"]);
-    for i in 1..=400_i64 {
-        let a = if i % 11 == 0 {
-            "NULL".to_owned()
-        } else {
-            format!("{}", i % 50)
-        };
-        insert_both(
-            &f,
-            &r,
-            &format!("INSERT INTO t VALUES ({i}, {a}, 'v{}');", i % 30),
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&["CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, x TEXT);"]).await;
+        for i in 1..=400_i64 {
+            let a = if i % 11 == 0 {
+                "NULL".to_owned()
+            } else {
+                format!("{}", i % 50)
+            };
+            insert_both(
+                &f,
+                &r,
+                &format!("INSERT INTO t VALUES ({i}, {a}, 'v{}');", i % 30),
+            )
+            .await;
+        }
+        // Rowid ranges read the table slice, so non-covering columns (a, x, *) are fine.
+        let cases = [
+            "SELECT id FROM t WHERE id < 100",
+            "SELECT id FROM t WHERE id <= 100",
+            "SELECT id FROM t WHERE id > 300",
+            "SELECT id FROM t WHERE id >= 300",
+            "SELECT id, a, x FROM t WHERE id BETWEEN 120 AND 180",
+            "SELECT * FROM t WHERE id <= 40",
+            "SELECT a FROM t WHERE id > 380",
+            "SELECT id FROM t WHERE id < 999999", // non-selective: still correct
+            "SELECT id FROM t WHERE id > 100 AND id < 110",
+        ];
+        for sql in cases {
+            cmp(&f, &r, sql, "rowid-range").await;
+        }
+        // Lower-bound query must position with a Seek (proves the seek fired, not a full scan).
+        assert!(
+            has_seek(&f, "SELECT id FROM t WHERE id > 300").await,
+            "lower-bound rowid range must Seek"
         );
-    }
-    // Rowid ranges read the table slice, so non-covering columns (a, x, *) are fine.
-    let cases = [
-        "SELECT id FROM t WHERE id < 100",
-        "SELECT id FROM t WHERE id <= 100",
-        "SELECT id FROM t WHERE id > 300",
-        "SELECT id FROM t WHERE id >= 300",
-        "SELECT id, a, x FROM t WHERE id BETWEEN 120 AND 180",
-        "SELECT * FROM t WHERE id <= 40",
-        "SELECT a FROM t WHERE id > 380",
-        "SELECT id FROM t WHERE id < 999999", // non-selective: still correct
-        "SELECT id FROM t WHERE id > 100 AND id < 110",
-    ];
-    for sql in cases {
-        cmp(&f, &r, sql, "rowid-range");
-    }
-    // Lower-bound query must position with a Seek (proves the seek fired, not a full scan).
-    assert!(
-        has_seek(&f, "SELECT id FROM t WHERE id > 300"),
-        "lower-bound rowid range must Seek"
-    );
-    assert!(
-        has_seek(&f, "SELECT id, a FROM t WHERE id BETWEEN 120 AND 180"),
-        "between must Seek"
-    );
+        assert!(
+            has_seek(&f, "SELECT id, a FROM t WHERE id BETWEEN 120 AND 180").await,
+            "between must Seek"
+        );
+    });
 }
 
 #[test]
 fn rowid_range_edge_cases() {
-    let (f, r) = setup(&["CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);"]);
-    let q = "SELECT id FROM t WHERE id > 5";
-    cmp(&f, &r, q, "empty");
-    for i in 1..=10_i64 {
-        insert_both(&f, &r, &format!("INSERT INTO t VALUES ({i}, {});", i * 2));
-    }
-    cmp(&f, &r, q, "small");
-    cmp(&f, &r, "SELECT id FROM t WHERE id >= 5", "ge-boundary");
-    cmp(&f, &r, "SELECT id FROM t WHERE id <= 1", "single-low");
-    cmp(&f, &r, "SELECT id FROM t WHERE id > 10", "empty-high");
-    cmp(
-        &f,
-        &r,
-        "SELECT id FROM t WHERE id BETWEEN 3 AND 7",
-        "between",
-    );
-    assert!(
-        has_seek(&f, "SELECT id FROM t WHERE id >= 5"),
-        "edge: lower-bound must Seek"
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&["CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);"]).await;
+        let q = "SELECT id FROM t WHERE id > 5";
+        cmp(&f, &r, q, "empty").await;
+        for i in 1..=10_i64 {
+            insert_both(&f, &r, &format!("INSERT INTO t VALUES ({i}, {});", i * 2)).await;
+        }
+        cmp(&f, &r, q, "small").await;
+        cmp(&f, &r, "SELECT id FROM t WHERE id >= 5", "ge-boundary").await;
+        cmp(&f, &r, "SELECT id FROM t WHERE id <= 1", "single-low").await;
+        cmp(&f, &r, "SELECT id FROM t WHERE id > 10", "empty-high").await;
+        cmp(
+            &f,
+            &r,
+            "SELECT id FROM t WHERE id BETWEEN 3 AND 7",
+            "between",
+        )
+        .await;
+        assert!(
+            has_seek(&f, "SELECT id FROM t WHERE id >= 5").await,
+            "edge: lower-bound must Seek"
+        );
+    });
 }

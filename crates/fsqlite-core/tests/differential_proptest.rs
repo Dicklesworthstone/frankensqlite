@@ -36,18 +36,20 @@ const FIXTURE_ROWS: &[(i64, &str, Option<i64>)] = &[
     (8, "zeta", None),
 ];
 
-fn setup_pair() -> (Connection, rusqlite::Connection) {
-    let fconn = Connection::open(":memory:").expect("open frankensqlite");
+async fn setup_pair() -> (Connection, rusqlite::Connection) {
+    let fconn = Connection::open(":memory:")
+        .await
+        .expect("open frankensqlite");
     let rconn = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     let ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL, val INTEGER)";
-    fconn.execute(ddl).expect("frankensqlite ddl");
+    fconn.execute(ddl).await.expect("frankensqlite ddl");
     rconn.execute(ddl, []).expect("rusqlite ddl");
     for (id, name, val) in FIXTURE_ROWS {
         let insert = match val {
             Some(v) => format!("INSERT INTO t VALUES ({id}, '{name}', {v})"),
             None => format!("INSERT INTO t VALUES ({id}, '{name}', NULL)"),
         };
-        fconn.execute(&insert).expect("frankensqlite insert");
+        fconn.execute(&insert).await.expect("frankensqlite insert");
         rconn.execute(&insert, []).expect("rusqlite insert");
     }
     (fconn, rconn)
@@ -64,8 +66,8 @@ fn setup_pair() -> (Connection, rusqlite::Connection) {
 /// same observable result. Only an asymmetric error (one engine
 /// accepts, the other rejects) or differing row contents constitute
 /// a real disagreement.
-fn rows_match(fconn: &Connection, rconn: &rusqlite::Connection, query: &str) -> bool {
-    match (fconn.query(query), rconn.prepare(query)) {
+async fn rows_match(fconn: &Connection, rconn: &rusqlite::Connection, query: &str) -> bool {
+    match (fconn.query(query).await, rconn.prepare(query)) {
         // Both engines agree on rejection — same observable result.
         (Err(_), Err(_)) => true,
         // Asymmetric rejection: real disagreement.
@@ -218,14 +220,18 @@ proptest! {
         desc in any::<bool>(),
         limit in 0u32..=8u32,
     ) {
-        let (fconn, rconn) = setup_pair();
         let order = if desc { "DESC" } else { "ASC" };
         let query = format!(
             "SELECT id, name, val FROM t WHERE id {} {} ORDER BY id {} LIMIT {}",
             cmp.sql(), val, order, limit
         );
+        let mut matched = false;
+        asupersync::test_utils::run_test(|| async {
+            let (fconn, rconn) = setup_pair().await;
+            matched = rows_match(&fconn, &rconn, &query).await;
+        });
         prop_assert!(
-            rows_match(&fconn, &rconn, &query),
+            matched,
             "query disagreement: {query}"
         );
     }
@@ -241,13 +247,17 @@ proptest! {
         // Skip strings with embedded quotes — that would need
         // parameterized binds, which the harness doesn't yet thread.
         prop_assume!(!s.contains('\''));
-        let (fconn, rconn) = setup_pair();
         let query = format!(
             "SELECT id, name, val FROM t WHERE name {} '{}' ORDER BY id ASC LIMIT {}",
             cmp.sql(), s, limit
         );
+        let mut matched = false;
+        asupersync::test_utils::run_test(|| async {
+            let (fconn, rconn) = setup_pair().await;
+            matched = rows_match(&fconn, &rconn, &query).await;
+        });
         prop_assert!(
-            rows_match(&fconn, &rconn, &query),
+            matched,
             "query disagreement: {query}"
         );
     }
@@ -257,11 +267,15 @@ proptest! {
     /// engine disagreements at the SQL surface.
     #[test]
     fn select_null_handling(want_null in any::<bool>()) {
-        let (fconn, rconn) = setup_pair();
         let predicate = if want_null { "IS NULL" } else { "IS NOT NULL" };
         let query = format!("SELECT id, val FROM t WHERE val {predicate} ORDER BY id ASC");
+        let mut matched = false;
+        asupersync::test_utils::run_test(|| async {
+            let (fconn, rconn) = setup_pair().await;
+            matched = rows_match(&fconn, &rconn, &query).await;
+        });
         prop_assert!(
-            rows_match(&fconn, &rconn, &query),
+            matched,
             "null-handling disagreement: {query}"
         );
     }

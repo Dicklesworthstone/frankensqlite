@@ -38,8 +38,9 @@ fn canonicalize(rows: Vec<Vec<SqliteValue>>) -> Vec<String> {
     out
 }
 
-fn select_all(conn: &Connection, sql: &str) -> Vec<Vec<SqliteValue>> {
+async fn select_all(conn: &Connection, sql: &str) -> Vec<Vec<SqliteValue>> {
     conn.query(sql)
+        .await
         .expect("query succeeds")
         .iter()
         .map(|r| r.values().to_vec())
@@ -48,17 +49,20 @@ fn select_all(conn: &Connection, sql: &str) -> Vec<Vec<SqliteValue>> {
 
 #[test]
 fn inner_join_small_and_big_returns_same_rows_regardless_of_source_order() {
-    let conn = Connection::open(":memory:").unwrap();
+    asupersync::test_utils::run_test(|| async {
+    let conn = Connection::open(":memory:").await.unwrap();
     conn.execute("CREATE TABLE t_small (id INTEGER PRIMARY KEY, tag TEXT);")
+        .await
         .unwrap();
     conn.execute("CREATE TABLE t_big (id INTEGER PRIMARY KEY, ref_id INTEGER, v INTEGER);")
+        .await
         .unwrap();
 
     // 10 rows in t_small, 10_000 rows in t_big. Each t_big row points at a
     // t_small row via ref_id (1..=10). This ensures that a proper inner join
     // returns 10_000 rows (one per t_big row, matched to the corresponding
     // t_small row).
-    conn.execute("BEGIN;").unwrap();
+    conn.execute("BEGIN;").await.unwrap();
     for i in 1..=10i64 {
         conn.execute_with_params(
             "INSERT INTO t_small(id, tag) VALUES (?1, ?2);",
@@ -67,6 +71,7 @@ fn inner_join_small_and_big_returns_same_rows_regardless_of_source_order() {
                 SqliteValue::Text(format!("tag{}", i).into()),
             ],
         )
+        .await
         .unwrap();
     }
     for i in 1..=10_000i64 {
@@ -79,10 +84,11 @@ fn inner_join_small_and_big_returns_same_rows_regardless_of_source_order() {
                 SqliteValue::Integer(i * 2),
             ],
         )
+        .await
         .unwrap();
     }
-    conn.execute("COMMIT;").unwrap();
-    conn.execute("ANALYZE;").unwrap();
+    conn.execute("COMMIT;").await.unwrap();
+    conn.execute("ANALYZE;").await.unwrap();
 
     // Query A: big joined against small (planner would prefer small-build,
     // big-probe; but the reshape is gated off so this executes in source
@@ -90,7 +96,8 @@ fn inner_join_small_and_big_returns_same_rows_regardless_of_source_order() {
     let rows_big_first = select_all(
         &conn,
         "SELECT t_big.id, t_small.tag FROM t_big JOIN t_small ON t_big.ref_id = t_small.id;",
-    );
+    )
+    .await;
 
     // Query B: same query with tables in reversed source order. With the
     // reshape landed these would take the same underlying execution path;
@@ -99,7 +106,8 @@ fn inner_join_small_and_big_returns_same_rows_regardless_of_source_order() {
     let rows_small_first = select_all(
         &conn,
         "SELECT t_big.id, t_small.tag FROM t_small JOIN t_big ON t_big.ref_id = t_small.id;",
-    );
+    )
+    .await;
 
     assert_eq!(rows_big_first.len(), 10_000, "every t_big row must join");
     assert_eq!(
@@ -107,20 +115,24 @@ fn inner_join_small_and_big_returns_same_rows_regardless_of_source_order() {
         canonicalize(rows_small_first),
         "inner-join result set must be order-invariant regardless of FROM-clause source order"
     );
+    });
 }
 
 #[test]
 fn left_join_falls_through_planner_gate_without_reshape() {
-    let conn = Connection::open(":memory:").unwrap();
+    asupersync::test_utils::run_test(|| async {
+    let conn = Connection::open(":memory:").await.unwrap();
     conn.execute("CREATE TABLE t_small (id INTEGER PRIMARY KEY, tag TEXT);")
+        .await
         .unwrap();
     conn.execute("CREATE TABLE t_big (id INTEGER PRIMARY KEY, ref_id INTEGER);")
+        .await
         .unwrap();
 
     // 5 small rows, 20 big rows with half having ref_id matching a small row
     // (id 1..=5) and half with ref_id = 999 (no match — relies on LEFT JOIN
     // NULL-padding).
-    conn.execute("BEGIN;").unwrap();
+    conn.execute("BEGIN;").await.unwrap();
     for i in 1..=5i64 {
         conn.execute_with_params(
             "INSERT INTO t_small(id, tag) VALUES (?1, ?2);",
@@ -129,6 +141,7 @@ fn left_join_falls_through_planner_gate_without_reshape() {
                 SqliteValue::Text(format!("s{}", i).into()),
             ],
         )
+        .await
         .unwrap();
     }
     for i in 1..=20i64 {
@@ -137,10 +150,11 @@ fn left_join_falls_through_planner_gate_without_reshape() {
             "INSERT INTO t_big(id, ref_id) VALUES (?1, ?2);",
             &[SqliteValue::Integer(i), SqliteValue::Integer(ref_id)],
         )
+        .await
         .unwrap();
     }
-    conn.execute("COMMIT;").unwrap();
-    conn.execute("ANALYZE;").unwrap();
+    conn.execute("COMMIT;").await.unwrap();
+    conn.execute("ANALYZE;").await.unwrap();
 
     // LEFT JOIN: every t_big row must be present. 10 rows match a t_small
     // tag; 10 rows have NULL tag. Source order must NOT be reordered by the
@@ -148,7 +162,8 @@ fn left_join_falls_through_planner_gate_without_reshape() {
     let rows = select_all(
         &conn,
         "SELECT t_big.id, t_small.tag FROM t_big LEFT JOIN t_small ON t_big.ref_id = t_small.id ORDER BY t_big.id;",
-    );
+    )
+    .await;
 
     assert_eq!(rows.len(), 20, "LEFT JOIN preserves all left-side rows");
 
@@ -179,6 +194,7 @@ fn left_join_falls_through_planner_gate_without_reshape() {
             );
         }
     }
+    });
 }
 
 #[test]
@@ -187,24 +203,31 @@ fn inner_join_without_analyze_preserves_source_order_result() {
     // `order_join_inputs_with_hints` returns identity. The query must
     // still execute correctly — this guards against the planner call
     // mis-handling an empty-stats case.
-    let conn = Connection::open(":memory:").unwrap();
+    asupersync::test_utils::run_test(|| async {
+    let conn = Connection::open(":memory:").await.unwrap();
     conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER);")
+        .await
         .unwrap();
     conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER);")
+        .await
         .unwrap();
     conn.execute("INSERT INTO a VALUES (1, 100), (2, 200);")
+        .await
         .unwrap();
     conn.execute("INSERT INTO b VALUES (10, 1), (11, 2), (12, 1);")
+        .await
         .unwrap();
     // NOTE: intentionally no ANALYZE.
 
     let rows = select_all(
         &conn,
         "SELECT b.id, a.v FROM b JOIN a ON b.a_id = a.id ORDER BY b.id;",
-    );
+    )
+    .await;
     assert_eq!(rows.len(), 3);
     // Just check first row round-trips correctly.
     let first = &rows[0];
     assert!(matches!(first[0], SqliteValue::Integer(10)));
     assert!(matches!(first[1], SqliteValue::Integer(100)));
+    });
 }

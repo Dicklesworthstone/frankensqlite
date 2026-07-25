@@ -28,22 +28,25 @@ use std::time::{Duration, Instant};
 const BATCH_SIZE: i64 = 1_000;
 const NUM_BATCHES: usize = 100;
 
-fn run_batched_inserts() -> Vec<Duration> {
-    let conn = Connection::open(":memory:").expect("open :memory:");
+async fn run_batched_inserts() -> Vec<Duration> {
+    let conn = Connection::open(":memory:").await.expect("open :memory:");
     // The O(n²) cliff this test guards against is driven by the eager
     // per-commit MemDatabase reload + clone that backs
     // `FOR SYSTEM_TIME AS OF` queries. The bench path never issues a
     // time-travel query, so disable the capture to prove the fix collapsed
     // the quadratic scaling.
     conn.execute("PRAGMA fsqlite_capture_time_travel_snapshots=false")
+        .await
         .expect("disable capture");
     conn.execute(
         "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL, value REAL NOT NULL)",
     )
+    .await
     .expect("create table");
 
     let stmt = conn
         .prepare("INSERT INTO bench VALUES (?1, ('user_' || ?1), (?1 * 0.137))")
+        .await
         .expect("prepare insert");
 
     let mut per_batch = Vec::with_capacity(NUM_BATCHES);
@@ -52,12 +55,13 @@ fn run_batched_inserts() -> Vec<Duration> {
         let end_id = start_id + BATCH_SIZE;
 
         let t0 = Instant::now();
-        conn.execute("BEGIN").expect("BEGIN");
+        conn.execute("BEGIN").await.expect("BEGIN");
         for i in start_id..end_id {
             stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                .await
                 .expect("INSERT");
         }
-        conn.execute("COMMIT").expect("COMMIT");
+        conn.execute("COMMIT").await.expect("COMMIT");
         per_batch.push(t0.elapsed());
     }
 
@@ -66,7 +70,8 @@ fn run_batched_inserts() -> Vec<Duration> {
 
 #[test]
 fn batched_insert_per_txn_is_approximately_constant() {
-    let per_batch = run_batched_inserts();
+    asupersync::test_utils::run_test(|| async {
+    let per_batch = run_batched_inserts().await;
 
     // Pick a few representative points.
     let first = per_batch[0];
@@ -98,4 +103,5 @@ fn batched_insert_per_txn_is_approximately_constant() {
         ratio < 4.0,
         "tail batch ({tail_mean:?}) is {ratio:.1}x slower than warm baseline ({warm_baseline:?}) — batched-commit cliff regressed. Per-batch timings: {per_batch:?}",
     );
+    });
 }

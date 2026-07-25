@@ -25,8 +25,9 @@ fn render(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+async fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     conn.query(sql)
+        .await
         .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"))
         .iter()
         .map(|row| row.values().iter().map(render).collect())
@@ -57,19 +58,23 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
     .collect()
 }
 
-fn has_op(conn: &Connection, sql: &str, want: &str) -> bool {
-    conn.query(&format!("EXPLAIN {sql}")).unwrap().iter().any(
-        |row| matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.to_string() == want),
-    )
+async fn has_op(conn: &Connection, sql: &str, want: &str) -> bool {
+    conn.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap()
+        .iter()
+        .any(
+            |row| matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.to_string() == want),
+        )
 }
 
 /// Set up matching frank + sqlite connections with `ddl`, populate 3000 rows, run the byte-exact
 /// battery, and gate that both aggregates seek.
-fn check_schema(label: &str, ddl: &[&str]) {
-    let f = Connection::open(":memory:").expect("frank");
+async fn check_schema(label: &str, ddl: &[&str]) {
+    let f = Connection::open(":memory:").await.expect("frank");
     let r = rusqlite::Connection::open_in_memory().expect("sqlite");
     for stmt in ddl {
-        f.execute(stmt).unwrap();
+        f.execute(stmt).await.unwrap();
         r.execute_batch(stmt).unwrap();
     }
     for i in 1..=3000_i64 {
@@ -81,17 +86,10 @@ fn check_schema(label: &str, ddl: &[&str]) {
             format!("{}", i % 10)
         };
         let stmt = format!("INSERT INTO t VALUES ({i}, {a}, {b}, {});", i % 100);
-        f.execute(&stmt).unwrap();
+        f.execute(&stmt).await.unwrap();
         r.execute_batch(&stmt).unwrap();
     }
 
-    let cmp = |sql: &str| {
-        assert_eq!(
-            frank_rows(&f, sql),
-            sqlite_rows(&r, sql),
-            "[{label}] diverged: `{sql}`"
-        );
-    };
     for sql in [
         "SELECT COUNT(*) FROM t WHERE a IN (3, 7, 11)",
         "SELECT SUM(x) FROM t WHERE a IN (3, 7, 11)",
@@ -104,16 +102,20 @@ fn check_schema(label: &str, ddl: &[&str]) {
         // Covering SUM of the *indexed* column (read straight from the index, no table lookup).
         "SELECT SUM(a) FROM t WHERE a IN (3, 7, 11)",
     ] {
-        cmp(sql);
+        assert_eq!(
+            frank_rows(&f, sql).await,
+            sqlite_rows(&r, sql),
+            "[{label}] diverged: `{sql}`"
+        );
     }
 
     // Opcode gate: both aggregates seek (COUNT(*) now yields to the aggregate seek path).
     assert!(
-        has_op(&f, "SELECT COUNT(*) FROM t WHERE a IN (3, 7, 11)", "SeekGE"),
+        has_op(&f, "SELECT COUNT(*) FROM t WHERE a IN (3, 7, 11)", "SeekGE").await,
         "[{label}] COUNT(*) WHERE a IN (list) must seek the index"
     );
     assert!(
-        has_op(&f, "SELECT SUM(x) FROM t WHERE a IN (3, 7, 11)", "SeekGE"),
+        has_op(&f, "SELECT SUM(x) FROM t WHERE a IN (3, 7, 11)", "SeekGE").await,
         "[{label}] SUM(x) WHERE a IN (list) must seek the index"
     );
     // Covering gate: COUNT(*) and SUM(indexed col) accumulate straight off the index (no SeekRowid);
@@ -123,7 +125,8 @@ fn check_schema(label: &str, ddl: &[&str]) {
             &f,
             "SELECT COUNT(*) FROM t WHERE a IN (3, 7, 11)",
             "SeekRowid"
-        ),
+        )
+        .await,
         "[{label}] COUNT(*) IN-list walk must be covering (no SeekRowid)"
     );
     assert!(
@@ -131,7 +134,8 @@ fn check_schema(label: &str, ddl: &[&str]) {
             &f,
             "SELECT SUM(a) FROM t WHERE a IN (3, 7, 11)",
             "SeekRowid"
-        ),
+        )
+        .await,
         "[{label}] SUM(indexed col) IN-list walk must be covering (no SeekRowid)"
     );
     assert!(
@@ -139,28 +143,33 @@ fn check_schema(label: &str, ddl: &[&str]) {
             &f,
             "SELECT SUM(x) FROM t WHERE a IN (3, 7, 11)",
             "SeekRowid"
-        ),
+        )
+        .await,
         "[{label}] SUM(non-indexed col) IN-list walk must open the table (SeekRowid)"
     );
 }
 
 #[test]
 fn in_list_seek_matches_sqlite() {
-    // Single-column index: exercises the `simple_count_star` yield fix.
-    check_schema(
-        "single idx_a",
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER);",
-            "CREATE INDEX idx_a ON t(a);",
-        ],
-    );
-    // Composite index declared FIRST, shadowing idx_a: exercises the index-selection fix too.
-    check_schema(
-        "idx_ab shadows idx_a",
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER);",
-            "CREATE INDEX idx_ab ON t(a, b);",
-            "CREATE INDEX idx_a ON t(a);",
-        ],
-    );
+    asupersync::test_utils::run_test(|| async {
+        // Single-column index: exercises the `simple_count_star` yield fix.
+        check_schema(
+            "single idx_a",
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER);",
+                "CREATE INDEX idx_a ON t(a);",
+            ],
+        )
+        .await;
+        // Composite index declared FIRST, shadowing idx_a: exercises the index-selection fix too.
+        check_schema(
+            "idx_ab shadows idx_a",
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER);",
+                "CREATE INDEX idx_ab ON t(a, b);",
+                "CREATE INDEX idx_a ON t(a);",
+            ],
+        )
+        .await;
+    });
 }

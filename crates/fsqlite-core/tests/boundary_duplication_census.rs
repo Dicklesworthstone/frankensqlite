@@ -134,13 +134,18 @@ impl CensusCounters {
 /// C1: Single prepared INSERT in autocommit mode — census per statement.
 #[test]
 fn test_census_single_prepared_insert_autocommit() {
+    asupersync::test_utils::run_test(|| async {
     let _profile_guard = CensusProfileGuard::new();
 
-    let conn = Connection::open(":memory:").unwrap();
+    let conn = Connection::open(":memory:").await.unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+        .await
         .unwrap();
 
-    let stmt = conn.prepare("INSERT INTO t VALUES(?1, ?2)").unwrap();
+    let stmt = conn
+        .prepare("INSERT INTO t VALUES(?1, ?2)")
+        .await
+        .unwrap();
 
     // Steady-state: execute 10 identical prepared INSERTs.
     let before = census_snapshot();
@@ -149,6 +154,7 @@ fn test_census_single_prepared_insert_autocommit() {
             fsqlite_types::SqliteValue::Integer(i),
             fsqlite_types::SqliteValue::Text(format!("v{i}").into()),
         ])
+        .await
         .unwrap();
     }
     let after = census_snapshot();
@@ -174,29 +180,36 @@ fn test_census_single_prepared_insert_autocommit() {
         delta.begin_refresh, 0,
         ":memory: should not trigger begin_refresh (uses memory fast path)"
     );
+    });
 }
 
 /// C2: File-backed prepared INSERT — exposes duplication.
 #[test]
 fn test_census_file_backed_prepared_insert() {
+    asupersync::test_utils::run_test(|| async {
     let _profile_guard = CensusProfileGuard::new();
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let path = tmp.path().to_str().unwrap();
 
-    let conn = Connection::open(path).unwrap();
-    conn.execute("PRAGMA journal_mode = WAL").unwrap();
-    conn.execute("PRAGMA synchronous = NORMAL").unwrap();
+    let conn = Connection::open(path).await.unwrap();
+    conn.execute("PRAGMA journal_mode = WAL").await.unwrap();
+    conn.execute("PRAGMA synchronous = NORMAL").await.unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+        .await
         .unwrap();
 
-    let stmt = conn.prepare("INSERT INTO t VALUES(?1, ?2)").unwrap();
+    let stmt = conn
+        .prepare("INSERT INTO t VALUES(?1, ?2)")
+        .await
+        .unwrap();
 
     // Warm: one execution to establish baseline.
     stmt.execute_with_params(&[
         fsqlite_types::SqliteValue::Integer(0),
         fsqlite_types::SqliteValue::Text("warm".into()),
     ])
+    .await
     .unwrap();
 
     // Census: 10 steady-state prepared INSERTs.
@@ -206,6 +219,7 @@ fn test_census_file_backed_prepared_insert() {
             fsqlite_types::SqliteValue::Integer(i),
             fsqlite_types::SqliteValue::Text(format!("v{i}").into()),
         ])
+        .await
         .unwrap();
     }
     let after = census_snapshot();
@@ -239,35 +253,42 @@ fn test_census_file_backed_prepared_insert() {
         "  publication_bind/stmt = {:.1}",
         delta.publication_bind as f64 / 10.0
     );
+    });
 }
 
 /// C3: Explicit transaction — begin/commit work should happen once, not per statement.
 #[test]
 fn test_census_explicit_transaction_prepared_insert() {
+    asupersync::test_utils::run_test(|| async {
     let _profile_guard = CensusProfileGuard::new();
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let path = tmp.path().to_str().unwrap();
 
-    let conn = Connection::open(path).unwrap();
-    conn.execute("PRAGMA journal_mode = WAL").unwrap();
+    let conn = Connection::open(path).await.unwrap();
+    conn.execute("PRAGMA journal_mode = WAL").await.unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+        .await
         .unwrap();
 
-    let stmt = conn.prepare("INSERT INTO t VALUES(?1, ?2)").unwrap();
+    let stmt = conn
+        .prepare("INSERT INTO t VALUES(?1, ?2)")
+        .await
+        .unwrap();
 
     // Explicit transaction wrapping 10 INSERTs.
-    conn.execute("BEGIN").unwrap();
+    conn.execute("BEGIN").await.unwrap();
     let before = census_snapshot();
     for i in 0..10 {
         stmt.execute_with_params(&[
             fsqlite_types::SqliteValue::Integer(i),
             fsqlite_types::SqliteValue::Text(format!("v{i}").into()),
         ])
+        .await
         .unwrap();
     }
     let after = census_snapshot();
-    conn.execute("COMMIT").unwrap();
+    conn.execute("COMMIT").await.unwrap();
     let delta = after.delta(&before);
 
     eprintln!("=== C3: Explicit txn, file-backed INSERT ×10 ===");
@@ -296,18 +317,24 @@ fn test_census_explicit_transaction_prepared_insert() {
         delta.commit_refresh < 10,
         "explicit txn commit_refresh should be below one-per-statement duplication: {delta:?}"
     );
+    });
 }
 
 /// C4: Schema invalidation during census — one DDL, verify counters spike then recover.
 #[test]
 fn test_census_schema_invalidation_spike() {
+    asupersync::test_utils::run_test(|| async {
     let _profile_guard = CensusProfileGuard::new();
 
-    let conn = Connection::open(":memory:").unwrap();
+    let conn = Connection::open(":memory:").await.unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+        .await
         .unwrap();
 
-    let stmt = conn.prepare("INSERT INTO t VALUES(?1, ?2)").unwrap();
+    let stmt = conn
+        .prepare("INSERT INTO t VALUES(?1, ?2)")
+        .await
+        .unwrap();
 
     // 5 steady-state executions.
     let before = census_snapshot();
@@ -316,19 +343,22 @@ fn test_census_schema_invalidation_spike() {
             fsqlite_types::SqliteValue::Integer(i),
             fsqlite_types::SqliteValue::Text("pre".into()),
         ])
+        .await
         .unwrap();
     }
     let mid = census_snapshot();
     let delta_pre = mid.delta(&before);
 
     // DDL — invalidates caches.
-    conn.execute("CREATE TABLE t2(x INTEGER)").unwrap();
+    conn.execute("CREATE TABLE t2(x INTEGER)").await.unwrap();
 
     // The old prepared stmt will get SchemaChanged.
-    let result = stmt.execute_with_params(&[
-        fsqlite_types::SqliteValue::Integer(99),
-        fsqlite_types::SqliteValue::Text("post-ddl".into()),
-    ]);
+    let result = stmt
+        .execute_with_params(&[
+            fsqlite_types::SqliteValue::Integer(99),
+            fsqlite_types::SqliteValue::Text("post-ddl".into()),
+        ])
+        .await;
     let after = census_snapshot();
     let delta_post = after.delta(&mid);
 
@@ -341,24 +371,28 @@ fn test_census_schema_invalidation_spike() {
         "  stmt_result: {:?}",
         result.as_ref().map(|_| "ok").unwrap_or("err")
     );
+    });
 }
 
 /// C5: Full census scorecard — the authoritative artifact for bd-db300.5.2.2.1.
 #[test]
 fn test_census_full_scorecard() {
+    asupersync::test_utils::run_test(|| async {
     let _profile_guard = CensusProfileGuard::new();
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let path = tmp.path().to_str().unwrap();
 
-    let conn = Connection::open(path).unwrap();
-    conn.execute("PRAGMA journal_mode = WAL").unwrap();
-    conn.execute("PRAGMA synchronous = NORMAL").unwrap();
+    let conn = Connection::open(path).await.unwrap();
+    conn.execute("PRAGMA journal_mode = WAL").await.unwrap();
+    conn.execute("PRAGMA synchronous = NORMAL").await.unwrap();
     conn.execute("CREATE TABLE bench(id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
+        .await
         .unwrap();
 
     let ins = conn
         .prepare("INSERT INTO bench VALUES(?1, ?2, ?3)")
+        .await
         .unwrap();
 
     // Warm.
@@ -367,6 +401,7 @@ fn test_census_full_scorecard() {
         fsqlite_types::SqliteValue::Text("warm".into()),
         fsqlite_types::SqliteValue::Integer(0),
     ])
+    .await
     .unwrap();
 
     // Census: 100 iterations.
@@ -377,6 +412,7 @@ fn test_census_full_scorecard() {
             fsqlite_types::SqliteValue::Text(format!("r{i}").into()),
             fsqlite_types::SqliteValue::Integer(i * 7),
         ])
+        .await
         .unwrap();
     }
     let snap = census_snapshot();
@@ -431,4 +467,5 @@ fn test_census_full_scorecard() {
         snap.fast_path,
         snap.slow_path
     );
+    });
 }

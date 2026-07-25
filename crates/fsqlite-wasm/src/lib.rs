@@ -1751,39 +1751,52 @@ mod tests {
 
     #[test]
     fn core_connection_roundtrip_for_wasm_wrapper() {
-        let _guard = host_connection_test_guard();
-        let conn = open_core_connection(":memory:").expect("in-memory connection should open");
-        conn.execute("CREATE TABLE wasm_rt (id INTEGER PRIMARY KEY, name TEXT)")
-            .expect("schema create should succeed");
-        conn.execute("INSERT INTO wasm_rt (id, name) VALUES (1, 'alpha'), (2, 'beta')")
-            .expect("seed rows should insert");
+        asupersync::test_utils::run_test(|| async {
+            let _guard = host_connection_test_guard();
+            let conn = open_core_connection(":memory:")
+                .await
+                .expect("in-memory connection should open");
+            conn.execute("CREATE TABLE wasm_rt (id INTEGER PRIMARY KEY, name TEXT)")
+                .await
+                .expect("schema create should succeed");
+            conn.execute("INSERT INTO wasm_rt (id, name) VALUES (1, 'alpha'), (2, 'beta')")
+                .await
+                .expect("seed rows should insert");
 
-        let stmt = conn
-            .prepare("SELECT id, name FROM wasm_rt ORDER BY id")
-            .expect("statement should prepare");
-        assert_eq!(stmt.column_count(), 2);
+            let stmt = conn
+                .prepare("SELECT id, name FROM wasm_rt ORDER BY id")
+                .await
+                .expect("statement should prepare");
+            assert_eq!(stmt.column_count(), 2);
 
-        let rows = stmt.query().expect("query should succeed");
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
+            let rows = stmt.query().await.expect("query should succeed");
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+            assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
+            assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+            assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
+        });
     }
 
     #[test]
     fn core_prepared_statement_exposes_inferred_column_names() {
-        let _guard = host_connection_test_guard();
-        let conn = open_core_connection(":memory:").expect("in-memory connection should open");
-        conn.execute("CREATE TABLE wasm_cols (id INTEGER PRIMARY KEY, name TEXT)")
-            .expect("schema create should succeed");
+        asupersync::test_utils::run_test(|| async {
+            let _guard = host_connection_test_guard();
+            let conn = open_core_connection(":memory:")
+                .await
+                .expect("in-memory connection should open");
+            conn.execute("CREATE TABLE wasm_cols (id INTEGER PRIMARY KEY, name TEXT)")
+                .await
+                .expect("schema create should succeed");
 
-        let stmt = conn
-            .prepare("SELECT id AS user_id, name, 1 + 2 FROM wasm_cols")
-            .expect("statement should prepare");
+            let stmt = conn
+                .prepare("SELECT id AS user_id, name, 1 + 2 FROM wasm_cols")
+                .await
+                .expect("statement should prepare");
 
-        assert_eq!(stmt.column_count(), 3);
-        assert_eq!(stmt.column_names(), &["user_id", "name", "_c2"]);
+            assert_eq!(stmt.column_count(), 3);
+            assert_eq!(stmt.column_names(), &["user_id", "name", "_c2"]);
+        });
     }
 
     #[cfg(feature = "memory-options")]

@@ -323,180 +323,197 @@ mod tests {
 
     #[test]
     fn test_vacuum_rebuilds_file_backed_database_and_preserves_header_metadata() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("vacuum-in-place.db");
-        let db = db_path.to_string_lossy().into_owned();
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("vacuum-in-place.db");
+            let db = db_path.to_string_lossy().into_owned();
 
-        let conn = Connection::open_with_page_size(&db, 1024).unwrap();
-        conn.execute("PRAGMA user_version = 321;").unwrap();
-        conn.execute("PRAGMA application_id = 654321;").unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);")
-            .unwrap();
+            let conn = Connection::open_with_page_size(&db, 1024).await.unwrap();
+            conn.execute("PRAGMA user_version = 321;").await.unwrap();
+            conn.execute("PRAGMA application_id = 654321;")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);")
+                .await
+                .unwrap();
 
-        let mut insert_sql = String::from("BEGIN;");
-        for rowid in 1..=120_u32 {
-            insert_sql.push_str(&format!(
-                "INSERT INTO t(id, payload) VALUES ({rowid}, '{}');",
-                "x".repeat(700)
-            ));
-        }
-        insert_sql.push_str("COMMIT;");
-        conn.execute_batch(&insert_sql).unwrap();
-        conn.execute("DELETE FROM t WHERE id <= 100;").unwrap();
-        drop(conn);
+            let mut insert_sql = String::from("BEGIN;");
+            for rowid in 1..=120_u32 {
+                insert_sql.push_str(&format!(
+                    "INSERT INTO t(id, payload) VALUES ({rowid}, '{}');",
+                    "x".repeat(700)
+                ));
+            }
+            insert_sql.push_str("COMMIT;");
+            conn.execute_batch(&insert_sql).await.unwrap();
+            conn.execute("DELETE FROM t WHERE id <= 100;")
+                .await
+                .unwrap();
+            drop(conn);
 
-        let oracle_before = rusqlite::Connection::open(&db_path).unwrap();
-        let freelist_before: i64 = oracle_before
-            .query_row("PRAGMA freelist_count;", [], |row| row.get(0))
-            .unwrap();
-        assert!(
-            freelist_before > 0,
-            "expected deletions to create free pages before VACUUM"
-        );
-        drop(oracle_before);
+            let oracle_before = rusqlite::Connection::open(&db_path).unwrap();
+            let freelist_before: i64 = oracle_before
+                .query_row("PRAGMA freelist_count;", [], |row| row.get(0))
+                .unwrap();
+            assert!(
+                freelist_before > 0,
+                "expected deletions to create free pages before VACUUM"
+            );
+            drop(oracle_before);
 
-        let conn = Connection::open(&db).unwrap();
-        conn.execute("VACUUM;").unwrap();
-        let rows = conn
-            .query("SELECT COUNT(*), MIN(id), MAX(id) FROM t;")
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].values()[0],
-            fsqlite_types::value::SqliteValue::Integer(20)
-        );
-        assert_eq!(
-            rows[0].values()[1],
-            fsqlite_types::value::SqliteValue::Integer(101)
-        );
-        assert_eq!(
-            rows[0].values()[2],
-            fsqlite_types::value::SqliteValue::Integer(120)
-        );
-        drop(conn);
+            let conn = Connection::open(&db).await.unwrap();
+            conn.execute("VACUUM;").await.unwrap();
+            let rows = conn
+                .query("SELECT COUNT(*), MIN(id), MAX(id) FROM t;")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].values()[0],
+                fsqlite_types::value::SqliteValue::Integer(20)
+            );
+            assert_eq!(
+                rows[0].values()[1],
+                fsqlite_types::value::SqliteValue::Integer(101)
+            );
+            assert_eq!(
+                rows[0].values()[2],
+                fsqlite_types::value::SqliteValue::Integer(120)
+            );
+            drop(conn);
 
-        let oracle_after = rusqlite::Connection::open(&db_path).unwrap();
-        let page_size: i64 = oracle_after
-            .query_row("PRAGMA page_size;", [], |row| row.get(0))
-            .unwrap();
-        let user_version: i64 = oracle_after
-            .query_row("PRAGMA user_version;", [], |row| row.get(0))
-            .unwrap();
-        let application_id: i64 = oracle_after
-            .query_row("PRAGMA application_id;", [], |row| row.get(0))
-            .unwrap();
-        let freelist_after: i64 = oracle_after
-            .query_row("PRAGMA freelist_count;", [], |row| row.get(0))
-            .unwrap();
-        let row_count: i64 = oracle_after
-            .query_row("SELECT COUNT(*) FROM t;", [], |row| row.get(0))
-            .unwrap();
+            let oracle_after = rusqlite::Connection::open(&db_path).unwrap();
+            let page_size: i64 = oracle_after
+                .query_row("PRAGMA page_size;", [], |row| row.get(0))
+                .unwrap();
+            let user_version: i64 = oracle_after
+                .query_row("PRAGMA user_version;", [], |row| row.get(0))
+                .unwrap();
+            let application_id: i64 = oracle_after
+                .query_row("PRAGMA application_id;", [], |row| row.get(0))
+                .unwrap();
+            let freelist_after: i64 = oracle_after
+                .query_row("PRAGMA freelist_count;", [], |row| row.get(0))
+                .unwrap();
+            let row_count: i64 = oracle_after
+                .query_row("SELECT COUNT(*) FROM t;", [], |row| row.get(0))
+                .unwrap();
 
-        assert_eq!(page_size, 1024);
-        assert_eq!(user_version, 321);
-        assert_eq!(application_id, 654321);
-        assert_eq!(freelist_after, 0);
-        assert_eq!(row_count, 20);
+            assert_eq!(page_size, 1024);
+            assert_eq!(user_version, 321);
+            assert_eq!(application_id, 654321);
+            assert_eq!(freelist_after, 0);
+            assert_eq!(row_count, 20);
+        });
     }
 
     #[test]
     fn test_vacuum_into_writes_compacted_copy_with_preserved_page_size_and_pragmas() {
-        let dir = tempfile::tempdir().unwrap();
-        let source_path = dir.path().join("vacuum-into-source.db");
-        let target_path = dir.path().join("vacuum-into-target.db");
-        let source = source_path.to_string_lossy().into_owned();
-        let target = target_path.to_string_lossy().into_owned();
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("vacuum-into-source.db");
+            let target_path = dir.path().join("vacuum-into-target.db");
+            let source = source_path.to_string_lossy().into_owned();
+            let target = target_path.to_string_lossy().into_owned();
 
-        let conn = Connection::open_with_page_size(&source, 8192).unwrap();
-        conn.execute("PRAGMA user_version = 777;").unwrap();
-        conn.execute("PRAGMA application_id = 888;").unwrap();
-        conn.execute(
-            "CREATE TABLE t(\
+            let conn = Connection::open_with_page_size(&source, 8192)
+                .await
+                .unwrap();
+            conn.execute("PRAGMA user_version = 777;").await.unwrap();
+            conn.execute("PRAGMA application_id = 888;").await.unwrap();
+            conn.execute(
+                "CREATE TABLE t(\
                 id INTEGER PRIMARY KEY,\
                 payload TEXT NOT NULL UNIQUE CHECK(length(payload) > 0)\
             );",
-        )
-        .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');")
+            )
+            .await
             .unwrap();
-        conn.execute("DELETE FROM t WHERE id = 2;").unwrap();
-        conn.execute_with_params(
-            "VACUUM INTO ?1;",
-            &[fsqlite_types::value::SqliteValue::Text(
-                target.clone().into(),
-            )],
-        )
-        .unwrap();
-        drop(conn);
-
-        let copied_fsqlite = Connection::open_schema_only(&target).unwrap();
-        let copied_rows = copied_fsqlite
-            .query("SELECT id, payload FROM t ORDER BY id;")
-            .unwrap();
-        assert_eq!(copied_rows.len(), 2);
-        assert_eq!(copied_rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(
-            copied_rows[0].values()[1],
-            SqliteValue::Text("alpha".into())
-        );
-        assert_eq!(copied_rows[1].values()[0], SqliteValue::Integer(3));
-        assert_eq!(
-            copied_rows[1].values()[1],
-            SqliteValue::Text("gamma".into())
-        );
-        let copied_schema = copied_fsqlite
-            .query("SELECT sql FROM sqlite_master WHERE type='table' AND name='t';")
-            .unwrap();
-        let copied_ddl = copied_schema[0].values()[0].to_text().to_ascii_uppercase();
-        assert!(copied_ddl.contains("UNIQUE"), "{copied_ddl}");
-        assert!(copied_ddl.contains("CHECK"), "{copied_ddl}");
-        copied_fsqlite.close().unwrap();
-
-        let copied = rusqlite::Connection::open(&target_path).unwrap();
-        let page_size: i64 = copied
-            .query_row("PRAGMA page_size;", [], |row| row.get(0))
-            .unwrap();
-        let user_version: i64 = copied
-            .query_row("PRAGMA user_version;", [], |row| row.get(0))
-            .unwrap();
-        let application_id: i64 = copied
-            .query_row("PRAGMA application_id;", [], |row| row.get(0))
-            .unwrap();
-        let freelist_count: i64 = copied
-            .query_row("PRAGMA freelist_count;", [], |row| row.get(0))
-            .unwrap();
-        let quick_check: String = copied
-            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
-            .unwrap();
-        let integrity_check: String = copied
-            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
-            .unwrap();
-        let values: Vec<(i64, String)> = {
-            let mut stmt = copied
-                .prepare("SELECT id, payload FROM t ORDER BY id;")
+            conn.execute("INSERT INTO t VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');")
+                .await
                 .unwrap();
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-        };
+            conn.execute("DELETE FROM t WHERE id = 2;").await.unwrap();
+            conn.execute_with_params(
+                "VACUUM INTO ?1;",
+                &[fsqlite_types::value::SqliteValue::Text(
+                    target.clone().into(),
+                )],
+            )
+            .await
+            .unwrap();
+            drop(conn);
 
-        assert_eq!(page_size, 8192);
-        assert_eq!(user_version, 777);
-        assert_eq!(application_id, 888);
-        assert_eq!(freelist_count, 0);
-        assert_eq!(quick_check, "ok");
-        assert_eq!(integrity_check, "ok");
-        assert_eq!(
-            values,
-            vec![(1, "alpha".to_owned()), (3, "gamma".to_owned())]
-        );
-        assert!(
-            copied
-                .execute("INSERT INTO t VALUES (4, 'alpha');", [])
-                .is_err(),
-            "the VACUUM INTO output must preserve the UNIQUE constraint"
-        );
+            let copied_fsqlite = Connection::open_schema_only(&target).await.unwrap();
+            let copied_rows = copied_fsqlite
+                .query("SELECT id, payload FROM t ORDER BY id;")
+                .await
+                .unwrap();
+            assert_eq!(copied_rows.len(), 2);
+            assert_eq!(copied_rows[0].values()[0], SqliteValue::Integer(1));
+            assert_eq!(
+                copied_rows[0].values()[1],
+                SqliteValue::Text("alpha".into())
+            );
+            assert_eq!(copied_rows[1].values()[0], SqliteValue::Integer(3));
+            assert_eq!(
+                copied_rows[1].values()[1],
+                SqliteValue::Text("gamma".into())
+            );
+            let copied_schema = copied_fsqlite
+                .query("SELECT sql FROM sqlite_master WHERE type='table' AND name='t';")
+                .await
+                .unwrap();
+            let copied_ddl = copied_schema[0].values()[0].to_text().to_ascii_uppercase();
+            assert!(copied_ddl.contains("UNIQUE"), "{copied_ddl}");
+            assert!(copied_ddl.contains("CHECK"), "{copied_ddl}");
+            copied_fsqlite.close().await.unwrap();
+
+            let copied = rusqlite::Connection::open(&target_path).unwrap();
+            let page_size: i64 = copied
+                .query_row("PRAGMA page_size;", [], |row| row.get(0))
+                .unwrap();
+            let user_version: i64 = copied
+                .query_row("PRAGMA user_version;", [], |row| row.get(0))
+                .unwrap();
+            let application_id: i64 = copied
+                .query_row("PRAGMA application_id;", [], |row| row.get(0))
+                .unwrap();
+            let freelist_count: i64 = copied
+                .query_row("PRAGMA freelist_count;", [], |row| row.get(0))
+                .unwrap();
+            let quick_check: String = copied
+                .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+                .unwrap();
+            let integrity_check: String = copied
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            let values: Vec<(i64, String)> = {
+                let mut stmt = copied
+                    .prepare("SELECT id, payload FROM t ORDER BY id;")
+                    .unwrap();
+                stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+
+            assert_eq!(page_size, 8192);
+            assert_eq!(user_version, 777);
+            assert_eq!(application_id, 888);
+            assert_eq!(freelist_count, 0);
+            assert_eq!(quick_check, "ok");
+            assert_eq!(integrity_check, "ok");
+            assert_eq!(
+                values,
+                vec![(1, "alpha".to_owned()), (3, "gamma".to_owned())]
+            );
+            assert!(
+                copied
+                    .execute("INSERT INTO t VALUES (4, 'alpha');", [])
+                    .is_err(),
+                "the VACUUM INTO output must preserve the UNIQUE constraint"
+            );
+        });
     }
 
     #[test]
@@ -534,29 +551,35 @@ mod tests {
 
     #[test]
     fn test_vacuum_into_empty_text_discards_without_owned_artifacts() {
-        let dir = tempfile::tempdir().unwrap();
-        let source_path = dir.path().join("discard-source.db");
-        let source = source_path.to_string_lossy().into_owned();
-        let conn = Connection::open(&source).unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT);")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'kept');").unwrap();
-        conn.execute_with_params("VACUUM INTO ?1;", &[SqliteValue::Text("".into())])
-            .unwrap();
-        let rows = conn.query("SELECT value FROM t WHERE id=1;").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("kept".into()));
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("discard-source.db");
+            let source = source_path.to_string_lossy().into_owned();
+            let conn = Connection::open(&source).await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'kept');")
+                .await
+                .unwrap();
+            conn.execute_with_params("VACUUM INTO ?1;", &[SqliteValue::Text("".into())])
+                .await
+                .unwrap();
+            let rows = conn.query("SELECT value FROM t WHERE id=1;").await.unwrap();
+            assert_eq!(rows[0].values()[0], SqliteValue::Text("kept".into()));
 
-        let artifacts = host_fs::read_dir_paths(dir.path())
-            .unwrap()
-            .into_iter()
-            .filter(|path| {
-                path.file_name().is_some_and(|name| {
-                    name.to_string_lossy()
-                        .contains(".fsqlite-vacuum-into-discard-")
+            let artifacts = host_fs::read_dir_paths(dir.path())
+                .unwrap()
+                .into_iter()
+                .filter(|path| {
+                    path.file_name().is_some_and(|name| {
+                        name.to_string_lossy()
+                            .contains(".fsqlite-vacuum-into-discard-")
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        assert!(artifacts.is_empty(), "{artifacts:?}");
+                .collect::<Vec<_>>();
+            assert!(artifacts.is_empty(), "{artifacts:?}");
+        });
     }
 
     #[test]
@@ -677,171 +700,198 @@ mod tests {
 
     #[test]
     fn test_vacuum_into_null_parameter_reports_non_text_filename() {
-        let dir = tempfile::tempdir().unwrap();
-        let source_path = dir.path().join("vacuum-into-null-source.db");
-        let source = source_path.to_string_lossy().into_owned();
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("vacuum-into-null-source.db");
+            let source = source_path.to_string_lossy().into_owned();
 
-        let conn = Connection::open(&source).unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);")
-            .unwrap();
+            let conn = Connection::open(&source).await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);")
+                .await
+                .unwrap();
 
-        let err = conn
-            .execute_with_params("VACUUM INTO ?1;", &[SqliteValue::Null])
-            .unwrap_err();
-        assert_eq!(err.to_string(), NON_TEXT_FILENAME);
+            let err = conn
+                .execute_with_params("VACUUM INTO ?1;", &[SqliteValue::Null])
+                .await
+                .unwrap_err();
+            assert_eq!(err.to_string(), NON_TEXT_FILENAME);
+        });
     }
 
     #[test]
     fn test_vacuum_into_empty_text_succeeds_without_leaving_output_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let source_path = dir.path().join("vacuum-into-empty-source.db");
-        let source = source_path.to_string_lossy().into_owned();
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("vacuum-into-empty-source.db");
+            let source = source_path.to_string_lossy().into_owned();
 
-        let conn = Connection::open(&source).unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'alpha'), (2, 'beta');")
-            .unwrap();
+            let conn = Connection::open(&source).await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'alpha'), (2, 'beta');")
+                .await
+                .unwrap();
 
-        conn.execute("VACUUM INTO '';").unwrap();
+            conn.execute("VACUUM INTO '';").await.unwrap();
 
-        let discard_files: Vec<_> = fsqlite_vfs::host_fs::read_dir_paths(dir.path())
-            .unwrap()
-            .into_iter()
-            .filter(|path| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy())
-                    .is_some_and(|name| name.contains(".fsqlite-vacuum-into-discard-"))
-            })
-            .collect();
-        assert!(
-            discard_files.is_empty(),
-            "VACUUM INTO '' should clean up its temporary discard sink: {discard_files:?}"
-        );
+            let discard_files: Vec<_> = fsqlite_vfs::host_fs::read_dir_paths(dir.path())
+                .unwrap()
+                .into_iter()
+                .filter(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy())
+                        .is_some_and(|name| name.contains(".fsqlite-vacuum-into-discard-"))
+                })
+                .collect();
+            assert!(
+                discard_files.is_empty(),
+                "VACUUM INTO '' should clean up its temporary discard sink: {discard_files:?}"
+            );
 
-        let rows = conn
-            .query("SELECT id, payload FROM t ORDER BY id;")
-            .unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+            let rows = conn
+                .query("SELECT id, payload FROM t ORDER BY id;")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+            assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        });
     }
 
     #[test]
     fn test_vacuum_in_place_removes_rebuild_temp_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("vacuum-temp-cleanup.db");
-        let db = db_path.to_string_lossy().into_owned();
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("vacuum-temp-cleanup.db");
+            let db = db_path.to_string_lossy().into_owned();
 
-        let conn = Connection::open(&db).unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'alpha'), (2, 'beta');")
-            .unwrap();
+            let conn = Connection::open(&db).await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'alpha'), (2, 'beta');")
+                .await
+                .unwrap();
 
-        conn.execute("VACUUM;").unwrap();
+            conn.execute("VACUUM;").await.unwrap();
 
-        let temp_prefix = format!(
-            "{}.fsqlite-vacuum-",
-            db_path.file_name().unwrap().to_string_lossy()
-        );
-        let temp_files: Vec<_> = fsqlite_vfs::host_fs::read_dir_paths(dir.path())
-            .unwrap()
-            .into_iter()
-            .filter(|path| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy())
-                    .is_some_and(|name| name.starts_with(&temp_prefix) && name.ends_with(".tmp"))
-            })
-            .collect();
-        assert!(
-            temp_files.is_empty(),
-            "VACUUM should not leave rebuild temp files behind: {temp_files:?}"
-        );
+            let temp_prefix = format!(
+                "{}.fsqlite-vacuum-",
+                db_path.file_name().unwrap().to_string_lossy()
+            );
+            let temp_files: Vec<_> = fsqlite_vfs::host_fs::read_dir_paths(dir.path())
+                .unwrap()
+                .into_iter()
+                .filter(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy())
+                        .is_some_and(|name| {
+                            name.starts_with(&temp_prefix) && name.ends_with(".tmp")
+                        })
+                })
+                .collect();
+            assert!(
+                temp_files.is_empty(),
+                "VACUUM should not leave rebuild temp files behind: {temp_files:?}"
+            );
+        });
     }
 
     #[test]
     fn test_vacuum_preserves_views_and_triggers_across_rebuild_and_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("vacuum-schema-objects.db");
-        let db = db_path.to_string_lossy().into_owned();
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("vacuum-schema-objects.db");
+            let db = db_path.to_string_lossy().into_owned();
 
-        let conn = Connection::open(&db).unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);")
+            let conn = Connection::open(&db).await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute("CREATE VIEW live_t AS SELECT id, payload FROM t WHERE id > 0;")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TRIGGER t_audit AFTER INSERT ON t BEGIN INSERT INTO audit(id) VALUES (NEW.id); END;",
+            )
+            .await
             .unwrap();
-        conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY);")
-            .unwrap();
-        conn.execute("CREATE VIEW live_t AS SELECT id, payload FROM t WHERE id > 0;")
-            .unwrap();
-        conn.execute(
-            "CREATE TRIGGER t_audit AFTER INSERT ON t BEGIN INSERT INTO audit(id) VALUES (NEW.id); END;",
-        )
-        .unwrap();
-        conn.execute("INSERT INTO t(id, payload) VALUES (1, 'alpha');")
-            .unwrap();
+            conn.execute("INSERT INTO t(id, payload) VALUES (1, 'alpha');")
+                .await
+                .unwrap();
 
-        conn.execute("VACUUM;").unwrap();
+            conn.execute("VACUUM;").await.unwrap();
 
-        let live_rows = conn
-            .query("SELECT id, payload FROM live_t ORDER BY id;")
-            .unwrap();
-        assert_eq!(live_rows.len(), 1);
-        assert_eq!(
-            live_rows[0].values()[0],
-            fsqlite_types::value::SqliteValue::Integer(1)
-        );
-        assert_eq!(
-            live_rows[0].values()[1],
-            fsqlite_types::value::SqliteValue::Text("alpha".into())
-        );
+            let live_rows = conn
+                .query("SELECT id, payload FROM live_t ORDER BY id;")
+                .await
+                .unwrap();
+            assert_eq!(live_rows.len(), 1);
+            assert_eq!(
+                live_rows[0].values()[0],
+                fsqlite_types::value::SqliteValue::Integer(1)
+            );
+            assert_eq!(
+                live_rows[0].values()[1],
+                fsqlite_types::value::SqliteValue::Text("alpha".into())
+            );
 
-        conn.execute("INSERT INTO t(id, payload) VALUES (2, 'beta');")
-            .unwrap();
-        let audit_rows = conn.query("SELECT id FROM audit ORDER BY id;").unwrap();
-        assert_eq!(audit_rows.len(), 2);
-        assert_eq!(
-            audit_rows[0].values()[0],
-            fsqlite_types::value::SqliteValue::Integer(1)
-        );
-        assert_eq!(
-            audit_rows[1].values()[0],
-            fsqlite_types::value::SqliteValue::Integer(2)
-        );
-        drop(conn);
+            conn.execute("INSERT INTO t(id, payload) VALUES (2, 'beta');")
+                .await
+                .unwrap();
+            let audit_rows = conn
+                .query("SELECT id FROM audit ORDER BY id;")
+                .await
+                .unwrap();
+            assert_eq!(audit_rows.len(), 2);
+            assert_eq!(
+                audit_rows[0].values()[0],
+                fsqlite_types::value::SqliteValue::Integer(1)
+            );
+            assert_eq!(
+                audit_rows[1].values()[0],
+                fsqlite_types::value::SqliteValue::Integer(2)
+            );
+            drop(conn);
 
-        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
-        let schema_rows: Vec<(String, String)> = {
-            let mut stmt = sqlite
-                .prepare(
-                    "SELECT type, name
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            let schema_rows: Vec<(String, String)> = {
+                let mut stmt = sqlite
+                    .prepare(
+                        "SELECT type, name
                      FROM sqlite_master
                      WHERE name IN ('live_t', 't_audit')
                      ORDER BY type, name;",
-                )
-                .unwrap();
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-        };
-        assert_eq!(
-            schema_rows,
-            vec![
-                ("trigger".to_owned(), "t_audit".to_owned()),
-                ("view".to_owned(), "live_t".to_owned()),
-            ]
-        );
+                    )
+                    .unwrap();
+                stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            assert_eq!(
+                schema_rows,
+                vec![
+                    ("trigger".to_owned(), "t_audit".to_owned()),
+                    ("view".to_owned(), "live_t".to_owned()),
+                ]
+            );
 
-        sqlite
-            .execute("INSERT INTO t(id, payload) VALUES (3, 'gamma');", [])
-            .unwrap();
-        let audit_ids: Vec<i64> = {
-            let mut stmt = sqlite.prepare("SELECT id FROM audit ORDER BY id;").unwrap();
-            stmt.query_map([], |row| row.get(0))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-        };
-        assert_eq!(audit_ids, vec![1, 2, 3]);
+            sqlite
+                .execute("INSERT INTO t(id, payload) VALUES (3, 'gamma');", [])
+                .unwrap();
+            let audit_ids: Vec<i64> = {
+                let mut stmt = sqlite.prepare("SELECT id FROM audit ORDER BY id;").unwrap();
+                stmt.query_map([], |row| row.get(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            assert_eq!(audit_ids, vec![1, 2, 3]);
+        });
     }
 }

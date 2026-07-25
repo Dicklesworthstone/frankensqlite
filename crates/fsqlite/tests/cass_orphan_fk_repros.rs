@@ -65,12 +65,12 @@ use tempfile::TempDir;
 /// not exist), then inserts one `message_metrics` row per message. None of
 /// the metric rows are themselves orphans — they all reference an existing
 /// `messages.id`.
-fn cass_orphan_schema(real_rows: i64, orphan_rows: i64) -> (Connection, TempDir) {
+async fn cass_orphan_schema(real_rows: i64, orphan_rows: i64) -> (Connection, TempDir) {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("orphan_fk_repro.db");
-    let conn = Connection::open(path.to_str().unwrap()).unwrap();
-    conn.execute("PRAGMA journal_mode = WAL;").unwrap();
-    conn.execute("PRAGMA foreign_keys = OFF;").unwrap();
+    let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+    conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+    conn.execute("PRAGMA foreign_keys = OFF;").await.unwrap();
 
     conn.execute(
         "CREATE TABLE conversations (
@@ -79,6 +79,7 @@ fn cass_orphan_schema(real_rows: i64, orphan_rows: i64) -> (Connection, TempDir)
             source_path TEXT NOT NULL
         );",
     )
+    .await
     .unwrap();
     conn.execute(
         "CREATE TABLE messages (
@@ -90,6 +91,7 @@ fn cass_orphan_schema(real_rows: i64, orphan_rows: i64) -> (Connection, TempDir)
             UNIQUE(conversation_id, idx)
         );",
     )
+    .await
     .unwrap();
     conn.execute(
         "CREATE TABLE message_metrics (
@@ -103,9 +105,11 @@ fn cass_orphan_schema(real_rows: i64, orphan_rows: i64) -> (Connection, TempDir)
             content_tokens_est INTEGER NOT NULL
         );",
     )
+    .await
     .unwrap();
 
     conn.execute("INSERT INTO conversations(id, agent_id, source_path) VALUES (1, 1, '/real');")
+        .await
         .unwrap();
 
     for i in 1..=real_rows {
@@ -118,6 +122,7 @@ fn cass_orphan_schema(real_rows: i64, orphan_rows: i64) -> (Connection, TempDir)
                 SqliteValue::Text(format!("real-msg-{i}").into()),
             ],
         )
+        .await
         .unwrap();
     }
     let orphan_start = real_rows + 1;
@@ -132,6 +137,7 @@ fn cass_orphan_schema(real_rows: i64, orphan_rows: i64) -> (Connection, TempDir)
                 SqliteValue::Text(format!("orphan-msg-{i}").into()),
             ],
         )
+        .await
         .unwrap();
     }
     for i in 1..=orphan_end {
@@ -142,9 +148,10 @@ fn cass_orphan_schema(real_rows: i64, orphan_rows: i64) -> (Connection, TempDir)
             ) VALUES (?1, 0, 0, 0, 'test-agent', 'user', 13, 2);",
             &[SqliteValue::Integer(i)],
         )
+        .await
         .unwrap();
     }
-    conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+    conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
     (conn, dir)
 }
 
@@ -169,26 +176,31 @@ const NOT_IN_PROBE_SQL: &str = "SELECT message_id FROM message_metrics \
 
 #[test]
 fn baseline_not_in_finds_zero_orphans_when_every_metric_has_matching_message() {
-    let (conn, _dir) = cass_orphan_schema(1, 3);
-    let rows = conn.query(NOT_IN_PROBE_SQL).unwrap();
-    assert_eq!(int_col(&rows, 0), Vec::<i64>::new());
+    asupersync::test_utils::run_test(|| async {
+        let (conn, _dir) = cass_orphan_schema(1, 3).await;
+        let rows = conn.query(NOT_IN_PROBE_SQL).await.unwrap();
+        assert_eq!(int_col(&rows, 0), Vec::<i64>::new());
+    });
 }
 
 #[test]
 fn baseline_not_in_finds_only_real_orphan_when_one_metric_is_dangling() {
-    let (conn, _dir) = cass_orphan_schema(5, 0);
-    conn.execute("PRAGMA foreign_keys = OFF;").unwrap();
-    conn.query_with_params(
-        "INSERT INTO message_metrics(
+    asupersync::test_utils::run_test(|| async {
+        let (conn, _dir) = cass_orphan_schema(5, 0).await;
+        conn.execute("PRAGMA foreign_keys = OFF;").await.unwrap();
+        conn.query_with_params(
+            "INSERT INTO message_metrics(
             message_id, created_at_ms, hour_id, day_id,
             agent_slug, role, content_chars, content_tokens_est
         ) VALUES (?1, 0, 0, 0, 'test-agent', 'user', 13, 2);",
-        &[SqliteValue::Integer(9999)],
-    )
-    .unwrap();
-    conn.execute("PRAGMA foreign_keys = ON;").unwrap();
-    let rows = conn.query(NOT_IN_PROBE_SQL).unwrap();
-    assert_eq!(int_col(&rows, 0), vec![9999_i64]);
+            &[SqliteValue::Integer(9999)],
+        )
+        .await
+        .unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+        let rows = conn.query(NOT_IN_PROBE_SQL).await.unwrap();
+        assert_eq!(int_col(&rows, 0), vec![9999_i64]);
+    });
 }
 
 // ---- Regression tests: correlated `NOT EXISTS` must match `NOT IN` ---------
@@ -201,14 +213,16 @@ fn baseline_not_in_finds_only_real_orphan_when_one_metric_is_dangling() {
 /// `NOT EXISTS` shape, the workaround has been (or can be) reverted.
 #[test]
 fn correlated_not_exists_must_match_not_in_at_small_scale() {
-    let (conn, _dir) = cass_orphan_schema(1, 3);
-    let rows = conn.query(NOT_EXISTS_PROBE_SQL).unwrap();
-    assert_eq!(
-        int_col(&rows, 0),
-        Vec::<i64>::new(),
-        "correlated NOT EXISTS regressed — it is leaking every metric row \
+    asupersync::test_utils::run_test(|| async {
+        let (conn, _dir) = cass_orphan_schema(1, 3).await;
+        let rows = conn.query(NOT_EXISTS_PROBE_SQL).await.unwrap();
+        assert_eq!(
+            int_col(&rows, 0),
+            Vec::<i64>::new(),
+            "correlated NOT EXISTS regressed — it is leaking every metric row \
          instead of evaluating the correlation predicate."
-    );
+        );
+    });
 }
 
 /// **Regression pin at the cass test scale** — the downstream cass test
@@ -218,47 +232,52 @@ fn correlated_not_exists_must_match_not_in_at_small_scale() {
 /// being inflated from 0 to N.
 #[test]
 fn correlated_not_exists_must_match_not_in_at_cass_test_scale() {
-    let n = 259_i64;
-    let (conn, _dir) = cass_orphan_schema(1, n - 1);
+    asupersync::test_utils::run_test(|| async {
+        let n = 259_i64;
+        let (conn, _dir) = cass_orphan_schema(1, n - 1).await;
 
-    let rows_not_in = conn.query(NOT_IN_PROBE_SQL).unwrap();
-    let rows_not_exists = conn.query(NOT_EXISTS_PROBE_SQL).unwrap();
+        let rows_not_in = conn.query(NOT_IN_PROBE_SQL).await.unwrap();
+        let rows_not_exists = conn.query(NOT_EXISTS_PROBE_SQL).await.unwrap();
 
-    assert_eq!(
-        int_col(&rows_not_in, 0),
-        Vec::<i64>::new(),
-        "baseline NOT IN must find no orphans (every metric has a matching message)"
-    );
-    assert_eq!(
-        int_col(&rows_not_exists, 0),
-        Vec::<i64>::new(),
-        "correlated NOT EXISTS regressed at scale — downstream cass test \
+        assert_eq!(
+            int_col(&rows_not_in, 0),
+            Vec::<i64>::new(),
+            "baseline NOT IN must find no orphans (every metric has a matching message)"
+        );
+        assert_eq!(
+            int_col(&rows_not_exists, 0),
+            Vec::<i64>::new(),
+            "correlated NOT EXISTS regressed at scale — downstream cass test \
          `cleanup_orphan_fk_rows_handles_more_than_one_delete_chunk` will fail \
          with `left: <2N>, right: <N>`."
-    );
+        );
+    });
 }
 
 /// **Regression pin** — correlated `NOT EXISTS` must isolate exactly the
 /// genuinely-orphan row when one is planted.
 #[test]
 fn correlated_not_exists_must_return_only_real_orphans() {
-    let (conn, _dir) = cass_orphan_schema(5, 0);
-    conn.execute("PRAGMA foreign_keys = OFF;").unwrap();
-    conn.query_with_params(
-        "INSERT INTO message_metrics(
+    asupersync::test_utils::run_test(|| async {
+        let (conn, _dir) = cass_orphan_schema(5, 0).await;
+        conn.execute("PRAGMA foreign_keys = OFF;").await.unwrap();
+        conn.query_with_params(
+            "INSERT INTO message_metrics(
             message_id, created_at_ms, hour_id, day_id,
             agent_slug, role, content_chars, content_tokens_est
         ) VALUES (?1, 0, 0, 0, 'test-agent', 'user', 13, 2);",
-        &[SqliteValue::Integer(9999)],
-    )
-    .unwrap();
-    conn.execute("PRAGMA foreign_keys = ON;").unwrap();
-    let rows = conn.query(NOT_EXISTS_PROBE_SQL).unwrap();
-    assert_eq!(
-        int_col(&rows, 0),
-        vec![9999_i64],
-        "correlated NOT EXISTS must isolate exactly the dangling row, not return everything."
-    );
+            &[SqliteValue::Integer(9999)],
+        )
+        .await
+        .unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+        let rows = conn.query(NOT_EXISTS_PROBE_SQL).await.unwrap();
+        assert_eq!(
+            int_col(&rows, 0),
+            vec![9999_i64],
+            "correlated NOT EXISTS must isolate exactly the dangling row, not return everything."
+        );
+    });
 }
 
 // ---- Chunked-IN DELETE — never broken, kept as a shape regression pin ------
@@ -282,47 +301,55 @@ fn positional_placeholders(n: usize) -> String {
 /// correct in fsqlite (both on the cass-pinned rev and on HEAD).
 #[test]
 fn dynamic_in_delete_with_positional_placeholders_deletes_exactly_bound_ids() {
-    let (conn, _dir) = cass_orphan_schema(10, 0);
-    let to_delete: Vec<i64> = vec![1, 3, 5, 7, 9];
-    let sql = format!(
-        "DELETE FROM message_metrics WHERE message_id IN ({})",
-        positional_placeholders(to_delete.len())
-    );
-    let params: Vec<SqliteValue> = to_delete
-        .iter()
-        .copied()
-        .map(SqliteValue::Integer)
-        .collect();
-    let _ = conn.query_with_params(&sql, &params).unwrap();
+    asupersync::test_utils::run_test(|| async {
+        let (conn, _dir) = cass_orphan_schema(10, 0).await;
+        let to_delete: Vec<i64> = vec![1, 3, 5, 7, 9];
+        let sql = format!(
+            "DELETE FROM message_metrics WHERE message_id IN ({})",
+            positional_placeholders(to_delete.len())
+        );
+        let params: Vec<SqliteValue> = to_delete
+            .iter()
+            .copied()
+            .map(SqliteValue::Integer)
+            .collect();
+        let _ = conn.query_with_params(&sql, &params).await.unwrap();
 
-    let remaining = conn
-        .query("SELECT message_id FROM message_metrics ORDER BY message_id")
-        .unwrap();
-    assert_eq!(int_col(&remaining, 0), vec![2_i64, 4, 6, 8, 10]);
+        let remaining = conn
+            .query("SELECT message_id FROM message_metrics ORDER BY message_id")
+            .await
+            .unwrap();
+        assert_eq!(int_col(&remaining, 0), vec![2_i64, 4, 6, 8, 10]);
+    });
 }
 
 /// Same shape at the chunk size cass used (256 placeholders).
 #[test]
 fn dynamic_in_delete_at_chunk_size_256() {
-    let n_rows: i64 = 300;
-    let (conn, _dir) = cass_orphan_schema(n_rows, 0);
+    asupersync::test_utils::run_test(|| async {
+        let n_rows: i64 = 300;
+        let (conn, _dir) = cass_orphan_schema(n_rows, 0).await;
 
-    let to_delete: Vec<i64> = (1..=256).collect();
-    let sql = format!(
-        "DELETE FROM message_metrics WHERE message_id IN ({})",
-        positional_placeholders(to_delete.len())
-    );
-    let params: Vec<SqliteValue> = to_delete
-        .iter()
-        .copied()
-        .map(SqliteValue::Integer)
-        .collect();
-    let _ = conn.query_with_params(&sql, &params).unwrap();
+        let to_delete: Vec<i64> = (1..=256).collect();
+        let sql = format!(
+            "DELETE FROM message_metrics WHERE message_id IN ({})",
+            positional_placeholders(to_delete.len())
+        );
+        let params: Vec<SqliteValue> = to_delete
+            .iter()
+            .copied()
+            .map(SqliteValue::Integer)
+            .collect();
+        let _ = conn.query_with_params(&sql, &params).await.unwrap();
 
-    let remaining = conn.query("SELECT COUNT(*) FROM message_metrics").unwrap();
-    let count = match &remaining[0].values()[0] {
-        SqliteValue::Integer(n) => *n,
-        other => panic!("expected count, got {other:?}"),
-    };
-    assert_eq!(count, n_rows - 256);
+        let remaining = conn
+            .query("SELECT COUNT(*) FROM message_metrics")
+            .await
+            .unwrap();
+        let count = match &remaining[0].values()[0] {
+            SqliteValue::Integer(n) => *n,
+            other => panic!("expected count, got {other:?}"),
+        };
+        assert_eq!(count, n_rows - 256);
+    });
 }

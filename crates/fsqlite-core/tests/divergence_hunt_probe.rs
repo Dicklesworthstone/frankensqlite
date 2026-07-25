@@ -41,18 +41,25 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02X}")).collect()
 }
 
-fn frank_rows(setup: &[&str], sql: &str) -> Result<Vec<Vec<String>>, String> {
+async fn frank_rows(setup: &[&str], sql: &str) -> Result<Vec<Vec<String>>, String> {
     let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
     let path = dir.path().join("probe.db");
-    let conn = Connection::open(path.to_str().unwrap()).map_err(|e| format!("open: {e}"))?;
+    let conn = Connection::open(path.to_str().unwrap())
+        .await
+        .map_err(|e| format!("open: {e}"))?;
     for s in setup {
-        conn.execute(s).map_err(|e| format!("setup `{s}`: {e}"))?;
+        conn.execute(s)
+            .await
+            .map_err(|e| format!("setup `{s}`: {e}"))?;
     }
-    conn.query(sql).map_err(|e| e.to_string()).map(|rows| {
-        rows.iter()
-            .map(|row| row.values().iter().map(tag_franken).collect())
-            .collect()
-    })
+    conn.query(sql)
+        .await
+        .map_err(|e| e.to_string())
+        .map(|rows| {
+            rows.iter()
+                .map(|row| row.values().iter().map(tag_franken).collect())
+                .collect()
+        })
 }
 
 fn sqlite_rows(setup: &[&str], sql: &str) -> Result<Vec<Vec<String>>, String> {
@@ -86,12 +93,12 @@ struct Case {
 /// Compare frank vs sqlite for a query whose row ORDER is implementation-defined
 /// (e.g. RETURNING from a multi-row DML). Rows are sorted before comparison so
 /// only the multiset of returned rows is asserted, not their order.
-fn check_unordered(divergences: &mut Vec<String>, c: &Case) {
+async fn check_unordered(divergences: &mut Vec<String>, c: &Case) {
     let norm = |mut v: Vec<Vec<String>>| {
         v.sort();
         v
     };
-    let f = frank_rows(c.setup, c.sql);
+    let f = frank_rows(c.setup, c.sql).await;
     let s = sqlite_rows(c.setup, c.sql);
     match (f, s) {
         (Ok(fr), Ok(sr)) => {
@@ -117,8 +124,8 @@ fn check_unordered(divergences: &mut Vec<String>, c: &Case) {
 
 const NO_SETUP: &[&str] = &[];
 
-fn check(divergences: &mut Vec<String>, c: &Case) {
-    let f = frank_rows(c.setup, c.sql);
+async fn check(divergences: &mut Vec<String>, c: &Case) {
+    let f = frank_rows(c.setup, c.sql).await;
     let s = sqlite_rows(c.setup, c.sql);
     match (&f, &s) {
         (Ok(fr), Ok(sr)) => {
@@ -644,9 +651,11 @@ fn divergence_hunt_broad_surface() {
     ];
 
     let mut divergences = Vec::new();
-    for c in &cases {
-        check(&mut divergences, c);
-    }
+    asupersync::test_utils::run_test(|| async {
+        for c in &cases {
+            check(&mut divergences, c).await;
+        }
+    });
 
     if !divergences.is_empty() {
         let report = divergences.join("\n\n");
@@ -778,9 +787,11 @@ fn without_rowid_returning_parity() {
     ];
 
     let mut divergences = Vec::new();
-    for c in &cases {
-        check_unordered(&mut divergences, c);
-    }
+    asupersync::test_utils::run_test(|| async {
+        for c in &cases {
+            check_unordered(&mut divergences, c).await;
+        }
+    });
     if !divergences.is_empty() {
         let report = divergences.join("\n\n");
         panic!(
@@ -910,14 +921,16 @@ fn without_rowid_insert_select_parity() {
     ];
 
     let mut divergences = Vec::new();
-    for c in &cases {
-        // The RETURNING case has impl-defined order; the rest are ORDER BY'd.
-        if c.sql.contains("RETURNING") {
-            check_unordered(&mut divergences, c);
-        } else {
-            check(&mut divergences, c);
+    asupersync::test_utils::run_test(|| async {
+        for c in &cases {
+            // The RETURNING case has impl-defined order; the rest are ORDER BY'd.
+            if c.sql.contains("RETURNING") {
+                check_unordered(&mut divergences, c).await;
+            } else {
+                check(&mut divergences, c).await;
+            }
         }
-    }
+    });
     if !divergences.is_empty() {
         let report = divergences.join("\n\n");
         panic!(
@@ -1106,13 +1119,15 @@ fn without_rowid_upsert_parity() {
     ];
 
     let mut divergences = Vec::new();
-    for c in &cases {
-        if c.sql.contains("RETURNING") {
-            check_unordered(&mut divergences, c);
-        } else {
-            check(&mut divergences, c);
+    asupersync::test_utils::run_test(|| async {
+        for c in &cases {
+            if c.sql.contains("RETURNING") {
+                check_unordered(&mut divergences, c).await;
+            } else {
+                check(&mut divergences, c).await;
+            }
         }
-    }
+    });
     if !divergences.is_empty() {
         let report = divergences.join("\n\n");
         panic!(
@@ -1274,13 +1289,15 @@ fn without_rowid_update_from_parity() {
     ];
 
     let mut divergences = Vec::new();
-    for c in &cases {
-        if c.sql.contains("RETURNING") {
-            check_unordered(&mut divergences, c);
-        } else {
-            check(&mut divergences, c);
+    asupersync::test_utils::run_test(|| async {
+        for c in &cases {
+            if c.sql.contains("RETURNING") {
+                check_unordered(&mut divergences, c).await;
+            } else {
+                check(&mut divergences, c).await;
+            }
         }
-    }
+    });
     if !divergences.is_empty() {
         let report = divergences.join("\n\n");
         panic!(
@@ -1597,9 +1614,11 @@ fn divergence_hunt_hard_constructs() {
     ];
 
     let mut divergences = Vec::new();
-    for c in &cases {
-        check(&mut divergences, c);
-    }
+    asupersync::test_utils::run_test(|| async {
+        for c in &cases {
+            check(&mut divergences, c).await;
+        }
+    });
 
     if !divergences.is_empty() {
         let report = divergences.join("\n\n");
@@ -1761,9 +1780,11 @@ fn printf_and_datetime_edge_parity() {
     ];
 
     let mut divergences = Vec::new();
-    for c in &cases {
-        check(&mut divergences, c);
-    }
+    asupersync::test_utils::run_test(|| async {
+        for c in &cases {
+            check(&mut divergences, c).await;
+        }
+    });
     if !divergences.is_empty() {
         let report = divergences.join("\n\n");
         panic!(
@@ -1918,9 +1939,11 @@ fn without_rowid_index_read_parity() {
     ];
 
     let mut divergences = Vec::new();
-    for c in &cases {
-        check(&mut divergences, c);
-    }
+    asupersync::test_utils::run_test(|| async {
+        for c in &cases {
+            check(&mut divergences, c).await;
+        }
+    });
     if !divergences.is_empty() {
         let report = divergences.join("\n\n");
         panic!(
@@ -2107,13 +2130,15 @@ fn omitted_conflict_target_upsert_parity() {
     ];
 
     let mut divergences = Vec::new();
-    for c in &cases {
-        if c.sql.contains("RETURNING") {
-            check_unordered(&mut divergences, c);
-        } else {
-            check(&mut divergences, c);
+    asupersync::test_utils::run_test(|| async {
+        for c in &cases {
+            if c.sql.contains("RETURNING") {
+                check_unordered(&mut divergences, c).await;
+            } else {
+                check(&mut divergences, c).await;
+            }
         }
-    }
+    });
     if !divergences.is_empty() {
         let report = divergences.join("\n\n");
         panic!(
