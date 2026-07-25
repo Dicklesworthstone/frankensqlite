@@ -1533,6 +1533,7 @@ dependencies = [
 name = "fsqlite-wasm"
 version = "0.1.19"
 dependencies = [
+ "asupersync",
  "console_error_panic_hook",
  "fsqlite-ast",
  "fsqlite-core",
