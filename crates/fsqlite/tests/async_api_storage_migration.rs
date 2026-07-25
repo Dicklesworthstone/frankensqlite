@@ -13,7 +13,9 @@ use fsqlite_types::cx::Cx;
 #[test]
 fn async_facade_drives_file_backed_storage_futures_to_completion() {
     let runtime = RuntimeBuilder::current_thread()
-        .blocking_threads(2, 2)
+        // The engine owns a separate large-stack thread. One runtime blocking
+        // slot is therefore sufficient for the sequential response waiters.
+        .blocking_threads(1, 1)
         .build()
         .expect("test runtime should build");
 
