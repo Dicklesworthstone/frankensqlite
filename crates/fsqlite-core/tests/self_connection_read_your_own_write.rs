@@ -1,3 +1,10 @@
+// Integration tests are their own crate root and do not inherit the lib's
+// `#![recursion_limit]`. The async engine futures nest deeply enough
+// (statement dispatch -> DML -> trigger -> nested statement execution) that
+// the trait solver overflows the default 128 while monomorphizing them.
+// Matches the 512 used by fsqlite-core, fsqlite, fsqlite-e2e and fsqlite-harness.
+#![recursion_limit = "512"]
+
 use fsqlite_core::connection::{Connection, Row};
 use fsqlite_types::SqliteValue;
 use std::error::Error;
