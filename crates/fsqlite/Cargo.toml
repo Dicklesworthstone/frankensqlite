@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 asupersync = { workspace = true, optional = true }
+futures-lite = { workspace = true, optional = true }
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-core = { version = "0.1.19", path = "../fsqlite-core", default-features = false }
@@ -35,7 +36,7 @@ rtree = ["dep:fsqlite-ext-rtree"]
 session = ["dep:fsqlite-ext-session"]
 icu = ["dep:fsqlite-ext-icu"]
 misc = ["dep:fsqlite-ext-misc"]
-async-api = ["dep:asupersync", "fsqlite-types/native"]
+async-api = ["dep:asupersync", "dep:futures-lite", "fsqlite-types/native"]
 raptorq = []
 mvcc = []
 

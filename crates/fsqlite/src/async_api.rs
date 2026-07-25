@@ -38,6 +38,7 @@ use asupersync::channel::oneshot;
 use asupersync::cx::Cx as NativeCx;
 use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeBuilder, RuntimeHandle};
 use fsqlite_types::cx::Cx;
+use futures_lite::future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -173,39 +174,39 @@ fn worker_loop(mut conn: Connection, rx: mpsc::Receiver<Command>) {
 
         match cmd {
             Command::Query { sql, tx } => {
-                let _ = tx.send(conn.query(&sql));
+                let _ = tx.send(future::block_on(conn.query(&sql)));
             }
             Command::QueryWithParams { sql, params, tx } => {
-                let _ = tx.send(conn.query_with_params(&sql, &params));
+                let _ = tx.send(future::block_on(conn.query_with_params(&sql, &params)));
             }
             Command::QueryRow { sql, tx } => {
-                let _ = tx.send(conn.query_row(&sql));
+                let _ = tx.send(future::block_on(conn.query_row(&sql)));
             }
             Command::QueryRowWithParams { sql, params, tx } => {
-                let _ = tx.send(conn.query_row_with_params(&sql, &params));
+                let _ = tx.send(future::block_on(conn.query_row_with_params(&sql, &params)));
             }
             Command::Execute { sql, tx } => {
-                let _ = tx.send(conn.execute(&sql));
+                let _ = tx.send(future::block_on(conn.execute(&sql)));
             }
             Command::ExecuteWithParams { sql, params, tx } => {
-                let _ = tx.send(conn.execute_with_params(&sql, &params));
+                let _ = tx.send(future::block_on(conn.execute_with_params(&sql, &params)));
             }
             Command::ExecuteBatch { sql, tx } => {
-                let _ = tx.send(conn.execute_batch(&sql));
+                let _ = tx.send(future::block_on(conn.execute_batch(&sql)));
             }
             Command::BeginTransaction { tx } => {
-                let _ = tx.send(conn.begin_transaction());
+                let _ = tx.send(future::block_on(conn.begin_transaction()));
             }
             Command::CommitTransaction { tx } => {
-                let _ = tx.send(conn.commit_transaction());
+                let _ = tx.send(future::block_on(conn.commit_transaction()));
             }
             Command::RollbackTransaction { tx } => {
-                let _ = tx.send(conn.rollback_transaction());
+                let _ = tx.send(future::block_on(conn.rollback_transaction()));
             }
             Command::Close { tx } => {
                 // Close the connection explicitly (rolls back any active txn,
                 // runs a passive WAL checkpoint).
-                let _ = tx.send(conn.close_in_place());
+                let _ = tx.send(future::block_on(conn.close_in_place()));
                 return;
             }
             Command::Shutdown => {
@@ -223,15 +224,17 @@ fn spawn_worker_task(
     open_tx: mpsc::SyncSender<Result<(), FrankenError>>,
 ) -> Result<BlockingTaskHandle, FrankenError> {
     runtime
-        .spawn_blocking(move || match Connection::open_with_env(path, env) {
-            Ok(conn) => {
-                let _ = open_tx.send(Ok(()));
-                worker_loop(conn, cmd_rx);
-            }
-            Err(error) => {
-                let _ = open_tx.send(Err(error));
-            }
-        })
+        .spawn_blocking(
+            move || match future::block_on(Connection::open_with_env(path, env)) {
+                Ok(conn) => {
+                    let _ = open_tx.send(Ok(()));
+                    worker_loop(conn, cmd_rx);
+                }
+                Err(error) => {
+                    let _ = open_tx.send(Err(error));
+                }
+            },
+        )
         .ok_or_else(worker_spawn_err)
 }
 
