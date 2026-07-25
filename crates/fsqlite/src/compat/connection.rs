@@ -122,89 +122,127 @@ mod tests {
 
     #[test]
     fn query_row_map_returns_value() {
-        let conn = Connection::open(":memory:").unwrap();
-        let result: i64 = conn
-            .query_row_map("SELECT 42", &[], |row| row.get_typed(0))
-            .unwrap();
-        assert_eq!(result, 42);
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let result: i64 = conn
+                .query_row_map("SELECT 42", &[], |row| row.get_typed(0))
+                .await
+                .unwrap();
+            assert_eq!(result, 42);
+        });
     }
 
     #[test]
     fn query_row_map_with_params() {
-        let conn = Connection::open(":memory:").unwrap();
-        let p = [ParamValue::from(10_i64), ParamValue::from(32_i64)];
-        let result: i64 = conn
-            .query_row_map("SELECT ?1 + ?2", &p, |row| row.get_typed(0))
-            .unwrap();
-        assert_eq!(result, 42);
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let p = [ParamValue::from(10_i64), ParamValue::from(32_i64)];
+            let result: i64 = conn
+                .query_row_map("SELECT ?1 + ?2", &p, |row| row.get_typed(0))
+                .await
+                .unwrap();
+            assert_eq!(result, 42);
+        });
     }
 
     #[test]
     fn query_map_collect_returns_vec() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
-            .unwrap();
-        conn.execute("INSERT INTO t (val) VALUES ('a')").unwrap();
-        conn.execute("INSERT INTO t (val) VALUES ('b')").unwrap();
-        conn.execute("INSERT INTO t (val) VALUES ('c')").unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t (val) VALUES ('a')")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t (val) VALUES ('b')")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t (val) VALUES ('c')")
+                .await
+                .unwrap();
 
-        let results: Vec<String> = conn
-            .query_map_collect("SELECT val FROM t ORDER BY id", &[], |row| row.get_typed(0))
-            .unwrap();
-        assert_eq!(results, vec!["a", "b", "c"]);
+            let results: Vec<String> = conn
+                .query_map_collect("SELECT val FROM t ORDER BY id", &[], |row| row.get_typed(0))
+                .await
+                .unwrap();
+            assert_eq!(results, vec!["a", "b", "c"]);
+        });
     }
 
     #[test]
     fn query_map_collect_supports_side_effect_only_row_processing() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
-            .unwrap();
-        conn.execute("INSERT INTO t (val) VALUES ('a')").unwrap();
-        conn.execute("INSERT INTO t (val) VALUES ('b')").unwrap();
-        conn.execute("INSERT INTO t (val) VALUES ('c')").unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t (val) VALUES ('a')")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t (val) VALUES ('b')")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t (val) VALUES ('c')")
+                .await
+                .unwrap();
 
-        let mut seen = Vec::new();
-        let results: Vec<()> = conn
-            .query_map_collect("SELECT val FROM t ORDER BY id", &[], |row| {
-                seen.push(row.get_typed::<String>(0)?);
-                Ok(())
-            })
-            .unwrap();
+            let mut seen = Vec::new();
+            let results: Vec<()> = conn
+                .query_map_collect("SELECT val FROM t ORDER BY id", &[], |row| {
+                    seen.push(row.get_typed::<String>(0)?);
+                    Ok(())
+                })
+                .await
+                .unwrap();
 
-        assert_eq!(results.len(), 3);
-        assert_eq!(seen, vec!["a", "b", "c"]);
+            assert_eq!(results.len(), 3);
+            assert_eq!(seen, vec!["a", "b", "c"]);
+        });
     }
 
     #[test]
     fn query_map_collect_supports_explain_statements() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
-            .unwrap();
-        conn.execute("INSERT INTO t (val) VALUES ('a')").unwrap();
-        conn.execute("INSERT INTO t (val) VALUES ('b')").unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t (val) VALUES ('a')")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t (val) VALUES ('b')")
+                .await
+                .unwrap();
 
-        let opcodes: Vec<String> = conn
-            .query_map_collect(
-                "EXPLAIN SELECT val FROM t WHERE id = ?1",
-                &[ParamValue::from(1_i64)],
-                |row| row.get_typed(1),
-            )
-            .unwrap();
+            let opcodes: Vec<String> = conn
+                .query_map_collect(
+                    "EXPLAIN SELECT val FROM t WHERE id = ?1",
+                    &[ParamValue::from(1_i64)],
+                    |row| row.get_typed(1),
+                )
+                .await
+                .unwrap();
 
-        assert!(!opcodes.is_empty());
-        assert!(opcodes.iter().any(|opcode| opcode == "OpenRead"));
+            assert!(!opcodes.is_empty());
+            assert!(opcodes.iter().any(|opcode| opcode == "OpenRead"));
+        });
     }
 
     #[test]
     fn execute_params_with_values() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER, name TEXT)")
-            .unwrap();
-        let p = [ParamValue::from(1_i64), ParamValue::from("alice")];
-        let affected = conn
-            .execute_compat("INSERT INTO t VALUES (?1, ?2)", &p)
-            .unwrap();
-        assert_eq!(affected, 1);
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER, name TEXT)")
+                .await
+                .unwrap();
+            let p = [ParamValue::from(1_i64), ParamValue::from("alice")];
+            let affected = conn
+                .execute_compat("INSERT INTO t VALUES (?1, ?2)", &p)
+                .await
+                .unwrap();
+            assert_eq!(affected, 1);
+        });
     }
 
     #[test]
@@ -259,97 +297,115 @@ mod tests {
             tx.commit().expect("commit fixture");
         }
 
-        let conn = Connection::open(db_path.to_str().expect("utf8 path")).expect("open fsqlite db");
-        let rows: Vec<(i64, i64, String)> = conn
-            .query_map_collect(
-                "SELECT id, idx, content
-                 FROM messages INDEXED BY sqlite_autoindex_messages_1
-                 WHERE conversation_id = ?1
-                 ORDER BY idx",
-                &[ParamValue::from(1_i64)],
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(db_path.to_str().expect("utf8 path"))
+                .await
+                .expect("open fsqlite db");
+            let rows: Vec<(i64, i64, String)> = conn
+                .query_map_collect(
+                    "SELECT id, idx, content
+                     FROM messages INDEXED BY sqlite_autoindex_messages_1
+                     WHERE conversation_id = ?1
+                     ORDER BY idx",
+                    &[ParamValue::from(1_i64)],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+                )
+                .await
+                .expect("query composite unique index");
+
+            assert_eq!(
+                rows,
+                vec![(1, 0, "first".to_owned()), (2, 1, "second".to_owned()),],
+                "indexed equality scan should stay within the conversation_id=1 duplicate run",
+            );
+
+            let readonly = open_with_flags(
+                db_path.to_str().expect("utf8 path"),
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
             )
-            .expect("query composite unique index");
+            .await
+            .expect("open readonly fsqlite db");
+            let readonly_rows: Vec<(i64, i64, String)> = readonly
+                .query_map_collect(
+                    "SELECT id, idx, content
+                     FROM messages INDEXED BY sqlite_autoindex_messages_1
+                     WHERE conversation_id = ?1
+                     ORDER BY idx",
+                    &[ParamValue::from(1_i64)],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+                )
+                .await
+                .expect("query composite unique index via readonly path");
 
-        assert_eq!(
-            rows,
-            vec![(1, 0, "first".to_owned()), (2, 1, "second".to_owned()),],
-            "indexed equality scan should stay within the conversation_id=1 duplicate run",
-        );
-
-        let readonly = open_with_flags(
-            db_path.to_str().expect("utf8 path"),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .expect("open readonly fsqlite db");
-        let readonly_rows: Vec<(i64, i64, String)> = readonly
-            .query_map_collect(
-                "SELECT id, idx, content
-                 FROM messages INDEXED BY sqlite_autoindex_messages_1
-                 WHERE conversation_id = ?1
-                 ORDER BY idx",
-                &[ParamValue::from(1_i64)],
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
-            )
-            .expect("query composite unique index via readonly path");
-
-        assert_eq!(
-            readonly_rows,
-            vec![(1, 0, "first".to_owned()), (2, 1, "second".to_owned()),],
-            "readonly indexed equality scan should stay within the conversation_id=1 duplicate run",
-        );
+            assert_eq!(
+                readonly_rows,
+                vec![(1, 0, "first".to_owned()), (2, 1, "second".to_owned()),],
+                "readonly indexed equality scan should stay within the conversation_id=1 duplicate run",
+            );
+        });
     }
 
     #[test]
     #[ignore = "machine-local cass repro; run with FSQLITE_REAL_DB=/path/to/agent_search.db"]
     fn query_map_collect_real_cass_db_repro() {
-        let db_path = std::env::var("FSQLITE_REAL_DB").expect("FSQLITE_REAL_DB must be set");
-        let conn = open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .expect("open readonly real cass db");
-        let query = "SELECT id, idx, content
-                 FROM messages INDEXED BY sqlite_autoindex_messages_1
-                 WHERE conversation_id = ?1
-                 ORDER BY idx
-                 LIMIT 20";
-        let stmt = conn.prepare(query).expect("prepare real cass query");
-        eprintln!("real_cass_query_explain:\n{}", stmt.explain());
-        let rows: Vec<(i64, i64, String)> = conn
-            .query_map_collect(query, &[ParamValue::from(1_i64)], |row| {
-                Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
-            })
-            .expect("query real cass db");
+        asupersync::test_utils::run_test(|| async {
+            let db_path = std::env::var("FSQLITE_REAL_DB").expect("FSQLITE_REAL_DB must be set");
+            let conn = open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .await
+                .expect("open readonly real cass db");
+            let query = "SELECT id, idx, content
+                     FROM messages INDEXED BY sqlite_autoindex_messages_1
+                     WHERE conversation_id = ?1
+                     ORDER BY idx
+                     LIMIT 20";
+            let stmt = conn.prepare(query).await.expect("prepare real cass query");
+            eprintln!("real_cass_query_explain:\n{}", stmt.explain());
+            let rows: Vec<(i64, i64, String)> = conn
+                .query_map_collect(query, &[ParamValue::from(1_i64)], |row| {
+                    Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+                })
+                .await
+                .expect("query real cass db");
 
-        assert_eq!(
-            rows.len(),
-            2,
-            "conversation_id=1 should only have two rows in the canonical cass db"
-        );
-        assert_eq!(rows[0].0, 1);
-        assert_eq!(rows[1].0, 2);
+            assert_eq!(
+                rows.len(),
+                2,
+                "conversation_id=1 should only have two rows in the canonical cass db"
+            );
+            assert_eq!(rows[0].0, 1);
+            assert_eq!(rows[1].0, 2);
+        });
     }
 
     #[test]
     #[ignore = "machine-local cass repro; run with FSQLITE_REAL_DB=/path/to/agent_search.db"]
     fn query_rowid_lookup_real_cass_db_repro() {
-        let db_path = std::env::var("FSQLITE_REAL_DB").expect("FSQLITE_REAL_DB must be set");
-        let conn = open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .expect("open readonly real cass db");
-        let query = "SELECT id, conversation_id, idx, content
-                 FROM messages
-                 WHERE id = ?1";
-        let stmt = conn.prepare(query).expect("prepare real cass rowid query");
-        eprintln!("real_cass_rowid_query_explain:\n{}", stmt.explain());
-        let rows: Vec<(i64, i64, i64, String)> = conn
-            .query_map_collect(query, &[ParamValue::from(1_i64)], |row| {
-                Ok((
-                    row.get_typed(0)?,
-                    row.get_typed(1)?,
-                    row.get_typed(2)?,
-                    row.get_typed(3)?,
-                ))
-            })
-            .expect("query real cass db by rowid");
+        asupersync::test_utils::run_test(|| async {
+            let db_path = std::env::var("FSQLITE_REAL_DB").expect("FSQLITE_REAL_DB must be set");
+            let conn = open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .await
+                .expect("open readonly real cass db");
+            let query = "SELECT id, conversation_id, idx, content
+                     FROM messages
+                     WHERE id = ?1";
+            let stmt = conn
+                .prepare(query)
+                .await
+                .expect("prepare real cass rowid query");
+            eprintln!("real_cass_rowid_query_explain:\n{}", stmt.explain());
+            let rows: Vec<(i64, i64, i64, String)> = conn
+                .query_map_collect(query, &[ParamValue::from(1_i64)], |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                    ))
+                })
+                .await
+                .expect("query real cass db by rowid");
 
-        assert_eq!(rows, vec![(1, 1, 0, "hello".to_owned())]);
+            assert_eq!(rows, vec![(1, 1, 0, "hello".to_owned())]);
+        });
     }
 }
