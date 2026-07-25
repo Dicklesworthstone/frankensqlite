@@ -36,12 +36,13 @@
 use crate::{Connection, ConnectionEnv, FrankenError, Row, SqliteValue};
 use asupersync::channel::oneshot;
 use asupersync::cx::Cx as NativeCx;
-use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeBuilder, RuntimeHandle};
+use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeHandle};
 use fsqlite_types::cx::Cx;
 use futures_lite::future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -51,9 +52,19 @@ use std::time::Duration;
 type Responder<T> = std::sync::mpsc::SyncSender<Result<T, FrankenError>>;
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+// Raw engine futures are deeply composed enough to overflow both Rust's
+// default spawned-thread stack and an 8 MiB test-thread stack under the
+// fs-ledger schema-migration workload. The synchronous consumer boundary owns
+// exactly one worker, so reserving a larger stack here is bounded per
+// connection and keeps that implementation detail off callers.
+const SYNC_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// A command sent from an async method to the worker task.
 enum Command {
+    Prepare {
+        sql: String,
+        tx: Responder<()>,
+    },
     Query {
         sql: String,
         tx: Responder<Vec<Row>>,
@@ -62,6 +73,11 @@ enum Command {
         sql: String,
         params: Vec<SqliteValue>,
         tx: Responder<Vec<Row>>,
+    },
+    QueryWithParamsStream {
+        sql: String,
+        params: Vec<SqliteValue>,
+        tx: mpsc::SyncSender<Result<Option<Row>, FrankenError>>,
     },
     QueryRow {
         sql: String,
@@ -94,6 +110,9 @@ enum Command {
     RollbackTransaction {
         tx: Responder<()>,
     },
+    LastInsertRowid {
+        tx: Responder<i64>,
+    },
     Close {
         tx: Responder<()>,
     },
@@ -108,6 +127,10 @@ fn worker_dead_err() -> FrankenError {
     FrankenError::Internal("async worker task terminated unexpectedly".to_owned())
 }
 
+fn stream_consumer_dead_err() -> FrankenError {
+    FrankenError::Internal("synchronous query consumer stopped receiving rows".to_owned())
+}
+
 fn requires_runtime_err() -> FrankenError {
     FrankenError::Internal(
         "AsyncConnection async methods require an asupersync runtime with a blocking pool"
@@ -119,6 +142,12 @@ fn worker_spawn_err() -> FrankenError {
     FrankenError::Internal(
         "failed to spawn async worker task: runtime has no blocking pool".to_owned(),
     )
+}
+
+fn sync_worker_spawn_err(error: std::io::Error) -> FrankenError {
+    FrankenError::Internal(format!(
+        "failed to spawn synchronous async-api worker thread: {error}"
+    ))
 }
 
 fn blocking_wait_send_err<T>(_: oneshot::SendError<Result<T, FrankenError>>) {}
@@ -160,6 +189,10 @@ async fn recv_sync_response<
     }
 }
 
+fn recv_worker_response<T>(rx: mpsc::Receiver<Result<T, FrankenError>>) -> Result<T, FrankenError> {
+    rx.recv().map_err(|_| worker_dead_err())?
+}
+
 // ---------------------------------------------------------------------------
 // Worker task
 // ---------------------------------------------------------------------------
@@ -173,11 +206,30 @@ fn worker_loop(mut conn: Connection, rx: mpsc::Receiver<Command>) {
         };
 
         match cmd {
+            Command::Prepare { sql, tx } => {
+                let result = future::block_on(conn.prepare(&sql)).map(drop);
+                let _ = tx.send(result);
+            }
             Command::Query { sql, tx } => {
                 let _ = tx.send(future::block_on(conn.query(&sql)));
             }
             Command::QueryWithParams { sql, params, tx } => {
                 let _ = tx.send(future::block_on(conn.query_with_params(&sql, &params)));
+            }
+            Command::QueryWithParamsStream { sql, params, tx } => {
+                let result =
+                    future::block_on(conn.query_with_params_for_each(&sql, &params, |row| {
+                        tx.send(Ok(Some(row.clone())))
+                            .map_err(|_| stream_consumer_dead_err())
+                    }));
+                match result {
+                    Ok(()) => {
+                        let _ = tx.send(Ok(None));
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(error));
+                    }
+                }
             }
             Command::QueryRow { sql, tx } => {
                 let _ = tx.send(future::block_on(conn.query_row(&sql)));
@@ -203,6 +255,9 @@ fn worker_loop(mut conn: Connection, rx: mpsc::Receiver<Command>) {
             Command::RollbackTransaction { tx } => {
                 let _ = tx.send(future::block_on(conn.rollback_transaction()));
             }
+            Command::LastInsertRowid { tx } => {
+                let _ = tx.send(Ok(conn.last_insert_rowid()));
+            }
             Command::Close { tx } => {
                 // Close the connection explicitly (rolls back any active txn,
                 // runs a passive WAL checkpoint).
@@ -211,6 +266,22 @@ fn worker_loop(mut conn: Connection, rx: mpsc::Receiver<Command>) {
             }
             Command::Shutdown => {
                 return;
+            }
+        }
+    }
+}
+
+enum WorkerHandle {
+    Runtime(BlockingTaskHandle),
+    Thread(JoinHandle<()>),
+}
+
+impl WorkerHandle {
+    fn wait(self) {
+        match self {
+            Self::Runtime(handle) => handle.wait(),
+            Self::Thread(handle) => {
+                let _ = handle.join();
             }
         }
     }
@@ -238,25 +309,28 @@ fn spawn_worker_task(
         .ok_or_else(worker_spawn_err)
 }
 
-fn build_owned_runtime() -> Result<Runtime, FrankenError> {
-    RuntimeBuilder::current_thread()
-        .blocking_threads(1, 1)
-        .build()
-        .map_err(|error| {
-            FrankenError::Internal(format!("failed to build async-api runtime: {error}"))
-        })
-}
-
-fn current_or_owned_runtime() -> Result<(Option<Runtime>, RuntimeHandle), FrankenError> {
-    if let Some(handle) = Runtime::current_handle()
-        && handle.blocking_handle().is_some()
-    {
-        return Ok((None, handle));
-    }
-
-    let runtime = build_owned_runtime()?;
-    let handle = runtime.handle();
-    Ok((Some(runtime), handle))
+fn spawn_sync_worker_thread(
+    path: String,
+    env: ConnectionEnv,
+    cmd_rx: mpsc::Receiver<Command>,
+    open_tx: mpsc::SyncSender<Result<(), FrankenError>>,
+) -> Result<WorkerHandle, FrankenError> {
+    thread::Builder::new()
+        .name("fsqlite-sync-worker".to_owned())
+        .stack_size(SYNC_WORKER_STACK_BYTES)
+        .spawn(
+            move || match future::block_on(Connection::open_with_env(path, env)) {
+                Ok(conn) => {
+                    let _ = open_tx.send(Ok(()));
+                    worker_loop(conn, cmd_rx);
+                }
+                Err(error) => {
+                    let _ = open_tx.send(Err(error));
+                }
+            },
+        )
+        .map(WorkerHandle::Thread)
+        .map_err(sync_worker_spawn_err)
 }
 
 fn wait_for_worker_open(
@@ -265,7 +339,7 @@ fn wait_for_worker_open(
     open_rx.recv().map_err(|_| worker_open_err())?
 }
 
-fn join_worker_task(handle: BlockingTaskHandle) {
+fn join_worker_task(handle: WorkerHandle) {
     handle.wait();
 }
 
@@ -307,11 +381,11 @@ fn send_err<T>(_: mpsc::SendError<T>) -> FrankenError {
 /// down. The underlying [`Connection`] is closed on the worker task as part
 /// of its normal drop sequence.
 ///
-/// For explicit, error-checked shutdown use [`close`](Self::close).
+/// For explicit, error-checked shutdown use [`close`](Self::close) on the
+/// async path or [`close_sync`](Self::close_sync) on the synchronous path.
 pub struct AsyncConnection {
     cmd_tx: Option<mpsc::SyncSender<Command>>,
-    worker: Option<BlockingTaskHandle>,
-    owned_runtime: Option<Runtime>,
+    worker: Option<WorkerHandle>,
     /// Tracks whether the worker task's connection has an active transaction.
     /// Updated by `begin_transaction`, `commit_transaction`, and
     /// `rollback_transaction` to allow `in_transaction()` to be a cheap local
@@ -333,8 +407,10 @@ impl AsyncConnection {
 
     /// Open a database connection without a capability context (convenience).
     ///
-    /// Equivalent to calling [`Connection::open`] and wrapping the result.
-    /// No cancellation check is performed.
+    /// The raw connection is born on a dedicated large-stack worker thread and
+    /// remains there for its lifetime. No cancellation check is performed;
+    /// synchronous consumers should use the `*_sync` methods and
+    /// [`close_sync`](Self::close_sync).
     pub fn open_sync(path: impl Into<String>) -> Result<Self, FrankenError> {
         Self::open_sync_with_env(path, ConnectionEnv::default())
     }
@@ -348,14 +424,12 @@ impl AsyncConnection {
         let path = path.into();
         let (open_tx, open_rx) = mpsc::sync_channel::<Result<(), FrankenError>>(1);
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(32);
-        let (owned_runtime, runtime_handle) = current_or_owned_runtime()?;
-        let worker = spawn_worker_task(&runtime_handle, path, env, cmd_rx, open_tx)?;
+        let worker = spawn_sync_worker_thread(path, env, cmd_rx, open_tx)?;
 
         match wait_for_worker_open(open_rx) {
             Ok(()) => Ok(Self {
                 cmd_tx: Some(cmd_tx),
                 worker: Some(worker),
-                owned_runtime,
                 in_txn: Arc::new(AtomicBool::new(false)),
             }),
             Err(error) => {
@@ -383,7 +457,8 @@ impl AsyncConnection {
         let (open_tx, open_rx) = mpsc::sync_channel::<Result<(), FrankenError>>(1);
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(32);
         let runtime = Runtime::current_handle().ok_or_else(requires_runtime_err)?;
-        let worker = spawn_worker_task(&runtime, path, env, cmd_rx, open_tx)?;
+        let worker =
+            WorkerHandle::Runtime(spawn_worker_task(&runtime, path, env, cmd_rx, open_tx)?);
 
         // Wait for the open result.
         if let Err(error) = recv_sync_response(cx, open_rx).await? {
@@ -394,7 +469,6 @@ impl AsyncConnection {
         Ok(Self {
             cmd_tx: Some(cmd_tx),
             worker: Some(worker),
-            owned_runtime: None,
             in_txn: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -404,6 +478,199 @@ impl AsyncConnection {
         self.cmd_tx
             .as_ref()
             .ok_or_else(|| FrankenError::Internal("AsyncConnection has been closed".to_owned()))
+    }
+
+    /// Validate and prepare one SQL statement on the dedicated worker.
+    ///
+    /// This is the synchronous-consumer counterpart to the async methods
+    /// below. It intentionally performs no cancellation check and blocks the
+    /// caller until the worker responds.
+    pub fn prepare_sync(&self, sql: &str) -> Result<(), FrankenError> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender()?
+            .send(Command::Prepare {
+                sql: sql.to_owned(),
+                tx,
+            })
+            .map_err(send_err)?;
+        recv_worker_response(rx)
+    }
+
+    /// Execute a query through the dedicated worker and block for all rows.
+    pub fn query_sync(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender()?
+            .send(Command::Query {
+                sql: sql.to_owned(),
+                tx,
+            })
+            .map_err(send_err)?;
+        recv_worker_response(rx)
+    }
+
+    /// Execute a parameterized query through the dedicated worker.
+    pub fn query_with_params_sync(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Vec<Row>, FrankenError> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender()?
+            .send(Command::QueryWithParams {
+                sql: sql.to_owned(),
+                params: params.to_vec(),
+                tx,
+            })
+            .map_err(send_err)?;
+        recv_worker_response(rx)
+    }
+
+    /// Stream a parameterized query through a one-row bounded worker channel.
+    ///
+    /// The callback runs on the caller thread. Returning an error stops the
+    /// stream, releases the worker, and returns that callback error.
+    pub fn query_with_params_for_each_sync<F>(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+        mut f: F,
+    ) -> Result<(), FrankenError>
+    where
+        F: FnMut(&Row) -> Result<(), FrankenError>,
+    {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender()?
+            .send(Command::QueryWithParamsStream {
+                sql: sql.to_owned(),
+                params: params.to_vec(),
+                tx,
+            })
+            .map_err(send_err)?;
+
+        loop {
+            match rx.recv().map_err(|_| worker_dead_err())?? {
+                Some(row) => f(&row)?,
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Execute a query through the dedicated worker and return exactly one row.
+    pub fn query_row_sync(&self, sql: &str) -> Result<Row, FrankenError> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender()?
+            .send(Command::QueryRow {
+                sql: sql.to_owned(),
+                tx,
+            })
+            .map_err(send_err)?;
+        recv_worker_response(rx)
+    }
+
+    /// Execute a parameterized query and return exactly one row.
+    pub fn query_row_with_params_sync(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Row, FrankenError> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender()?
+            .send(Command::QueryRowWithParams {
+                sql: sql.to_owned(),
+                params: params.to_vec(),
+                tx,
+            })
+            .map_err(send_err)?;
+        recv_worker_response(rx)
+    }
+
+    /// Execute SQL through the dedicated worker.
+    pub fn execute_sync(&self, sql: &str) -> Result<usize, FrankenError> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender()?
+            .send(Command::Execute {
+                sql: sql.to_owned(),
+                tx,
+            })
+            .map_err(send_err)?;
+        recv_worker_response(rx)
+    }
+
+    /// Execute parameterized SQL through the dedicated worker.
+    pub fn execute_with_params_sync(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<usize, FrankenError> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender()?
+            .send(Command::ExecuteWithParams {
+                sql: sql.to_owned(),
+                params: params.to_vec(),
+                tx,
+            })
+            .map_err(send_err)?;
+        recv_worker_response(rx)
+    }
+
+    /// Execute zero or more SQL statements through the dedicated worker.
+    pub fn execute_batch_sync(&self, sql: &str) -> Result<(), FrankenError> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender()?
+            .send(Command::ExecuteBatch {
+                sql: sql.to_owned(),
+                tx,
+            })
+            .map_err(send_err)?;
+        recv_worker_response(rx)
+    }
+
+    /// Begin a transaction through the dedicated worker.
+    pub fn begin_transaction_sync(&self) -> Result<(), FrankenError> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender()?
+            .send(Command::BeginTransaction { tx })
+            .map_err(send_err)?;
+        let result = recv_worker_response(rx);
+        if result.is_ok() {
+            self.in_txn.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    /// Commit the active transaction through the dedicated worker.
+    pub fn commit_transaction_sync(&self) -> Result<(), FrankenError> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender()?
+            .send(Command::CommitTransaction { tx })
+            .map_err(send_err)?;
+        let result = recv_worker_response(rx);
+        if result.is_ok() {
+            self.in_txn.store(false, Ordering::Release);
+        }
+        result
+    }
+
+    /// Roll back the active transaction through the dedicated worker.
+    pub fn rollback_transaction_sync(&self) -> Result<(), FrankenError> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender()?
+            .send(Command::RollbackTransaction { tx })
+            .map_err(send_err)?;
+        let result = recv_worker_response(rx);
+        if result.is_ok() {
+            self.in_txn.store(false, Ordering::Release);
+        }
+        result
+    }
+
+    /// Return the worker-owned connection's last inserted row identifier.
+    pub fn last_insert_rowid_sync(&self) -> Result<i64, FrankenError> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender()?
+            .send(Command::LastInsertRowid { tx })
+            .map_err(send_err)?;
+        recv_worker_response(rx)
     }
 
     /// Execute a SQL query and return all result rows.
@@ -613,11 +880,27 @@ impl AsyncConnection {
             if let Some(handle) = self.worker.take() {
                 join_worker_task(handle);
             }
-            self.owned_runtime = None;
 
             result
         } else {
             // Already closed.
+            Ok(())
+        }
+    }
+
+    /// Explicitly close a synchronously used connection and join its worker.
+    pub fn close_sync(&mut self) -> Result<(), FrankenError> {
+        if let Some(cmd_tx) = self.cmd_tx.take() {
+            let (tx, rx) = mpsc::sync_channel(1);
+            cmd_tx.send(Command::Close { tx }).map_err(send_err)?;
+            let result = recv_worker_response(rx);
+
+            if let Some(handle) = self.worker.take() {
+                join_worker_task(handle);
+            }
+
+            result
+        } else {
             Ok(())
         }
     }
@@ -631,7 +914,6 @@ impl Drop for AsyncConnection {
         if let Some(handle) = self.worker.take() {
             join_worker_task(handle);
         }
-        self.owned_runtime = None;
     }
 }
 

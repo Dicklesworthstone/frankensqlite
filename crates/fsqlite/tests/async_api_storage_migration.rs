@@ -126,3 +126,87 @@ fn async_facade_drives_file_backed_storage_futures_to_completion() {
             .expect("reopened connection should close");
     });
 }
+
+#[test]
+fn sync_facade_owns_storage_futures_on_its_worker() {
+    let directory = tempfile::tempdir().expect("temporary database directory");
+    let database_path = directory.path().join("sync-facade.db");
+    let database_path = database_path.to_string_lossy().into_owned();
+    let mut connection =
+        AsyncConnection::open_sync(database_path).expect("file-backed sync connection should open");
+
+    connection
+        .execute_batch_sync(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             INSERT INTO items(name) VALUES ('before');",
+        )
+        .expect("schema and seed batch should complete");
+    connection
+        .prepare_sync("SELECT id, name FROM items WHERE id = ?1")
+        .expect("statement validation should complete on the worker");
+
+    assert_eq!(
+        connection
+            .execute_with_params_sync(
+                "INSERT INTO items(name) VALUES (?1)",
+                &[SqliteValue::Text("after".into())],
+            )
+            .expect("parameterized insert should complete"),
+        1
+    );
+    assert_eq!(
+        connection
+            .last_insert_rowid_sync()
+            .expect("last inserted row id should cross the worker boundary"),
+        2
+    );
+
+    let row = connection
+        .query_row_with_params_sync(
+            "SELECT id, name FROM items WHERE id = ?1",
+            &[SqliteValue::Integer(2)],
+        )
+        .expect("parameterized row query should complete");
+    assert_eq!(row.get(0), Some(&SqliteValue::Integer(2)));
+    assert_eq!(row.get(1), Some(&SqliteValue::Text("after".into())));
+
+    let mut streamed_ids = Vec::new();
+    connection
+        .query_with_params_for_each_sync(
+            "SELECT id FROM items WHERE id >= ?1 ORDER BY id",
+            &[SqliteValue::Integer(1)],
+            |row| {
+                streamed_ids.push(row.get(0).cloned());
+                Ok(())
+            },
+        )
+        .expect("bounded row stream should complete");
+    assert_eq!(
+        streamed_ids,
+        vec![Some(SqliteValue::Integer(1)), Some(SqliteValue::Integer(2))]
+    );
+
+    connection
+        .begin_transaction_sync()
+        .expect("transaction should begin");
+    assert!(connection.in_transaction());
+    connection
+        .execute_sync("DELETE FROM items")
+        .expect("transactional delete should complete");
+    connection
+        .rollback_transaction_sync()
+        .expect("transaction should roll back");
+    assert!(!connection.in_transaction());
+    assert_eq!(
+        connection
+            .query_sync("SELECT id FROM items")
+            .expect("post-rollback query should complete")
+            .len(),
+        2
+    );
+
+    connection
+        .close_sync()
+        .expect("explicit sync close should complete");
+    assert!(connection.query_sync("SELECT 1").is_err());
+}
