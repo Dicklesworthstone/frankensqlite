@@ -30,164 +30,206 @@ mod pager_tests {
     use fsqlite_vfs::MemoryVfs;
     use std::path::PathBuf;
 
-    fn test_pager() -> SimplePager<MemoryVfs> {
+    async fn test_pager() -> SimplePager<MemoryVfs> {
         let vfs = MemoryVfs::new();
         let path = PathBuf::from("/stor-suite-test.db");
         let cx = Cx::new();
-        SimplePager::open_with_cx(&cx, vfs, &path, PageSize::DEFAULT).expect("open test pager")
+        SimplePager::open_with_cx(&cx, vfs, &path, PageSize::DEFAULT)
+            .await
+            .expect("open test pager")
     }
 
-    fn test_pager_with_size(page_size: PageSize) -> SimplePager<MemoryVfs> {
+    async fn test_pager_with_size(page_size: PageSize) -> SimplePager<MemoryVfs> {
         let vfs = MemoryVfs::new();
         let path = PathBuf::from(format!("/stor-suite-{}.db", page_size.get()));
         let cx = Cx::new();
-        SimplePager::open_with_cx(&cx, vfs, &path, page_size).expect("open test pager")
+        SimplePager::open_with_cx(&cx, vfs, &path, page_size)
+            .await
+            .expect("open test pager")
     }
 
     // -- Transaction mode isolation --
 
     #[test]
     fn pager_readonly_cannot_write() {
-        let pager = test_pager();
-        let cx = Cx::new();
-        let mut txn = pager
-            .begin(&cx, TransactionMode::ReadOnly)
-            .expect("begin ro");
-        let result = txn.allocate_page(&cx);
-        let ctx = DiagContext::new(BEAD_ID)
-            .case("readonly_cannot_write")
-            .invariant("RO txn must reject write operations");
-        diag_assert!(ctx, result.is_err(), "allocate_page on RO must fail");
+        asupersync::test_utils::run_test(|| async {
+            let pager = test_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager
+                .begin(&cx, TransactionMode::ReadOnly)
+                .await
+                .expect("begin ro");
+            let result = txn.allocate_page(&cx).await;
+            let ctx = DiagContext::new(BEAD_ID)
+                .case("readonly_cannot_write")
+                .invariant("RO txn must reject write operations");
+            diag_assert!(ctx, result.is_err(), "allocate_page on RO must fail");
+        });
     }
 
     #[test]
     fn pager_immediate_is_writer() {
-        let pager = test_pager();
-        let cx = Cx::new();
-        let mut txn = pager
-            .begin(&cx, TransactionMode::Immediate)
-            .expect("begin imm");
-        let result = txn.allocate_page(&cx);
-        let ctx = DiagContext::new(BEAD_ID)
-            .case("immediate_is_writer")
-            .invariant("IMMEDIATE txn can allocate pages (holds writer lock)");
-        diag_assert!(
-            ctx,
-            result.is_ok(),
-            "allocate_page on IMMEDIATE must succeed"
-        );
+        asupersync::test_utils::run_test(|| async {
+            let pager = test_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager
+                .begin(&cx, TransactionMode::Immediate)
+                .await
+                .expect("begin imm");
+            let result = txn.allocate_page(&cx).await;
+            let ctx = DiagContext::new(BEAD_ID)
+                .case("immediate_is_writer")
+                .invariant("IMMEDIATE txn can allocate pages (holds writer lock)");
+            diag_assert!(
+                ctx,
+                result.is_ok(),
+                "allocate_page on IMMEDIATE must succeed"
+            );
+        });
     }
 
     #[test]
     fn pager_writer_mutual_exclusion() {
-        let pager = test_pager();
-        let cx = Cx::new();
-        let _w1 = pager
-            .begin(&cx, TransactionMode::Exclusive)
-            .expect("begin excl");
-        let result = pager.begin(&cx, TransactionMode::Immediate);
-        let ctx = DiagContext::new(BEAD_ID)
-            .case("writer_mutual_exclusion")
-            .invariant("Only one writer at a time");
-        diag_assert!(ctx, result.is_err(), "second writer must be rejected");
+        asupersync::test_utils::run_test(|| async {
+            let pager = test_pager().await;
+            let cx = Cx::new();
+            let _w1 = pager
+                .begin(&cx, TransactionMode::Exclusive)
+                .await
+                .expect("begin excl");
+            let result = pager.begin(&cx, TransactionMode::Immediate).await;
+            let ctx = DiagContext::new(BEAD_ID)
+                .case("writer_mutual_exclusion")
+                .invariant("Only one writer at a time");
+            diag_assert!(ctx, result.is_err(), "second writer must be rejected");
+        });
     }
 
     #[test]
     fn pager_multiple_readers_coexist() {
-        let pager = test_pager();
-        let cx = Cx::new();
-        let r1 = pager.begin(&cx, TransactionMode::ReadOnly);
-        let r2 = pager.begin(&cx, TransactionMode::ReadOnly);
-        let ctx = DiagContext::new(BEAD_ID)
-            .case("multiple_readers")
-            .invariant("Multiple readers allowed concurrently");
-        diag_assert!(ctx, r1.is_ok(), "first reader must succeed");
-        diag_assert!(ctx, r2.is_ok(), "second reader must succeed");
+        asupersync::test_utils::run_test(|| async {
+            let pager = test_pager().await;
+            let cx = Cx::new();
+            // Both readers are held live simultaneously: `r1` stays in scope
+            // across `r2`'s `begin`, preserving the concurrency this asserts.
+            let r1 = pager.begin(&cx, TransactionMode::ReadOnly).await;
+            let r2 = pager.begin(&cx, TransactionMode::ReadOnly).await;
+            let ctx = DiagContext::new(BEAD_ID)
+                .case("multiple_readers")
+                .invariant("Multiple readers allowed concurrently");
+            diag_assert!(ctx, r1.is_ok(), "first reader must succeed");
+            diag_assert!(ctx, r2.is_ok(), "second reader must succeed");
+        });
     }
 
     #[test]
     fn pager_deferred_upgrades_on_allocate() {
-        let pager = test_pager();
-        let cx = Cx::new();
-        let mut deferred = pager
-            .begin(&cx, TransactionMode::Deferred)
-            .expect("begin def");
+        asupersync::test_utils::run_test(|| async {
+            let pager = test_pager().await;
+            let cx = Cx::new();
+            let mut deferred = pager
+                .begin(&cx, TransactionMode::Deferred)
+                .await
+                .expect("begin def");
 
-        // DEFERRED can read page 1 (starts as reader).
-        let pre_ctx = DiagContext::new(BEAD_ID)
-            .case("deferred_pre_upgrade")
-            .invariant("DEFERRED starts as reader, can read");
-        let read_result = deferred.get_page(&cx, PageNumber::ONE);
-        diag_assert!(pre_ctx, read_result.is_ok(), "reader can read");
+            // DEFERRED can read page 1 (starts as reader).
+            let pre_ctx = DiagContext::new(BEAD_ID)
+                .case("deferred_pre_upgrade")
+                .invariant("DEFERRED starts as reader, can read");
+            let read_result = deferred.get_page(&cx, PageNumber::ONE).await;
+            diag_assert!(pre_ctx, read_result.is_ok(), "reader can read");
 
-        // After allocate, deferred has upgraded to writer.
-        let _page = deferred
-            .allocate_page(&cx)
-            .expect("allocate upgrades to writer");
-        let post_ctx = DiagContext::new(BEAD_ID)
-            .case("deferred_post_upgrade")
-            .invariant("DEFERRED upgrades on first write, can commit");
-        let commit_result = deferred.commit(&cx);
-        diag_assert!(
-            post_ctx,
-            commit_result.is_ok(),
-            "upgraded writer can commit"
-        );
+            // After allocate, deferred has upgraded to writer.
+            let _page = deferred
+                .allocate_page(&cx)
+                .await
+                .expect("allocate upgrades to writer");
+            let post_ctx = DiagContext::new(BEAD_ID)
+                .case("deferred_post_upgrade")
+                .invariant("DEFERRED upgrades on first write, can commit");
+            let commit_result = deferred.commit(&cx).await;
+            diag_assert!(
+                post_ctx,
+                commit_result.is_ok(),
+                "upgraded writer can commit"
+            );
+        });
     }
 
     // -- Page write and read-back --
 
     #[test]
     fn pager_write_readback_deterministic() {
-        let pager = test_pager();
-        let cx = Cx::new();
-        let mut txn = pager.begin(&cx, TransactionMode::Immediate).expect("begin");
-        let page_no = txn.allocate_page(&cx).expect("alloc");
-        let page_size = PageSize::DEFAULT.as_usize();
+        asupersync::test_utils::run_test(|| async {
+            let pager = test_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager
+                .begin(&cx, TransactionMode::Immediate)
+                .await
+                .expect("begin");
+            let page_no = txn.allocate_page(&cx).await.expect("alloc");
+            let page_size = PageSize::DEFAULT.as_usize();
 
-        let seed = FixtureSeed::derive("pager-write-readback");
-        let mut data = vec![0u8; page_size];
-        let seed_bytes = seed.raw().to_le_bytes();
-        for (i, byte) in data.iter_mut().enumerate() {
-            *byte = seed_bytes[i % 8];
-        }
+            let seed = FixtureSeed::derive("pager-write-readback");
+            let mut data = vec![0u8; page_size];
+            let seed_bytes = seed.raw().to_le_bytes();
+            for (i, byte) in data.iter_mut().enumerate() {
+                *byte = seed_bytes[i % 8];
+            }
 
-        txn.write_page(&cx, page_no, &data).expect("write");
-        let read_back = txn.get_page(&cx, page_no).expect("read");
+            txn.write_page(&cx, page_no, &data).await.expect("write");
+            let read_back = txn.get_page(&cx, page_no).await.expect("read");
 
-        let ctx = DiagContext::new(BEAD_ID)
-            .case("write_readback")
-            .seed(seed.raw())
-            .invariant("Written page reads back identically");
-        diag_assert_eq!(ctx, read_back.as_ref(), data.as_slice());
+            let ctx = DiagContext::new(BEAD_ID)
+                .case("write_readback")
+                .seed(seed.raw())
+                .invariant("Written page reads back identically");
+            diag_assert_eq!(ctx, read_back.as_ref(), data.as_slice());
+        });
     }
 
     // -- Page boundary sizes --
 
     #[test]
     fn pager_min_page_size() {
-        let page_size = PageSize::new(512).expect("512 valid");
-        let pager = test_pager_with_size(page_size);
-        let cx = Cx::new();
-        let txn = pager.begin(&cx, TransactionMode::ReadOnly).expect("begin");
-        let page1 = txn.get_page(&cx, PageNumber::ONE).expect("read page 1");
-        let ctx = DiagContext::new(BEAD_ID)
-            .case("min_page_size")
-            .invariant("512-byte page size boundary");
-        diag_assert_eq!(ctx, page1.as_ref().len(), 512);
+        asupersync::test_utils::run_test(|| async {
+            let page_size = PageSize::new(512).expect("512 valid");
+            let pager = test_pager_with_size(page_size).await;
+            let cx = Cx::new();
+            let txn = pager
+                .begin(&cx, TransactionMode::ReadOnly)
+                .await
+                .expect("begin");
+            let page1 = txn
+                .get_page(&cx, PageNumber::ONE)
+                .await
+                .expect("read page 1");
+            let ctx = DiagContext::new(BEAD_ID)
+                .case("min_page_size")
+                .invariant("512-byte page size boundary");
+            diag_assert_eq!(ctx, page1.as_ref().len(), 512);
+        });
     }
 
     #[test]
     fn pager_max_page_size() {
-        let page_size = PageSize::new(65536).expect("65536 valid");
-        let pager = test_pager_with_size(page_size);
-        let cx = Cx::new();
-        let txn = pager.begin(&cx, TransactionMode::ReadOnly).expect("begin");
-        let page1 = txn.get_page(&cx, PageNumber::ONE).expect("read page 1");
-        let ctx = DiagContext::new(BEAD_ID)
-            .case("max_page_size")
-            .invariant("65536-byte page size boundary");
-        diag_assert_eq!(ctx, page1.as_ref().len(), 65536);
+        asupersync::test_utils::run_test(|| async {
+            let page_size = PageSize::new(65536).expect("65536 valid");
+            let pager = test_pager_with_size(page_size).await;
+            let cx = Cx::new();
+            let txn = pager
+                .begin(&cx, TransactionMode::ReadOnly)
+                .await
+                .expect("begin");
+            let page1 = txn
+                .get_page(&cx, PageNumber::ONE)
+                .await
+                .expect("read page 1");
+            let ctx = DiagContext::new(BEAD_ID)
+                .case("max_page_size")
+                .invariant("65536-byte page size boundary");
+            diag_assert_eq!(ctx, page1.as_ref().len(), 65536);
+        });
     }
 
     // -- Journal format --
@@ -317,105 +359,128 @@ mod wal_tests {
 
     #[test]
     fn wal_frame_write_readback() {
-        let cx = test_cx();
-        let vfs = MemoryVfs::new();
-        let file = open_wal_file(&vfs, &cx);
-        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+        asupersync::test_utils::run_test(|| async {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let file = open_wal_file(&vfs, &cx);
+            let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts())
+                .await
+                .expect("create WAL");
 
-        let page = sample_page(0x42);
-        wal.append_frame(&cx, 1, &page, 0).expect("append frame");
+            let page = sample_page(0x42);
+            wal.append_frame(&cx, 1, &page, 0)
+                .await
+                .expect("append frame");
 
-        let (header, data) = wal.read_frame(&cx, 0).expect("read frame");
-        let ctx = DiagContext::new(BEAD_ID)
-            .case("wal_frame_readback")
-            .seed(0x42)
-            .invariant("Written frame reads back identically");
-        diag_assert_eq!(ctx, data, page);
-        diag_assert_eq!(
-            ctx.clone().case("wal_frame_page_number"),
-            header.page_number,
-            1
-        );
+            let (header, data) = wal.read_frame(&cx, 0).await.expect("read frame");
+            let ctx = DiagContext::new(BEAD_ID)
+                .case("wal_frame_readback")
+                .seed(0x42)
+                .invariant("Written frame reads back identically");
+            diag_assert_eq!(ctx, data, page);
+            diag_assert_eq!(
+                ctx.clone().case("wal_frame_page_number"),
+                header.page_number,
+                1
+            );
 
-        wal.close(&cx).expect("close WAL");
+            wal.close(&cx).expect("close WAL");
+        });
     }
 
     #[test]
     fn wal_checksum_chain_integrity() {
-        let cx = test_cx();
-        let vfs = MemoryVfs::new();
-        let file = open_wal_file(&vfs, &cx);
-        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 5, test_salts()).expect("create WAL");
+        asupersync::test_utils::run_test(|| async {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let file = open_wal_file(&vfs, &cx);
+            let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 5, test_salts())
+                .await
+                .expect("create WAL");
 
-        for i in 0..5u32 {
-            let page = sample_page(u8::try_from(i).expect("fits"));
-            let db_size = if i == 4 { 5 } else { 0 };
-            wal.append_frame(&cx, i + 1, &page, db_size)
-                .expect("append frame");
-        }
+            for i in 0..5u32 {
+                let page = sample_page(u8::try_from(i).expect("fits"));
+                let db_size = if i == 4 { 5 } else { 0 };
+                wal.append_frame(&cx, i + 1, &page, db_size)
+                    .await
+                    .expect("append frame");
+            }
 
-        wal.close(&cx).expect("close");
+            wal.close(&cx).expect("close");
 
-        // Reopen — checksum chain validated on open.
-        let file2 = open_wal_file(&vfs, &cx);
-        let wal2 = WalFile::open(&cx, file2).expect("reopen validates chain");
-        let ctx = DiagContext::new(BEAD_ID)
-            .case("checksum_chain_intact")
-            .invariant("Checksum chain validates on reopen");
-        diag_assert_eq!(ctx, wal2.frame_count(), 5);
+            // Reopen — checksum chain validated on open.
+            let file2 = open_wal_file(&vfs, &cx);
+            let wal2 = WalFile::open(&cx, file2)
+                .await
+                .expect("reopen validates chain");
+            let ctx = DiagContext::new(BEAD_ID)
+                .case("checksum_chain_intact")
+                .invariant("Checksum chain validates on reopen");
+            diag_assert_eq!(ctx, wal2.frame_count(), 5);
 
-        wal2.close(&cx).expect("close");
+            wal2.close(&cx).expect("close");
+        });
     }
 
     #[test]
     fn wal_reset_clears_frames() {
-        let cx = test_cx();
-        let vfs = MemoryVfs::new();
-        let file = open_wal_file(&vfs, &cx);
-        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        asupersync::test_utils::run_test(|| async {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let file = open_wal_file(&vfs, &cx);
+            let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts())
+                .await
+                .expect("create");
 
-        for i in 0..3u8 {
-            wal.append_frame(&cx, u32::from(i) + 1, &sample_page(i), 0)
-                .expect("append");
-        }
+            for i in 0..3u8 {
+                wal.append_frame(&cx, u32::from(i) + 1, &sample_page(i), 0)
+                    .await
+                    .expect("append");
+            }
 
-        let new_salts = WalSalts {
-            salt1: 0x1111_2222,
-            salt2: 0x3333_4444,
-        };
-        wal.reset(&cx, 1, new_salts, true).expect("reset");
+            let new_salts = WalSalts {
+                salt1: 0x1111_2222,
+                salt2: 0x3333_4444,
+            };
+            wal.reset(&cx, 1, new_salts, true).await.expect("reset");
 
-        let ctx = DiagContext::new(BEAD_ID)
-            .case("wal_reset")
-            .invariant("WAL reset zeroes frame count");
-        diag_assert_eq!(ctx, wal.frame_count(), 0);
-        diag_assert_eq!(
-            ctx.clone().case("wal_reset_ckpt_seq"),
-            wal.header().checkpoint_seq,
-            1
-        );
+            let ctx = DiagContext::new(BEAD_ID)
+                .case("wal_reset")
+                .invariant("WAL reset zeroes frame count");
+            diag_assert_eq!(ctx, wal.frame_count(), 0);
+            diag_assert_eq!(
+                ctx.clone().case("wal_reset_ckpt_seq"),
+                wal.header().checkpoint_seq,
+                1
+            );
 
-        wal.close(&cx).expect("close");
+            wal.close(&cx).expect("close");
+        });
     }
 
     #[test]
     fn wal_commit_frame_marks_db_size() {
-        let cx = test_cx();
-        let vfs = MemoryVfs::new();
-        let file = open_wal_file(&vfs, &cx);
-        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        asupersync::test_utils::run_test(|| async {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let file = open_wal_file(&vfs, &cx);
+            let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts())
+                .await
+                .expect("create");
 
-        wal.append_frame(&cx, 1, &sample_page(0x10), 10)
-            .expect("append commit");
-        let header = wal.read_frame_header(&cx, 0).expect("read header");
+            wal.append_frame(&cx, 1, &sample_page(0x10), 10)
+                .await
+                .expect("append commit");
+            let header = wal.read_frame_header(&cx, 0).await.expect("read header");
 
-        let ctx = DiagContext::new(BEAD_ID)
-            .case("commit_frame_db_size")
-            .invariant("Commit frame carries db_size");
-        diag_assert!(ctx.clone(), header.is_commit(), "must be commit frame");
-        diag_assert_eq!(ctx, header.db_size, 10);
+            let ctx = DiagContext::new(BEAD_ID)
+                .case("commit_frame_db_size")
+                .invariant("Commit frame carries db_size");
+            diag_assert!(ctx.clone(), header.is_commit(), "must be commit frame");
+            diag_assert_eq!(ctx, header.db_size, 10);
 
-        wal.close(&cx).expect("close");
+            wal.close(&cx).expect("close");
+        });
     }
 
     // -- Checkpoint planning (UT-STOR-006) --
@@ -1205,108 +1270,118 @@ mod vfs_tests {
 
     #[test]
     fn memory_vfs_write_read_roundtrip() {
-        let vfs = MemoryVfs::new();
-        let cx = Cx::new();
-        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
-        let (mut file, _) = vfs
-            .open(&cx, Some(std::path::Path::new("vfs-test.db")), flags)
-            .expect("open");
+        asupersync::test_utils::run_test(|| async {
+            let vfs = MemoryVfs::new();
+            let cx = Cx::new();
+            let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
+            let (file, _) = vfs
+                .open(&cx, Some(std::path::Path::new("vfs-test.db")), flags)
+                .expect("open");
 
-        let seed = FixtureSeed::derive("vfs-write-roundtrip");
-        let data: Vec<u8> = seed.raw().to_le_bytes().to_vec();
-        file.write(&cx, &data, 0).expect("write");
+            let seed = FixtureSeed::derive("vfs-write-roundtrip");
+            let data: Vec<u8> = seed.raw().to_le_bytes().to_vec();
+            file.write(&cx, &data, 0).await.expect("write");
 
-        let mut buf = vec![0u8; data.len()];
-        file.read(&cx, &mut buf, 0).expect("read");
+            let mut buf = vec![0u8; data.len()];
+            file.read(&cx, &mut buf, 0).await.expect("read");
 
-        let ctx = DiagContext::new(BEAD_ID)
-            .case("vfs_write_read")
-            .seed(seed.raw())
-            .invariant("VFS write→read roundtrip");
-        diag_assert_eq!(ctx, buf, data);
+            let ctx = DiagContext::new(BEAD_ID)
+                .case("vfs_write_read")
+                .seed(seed.raw())
+                .invariant("VFS write→read roundtrip");
+            diag_assert_eq!(ctx, buf, data);
+        });
     }
 
     #[test]
     fn memory_vfs_file_size_tracks_writes() {
-        let vfs = MemoryVfs::new();
-        let cx = Cx::new();
-        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
-        let (mut file, _) = vfs
-            .open(&cx, Some(std::path::Path::new("vfs-size.db")), flags)
-            .expect("open");
+        asupersync::test_utils::run_test(|| async {
+            let vfs = MemoryVfs::new();
+            let cx = Cx::new();
+            let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
+            let (file, _) = vfs
+                .open(&cx, Some(std::path::Path::new("vfs-size.db")), flags)
+                .expect("open");
 
-        let ctx = DiagContext::new(BEAD_ID)
-            .case("file_size_tracks")
-            .invariant("File size grows with writes");
+            let ctx = DiagContext::new(BEAD_ID)
+                .case("file_size_tracks")
+                .invariant("File size grows with writes");
 
-        let initial = file.file_size(&cx).expect("size");
-        diag_assert_eq!(ctx.clone().case("initial_zero"), initial, 0);
+            let initial = file.file_size(&cx).expect("size");
+            diag_assert_eq!(ctx.clone().case("initial_zero"), initial, 0);
 
-        file.write(&cx, &[0xAB; 4096], 0).expect("write 4k");
-        let after_write = file.file_size(&cx).expect("size");
-        diag_assert_eq!(ctx, after_write, 4096);
+            file.write(&cx, &[0xAB; 4096], 0).await.expect("write 4k");
+            let after_write = file.file_size(&cx).expect("size");
+            diag_assert_eq!(ctx, after_write, 4096);
+        });
     }
 
     #[test]
     fn memory_vfs_multiple_files_isolated() {
-        let vfs = MemoryVfs::new();
-        let cx = Cx::new();
-        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
+        asupersync::test_utils::run_test(|| async {
+            let vfs = MemoryVfs::new();
+            let cx = Cx::new();
+            let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
 
-        let (mut f1, _) = vfs
-            .open(&cx, Some(std::path::Path::new("iso-a.db")), flags)
-            .expect("open a");
-        let (mut f2, _) = vfs
-            .open(&cx, Some(std::path::Path::new("iso-b.db")), flags)
-            .expect("open b");
+            let (f1, _) = vfs
+                .open(&cx, Some(std::path::Path::new("iso-a.db")), flags)
+                .expect("open a");
+            let (f2, _) = vfs
+                .open(&cx, Some(std::path::Path::new("iso-b.db")), flags)
+                .expect("open b");
 
-        f1.write(&cx, &[0xAA; 100], 0).expect("write a");
-        f2.write(&cx, &[0xBB; 200], 0).expect("write b");
+            f1.write(&cx, &[0xAA; 100], 0).await.expect("write a");
+            f2.write(&cx, &[0xBB; 200], 0).await.expect("write b");
 
-        let ctx = DiagContext::new(BEAD_ID)
-            .case("file_isolation")
-            .invariant("Separate VFS files are isolated");
-        diag_assert_eq!(ctx.clone().case("f1_size"), f1.file_size(&cx).unwrap(), 100);
-        diag_assert_eq!(ctx, f2.file_size(&cx).unwrap(), 200);
+            let ctx = DiagContext::new(BEAD_ID)
+                .case("file_isolation")
+                .invariant("Separate VFS files are isolated");
+            diag_assert_eq!(ctx.clone().case("f1_size"), f1.file_size(&cx).unwrap(), 100);
+            diag_assert_eq!(ctx, f2.file_size(&cx).unwrap(), 200);
+        });
     }
 
     #[test]
     fn memory_vfs_truncate() {
-        let vfs = MemoryVfs::new();
-        let cx = Cx::new();
-        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
-        let (mut file, _) = vfs
-            .open(&cx, Some(std::path::Path::new("trunc.db")), flags)
-            .expect("open");
+        asupersync::test_utils::run_test(|| async {
+            let vfs = MemoryVfs::new();
+            let cx = Cx::new();
+            let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
+            let (mut file, _) = vfs
+                .open(&cx, Some(std::path::Path::new("trunc.db")), flags)
+                .expect("open");
 
-        file.write(&cx, &[0xCC; 8192], 0).expect("write 8k");
-        file.truncate(&cx, 4096).expect("truncate to 4k");
+            file.write(&cx, &[0xCC; 8192], 0).await.expect("write 8k");
+            file.truncate(&cx, 4096).expect("truncate to 4k");
 
-        let ctx = DiagContext::new(BEAD_ID)
-            .case("vfs_truncate")
-            .invariant("Truncate reduces file size");
-        diag_assert_eq!(ctx, file.file_size(&cx).unwrap(), 4096);
+            let ctx = DiagContext::new(BEAD_ID)
+                .case("vfs_truncate")
+                .invariant("Truncate reduces file size");
+            diag_assert_eq!(ctx, file.file_size(&cx).unwrap(), 4096);
+        });
     }
 
     #[test]
     fn memory_vfs_read_beyond_eof_zeroes() {
-        let vfs = MemoryVfs::new();
-        let cx = Cx::new();
-        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
-        let (mut file, _) = vfs
-            .open(&cx, Some(std::path::Path::new("eof.db")), flags)
-            .expect("open");
+        asupersync::test_utils::run_test(|| async {
+            let vfs = MemoryVfs::new();
+            let cx = Cx::new();
+            let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
+            let (file, _) = vfs
+                .open(&cx, Some(std::path::Path::new("eof.db")), flags)
+                .expect("open");
 
-        file.write(&cx, &[0xDD; 100], 0).expect("write");
+            file.write(&cx, &[0xDD; 100], 0).await.expect("write");
 
-        let mut buf = vec![0xFF; 200];
-        // Read starting at offset 50, spanning past EOF.
-        let result = file.read(&cx, &mut buf, 50);
-        let ctx = DiagContext::new(BEAD_ID)
-            .case("read_beyond_eof")
-            .invariant("Read past EOF pads with zeros or short-reads");
-        // The exact behavior depends on VFS impl — just verify no panic.
-        diag_assert!(ctx, result.is_ok(), "read past EOF should not panic");
+            let mut buf = vec![0xFF; 200];
+            // Read starting at offset 50, spanning past EOF.
+            let result = file.read(&cx, &mut buf, 50).await;
+            let ctx = DiagContext::new(BEAD_ID)
+                .case("read_beyond_eof")
+                .invariant("Read past EOF pads with zeros or short-reads");
+            // The exact behavior depends on VFS impl — just verify no panic.
+            diag_assert!(ctx, result.is_ok(), "read past EOF should not panic");
+        });
     }
 
     // -- SHM region management --

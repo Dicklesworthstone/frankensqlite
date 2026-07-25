@@ -1784,33 +1784,40 @@ mod tests {
     #[test]
     fn concurrent_mode_default_guard_fails_closed_without_mutating_connection()
     -> Result<(), Box<dyn std::error::Error>> {
-        let conn = fsqlite_core::connection::Connection::open(":memory:")?;
-        assert!(conn.is_concurrent_mode_default());
+        let mut outcome: Result<(), Box<dyn std::error::Error>> = Ok(());
+        asupersync::test_utils::run_test(|| async {
+            outcome = async {
+                let conn = fsqlite_core::connection::Connection::open(":memory:").await?;
+                assert!(conn.is_concurrent_mode_default());
 
-        let mut input = healthy_input();
-        input.concurrent_mode_default_observed = conn.is_concurrent_mode_default();
-        input.latency_p50_ns = 20_000_000;
-        input.latency_p99_ns = 150_000_000;
-        let safe_mode_decision = evaluate_swarm_slo_once(&input);
-        assert_eq!(safe_mode_decision.action, SwarmSloAction::ForceSafeMode);
-        assert!(
-            conn.is_concurrent_mode_default(),
-            "shadow policy must not disable concurrent-writer default"
-        );
+                let mut input = healthy_input();
+                input.concurrent_mode_default_observed = conn.is_concurrent_mode_default();
+                input.latency_p50_ns = 20_000_000;
+                input.latency_p99_ns = 150_000_000;
+                let safe_mode_decision = evaluate_swarm_slo_once(&input);
+                assert_eq!(safe_mode_decision.action, SwarmSloAction::ForceSafeMode);
+                assert!(
+                    conn.is_concurrent_mode_default(),
+                    "shadow policy must not disable concurrent-writer default"
+                );
 
-        input.concurrent_mode_default_observed = false;
-        input.latency_p99_ns = 4_000_000;
-        let fail_closed_decision = evaluate_swarm_slo_once(&input);
-        assert_eq!(
-            fail_closed_decision.guardrail_id,
-            "G0_CONCURRENT_DEFAULT_OFF"
-        );
-        assert_eq!(
-            fail_closed_decision.action,
-            SwarmSloAction::ApplyBackpressure
-        );
+                input.concurrent_mode_default_observed = false;
+                input.latency_p99_ns = 4_000_000;
+                let fail_closed_decision = evaluate_swarm_slo_once(&input);
+                assert_eq!(
+                    fail_closed_decision.guardrail_id,
+                    "G0_CONCURRENT_DEFAULT_OFF"
+                );
+                assert_eq!(
+                    fail_closed_decision.action,
+                    SwarmSloAction::ApplyBackpressure
+                );
 
-        Ok(())
+                Ok(())
+            }
+            .await;
+        });
+        outcome
     }
 
     #[test]

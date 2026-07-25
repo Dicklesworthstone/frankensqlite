@@ -2305,14 +2305,12 @@ mod tests {
     fn test_column_text_preserves_embedded_nul_bytes() {
         unsafe {
             let db = open_memory();
-            (*db).conn.execute("CREATE TABLE t(v TEXT)").unwrap();
-            (*db)
-                .conn
-                .execute_with_params(
-                    "INSERT INTO t(v) VALUES (?)",
-                    &[SqliteValue::Text(fsqlite_types::SmallText::from("a\0b"))],
-                )
-                .unwrap();
+            block_on((*db).conn.execute("CREATE TABLE t(v TEXT)")).unwrap();
+            block_on((*db).conn.execute_with_params(
+                "INSERT INTO t(v) VALUES (?)",
+                &[SqliteValue::Text(fsqlite_types::SmallText::from("a\0b"))],
+            ))
+            .unwrap();
 
             let sql = CString::new("SELECT v FROM t;").unwrap();
             let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
@@ -2352,14 +2350,14 @@ mod tests {
                 SQLITE_OK
             }
 
-            let conn = Connection::open(":memory:").unwrap();
-            conn.execute("CREATE TABLE t(v TEXT)").unwrap();
-            conn.execute_with_params(
+            let conn = block_on(Connection::open(":memory:")).unwrap();
+            block_on(conn.execute("CREATE TABLE t(v TEXT)")).unwrap();
+            block_on(conn.execute_with_params(
                 "INSERT INTO t(v) VALUES (?)",
                 &[SqliteValue::Text(fsqlite_types::SmallText::from("a\0b"))],
-            )
+            ))
             .unwrap();
-            let rows = conn.query("SELECT v FROM t").unwrap();
+            let rows = block_on(conn.query("SELECT v FROM t")).unwrap();
             let handle = Sqlite3::new(conn, None);
             let mut captured: Vec<u8> = Vec::new();
 
@@ -2491,8 +2489,8 @@ mod tests {
                 SQLITE_OK
             }
 
-            let conn = Connection::open(":memory:").unwrap();
-            let rows = conn.query("SELECT X'CAFE'").unwrap();
+            let conn = block_on(Connection::open(":memory:")).unwrap();
+            let rows = block_on(conn.query("SELECT X'CAFE'")).unwrap();
             let handle = Sqlite3::new(conn, None);
             let mut captured: Vec<u8> = Vec::new();
 

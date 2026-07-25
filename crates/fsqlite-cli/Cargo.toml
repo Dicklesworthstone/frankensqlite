@@ -26,5 +26,11 @@ serde_json = { workspace = true }
 # itself never builds a runtime).
 asupersync = { workspace = true }
 
+[dev-dependencies]
+# The inline `#[cfg(test)]` module drives the async `run`/`run_with_shell_options`
+# entry points through `asupersync::test_utils::run_test`, which lives behind
+# `test-internals`. The runtime the binary itself builds in `main` is unchanged.
+asupersync = { workspace = true, features = ["test-internals"] }
+
 [lints]
 workspace = true
