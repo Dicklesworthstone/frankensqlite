@@ -70,6 +70,7 @@ use fsqlite_wal::{
     parallel_wal_fallback_reason_name, parallel_wal_mode_name, parallel_wal_shadow_verdict_name,
     parallel_wal_should_shadow_compare, resolve_parallel_wal_control_surface_from_env,
 };
+use futures_lite::future;
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
@@ -6136,12 +6137,8 @@ where
 {
     type Txn = SimpleTransaction<V>;
 
-    fn begin<'a>(
-        &'a self,
-        cx: &'a Cx,
-        mode: TransactionMode,
-    ) -> impl Future<Output = Result<Self::Txn>> + 'a {
-        async move {
+    fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<Self::Txn> {
+        future::block_on(async move {
             let mut maintenance_lease = self.maintenance_gate.enter_transaction()?;
             self.validate_namespace_binding()?;
             let mut inner = self
@@ -6478,7 +6475,7 @@ where
                 retained_memory_overlay_dirty_pages: BTreeSet::new(),
                 scratch_arena: bumpalo::Bump::new(),
             })
-        }
+        })
     }
 
     fn journal_mode(&self) -> JournalMode {
@@ -6493,12 +6490,8 @@ where
         inner.access_mode.is_readonly()
     }
 
-    fn set_journal_mode<'a>(
-        &'a self,
-        cx: &'a Cx,
-        mode: JournalMode,
-    ) -> impl Future<Output = Result<JournalMode>> + 'a {
-        async move {
+    fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
+        future::block_on(async move {
             let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
             self.validate_namespace_binding()?;
             let mut inner = self
@@ -6572,7 +6565,7 @@ where
             );
             drop(inner);
             Ok(mode)
-        }
+        })
     }
 
     fn set_wal_backend(&self, backend: Box<dyn WalBackend>) -> Result<()> {
@@ -6840,29 +6833,33 @@ where
     ///
     /// The VFS implementation determines whether a stable descriptor identity
     /// is available. The pager never re-resolves [`Self::db_path`] here.
-    pub async fn file_identity(&self, cx: &Cx) -> Result<Option<FileIdentity>> {
-        let inner = self
-            .inner
-            .lock()
-            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
-        let db_file = shared_db_file_read(&inner.db_file, cx).await?;
-        db_file.file_identity()
+    pub fn file_identity(&self, cx: &Cx) -> Result<Option<FileIdentity>> {
+        future::block_on(async {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            let db_file = shared_db_file_read(&inner.db_file, cx).await?;
+            db_file.file_identity()
+        })
     }
 
     /// Propagate the connection's busy-timeout to the underlying VFS file so
     /// that `posix_lock` retries with backoff instead of returning BUSY
     /// immediately on cross-process contention.
-    pub async fn set_vfs_busy_timeout_ms(&self, cx: &Cx, ms: u64) {
-        let db_file = self
-            .inner
-            .lock()
-            .ok()
-            .map(|inner| Arc::clone(&inner.db_file));
-        if let Some(db_file) = db_file
-            && let Ok(mut db_file) = shared_db_file_write(&db_file, cx).await
-        {
-            db_file.set_busy_timeout_ms(ms);
-        }
+    pub fn set_vfs_busy_timeout_ms(&self, cx: &Cx, ms: u64) {
+        future::block_on(async {
+            let db_file = self
+                .inner
+                .lock()
+                .ok()
+                .map(|inner| Arc::clone(&inner.db_file));
+            if let Some(db_file) = db_file
+                && let Ok(mut db_file) = shared_db_file_write(&db_file, cx).await
+            {
+                db_file.set_busy_timeout_ms(ms);
+            }
+        });
     }
 
     /// Install a concrete WAL backend while preserving ownership on failure.
@@ -6928,19 +6925,22 @@ where
     /// Inspect a fully-written candidate database image without creating any
     /// SQLite sidecars. Callers should perform semantic validation first, then
     /// retain this receipt for identity/hash verification at publication.
-    pub async fn inspect_database_image(
+    pub fn inspect_database_image(
         &self,
         cx: &Cx,
         image_path: &Path,
     ) -> Result<DatabaseImageReceipt> {
-        let full_path = self.vfs.full_pathname(cx, image_path)?;
-        let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
-        let (mut file, _) = self.vfs.open(cx, Some(&full_path), flags)?;
-        let result = database_image_receipt_for_open_file(cx, &file, Some(self.page_size())).await;
-        let close_result = file.close(cx);
-        let receipt = result?;
-        close_result?;
-        Ok(receipt)
+        future::block_on(async move {
+            let full_path = self.vfs.full_pathname(cx, image_path)?;
+            let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
+            let (mut file, _) = self.vfs.open(cx, Some(&full_path), flags)?;
+            let result =
+                database_image_receipt_for_open_file(cx, &file, Some(self.page_size())).await;
+            let close_result = file.close(cx);
+            let receipt = result?;
+            close_result?;
+            Ok(receipt)
+        })
     }
 
     /// Inspect a private database image and prove that no recovery sidecar is
@@ -6951,14 +6951,14 @@ where
     /// digest closes the window in which a cooperating opener could switch a
     /// nominally complete main file into a WAL- or journal-backed generation
     /// without changing the main-file bytes themselves.
-    pub async fn inspect_self_contained_database_image(
+    pub fn inspect_self_contained_database_image(
         &self,
         cx: &Cx,
         image_path: &Path,
     ) -> Result<DatabaseImageReceipt> {
         let full_path = self.vfs.full_pathname(cx, image_path)?;
         self.ensure_vacuum_candidate_is_self_contained(cx, &full_path)?;
-        let receipt = self.inspect_database_image(cx, &full_path).await?;
+        let receipt = self.inspect_database_image(cx, &full_path)?;
         self.ensure_vacuum_candidate_is_self_contained(cx, &full_path)?;
         Ok(receipt)
     }
@@ -6971,7 +6971,22 @@ where
     /// complete page-1 image, durably syncs it, verifies that every byte outside
     /// offsets 24..28 and 92..96 is unchanged, and returns the final full-image
     /// receipt for later semantic validation and publication CAS.
-    pub async fn restore_vacuum_candidate_change_counter(
+    pub fn restore_vacuum_candidate_change_counter(
+        &self,
+        cx: &Cx,
+        image_path: &Path,
+        provisional: &DatabaseImageReceipt,
+        change_counter: u32,
+    ) -> Result<DatabaseImageReceipt> {
+        future::block_on(self.restore_vacuum_candidate_change_counter_async(
+            cx,
+            image_path,
+            provisional,
+            change_counter,
+        ))
+    }
+
+    async fn restore_vacuum_candidate_change_counter_async(
         &self,
         cx: &Cx,
         image_path: &Path,
@@ -7083,7 +7098,11 @@ where
     /// Capture the exact post-checkpoint source image used to build VACUUM's
     /// candidate. Publication later recomputes this logical digest under the
     /// same exclusive maintenance protocol and aborts if any page changed.
-    pub async fn capture_vacuum_source_image(&self, cx: &Cx) -> Result<DatabaseImageReceipt> {
+    pub fn capture_vacuum_source_image(&self, cx: &Cx) -> Result<DatabaseImageReceipt> {
+        future::block_on(self.capture_vacuum_source_image_async(cx))
+    }
+
+    async fn capture_vacuum_source_image_async(&self, cx: &Cx) -> Result<DatabaseImageReceipt> {
         self.with_exclusive_maintenance(cx, &mut (), |_, cx, inner, _| {
             Box::pin(async move {
                 let db_file = shared_db_file_read(&inner.db_file, cx).await?;
@@ -7119,7 +7138,20 @@ where
     /// recomputed from their original open handles inside the exclusive
     /// maintenance epoch before any durable source byte is changed.
     #[allow(clippy::too_many_lines)]
-    pub async fn publish_validated_database_image(
+    pub fn publish_validated_database_image(
+        &self,
+        cx: &Cx,
+        image_path: &Path,
+        source: &DatabaseImageReceipt,
+        candidate: &DatabaseImageReceipt,
+    ) -> Result<()> {
+        future::block_on(
+            self.publish_validated_database_image_async(cx, image_path, source, candidate),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn publish_validated_database_image_async(
         &self,
         cx: &Cx,
         image_path: &Path,
@@ -7658,7 +7690,11 @@ where
     ///
     /// The pager must be quiescent. In WAL mode we first checkpoint and
     /// truncate the WAL so the returned bytes contain the durable main image.
-    pub async fn export_database_bytes(&self, cx: &Cx) -> Result<Vec<u8>> {
+    pub fn export_database_bytes(&self, cx: &Cx) -> Result<Vec<u8>> {
+        future::block_on(self.export_database_bytes_async(cx))
+    }
+
+    async fn export_database_bytes_async(&self, cx: &Cx) -> Result<Vec<u8>> {
         let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let source_full = self.vfs.full_pathname(cx, &self.db_path)?;
@@ -7675,7 +7711,7 @@ where
         };
 
         if journal_mode == JournalMode::Wal {
-            self.checkpoint(cx, traits::CheckpointMode::Truncate)
+            self.checkpoint_async(cx, traits::CheckpointMode::Truncate)
                 .await?;
         }
 
@@ -7721,7 +7757,11 @@ where
     /// like `VACUUM INTO` and backup/canonicalization flows. The copy is only
     /// allowed when the pager is quiescent. In WAL mode we first checkpoint and
     /// truncate the WAL so the destination contains a self-contained main DB.
-    pub async fn copy_database_to(&self, cx: &Cx, target_path: &Path) -> Result<()> {
+    pub fn copy_database_to(&self, cx: &Cx, target_path: &Path) -> Result<()> {
+        future::block_on(self.copy_database_to_async(cx, target_path))
+    }
+
+    async fn copy_database_to_async(&self, cx: &Cx, target_path: &Path) -> Result<()> {
         let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let source_path = self.db_path.clone();
@@ -7746,7 +7786,7 @@ where
         };
 
         if journal_mode == JournalMode::Wal {
-            self.checkpoint(cx, traits::CheckpointMode::Truncate)
+            self.checkpoint_async(cx, traits::CheckpointMode::Truncate)
                 .await?;
         }
 
@@ -7840,7 +7880,11 @@ where
     /// This is used by upper layers that need a coherent published visibility
     /// snapshot before starting a new transaction or deciding whether a
     /// connection-local execution image is stale.
-    pub async fn refresh_published_snapshot(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
+    pub fn refresh_published_snapshot(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
+        future::block_on(self.refresh_published_snapshot_async(cx))
+    }
+
+    async fn refresh_published_snapshot_async(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
         let mut maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let mut inner = self
@@ -7886,11 +7930,11 @@ where
     /// required cross-process visibility probe; taking the database-file shared
     /// lock and probing the rollback journal only adds work to the hot read
     /// path.
-    pub async fn refresh_published_snapshot_for_clean_wal_read(
+    pub fn refresh_published_snapshot_for_clean_wal_read(
         &self,
         cx: &Cx,
     ) -> Result<PagerPublishedSnapshot> {
-        self.refresh_published_snapshot(cx).await
+        self.refresh_published_snapshot(cx)
     }
 
     /// Number of snapshot retries steady-state readers have taken.
@@ -7988,12 +8032,16 @@ where
     /// on every commit, so under MT-writer workloads it turned each
     /// post-commit poll into a global WAL RwLock write-contention
     /// point.
-    pub async fn wal_frame_count(&self, cx: &Cx) -> usize {
-        with_wal_backend_read(&self.wal_backend, cx, |wal, _| {
-            Box::pin(async move { Ok(wal.frame_count()) })
-        })
-        .await
-        .unwrap_or(0)
+    pub fn wal_frame_count(&self) -> usize {
+        let wal = self
+            .wal_backend
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned());
+        let Some(wal) = wal else {
+            return 0;
+        };
+        wal.try_read().map_or(0, |wal| wal.frame_count())
     }
 
     /// Compute the journal path from the database path.
@@ -8359,7 +8407,26 @@ where
     /// successfully initialized connection.
     #[doc(hidden)]
     #[allow(clippy::too_many_lines)]
-    pub async fn open_for_connection_with_cx_and_page_buffer_max(
+    pub fn open_for_connection_with_cx_and_page_buffer_max(
+        cx: &Cx,
+        vfs: V,
+        path: &Path,
+        requested_page_size: PageSize,
+        page_buffer_max: Option<usize>,
+        mode: ConnectionPagerOpenMode,
+    ) -> Result<Self> {
+        future::block_on(Self::open_for_connection_with_cx_and_page_buffer_max_async(
+            cx,
+            vfs,
+            path,
+            requested_page_size,
+            page_buffer_max,
+            mode,
+        ))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn open_for_connection_with_cx_and_page_buffer_max_async(
         cx: &Cx,
         vfs: V,
         path: &Path,
@@ -8439,13 +8506,13 @@ where
     /// If a hot journal is detected (leftover from a crash), it is replayed
     /// to restore the database to a consistent state before returning.
     #[allow(clippy::too_many_lines)]
-    pub async fn open_with_cx(
+    pub fn open_with_cx(
         cx: &Cx,
         vfs: V,
         path: &Path,
         requested_page_size: PageSize,
     ) -> Result<Self> {
-        Self::open_with_cx_and_page_buffer_max(cx, vfs, path, requested_page_size, None).await
+        Self::open_with_cx_and_page_buffer_max(cx, vfs, path, requested_page_size, None)
     }
 
     /// Like [`open_with_cx`](Self::open_with_cx) but allows overriding the
@@ -8455,14 +8522,14 @@ where
     /// uses that value directly, `None` checks the `FSQLITE_PAGE_BUFFER_MAX`
     /// env var, then falls back to [`crate::DEFAULT_PAGE_BUFFER_MAX`] (262 144).
     #[allow(clippy::too_many_lines)]
-    pub async fn open_with_cx_and_page_buffer_max(
+    pub fn open_with_cx_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
         path: &Path,
         requested_page_size: PageSize,
         page_buffer_max: Option<usize>,
     ) -> Result<Self> {
-        Self::open_readwrite_with_cx_and_page_buffer_max(
+        future::block_on(Self::open_readwrite_with_cx_and_page_buffer_max(
             cx,
             vfs,
             path,
@@ -8473,8 +8540,7 @@ where
                 expected_identity: None,
                 finish_namespace_bootstrap: true,
             },
-        )
-        .await
+        ))
     }
 
     /// Initialize a caller-reserved empty file only if the opened VFS handle
@@ -8485,7 +8551,7 @@ where
     /// pre-existing rollback journal, WAL, WAL-FEC, or shared-memory sidecar.
     /// The identity and sidecar checks precede database initialization, and
     /// this path never performs recovery.
-    pub async fn open_reserved_with_cx_and_page_buffer_max(
+    pub fn open_reserved_with_cx_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
         path: &Path,
@@ -8493,7 +8559,7 @@ where
         expected_identity: FileIdentity,
         page_buffer_max: Option<usize>,
     ) -> Result<Self> {
-        Self::open_readwrite_with_cx_and_page_buffer_max(
+        future::block_on(Self::open_readwrite_with_cx_and_page_buffer_max(
             cx,
             vfs,
             path,
@@ -8504,8 +8570,7 @@ where
                 expected_identity: Some(expected_identity),
                 finish_namespace_bootstrap: true,
             },
-        )
-        .await
+        ))
     }
 
     /// Open an existing database for reading and writing without creating or
@@ -8517,7 +8582,7 @@ where
     /// When `expected_identity` is present, it is compared with the identity
     /// of the already-open VFS handle before any file read or recovery action.
     #[allow(clippy::too_many_lines)]
-    pub async fn open_existing_with_cx_and_page_buffer_max(
+    pub fn open_existing_with_cx_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
         path: &Path,
@@ -8525,7 +8590,7 @@ where
         expected_identity: Option<FileIdentity>,
         page_buffer_max: Option<usize>,
     ) -> Result<Self> {
-        Self::open_readwrite_with_cx_and_page_buffer_max(
+        future::block_on(Self::open_readwrite_with_cx_and_page_buffer_max(
             cx,
             vfs,
             path,
@@ -8536,8 +8601,7 @@ where
                 expected_identity,
                 finish_namespace_bootstrap: true,
             },
-        )
-        .await
+        ))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -9090,14 +9154,13 @@ where
     /// minutes, because it avoids the expensive freelist scan and journal
     /// recovery that the read-write path performs.
     #[allow(clippy::too_many_lines)]
-    pub async fn open_readonly_with_cx(
+    pub fn open_readonly_with_cx(
         cx: &Cx,
         vfs: V,
         path: &Path,
         _requested_page_size: PageSize,
     ) -> Result<Self> {
         Self::open_readonly_with_cx_and_page_buffer_max(cx, vfs, path, _requested_page_size, None)
-            .await
     }
 
     /// Like [`open_readonly_with_cx`](Self::open_readonly_with_cx) but allows
@@ -9105,14 +9168,14 @@ where
     ///
     /// See [`open_with_cx_and_page_buffer_max`](Self::open_with_cx_and_page_buffer_max)
     /// for parameter semantics.
-    pub async fn open_readonly_with_cx_and_page_buffer_max(
+    pub fn open_readonly_with_cx_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
         path: &Path,
         _requested_page_size: PageSize,
         page_buffer_max: Option<usize>,
     ) -> Result<Self> {
-        Self::open_readonly_with_optional_expected_identity(
+        future::block_on(Self::open_readonly_with_optional_expected_identity(
             cx,
             vfs,
             path,
@@ -9120,8 +9183,7 @@ where
             None,
             page_buffer_max,
             true,
-        )
-        .await
+        ))
     }
 
     /// Open an existing database read-only only if its VFS handle has
@@ -9129,7 +9191,7 @@ where
     ///
     /// The identity-bound VFS open occurs before the header or any live-WAL
     /// sidecar is inspected.
-    pub async fn open_readonly_with_expected_identity_and_page_buffer_max(
+    pub fn open_readonly_with_expected_identity_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
         path: &Path,
@@ -9137,7 +9199,7 @@ where
         expected_identity: FileIdentity,
         page_buffer_max: Option<usize>,
     ) -> Result<Self> {
-        Self::open_readonly_with_optional_expected_identity(
+        future::block_on(Self::open_readonly_with_optional_expected_identity(
             cx,
             vfs,
             path,
@@ -9145,8 +9207,7 @@ where
             Some(expected_identity),
             page_buffer_max,
             true,
-        )
-        .await
+        ))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -9400,9 +9461,9 @@ where
     /// Open (or create) a database and return a pager using a detached test context.
     #[cfg(test)]
     #[allow(clippy::too_many_lines)]
-    pub async fn open(vfs: V, path: &Path, page_size: PageSize) -> Result<Self> {
+    pub fn open(vfs: V, path: &Path, page_size: PageSize) -> Result<Self> {
         let cx = Cx::new();
-        Self::open_with_cx(&cx, vfs, path, page_size).await
+        Self::open_with_cx(&cx, vfs, path, page_size)
     }
 
     /// Replay a hot journal by writing original pages back to the database.
@@ -12909,12 +12970,8 @@ where
     V: Vfs + Send,
     V::File: Send + Sync,
 {
-    fn get_page<'a>(
-        &'a self,
-        cx: &'a Cx,
-        page_no: PageNumber,
-    ) -> impl Future<Output = Result<PageData>> + 'a {
-        async move {
+    fn get_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
+        future::block_on(async move {
             if self.contains_freed_page(page_no) {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -13123,7 +13180,7 @@ where
                 .borrow_mut()
                 .insert(page_no, page.clone());
             Ok(page)
-        }
+        })
     }
 
     fn prefetch_page_hint(&self, _cx: &Cx, page_no: PageNumber) {
@@ -13146,13 +13203,8 @@ where
         self.cache.prefetch_page_hint(page_no);
     }
 
-    fn write_page<'a>(
-        &'a mut self,
-        cx: &'a Cx,
-        page_no: PageNumber,
-        data: &'a [u8],
-    ) -> impl Future<Output = Result<()>> + 'a {
-        async move {
+    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        future::block_on(async move {
             self.ensure_writer(cx).await?;
 
             // Fast path: a second (or Nth) write to the same page within the
@@ -13182,16 +13234,11 @@ where
                 staged,
             );
             Ok(())
-        }
+        })
     }
 
-    fn write_page_data<'a>(
-        &'a mut self,
-        cx: &'a Cx,
-        page_no: PageNumber,
-        data: PageData,
-    ) -> impl Future<Output = Result<()>> + 'a {
-        async move {
+    fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
+        future::block_on(async move {
             self.ensure_writer(cx).await?;
 
             // Same-page steal fast path (see `write_page`). If the existing staged
@@ -13228,7 +13275,7 @@ where
                 staged,
             );
             Ok(())
-        }
+        })
     }
 
     fn try_take_staged_page_data(&mut self, page_no: PageNumber) -> Option<PageData> {
@@ -13263,13 +13310,13 @@ where
         true
     }
 
-    fn restore_staged_page_data<'a>(
-        &'a mut self,
-        cx: &'a Cx,
+    fn restore_staged_page_data(
+        &mut self,
+        cx: &Cx,
         page_no: PageNumber,
         data: PageData,
-    ) -> impl Future<Output = Result<()>> + 'a {
-        async move {
+    ) -> Result<()> {
+        future::block_on(async move {
             self.ensure_writer(cx).await?;
             let staged = StagedPage::from_page_data_with_cache_recovery(
                 &self.pool,
@@ -13286,14 +13333,11 @@ where
                 staged,
             );
             Ok(())
-        }
+        })
     }
 
-    fn allocate_page<'a>(
-        &'a mut self,
-        cx: &'a Cx,
-    ) -> impl Future<Output = Result<PageNumber>> + 'a {
-        async move {
+    fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
+        future::block_on(async move {
             self.ensure_writer(cx).await?;
 
             // ── Local lease fast path ──────────────────────────────────────
@@ -13389,15 +13433,11 @@ where
             })?;
             self.allocated_from_eof.push(page);
             Ok(page)
-        }
+        })
     }
 
-    fn free_page<'a>(
-        &'a mut self,
-        cx: &'a Cx,
-        page_no: PageNumber,
-    ) -> impl Future<Output = Result<()>> + 'a {
-        async move {
+    fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+        future::block_on(async move {
             self.ensure_writer(cx).await?;
             if page_no == PageNumber::ONE {
                 return Err(FrankenError::OutOfRange {
@@ -13413,12 +13453,12 @@ where
                 remove_page_sorted(&mut self.write_pages_sorted, page_no);
             }
             Ok(())
-        }
+        })
     }
 
     #[allow(clippy::too_many_lines)]
-    fn commit<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
-        async move {
+    fn commit(&mut self, cx: &Cx) -> Result<()> {
+        future::block_on(async move {
             if self.finished {
                 return Ok(());
             }
@@ -13957,20 +13997,20 @@ where
                 drop(inner);
             }
             commit_result
-        }
+        })
     }
 
-    fn commit_and_retain<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<bool>> + 'a {
-        async move {
+    fn commit_and_retain(&mut self, cx: &Cx) -> Result<bool> {
+        future::block_on(async move {
             // Only supported for in-memory pagers where we can skip I/O.
             if !self.vfs.is_memory() {
-                self.commit(cx).await?;
+                self.commit(cx)?;
                 return Ok(false);
             }
 
             // If not a writer or no pending writes, just commit normally.
             if !self.is_writer || !self.has_pending_writes() {
-                self.commit(cx).await?;
+                self.commit(cx)?;
                 return Ok(false);
             }
 
@@ -14317,7 +14357,7 @@ where
                 commit_result?;
                 unreachable!()
             }
-        }
+        })
     }
 
     fn is_writer(&self) -> bool {
@@ -14432,8 +14472,8 @@ where
         Ok(self.write_page_requires_page_one_conflict_tracking_with_inner(&inner, page_no))
     }
 
-    fn rollback<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
-        async move {
+    fn rollback(&mut self, cx: &Cx) -> Result<()> {
+        future::block_on(async move {
             if self.finished {
                 return Ok(());
             }
@@ -14552,7 +14592,7 @@ where
             // carry across transaction boundaries.
             self.scratch_arena.reset();
             Ok(())
-        }
+        })
     }
 
     fn record_write_witness(&mut self, _cx: &Cx, _key: fsqlite_types::WitnessKey) {}
@@ -14703,10 +14743,11 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
             return;
         }
         let mut notify_writer_idle = false;
-        // Drop is the last synchronous fail-safe after a caller abandons a
-        // transaction. A hot journal stays marked pending for the pager's next
-        // explicit async recovery epoch; Drop only restores in-memory state and
-        // releases the already-held snapshot lock without blocking an executor.
+        // Drop is the last fail-safe after a caller abandons a failed commit.
+        // Keep recovery and lock release alive even if that caller's context
+        // was cancelled while the journal was hot. The pager-facing contract
+        // is deliberately synchronous until the B-tree/VDBE async migration
+        // lands atomically, so Drop must not defer recovery to a later epoch.
         let cleanup_cx = self.cleanup_cx.clone();
         let _cleanup_mask = cleanup_cx.masked();
         let recovery_was_pending = self
@@ -14718,13 +14759,31 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
                     && inner.rollback_journal_recovery_state.is_pending()
             })
             .unwrap_or(false);
-        if recovery_was_pending {
-            tracing::warn!(
-                "drop left a pending rollback journal for the pager's next recovery epoch"
-            );
-        }
+        let restored_from_journal = if recovery_was_pending {
+            match future::block_on(self.recover_pending_rollback_journal(&cleanup_cx)) {
+                Ok(restored) => restored,
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "drop-time recovery could not finish the pending rollback journal"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
         if let Ok(mut inner) = self.inner.lock() {
-            if recovery_was_pending {
+            if restored_from_journal {
+                // The refreshed durable freelist is authoritative; transaction
+                // allocations belong to the discarded candidate image.
+                self.allocated_from_freelist.clear();
+                self.allocated_from_eof.clear();
+                self.page_lease.clear();
+                if self.mode != TransactionMode::Concurrent {
+                    notify_writer_idle = release_single_writer_baton(&mut inner);
+                }
+            } else if recovery_was_pending {
                 // Never merge transaction-local allocation state into an
                 // image whose recovery failed. Keep Pending set so every
                 // subsequent begin retries or fails closed.
@@ -15072,7 +15131,15 @@ where
     /// to `FULL` so we never reset or truncate WAL based on incomplete reader
     /// visibility. For incremental, reader-aware checkpointing, use the
     /// lower-level WAL backend API.
-    pub async fn checkpoint(
+    pub fn checkpoint(
+        &self,
+        cx: &Cx,
+        mode: traits::CheckpointMode,
+    ) -> Result<traits::CheckpointResult> {
+        future::block_on(self.checkpoint_async(cx, mode))
+    }
+
+    async fn checkpoint_async(
         &self,
         cx: &Cx,
         mode: traits::CheckpointMode,

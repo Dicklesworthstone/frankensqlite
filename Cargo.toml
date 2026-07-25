@@ -178,6 +178,7 @@ rusqlite = { version = "0.40.1", features = ["bundled", "backup"] }
 # can build FrankenSQLite without a private `/dp/asupersync` checkout; local
 # asupersync development belongs in an uncommitted Cargo patch/config override.
 asupersync = { version = "0.3.9", default-features = false }
+futures-lite = "2.6.1"
 
 # Dev dependencies
 criterion = { version = "0.7", features = ["html_reports"] }

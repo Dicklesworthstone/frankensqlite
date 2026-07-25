@@ -29,6 +29,7 @@ mod pragma_maintenance;
 
 use conformal_retry::{ConformalRetryBudget, ConformalRetryBudgetCell};
 
+use futures_lite::future;
 use hashbrown::HashMap as HbHashMap;
 use lru::LruCache;
 use std::borrow::Cow;
@@ -2390,15 +2391,15 @@ impl PagerBackend {
     }
 
     /// Propagate busy-timeout to the VFS file for cross-process lock retry.
-    pub fn set_vfs_busy_timeout_ms(&self, ms: u64) {
+    pub fn set_vfs_busy_timeout_ms(&self, cx: &Cx, ms: u64) {
         match self {
-            Self::Memory(p) => p.set_vfs_busy_timeout_ms(ms),
+            Self::Memory(p) => p.set_vfs_busy_timeout_ms(cx, ms),
             #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(p) => p.set_vfs_busy_timeout_ms(ms),
+            Self::IoUring(p) => p.set_vfs_busy_timeout_ms(cx, ms),
             #[cfg(all(feature = "native", unix))]
-            Self::Unix(p) => p.set_vfs_busy_timeout_ms(ms),
+            Self::Unix(p) => p.set_vfs_busy_timeout_ms(cx, ms),
             #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(p) => p.set_vfs_busy_timeout_ms(ms),
+            Self::Windows(p) => p.set_vfs_busy_timeout_ms(cx, ms),
         }
     }
 
@@ -2624,15 +2625,15 @@ impl PagerBackend {
     }
 
     /// Return the identity of the already-open main database file.
-    pub fn file_identity(&self) -> Result<Option<FileIdentity>> {
+    pub fn file_identity(&self, cx: &Cx) -> Result<Option<FileIdentity>> {
         match self {
-            Self::Memory(p) => p.file_identity(),
+            Self::Memory(p) => p.file_identity(cx),
             #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(p) => p.file_identity(),
+            Self::IoUring(p) => p.file_identity(cx),
             #[cfg(all(feature = "native", unix))]
-            Self::Unix(p) => p.file_identity(),
+            Self::Unix(p) => p.file_identity(cx),
             #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(p) => p.file_identity(),
+            Self::Windows(p) => p.file_identity(cx),
         }
     }
 
@@ -3301,7 +3302,7 @@ where
 /// header stays a hard error and is left to [`WalFile::open`].
 fn wal_sidecar_treated_as_empty<F: VfsFile>(cx: &Cx, file: &F) -> Result<bool> {
     let mut header_buf = [0_u8; fsqlite_wal::WAL_HEADER_SIZE];
-    let bytes_read = file.read(cx, &mut header_buf, 0)?;
+    let bytes_read = future::block_on(file.read(cx, &mut header_buf, 0))?;
     if bytes_read < header_buf.len() {
         return Ok(true);
     }
@@ -3337,7 +3338,7 @@ where
                 );
                 let _ = file.close(cx);
             } else {
-                match WalFile::open(cx, file) {
+                match future::block_on(WalFile::open(cx, file)) {
                     Ok(wal) => {
                         return install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true);
                     }
@@ -3353,7 +3354,13 @@ where
     let (file, _) = vfs.open(cx, Some(wal_path), create_flags)?;
     // Random salts (GH #201): a fresh WAL generation must not validate
     // frames from any stale or copied WAL of a previous generation.
-    let wal = WalFile::create(cx, file, pager.page_size().get(), 0, WalSalts::generate())?;
+    let wal = future::block_on(WalFile::create(
+        cx,
+        file,
+        pager.page_size().get(),
+        0,
+        WalSalts::generate(),
+    ))?;
     install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true)
 }
 
@@ -3409,7 +3416,7 @@ where
         return Ok(false);
     }
 
-    let wal = WalFile::open(cx, file)?;
+    let wal = future::block_on(WalFile::open(cx, file))?;
     if allow_readonly {
         install_opened_wal_backend_bare(pager, cx, wal)?;
     } else {
@@ -9850,7 +9857,7 @@ impl Connection {
         };
         {
             let ms = conn.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
-            conn.pager.set_vfs_busy_timeout_ms(ms);
+            conn.pager.set_vfs_busy_timeout_ms(&conn.root_cx, ms);
         }
         conn.register_cache_pages_module();
         conn.bootstrap_journal_mode_from_storage(false)?;
@@ -10042,7 +10049,7 @@ impl Connection {
         let db_path = vfs.full_pathname(&bootstrap_cx, Path::new("/:memory:"))?;
         let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
         let (mut db_file, _) = vfs.open(&bootstrap_cx, Some(&db_path), flags)?;
-        db_file.write(&bootstrap_cx, bytes, 0)?;
+        future::block_on(db_file.write(&bootstrap_cx, bytes, 0))?;
         db_file.sync(&bootstrap_cx, fsqlite_types::flags::SyncFlags::NORMAL)?;
         db_file.close(&bootstrap_cx)?;
         let mut pager = SimplePager::open_with_cx_and_page_buffer_max(
@@ -10281,7 +10288,7 @@ impl Connection {
         };
         {
             let ms = conn.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
-            conn.pager.set_vfs_busy_timeout_ms(ms);
+            conn.pager.set_vfs_busy_timeout_ms(&conn.root_cx, ms);
         }
         conn.register_cache_pages_module();
         conn.bootstrap_journal_mode_from_storage(storage_was_empty)?;
@@ -10321,7 +10328,8 @@ impl Connection {
         if matches!(&self.pager, PagerBackend::Memory(_)) {
             return Ok(None);
         }
-        self.pager.file_identity()
+        let cx = self.op_cx()?;
+        self.pager.file_identity(&cx)
     }
 
     fn attach_connection_pool_metrics(&self) {
@@ -49357,7 +49365,8 @@ impl Connection {
                     // Propagate busy_timeout to the VFS file so posix_lock
                     // retries with backoff on cross-process lock contention.
                     let ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
-                    self.pager.set_vfs_busy_timeout_ms(ms);
+                    let cx = self.op_cx()?;
+                    self.pager.set_vfs_busy_timeout_ms(&cx, ms);
                 }
                 _ => {}
             }

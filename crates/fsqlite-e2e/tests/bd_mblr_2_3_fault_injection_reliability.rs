@@ -266,46 +266,58 @@ impl<F: VfsFile> VfsFile for TargetedFaultFile<F> {
         self.inner.close(cx)
     }
 
-    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        let fault = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(mut spec) = state.next_partial_read.take() {
-                if spec.skip_matches == 0 {
-                    state.triggered_partial_reads += 1;
-                    state.last_partial_read_detail = Some(format!(
-                        "offset={offset} requested={} valid_bytes={}",
-                        buf.len(),
-                        spec.valid_bytes
-                    ));
-                    Some(spec)
+    fn read<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+        async move {
+            let fault = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(mut spec) = state.next_partial_read.take() {
+                    if spec.skip_matches == 0 {
+                        state.triggered_partial_reads += 1;
+                        state.last_partial_read_detail = Some(format!(
+                            "offset={offset} requested={} valid_bytes={}",
+                            buf.len(),
+                            spec.valid_bytes
+                        ));
+                        Some(spec)
+                    } else {
+                        spec.skip_matches -= 1;
+                        state.next_partial_read = Some(spec);
+                        None
+                    }
                 } else {
-                    spec.skip_matches -= 1;
-                    state.next_partial_read = Some(spec);
                     None
                 }
-            } else {
-                None
-            }
-        };
+            };
 
-        if let Some(spec) = fault {
-            let requested = spec.valid_bytes.min(buf.len());
-            let mut scratch = vec![0_u8; requested];
-            let actual = self.inner.read(cx, &mut scratch, offset)?;
-            buf.fill(0);
-            if actual > 0 {
-                buf[..actual].copy_from_slice(&scratch[..actual]);
+            if let Some(spec) = fault {
+                let requested = spec.valid_bytes.min(buf.len());
+                let mut scratch = vec![0_u8; requested];
+                let actual = self.inner.read(cx, &mut scratch, offset).await?;
+                buf.fill(0);
+                if actual > 0 {
+                    buf[..actual].copy_from_slice(&scratch[..actual]);
+                }
+                Ok(actual)
+            } else {
+                self.inner.read(cx, buf, offset).await
             }
-            Ok(actual)
-        } else {
-            self.inner.read(cx, buf, offset)
         }
     }
 
-    fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+    fn write<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
         self.inner.write(cx, buf, offset)
     }
 
@@ -713,6 +725,10 @@ struct VacuumFaultVfs<V: Vfs> {
 #[cfg(unix)]
 impl<V: Vfs> VacuumFaultVfs<V> {
     fn new(inner: V, source_path: PathBuf, candidate_path: PathBuf) -> Self {
+        let source_path =
+            std::fs::canonicalize(source_path).expect("canonicalize VACUUM source path");
+        let candidate_path =
+            std::fs::canonicalize(candidate_path).expect("canonicalize VACUUM candidate path");
         let journal_path = journal_path_for(&source_path);
         Self {
             inner,
@@ -1009,52 +1025,66 @@ impl<F: VfsFile> VfsFile for VacuumFaultFile<F> {
         self.inner.file_identity()
     }
 
-    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+    fn read<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
         self.inner.read(cx, buf, offset)
     }
 
-    fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        match take_silent_replay_write_action(&self.state, self.role) {
-            Some(SilentReplayWriteAction::TriggerRollback) => {
-                self.inner.write(cx, buf, offset)?;
+    fn write<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            match take_silent_replay_write_action(&self.state, self.role) {
+                Some(SilentReplayWriteAction::TriggerRollback) => {
+                    self.inner.write(cx, buf, offset).await?;
+                    return Err(vacuum_injected_error(
+                        "trigger-rollback-before-silent-replay-corruption",
+                    ));
+                }
+                Some(SilentReplayWriteAction::CorruptSilently) => {
+                    let mut corrupted = buf.to_vec();
+                    let byte = corrupted.last_mut().ok_or_else(|| {
+                        FrankenError::internal("silent replay corruption received an empty write")
+                    })?;
+                    // Keep the SQLite header parseable so a fresh pager can reach
+                    // hot-journal recovery; corrupt only restored payload bytes.
+                    *byte ^= 0x5a;
+                    return self.inner.write(cx, &corrupted, offset).await;
+                }
+                None => {}
+            }
+            if let Some(parent_cx) =
+                take_parent_to_cancel_after_source_write(&self.state, self.role)
+            {
+                // Apply one complete target-page write first, then cancel the
+                // caller and force the publisher down its hot-journal replay path.
+                // The replay must use its independently masked cleanup context;
+                // returning before the old image is restored would make the test's
+                // byte and live-peer assertions fail immediately.
+                self.inner.write(cx, buf, offset).await?;
+                parent_cx.cancel();
                 return Err(vacuum_injected_error(
-                    "trigger-rollback-before-silent-replay-corruption",
+                    "source-first-write-parent-cancellation",
                 ));
             }
-            Some(SilentReplayWriteAction::CorruptSilently) => {
-                let mut corrupted = buf.to_vec();
-                let byte = corrupted.last_mut().ok_or_else(|| {
-                    FrankenError::internal("silent replay corruption received an empty write")
-                })?;
-                // Keep the SQLite header parseable so a fresh pager can reach
-                // hot-journal recovery; corrupt only restored payload bytes.
-                *byte ^= 0x5a;
-                return self.inner.write(cx, &corrupted, offset);
-            }
-            None => {}
-        }
-        if let Some(parent_cx) = take_parent_to_cancel_after_source_write(&self.state, self.role) {
-            // Apply one complete target-page write first, then cancel the
-            // caller and force the publisher down its hot-journal replay path.
-            // The replay must use its independently masked cleanup context;
-            // returning before the old image is restored would make the test's
-            // byte and live-peer assertions fail immediately.
-            self.inner.write(cx, buf, offset)?;
-            parent_cx.cancel();
-            return Err(vacuum_injected_error(
-                "source-first-write-parent-cancellation",
-            ));
-        }
-        match take_vacuum_fault(&self.state, self.role, VacuumFaultOperation::Write) {
-            Some((VacuumFaultEffect::ReturnError, label)) => Err(vacuum_injected_error(label)),
-            Some((VacuumFaultEffect::PartialWrite { valid_bytes }, label)) => {
-                let applied = valid_bytes.min(buf.len());
-                if applied > 0 {
-                    self.inner.write(cx, &buf[..applied], offset)?;
+            match take_vacuum_fault(&self.state, self.role, VacuumFaultOperation::Write) {
+                Some((VacuumFaultEffect::ReturnError, label)) => Err(vacuum_injected_error(label)),
+                Some((VacuumFaultEffect::PartialWrite { valid_bytes }, label)) => {
+                    let applied = valid_bytes.min(buf.len());
+                    if applied > 0 {
+                        self.inner.write(cx, &buf[..applied], offset).await?;
+                    }
+                    Err(vacuum_injected_error(label))
                 }
-                Err(vacuum_injected_error(label))
+                None => self.inner.write(cx, buf, offset).await,
             }
-            None => self.inner.write(cx, buf, offset),
         }
     }
 
@@ -1428,15 +1458,19 @@ fn vacuum_publication_precommit_fault_matrix_restores_exact_source_and_retries()
         let source_identity = fixture.source_receipt.identity();
         vfs.arm(spec);
 
-        let error = fixture
-            .pager
-            .publish_validated_database_image(
-                &fixture.cx,
-                &fixture.candidate_path,
-                &fixture.source_receipt,
-                &fixture.candidate_receipt,
-            )
-            .expect_err("pre-commit injected fault must fail publication");
+        let publication = fixture.pager.publish_validated_database_image(
+            &fixture.cx,
+            &fixture.candidate_path,
+            &fixture.source_receipt,
+            &fixture.candidate_receipt,
+        );
+        let error = match publication {
+            Err(error) => error,
+            Ok(()) => panic!(
+                "pre-commit injected fault must fail publication: spec={spec:?}, snapshot={:?}",
+                vfs.snapshot()
+            ),
+        };
         assert!(
             error.to_string().contains(spec.label),
             "{}: injected diagnostic was lost: {error}",
@@ -1454,7 +1488,10 @@ fn vacuum_publication_precommit_fault_matrix_restores_exact_source_and_retries()
             spec.label
         );
         assert_eq!(
-            fixture.pager.file_identity().expect("source identity"),
+            fixture
+                .pager
+                .file_identity(&fixture.cx)
+                .expect("source identity"),
             Some(source_identity),
             "{}: failed publication replaced the source inode",
             spec.label
@@ -1554,12 +1591,15 @@ fn vacuum_publication_parent_cancellation_after_first_target_write_restores_befo
         fixture.source_bytes,
         "publisher returned before restoring the exact old source image"
     );
+    let verification_cx = Cx::new();
     assert_eq!(
-        fixture.pager.file_identity().expect("source identity"),
+        fixture
+            .pager
+            .file_identity(&verification_cx)
+            .expect("source identity"),
         Some(source_identity),
         "cancelled publication replaced the source inode"
     );
-    let verification_cx = Cx::new();
     let restored_receipt = fixture
         .pager
         .capture_vacuum_source_image(&verification_cx)
@@ -1811,7 +1851,10 @@ fn vacuum_publication_postcommit_cleanup_faults_preserve_committed_candidate_and
             spec.label
         );
         assert_eq!(
-            fixture.pager.file_identity().expect("source identity"),
+            fixture
+                .pager
+                .file_identity(&fixture.cx)
+                .expect("source identity"),
             Some(source_identity),
             "{}: publication replaced the source inode",
             spec.label

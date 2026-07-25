@@ -13,6 +13,7 @@ use fsqlite_error::FrankenError;
 use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
 use fsqlite_types::{Cx, LockLevel};
 use fsqlite_vfs::traits::{SyncKind, Vfs, VfsFile};
+use futures_lite::future;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -664,7 +665,7 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         let (mut file, _) = self.vfs.open(self.cx, Some(&self.history_path), flags)?;
         let header = self.expectations.header()?.encode_slot();
         let result: Result<(), FrankenError> = (|| {
-            file.write(self.cx, &header, 0)?;
+            future::block_on(file.write(self.cx, &header, 0))?;
             file.durable_sync(self.cx, SyncKind::FullDurable)?;
             self.vfs
                 .sync_parent_directory(self.cx, &self.history_path)?;
@@ -743,7 +744,11 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
                     .ok_or_else(|| {
                         HistoryError::InvalidInput("record count overflow".to_owned())
                     })?;
-                file.write(self.cx, &record.encode_slot(), record_offset(index)?)?;
+                future::block_on(file.write(
+                    self.cx,
+                    &record.encode_slot(),
+                    record_offset(index)?,
+                ))?;
                 appended.push(record);
                 previous = Some(record);
             }
@@ -1387,9 +1392,9 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
                 bytes
             };
             file.truncate(self.cx, 0)?;
-            file.write(self.cx, &unpublished, 0)?;
+            future::block_on(file.write(self.cx, &unpublished, 0))?;
             file.durable_sync(self.cx, SyncKind::FullDurable)?;
-            file.write(self.cx, &bytes[..HISTORY_SLOT_SIZE], 0)?;
+            future::block_on(file.write(self.cx, &bytes[..HISTORY_SLOT_SIZE], 0))?;
             file.durable_sync(self.cx, SyncKind::FullDurable)?;
             if !exists {
                 self.vfs.sync_parent_directory(self.cx, &self.index_path)?;
@@ -1801,7 +1806,7 @@ fn read_exact_at<F: VfsFile>(
     buffer: &mut [u8],
     offset: u64,
 ) -> Result<(), HistoryError> {
-    let read = file.read(cx, buffer, offset)?;
+    let read = future::block_on(file.read(cx, buffer, offset))?;
     if read != buffer.len() {
         return Err(HistoryError::Storage(FrankenError::ShortRead {
             expected: buffer.len(),
