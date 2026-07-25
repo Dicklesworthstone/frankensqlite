@@ -54,21 +54,22 @@ fn classify_rusqlite(r: rusqlite::Result<usize>) -> Outcome {
 }
 
 /// (frankensqlite, rusqlite) pair with `parent`/`child` schema and FK on.
-fn setup_pair(child_ddl: &str) -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").unwrap();
+async fn setup_pair(child_ddl: &str) -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
-    f.execute("PRAGMA foreign_keys=ON;").unwrap();
+    f.execute("PRAGMA foreign_keys=ON;").await.unwrap();
     r.execute("PRAGMA foreign_keys=ON;", []).unwrap();
     let parent_ddl = "CREATE TABLE parent (id INTEGER PRIMARY KEY);";
-    f.execute(parent_ddl).unwrap();
+    f.execute(parent_ddl).await.unwrap();
     r.execute(parent_ddl, []).unwrap();
-    f.execute(child_ddl).unwrap();
+    f.execute(child_ddl).await.unwrap();
     r.execute(child_ddl, []).unwrap();
     (f, r)
 }
 
-fn franken_table_dump(conn: &Connection, sql: &str) -> Vec<Vec<SqliteValue>> {
+async fn franken_table_dump(conn: &Connection, sql: &str) -> Vec<Vec<SqliteValue>> {
     conn.query(sql)
+        .await
         .unwrap()
         .iter()
         .map(|row| row.values().to_vec())
@@ -105,7 +106,7 @@ fn rusqlite_table_dump(
 /// Run a sequence of (sql, expected-row-changed-or-error) inserts on both
 /// engines and assert the normalized outcomes match step-by-step, then assert
 /// the final table contents match. `select_sql` and `ncols` describe the dump.
-fn assert_parity(
+async fn assert_parity(
     child_ddl: &str,
     seed: &[&str],
     cases: &[&str],
@@ -113,16 +114,16 @@ fn assert_parity(
     ncols: usize,
     label: &str,
 ) {
-    let (f, r) = setup_pair(child_ddl);
+    let (f, r) = setup_pair(child_ddl).await;
     // Seed (must succeed on both).
-    f.execute("BEGIN;").unwrap();
+    f.execute("BEGIN;").await.unwrap();
     r.execute("BEGIN;", []).unwrap();
     for s in seed {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute(s, []).unwrap();
     }
     for (i, sql) in cases.iter().enumerate() {
-        let fo = classify_franken(f.execute(sql));
+        let fo = classify_franken(f.execute(sql).await);
         let ro = classify_rusqlite(r.execute(sql, []));
         assert_eq!(
             fo, ro,
@@ -132,13 +133,13 @@ fn assert_parity(
     // After potentially-erroring statements, both engines remain in the txn
     // (immediate FK / PK errors do not auto-rollback the whole txn in SQLite;
     // they abort only the offending statement). Compare table contents.
-    let fd = franken_table_dump(&f, select_sql);
+    let fd = franken_table_dump(&f, select_sql).await;
     let rd = rusqlite_table_dump(&r, select_sql, ncols);
     assert_eq!(
         fd, rd,
         "[{label}] final table contents diverged: frankensqlite={fd:?} vs rusqlite={rd:?}"
     );
-    f.execute("COMMIT;").unwrap();
+    f.execute("COMMIT;").await.unwrap();
     r.execute("COMMIT;", []).unwrap();
 }
 
@@ -148,6 +149,7 @@ const SELECT_CHILD: &str = "SELECT id, parent_id FROM child ORDER BY id;";
 
 #[test]
 fn fk_explicit_rowid_plain_valid_and_bad() {
+    asupersync::test_utils::run_test(|| async {
     assert_parity(
         CHILD_FK,
         &[
@@ -162,13 +164,16 @@ fn fk_explicit_rowid_plain_valid_and_bad() {
         SELECT_CHILD,
         2,
         "explicit_plain",
-    );
+    )
+    .await;
+    });
 }
 
 #[test]
 fn fk_explicit_rowid_dup_pk_plain_pk_wins_over_fk() {
     // Plain INSERT with a dup PK AND a bad FK must raise PK/UNIQUE (PK first),
     // never FK.
+    asupersync::test_utils::run_test(|| async {
     assert_parity(
         CHILD_FK,
         &[
@@ -179,13 +184,16 @@ fn fk_explicit_rowid_dup_pk_plain_pk_wins_over_fk() {
         SELECT_CHILD,
         2,
         "explicit_dup_pk_plain",
-    );
+    )
+    .await;
+    });
 }
 
 #[test]
 fn fk_or_ignore_dup_pk_drops_no_fk() {
     // OR IGNORE on a dup PK drops the row (0 changed), and must NOT raise FK
     // even though the dropped row had a bad FK value.
+    asupersync::test_utils::run_test(|| async {
     assert_parity(
         CHILD_FK,
         &[
@@ -196,13 +204,16 @@ fn fk_or_ignore_dup_pk_drops_no_fk() {
         SELECT_CHILD,
         2,
         "or_ignore_dup_pk",
-    );
+    )
+    .await;
+    });
 }
 
 #[test]
 fn fk_or_ignore_new_pk_bad_fk_still_raises() {
     // OR IGNORE does NOT suppress an immediate FK violation when there is no
     // PK conflict.
+    asupersync::test_utils::run_test(|| async {
     assert_parity(
         CHILD_FK,
         &["INSERT INTO parent VALUES (1);"],
@@ -210,13 +221,16 @@ fn fk_or_ignore_new_pk_bad_fk_still_raises() {
         SELECT_CHILD,
         2,
         "or_ignore_new_pk_bad_fk",
-    );
+    )
+    .await;
+    });
 }
 
 #[test]
 fn fk_or_replace_dup_pk_bad_fk_raises_fk() {
     // OR REPLACE replaces the conflicting row, but the replacement row's FK is
     // still enforced -> FK violation.
+    asupersync::test_utils::run_test(|| async {
     assert_parity(
         CHILD_FK,
         &[
@@ -227,11 +241,14 @@ fn fk_or_replace_dup_pk_bad_fk_raises_fk() {
         SELECT_CHILD,
         2,
         "or_replace_dup_pk_bad_fk",
-    );
+    )
+    .await;
+    });
 }
 
 #[test]
 fn fk_or_replace_dup_pk_valid_fk_replaces() {
+    asupersync::test_utils::run_test(|| async {
     assert_parity(
         CHILD_FK,
         &[
@@ -243,11 +260,14 @@ fn fk_or_replace_dup_pk_valid_fk_replaces() {
         SELECT_CHILD,
         2,
         "or_replace_dup_pk_valid",
-    );
+    )
+    .await;
+    });
 }
 
 #[test]
 fn fk_or_abort_fail_dup_pk_pk_wins() {
+    asupersync::test_utils::run_test(|| async {
     for clause in ["OR ABORT", "OR FAIL"] {
         let case = format!("INSERT {clause} INTO child VALUES (5, 99);");
         assert_parity(
@@ -260,12 +280,15 @@ fn fk_or_abort_fail_dup_pk_pk_wins() {
             SELECT_CHILD,
             2,
             "or_abort_fail_dup_pk",
-        );
+        )
+        .await;
     }
+    });
 }
 
 #[test]
 fn fk_implicit_rowid_regression() {
+    asupersync::test_utils::run_test(|| async {
     // Implicit-rowid child (id is NOT the IPK alias used for the FK). FK is on
     // parent_id. Auto-assigned rowid never conflicts. Guards the pre-existing
     // implicit-rowid behavior.
@@ -282,17 +305,20 @@ fn fk_implicit_rowid_regression() {
         select,
         2,
         "implicit_rowid",
-    );
+    )
+    .await;
+    });
 }
 
 #[test]
 fn fk_self_reference_explicit_rowid() {
+    asupersync::test_utils::run_test(|| async {
     // Self-referential FK: child.parent_id REFERENCES child.id. Post-insert FK
     // must see the just-inserted (and earlier in-flight) rows.
     let child =
         "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES child(id));";
-    let (f, r) = setup_pair(child); // parent table unused but harmless
-    f.execute("BEGIN;").unwrap();
+    let (f, r) = setup_pair(child).await; // parent table unused but harmless
+    f.execute("BEGIN;").await.unwrap();
     r.execute("BEGIN;", []).unwrap();
     let cases: &[&str] = &[
         "INSERT INTO child VALUES (1, NULL);", // root, Ok(1)
@@ -301,20 +327,22 @@ fn fk_self_reference_explicit_rowid() {
         "INSERT INTO child VALUES (4, 99);",   // references missing id -> FkViolation
     ];
     for (i, sql) in cases.iter().enumerate() {
-        let fo = classify_franken(f.execute(sql));
+        let fo = classify_franken(f.execute(sql).await);
         let ro = classify_rusqlite(r.execute(sql, []));
         assert_eq!(fo, ro, "[self_ref] case #{i} `{sql}`: {fo:?} vs {ro:?}");
     }
-    let fd = franken_table_dump(&f, "SELECT id, parent_id FROM child ORDER BY id;");
+    let fd = franken_table_dump(&f, "SELECT id, parent_id FROM child ORDER BY id;").await;
     let rd = rusqlite_table_dump(&r, "SELECT id, parent_id FROM child ORDER BY id;", 2);
     assert_eq!(
         fd, rd,
         "[self_ref] final contents diverged: {fd:?} vs {rd:?}"
     );
+    });
 }
 
 #[test]
 fn fk_null_fk_column_satisfied() {
+    asupersync::test_utils::run_test(|| async {
     assert_parity(
         CHILD_FK,
         &["INSERT INTO parent VALUES (1);"],
@@ -322,11 +350,14 @@ fn fk_null_fk_column_satisfied() {
         SELECT_CHILD,
         2,
         "null_fk",
-    );
+    )
+    .await;
+    });
 }
 
 #[test]
 fn fk_multi_fk_one_bad() {
+    asupersync::test_utils::run_test(|| async {
     let child = "CREATE TABLE child (id INTEGER PRIMARY KEY, p1 INTEGER REFERENCES parent(id), p2 INTEGER REFERENCES parent(id));";
     let select = "SELECT id, p1, p2 FROM child ORDER BY id;";
     assert_parity(
@@ -342,23 +373,26 @@ fn fk_multi_fk_one_bad() {
         select,
         3,
         "multi_fk",
-    );
+    )
+    .await;
+    });
 }
 
 #[test]
 fn fk_autocommit_single_inserts() {
+    asupersync::test_utils::run_test(|| async {
     // Same matrix but in autocommit (no explicit BEGIN). Each statement is its
     // own transaction; a failed FK insert rolls back its own statement.
-    let f = Connection::open(":memory:").unwrap();
+    let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
-    f.execute("PRAGMA foreign_keys=ON;").unwrap();
+    f.execute("PRAGMA foreign_keys=ON;").await.unwrap();
     r.execute("PRAGMA foreign_keys=ON;", []).unwrap();
     for ddl in [
         "CREATE TABLE parent (id INTEGER PRIMARY KEY);",
         CHILD_FK,
         "INSERT INTO parent VALUES (1);",
     ] {
-        f.execute(ddl).unwrap();
+        f.execute(ddl).await.unwrap();
         r.execute(ddl, []).unwrap();
     }
     for sql in [
@@ -367,11 +401,12 @@ fn fk_autocommit_single_inserts() {
         "INSERT OR IGNORE INTO child VALUES (1, 99);", // dup PK -> ignored
         "INSERT INTO child VALUES (3, 1);",            // Ok
     ] {
-        let fo = classify_franken(f.execute(sql));
+        let fo = classify_franken(f.execute(sql).await);
         let ro = classify_rusqlite(r.execute(sql, []));
         assert_eq!(fo, ro, "[autocommit] `{sql}`: {fo:?} vs {ro:?}");
     }
-    let fd = franken_table_dump(&f, SELECT_CHILD);
+    let fd = franken_table_dump(&f, SELECT_CHILD).await;
     let rd = rusqlite_table_dump(&r, SELECT_CHILD, 2);
     assert_eq!(fd, rd, "[autocommit] final contents: {fd:?} vs {rd:?}");
+    });
 }

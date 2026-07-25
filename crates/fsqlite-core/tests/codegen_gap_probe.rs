@@ -14,15 +14,22 @@
 
 use fsqlite_core::connection::Connection;
 
-fn frank_run(setup: &[&str], sql: &str, is_query: bool) -> Result<(), String> {
-    let conn = Connection::open(":memory:").map_err(|e| format!("open: {e}"))?;
+async fn frank_run(setup: &[&str], sql: &str, is_query: bool) -> Result<(), String> {
+    let conn = Connection::open(":memory:")
+        .await
+        .map_err(|e| format!("open: {e}"))?;
     for s in setup {
-        conn.execute(s).map_err(|e| format!("setup `{s}`: {e}"))?;
+        conn.execute(s)
+            .await
+            .map_err(|e| format!("setup `{s}`: {e}"))?;
     }
     if is_query {
-        conn.query(sql).map(|_| ()).map_err(|e| e.to_string())
+        conn.query(sql).await.map(|_| ()).map_err(|e| e.to_string())
     } else {
-        conn.execute(sql).map(|_| ()).map_err(|e| e.to_string())
+        conn.execute(sql)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -50,8 +57,8 @@ fn sqlite_run(setup: &[&str], sql: &str, is_query: bool) -> Result<(), String> {
     }
 }
 
-fn classify(label: &str, setup: &[&str], sql: &str, is_query: bool) {
-    let f = frank_run(setup, sql, is_query);
+async fn classify(label: &str, setup: &[&str], sql: &str, is_query: bool) {
+    let f = frank_run(setup, sql, is_query).await;
     let s = sqlite_run(setup, sql, is_query);
     match (&f, &s) {
         (Err(fe), Ok(())) => println!("GAP   {label}: {sql}\n        frank => {fe}"),
@@ -70,6 +77,7 @@ fn classify(label: &str, setup: &[&str], sql: &str, is_query: bool) {
 #[test]
 #[ignore = "diagnostic triage harness; run with --ignored --nocapture"]
 fn codegen_gap_probe() {
+    asupersync::test_utils::run_test(|| async {
     let t = &[
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT)",
         "INSERT INTO t VALUES (1,10,100,'x'),(2,20,200,'y'),(3,30,300,'z')",
@@ -87,19 +95,22 @@ fn codegen_gap_probe() {
         t,
         "UPDATE t SET (a, b) = (99, 999) WHERE id = 1",
         false,
-    );
+    )
+    .await;
     classify(
         "update_multicol_set_subquery",
         ts,
         "UPDATE t SET (v) = (SELECT max(v) FROM src) WHERE id = 1",
         false,
-    );
+    )
+    .await;
     classify(
         "update_multicol_set_rowvalue_subquery",
         ts,
         "UPDATE t SET (v) = (SELECT v FROM src WHERE src.id = t.id) WHERE id = 2",
         false,
-    );
+    )
+    .await;
 
     // ---- UPDATE ... FROM — SQLite 3.33+ ----
     classify(
@@ -107,13 +118,15 @@ fn codegen_gap_probe() {
         ts,
         "UPDATE t SET v = s.v FROM (SELECT id, v FROM src) s WHERE t.id = s.id",
         false,
-    );
+    )
+    .await;
     classify(
         "update_from_join",
         ts,
         "UPDATE t SET v = src.w FROM src JOIN (SELECT 1 AS k) k ON 1=1 WHERE t.id = src.id",
         false,
-    );
+    )
+    .await;
 
     // ---- UPDATE / DELETE with ORDER BY / LIMIT ----
     // (Whether rusqlite accepts depends on SQLITE_ENABLE_UPDATE_DELETE_LIMIT;
@@ -123,25 +136,29 @@ fn codegen_gap_probe() {
         t,
         "DELETE FROM t WHERE a > 0 LIMIT 1",
         false,
-    );
+    )
+    .await;
     classify(
         "delete_order_by_limit",
         t,
         "DELETE FROM t ORDER BY id LIMIT 1",
         false,
-    );
+    )
+    .await;
     classify(
         "update_limit",
         t,
         "UPDATE t SET a = a + 1 WHERE b > 0 LIMIT 1",
         false,
-    );
+    )
+    .await;
     classify(
         "update_order_by_limit",
         t,
         "UPDATE t SET a = a + 1 ORDER BY id LIMIT 1",
         false,
-    );
+    )
+    .await;
 
     // ---- CREATE TABLE complex DEFAULT expressions ----
     classify(
@@ -149,13 +166,15 @@ fn codegen_gap_probe() {
         &[],
         "CREATE TABLE x (a INTEGER DEFAULT (abs(-5)))",
         false,
-    );
+    )
+    .await;
     classify(
         "create_default_arith",
         &[],
         "CREATE TABLE x (a INTEGER DEFAULT (2 + 3 * 4))",
         false,
-    );
+    )
+    .await;
 
     // ---- assorted constructs that may or may not fall back ----
     classify(
@@ -163,19 +182,22 @@ fn codegen_gap_probe() {
         &["CREATE TABLE x (a INTEGER DEFAULT 7, b TEXT DEFAULT 'q')"],
         "INSERT INTO x DEFAULT VALUES",
         false,
-    );
+    )
+    .await;
     classify(
         "update_set_from_self_join",
         ts,
         "UPDATE t SET v = (SELECT w FROM src WHERE src.id = t.id)",
         false,
-    );
+    )
+    .await;
     classify(
         "delete_using_subselect_limit",
         t,
         "DELETE FROM t WHERE id IN (SELECT id FROM t ORDER BY a DESC LIMIT 1)",
         false,
-    );
+    )
+    .await;
 
     // ---- second batch: more UPDATE / INSERT variants ----
     // aliased UPDATE target (SQLite 3.33+)
@@ -184,21 +206,24 @@ fn codegen_gap_probe() {
         t,
         "UPDATE t AS x SET a = 1 WHERE x.id = 1",
         false,
-    );
+    )
+    .await;
     // UPDATE ... FROM with table alias
     classify(
         "update_from_table_alias",
         ts,
         "UPDATE t SET v = s.v FROM src AS s WHERE t.id = s.id",
         false,
-    );
+    )
+    .await;
     // UPDATE ... FROM comma-joined multiple tables
     classify(
         "update_from_comma_tables",
         ts,
         "UPDATE t SET v = src.v FROM src, (SELECT 1) WHERE t.id = src.id",
         false,
-    );
+    )
+    .await;
     // multi-target (2-col) row-value SET from correlated subquery
     classify(
         "update_multicol2_subquery",
@@ -210,7 +235,8 @@ fn codegen_gap_probe() {
         ],
         "UPDATE t SET (a, b) = (SELECT a, b FROM src WHERE src.id = t.id)",
         false,
-    );
+    )
+    .await;
     // INSERT ... SELECT with ORDER BY / LIMIT
     classify(
         "insert_select_order_limit",
@@ -221,7 +247,8 @@ fn codegen_gap_probe() {
         ],
         "INSERT INTO dst SELECT id, v FROM src ORDER BY v DESC LIMIT 2",
         false,
-    );
+    )
+    .await;
     // INSERT ... SELECT compound (UNION)
     classify(
         "insert_select_union",
@@ -234,7 +261,8 @@ fn codegen_gap_probe() {
         ],
         "INSERT INTO dst SELECT x FROM a UNION SELECT x FROM b",
         false,
-    );
+    )
+    .await;
     // UPSERT targeting a non-PK unique index with DO UPDATE
     classify(
         "upsert_do_update_unique",
@@ -244,21 +272,25 @@ fn codegen_gap_probe() {
         ],
         "INSERT INTO t (id,k,n) VALUES (2,'a',5) ON CONFLICT(k) DO UPDATE SET n = n + excluded.n",
         false,
-    );
+    )
+    .await;
     // RETURNING on UPDATE (SQLite 3.35+)
     classify(
         "update_returning",
         t,
         "UPDATE t SET a = a + 1 WHERE id = 1 RETURNING id, a",
         true,
-    );
+    )
+    .await;
     // RETURNING on DELETE
     classify(
         "delete_returning",
         t,
         "DELETE FROM t WHERE id = 1 RETURNING id, a",
         true,
-    );
+    )
+    .await;
+    });
 }
 
 // Second diagnostic harness: broader SELECT / aggregate / window / compound /
@@ -268,6 +300,7 @@ fn codegen_gap_probe() {
 #[test]
 #[ignore = "diagnostic triage harness; run with --ignored --nocapture"]
 fn codegen_gap_probe_select_window_aggregate() {
+    asupersync::test_utils::run_test(|| async {
     let t = &[
         "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
         "INSERT INTO t VALUES (1,1,10),(2,1,20),(3,2,30),(4,2,40),(5,2,50)",
@@ -279,13 +312,15 @@ fn codegen_gap_probe_select_window_aggregate() {
         t,
         "SELECT g, count(*) FILTER (WHERE v > 20) AS c FROM t GROUP BY g ORDER BY g",
         true,
-    );
+    )
+    .await;
     classify(
         "agg_filter_sum",
         t,
         "SELECT sum(v) FILTER (WHERE v < 40) AS s FROM t",
         true,
-    );
+    )
+    .await;
 
     // ---- window frame variants ----
     classify(
@@ -293,40 +328,46 @@ fn codegen_gap_probe_select_window_aggregate() {
         t,
         "SELECT v, sum(v) OVER (ORDER BY v RANGE BETWEEN 15 PRECEDING AND 15 FOLLOWING) FROM t ORDER BY v",
         true,
-    );
+    )
+    .await;
     classify(
         "window_groups_frame",
         t,
         "SELECT v, sum(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY v",
         true,
-    );
+    )
+    .await;
     classify(
         "window_exclude_current",
         t,
         "SELECT v, sum(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM t ORDER BY v",
         true,
-    );
+    )
+    .await;
     classify(
         "window_named_window_clause",
         t,
         "SELECT v, row_number() OVER w FROM t WINDOW w AS (ORDER BY v) ORDER BY v",
         true,
-    );
+    )
+    .await;
     classify(
         "window_filter_on_window_agg",
         t,
         "SELECT v, sum(v) FILTER (WHERE v > 15) OVER (ORDER BY v) FROM t ORDER BY v",
         true,
-    );
+    )
+    .await;
 
     // ---- VALUES as a relation / top-level ----
-    classify("values_top_level", &[], "VALUES (1, 2), (3, 4)", true);
+    classify("values_top_level", &[], "VALUES (1, 2), (3, 4)", true).await;
     classify(
         "select_from_values",
         &[],
         "SELECT column1, column2 FROM (VALUES (1, 'a'), (2, 'b')) ORDER BY column1",
         true,
-    );
+    )
+    .await;
 
     // ---- compound SELECT edges ----
     classify(
@@ -334,13 +375,15 @@ fn codegen_gap_probe_select_window_aggregate() {
         t,
         "SELECT v FROM t UNION SELECT v + 1000 FROM t ORDER BY 1 DESC LIMIT 3",
         true,
-    );
+    )
+    .await;
     classify(
         "compound_limit_on_values",
         &[],
         "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT 2",
         true,
-    );
+    )
+    .await;
 
     // ---- correlated scalar subquery in projection ----
     classify(
@@ -348,7 +391,8 @@ fn codegen_gap_probe_select_window_aggregate() {
         t,
         "SELECT id, (SELECT count(*) FROM t t2 WHERE t2.g = t.g) AS gc FROM t ORDER BY id",
         true,
-    );
+    )
+    .await;
 
     // ---- DISTINCT aggregate + GROUP BY HAVING ----
     classify(
@@ -356,7 +400,8 @@ fn codegen_gap_probe_select_window_aggregate() {
         t,
         "SELECT g, count(DISTINCT v) AS d FROM t GROUP BY g HAVING count(DISTINCT v) > 1 ORDER BY g",
         true,
-    );
+    )
+    .await;
 
     // ---- json table-valued + scalar ----
     classify(
@@ -364,7 +409,8 @@ fn codegen_gap_probe_select_window_aggregate() {
         &[],
         "SELECT value FROM json_each('[10,20,30]') ORDER BY value",
         true,
-    );
+    )
+    .await;
 
     // ---- SELECT with LIMIT and OFFSET expression ----
     classify(
@@ -372,5 +418,7 @@ fn codegen_gap_probe_select_window_aggregate() {
         t,
         "SELECT v FROM t ORDER BY v LIMIT 2 + 1 OFFSET 1",
         true,
-    );
+    )
+    .await;
+    });
 }

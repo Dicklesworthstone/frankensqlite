@@ -18,8 +18,9 @@ use fsqlite_core::connection::{Connection, WriteMergeMode};
 
 /// Deterministic workload: N serial `BEGIN CONCURRENT` transactions on
 /// disjoint keys. Returns `SUM(v) FROM kv`.
-fn run_pivot_free_workload(conn: &Connection, commits: usize) -> i64 {
+async fn run_pivot_free_workload(conn: &Connection, commits: usize) -> i64 {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS kv (k INTEGER PRIMARY KEY, v INTEGER);")
+        .await
         .unwrap();
     for i in 0..commits {
         let k = i + 1;
@@ -27,10 +28,14 @@ fn run_pivot_free_workload(conn: &Connection, commits: usize) -> i64 {
         conn.execute_batch(&format!(
             "BEGIN CONCURRENT; INSERT OR REPLACE INTO kv(k, v) VALUES ({k}, {v}); COMMIT;"
         ))
+        .await
         .unwrap();
     }
-    let stmt = conn.prepare("SELECT COALESCE(SUM(v), 0) FROM kv").unwrap();
-    let row = stmt.query_row().unwrap();
+    let stmt = conn
+        .prepare("SELECT COALESCE(SUM(v), 0) FROM kv")
+        .await
+        .unwrap();
+    let row = stmt.query_row().await.unwrap();
     match &row.values()[0] {
         fsqlite_types::SqliteValue::Integer(n) => *n,
         other => panic!("expected integer sum, got {other:?}"),
@@ -43,13 +48,14 @@ fn run_pivot_free_workload(conn: &Connection, commits: usize) -> i64 {
 /// SAFE-mode run.
 #[test]
 fn lab_unsafe_wired_commit_path_opens_gate_and_matches_safe() {
+    asupersync::test_utils::run_test(|| async {
     let commits = 512;
 
     // SAFE baseline.
     let safe_sum = {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open(":memory:").await.unwrap();
         assert_eq!(conn.write_merge_mode(), WriteMergeMode::Safe);
-        let sum = run_pivot_free_workload(&conn, commits);
+        let sum = run_pivot_free_workload(&conn, commits).await;
         // Under SAFE, the gate must never open regardless of outcomes
         // auto-fed by the commit path.
         let snap = conn.ssi_e_process_snapshot();
@@ -62,14 +68,15 @@ fn lab_unsafe_wired_commit_path_opens_gate_and_matches_safe() {
 
     // LAB_UNSAFE: rely on the wired commit path to feed observations.
     let (lab_sum, lab_snap) = {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open(":memory:").await.unwrap();
         conn.execute_batch(
             "PRAGMA fsqlite.write_merge = LAB_UNSAFE;
              PRAGMA fsqlite.ssi_e_process_alpha = 0.001;",
         )
+        .await
         .unwrap();
         assert_eq!(conn.write_merge_mode(), WriteMergeMode::LabUnsafe);
-        let sum = run_pivot_free_workload(&conn, commits);
+        let sum = run_pivot_free_workload(&conn, commits).await;
         (sum, conn.ssi_e_process_snapshot())
     };
 
@@ -97,6 +104,7 @@ fn lab_unsafe_wired_commit_path_opens_gate_and_matches_safe() {
         lab_snap.skip_consultations > 0,
         "LAB_UNSAFE commit path must consult the gate; snap={lab_snap}"
     );
+    });
 }
 
 /// Adversarial workload: two transactions whose write sets overlap on
@@ -105,13 +113,15 @@ fn lab_unsafe_wired_commit_path_opens_gate_and_matches_safe() {
 /// an SSI pivot), but the gate must still keep functioning.
 #[test]
 fn lab_unsafe_fcw_conflict_does_not_trip_gate() {
-    let conn = Connection::open(":memory:").unwrap();
+    asupersync::test_utils::run_test(|| async {
+    let conn = Connection::open(":memory:").await.unwrap();
     conn.execute_batch(
         "PRAGMA fsqlite.write_merge = LAB_UNSAFE;
          PRAGMA fsqlite.ssi_e_process_alpha = 0.001;
          CREATE TABLE kv (k INTEGER PRIMARY KEY, v INTEGER);
          INSERT INTO kv(k, v) VALUES (1, 10);",
     )
+    .await
     .unwrap();
 
     // Prime with a long clean history so the gate would be eligible to
@@ -125,6 +135,7 @@ fn lab_unsafe_fcw_conflict_does_not_trip_gate() {
         conn.execute_batch(&format!(
             "BEGIN CONCURRENT; INSERT INTO kv(k, v) VALUES ({i}, {i}); COMMIT;"
         ))
+        .await
         .unwrap();
     }
 
@@ -163,6 +174,7 @@ fn lab_unsafe_fcw_conflict_does_not_trip_gate() {
         snap_before_conflict.observations,
         snap_after.observations
     );
+    });
 }
 
 /// Feeding a synthetic conflict observation stream via the Rust API
@@ -172,11 +184,13 @@ fn lab_unsafe_fcw_conflict_does_not_trip_gate() {
 /// the observation was sourced.
 #[test]
 fn synthetic_conflict_stream_traps_gate_in_alert_and_disables_skip() {
-    let conn = Connection::open(":memory:").unwrap();
+    asupersync::test_utils::run_test(|| async {
+    let conn = Connection::open(":memory:").await.unwrap();
     conn.execute_batch(
         "PRAGMA fsqlite.write_merge = LAB_UNSAFE;
          PRAGMA fsqlite.ssi_e_process_alpha = 0.001;",
     )
+    .await
     .unwrap();
 
     // Pad to `min_observations`.
@@ -204,11 +218,13 @@ fn synthetic_conflict_stream_traps_gate_in_alert_and_disables_skip() {
     }
     // And the wired commit path must still execute fine under Alert.
     conn.execute_batch("CREATE TABLE adv (k INTEGER PRIMARY KEY);")
+        .await
         .unwrap();
     for i in 0..16 {
         conn.execute_batch(&format!(
             "BEGIN CONCURRENT; INSERT INTO adv(k) VALUES ({i}); COMMIT;"
         ))
+        .await
         .unwrap();
     }
     let after = conn.ssi_e_process_snapshot();
@@ -216,4 +232,5 @@ fn synthetic_conflict_stream_traps_gate_in_alert_and_disables_skip() {
         after.skip_grants, snap.skip_grants,
         "no skips may be granted while in Alert; before={snap} after={after}"
     );
+    });
 }

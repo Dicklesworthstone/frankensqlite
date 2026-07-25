@@ -46,7 +46,7 @@ fn only_row_values<'a>(rows: &'a [Row], context: &str) -> TestResult<&'a [Sqlite
         .ok_or_else(|| contract_error(format!("{context} returned no rows")))
 }
 
-fn install_range_schema(conn: &Connection) -> TestResult {
+async fn install_range_schema(conn: &Connection) -> TestResult {
     conn.execute(
         "CREATE TABLE fsqlite_worker_range_reason_codes_contract(
             reason_code TEXT NOT NULL PRIMARY KEY,
@@ -54,7 +54,8 @@ fn install_range_schema(conn: &Connection) -> TestResult {
             retryable INTEGER NOT NULL,
             operator_hint TEXT NOT NULL
         );",
-    )?;
+    )
+    .await?;
     conn.execute(
         "CREATE TABLE fsqlite_worker_ranges_contract(
             range_name TEXT NOT NULL,
@@ -79,7 +80,8 @@ fn install_range_schema(conn: &Connection) -> TestResult {
             last_reason_code TEXT,
             PRIMARY KEY(range_name, range_id)
         );",
-    )?;
+    )
+    .await?;
     conn.execute(
         "CREATE INDEX idx_fsqlite_worker_ranges_contract_allocator
             ON fsqlite_worker_ranges_contract(
@@ -89,19 +91,21 @@ fn install_range_schema(conn: &Connection) -> TestResult {
                 state,
                 range_start
             );",
-    )?;
+    )
+    .await?;
     conn.execute(
         "CREATE TABLE fsqlite_worker_range_conflict_samples_contract(
             strategy TEXT NOT NULL,
             worker_id TEXT NOT NULL,
             page_number INTEGER NOT NULL
         );",
-    )?;
-    seed_range_reason_codes(conn)?;
+    )
+    .await?;
+    seed_range_reason_codes(conn).await?;
     Ok(())
 }
 
-fn seed_range_reason_codes(conn: &Connection) -> TestResult {
+async fn seed_range_reason_codes(conn: &Connection) -> TestResult {
     conn.execute(
         "INSERT INTO fsqlite_worker_range_reason_codes_contract(
             reason_code,
@@ -118,11 +122,12 @@ fn seed_range_reason_codes(conn: &Connection) -> TestResult {
             ('range_generation_conflict', 'warning', 1, 'retry after reading current generation'),
             ('range_invalid_state', 'error', 0, 'requested range transition is illegal'),
             ('range_enforced_unsupported', 'notice', 0, 'initial implementation is advisory');",
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
-fn seed_range(conn: &Connection, spec: RangeSpec<'_>) -> TestResult {
+async fn seed_range(conn: &Connection, spec: RangeSpec<'_>) -> TestResult {
     conn.execute(&format!(
         "INSERT INTO fsqlite_worker_ranges_contract(
             range_name,
@@ -175,7 +180,8 @@ fn seed_range(conn: &Connection, spec: RangeSpec<'_>) -> TestResult {
         split_parent = sql_optional_text(spec.split_parent),
         page_start = spec.page_start,
         page_end = spec.page_end
-    ))?;
+    ))
+    .await?;
     Ok(())
 }
 
@@ -367,7 +373,7 @@ fn insert_available_range_sql(spec: RangeSpec<'_>) -> String {
     )
 }
 
-fn record_conflict_sample(
+async fn record_conflict_sample(
     conn: &Connection,
     strategy: &str,
     worker_id: &str,
@@ -385,17 +391,20 @@ fn record_conflict_sample(
         );",
         strategy = sql_text(strategy),
         worker_id = sql_text(worker_id)
-    ))?;
+    ))
+    .await?;
     Ok(())
 }
 
-fn modeled_same_page_conflicts(conn: &Connection, strategy: &str) -> TestResult<i64> {
-    let rows = conn.query(&format!(
-        "SELECT worker_id, page_number
+async fn modeled_same_page_conflicts(conn: &Connection, strategy: &str) -> TestResult<i64> {
+    let rows = conn
+        .query(&format!(
+            "SELECT worker_id, page_number
            FROM fsqlite_worker_range_conflict_samples_contract
           WHERE strategy = {strategy};",
-        strategy = sql_text(strategy)
-    ))?;
+            strategy = sql_text(strategy)
+        ))
+        .await?;
     let mut pages = BTreeSet::new();
     for row in &rows {
         match row.values() {
@@ -436,530 +445,610 @@ fn trace_range_event(
 
 #[test]
 fn range_reason_codes_and_introspection_fields_are_stable() -> TestResult {
-    let conn = Connection::open(":memory:")?;
-    assert!(
-        conn.is_concurrent_mode_default(),
-        "worker range coordination contract must not disable concurrent-writer mode"
-    );
-    install_range_schema(&conn)?;
-    seed_range(
-        &conn,
-        RangeSpec {
-            range_id: "range-a",
-            start_key: 0,
-            end_key: 1_000,
-            page_start: 0,
-            page_end: 3,
-            split_parent: None,
-        },
-    )?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let conn = Connection::open(":memory:").await?;
+            assert!(
+                conn.is_concurrent_mode_default(),
+                "worker range coordination contract must not disable concurrent-writer mode"
+            );
+            install_range_schema(&conn).await?;
+            seed_range(
+                &conn,
+                RangeSpec {
+                    range_id: "range-a",
+                    start_key: 0,
+                    end_key: 1_000,
+                    page_start: 0,
+                    page_end: 3,
+                    split_parent: None,
+                },
+            )
+            .await?;
 
-    let codes = conn.query(
-        "SELECT reason_code, severity, retryable, operator_hint
+            let codes = conn
+                .query(
+                    "SELECT reason_code, severity, retryable, operator_hint
            FROM fsqlite_worker_range_reason_codes_contract
           ORDER BY reason_code;",
-    )?;
-    assert_eq!(codes.len(), 9);
-    assert_eq!(
-        only_row_values(
-            &conn.query(
-                "SELECT reason_code, severity, retryable, operator_hint
+                )
+                .await?;
+            assert_eq!(codes.len(), 9);
+            assert_eq!(
+                only_row_values(
+                    &conn
+                        .query(
+                            "SELECT reason_code, severity, retryable, operator_hint
                    FROM fsqlite_worker_range_reason_codes_contract
                   WHERE reason_code = 'range_overlap';",
-            )?,
-            "range_overlap reason code",
-        )?,
-        &[
-            SqliteValue::Text("range_overlap".into()),
-            SqliteValue::Text("warning".into()),
-            SqliteValue::Integer(1),
-            SqliteValue::Text("choose disjoint key bounds".into()),
-        ]
-    );
+                        )
+                        .await?,
+                    "range_overlap reason code",
+                )?,
+                &[
+                    SqliteValue::Text("range_overlap".into()),
+                    SqliteValue::Text("warning".into()),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("choose disjoint key bounds".into()),
+                ]
+            );
 
-    let introspection = conn.query(
-        "SELECT range_name, range_id, table_name, index_name, range_start,
+            let introspection = conn
+                .query(
+                    "SELECT range_name, range_id, table_name, index_name, range_start,
                 range_end, owner_id, mode, state, predicted_page_start,
                 predicted_page_end, observed_conflict_count, imbalance_reason,
                 last_reason_code
            FROM fsqlite_worker_ranges_contract
           WHERE range_name = 'bulk'
           ORDER BY table_name, index_name, range_start;",
-    )?;
-    assert_eq!(
-        only_row_values(&introspection, "worker range introspection")?,
-        &[
-            SqliteValue::Text(RANGE_NAME.into()),
-            SqliteValue::Text("range-a".into()),
-            SqliteValue::Text(TABLE_NAME.into()),
-            SqliteValue::Null,
-            SqliteValue::Text(encoded_key(0).into()),
-            SqliteValue::Text(encoded_key(1_000).into()),
-            SqliteValue::Null,
-            SqliteValue::Text("advisory".into()),
-            SqliteValue::Text("available".into()),
-            SqliteValue::Integer(0),
-            SqliteValue::Integer(3),
-            SqliteValue::Integer(0),
-            SqliteValue::Text("balanced".into()),
-            SqliteValue::Text("ok".into()),
-        ],
-        "introspection must expose stable range, planner, and diagnostic fields"
-    );
+                )
+                .await?;
+            assert_eq!(
+                only_row_values(&introspection, "worker range introspection")?,
+                &[
+                    SqliteValue::Text(RANGE_NAME.into()),
+                    SqliteValue::Text("range-a".into()),
+                    SqliteValue::Text(TABLE_NAME.into()),
+                    SqliteValue::Null,
+                    SqliteValue::Text(encoded_key(0).into()),
+                    SqliteValue::Text(encoded_key(1_000).into()),
+                    SqliteValue::Null,
+                    SqliteValue::Text("advisory".into()),
+                    SqliteValue::Text("available".into()),
+                    SqliteValue::Integer(0),
+                    SqliteValue::Integer(3),
+                    SqliteValue::Integer(0),
+                    SqliteValue::Text("balanced".into()),
+                    SqliteValue::Text("ok".into()),
+                ],
+                "introspection must expose stable range, planner, and diagnostic fields"
+            );
 
-    Ok(())
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn range_allocate_renew_release_and_exhausted_paths_are_deterministic() -> TestResult {
-    let conn = Connection::open(":memory:")?;
-    assert!(
-        conn.is_concurrent_mode_default(),
-        "worker range coordination contract must not disable concurrent-writer mode"
-    );
-    install_range_schema(&conn)?;
-    for spec in [
-        RangeSpec {
-            range_id: "range-a",
-            start_key: 0,
-            end_key: 500,
-            page_start: 0,
-            page_end: 1,
-            split_parent: None,
-        },
-        RangeSpec {
-            range_id: "range-b",
-            start_key: 500,
-            end_key: 1_000,
-            page_start: 2,
-            page_end: 3,
-            split_parent: None,
-        },
-    ] {
-        seed_range(&conn, spec)?;
-    }
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let conn = Connection::open(":memory:").await?;
+            assert!(
+                conn.is_concurrent_mode_default(),
+                "worker range coordination contract must not disable concurrent-writer mode"
+            );
+            install_range_schema(&conn).await?;
+            for spec in [
+                RangeSpec {
+                    range_id: "range-a",
+                    start_key: 0,
+                    end_key: 500,
+                    page_start: 0,
+                    page_end: 1,
+                    split_parent: None,
+                },
+                RangeSpec {
+                    range_id: "range-b",
+                    start_key: 500,
+                    end_key: 1_000,
+                    page_start: 2,
+                    page_end: 3,
+                    split_parent: None,
+                },
+            ] {
+                seed_range(&conn, spec).await?;
+            }
 
-    let allocated = conn.query(&allocate_sql("worker-a", "token-a", 100, 1_000))?;
-    trace_range_event("allocate", "range-a", "worker-a", "ok", "balanced");
-    assert_eq!(
-        only_row_values(&allocated, "first worker range allocation")?,
-        &[
-            SqliteValue::Text("range-a".into()),
-            SqliteValue::Text("worker-a".into()),
-            SqliteValue::Text("token-a".into()),
-            SqliteValue::Integer(2),
-            SqliteValue::Text(encoded_key(0).into()),
-            SqliteValue::Text(encoded_key(500).into()),
-            SqliteValue::Integer(0),
-            SqliteValue::Integer(1),
-            SqliteValue::Text("ok".into()),
-        ]
-    );
+            let allocated = conn
+                .query(&allocate_sql("worker-a", "token-a", 100, 1_000))
+                .await?;
+            trace_range_event("allocate", "range-a", "worker-a", "ok", "balanced");
+            assert_eq!(
+                only_row_values(&allocated, "first worker range allocation")?,
+                &[
+                    SqliteValue::Text("range-a".into()),
+                    SqliteValue::Text("worker-a".into()),
+                    SqliteValue::Text("token-a".into()),
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text(encoded_key(0).into()),
+                    SqliteValue::Text(encoded_key(500).into()),
+                    SqliteValue::Integer(0),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("ok".into()),
+                ]
+            );
 
-    let stale_renew = conn.query(&renew_sql("range-a", "worker-a", "token-a", 1, 200, 1_000))?;
-    assert!(
-        stale_renew.is_empty(),
-        "range renew must require the current generation"
-    );
+            let stale_renew = conn
+                .query(&renew_sql("range-a", "worker-a", "token-a", 1, 200, 1_000))
+                .await?;
+            assert!(
+                stale_renew.is_empty(),
+                "range renew must require the current generation"
+            );
 
-    let renewed = conn.query(&renew_sql("range-a", "worker-a", "token-a", 2, 300, 1_200))?;
-    trace_range_event("renew", "range-a", "worker-a", "ok", "balanced");
-    assert_eq!(
-        only_row_values(&renewed, "range renewal")?,
-        &[
-            SqliteValue::Text("range-a".into()),
-            SqliteValue::Text("worker-a".into()),
-            SqliteValue::Integer(2),
-            SqliteValue::Integer(1_500),
-            SqliteValue::Integer(300),
-            SqliteValue::Text("ok".into()),
-        ]
-    );
+            let renewed = conn
+                .query(&renew_sql("range-a", "worker-a", "token-a", 2, 300, 1_200))
+                .await?;
+            trace_range_event("renew", "range-a", "worker-a", "ok", "balanced");
+            assert_eq!(
+                only_row_values(&renewed, "range renewal")?,
+                &[
+                    SqliteValue::Text("range-a".into()),
+                    SqliteValue::Text("worker-a".into()),
+                    SqliteValue::Integer(2),
+                    SqliteValue::Integer(1_500),
+                    SqliteValue::Integer(300),
+                    SqliteValue::Text("ok".into()),
+                ]
+            );
 
-    let wrong_owner_release = conn.query(&release_sql("range-a", "worker-b", 2, 400))?;
-    assert!(
-        wrong_owner_release.is_empty(),
-        "range release must require the current owner and generation"
-    );
+            let wrong_owner_release = conn
+                .query(&release_sql("range-a", "worker-b", 2, 400))
+                .await?;
+            assert!(
+                wrong_owner_release.is_empty(),
+                "range release must require the current owner and generation"
+            );
 
-    let released = conn.query(&release_sql("range-a", "worker-a", 2, 500))?;
-    trace_range_event("release", "range-a", "worker-a", "ok", "balanced");
-    assert_eq!(
-        only_row_values(&released, "range release")?,
-        &[
-            SqliteValue::Text("range-a".into()),
-            SqliteValue::Text("released".into()),
-            SqliteValue::Integer(2),
-            SqliteValue::Text("ok".into()),
-        ]
-    );
+            let released = conn
+                .query(&release_sql("range-a", "worker-a", 2, 500))
+                .await?;
+            trace_range_event("release", "range-a", "worker-a", "ok", "balanced");
+            assert_eq!(
+                only_row_values(&released, "range release")?,
+                &[
+                    SqliteValue::Text("range-a".into()),
+                    SqliteValue::Text("released".into()),
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("ok".into()),
+                ]
+            );
 
-    let reassigned = conn.query(&allocate_sql("worker-b", "token-b", 600, 1_000))?;
-    trace_range_event("allocate", "range-a", "worker-b", "ok", "balanced");
-    assert_eq!(
-        only_row_values(&reassigned, "released range reassignment")?,
-        &[
-            SqliteValue::Text("range-a".into()),
-            SqliteValue::Text("worker-b".into()),
-            SqliteValue::Text("token-b".into()),
-            SqliteValue::Integer(3),
-            SqliteValue::Text(encoded_key(0).into()),
-            SqliteValue::Text(encoded_key(500).into()),
-            SqliteValue::Integer(0),
-            SqliteValue::Integer(1),
-            SqliteValue::Text("ok".into()),
-        ]
-    );
+            let reassigned = conn
+                .query(&allocate_sql("worker-b", "token-b", 600, 1_000))
+                .await?;
+            trace_range_event("allocate", "range-a", "worker-b", "ok", "balanced");
+            assert_eq!(
+                only_row_values(&reassigned, "released range reassignment")?,
+                &[
+                    SqliteValue::Text("range-a".into()),
+                    SqliteValue::Text("worker-b".into()),
+                    SqliteValue::Text("token-b".into()),
+                    SqliteValue::Integer(3),
+                    SqliteValue::Text(encoded_key(0).into()),
+                    SqliteValue::Text(encoded_key(500).into()),
+                    SqliteValue::Integer(0),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("ok".into()),
+                ]
+            );
 
-    let second_assignment = conn.query(&allocate_sql("worker-c", "token-c", 700, 1_000))?;
-    trace_range_event("allocate", "range-b", "worker-c", "ok", "balanced");
-    assert_eq!(second_assignment.len(), 1);
+            let second_assignment = conn
+                .query(&allocate_sql("worker-c", "token-c", 700, 1_000))
+                .await?;
+            trace_range_event("allocate", "range-b", "worker-c", "ok", "balanced");
+            assert_eq!(second_assignment.len(), 1);
 
-    let exhausted = conn.query(&allocate_sql("worker-d", "token-d", 800, 1_000))?;
-    trace_range_event(
-        "allocate",
-        "none",
-        "worker-d",
-        "range_exhausted",
-        "split_or_release_required",
-    );
-    assert!(
-        exhausted.is_empty(),
-        "exhausted allocator must return no ownership row"
-    );
+            let exhausted = conn
+                .query(&allocate_sql("worker-d", "token-d", 800, 1_000))
+                .await?;
+            trace_range_event(
+                "allocate",
+                "none",
+                "worker-d",
+                "range_exhausted",
+                "split_or_release_required",
+            );
+            assert!(
+                exhausted.is_empty(),
+                "exhausted allocator must return no ownership row"
+            );
 
-    Ok(())
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn range_overlap_invalid_bounds_split_and_merge_are_enforced() -> TestResult {
-    let conn = Connection::open(":memory:")?;
-    assert!(
-        conn.is_concurrent_mode_default(),
-        "worker range coordination contract must not disable concurrent-writer mode"
-    );
-    install_range_schema(&conn)?;
-    seed_range(
-        &conn,
-        RangeSpec {
-            range_id: "range-parent",
-            start_key: 0,
-            end_key: 1_000,
-            page_start: 0,
-            page_end: 3,
-            split_parent: None,
-        },
-    )?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let conn = Connection::open(":memory:").await?;
+            assert!(
+                conn.is_concurrent_mode_default(),
+                "worker range coordination contract must not disable concurrent-writer mode"
+            );
+            install_range_schema(&conn).await?;
+            seed_range(
+                &conn,
+                RangeSpec {
+                    range_id: "range-parent",
+                    start_key: 0,
+                    end_key: 1_000,
+                    page_start: 0,
+                    page_end: 3,
+                    split_parent: None,
+                },
+            )
+            .await?;
 
-    let allocated = conn.query(&allocate_sql("worker-split", "token-split", 100, 1_000))?;
-    assert_eq!(allocated.len(), 1);
-    let retired_parent = conn.query(&retire_owned_sql("range-parent", "worker-split", 2))?;
-    trace_range_event(
-        "split-retire-parent",
-        "range-parent",
-        "worker-split",
-        "ok",
-        "balanced",
-    );
-    assert_eq!(
-        only_row_values(&retired_parent, "retired split parent")?,
-        &[
-            SqliteValue::Text("range-parent".into()),
-            SqliteValue::Text("retired".into()),
-            SqliteValue::Text("ok".into()),
-        ]
-    );
+            let allocated = conn
+                .query(&allocate_sql("worker-split", "token-split", 100, 1_000))
+                .await?;
+            assert_eq!(allocated.len(), 1);
+            let retired_parent = conn
+                .query(&retire_owned_sql("range-parent", "worker-split", 2))
+                .await?;
+            trace_range_event(
+                "split-retire-parent",
+                "range-parent",
+                "worker-split",
+                "ok",
+                "balanced",
+            );
+            assert_eq!(
+                only_row_values(&retired_parent, "retired split parent")?,
+                &[
+                    SqliteValue::Text("range-parent".into()),
+                    SqliteValue::Text("retired".into()),
+                    SqliteValue::Text("ok".into()),
+                ]
+            );
 
-    for spec in [
-        RangeSpec {
-            range_id: "range-left",
-            start_key: 0,
-            end_key: 500,
-            page_start: 0,
-            page_end: 1,
-            split_parent: Some("range-parent"),
-        },
-        RangeSpec {
-            range_id: "range-right",
-            start_key: 500,
-            end_key: 1_000,
-            page_start: 2,
-            page_end: 3,
-            split_parent: Some("range-parent"),
-        },
-    ] {
-        let split_child = conn.query(&insert_available_range_sql(spec))?;
-        trace_range_event(
-            "split-child",
-            spec.range_id,
-            "worker-split",
-            "ok",
-            "balanced",
-        );
-        assert_eq!(split_child.len(), 1);
-    }
+            for spec in [
+                RangeSpec {
+                    range_id: "range-left",
+                    start_key: 0,
+                    end_key: 500,
+                    page_start: 0,
+                    page_end: 1,
+                    split_parent: Some("range-parent"),
+                },
+                RangeSpec {
+                    range_id: "range-right",
+                    start_key: 500,
+                    end_key: 1_000,
+                    page_start: 2,
+                    page_end: 3,
+                    split_parent: Some("range-parent"),
+                },
+            ] {
+                let split_child = conn.query(&insert_available_range_sql(spec)).await?;
+                trace_range_event(
+                    "split-child",
+                    spec.range_id,
+                    "worker-split",
+                    "ok",
+                    "balanced",
+                );
+                assert_eq!(split_child.len(), 1);
+            }
 
-    let overlapping = conn.query(&insert_available_range_sql(RangeSpec {
-        range_id: "range-overlap",
-        start_key: 400,
-        end_key: 600,
-        page_start: 1,
-        page_end: 2,
-        split_parent: Some("range-parent"),
-    }))?;
-    trace_range_event(
-        "insert",
-        "range-overlap",
-        "worker-split",
-        "range_overlap",
-        "choose_disjoint_key_bounds",
-    );
-    assert!(
-        overlapping.is_empty(),
-        "overlapping active worker range must not be inserted"
-    );
+            let overlapping = conn
+                .query(&insert_available_range_sql(RangeSpec {
+                    range_id: "range-overlap",
+                    start_key: 400,
+                    end_key: 600,
+                    page_start: 1,
+                    page_end: 2,
+                    split_parent: Some("range-parent"),
+                }))
+                .await?;
+            trace_range_event(
+                "insert",
+                "range-overlap",
+                "worker-split",
+                "range_overlap",
+                "choose_disjoint_key_bounds",
+            );
+            assert!(
+                overlapping.is_empty(),
+                "overlapping active worker range must not be inserted"
+            );
 
-    let invalid_bounds = conn.query(&insert_available_range_sql(RangeSpec {
-        range_id: "range-invalid",
-        start_key: 700,
-        end_key: 600,
-        page_start: 2,
-        page_end: 2,
-        split_parent: Some("range-parent"),
-    }))?;
-    trace_range_event(
-        "insert",
-        "range-invalid",
-        "worker-split",
-        "range_invalid_bounds",
-        "start_must_sort_before_end",
-    );
-    assert!(
-        invalid_bounds.is_empty(),
-        "range_start >= range_end must return no inserted range"
-    );
+            let invalid_bounds = conn
+                .query(&insert_available_range_sql(RangeSpec {
+                    range_id: "range-invalid",
+                    start_key: 700,
+                    end_key: 600,
+                    page_start: 2,
+                    page_end: 2,
+                    split_parent: Some("range-parent"),
+                }))
+                .await?;
+            trace_range_event(
+                "insert",
+                "range-invalid",
+                "worker-split",
+                "range_invalid_bounds",
+                "start_must_sort_before_end",
+            );
+            assert!(
+                invalid_bounds.is_empty(),
+                "range_start >= range_end must return no inserted range"
+            );
 
-    for range_id in ["range-left", "range-right"] {
-        let retired = conn.query(&retire_available_sql(range_id))?;
-        trace_range_event(
-            "merge-retire-source",
-            range_id,
-            "worker-merge",
-            "ok",
-            "balanced",
-        );
-        assert_eq!(retired.len(), 1);
-    }
-    let merged = conn.query(&insert_available_range_sql(RangeSpec {
-        range_id: "range-merged",
-        start_key: 0,
-        end_key: 1_000,
-        page_start: 0,
-        page_end: 3,
-        split_parent: None,
-    }))?;
-    trace_range_event(
-        "merge-insert",
-        "range-merged",
-        "worker-merge",
-        "ok",
-        "balanced",
-    );
-    assert_eq!(
-        only_row_values(&merged, "merged worker range")?,
-        &[
-            SqliteValue::Text("range-merged".into()),
-            SqliteValue::Text(encoded_key(0).into()),
-            SqliteValue::Text(encoded_key(1_000).into()),
-            SqliteValue::Text("available".into()),
-            SqliteValue::Null,
-            SqliteValue::Text("ok".into()),
-        ]
-    );
+            for range_id in ["range-left", "range-right"] {
+                let retired = conn.query(&retire_available_sql(range_id)).await?;
+                trace_range_event(
+                    "merge-retire-source",
+                    range_id,
+                    "worker-merge",
+                    "ok",
+                    "balanced",
+                );
+                assert_eq!(retired.len(), 1);
+            }
+            let merged = conn
+                .query(&insert_available_range_sql(RangeSpec {
+                    range_id: "range-merged",
+                    start_key: 0,
+                    end_key: 1_000,
+                    page_start: 0,
+                    page_end: 3,
+                    split_parent: None,
+                }))
+                .await?;
+            trace_range_event(
+                "merge-insert",
+                "range-merged",
+                "worker-merge",
+                "ok",
+                "balanced",
+            );
+            assert_eq!(
+                only_row_values(&merged, "merged worker range")?,
+                &[
+                    SqliteValue::Text("range-merged".into()),
+                    SqliteValue::Text(encoded_key(0).into()),
+                    SqliteValue::Text(encoded_key(1_000).into()),
+                    SqliteValue::Text("available".into()),
+                    SqliteValue::Null,
+                    SqliteValue::Text("ok".into()),
+                ]
+            );
 
-    let active_ranges = conn.query(
-        "SELECT range_id, range_start, range_end
+            let active_ranges = conn
+                .query(
+                    "SELECT range_id, range_start, range_end
            FROM fsqlite_worker_ranges_contract
           WHERE state <> 'retired'
           ORDER BY range_start;",
-    )?;
-    assert_eq!(
-        only_row_values(&active_ranges, "active merged range")?,
-        &[
-            SqliteValue::Text("range-merged".into()),
-            SqliteValue::Text(encoded_key(0).into()),
-            SqliteValue::Text(encoded_key(1_000).into()),
-        ],
-        "merge must leave one active disjoint replacement range"
-    );
+                )
+                .await?;
+            assert_eq!(
+                only_row_values(&active_ranges, "active merged range")?,
+                &[
+                    SqliteValue::Text("range-merged".into()),
+                    SqliteValue::Text(encoded_key(0).into()),
+                    SqliteValue::Text(encoded_key(1_000).into()),
+                ],
+                "merge must leave one active disjoint replacement range"
+            );
 
-    Ok(())
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn range_rollback_restores_available_assignment_state() -> TestResult {
-    let dir = tempfile::tempdir()?;
-    let db_path = dir.path().join("range_rollback.db");
-    let db = db_path.to_string_lossy().to_string();
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let dir = tempfile::tempdir()?;
+            let db_path = dir.path().join("range_rollback.db");
+            let db = db_path.to_string_lossy().to_string();
 
-    let conn = Connection::open(&db)?;
-    conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")?;
-    assert!(
-        conn.is_concurrent_mode_default(),
-        "worker range rollback proof must keep concurrent-writer mode enabled"
-    );
-    install_range_schema(&conn)?;
-    seed_range(
-        &conn,
-        RangeSpec {
-            range_id: "range-rollback",
-            start_key: 0,
-            end_key: 1_000,
-            page_start: 0,
-            page_end: 3,
-            split_parent: None,
-        },
-    )?;
+            let conn = Connection::open(&db).await?;
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").await?;
+            assert!(
+                conn.is_concurrent_mode_default(),
+                "worker range rollback proof must keep concurrent-writer mode enabled"
+            );
+            install_range_schema(&conn).await?;
+            seed_range(
+                &conn,
+                RangeSpec {
+                    range_id: "range-rollback",
+                    start_key: 0,
+                    end_key: 1_000,
+                    page_start: 0,
+                    page_end: 3,
+                    split_parent: None,
+                },
+            )
+            .await?;
 
-    conn.execute("BEGIN CONCURRENT;")?;
-    let allocated = conn.query(&allocate_sql(
-        "worker-rollback",
-        "token-rollback",
-        100,
-        1_000,
-    ))?;
-    trace_range_event(
-        "allocate",
-        "range-rollback",
-        "worker-rollback",
-        "ok",
-        "balanced",
-    );
-    assert_eq!(allocated.len(), 1);
-    conn.execute("ROLLBACK;")?;
+            conn.execute("BEGIN CONCURRENT;").await?;
+            let allocated = conn
+                .query(&allocate_sql(
+                    "worker-rollback",
+                    "token-rollback",
+                    100,
+                    1_000,
+                ))
+                .await?;
+            trace_range_event(
+                "allocate",
+                "range-rollback",
+                "worker-rollback",
+                "ok",
+                "balanced",
+            );
+            assert_eq!(allocated.len(), 1);
+            conn.execute("ROLLBACK;").await?;
 
-    let restored = conn.query(
-        "SELECT owner_id, lease_token, generation, state, expires_at_ms,
+            let restored = conn
+                .query(
+                    "SELECT owner_id, lease_token, generation, state, expires_at_ms,
                 last_reason_code
            FROM fsqlite_worker_ranges_contract
           WHERE range_name = 'bulk'
             AND range_id = 'range-rollback';",
-    )?;
-    assert_eq!(
-        only_row_values(&restored, "rolled back range assignment")?,
-        &[
-            SqliteValue::Null,
-            SqliteValue::Null,
-            SqliteValue::Integer(1),
-            SqliteValue::Text("available".into()),
-            SqliteValue::Null,
-            SqliteValue::Text("ok".into()),
-        ],
-        "rollback must restore worker range ownership and generation"
-    );
+                )
+                .await?;
+            assert_eq!(
+                only_row_values(&restored, "rolled back range assignment")?,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("available".into()),
+                    SqliteValue::Null,
+                    SqliteValue::Text("ok".into()),
+                ],
+                "rollback must restore worker range ownership and generation"
+            );
 
-    Ok(())
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn range_aware_assignment_reduces_modeled_same_page_conflicts() -> TestResult {
-    let conn = Connection::open(":memory:")?;
-    assert!(
-        conn.is_concurrent_mode_default(),
-        "worker range fairness proof must keep concurrent-writer mode enabled"
-    );
-    install_range_schema(&conn)?;
-    for spec in [
-        RangeSpec {
-            range_id: "range-0",
-            start_key: 0,
-            end_key: 250,
-            page_start: 0,
-            page_end: 0,
-            split_parent: None,
-        },
-        RangeSpec {
-            range_id: "range-1",
-            start_key: 250,
-            end_key: 500,
-            page_start: 1,
-            page_end: 1,
-            split_parent: None,
-        },
-        RangeSpec {
-            range_id: "range-2",
-            start_key: 500,
-            end_key: 750,
-            page_start: 2,
-            page_end: 2,
-            split_parent: None,
-        },
-        RangeSpec {
-            range_id: "range-3",
-            start_key: 750,
-            end_key: 1_000,
-            page_start: 3,
-            page_end: 3,
-            split_parent: None,
-        },
-    ] {
-        seed_range(&conn, spec)?;
-    }
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let conn = Connection::open(":memory:").await?;
+            assert!(
+                conn.is_concurrent_mode_default(),
+                "worker range fairness proof must keep concurrent-writer mode enabled"
+            );
+            install_range_schema(&conn).await?;
+            for spec in [
+                RangeSpec {
+                    range_id: "range-0",
+                    start_key: 0,
+                    end_key: 250,
+                    page_start: 0,
+                    page_end: 0,
+                    split_parent: None,
+                },
+                RangeSpec {
+                    range_id: "range-1",
+                    start_key: 250,
+                    end_key: 500,
+                    page_start: 1,
+                    page_end: 1,
+                    split_parent: None,
+                },
+                RangeSpec {
+                    range_id: "range-2",
+                    start_key: 500,
+                    end_key: 750,
+                    page_start: 2,
+                    page_end: 2,
+                    split_parent: None,
+                },
+                RangeSpec {
+                    range_id: "range-3",
+                    start_key: 750,
+                    end_key: 1_000,
+                    page_start: 3,
+                    page_end: 3,
+                    split_parent: None,
+                },
+            ] {
+                seed_range(&conn, spec).await?;
+            }
 
-    for worker_index in 0_i64..4 {
-        let worker_id = format!("worker-{worker_index}");
-        record_conflict_sample(&conn, "naive", &worker_id, 0)?;
-        let allocation = conn.query(&allocate_sql(
-            &worker_id,
-            &format!("token-{worker_index}"),
-            100 + worker_index,
-            1_000,
-        ))?;
-        assert_eq!(allocation.len(), 1);
-        record_conflict_sample(&conn, "range-aware", &worker_id, worker_index)?;
-    }
+            for worker_index in 0_i64..4 {
+                let worker_id = format!("worker-{worker_index}");
+                record_conflict_sample(&conn, "naive", &worker_id, 0).await?;
+                let allocation = conn
+                    .query(&allocate_sql(
+                        &worker_id,
+                        &format!("token-{worker_index}"),
+                        100 + worker_index,
+                        1_000,
+                    ))
+                    .await?;
+                assert_eq!(allocation.len(), 1);
+                record_conflict_sample(&conn, "range-aware", &worker_id, worker_index).await?;
+            }
 
-    let assigned = conn.query(
-        "SELECT range_id, owner_id, predicted_page_start, predicted_page_end,
+            let assigned = conn
+                .query(
+                    "SELECT range_id, owner_id, predicted_page_start, predicted_page_end,
                 observed_conflict_count, imbalance_reason
            FROM fsqlite_worker_ranges_contract
           WHERE state = 'assigned'
           ORDER BY range_id;",
-    )?;
-    assert_eq!(assigned.len(), 4);
-    for row in &assigned {
-        match row.values() {
-            [
-                SqliteValue::Text(range_id),
-                SqliteValue::Text(owner_id),
-                SqliteValue::Integer(page_start),
-                SqliteValue::Integer(page_end),
-                SqliteValue::Integer(conflict_count),
-                SqliteValue::Text(imbalance_reason),
-            ] => {
-                assert_eq!(page_start, page_end);
-                assert_eq!(*conflict_count, 0);
-                assert_eq!(imbalance_reason.as_str(), "balanced");
-                trace_range_event("fairness", range_id, owner_id, "ok", imbalance_reason);
+                )
+                .await?;
+            assert_eq!(assigned.len(), 4);
+            for row in &assigned {
+                match row.values() {
+                    [
+                        SqliteValue::Text(range_id),
+                        SqliteValue::Text(owner_id),
+                        SqliteValue::Integer(page_start),
+                        SqliteValue::Integer(page_end),
+                        SqliteValue::Integer(conflict_count),
+                        SqliteValue::Text(imbalance_reason),
+                    ] => {
+                        assert_eq!(page_start, page_end);
+                        assert_eq!(*conflict_count, 0);
+                        assert_eq!(imbalance_reason.as_str(), "balanced");
+                        trace_range_event("fairness", range_id, owner_id, "ok", imbalance_reason);
+                    }
+                    other => {
+                        return Err(contract_error(format!(
+                            "assigned range row had unexpected shape: {other:?}"
+                        )));
+                    }
+                }
             }
-            other => {
-                return Err(contract_error(format!(
-                    "assigned range row had unexpected shape: {other:?}"
-                )));
-            }
+
+            assert_eq!(
+                modeled_same_page_conflicts(&conn, "naive").await?,
+                3,
+                "naive shared-key workers all target the same modeled page"
+            );
+            assert_eq!(
+                modeled_same_page_conflicts(&conn, "range-aware").await?,
+                0,
+                "range-aware workers must model disjoint page ownership"
+            );
+
+            Ok(())
         }
-    }
-
-    assert_eq!(
-        modeled_same_page_conflicts(&conn, "naive")?,
-        3,
-        "naive shared-key workers all target the same modeled page"
-    );
-    assert_eq!(
-        modeled_same_page_conflicts(&conn, "range-aware")?,
-        0,
-        "range-aware workers must model disjoint page ownership"
-    );
-
-    Ok(())
+        .await;
+    });
+    outcome
 }

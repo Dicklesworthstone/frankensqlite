@@ -14,38 +14,51 @@
 use std::hint::black_box;
 use std::time::Instant;
 
+use asupersync::runtime::{Runtime, RuntimeBuilder};
 use fsqlite_core::connection::Connection;
 
 const ROWS: i64 = 20_000;
 const EXECS_PER_SAMPLE: usize = 64;
 const SAMPLES: usize = 60;
 
-fn setup() -> Connection {
-    let conn = Connection::open(":memory:").expect("open");
+/// One runtime for the whole benchmark: built once, outside every measured region, so no
+/// per-sample runtime construction can leak into the timings.
+fn benchmark_runtime() -> Runtime {
+    RuntimeBuilder::current_thread()
+        .blocking_threads(1, 2)
+        .build()
+        .expect("rowid-eq-aggregate benchmark runtime should build")
+}
+
+async fn setup() -> Connection {
+    let conn = Connection::open(":memory:").await.expect("open");
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v REAL);")
+        .await
         .expect("create");
-    conn.execute("BEGIN;").expect("begin");
+    conn.execute("BEGIN;").await.expect("begin");
     for i in 1..=ROWS {
         // k == id (unique, INTEGER affinity) so an IN-list of a few values is selective and
         // has a secondary index to seek; the id-based equality/range arms are unaffected.
         conn.execute(&format!("INSERT INTO t VALUES ({i}, {i}, {i}.5);"))
+            .await
             .expect("insert");
     }
-    conn.execute("COMMIT;").expect("commit");
+    conn.execute("COMMIT;").await.expect("commit");
     conn.execute("CREATE INDEX idx_t_k ON t(k);")
+        .await
         .expect("create index");
     conn
 }
 
 /// Run one arm over `EXECS_PER_SAMPLE` distinct literals and return elapsed nanoseconds.
 /// `not_indexed` selects the scan arm; the literal cycles so no cache hit can serve it.
-fn time_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
+async fn time_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
     let hint = if not_indexed { " NOT INDEXED" } else { "" };
     let start = Instant::now();
     for j in 0..EXECS_PER_SAMPLE {
         let id = 1 + ((base + j as i64) % ROWS);
         let sql = format!("SELECT SUM(v) FROM t{hint} WHERE id = {id}");
-        let rows = conn.query(black_box(&sql)).expect("query");
+        let rows = conn.query(black_box(&sql)).await.expect("query");
         black_box(&rows);
     }
     start.elapsed().as_nanos()
@@ -53,14 +66,14 @@ fn time_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
 
 /// Range arm: `SUM(v) WHERE id <= <upper>` over a selective upper bound. The bounded scan
 /// visits `[1, upper]` and stops; `NOT INDEXED` full-scans all `ROWS`. Upper varies per exec.
-fn time_range_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
+async fn time_range_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
     let hint = if not_indexed { " NOT INDEXED" } else { "" };
     let start = Instant::now();
     for j in 0..EXECS_PER_SAMPLE {
         // Keep the range selective (~100 rows) so the bounded scan's early-exit dominates.
         let upper = 50 + ((base + j as i64) % 100);
         let sql = format!("SELECT SUM(v) FROM t{hint} WHERE id <= {upper}");
-        let rows = conn.query(black_box(&sql)).expect("query");
+        let rows = conn.query(black_box(&sql)).await.expect("query");
         black_box(&rows);
     }
     start.elapsed().as_nanos()
@@ -68,7 +81,7 @@ fn time_range_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
 
 /// IN-list arm: `SUM(v) WHERE k IN (a,b,c)` on the INTEGER index `idx_t_k`. The seek visits
 /// three duplicate runs of one row each; `NOT INDEXED` full-scans all `ROWS`. Values vary.
-fn time_in_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
+async fn time_in_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
     let hint = if not_indexed { " NOT INDEXED" } else { "" };
     let start = Instant::now();
     for j in 0..EXECS_PER_SAMPLE {
@@ -76,7 +89,7 @@ fn time_in_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
         let b = 1 + ((base + j as i64 + 1) % ROWS);
         let c = 1 + ((base + j as i64 + 2) % ROWS);
         let sql = format!("SELECT SUM(v) FROM t{hint} WHERE k IN ({a}, {b}, {c})");
-        let rows = conn.query(black_box(&sql)).expect("query");
+        let rows = conn.query(black_box(&sql)).await.expect("query");
         black_box(&rows);
     }
     start.elapsed().as_nanos()
@@ -85,7 +98,7 @@ fn time_in_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
 /// Non-aggregate IN-list arm: `SELECT id, v WHERE k IN (a,b,c)`, per-value index seek + row
 /// projection vs `NOT INDEXED` full-scan. Values vary. Distinct from the aggregate arm: this
 /// exercises the `codegen_select_index_in_scan` ResultRow path, not accumulate.
-fn time_nonagg_in_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
+async fn time_nonagg_in_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
     let hint = if not_indexed { " NOT INDEXED" } else { "" };
     let start = Instant::now();
     for j in 0..EXECS_PER_SAMPLE {
@@ -93,7 +106,7 @@ fn time_nonagg_in_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
         let b = 1 + ((base + j as i64 + 1) % ROWS);
         let c = 1 + ((base + j as i64 + 2) % ROWS);
         let sql = format!("SELECT id, v FROM t{hint} WHERE k IN ({a}, {b}, {c})");
-        let rows = conn.query(black_box(&sql)).expect("query");
+        let rows = conn.query(black_box(&sql)).await.expect("query");
         black_box(&rows);
     }
     start.elapsed().as_nanos()
@@ -101,7 +114,7 @@ fn time_nonagg_in_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
 
 /// Rowid IN-list arm: `SELECT id, v WHERE id IN (a,b,c)`, one SeekRowid per value vs a
 /// `NOT INDEXED` full scan. Values vary. Exercises `codegen_select_rowid_in_scan`.
-fn time_rowid_in_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
+async fn time_rowid_in_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
     let hint = if not_indexed { " NOT INDEXED" } else { "" };
     let start = Instant::now();
     for j in 0..EXECS_PER_SAMPLE {
@@ -109,7 +122,7 @@ fn time_rowid_in_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
         let b = 1 + ((base + j as i64 + 7) % ROWS);
         let c = 1 + ((base + j as i64 + 13) % ROWS);
         let sql = format!("SELECT id, v FROM t{hint} WHERE id IN ({a}, {b}, {c})");
-        let rows = conn.query(black_box(&sql)).expect("query");
+        let rows = conn.query(black_box(&sql)).await.expect("query");
         black_box(&rows);
     }
     start.elapsed().as_nanos()
@@ -117,7 +130,7 @@ fn time_rowid_in_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
 
 /// OR-of-equalities arm: `SELECT id, v WHERE k = a OR k = b OR k = c`, normalized to a
 /// per-value index seek vs a `NOT INDEXED` scan. Proves the OR->IN normalization fires.
-fn time_or_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
+async fn time_or_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
     let hint = if not_indexed { " NOT INDEXED" } else { "" };
     let start = Instant::now();
     for j in 0..EXECS_PER_SAMPLE {
@@ -125,7 +138,7 @@ fn time_or_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
         let b = 1 + ((base + j as i64 + 1) % ROWS);
         let c = 1 + ((base + j as i64 + 2) % ROWS);
         let sql = format!("SELECT id, v FROM t{hint} WHERE k = {a} OR k = {b} OR k = {c}");
-        let rows = conn.query(black_box(&sql)).expect("query");
+        let rows = conn.query(black_box(&sql)).await.expect("query");
         black_box(&rows);
     }
     start.elapsed().as_nanos()
@@ -137,11 +150,17 @@ fn median(mut v: Vec<u128>) -> u128 {
 }
 
 fn main() {
-    let conn = setup();
+    // ONE runtime for the entire benchmark, built before any measurement begins.
+    let runtime = benchmark_runtime();
+    runtime.block_on(run());
+}
+
+async fn run() {
+    let conn = setup().await;
 
     // Warm both paths once (JIT-free, but primes caches/allocations symmetrically).
-    black_box(time_arm(&conn, false, 0));
-    black_box(time_arm(&conn, true, 0));
+    black_box(time_arm(&conn, false, 0).await);
+    black_box(time_arm(&conn, true, 0).await);
 
     let mut seek = Vec::with_capacity(SAMPLES);
     let mut scan = Vec::with_capacity(SAMPLES);
@@ -151,11 +170,11 @@ fn main() {
     for s in 0..SAMPLES {
         let base = (s as i64) * (EXECS_PER_SAMPLE as i64);
         // Interleaved within the sample: seek, then scan, back-to-back.
-        seek.push(time_arm(&conn, false, base));
-        scan.push(time_arm(&conn, true, base));
+        seek.push(time_arm(&conn, false, base).await);
+        scan.push(time_arm(&conn, true, base).await);
         // Null control: seek vs seek, same interleave shape.
-        null_a.push(time_arm(&conn, false, base));
-        null_b.push(time_arm(&conn, false, base));
+        null_a.push(time_arm(&conn, false, base).await);
+        null_b.push(time_arm(&conn, false, base).await);
     }
 
     let m_seek = median(seek);
@@ -179,18 +198,18 @@ fn main() {
     );
 
     // Range arm: SUM(v) WHERE id <= <selective upper>, bounded scan vs NOT INDEXED scan.
-    black_box(time_range_arm(&conn, false, 0));
-    black_box(time_range_arm(&conn, true, 0));
+    black_box(time_range_arm(&conn, false, 0).await);
+    black_box(time_range_arm(&conn, true, 0).await);
     let mut rseek = Vec::with_capacity(SAMPLES);
     let mut rscan = Vec::with_capacity(SAMPLES);
     let mut rnull_a = Vec::with_capacity(SAMPLES);
     let mut rnull_b = Vec::with_capacity(SAMPLES);
     for s in 0..SAMPLES {
         let base = (s as i64) * (EXECS_PER_SAMPLE as i64);
-        rseek.push(time_range_arm(&conn, false, base));
-        rscan.push(time_range_arm(&conn, true, base));
-        rnull_a.push(time_range_arm(&conn, false, base));
-        rnull_b.push(time_range_arm(&conn, false, base));
+        rseek.push(time_range_arm(&conn, false, base).await);
+        rscan.push(time_range_arm(&conn, true, base).await);
+        rnull_a.push(time_range_arm(&conn, false, base).await);
+        rnull_b.push(time_range_arm(&conn, false, base).await);
     }
     let mr_seek = median(rseek);
     let mr_scan = median(rscan);
@@ -211,18 +230,18 @@ fn main() {
     );
 
     // IN-list arm: SUM(v) WHERE k IN (a,b,c), per-value index seek vs NOT INDEXED scan.
-    black_box(time_in_arm(&conn, false, 0));
-    black_box(time_in_arm(&conn, true, 0));
+    black_box(time_in_arm(&conn, false, 0).await);
+    black_box(time_in_arm(&conn, true, 0).await);
     let mut iseek = Vec::with_capacity(SAMPLES);
     let mut iscan = Vec::with_capacity(SAMPLES);
     let mut inull_a = Vec::with_capacity(SAMPLES);
     let mut inull_b = Vec::with_capacity(SAMPLES);
     for s in 0..SAMPLES {
         let base = (s as i64) * (EXECS_PER_SAMPLE as i64);
-        iseek.push(time_in_arm(&conn, false, base));
-        iscan.push(time_in_arm(&conn, true, base));
-        inull_a.push(time_in_arm(&conn, false, base));
-        inull_b.push(time_in_arm(&conn, false, base));
+        iseek.push(time_in_arm(&conn, false, base).await);
+        iscan.push(time_in_arm(&conn, true, base).await);
+        inull_a.push(time_in_arm(&conn, false, base).await);
+        inull_b.push(time_in_arm(&conn, false, base).await);
     }
     let mi_seek = median(iseek);
     let mi_scan = median(iscan);
@@ -243,18 +262,18 @@ fn main() {
     );
 
     // Non-aggregate IN-list arm: SELECT id,v WHERE k IN (a,b,c), seek+ResultRow vs scan.
-    black_box(time_nonagg_in_arm(&conn, false, 0));
-    black_box(time_nonagg_in_arm(&conn, true, 0));
+    black_box(time_nonagg_in_arm(&conn, false, 0).await);
+    black_box(time_nonagg_in_arm(&conn, true, 0).await);
     let mut nseek = Vec::with_capacity(SAMPLES);
     let mut nscan = Vec::with_capacity(SAMPLES);
     let mut nnull_a = Vec::with_capacity(SAMPLES);
     let mut nnull_b = Vec::with_capacity(SAMPLES);
     for s in 0..SAMPLES {
         let base = (s as i64) * (EXECS_PER_SAMPLE as i64);
-        nseek.push(time_nonagg_in_arm(&conn, false, base));
-        nscan.push(time_nonagg_in_arm(&conn, true, base));
-        nnull_a.push(time_nonagg_in_arm(&conn, false, base));
-        nnull_b.push(time_nonagg_in_arm(&conn, false, base));
+        nseek.push(time_nonagg_in_arm(&conn, false, base).await);
+        nscan.push(time_nonagg_in_arm(&conn, true, base).await);
+        nnull_a.push(time_nonagg_in_arm(&conn, false, base).await);
+        nnull_b.push(time_nonagg_in_arm(&conn, false, base).await);
     }
     let mn_seek = median(nseek);
     let mn_scan = median(nscan);
@@ -275,18 +294,18 @@ fn main() {
     );
 
     // Rowid IN-list arm: SELECT id,v WHERE id IN (a,b,c), SeekRowid per value vs scan.
-    black_box(time_rowid_in_arm(&conn, false, 0));
-    black_box(time_rowid_in_arm(&conn, true, 0));
+    black_box(time_rowid_in_arm(&conn, false, 0).await);
+    black_box(time_rowid_in_arm(&conn, true, 0).await);
     let mut rid_seek = Vec::with_capacity(SAMPLES);
     let mut rid_scan = Vec::with_capacity(SAMPLES);
     let mut rid_na = Vec::with_capacity(SAMPLES);
     let mut rid_nb = Vec::with_capacity(SAMPLES);
     for s in 0..SAMPLES {
         let base = (s as i64) * (EXECS_PER_SAMPLE as i64);
-        rid_seek.push(time_rowid_in_arm(&conn, false, base));
-        rid_scan.push(time_rowid_in_arm(&conn, true, base));
-        rid_na.push(time_rowid_in_arm(&conn, false, base));
-        rid_nb.push(time_rowid_in_arm(&conn, false, base));
+        rid_seek.push(time_rowid_in_arm(&conn, false, base).await);
+        rid_scan.push(time_rowid_in_arm(&conn, true, base).await);
+        rid_na.push(time_rowid_in_arm(&conn, false, base).await);
+        rid_nb.push(time_rowid_in_arm(&conn, false, base).await);
     }
     let mrid_seek = median(rid_seek);
     let mrid_scan = median(rid_scan);
@@ -307,18 +326,18 @@ fn main() {
     );
 
     // OR-of-equalities arm.
-    black_box(time_or_arm(&conn, false, 0));
-    black_box(time_or_arm(&conn, true, 0));
+    black_box(time_or_arm(&conn, false, 0).await);
+    black_box(time_or_arm(&conn, true, 0).await);
     let mut or_seek = Vec::with_capacity(SAMPLES);
     let mut or_scan = Vec::with_capacity(SAMPLES);
     let mut or_na = Vec::with_capacity(SAMPLES);
     let mut or_nb = Vec::with_capacity(SAMPLES);
     for s in 0..SAMPLES {
         let base = (s as i64) * (EXECS_PER_SAMPLE as i64);
-        or_seek.push(time_or_arm(&conn, false, base));
-        or_scan.push(time_or_arm(&conn, true, base));
-        or_na.push(time_or_arm(&conn, false, base));
-        or_nb.push(time_or_arm(&conn, false, base));
+        or_seek.push(time_or_arm(&conn, false, base).await);
+        or_scan.push(time_or_arm(&conn, true, base).await);
+        or_na.push(time_or_arm(&conn, false, base).await);
+        or_nb.push(time_or_arm(&conn, false, base).await);
     }
     let mor_seek = median(or_seek);
     let mor_scan = median(or_scan);
