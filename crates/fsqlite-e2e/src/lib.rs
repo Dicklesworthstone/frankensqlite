@@ -6,6 +6,27 @@
 //! - **Differential comparison**: running identical SQL against FrankenSQLite and C SQLite
 //! - **Corruption injection**: byte/page/sector-level corruption for recovery testing
 
+// The engine futures composed here are deeply nested; the default limit
+// overflows while type-checking them.
+#![recursion_limit = "512"]
+
+/// Drive an engine future to completion on a harness-owned runtime.
+///
+/// This crate compares FrankenSQLite against synchronous reference engines
+/// (rusqlite) and drives multi-threaded benchmark workloads through sync
+/// executor traits, so the FrankenSQLite side needs a synchronous bridge. The
+/// E2E harness is the top-level consumer here, so owning a runtime is correct
+/// (the engine itself still never builds one — see AGENTS.md).
+pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    thread_local! {
+        static RUNTIME: asupersync::runtime::Runtime =
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build fsqlite-e2e runtime");
+    }
+    RUNTIME.with(|runtime| runtime.block_on(future))
+}
+
 pub mod baseline;
 pub mod batch_runner;
 pub mod bench_summary;

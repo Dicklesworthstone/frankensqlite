@@ -369,7 +369,7 @@ impl Engine {
                 let target = path
                     .map(path_to_string)
                     .unwrap_or_else(|| ":memory:".to_owned());
-                fsqlite::Connection::open(target)
+                crate::block_on(fsqlite::Connection::open(target))
                     .map(Box::new)
                     .map(Self::FrankenSqlite)
                     .map_err(|error| error.to_string())
@@ -404,7 +404,7 @@ impl Engine {
     fn execute(&self, sql: &str) -> Result<usize, String> {
         match self {
             Self::FrankenSqlite(conn) => {
-                conn.execute(sql.trim()).map_err(|error| error.to_string())
+                crate::block_on(conn.execute(sql.trim())).map_err(|error| error.to_string())
             }
             Self::StockSqlite(conn) => conn
                 .execute(sql.trim(), [])
@@ -414,8 +414,7 @@ impl Engine {
 
     fn query(&self, sql: &str) -> Result<Vec<Vec<NormalizedValue>>, String> {
         match self {
-            Self::FrankenSqlite(conn) => conn
-                .query(sql.trim())
+            Self::FrankenSqlite(conn) => crate::block_on(conn.query(sql.trim()))
                 .map(|rows| {
                     rows.into_iter()
                         .map(|row| {

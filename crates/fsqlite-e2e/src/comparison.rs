@@ -209,18 +209,19 @@ impl FrankenSqliteBackend {
     ///
     /// Returns `E2eError::Fsqlite` if the connection fails.
     pub fn open_in_memory() -> E2eResult<Self> {
-        let conn = FConnection::open(":memory:").map_err(|e| E2eError::Fsqlite(e.to_string()))?;
+        let conn = crate::block_on(FConnection::open(":memory:"))
+            .map_err(|e| E2eError::Fsqlite(e.to_string()))?;
         Ok(Self { conn })
     }
 }
 
 impl SqlBackend for FrankenSqliteBackend {
     fn execute(&self, sql: &str) -> Result<usize, String> {
-        self.conn.execute(sql.trim()).map_err(|e| e.to_string())
+        crate::block_on(self.conn.execute(sql.trim())).map_err(|e| e.to_string())
     }
 
     fn query(&self, sql: &str) -> Result<Vec<NormalizedRow>, String> {
-        let rows = self.conn.query(sql.trim()).map_err(|e| e.to_string())?;
+        let rows = crate::block_on(self.conn.query(sql.trim())).map_err(|e| e.to_string())?;
         Ok(rows
             .into_iter()
             .map(|row| {

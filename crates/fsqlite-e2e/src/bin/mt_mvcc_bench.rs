@@ -644,7 +644,7 @@ fn worker_insert_sql(tid: usize, separate_tables: bool) -> String {
 }
 
 fn prepare_fsqlite_schema(path: &str, threads: usize, separate_tables: bool) -> Result<(), String> {
-    let conn = fsqlite::Connection::open(path.to_owned())
+    let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.to_owned()))
         .map_err(|error| format!("fsqlite open (init): {error}"))?;
     for pragma in [
         "PRAGMA page_size=4096;",
@@ -652,12 +652,12 @@ fn prepare_fsqlite_schema(path: &str, threads: usize, separate_tables: bool) -> 
         "PRAGMA synchronous=NORMAL;",
         "PRAGMA cache_size=-64000;",
     ] {
-        let _ = conn.execute(pragma);
+        let _ = fsqlite_e2e::block_on(conn.execute(pragma));
     }
     for tid in 0..worker_table_count(threads, separate_tables) {
         let table_name = worker_table_name(tid, separate_tables);
         let create_sql = create_table_sql(&table_name);
-        conn.execute(&create_sql)
+        fsqlite_e2e::block_on(conn.execute(&create_sql))
             .map_err(|error| format!("create table {table_name}: {error}"))?;
     }
     Ok(())
@@ -685,10 +685,11 @@ fn percentile_value(mut values: Vec<f64>, percentile: f64) -> f64 {
 // ─── FrankenSQLite workload ──────────────────────────────────────────────
 
 fn open_fsqlite_worker(path: &str) -> Result<(fsqlite::Connection, bool), String> {
-    let conn = fsqlite::Connection::open(path.to_owned())
+    let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.to_owned()))
         .map_err(|error| format!("fsqlite open (worker): {error}"))?;
-    let concurrent_ok = conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").is_ok();
-    let _ = conn.execute("PRAGMA busy_timeout=5000;");
+    let concurrent_ok =
+        fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")).is_ok();
+    let _ = fsqlite_e2e::block_on(conn.execute("PRAGMA busy_timeout=5000;"));
     Ok((conn, concurrent_ok))
 }
 
@@ -786,7 +787,7 @@ fn run_fsqlite(
                 } else {
                     "BEGIN"
                 };
-                if let Err(e) = conn.execute(begin_sql) {
+                if let Err(e) = fsqlite_e2e::block_on(conn.execute(begin_sql)) {
                     if e.is_transient()
                         && let Some(wait) = retry_budget.next_wait(tid)
                     {
@@ -799,10 +800,10 @@ fn run_fsqlite(
                     ));
                 }
 
-                let stmt = match conn.prepare(&insert_sql) {
+                let stmt = match fsqlite_e2e::block_on(conn.prepare(&insert_sql)) {
                     Ok(s) => s,
                     Err(e) => {
-                        let _ = conn.execute("ROLLBACK");
+                        let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
                         return Err(format!("[fsqlite t{tid}] prepare failed: {e}"));
                     }
                 };
@@ -815,10 +816,10 @@ fn run_fsqlite(
                         fsqlite::SqliteValue::Integer(id),
                         fsqlite::SqliteValue::Text(payload.into()),
                     ];
-                    match stmt.execute_with_params(&params) {
+                    match fsqlite_e2e::block_on(stmt.execute_with_params(&params)) {
                         Ok(_) => {}
                         Err(e) if e.is_transient() => {
-                            let _ = conn.execute("ROLLBACK");
+                            let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
                             if let Some(wait) = retry_budget.next_wait(tid) {
                                 thread::sleep(wait);
                                 continue 'outer;
@@ -835,10 +836,10 @@ fn run_fsqlite(
                     }
                 }
 
-                match conn.execute("COMMIT") {
+                match fsqlite_e2e::block_on(conn.execute("COMMIT")) {
                     Ok(_) => break 'outer,
                     Err(e) if e.is_transient() => {
-                        let _ = conn.execute("ROLLBACK");
+                        let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
                         if let Some(wait) = retry_budget.next_wait(tid) {
                             thread::sleep(wait);
                             continue;
@@ -849,7 +850,7 @@ fn run_fsqlite(
                         ));
                     }
                     Err(e) => {
-                        let _ = conn.execute("ROLLBACK");
+                        let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
                         return Err(format!("[fsqlite t{tid}] COMMIT failed: {e}"));
                     }
                 }
