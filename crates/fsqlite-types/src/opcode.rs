@@ -568,7 +568,10 @@ pub enum Opcode {
 }
 
 impl Opcode {
-    /// Total number of opcodes defined.
+    /// Exclusive upper bound on valid opcode discriminants.
+    ///
+    /// Discriminants run `1..=198` (there is no zero opcode), so valid bytes
+    /// are exactly `1..COUNT` and the number of opcodes defined is `COUNT - 1`.
     pub const COUNT: usize = 199;
 
     /// Get the opcode name as a static string slice.
@@ -1592,7 +1595,10 @@ mod tests {
 
     #[test]
     fn opcode_count() {
-        assert_eq!(Opcode::COUNT, 198);
+        // COUNT is the exclusive upper bound on discriminants (1..COUNT), so the
+        // number of opcodes actually defined is COUNT - 1.
+        assert_eq!(Opcode::COUNT, 199);
+        assert_eq!(Opcode::COUNT - 1, 198);
     }
 
     #[test]
