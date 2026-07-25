@@ -188,6 +188,77 @@ fn sync_facade_owns_storage_futures_on_its_worker() {
         vec![Some(SqliteValue::Integer(1)), Some(SqliteValue::Integer(2))]
     );
 
+    assert!(matches!(
+        connection.execute_many_with_params_in_transaction_sync(
+            "INSERT INTO items(name) VALUES (?1)",
+            &[vec![SqliteValue::Text("outside".into())]],
+        ),
+        Err(FrankenError::Internal(detail)) if detail.contains("explicit transaction")
+    ));
+
+    connection
+        .begin_transaction_sync()
+        .expect("batch transaction should begin");
+    assert_eq!(
+        connection
+            .execute_many_with_params_in_transaction_sync(
+                "INSERT INTO items(name) VALUES (?1)",
+                &[
+                    vec![SqliteValue::Text("batch-a".into())],
+                    vec![SqliteValue::Text("batch-b".into())],
+                ],
+            )
+            .expect("batched parameter sets should complete"),
+        2
+    );
+    connection
+        .commit_transaction_sync()
+        .expect("batch transaction should commit");
+    let batch_names = connection
+        .query_sync("SELECT name FROM items WHERE id >= 3 ORDER BY id")
+        .expect("committed batch should be queryable");
+    assert_eq!(
+        batch_names
+            .iter()
+            .map(|row| row.get(0).cloned())
+            .collect::<Vec<_>>(),
+        vec![
+            Some(SqliteValue::Text("batch-a".into())),
+            Some(SqliteValue::Text("batch-b".into())),
+        ]
+    );
+
+    connection
+        .begin_transaction_sync()
+        .expect("failing batch transaction should begin");
+    assert!(
+        connection
+            .execute_many_with_params_in_transaction_sync(
+                "INSERT INTO items(id, name) VALUES (?1, ?2)",
+                &[
+                    vec![
+                        SqliteValue::Integer(10),
+                        SqliteValue::Text("pending".into()),
+                    ],
+                    vec![
+                        SqliteValue::Integer(1),
+                        SqliteValue::Text("duplicate".into()),
+                    ],
+                ],
+            )
+            .is_err()
+    );
+    assert!(connection.in_transaction());
+    connection
+        .rollback_transaction_sync()
+        .expect("caller should roll back a failed batch");
+    assert!(
+        connection
+            .query_sync("SELECT id FROM items WHERE id = 10")
+            .expect("rolled-back batch should be queryable")
+            .is_empty()
+    );
+
     connection
         .begin_transaction_sync()
         .expect("transaction should begin");
@@ -204,7 +275,7 @@ fn sync_facade_owns_storage_futures_on_its_worker() {
             .query_sync("SELECT id FROM items")
             .expect("post-rollback query should complete")
             .len(),
-        2
+        4
     );
 
     connection

@@ -15586,6 +15586,39 @@ impl Connection {
             .await
     }
 
+    /// Prepare one statement once and execute every parameter set inside an
+    /// explicit transaction without per-statement savepoints.
+    ///
+    /// This is the batched counterpart to
+    /// [`Self::execute_with_params_skip_statement_savepoint_in_explicit_txn`].
+    /// Callers must prevalidate application-level inputs and roll back the
+    /// enclosing transaction if any execution fails; earlier effects remain
+    /// pending in that transaction. Database constraints are still enforced
+    /// by every execution.
+    pub async fn execute_many_with_params_skip_statement_savepoint_in_explicit_txn(
+        &self,
+        sql: &str,
+        parameter_sets: &[Vec<SqliteValue>],
+    ) -> Result<usize> {
+        self.background_status()?;
+        if !self.in_transaction() {
+            return Err(FrankenError::internal(
+                "batched parameter execution requires an explicit transaction",
+            ));
+        }
+        let prepared = self.prepare_after_background_status(sql).await?;
+        let mut affected = 0_usize;
+        for params in parameter_sets {
+            let next = self
+                .execute_prepared_with_params_after_background_status(&prepared, params, true)
+                .await?;
+            affected = affected.checked_add(next).ok_or_else(|| {
+                FrankenError::internal("batched parameter execution affected-row count overflow")
+            })?;
+        }
+        Ok(affected)
+    }
+
     async fn execute_with_params_with_statement_savepoint_policy(
         &self,
         sql: &str,

@@ -97,6 +97,11 @@ enum Command {
         params: Vec<SqliteValue>,
         tx: Responder<usize>,
     },
+    ExecuteManyWithParamsInTransaction {
+        sql: String,
+        parameter_sets: Vec<Vec<SqliteValue>>,
+        tx: Responder<usize>,
+    },
     ExecuteBatch {
         sql: String,
         tx: Responder<()>,
@@ -234,6 +239,19 @@ fn worker_loop(mut conn: Connection, rx: mpsc::Receiver<Command>) {
             }
             Command::ExecuteWithParams { sql, params, tx } => {
                 let _ = tx.send(future::block_on(conn.execute_with_params(&sql, &params)));
+            }
+            Command::ExecuteManyWithParamsInTransaction {
+                sql,
+                parameter_sets,
+                tx,
+            } => {
+                let result = future::block_on(
+                    conn.execute_many_with_params_skip_statement_savepoint_in_explicit_txn(
+                        &sql,
+                        &parameter_sets,
+                    ),
+                );
+                let _ = tx.send(result);
             }
             Command::ExecuteBatch { sql, tx } => {
                 let _ = tx.send(future::block_on(conn.execute_batch(&sql)));
@@ -574,6 +592,27 @@ impl AsyncConnection {
             .send(Command::ExecuteWithParams {
                 sql: sql.to_owned(),
                 params: params.to_vec(),
+                tx,
+            })
+            .map_err(send_err)?;
+        recv_worker_response(rx)
+    }
+
+    /// Execute parameter sets as one worker command inside an explicit transaction.
+    ///
+    /// Inputs must be fully validated before this call. The worker deliberately
+    /// skips per-statement savepoints; if one execution fails, earlier effects
+    /// remain pending and the caller must roll back the enclosing transaction.
+    pub fn execute_many_with_params_in_transaction_sync(
+        &self,
+        sql: &str,
+        parameter_sets: &[Vec<SqliteValue>],
+    ) -> Result<usize, FrankenError> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.sender()?
+            .send(Command::ExecuteManyWithParamsInTransaction {
+                sql: sql.to_owned(),
+                parameter_sets: parameter_sets.to_vec(),
                 tx,
             })
             .map_err(send_err)?;
