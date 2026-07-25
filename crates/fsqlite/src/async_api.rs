@@ -245,29 +245,12 @@ fn worker_loop(mut conn: Connection, rx: mpsc::Receiver<Command>) {
                 parameter_sets,
                 tx,
             } => {
-                let result = future::block_on(async {
-                    if !conn.in_transaction() {
-                        return Err(FrankenError::Internal(
-                            "batched parameter execution requires an explicit transaction"
-                                .to_owned(),
-                        ));
-                    }
-                    let mut affected = 0_usize;
-                    for params in &parameter_sets {
-                        let next = conn
-                            .execute_with_params_skip_statement_savepoint_in_explicit_txn(
-                                &sql, params,
-                            )
-                            .await?;
-                        affected = affected.checked_add(next).ok_or_else(|| {
-                            FrankenError::Internal(
-                                "batched parameter execution affected-row count overflow"
-                                    .to_owned(),
-                            )
-                        })?;
-                    }
-                    Ok(affected)
-                });
+                let result = future::block_on(
+                    conn.execute_many_with_params_skip_statement_savepoint_in_explicit_txn(
+                        &sql,
+                        &parameter_sets,
+                    ),
+                );
                 let _ = tx.send(result);
             }
             Command::ExecuteBatch { sql, tx } => {
