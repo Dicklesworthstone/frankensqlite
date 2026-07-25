@@ -3404,11 +3404,7 @@ impl ShardedPageCache {
     /// attach a runtime-backed native context to `cx`). The non-native fallback
     /// performs the same generation-safe async write directly because there is
     /// no multi-worker runtime on that target.
-    pub async fn evict_any_async<F>(
-        self: &Arc<Self>,
-        cx: &Cx,
-        file: Arc<F>,
-    ) -> Result<bool>
+    pub async fn evict_any_async<F>(self: &Arc<Self>, cx: &Cx, file: Arc<F>) -> Result<bool>
     where
         F: VfsFile + 'static,
     {
@@ -3467,9 +3463,7 @@ impl ShardedPageCache {
             return Some(preferred);
         }
 
-        candidates.sort_unstable_by_key(|snapshot| {
-            (snapshot.access_count, snapshot.page_no.get())
-        });
+        candidates.sort_unstable_by_key(|snapshot| (snapshot.access_count, snapshot.page_no.get()));
         candidates
             .into_iter()
             .find(|snapshot| snapshot.dirty)
@@ -4468,10 +4462,8 @@ mod tests {
                 .ok_or_else(|| FrankenError::internal("writeback parent task was not recorded"))?;
             self.observed_child_task
                 .store(native_cx.task_id() != parent_task, Ordering::Release);
-            self.observed_parent_region.store(
-                native_cx.region_id() == parent_region,
-                Ordering::Release,
-            );
+            self.observed_parent_region
+                .store(native_cx.region_id() == parent_region, Ordering::Release);
 
             if self.fail_writes {
                 return Err(FrankenError::internal(
@@ -4658,8 +4650,7 @@ mod tests {
         let task_cache = Arc::clone(&cache);
         let task_file = Arc::clone(&file);
         let writeback = runtime.handle().spawn(async move {
-            let native_cx =
-                asupersync::Cx::current().expect("runtime task must expose native Cx");
+            let native_cx = asupersync::Cx::current().expect("runtime task must expose native Cx");
             task_file.set_parent(&native_cx);
             let cx = Cx::new();
             cx.set_native_cx(native_cx);
@@ -4702,8 +4693,7 @@ mod tests {
         let task_cache = Arc::clone(&cache);
         let task_file = Arc::clone(&file);
         let writeback = runtime.handle().spawn(async move {
-            let native_cx =
-                asupersync::Cx::current().expect("runtime task must expose native Cx");
+            let native_cx = asupersync::Cx::current().expect("runtime task must expose native Cx");
             task_file.set_parent(&native_cx);
             let cx = Cx::new();
             cx.set_native_cx(native_cx);

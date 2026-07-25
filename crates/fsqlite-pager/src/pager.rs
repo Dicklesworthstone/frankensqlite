@@ -73,7 +73,6 @@ use fsqlite_wal::{
     parallel_wal_mode_name, parallel_wal_shadow_verdict_name, parallel_wal_should_shadow_compare,
     resolve_parallel_wal_control_surface_from_env,
 };
-
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn prefetch_l1_read<T>(ptr: *const T) {
@@ -15071,7 +15070,26 @@ where
                 return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                 drop(inner);
             }
-            commit_result
+            match commit_result {
+                Ok(()) => Ok(()),
+                Err(commit_error) => {
+                    // A failed rollback-journal commit may have changed durable
+                    // database pages after making the pre-image journal hot.
+                    // Finish that recovery epoch before the async commit future
+                    // resolves so callers never observe a half-published image
+                    // and Drop does not need to block an executor.
+                    let cleanup_cx = self.cleanup_cx.clone();
+                    let _cleanup_mask = cleanup_cx.masked();
+                    if let Err(recovery_error) =
+                        self.recover_pending_rollback_journal(&cleanup_cx).await
+                    {
+                        return Err(FrankenError::internal(format!(
+                            "commit failed and rollback-journal recovery did not complete: commit={commit_error}; recovery={recovery_error}"
+                        )));
+                    }
+                    Err(commit_error)
+                }
+            }
         }
     }
 

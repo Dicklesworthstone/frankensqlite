@@ -13,6 +13,7 @@ use std::ffi::OsString;
 #[cfg(unix)]
 use std::io::{Seek, SeekFrom, Write};
 
+use fsqlite_e2e::block_on;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_harness::fault_vfs::{
     FaultInjectingVfs, FaultKind, FaultMetricsSnapshot, FaultSpec, FaultTriggerRecord,
@@ -53,17 +54,20 @@ fn sample_page(fill: u8) -> Vec<u8> {
 
 fn seed_committed_page(backing: &MemoryVfs, path: &Path, fill: u8) -> (PageNumber, Vec<u8>) {
     let cx = Cx::new();
-    let pager = SimplePager::open_with_cx(&cx, backing.clone(), path, PageSize::DEFAULT)
-        .expect("open seed pager");
+    let pager = block_on(SimplePager::open_with_cx(
+        &cx,
+        backing.clone(),
+        path,
+        PageSize::DEFAULT,
+    ))
+    .expect("open seed pager");
     let original = sample_page(fill);
     let page_no = {
-        let mut txn = pager
-            .begin(&cx, TransactionMode::Immediate)
-            .expect("begin seed txn");
-        let page_no = txn.allocate_page(&cx).expect("allocate seed page");
-        txn.write_page(&cx, page_no, &original)
-            .expect("write seed page");
-        txn.commit(&cx).expect("commit seed txn");
+        let mut txn =
+            block_on(pager.begin(&cx, TransactionMode::Immediate)).expect("begin seed txn");
+        let page_no = block_on(txn.allocate_page(&cx)).expect("allocate seed page");
+        block_on(txn.write_page(&cx, page_no, &original)).expect("write seed page");
+        block_on(txn.commit(&cx)).expect("commit seed txn");
         page_no
     };
     drop(pager);
@@ -72,13 +76,15 @@ fn seed_committed_page(backing: &MemoryVfs, path: &Path, fill: u8) -> (PageNumbe
 
 fn read_committed_page(backing: &MemoryVfs, path: &Path, page_no: PageNumber) -> Vec<u8> {
     let cx = Cx::new();
-    let pager = SimplePager::open_with_cx(&cx, backing.clone(), path, PageSize::DEFAULT)
-        .expect("open reader pager");
-    let reader = pager
-        .begin(&cx, TransactionMode::ReadOnly)
-        .expect("begin readonly txn");
-    let bytes = reader
-        .get_page(&cx, page_no)
+    let pager = block_on(SimplePager::open_with_cx(
+        &cx,
+        backing.clone(),
+        path,
+        PageSize::DEFAULT,
+    ))
+    .expect("open reader pager");
+    let reader = block_on(pager.begin(&cx, TransactionMode::ReadOnly)).expect("begin readonly txn");
+    let bytes = block_on(reader.get_page(&cx, page_no))
         .expect("read committed page")
         .as_ref()
         .to_vec();
@@ -266,46 +272,58 @@ impl<F: VfsFile> VfsFile for TargetedFaultFile<F> {
         self.inner.close(cx)
     }
 
-    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        let fault = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(mut spec) = state.next_partial_read.take() {
-                if spec.skip_matches == 0 {
-                    state.triggered_partial_reads += 1;
-                    state.last_partial_read_detail = Some(format!(
-                        "offset={offset} requested={} valid_bytes={}",
-                        buf.len(),
-                        spec.valid_bytes
-                    ));
-                    Some(spec)
+    fn read<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+        async move {
+            let fault = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(mut spec) = state.next_partial_read.take() {
+                    if spec.skip_matches == 0 {
+                        state.triggered_partial_reads += 1;
+                        state.last_partial_read_detail = Some(format!(
+                            "offset={offset} requested={} valid_bytes={}",
+                            buf.len(),
+                            spec.valid_bytes
+                        ));
+                        Some(spec)
+                    } else {
+                        spec.skip_matches -= 1;
+                        state.next_partial_read = Some(spec);
+                        None
+                    }
                 } else {
-                    spec.skip_matches -= 1;
-                    state.next_partial_read = Some(spec);
                     None
                 }
-            } else {
-                None
-            }
-        };
+            };
 
-        if let Some(spec) = fault {
-            let requested = spec.valid_bytes.min(buf.len());
-            let mut scratch = vec![0_u8; requested];
-            let actual = self.inner.read(cx, &mut scratch, offset)?;
-            buf.fill(0);
-            if actual > 0 {
-                buf[..actual].copy_from_slice(&scratch[..actual]);
+            if let Some(spec) = fault {
+                let requested = spec.valid_bytes.min(buf.len());
+                let mut scratch = vec![0_u8; requested];
+                let actual = self.inner.read(cx, &mut scratch, offset).await?;
+                buf.fill(0);
+                if actual > 0 {
+                    buf[..actual].copy_from_slice(&scratch[..actual]);
+                }
+                Ok(actual)
+            } else {
+                self.inner.read(cx, buf, offset).await
             }
-            Ok(actual)
-        } else {
-            self.inner.read(cx, buf, offset)
         }
     }
 
-    fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+    fn write<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
         self.inner.write(cx, buf, offset)
     }
 
@@ -390,16 +408,18 @@ fn fault_injection_disk_full_during_commit_preserves_preexisting_page() {
 
     let fault_vfs = FaultInjectingVfs::with_seed(backing.clone(), SUITE_SEED ^ 0x01);
     fault_vfs.inject_fault(FaultSpec::disk_full("*.db-journal").build());
-    let pager =
-        SimplePager::open_with_cx(&cx, fault_vfs, &path, PageSize::DEFAULT).expect("open pager");
+    let pager = block_on(SimplePager::open_with_cx(
+        &cx,
+        fault_vfs,
+        &path,
+        PageSize::DEFAULT,
+    ))
+    .expect("open pager");
 
     let err = {
-        let mut txn = pager
-            .begin(&cx, TransactionMode::Immediate)
-            .expect("begin txn");
-        txn.write_page(&cx, page_no, &sample_page(0x7A))
-            .expect("stage updated page");
-        txn.commit(&cx)
+        let mut txn = block_on(pager.begin(&cx, TransactionMode::Immediate)).expect("begin txn");
+        block_on(txn.write_page(&cx, page_no, &sample_page(0x7A))).expect("stage updated page");
+        block_on(txn.commit(&cx))
             .err()
             .unwrap_or_else(|| panic!("commit should fail"))
     };
@@ -442,16 +462,18 @@ fn fault_injection_io_error_mid_write_recovers_original_page_on_reopen() {
 
     let fault_vfs = FaultInjectingVfs::with_seed(backing.clone(), SUITE_SEED ^ 0x02);
     fault_vfs.inject_fault(FaultSpec::partial_write("*.db").bytes_written(128).build());
-    let pager =
-        SimplePager::open_with_cx(&cx, fault_vfs, &path, PageSize::DEFAULT).expect("open pager");
+    let pager = block_on(SimplePager::open_with_cx(
+        &cx,
+        fault_vfs,
+        &path,
+        PageSize::DEFAULT,
+    ))
+    .expect("open pager");
 
     let err = {
-        let mut txn = pager
-            .begin(&cx, TransactionMode::Immediate)
-            .expect("begin txn");
-        txn.write_page(&cx, page_no, &sample_page(0x8C))
-            .expect("stage updated page");
-        txn.commit(&cx)
+        let mut txn = block_on(pager.begin(&cx, TransactionMode::Immediate)).expect("begin txn");
+        block_on(txn.write_page(&cx, page_no, &sample_page(0x8C))).expect("stage updated page");
+        block_on(txn.commit(&cx))
             .err()
             .unwrap_or_else(|| panic!("commit should fail"))
     };
@@ -497,18 +519,20 @@ fn fault_injection_partial_read_on_page_fetch_reports_short_read_diagnostic() {
     let cx = Cx::new();
 
     let fault_vfs = TargetedFaultVfs::new(backing.clone());
-    let pager =
-        SimplePager::open_with_cx(&cx, fault_vfs, &path, PageSize::DEFAULT).expect("open pager");
+    let pager = block_on(SimplePager::open_with_cx(
+        &cx,
+        fault_vfs,
+        &path,
+        PageSize::DEFAULT,
+    ))
+    .expect("open pager");
 
-    let reader = pager
-        .begin(&cx, TransactionMode::ReadOnly)
-        .expect("begin readonly txn");
+    let reader = block_on(pager.begin(&cx, TransactionMode::ReadOnly)).expect("begin readonly txn");
     pager
         .vfs_handle()
         .inject_partial_read_after(0, PageSize::DEFAULT.as_usize() / 2);
-    let err = reader
-        .get_page(&cx, page_no)
-        .expect_err("short read on page fetch should fail");
+    let err =
+        block_on(reader.get_page(&cx, page_no)).expect_err("short read on page fetch should fail");
     let detail = match &err {
         FrankenError::DatabaseCorrupt { detail } => detail,
         other => panic!("expected DatabaseCorrupt for short read, got {other:?}"),
@@ -554,16 +578,18 @@ fn fault_injection_fsync_failure_during_commit_preserves_preexisting_page() {
 
     let fault_vfs = TargetedFaultVfs::new(backing.clone());
     fault_vfs.inject_sync_io();
-    let pager =
-        SimplePager::open_with_cx(&cx, fault_vfs, &path, PageSize::DEFAULT).expect("open pager");
+    let pager = block_on(SimplePager::open_with_cx(
+        &cx,
+        fault_vfs,
+        &path,
+        PageSize::DEFAULT,
+    ))
+    .expect("open pager");
 
     let err = {
-        let mut txn = pager
-            .begin(&cx, TransactionMode::Immediate)
-            .expect("begin txn");
-        txn.write_page(&cx, page_no, &sample_page(0xC1))
-            .expect("stage updated page");
-        txn.commit(&cx)
+        let mut txn = block_on(pager.begin(&cx, TransactionMode::Immediate)).expect("begin txn");
+        block_on(txn.write_page(&cx, page_no, &sample_page(0xC1))).expect("stage updated page");
+        block_on(txn.commit(&cx))
             .err()
             .unwrap_or_else(|| panic!("commit should fail"))
     };
@@ -713,6 +739,10 @@ struct VacuumFaultVfs<V: Vfs> {
 #[cfg(unix)]
 impl<V: Vfs> VacuumFaultVfs<V> {
     fn new(inner: V, source_path: PathBuf, candidate_path: PathBuf) -> Self {
+        let source_path =
+            std::fs::canonicalize(source_path).expect("canonicalize VACUUM source path");
+        let candidate_path =
+            std::fs::canonicalize(candidate_path).expect("canonicalize VACUUM candidate path");
         let journal_path = journal_path_for(&source_path);
         Self {
             inner,
@@ -1009,52 +1039,66 @@ impl<F: VfsFile> VfsFile for VacuumFaultFile<F> {
         self.inner.file_identity()
     }
 
-    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+    fn read<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
         self.inner.read(cx, buf, offset)
     }
 
-    fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        match take_silent_replay_write_action(&self.state, self.role) {
-            Some(SilentReplayWriteAction::TriggerRollback) => {
-                self.inner.write(cx, buf, offset)?;
+    fn write<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            match take_silent_replay_write_action(&self.state, self.role) {
+                Some(SilentReplayWriteAction::TriggerRollback) => {
+                    self.inner.write(cx, buf, offset).await?;
+                    return Err(vacuum_injected_error(
+                        "trigger-rollback-before-silent-replay-corruption",
+                    ));
+                }
+                Some(SilentReplayWriteAction::CorruptSilently) => {
+                    let mut corrupted = buf.to_vec();
+                    let byte = corrupted.last_mut().ok_or_else(|| {
+                        FrankenError::internal("silent replay corruption received an empty write")
+                    })?;
+                    // Keep the SQLite header parseable so a fresh pager can reach
+                    // hot-journal recovery; corrupt only restored payload bytes.
+                    *byte ^= 0x5a;
+                    return self.inner.write(cx, &corrupted, offset).await;
+                }
+                None => {}
+            }
+            if let Some(parent_cx) =
+                take_parent_to_cancel_after_source_write(&self.state, self.role)
+            {
+                // Apply one complete target-page write first, then cancel the
+                // caller and force the publisher down its hot-journal replay path.
+                // The replay must use its independently masked cleanup context;
+                // returning before the old image is restored would make the test's
+                // byte and live-peer assertions fail immediately.
+                self.inner.write(cx, buf, offset).await?;
+                parent_cx.cancel();
                 return Err(vacuum_injected_error(
-                    "trigger-rollback-before-silent-replay-corruption",
+                    "source-first-write-parent-cancellation",
                 ));
             }
-            Some(SilentReplayWriteAction::CorruptSilently) => {
-                let mut corrupted = buf.to_vec();
-                let byte = corrupted.last_mut().ok_or_else(|| {
-                    FrankenError::internal("silent replay corruption received an empty write")
-                })?;
-                // Keep the SQLite header parseable so a fresh pager can reach
-                // hot-journal recovery; corrupt only restored payload bytes.
-                *byte ^= 0x5a;
-                return self.inner.write(cx, &corrupted, offset);
-            }
-            None => {}
-        }
-        if let Some(parent_cx) = take_parent_to_cancel_after_source_write(&self.state, self.role) {
-            // Apply one complete target-page write first, then cancel the
-            // caller and force the publisher down its hot-journal replay path.
-            // The replay must use its independently masked cleanup context;
-            // returning before the old image is restored would make the test's
-            // byte and live-peer assertions fail immediately.
-            self.inner.write(cx, buf, offset)?;
-            parent_cx.cancel();
-            return Err(vacuum_injected_error(
-                "source-first-write-parent-cancellation",
-            ));
-        }
-        match take_vacuum_fault(&self.state, self.role, VacuumFaultOperation::Write) {
-            Some((VacuumFaultEffect::ReturnError, label)) => Err(vacuum_injected_error(label)),
-            Some((VacuumFaultEffect::PartialWrite { valid_bytes }, label)) => {
-                let applied = valid_bytes.min(buf.len());
-                if applied > 0 {
-                    self.inner.write(cx, &buf[..applied], offset)?;
+            match take_vacuum_fault(&self.state, self.role, VacuumFaultOperation::Write) {
+                Some((VacuumFaultEffect::ReturnError, label)) => Err(vacuum_injected_error(label)),
+                Some((VacuumFaultEffect::PartialWrite { valid_bytes }, label)) => {
+                    let applied = valid_bytes.min(buf.len());
+                    if applied > 0 {
+                        self.inner.write(cx, &buf[..applied], offset).await?;
+                    }
+                    Err(vacuum_injected_error(label))
                 }
-                Err(vacuum_injected_error(label))
+                None => self.inner.write(cx, buf, offset).await,
             }
-            None => self.inner.write(cx, buf, offset),
         }
     }
 
@@ -1203,24 +1247,22 @@ impl VacuumPublicationFixture {
         create_sqlite_vacuum_fixture(&candidate_path, VACUUM_CANDIDATE_ROW_COUNT, 320, 0xA1);
 
         let cx = Cx::new();
-        let pager = SimplePager::open_with_cx(
+        let pager = block_on(SimplePager::open_with_cx(
             &cx,
             VacuumFaultVfs::new(UnixVfs::new(), source_path.clone(), candidate_path.clone()),
             &source_path,
             PageSize::DEFAULT,
-        )
+        ))
         .expect("open real-VFS source pager");
-        let source_receipt = pager
-            .capture_vacuum_source_image(&cx)
-            .expect("capture source image receipt");
+        let source_receipt =
+            block_on(pager.capture_vacuum_source_image(&cx)).expect("capture source image receipt");
         let next_change_counter = source_receipt
             .header()
             .change_counter
             .wrapping_add(1)
             .max(1);
         patch_database_change_counter(&candidate_path, next_change_counter);
-        let candidate_receipt = pager
-            .inspect_database_image(&cx, &candidate_path)
+        let candidate_receipt = block_on(pager.inspect_database_image(&cx, &candidate_path))
             .expect("capture candidate image receipt");
         let source_bytes = std::fs::read(&source_path).expect("read source fixture bytes");
         let candidate_bytes = std::fs::read(&candidate_path).expect("read candidate fixture bytes");
@@ -1250,9 +1292,7 @@ impl VacuumPublicationFixture {
     }
 
     fn refresh_receipts_after_peer_open(&mut self) {
-        self.source_receipt = self
-            .pager
-            .capture_vacuum_source_image(&self.cx)
+        self.source_receipt = block_on(self.pager.capture_vacuum_source_image(&self.cx))
             .expect("recapture source after opening live peer");
         let next_change_counter = self
             .source_receipt
@@ -1261,10 +1301,11 @@ impl VacuumPublicationFixture {
             .wrapping_add(1)
             .max(1);
         patch_database_change_counter(&self.candidate_path, next_change_counter);
-        self.candidate_receipt = self
-            .pager
-            .inspect_database_image(&self.cx, &self.candidate_path)
-            .expect("recapture candidate after opening live peer");
+        self.candidate_receipt = block_on(
+            self.pager
+                .inspect_database_image(&self.cx, &self.candidate_path),
+        )
+        .expect("recapture candidate after opening live peer");
         self.source_bytes = std::fs::read(&self.source_path).expect("refresh source fixture bytes");
         self.candidate_bytes =
             std::fs::read(&self.candidate_path).expect("refresh candidate fixture bytes");
@@ -1315,11 +1356,10 @@ fn assert_both_engines_integrity(path: &Path, expected_rows: i64, label: &str) {
     drop(sqlite);
 
     let path_text = path.to_string_lossy();
-    let frank = fsqlite::Connection::open(path_text.as_ref())
+    let frank = block_on(fsqlite::Connection::open(path_text.as_ref()))
         .unwrap_or_else(|error| panic!("{label}: FrankenSQLite open failed: {error}"));
     for pragma in ["quick_check", "integrity_check"] {
-        let rows = frank
-            .query(&format!("PRAGMA {pragma};"))
+        let rows = block_on(frank.query(&format!("PRAGMA {pragma};")))
             .unwrap_or_else(|error| panic!("{label}: FrankenSQLite {pragma} failed: {error}"));
         assert_eq!(rows.len(), 1, "{label}: FrankenSQLite {pragma} rows");
         assert_eq!(
@@ -1328,8 +1368,7 @@ fn assert_both_engines_integrity(path: &Path, expected_rows: i64, label: &str) {
             "{label}: FrankenSQLite {pragma}"
         );
     }
-    let rows = frank
-        .query("SELECT COUNT(*) FROM payload;")
+    let rows = block_on(frank.query("SELECT COUNT(*) FROM payload;"))
         .unwrap_or_else(|error| panic!("{label}: FrankenSQLite row count failed: {error}"));
     assert_eq!(rows.len(), 1, "{label}: FrankenSQLite count rows");
     assert_eq!(
@@ -1358,8 +1397,7 @@ fn assert_live_franken_integrity(
     label: &str,
 ) {
     for pragma in ["quick_check", "integrity_check"] {
-        let rows = connection
-            .query(&format!("PRAGMA {pragma};"))
+        let rows = block_on(connection.query(&format!("PRAGMA {pragma};")))
             .unwrap_or_else(|error| panic!("{label}: live peer {pragma} failed: {error}"));
         assert_eq!(rows.len(), 1, "{label}: live peer {pragma} rows");
         assert_eq!(
@@ -1368,8 +1406,7 @@ fn assert_live_franken_integrity(
             "{label}: live peer {pragma}"
         );
     }
-    let rows = connection
-        .query("SELECT COUNT(*) FROM payload;")
+    let rows = block_on(connection.query("SELECT COUNT(*) FROM payload;"))
         .unwrap_or_else(|error| panic!("{label}: live peer row count failed: {error}"));
     assert_eq!(rows.len(), 1, "{label}: live peer count rows");
     assert_eq!(
@@ -1428,15 +1465,19 @@ fn vacuum_publication_precommit_fault_matrix_restores_exact_source_and_retries()
         let source_identity = fixture.source_receipt.identity();
         vfs.arm(spec);
 
-        let error = fixture
-            .pager
-            .publish_validated_database_image(
-                &fixture.cx,
-                &fixture.candidate_path,
-                &fixture.source_receipt,
-                &fixture.candidate_receipt,
-            )
-            .expect_err("pre-commit injected fault must fail publication");
+        let publication = block_on(fixture.pager.publish_validated_database_image(
+            &fixture.cx,
+            &fixture.candidate_path,
+            &fixture.source_receipt,
+            &fixture.candidate_receipt,
+        ));
+        let error = match publication {
+            Err(error) => error,
+            Ok(()) => panic!(
+                "pre-commit injected fault must fail publication: spec={spec:?}, snapshot={:?}",
+                vfs.snapshot()
+            ),
+        };
         assert!(
             error.to_string().contains(spec.label),
             "{}: injected diagnostic was lost: {error}",
@@ -1454,14 +1495,12 @@ fn vacuum_publication_precommit_fault_matrix_restores_exact_source_and_retries()
             spec.label
         );
         assert_eq!(
-            fixture.pager.file_identity().expect("source identity"),
+            block_on(fixture.pager.file_identity(&fixture.cx)).expect("source identity"),
             Some(source_identity),
             "{}: failed publication replaced the source inode",
             spec.label
         );
-        let restored_receipt = fixture
-            .pager
-            .capture_vacuum_source_image(&fixture.cx)
+        let restored_receipt = block_on(fixture.pager.capture_vacuum_source_image(&fixture.cx))
             .expect("recapture restored source image");
         assert!(
             restored_receipt == fixture.source_receipt,
@@ -1477,17 +1516,13 @@ fn vacuum_publication_precommit_fault_matrix_restores_exact_source_and_retries()
         );
 
         vfs.disarm();
-        fixture
-            .pager
-            .publish_validated_database_image(
-                &fixture.cx,
-                &fixture.candidate_path,
-                &fixture.source_receipt,
-                &fixture.candidate_receipt,
-            )
-            .unwrap_or_else(|retry_error| {
-                panic!("{}: clean retry failed: {retry_error}", spec.label)
-            });
+        block_on(fixture.pager.publish_validated_database_image(
+            &fixture.cx,
+            &fixture.candidate_path,
+            &fixture.source_receipt,
+            &fixture.candidate_receipt,
+        ))
+        .unwrap_or_else(|retry_error| panic!("{}: clean retry failed: {retry_error}", spec.label));
         let published_bytes =
             std::fs::read(&fixture.source_path).expect("read retried publication");
         assert_eq!(
@@ -1495,9 +1530,7 @@ fn vacuum_publication_precommit_fault_matrix_restores_exact_source_and_retries()
             "{}: retry did not publish the exact candidate bytes",
             spec.label
         );
-        let published_receipt = fixture
-            .pager
-            .capture_vacuum_source_image(&fixture.cx)
+        let published_receipt = block_on(fixture.pager.capture_vacuum_source_image(&fixture.cx))
             .expect("capture retried publication");
         assert_image_matches_candidate(
             &published_receipt,
@@ -1515,9 +1548,8 @@ fn vacuum_publication_parent_cancellation_after_first_target_write_restores_befo
 
     let mut fixture = VacuumPublicationFixture::new();
     let source_path_text = fixture.source_path.to_string_lossy().into_owned();
-    let live_peer = fsqlite::Connection::open(&source_path_text).expect("open live peer");
-    live_peer
-        .execute("PRAGMA fsqlite.concurrent_mode=OFF;")
+    let live_peer = block_on(fsqlite::Connection::open(&source_path_text)).expect("open live peer");
+    block_on(live_peer.execute("PRAGMA fsqlite.concurrent_mode=OFF;"))
         .expect("keep cancellation fixture in rollback-journal format");
     assert_live_franken_integrity(&live_peer, VACUUM_SOURCE_ROW_COUNT, LABEL);
     fixture.refresh_receipts_after_peer_open();
@@ -1525,15 +1557,13 @@ fn vacuum_publication_parent_cancellation_after_first_target_write_restores_befo
     let vfs = fixture.pager.vfs_handle();
     let source_identity = fixture.source_receipt.identity();
     vfs.arm_cancel_after_first_source_write(&fixture.cx);
-    let error = fixture
-        .pager
-        .publish_validated_database_image(
-            &fixture.cx,
-            &fixture.candidate_path,
-            &fixture.source_receipt,
-            &fixture.candidate_receipt,
-        )
-        .expect_err("cancellation after the first target write must select rollback");
+    let error = block_on(fixture.pager.publish_validated_database_image(
+        &fixture.cx,
+        &fixture.candidate_path,
+        &fixture.source_receipt,
+        &fixture.candidate_receipt,
+    ))
+    .expect_err("cancellation after the first target write must select rollback");
     assert!(
         error.to_string().contains(LABEL),
         "cancellation diagnostic was lost: {error}"
@@ -1554,15 +1584,13 @@ fn vacuum_publication_parent_cancellation_after_first_target_write_restores_befo
         fixture.source_bytes,
         "publisher returned before restoring the exact old source image"
     );
+    let verification_cx = Cx::new();
     assert_eq!(
-        fixture.pager.file_identity().expect("source identity"),
+        block_on(fixture.pager.file_identity(&verification_cx)).expect("source identity"),
         Some(source_identity),
         "cancelled publication replaced the source inode"
     );
-    let verification_cx = Cx::new();
-    let restored_receipt = fixture
-        .pager
-        .capture_vacuum_source_image(&verification_cx)
+    let restored_receipt = block_on(fixture.pager.capture_vacuum_source_image(&verification_cx))
         .expect("maintenance locks must be released despite parent cancellation");
     assert!(
         restored_receipt == fixture.source_receipt,
@@ -1581,15 +1609,13 @@ fn vacuum_silent_replay_corruption_stays_hot_and_recovers_on_fresh_open() {
     let fault_vfs = fixture.pager.vfs_handle();
     fault_vfs.arm_silent_replay_corruption();
 
-    let error = fixture
-        .pager
-        .publish_validated_database_image(
-            &fixture.cx,
-            &fixture.candidate_path,
-            &fixture.source_receipt,
-            &fixture.candidate_receipt,
-        )
-        .expect_err("silent replay corruption must fail exact rollback verification");
+    let error = block_on(fixture.pager.publish_validated_database_image(
+        &fixture.cx,
+        &fixture.candidate_path,
+        &fixture.source_receipt,
+        &fixture.candidate_receipt,
+    ))
+    .expect_err("silent replay corruption must fail exact rollback verification");
     assert!(
         error
             .to_string()
@@ -1605,10 +1631,7 @@ fn vacuum_silent_replay_corruption_stays_hot_and_recovers_on_fresh_open() {
         "failed replay verification invalidated the only recovery record"
     );
     assert!(
-        fixture
-            .pager
-            .capture_vacuum_source_image(&fixture.cx)
-            .is_err(),
+        block_on(fixture.pager.capture_vacuum_source_image(&fixture.cx)).is_err(),
         "a pager with unverified recovery must remain fail-closed"
     );
 
@@ -1628,15 +1651,19 @@ fn vacuum_silent_replay_corruption_stays_hot_and_recovers_on_fresh_open() {
     drop(fault_vfs);
     drop(pager);
 
-    let recovered = SimplePager::open_with_cx(&cx, recovery_vfs, &source_path, PageSize::DEFAULT)
-        .expect("fresh open must retry and verify the retained hot journal");
+    let recovered = block_on(SimplePager::open_with_cx(
+        &cx,
+        recovery_vfs,
+        &source_path,
+        PageSize::DEFAULT,
+    ))
+    .expect("fresh open must retry and verify the retained hot journal");
     assert_eq!(
         std::fs::read(&source_path).expect("read freshly recovered source"),
         source_bytes,
         "fresh recovery did not restore the exact pre-publication bytes"
     );
-    let recovered_receipt = recovered
-        .capture_vacuum_source_image(&cx)
+    let recovered_receipt = block_on(recovered.capture_vacuum_source_image(&cx))
         .expect("freshly recovered pager must leave recovery clean");
     assert!(
         recovered_receipt == original_receipt,
@@ -1650,14 +1677,13 @@ fn vacuum_silent_replay_corruption_stays_hot_and_recovers_on_fresh_open() {
 
 #[cfg(unix)]
 #[test]
-fn rollback_journal_failed_commit_drop_replays_hot_journal_before_return() {
+fn rollback_journal_failed_commit_recovers_before_return() {
     const LABEL: &str = "ordinary-commit-source-partial-write";
 
     let mut fixture = VacuumPublicationFixture::new();
     let source_path_text = fixture.source_path.to_string_lossy().into_owned();
-    let live_peer = fsqlite::Connection::open(&source_path_text).expect("open live peer");
-    live_peer
-        .execute("PRAGMA fsqlite.concurrent_mode=OFF;")
+    let live_peer = block_on(fsqlite::Connection::open(&source_path_text)).expect("open live peer");
+    block_on(live_peer.execute("PRAGMA fsqlite.concurrent_mode=OFF;"))
         .expect("keep failed-commit fixture in rollback-journal format");
     assert_live_franken_integrity(&live_peer, VACUUM_SOURCE_ROW_COUNT, LABEL);
     fixture.refresh_receipts_after_peer_open();
@@ -1670,16 +1696,12 @@ fn rollback_journal_failed_commit_drop_replays_hot_journal_before_return() {
 
     let vfs = fixture.pager.vfs_handle();
     let spec = VacuumFaultSpec::partial_write(LABEL, VacuumFileRole::Source, 1, 128);
-    let mut transaction = fixture
-        .pager
-        .begin(&fixture.cx, TransactionMode::Immediate)
+    let mut transaction = block_on(fixture.pager.begin(&fixture.cx, TransactionMode::Immediate))
         .expect("begin ordinary rollback-journal transaction");
-    transaction
-        .write_page(&fixture.cx, PageNumber::ONE, &failed_page_one)
+    block_on(transaction.write_page(&fixture.cx, PageNumber::ONE, &failed_page_one))
         .expect("stage page-one overwrite");
     vfs.arm(spec);
-    let error = transaction
-        .commit(&fixture.cx)
+    let error = block_on(transaction.commit(&fixture.cx))
         .expect_err("partial target write must fail ordinary commit");
     assert!(
         error.to_string().contains(LABEL),
@@ -1689,63 +1711,49 @@ fn rollback_journal_failed_commit_drop_replays_hot_journal_before_return() {
     assert_eq!(snapshot.fired_label, Some(LABEL));
     assert_eq!(snapshot.matching_operations_seen, 1);
 
-    // The commit has already made its journal durable and partially touched
-    // the database. Recovery must therefore be the failed transaction's Drop
-    // responsibility rather than a later reopen side effect.
-    assert_ne!(
-        std::fs::read(&fixture.source_path).expect("read partially written database"),
+    // The commit made its journal durable and partially touched the database,
+    // but its async failure path must complete the recovery epoch before
+    // resolving. No later Drop or reopen may be required for atomicity.
+    assert_eq!(
+        std::fs::read(&fixture.source_path).expect("read commit-recovered database"),
         original_database,
-        "fault did not reach the target database after the hot journal"
+        "failed commit returned before restoring the exact pre-commit database"
     );
-    let hot_journal = std::fs::read(journal_path_for(&fixture.source_path))
-        .expect("failed commit must leave its durable hot journal available to Drop");
-    assert!(
-        hot_journal.len() >= 8 && hot_journal[..8].iter().any(|byte| *byte != 0),
-        "failed commit did not preserve a hot rollback journal"
-    );
+    assert_journal_is_absent_or_non_hot(&fixture.source_path, LABEL);
 
     drop(transaction);
 
-    // These checks run immediately after Drop returns. Exact file and page
-    // equality prove replay was synchronous; successful begin proves Pending
-    // state and the single-writer baton were both released.
-    assert_eq!(
-        std::fs::read(&fixture.source_path).expect("read Drop-recovered database"),
-        original_database,
-        "Drop returned before restoring the exact pre-commit database"
-    );
-    assert_journal_is_absent_or_non_hot(&fixture.source_path, LABEL);
+    // Dropping the already-recovered failed transaction must release its
+    // snapshot and writer baton without changing the restored image.
     let verification_cx = Cx::new();
-    let mut reader = fixture
-        .pager
-        .begin(&verification_cx, TransactionMode::ReadOnly)
-        .expect("Drop recovery must clear pending state for the live pager");
+    let mut reader = block_on(
+        fixture
+            .pager
+            .begin(&verification_cx, TransactionMode::ReadOnly),
+    )
+    .expect("failed-commit recovery must clear pending state for the live pager");
     assert_eq!(
-        reader
-            .get_page(&verification_cx, PageNumber::ONE)
+        block_on(reader.get_page(&verification_cx, PageNumber::ONE))
             .expect("read recovered page one")
             .as_ref(),
         original_page_one.as_slice(),
         "live pager retained a partially written page after Drop recovery"
     );
-    reader
-        .commit(&verification_cx)
-        .expect("finish recovery verification reader");
+    block_on(reader.commit(&verification_cx)).expect("finish recovery verification reader");
     assert_live_franken_integrity(&live_peer, VACUUM_SOURCE_ROW_COUNT, LABEL);
 
     // A full clean journal commit on the same live pager proves recovery did
     // not merely make reads work while leaving writer state poisoned.
     vfs.disarm();
-    let mut retry = fixture
-        .pager
-        .begin(&verification_cx, TransactionMode::Immediate)
-        .expect("begin clean commit after Drop recovery");
-    retry
-        .write_page(&verification_cx, PageNumber::ONE, &original_page_one)
+    let mut retry = block_on(
+        fixture
+            .pager
+            .begin(&verification_cx, TransactionMode::Immediate),
+    )
+    .expect("begin clean commit after failed-commit recovery");
+    block_on(retry.write_page(&verification_cx, PageNumber::ONE, &original_page_one))
         .expect("stage clean retry page");
-    retry
-        .commit(&verification_cx)
-        .expect("clean commit after Drop recovery");
+    block_on(retry.commit(&verification_cx)).expect("clean commit after failed-commit recovery");
     assert_journal_is_absent_or_non_hot(&fixture.source_path, LABEL);
     assert_both_engines_integrity(&fixture.source_path, VACUUM_SOURCE_ROW_COUNT, LABEL);
     assert_live_franken_integrity(&live_peer, VACUUM_SOURCE_ROW_COUNT, LABEL);
@@ -1787,20 +1795,18 @@ fn vacuum_publication_postcommit_cleanup_faults_preserve_committed_candidate_and
         let source_identity = fixture.source_receipt.identity();
         vfs.arm(spec);
 
-        fixture
-            .pager
-            .publish_validated_database_image(
-                &fixture.cx,
-                &fixture.candidate_path,
-                &fixture.source_receipt,
-                &fixture.candidate_receipt,
+        block_on(fixture.pager.publish_validated_database_image(
+            &fixture.cx,
+            &fixture.candidate_path,
+            &fixture.source_receipt,
+            &fixture.candidate_receipt,
+        ))
+        .unwrap_or_else(|error| {
+            panic!(
+                "{}: post-commit cleanup fault changed success into error: {error}",
+                spec.label
             )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "{}: post-commit cleanup fault changed success into error: {error}",
-                    spec.label
-                )
-            });
+        });
         let snapshot = vfs.snapshot();
         assert_eq!(snapshot.fired_label, Some(spec.label));
         assert_eq!(snapshot.matching_operations_seen, spec.nth_match);
@@ -1811,16 +1817,15 @@ fn vacuum_publication_postcommit_cleanup_faults_preserve_committed_candidate_and
             spec.label
         );
         assert_eq!(
-            fixture.pager.file_identity().expect("source identity"),
+            block_on(fixture.pager.file_identity(&fixture.cx)).expect("source identity"),
             Some(source_identity),
             "{}: publication replaced the source inode",
             spec.label
         );
         assert_journal_is_absent_or_non_hot(&fixture.source_path, spec.label);
-        let first_published_receipt = fixture
-            .pager
-            .capture_vacuum_source_image(&fixture.cx)
-            .expect("capture committed candidate after cleanup fault");
+        let first_published_receipt =
+            block_on(fixture.pager.capture_vacuum_source_image(&fixture.cx))
+                .expect("capture committed candidate after cleanup fault");
         assert_image_matches_candidate(
             &first_published_receipt,
             &fixture.candidate_receipt,
@@ -1831,25 +1836,23 @@ fn vacuum_publication_postcommit_cleanup_faults_preserve_committed_candidate_and
         // accepted and cleaned, and that post-commit errors did not poison the
         // live pager's maintenance state.
         vfs.disarm();
-        let second_source = fixture
-            .pager
-            .capture_vacuum_source_image(&fixture.cx)
+        let second_source = block_on(fixture.pager.capture_vacuum_source_image(&fixture.cx))
             .expect("capture source for second publication");
         let next_change_counter = second_source.header().change_counter.wrapping_add(1).max(1);
         patch_database_change_counter(&fixture.candidate_path, next_change_counter);
-        let second_candidate = fixture
-            .pager
-            .inspect_database_image(&fixture.cx, &fixture.candidate_path)
-            .expect("inspect second candidate");
-        fixture
-            .pager
-            .publish_validated_database_image(
-                &fixture.cx,
-                &fixture.candidate_path,
-                &second_source,
-                &second_candidate,
-            )
-            .unwrap_or_else(|error| panic!("{}: second publication failed: {error}", spec.label));
+        let second_candidate = block_on(
+            fixture
+                .pager
+                .inspect_database_image(&fixture.cx, &fixture.candidate_path),
+        )
+        .expect("inspect second candidate");
+        block_on(fixture.pager.publish_validated_database_image(
+            &fixture.cx,
+            &fixture.candidate_path,
+            &second_source,
+            &second_candidate,
+        ))
+        .unwrap_or_else(|error| panic!("{}: second publication failed: {error}", spec.label));
         let second_candidate_bytes =
             std::fs::read(&fixture.candidate_path).expect("read second candidate");
         assert_eq!(
@@ -1858,10 +1861,9 @@ fn vacuum_publication_postcommit_cleanup_faults_preserve_committed_candidate_and
             "{}: second publication did not exactly match candidate",
             spec.label
         );
-        let second_published_receipt = fixture
-            .pager
-            .capture_vacuum_source_image(&fixture.cx)
-            .expect("capture second published image");
+        let second_published_receipt =
+            block_on(fixture.pager.capture_vacuum_source_image(&fixture.cx))
+                .expect("capture second published image");
         assert_image_matches_candidate(
             &second_published_receipt,
             &second_candidate,

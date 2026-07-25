@@ -688,24 +688,24 @@ where
     E: Write,
 {
     Box::pin(async move {
-    let contents = match std::fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) => {
-            let _ = writeln!(err, "error: {error}");
-            return None;
-        }
-    };
-    let mut nested = io::Cursor::new(contents.into_bytes());
-    run_shell(
-        connection,
-        current_db_path,
-        output_options,
-        &mut nested,
-        out,
-        err,
-        shell_options,
-    )
-    .await
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                let _ = writeln!(err, "error: {error}");
+                return None;
+            }
+        };
+        let mut nested = io::Cursor::new(contents.into_bytes());
+        run_shell(
+            connection,
+            current_db_path,
+            output_options,
+            &mut nested,
+            out,
+            err,
+            shell_options,
+        )
+        .await
     })
 }
 
