@@ -36,6 +36,179 @@ new kept, rejected, or non-candidate record, include the date, benchmark or
 artifact path, Beads comment or issue reference, touched source surface, and the
 retry condition so this preflight can emit actionable evidence.
 
+## 2026-07-26 - ATTRIBUTION HOLD: the current/control slowdown is not an async-only experiment
+
+- Target: the apparent broad regression reported while migrating the public
+  engine surface to async. A same-host `comprehensive-bench --quick` comparison
+  found C SQLite nearly unchanged while FrankenSQLite's current/control median
+  factor was about `1.895x`; this proves a FrankenSQLite-side historical delta,
+  not its cause. The control `b612eb7b` is 194 commits and 336 changed files
+  behind the current tree, spanning dependencies, benchmark code, and most
+  engine layers. See `bd-dqdoe`.
+- Evidence: both reports were generated on 2026-07-25 UTC on the same
+  Threadripper PRO 5995WX host with the same nightly toolchain and
+  `release-perf` profile. Current cohort
+  `5419dff5ed53fbc2e109dac0d6b9dfb5b9e7e1de` is
+  `tests/artifacts/perf/gate0-historical-drift-20260725T1625Z-trj/current-5419dff5.json`
+  with SHA-256
+  `9c9b93fea7e7288719c92b4b1b8af16c979875c037430580bd8377cdf5d878a2`;
+  control cohort `b612eb7b5513c03c7cf5a091208c9cfe7d20c755` is
+  `tests/artifacts/perf/gate0-historical-drift-20260725T1625Z-trj/control-b612eb7b.json`
+  with SHA-256
+  `fd59d2fdf37a0a4deddddeefe0fed583fa3664cb88f083fd6a5984ebd171a0e7`.
+  The durable files are byte-for-byte copies of the original
+  `trj:/data/tmp/fsqlite-bench-async-verify/{async-verify,ctrl-preasync}.json`
+  reports.
+  Across the 93 rows with both FrankenSQLite medians, the median of
+  current/control median-time ratios is `1.894854261715`; across 96 C SQLite
+  rows the same statistic is `1.000576994455`. These legacy reports omit
+  embedded Git identity and use the invalidated unpaired/adaptive design
+  documented below, so the external checkout receipts and hashes preserve only
+  a historical drift signal.
+- Result: causal labels such as “async made the engine 1.9x slower” are held.
+  The comparison is useful release-blocking evidence of drift, but it is not an
+  async-only A/B and must not justify an engine optimization by itself.
+- Retry attribution only with a buildable narrow boundary, identical benchmark
+  driver and settings, paired same-host ordering, work receipts, and a profile
+  or counter that measures the proposed mechanism. C SQLite stability is a
+  host-drift control; it does not turn a 194-commit interval into a causal A/B.
+
+## 2026-07-26 - BOUNDARY HOLD: `c967eaeb..13ec577f` localizes a merge interval, not one mechanism
+
+- Target: the narrowest buildable pre/post boundary around the public async
+  migration. `31fc4a3b` is not a valid cohort because the benchmark build fails
+  with eight synchronous-value-versus-`Future` errors in the B-tree cursor.
+  `c967eaeb014988ac0496c3acea24e69d4707fe68` and
+  `13ec577f14433b19a28ea67cc4400c542a2b4349` both build and accept the same
+  `--quick --filter txn --no-html --json-out` invocation.
+- Evidence: durable build logs, toolchain capture, and smoke reports are under
+  `tests/artifacts/perf/gate0-boundary-c967eaeb-13ec577f-20260725/`.
+  The original frozen binaries remain in the local campaign directory
+  `/data/projects/frankensqlite-boundary-gate0-20260725-Bi6rUk/artifacts/`;
+  the pre binary SHA-256 is
+  `f191c209ee46d887bb51ac217ed9a8071624023169c76380963cc83ec513bef5`;
+  the post binary SHA-256 is
+  `bcb9ce0f440375d96b26f5ee0d5e0a79e3b8b560632aabfa9c5705d54570c4d4`.
+  Their build-log SHA-256 values are
+  `a4bd41edc44cc29b0b45b1cbe12c5ff05ab6065b782c52aa81388b80a731cefd`
+  and
+  `5182953a662cc3260e0009c079757d07ffe2f099ee3eefcb543c2f0536dd8f9d`.
+  The follow-up diagnostic matrix is under
+  `tests/artifacts/perf/gate0-boundary-abba-c967eaeb-13ec577f-20260726T0531Z-trj/`:
+  24 fresh processes in six alternating ABBA/BAAB blocks, pinned to CPU 2 on a
+  128-logical-CPU Threadripper PRO 5995WX. All runs exited zero and emitted all
+  nine transaction rows. Equal-scenario, block-paired log contrasts give a
+  FrankenSQLite post/pre ratio of `2.650381` (diagnostic exact
+  order-stratified bootstrap
+  interval `[2.602754, 2.701227]`), a C SQLite post/pre control of `0.994767`
+  (`[0.985593, 1.003108]`), and a difference-in-differences ratio of `2.664324`
+  (`[2.609429, 2.720374]`). The host was lightly loaded and under the
+  performance governor, but CPU 2 was not isolated from its sibling, IRQs, or
+  unrelated work; the legacy driver also lacks the new symmetric work receipts,
+  so these intervals remain diagnostic rather than release-citable.
+- Result: the boundary now proves a large, repeatable FrankenSQLite-side timing
+  discontinuity while its within-run C control is stable. A second diagnostic
+  matrix at
+  `tests/artifacts/perf/gate0-boundary-three-cohort-c967eaeb-a0ab400a-13ec577f-20260726T0542Z-trj/`
+  ran all six permutations twice: 36 fresh processes, 12 complete
+  three-cohort blocks, each cohort in each position four times. The substantive
+  async-branch parent `a0ab400a` versus repaired parent `c967eaeb` is
+  `2.667659` for FrankenSQLite and `0.993471` for C SQLite; the
+  difference-in-differences is `2.685191` (diagnostic exact
+  permutation-stratified interval `[2.646376, 2.724576]`). The merge result
+  versus `a0ab400a` is only `1.003082` after the C control
+  (`[0.989065, 1.017297]`). Thus the merge
+  resolution itself adds no measurable aggregate discontinuity here; the
+  slowdown is already present in the async branch parent.
+- This still does not prove an async mechanism. The repaired and async branch
+  parents diverge from unbuildable `31fc4a3b` and differ across engine plus
+  driver code. `a0ab400a` also introduces the harness runtime bridge that makes
+  the benchmark buildable. The matrix cannot distinguish runtime entry per
+  operation from intrinsic engine work, boxing, stack frames, or another
+  branch change.
+- Retry with a same-source three-arm bridge experiment: one runtime entry for
+  the whole workload, one entry per operation, and a ready-future control.
+  Attribute any residual engine cost only after CPU/allocation profiles and a
+  one-variable A/B; keep profiling outside the timing matrix.
+
+## 2026-07-26 - REJECTED ATTRIBUTION: boxed WAL futures are not yet a measured root cause
+
+- Target: the hypothesis that one `Box::pin` allocation per `WalBackend` call
+  explains the write-heavy historical regression. `WalFuture` and
+  `LocalPagerFuture` boxing are already present before the narrow buildable
+  `c967eaeb..13ec577f` boundary, and no allocation count, heap profile, CPU
+  profile, or same-source boxed-versus-static-dispatch A/B established their
+  contribution.
+- Result: reject the causal claim and do not redesign the WAL trait boundary
+  from timing-shape intuition. The mechanism remains plausible, but the current
+  evidence ceiling is unknown.
+- Retry only after a paired boundary run reproduces the loss and a heap/CPU
+  profile attributes material timed-region cost to future allocation or dynamic
+  dispatch. Any candidate must preserve pluggable WAL semantics and pass an
+  allocation-count plus end-to-end paired keep gate.
+
+## 2026-07-26 - REJECTED: redundant trigger re-entry boxing does not solve recursive stack depth
+
+- Target: the hypothesis that an extra `Box::pin` around the already-boxed
+  trigger statement future would move enough async state to the heap to permit
+  materially deeper recursive triggers. This is the trigger re-entry path
+  tracked by `bd-wymdl`, not the hot `WalBackend` attribution above.
+- Evidence: a same-debug-profile pinned-stack A/B measured the extra wrapper as
+  adding about `1,200` bytes per recursive level; removing it is part of
+  `5fb10ffc`. After removal, an optimized build with `opt-level = "z"`,
+  `lto = false`, and `codegen-units = 16` still measured a steady
+  `129,328` bytes per level, of which `125,648` bytes was the
+  `execute_statement_impl_after_background_status` frame. The debug build
+  remained about `185,408` bytes per level. The targeted engine gate passed
+  114 tests, including the depth-limit and last-connection teardown
+  regressions. These are stack measurements, not throughput measurements.
+- Result: reject the redundant box. Heap storage for a future does not break
+  the recursive native-stack poll chain, and this instance made per-level stack
+  use worse. `MAX_TRIGGER_DEPTH` remains 8 so debug consumers receive an error
+  before process abort; approaching SQLite's depth of 1000 requires an explicit
+  statement work stack or another trampoline, not a larger thread stack or an
+  extra box.
+- Retry only after a compiler/runtime representation change or a design that
+  removes recursive polling. Re-measure both the default raw API and optional
+  worker API on pinned 1/2/4/8/16 MiB stacks, prove the configured depth error
+  fires before abort in debug and optimized profiles, and separately benchmark
+  any throughput effect rather than inferring it from frame size.
+
+## 2026-07-26 - INVALIDATED EVIDENCE: legacy comprehensive scorecards are diagnostic-only
+
+- Target: `comprehensive-bench` full/quick reports, including
+  `tests/artifacts/perf/cod-fullquick-refresh-20260722T1800Z/full-quick.json`.
+  The legacy driver measures all C SQLite samples before all FrankenSQLite
+  samples, lets each engine stop independently on an adaptive time budget, and
+  computes tail ratios from only a handful of unpaired samples. Many scored
+  write rows omit affected-row/final-state receipts, many reads discard results,
+  host/topology state is not release-gated, and historical concurrent-writer
+  rows used unmatched durability.
+- Result: existing numeric rows remain useful routing diagnostics, but their
+  aggregate score, p90/p99, “faster” count, and CI eligibility cannot support a
+  release or README performance claim. Gate 0 makes this measurement design
+  explicitly non-citable until the runner is paired and fully receipted.
+- Retry only after fixed-count paired ABBA/BAAB execution, symmetric work
+  oracles, matched read-back durability, topology-pinned host receipts, and
+  final artifact validation land. Do not compare a new candidate against these
+  historical scorecards as if they were a causal baseline.
+
+## 2026-07-26 - INVALIDATED EVIDENCE: pre-Gate-0 `mt-oltp-bench` reader and ratio rows
+
+- Target: earlier `mt-oltp-bench` mixed reader/writer output. The migrated
+  reader path could construct a future without polling it, ignore the query
+  result, and still increment its operation count; aggregate latency was
+  derived from thread summaries rather than retained operation samples, and
+  engine runs were not paired/counterbalanced.
+- Result: all pre-v2 reader latency/throughput and engine-ratio claims from this
+  binary are invalid. Merely wrapping the query in `block_on` is insufficient
+  unless errors, row cardinality/type/value, consumed payload, completed work,
+  database postflight, and ordering are also receipted.
+- Retry with report schema `fsqlite-e2e.mt_oltp_bench_report.v2` or newer and
+  external Gate-0 source/build/host provenance. The corrected harness must keep
+  exact expected/completed work, real operation latency samples, paired
+  alternating ABBA/BAAB order, full-precision ratios, and fail-closed JSON.
+
 ## 2026-07-11 - SURFACE: prepared ORDER BY/LIMIT bypasses the assigned runtime/storage lane
 
 - Target at `d9e9b811`: find one fresh, output-identical lever in B-tree,

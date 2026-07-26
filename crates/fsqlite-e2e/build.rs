@@ -53,6 +53,103 @@ fn emit(name: &str, value: impl AsRef<str>) {
     println!("cargo:rustc-env={name}={}", single_line(value.as_ref()));
 }
 
+fn selected_profile_from_out_dir() -> String {
+    env::var_os("OUT_DIR")
+        .map(std::path::PathBuf::from)
+        .and_then(|out_dir| {
+            out_dir
+                .ancestors()
+                .nth(3)
+                .and_then(Path::file_name)
+                .map(|profile| profile.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn profile_override_environment() -> String {
+    let mut overrides = env::vars()
+        .filter(|(name, _)| {
+            name.starts_with("CARGO_PROFILE_")
+                || matches!(
+                    name.as_str(),
+                    "CARGO_INCREMENTAL"
+                        | "CARGO_BUILD_INCREMENTAL"
+                        | "CARGO_BUILD_RUSTFLAGS"
+                        | "CARGO_BUILD_RUSTC_WRAPPER"
+                        | "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"
+                        | "RUSTC_WRAPPER"
+                        | "RUSTC_WORKSPACE_WRAPPER"
+                )
+                || (name.contains("RUSTFLAGS") && name != "CARGO_ENCODED_RUSTFLAGS")
+                || name.ends_with("_RUSTC")
+                || name.ends_with("_RUSTC_WRAPPER")
+        })
+        .collect::<Vec<_>>();
+    overrides.sort_unstable();
+    let mut encoded = String::new();
+    for (index, (name, value)) in overrides.into_iter().enumerate() {
+        if index != 0 {
+            encoded.push('\0');
+        }
+        encoded.push_str(&name);
+        encoded.push('=');
+        encoded.push_str(&value);
+    }
+    encoded
+}
+
+fn native_build_override_environment() -> String {
+    let exact_names = [
+        "AR",
+        "ARFLAGS",
+        "CC",
+        "CFLAGS",
+        "CPPFLAGS",
+        "CRATE_CC_NO_DEFAULTS",
+        "CXX",
+        "CXXFLAGS",
+        "LIBSQLITE3_FLAGS",
+        "LIBSQLITE3_SYS_USE_PKG_CONFIG",
+        "SQLITE3_INCLUDE_DIR",
+        "SQLITE3_LIB_DIR",
+        "SQLITE3_NO_PKG_CONFIG",
+        "SQLITE3_STATIC",
+    ];
+    let prefixes = [
+        "AR_",
+        "CC_",
+        "CFLAGS_",
+        "CMAKE_",
+        "CPPFLAGS_",
+        "CXX_",
+        "CXXFLAGS_",
+        "LIBSQLITE3_",
+        "PKG_CONFIG",
+        "SQLITE3_",
+        "SQLITE_",
+        "VCPKG_",
+    ];
+    let suffixes = ["_AR", "_CC", "_CFLAGS", "_CXX", "_CXXFLAGS", "_LINKER"];
+    let mut overrides = env::vars()
+        .filter(|(name, _)| {
+            exact_names.contains(&name.as_str())
+                || prefixes.iter().any(|prefix| name.starts_with(prefix))
+                || suffixes.iter().any(|suffix| name.ends_with(suffix))
+        })
+        .collect::<Vec<_>>();
+    overrides.sort_unstable();
+    let mut encoded = String::new();
+    for (index, (name, value)) in overrides.into_iter().enumerate() {
+        if index != 0 {
+            encoded.push('\0');
+        }
+        encoded.push_str(&name);
+        encoded.push('=');
+        encoded.push_str(&value);
+    }
+    encoded
+}
+
 fn main() {
     let manifest_dir = env::var_os("CARGO_MANIFEST_DIR")
         .map(std::path::PathBuf::from)
@@ -110,8 +207,16 @@ fn main() {
         env::var("PROFILE").unwrap_or_else(|_| "unknown".to_owned()),
     );
     emit(
+        "FSQLITE_BENCH_BUILD_SELECTED_PROFILE",
+        selected_profile_from_out_dir(),
+    );
+    emit(
         "FSQLITE_BENCH_BUILD_PROFILE_LABEL",
         env::var("FSQLITE_BENCH_PROFILE_NAME").unwrap_or_else(|_| "unspecified".to_owned()),
+    );
+    emit(
+        "FSQLITE_BENCH_BUILD_NONCE",
+        env::var("FSQLITE_BENCH_BUILD_NONCE").unwrap_or_else(|_| "unknown".to_owned()),
     );
     emit(
         "FSQLITE_BENCH_BUILD_OPT_LEVEL",
@@ -141,6 +246,22 @@ fn main() {
                 .unwrap_or_default()
                 .as_bytes(),
         ),
+    );
+    emit(
+        "FSQLITE_BENCH_BUILD_ENCODED_RUSTFLAGS_PRESENT",
+        if env::var_os("CARGO_ENCODED_RUSTFLAGS").is_some() {
+            "true"
+        } else {
+            "false"
+        },
+    );
+    emit(
+        "FSQLITE_BENCH_BUILD_PROFILE_OVERRIDES_HEX",
+        hex_bytes(profile_override_environment().as_bytes()),
+    );
+    emit(
+        "FSQLITE_BENCH_BUILD_NATIVE_OVERRIDES_HEX",
+        hex_bytes(native_build_override_environment().as_bytes()),
     );
     emit(
         "FSQLITE_BENCH_BUILD_RUSTC_VERSION",
@@ -199,5 +320,50 @@ fn main() {
         }
     }
     println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
+    println!("cargo:rerun-if-env-changed=FSQLITE_BENCH_BUILD_NONCE");
     println!("cargo:rerun-if-env-changed=FSQLITE_BENCH_PROFILE_NAME");
+    for profile in ["RELEASE", "RELEASE_PERF"] {
+        for key in [
+            "OPT_LEVEL",
+            "LTO",
+            "CODEGEN_UNITS",
+            "PANIC",
+            "DEBUG",
+            "STRIP",
+            "INCREMENTAL",
+            "DEBUG_ASSERTIONS",
+            "OVERFLOW_CHECKS",
+            "RPATH",
+            "SPLIT_DEBUGINFO",
+        ] {
+            println!("cargo:rerun-if-env-changed=CARGO_PROFILE_{profile}_{key}");
+        }
+    }
+    for name in [
+        "AR",
+        "ARFLAGS",
+        "CC",
+        "CFLAGS",
+        "CARGO_INCREMENTAL",
+        "CARGO_BUILD_INCREMENTAL",
+        "CARGO_BUILD_RUSTC",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTFLAGS",
+        "CPPFLAGS",
+        "CRATE_CC_NO_DEFAULTS",
+        "CXX",
+        "CXXFLAGS",
+        "LIBSQLITE3_FLAGS",
+        "LIBSQLITE3_SYS_USE_PKG_CONFIG",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTFLAGS",
+        "SQLITE3_INCLUDE_DIR",
+        "SQLITE3_LIB_DIR",
+        "SQLITE3_NO_PKG_CONFIG",
+        "SQLITE3_STATIC",
+    ] {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
 }
