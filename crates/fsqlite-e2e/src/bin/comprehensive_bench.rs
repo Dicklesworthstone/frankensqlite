@@ -9259,6 +9259,52 @@ mod tests {
 
     #[cfg(feature = "bridge-experiment")]
     #[test]
+    fn bridge_competitor_classification_uses_full_process_identity() {
+        assert!(
+            !bridge_process_is_competitor("btrfs-cleaner", &[], None),
+            "an idle kernel thread must not fail the run by mere existence"
+        );
+        assert!(
+            bridge_process_is_competitor(
+                "btrfs",
+                &["/usr/bin/btrfs".to_owned(), "scrub".to_owned()],
+                Some("0::/user.slice/test.scope")
+            ),
+            "a userspace Btrfs maintenance command must remain blocked"
+        );
+        assert!(
+            !bridge_process_is_competitor(
+                "cargo-io-enforc",
+                &[
+                    "/bin/bash".to_owned(),
+                    "/home/ubuntu/.local/bin/cargo-io-enforcer".to_owned(),
+                ],
+                Some("0::/system.slice/cargo-io-enforcer.service")
+            ),
+            "the exact permanent build-priority monitor is not a Cargo build"
+        );
+        assert!(
+            bridge_process_is_competitor(
+                "cargo-io-enforc",
+                &["/bin/bash".to_owned(), "/tmp/cargo-io-enforcer".to_owned()],
+                Some("0::/user.slice/untrusted.scope")
+            ),
+            "a lookalike outside the exact service cgroup must fail closed"
+        );
+        assert!(bridge_process_is_competitor(
+            "cargo",
+            &["cargo".to_owned(), "build".to_owned()],
+            Some("0::/user.slice/test.scope")
+        ));
+        assert!(bridge_process_is_competitor(
+            "sbh",
+            &["sbh".to_owned(), "daemon".to_owned()],
+            Some("0::/user.slice/test.scope")
+        ));
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
     fn bridge_paired_comparison_uses_block_means() {
         let mut samples = Vec::new();
         for block_index in 0..12 {
@@ -11101,6 +11147,61 @@ fn bridge_pressure_some_average(path: &str, field: &str) -> Option<f64> {
 }
 
 #[cfg(feature = "bridge-experiment")]
+fn bridge_cmdline_has_program(cmdline: &[String], program: &str) -> bool {
+    cmdline.iter().any(|argument| {
+        std::path::Path::new(argument)
+            .file_name()
+            .is_some_and(|name| name == program)
+    })
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_process_is_competitor(comm: &str, cmdline: &[String], cgroup: Option<&str>) -> bool {
+    // Kernel threads have an empty cmdline. Their mere presence is not host
+    // activity: system-wide PSI and the checkpoints below still catch actual
+    // Btrfs work, while a userspace `btrfs` command remains blocked.
+    if cmdline.is_empty() {
+        return false;
+    }
+
+    // This permanent system service is a lightweight build-priority monitor,
+    // not a Cargo invocation. `/proc/<pid>/comm` truncates its name to
+    // `cargo-io-enforc`, so require both the exact service cgroup and script
+    // identity before exempting it; a real Cargo process still fails closed.
+    let cargo_io_enforcer = bridge_cmdline_has_program(cmdline, "cargo-io-enforcer")
+        && cgroup.is_some_and(|value| {
+            value
+                .lines()
+                .any(|line| line == "0::/system.slice/cargo-io-enforcer.service")
+        });
+    if cargo_io_enforcer {
+        return false;
+    }
+
+    let blocked = [
+        "btrfs",
+        "cargo",
+        "cc1",
+        "clang",
+        "comprehensive-b",
+        "fio",
+        "fsqlite",
+        "gcc",
+        "hyperfine",
+        "ld",
+        "make",
+        "mold",
+        "mt_oltp_bench",
+        "ninja",
+        "rustc",
+        "sbh",
+        "sccache",
+        "stress",
+    ];
+    blocked.iter().any(|prefix| comm.starts_with(prefix))
+}
+
+#[cfg(feature = "bridge-experiment")]
 fn bridge_competing_processes() -> Result<Vec<String>, String> {
     let current_pid = std::process::id();
     let entries = std::fs::read_dir("/proc")
@@ -11125,27 +11226,31 @@ fn bridge_competing_processes() -> Result<Vec<String>, String> {
                 return Err(format!("could not read /proc/{pid}/comm: {error}"));
             }
         };
-        let blocked = [
-            "btrfs",
-            "cargo",
-            "cc1",
-            "clang",
-            "comprehensive-b",
-            "fio",
-            "fsqlite",
-            "gcc",
-            "hyperfine",
-            "ld",
-            "make",
-            "mold",
-            "mt_oltp_bench",
-            "ninja",
-            "rustc",
-            "sbh",
-            "sccache",
-            "stress",
-        ];
-        if blocked.iter().any(|prefix| comm.starts_with(prefix)) {
+        let raw_cmdline = match std::fs::read(entry.path().join("cmdline")) {
+            Ok(cmdline) => cmdline,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!("could not read /proc/{pid}/cmdline: {error}"));
+            }
+        };
+        let cmdline = raw_cmdline
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty())
+            .map(|argument| String::from_utf8_lossy(argument).into_owned())
+            .collect::<Vec<_>>();
+        let possible_cargo_io_enforcer = bridge_cmdline_has_program(&cmdline, "cargo-io-enforcer");
+        let cgroup = if possible_cargo_io_enforcer {
+            match std::fs::read_to_string(entry.path().join("cgroup")) {
+                Ok(cgroup) => Some(cgroup),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!("could not read /proc/{pid}/cgroup: {error}"));
+                }
+            }
+        } else {
+            None
+        };
+        if bridge_process_is_competitor(&comm, &cmdline, cgroup.as_deref()) {
             competitors.push(format!("pid={pid},comm={comm}"));
         }
     }
