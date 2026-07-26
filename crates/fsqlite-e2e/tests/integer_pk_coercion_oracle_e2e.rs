@@ -7,6 +7,7 @@
 //! STRICTER than ordinary INTEGER affinity on a non-PK column, which happily
 //! stores 5.5 as a real and 'abc' as text. These verify both behaviours against
 //! rusqlite.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -24,8 +25,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -57,11 +58,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -71,7 +72,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -95,47 +96,56 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 
 #[test]
 fn integer_pk_coerces_text_real_and_null() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
-            "INSERT INTO t VALUES ('10','a')", // '10' -> 10
-            "INSERT INTO t VALUES (20.0,'b')", // 20.0 -> 20
-            "INSERT INTO t VALUES (NULL,'c')", // auto -> 21
-        ],
-        &[
-            "SELECT id, typeof(id), v FROM t ORDER BY id", // (10,integer,a),(20,integer,b),(21,integer,c)
-        ],
-        "integer_pk_coerces_text_real_and_null",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
+                "INSERT INTO t VALUES ('10','a')", // '10' -> 10
+                "INSERT INTO t VALUES (20.0,'b')", // 20.0 -> 20
+                "INSERT INTO t VALUES (NULL,'c')", // auto -> 21
+            ],
+            &[
+                "SELECT id, typeof(id), v FROM t ORDER BY id", // (10,integer,a),(20,integer,b),(21,integer,c)
+            ],
+            "integer_pk_coerces_text_real_and_null",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn integer_pk_rejects_non_integer() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
-            "INSERT INTO t VALUES (1,'ok')",
-            "INSERT INTO t VALUES (5.5,'x')", // not an integer rowid -> datatype mismatch
-            "INSERT INTO t VALUES ('abc','y')", // not coercible -> datatype mismatch
-            "INSERT INTO t VALUES (2,'ok2')",
-        ],
-        &["SELECT id, v FROM t ORDER BY id"], // (1,'ok'),(2,'ok2')
-        "integer_pk_rejects_non_integer",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
+                "INSERT INTO t VALUES (1,'ok')",
+                "INSERT INTO t VALUES (5.5,'x')", // not an integer rowid -> datatype mismatch
+                "INSERT INTO t VALUES ('abc','y')", // not coercible -> datatype mismatch
+                "INSERT INTO t VALUES (2,'ok2')",
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // (1,'ok'),(2,'ok2')
+            "integer_pk_rejects_non_integer",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn integer_affinity_non_pk_is_lenient() {
-    scenario(
-        &[
-            // A plain INTEGER column (not the rowid) keeps non-integer values.
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
-            "INSERT INTO t VALUES (1, 5.5)",   // stays real 5.5
-            "INSERT INTO t VALUES (2, 'abc')", // stays text 'abc'
-            "INSERT INTO t VALUES (3, '7')",   // coerces '7' -> 7
-            "INSERT INTO t VALUES (4, 9.0)",   // 9.0 -> integer 9 (no fractional part)
-        ],
-        &["SELECT id, typeof(n), n FROM t ORDER BY id"], // (1,real,5.5),(2,text,abc),(3,integer,7),(4,integer,9)
-        "integer_affinity_non_pk_is_lenient",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                // A plain INTEGER column (not the rowid) keeps non-integer values.
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
+                "INSERT INTO t VALUES (1, 5.5)",   // stays real 5.5
+                "INSERT INTO t VALUES (2, 'abc')", // stays text 'abc'
+                "INSERT INTO t VALUES (3, '7')",   // coerces '7' -> 7
+                "INSERT INTO t VALUES (4, 9.0)",   // 9.0 -> integer 9 (no fractional part)
+            ],
+            &["SELECT id, typeof(n), n FROM t ORDER BY id"], // (1,real,5.5),(2,text,abc),(3,integer,7),(4,integer,9)
+            "integer_affinity_non_pk_is_lenient",
+        )
+        .await;
+    });
 }

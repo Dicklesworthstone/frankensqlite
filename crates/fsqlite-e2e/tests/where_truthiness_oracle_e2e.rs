@@ -23,8 +23,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -56,10 +56,10 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -81,77 +81,89 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
     );
 }
 
-fn assert_scalar(queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn assert_scalar(queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
-    check(&f, &r, queries, label);
+    check(&f, &r, queries, label).await;
 }
 
 #[test]
 fn where_numeric_truthiness() {
-    assert_scalar(
-        &[
-            "SELECT 1 WHERE 1",    // [1]
-            "SELECT 1 WHERE 0",    // []
-            "SELECT 1 WHERE -3",   // [1] (non-zero)
-            "SELECT 1 WHERE 0.5",  // [1]
-            "SELECT 1 WHERE 0.0",  // []
-            "SELECT 1 WHERE NULL", // [] (NULL is not true)
-        ],
-        "where_numeric_truthiness",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT 1 WHERE 1",    // [1]
+                "SELECT 1 WHERE 0",    // []
+                "SELECT 1 WHERE -3",   // [1] (non-zero)
+                "SELECT 1 WHERE 0.5",  // [1]
+                "SELECT 1 WHERE 0.0",  // []
+                "SELECT 1 WHERE NULL", // [] (NULL is not true)
+            ],
+            "where_numeric_truthiness",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn where_text_truthiness_via_numeric_coercion() {
-    assert_scalar(
-        &[
-            "SELECT 1 WHERE '5'",    // [1] -> 5
-            "SELECT 1 WHERE '0'",    // []  -> 0
-            "SELECT 1 WHERE 'abc'",  // []  -> 0
-            "SELECT 1 WHERE '3abc'", // [1] -> 3 (numeric prefix)
-            "SELECT 1 WHERE '0abc'", // []  -> 0
-            "SELECT 1 WHERE '-2'",   // [1] -> -2 (non-zero)
-            "SELECT 1 WHERE ''",     // []  -> 0
-        ],
-        "where_text_truthiness_via_numeric_coercion",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT 1 WHERE '5'",    // [1] -> 5
+                "SELECT 1 WHERE '0'",    // []  -> 0
+                "SELECT 1 WHERE 'abc'",  // []  -> 0
+                "SELECT 1 WHERE '3abc'", // [1] -> 3 (numeric prefix)
+                "SELECT 1 WHERE '0abc'", // []  -> 0
+                "SELECT 1 WHERE '-2'",   // [1] -> -2 (non-zero)
+                "SELECT 1 WHERE ''",     // []  -> 0
+            ],
+            "where_text_truthiness_via_numeric_coercion",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn where_truthiness_combined_with_boolean_ops() {
-    assert_scalar(
-        &[
-            "SELECT 1 WHERE 'abc' OR 1",  // [1]
-            "SELECT 1 WHERE '5' AND 'x'", // [] (5 is true, 'x'->0 false)
-            "SELECT 1 WHERE NOT 'abc'",   // [1] (NOT false -> true)
-            "SELECT 1 WHERE NOT '5'",     // [] (NOT true)
-        ],
-        "where_truthiness_combined_with_boolean_ops",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT 1 WHERE 'abc' OR 1",  // [1]
+                "SELECT 1 WHERE '5' AND 'x'", // [] (5 is true, 'x'->0 false)
+                "SELECT 1 WHERE NOT 'abc'",   // [1] (NOT false -> true)
+                "SELECT 1 WHERE NOT '5'",     // [] (NOT true)
+            ],
+            "where_truthiness_combined_with_boolean_ops",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn where_truthiness_over_table_column() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    for s in [
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, v)",
-        "INSERT INTO t VALUES (1,5),(2,0),(3,'7'),(4,'abc'),(5,NULL),(6,0.0),(7,'0')",
-    ] {
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
-    check(
-        &f,
-        &r,
-        &[
-            // Truthiness per row: 5 true, 0 false, '7'->7 true, 'abc'->0 false,
-            // NULL false, 0.0 false, '0'->0 false. -> ids 1,3.
-            "SELECT id FROM t WHERE v ORDER BY id",
-            // NOT v inverts (NULL stays excluded by NOT NULL = NULL).
-            "SELECT id FROM t WHERE NOT v ORDER BY id", // 2,4,6,7
-        ],
-        "where_truthiness_over_table_column",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for s in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v)",
+            "INSERT INTO t VALUES (1,5),(2,0),(3,'7'),(4,'abc'),(5,NULL),(6,0.0),(7,'0')",
+        ] {
+            f.execute(s).await.unwrap();
+            r.execute_batch(s).unwrap();
+        }
+        check(
+            &f,
+            &r,
+            &[
+                // Truthiness per row: 5 true, 0 false, '7'->7 true, 'abc'->0 false,
+                // NULL false, 0.0 false, '0'->0 false. -> ids 1,3.
+                "SELECT id FROM t WHERE v ORDER BY id",
+                // NOT v inverts (NULL stays excluded by NOT NULL = NULL).
+                "SELECT id FROM t WHERE NOT v ORDER BY id", // 2,4,6,7
+            ],
+            "where_truthiness_over_table_column",
+        )
+        .await;
+    });
 }

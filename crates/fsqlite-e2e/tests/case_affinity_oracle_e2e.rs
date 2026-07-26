@@ -7,6 +7,7 @@
 //! behaviour of CASE-WHEN specifically — the IN value-list path was found to
 //! skip this coercion (bd-56aj2) while scalar `=` applies it (bd-525y0), so
 //! CASE-WHEN could go either way. Compared against rusqlite.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -24,8 +25,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -57,10 +58,10 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -82,14 +83,14 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
     );
 }
 
-fn data() -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").unwrap();
+async fn data() -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, s TEXT)",
         "INSERT INTO t VALUES (1,5,'5'),(2,10,'x')",
     ] {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
     (f, r)
@@ -99,75 +100,92 @@ fn data() -> (Connection, rusqlite::Connection) {
 /// coerce the WHEN value, so it never matches; SQLite applies INTEGER affinity.
 #[test]
 fn case_integer_column_when_text_numeric() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            // n has INTEGER affinity: '5' coerces to 5 -> id1 hits.
-            "SELECT id, CASE n WHEN '5' THEN 'hit' ELSE 'miss' END FROM t ORDER BY id",
-        ],
-        "case_integer_column_when_text_numeric",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                // n has INTEGER affinity: '5' coerces to 5 -> id1 hits.
+                "SELECT id, CASE n WHEN '5' THEN 'hit' ELSE 'miss' END FROM t ORDER BY id",
+            ],
+            "case_integer_column_when_text_numeric",
+        )
+        .await;
+    });
 }
 
 /// bd-w4r25: simple-CASE `CASE s WHEN 5` (TEXT col vs numeric literal) does not
 /// coerce, so it never matches; SQLite applies TEXT affinity.
 #[test]
 fn case_text_column_when_numeric() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            // s has TEXT affinity: 5 coerces to '5' -> id1 (s='5') hits.
-            "SELECT id, CASE s WHEN 5 THEN 'hit' ELSE 'miss' END FROM t ORDER BY id",
-        ],
-        "case_text_column_when_numeric",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                // s has TEXT affinity: 5 coerces to '5' -> id1 (s='5') hits.
+                "SELECT id, CASE s WHEN 5 THEN 'hit' ELSE 'miss' END FROM t ORDER BY id",
+            ],
+            "case_text_column_when_numeric",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn case_bare_literals_no_affinity() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            // Bare operands -> no affinity: 5 vs '5' are unequal -> 'miss'.
-            "SELECT CASE 5 WHEN '5' THEN 'hit' ELSE 'miss' END",
-            // Both text -> equal.
-            "SELECT CASE '5' WHEN '5' THEN 'hit' ELSE 'miss' END",
-            // Numeric int vs real -> equal (5 = 5.0).
-            "SELECT CASE 5 WHEN 5.0 THEN 'hit' ELSE 'miss' END",
-        ],
-        "case_bare_literals_no_affinity",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                // Bare operands -> no affinity: 5 vs '5' are unequal -> 'miss'.
+                "SELECT CASE 5 WHEN '5' THEN 'hit' ELSE 'miss' END",
+                // Both text -> equal.
+                "SELECT CASE '5' WHEN '5' THEN 'hit' ELSE 'miss' END",
+                // Numeric int vs real -> equal (5 = 5.0).
+                "SELECT CASE 5 WHEN 5.0 THEN 'hit' ELSE 'miss' END",
+            ],
+            "case_bare_literals_no_affinity",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn case_numeric_int_vs_real_in_where() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            // n = 5 matched against 5.0 (numeric equality, no affinity) -> hit.
-            "SELECT id FROM t WHERE CASE n WHEN 5.0 THEN 1 ELSE 0 END = 1 ORDER BY id", // 1
-        ],
-        "case_numeric_int_vs_real_in_where",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                // n = 5 matched against 5.0 (numeric equality, no affinity) -> hit.
+                "SELECT id FROM t WHERE CASE n WHEN 5.0 THEN 1 ELSE 0 END = 1 ORDER BY id", // 1
+            ],
+            "case_numeric_int_vs_real_in_where",
+        )
+        .await;
+    });
 }
 
 /// bd-w4r25: multi-branch simple-CASE with text-numeric WHEN values on an
 /// INTEGER column — every branch fails to coerce, so all rows fall to ELSE.
 #[test]
 fn case_multibranch_affinity() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &["SELECT id, CASE n WHEN '5' THEN 'a' WHEN '10' THEN 'b' ELSE 'c' END FROM t ORDER BY id"],
-        "case_multibranch_affinity",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT id, CASE n WHEN '5' THEN 'a' WHEN '10' THEN 'b' ELSE 'c' END FROM t ORDER BY id",
+            ],
+            "case_multibranch_affinity",
+        )
+        .await;
+    });
 }

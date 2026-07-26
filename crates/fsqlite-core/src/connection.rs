@@ -8999,6 +8999,21 @@ pub struct Connection {
     /// (`BEGIN CONCURRENT`).  When true, the harness can observe different
     /// concurrency behaviour compared to single-writer mode.
     concurrent_txn: Cell<bool>,
+    /// Set when a scoped transaction wrapper is dropped without an awaited
+    /// `commit()`/`rollback()`.
+    ///
+    /// `Drop::drop` cannot await and this crate never builds its own runtime,
+    /// so the drop path cannot finish a rollback itself. Instead it records
+    /// the obligation here, and the next SQL entry point discharges it by
+    /// rolling back *before* executing anything else. That preserves the
+    /// observable rollback-on-drop contract (an un-committed transaction's
+    /// writes never become visible to subsequent statements) without blocking
+    /// in `Drop` and without owning a runtime.
+    ///
+    /// This is a `Cell<bool>` rather than a richer state machine because the
+    /// only question at the next entry point is "is there an abandoned
+    /// transaction to unwind?".
+    pending_transaction_cleanup: Cell<bool>,
     /// Connection-level flag: when set, plain `BEGIN` is promoted to
     /// `BEGIN CONCURRENT`.  Controlled by `PRAGMA fsqlite.concurrent_mode`.
     concurrent_mode_default: RefCell<bool>,
@@ -9914,6 +9929,7 @@ impl Connection {
             internal_statement_savepoint_depth: Cell::new(0),
             implicit_txn: Cell::new(false),
             concurrent_txn: Cell::new(false),
+            pending_transaction_cleanup: Cell::new(false),
             concurrent_mode_default: RefCell::new(true),
             write_merge_mode: Cell::new(WriteMergeMode::Safe),
             write_merge_lab_unsafe_warned: Cell::new(false),
@@ -10341,6 +10357,7 @@ impl Connection {
             internal_statement_savepoint_depth: Cell::new(0),
             implicit_txn: Cell::new(false),
             concurrent_txn: Cell::new(false),
+            pending_transaction_cleanup: Cell::new(false),
             concurrent_mode_default: RefCell::new(true),
             write_merge_mode: Cell::new(WriteMergeMode::Safe),
             write_merge_lab_unsafe_warned: Cell::new(false),
@@ -15154,6 +15171,7 @@ impl Connection {
     /// Prepare SQL into a statement.
     pub async fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>> {
         self.background_status()?;
+        self.settle_pending_transaction_cleanup().await?;
         self.prepare_after_background_status(sql).await
     }
 
@@ -15290,6 +15308,7 @@ impl Connection {
     /// discarded. This matches common SQL driver semantics (last statement wins).
     pub async fn query(&self, sql: &str) -> Result<Vec<Row>> {
         self.background_status()?;
+        self.settle_pending_transaction_cleanup().await?;
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                 .then(|| {
@@ -15319,6 +15338,7 @@ impl Connection {
     /// Prepare and execute SQL as a query with bound SQL parameters.
     pub async fn query_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
         self.background_status()?;
+        self.settle_pending_transaction_cleanup().await?;
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                 .then(|| {
@@ -15365,6 +15385,7 @@ impl Connection {
         F: FnMut(&Row) -> Result<()>,
     {
         self.background_status()?;
+        self.settle_pending_transaction_cleanup().await?;
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                 .then(|| {
@@ -15402,6 +15423,7 @@ impl Connection {
     /// Prepare and execute SQL as a query, returning exactly one row.
     pub async fn query_row(&self, sql: &str) -> Result<Row> {
         self.background_status()?;
+        self.settle_pending_transaction_cleanup().await?;
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                 .then(|| {
@@ -15440,6 +15462,7 @@ impl Connection {
     /// Prepare and execute SQL as a query with bound SQL parameters, returning exactly one row.
     pub async fn query_row_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Row> {
         self.background_status()?;
+        self.settle_pending_transaction_cleanup().await?;
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                 .then(|| {
@@ -15481,6 +15504,7 @@ impl Connection {
     /// result rows.
     pub async fn execute(&self, sql: &str) -> Result<usize> {
         self.background_status()?;
+        self.settle_pending_transaction_cleanup().await?;
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                 .then(|| {
@@ -15530,6 +15554,7 @@ impl Connection {
     /// SQL comments are treated as a no-op, matching SQLite batch semantics.
     pub async fn execute_batch(&self, sql: &str) -> Result<()> {
         self.background_status()?;
+        self.settle_pending_transaction_cleanup().await?;
         if batch_is_noop(sql)? {
             return Ok(());
         }
@@ -15543,6 +15568,9 @@ impl Connection {
     /// transaction auto-promotes to concurrent mode.
     pub async fn begin_transaction(&self) -> Result<()> {
         self.background_status()?;
+        // Unwind any abandoned transaction before opening a new one, so the
+        // new transaction never inherits an abandoned one's uncommitted state.
+        self.settle_pending_transaction_cleanup().await?;
         self.execute_begin(fsqlite_ast::BeginStatement { mode: None })
             .await
     }
@@ -15550,6 +15578,9 @@ impl Connection {
     /// Commit the active transaction without reparsing a `COMMIT` statement.
     pub async fn commit_transaction(&self) -> Result<()> {
         self.background_status()?;
+        // An abandoned transaction cannot be committed after the fact: unwind
+        // it first so a stale wrapper cannot resurrect uncommitted writes.
+        self.settle_pending_transaction_cleanup().await?;
         let cx = self.op_cx_after_background_status();
         self.execute_commit_with_cx(&cx).await
     }
@@ -15557,6 +15588,44 @@ impl Connection {
     /// Roll back the active transaction without reparsing a `ROLLBACK` statement.
     pub async fn rollback_transaction(&self) -> Result<()> {
         self.background_status()?;
+        self.pending_transaction_cleanup.set(false);
+        let cx = self.op_cx_after_background_status();
+        self.execute_rollback_with_cx(&cx, &fsqlite_ast::RollbackStatement { to_savepoint: None })
+            .await
+    }
+
+    /// Record that a scoped transaction wrapper was dropped without an awaited
+    /// `commit()` / `rollback()`.
+    ///
+    /// `Drop::drop` cannot await, and this crate never builds its own runtime,
+    /// so a drop path cannot finish the rollback itself. It calls this instead
+    /// to record the obligation; [`Self::settle_pending_transaction_cleanup`]
+    /// discharges it at the next SQL entry point. The net effect is that an
+    /// abandoned transaction's writes are never observable to later
+    /// statements, which is the contract `rusqlite` callers expect from
+    /// rollback-on-drop, without blocking inside `Drop`.
+    pub fn mark_transaction_cleanup_required(&self) {
+        self.pending_transaction_cleanup.set(true);
+    }
+
+    /// Discharge a pending abandoned-transaction obligation, if one exists.
+    ///
+    /// Runs at the head of every public SQL entry point, *before* the incoming
+    /// statement executes, so no later statement can observe the abandoned
+    /// transaction's writes.
+    ///
+    /// The flag is cleared before the rollback is attempted, so a failing
+    /// rollback cannot wedge the connection into retrying it forever; the
+    /// error surfaces to the caller of whichever statement discharged it.
+    async fn settle_pending_transaction_cleanup(&self) -> Result<()> {
+        if !self.pending_transaction_cleanup.replace(false) {
+            return Ok(());
+        }
+        // An explicit commit/rollback may already have closed it, or the
+        // wrapper may have been dropped after finalizing.
+        if !self.in_transaction() {
+            return Ok(());
+        }
         let cx = self.op_cx_after_background_status();
         self.execute_rollback_with_cx(&cx, &fsqlite_ast::RollbackStatement { to_savepoint: None })
             .await
@@ -15626,6 +15695,7 @@ impl Connection {
         skip_statement_savepoint_in_explicit_txn: bool,
     ) -> Result<usize> {
         self.background_status()?;
+        self.settle_pending_transaction_cleanup().await?;
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                 .then(|| {

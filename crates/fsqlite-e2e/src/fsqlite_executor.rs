@@ -3075,9 +3075,11 @@ mod tests {
 
     #[test]
     fn prepared_op_executor_reuses_insert_shape() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT, num REAL);")
-            .unwrap();
+        let conn = crate::block_on(Connection::open(":memory:")).unwrap();
+        crate::block_on(conn.execute(
+            "CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT, num REAL);",
+        ))
+        .unwrap();
 
         let mut executor = PreparedOpExecutor::new(&conn);
         let rows = [
@@ -3114,17 +3116,16 @@ mod tests {
         }
 
         assert_eq!(executor.prepared_dml.len(), 1);
-        let count = conn.query_row("SELECT COUNT(*) FROM t0;").unwrap();
+        let count = crate::block_on(conn.query_row("SELECT COUNT(*) FROM t0;")).unwrap();
         assert_eq!(count.get(0), Some(&SqliteValue::Integer(2)));
     }
 
     #[test]
     fn prepared_op_executor_reuses_sql_shape() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);")
+        let conn = crate::block_on(Connection::open(":memory:")).unwrap();
+        crate::block_on(conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);"))
             .unwrap();
-        conn.execute("INSERT INTO t0(id, val) VALUES (1, 'alpha');")
-            .unwrap();
+        crate::block_on(conn.execute("INSERT INTO t0(id, val) VALUES (1, 'alpha');")).unwrap();
 
         let mut executor = PreparedOpExecutor::new(&conn);
         let reads = [
@@ -3155,13 +3156,11 @@ mod tests {
 
     #[test]
     fn prepared_op_executor_normalizes_varying_point_selects_into_one_shape() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);")
+        let conn = crate::block_on(Connection::open(":memory:")).unwrap();
+        crate::block_on(conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);"))
             .unwrap();
-        conn.execute("INSERT INTO t0(id, val) VALUES (1, 'alpha');")
-            .unwrap();
-        conn.execute("INSERT INTO t0(id, val) VALUES (2, 'beta');")
-            .unwrap();
+        crate::block_on(conn.execute("INSERT INTO t0(id, val) VALUES (1, 'alpha');")).unwrap();
+        crate::block_on(conn.execute("INSERT INTO t0(id, val) VALUES (2, 'beta');")).unwrap();
 
         let mut executor = PreparedOpExecutor::new(&conn);
         for (op_id, id) in [(0_u64, 1_i64), (1, 2), (2, 1)] {
@@ -3187,13 +3186,13 @@ mod tests {
 
     #[test]
     fn prepared_op_executor_normalizes_varying_point_deletes_into_one_shape() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);")
+        let conn = crate::block_on(Connection::open(":memory:")).unwrap();
+        crate::block_on(conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);"))
             .unwrap();
         for (id, value) in [(1, "alpha"), (2, "beta"), (3, "gamma")] {
-            conn.execute(&format!(
+            crate::block_on(conn.execute(&format!(
                 "INSERT INTO t0(id, val) VALUES ({id}, '{value}');"
-            ))
+            )))
             .unwrap();
         }
 
@@ -3221,15 +3220,15 @@ mod tests {
 
     #[test]
     fn prepared_op_executor_normalizes_varying_point_updates_into_one_shape() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute(
+        let conn = crate::block_on(Connection::open(":memory:")).unwrap();
+        crate::block_on(conn.execute(
             "CREATE TABLE users(id INTEGER PRIMARY KEY, status TEXT, created_at INTEGER);",
-        )
+        ))
         .unwrap();
         for id in 1..=3 {
-            conn.execute(&format!(
+            crate::block_on(conn.execute(&format!(
                 "INSERT INTO users(id, status, created_at) VALUES ({id}, 'seed', 0);"
-            ))
+            )))
             .unwrap();
         }
 
@@ -3722,14 +3721,14 @@ mod tests {
 
         // Run through the executor (uses Connection internally).
         let path_str = ":memory:";
-        let conn = Connection::open(path_str).unwrap();
+        let conn = crate::block_on(Connection::open(path_str)).unwrap();
 
         // Manually replay the same oplog to verify final state.
         for rec in &oplog.records {
             let _ = execute_op(&conn, rec);
         }
 
-        let rows = conn.query("SELECT COUNT(*) FROM t0").unwrap();
+        let rows = crate::block_on(conn.query("SELECT COUNT(*) FROM t0")).unwrap();
         let count = rows[0].get(0).unwrap();
         assert_eq!(
             *count,
@@ -3771,7 +3770,7 @@ mod tests {
 
     #[test]
     fn execute_sql_expected_error_behavior() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = crate::block_on(Connection::open(":memory:")).unwrap();
 
         let expected = ExpectedResult::Error;
         assert!(

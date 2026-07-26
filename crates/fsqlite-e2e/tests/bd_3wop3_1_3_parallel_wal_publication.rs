@@ -1,4 +1,5 @@
 //! E2E verification for `bd-3wop3.1.3` durability certificates and visibility publication.
+#![recursion_limit = "512"]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -155,14 +156,14 @@ fn is_lock_contention(error: &fsqlite::FrankenError) -> bool {
     )
 }
 
-fn retry_lock_contention<T>(
+async fn retry_lock_contention<T>(
     context: &str,
-    mut operation: impl FnMut() -> Result<T, fsqlite::FrankenError>,
+    mut operation: impl std::ops::AsyncFnMut() -> Result<T, fsqlite::FrankenError>,
 ) -> Result<T, String> {
     let started = Instant::now();
     let mut attempt = 0_u32;
     loop {
-        match operation() {
+        match operation().await {
             Ok(value) => return Ok(value),
             Err(error) if is_lock_contention(&error) && started.elapsed() < OPEN_RETRY_BUDGET => {
                 attempt = attempt.saturating_add(1);
@@ -173,16 +174,18 @@ fn retry_lock_contention<T>(
     }
 }
 
-fn try_open_connection(path: &Path) -> Result<fsqlite::Connection, String> {
+async fn try_open_connection(path: &Path) -> Result<fsqlite::Connection, String> {
     let path = path
         .to_str()
         .ok_or_else(|| format!("database path is not UTF-8: {}", path.display()))?;
-    let conn = retry_lock_contention("open FrankenSQLite connection", || {
-        fsqlite::Connection::open(path)
-    })?;
-    retry_lock_contention("enable WAL mode", || {
-        conn.execute("PRAGMA journal_mode=WAL;").map(|_| ())
-    })?;
+    let conn = retry_lock_contention("open FrankenSQLite connection", async || {
+        fsqlite::Connection::open(path).await
+    })
+    .await?;
+    retry_lock_contention("enable WAL mode", async || {
+        conn.execute("PRAGMA journal_mode=WAL;").await.map(|_| ())
+    })
+    .await?;
     if !conn.is_concurrent_mode_default() {
         return Err(format!(
             "bead_id={BEAD_ID} case=concurrent_mode_default_guard"
@@ -191,28 +194,34 @@ fn try_open_connection(path: &Path) -> Result<fsqlite::Connection, String> {
     Ok(conn)
 }
 
-fn open_connection(path: &Path) -> fsqlite::Connection {
-    try_open_connection(path).unwrap_or_else(|error| panic!("{error}"))
+async fn open_connection(path: &Path) -> fsqlite::Connection {
+    try_open_connection(path)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"))
 }
 
-fn insert_row(path: &Path, table_name: &'static str, id: i64, barrier: Arc<Barrier>) {
-    let conn = try_open_connection(path);
+async fn insert_row(path: &Path, table_name: &'static str, id: i64, barrier: Arc<Barrier>) {
+    let conn = try_open_connection(path).await;
     barrier.wait();
     let conn = conn.unwrap_or_else(|error| panic!("{error}"));
     conn.execute("BEGIN CONCURRENT;")
+        .await
         .expect("begin concurrent transaction");
     conn.execute(&format!(
         "INSERT INTO {table_name} VALUES ({id}, '{table_name}-{id}')"
     ))
+    .await
     .expect("insert row");
-    conn.execute("COMMIT;").expect("commit transaction");
+    conn.execute("COMMIT;").await.expect("commit transaction");
     conn.close_without_checkpoint()
+        .await
         .expect("close writer without checkpoint");
 }
 
-fn query_single_text(conn: &fsqlite::Connection, sql: &str) -> String {
+async fn query_single_text(conn: &fsqlite::Connection, sql: &str) -> String {
     let rows = conn
         .query(sql)
+        .await
         .unwrap_or_else(|error| panic!("{sql}: {error}"));
     match rows.first().and_then(|row| row.get(0)) {
         Some(SqliteValue::Text(value)) => value.to_string(),
@@ -220,7 +229,7 @@ fn query_single_text(conn: &fsqlite::Connection, sql: &str) -> String {
     }
 }
 
-fn fetch_final_rows(conn: &fsqlite::Connection) -> Vec<FinalRow> {
+async fn fetch_final_rows(conn: &fsqlite::Connection) -> Vec<FinalRow> {
     conn.query(
         "SELECT table_name, id, value FROM (\
          SELECT 'a' AS table_name, id, value FROM a \
@@ -228,6 +237,7 @@ fn fetch_final_rows(conn: &fsqlite::Connection) -> Vec<FinalRow> {
          SELECT 'b' AS table_name, id, value FROM b\
          ) ORDER BY table_name, id",
     )
+    .await
     .expect("query final rows")
     .into_iter()
     .map(|row| {
@@ -407,18 +417,21 @@ fn summarize_publication_logs(
     }
 }
 
-fn run_child_workload(run_dir: &Path, mode: &str) -> PublicationRunSummary {
+async fn run_child_workload(run_dir: &Path, mode: &str) -> PublicationRunSummary {
     let _logging_guard = init_logging(run_dir, true).expect("initialize child logging");
     let db_path = run_dir.join("parallel_wal_publication.db");
     let log_path = run_dir.join("test.log.jsonl");
 
     {
-        let conn = open_connection(&db_path);
+        let conn = open_connection(&db_path).await;
         conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, value TEXT)")
+            .await
             .expect("create table a");
         conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, value TEXT)")
+            .await
             .expect("create table b");
         conn.close_without_checkpoint()
+            .await
             .expect("close setup connection without resetting certificate-bound WAL");
     }
 
@@ -429,40 +442,49 @@ fn run_child_workload(run_dir: &Path, mode: &str) -> PublicationRunSummary {
         let writer_a_barrier = Arc::clone(&barrier);
         let writer_b_barrier = Arc::clone(&barrier);
         let writer_a = thread::spawn(move || {
-            insert_row(&writer_a_path, "a", wave + 1, writer_a_barrier);
+            asupersync::test_utils::run_test(|| async {
+                insert_row(&writer_a_path, "a", wave + 1, writer_a_barrier).await;
+            });
         });
         let writer_b = thread::spawn(move || {
-            insert_row(&writer_b_path, "b", wave + 1, writer_b_barrier);
+            asupersync::test_utils::run_test(|| async {
+                insert_row(&writer_b_path, "b", wave + 1, writer_b_barrier).await;
+            });
         });
         barrier.wait();
         writer_a.join().expect("join writer a");
         writer_b.join().expect("join writer b");
     }
 
-    let conn = open_connection(&db_path);
-    let rows_before_checkpoint = fetch_final_rows(&conn);
+    let conn = open_connection(&db_path).await;
+    let rows_before_checkpoint = fetch_final_rows(&conn).await;
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        .await
         .expect("truncate checkpoint");
     conn.close_without_checkpoint()
+        .await
         .expect("close explicit checkpoint connection");
 
-    let post_checkpoint = open_connection(&db_path);
+    let post_checkpoint = open_connection(&db_path).await;
     post_checkpoint
         .execute("INSERT INTO a VALUES (3, 'a-3')")
+        .await
         .expect("commit first transaction in reset WAL generation");
     post_checkpoint
         .close_without_checkpoint()
+        .await
         .expect("close post-checkpoint writer without another reset");
 
-    let reopened = open_connection(&db_path);
-    let final_rows = fetch_final_rows(&reopened);
-    let integrity_check = query_single_text(&reopened, "PRAGMA integrity_check;");
+    let reopened = open_connection(&db_path).await;
+    let final_rows = fetch_final_rows(&reopened).await;
+    let integrity_check = query_single_text(&reopened, "PRAGMA integrity_check;").await;
     assert_eq!(
         integrity_check, "ok",
         "integrity check after post-checkpoint commit"
     );
     reopened
         .close_without_checkpoint()
+        .await
         .expect("close reopened connection without resetting post-checkpoint WAL");
     assert_eq!(
         final_rows.len(),
@@ -496,13 +518,13 @@ fn run_child_workload(run_dir: &Path, mode: &str) -> PublicationRunSummary {
     )
 }
 
-fn run_performance_writer(
+async fn run_performance_writer(
     db_path: &Path,
     lane_id: usize,
     transactions: usize,
     barrier: Arc<Barrier>,
 ) -> u64 {
-    let conn = open_connection(db_path);
+    let conn = open_connection(db_path).await;
     barrier.wait();
     let mut retries = 0_u64;
     for row_id in 1..=transactions {
@@ -510,15 +532,21 @@ fn run_performance_writer(
         loop {
             attempt = attempt.saturating_add(1);
             conn.execute("BEGIN CONCURRENT;")
+                .await
                 .expect("begin production matrix transaction");
-            let insert = conn.execute(&format!(
-                "INSERT INTO lane_{lane_id} VALUES ({row_id}, 'lane-{lane_id}-row-{row_id}')"
-            ));
-            let commit = insert.and_then(|_| conn.execute("COMMIT;"));
+            let insert = conn
+                .execute(&format!(
+                    "INSERT INTO lane_{lane_id} VALUES ({row_id}, 'lane-{lane_id}-row-{row_id}')"
+                ))
+                .await;
+            let commit = match insert {
+                Ok(_) => conn.execute("COMMIT;").await,
+                Err(error) => Err(error),
+            };
             match commit {
                 Ok(_) => break,
                 Err(error) if is_lock_contention(&error) && attempt < 64 => {
-                    let _ = conn.execute("ROLLBACK;");
+                    drop(conn.execute("ROLLBACK;").await);
                     retries = retries.saturating_add(1);
                     thread::sleep(Duration::from_micros(u64::from(attempt).saturating_mul(50)));
                 }
@@ -529,11 +557,12 @@ fn run_performance_writer(
         }
     }
     conn.close_without_checkpoint()
+        .await
         .expect("close production matrix writer without checkpoint");
     retries
 }
 
-fn run_performance_workload(
+async fn run_performance_workload(
     run_dir: &Path,
     mode: &str,
     thread_count: usize,
@@ -544,19 +573,22 @@ fn run_performance_workload(
     let _logging_guard = init_logging(run_dir, true).expect("initialize performance logging");
     let db_path = run_dir.join("parallel_wal_publication_performance.db");
     let log_path = run_dir.join("test.log.jsonl");
-    let setup = open_connection(&db_path);
+    let setup = open_connection(&db_path).await;
     for lane_id in 0..thread_count {
         setup
             .execute(&format!(
                 "CREATE TABLE lane_{lane_id} (id INTEGER PRIMARY KEY, value TEXT)"
             ))
+            .await
             .expect("create disjoint production matrix table");
     }
     setup
         .execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        .await
         .expect("reset WAL before measured production matrix");
     setup
         .close_without_checkpoint()
+        .await
         .expect("close production matrix setup connection");
 
     let barrier = Arc::new(Barrier::new(thread_count.saturating_add(1)));
@@ -565,12 +597,17 @@ fn run_performance_workload(
         let writer_path = db_path.clone();
         let writer_barrier = Arc::clone(&barrier);
         writers.push(thread::spawn(move || {
-            run_performance_writer(
-                &writer_path,
-                lane_id,
-                TRANSACTIONS_PER_THREAD,
-                writer_barrier,
-            )
+            let mut lane_retries = 0_u64;
+            asupersync::test_utils::run_test(|| async {
+                lane_retries = run_performance_writer(
+                    &writer_path,
+                    lane_id,
+                    TRANSACTIONS_PER_THREAD,
+                    writer_barrier,
+                )
+                .await;
+            });
+            lane_retries
         }));
     }
     let wall_start = Instant::now();
@@ -582,21 +619,22 @@ fn run_performance_workload(
     let wall_time_ns = u64::try_from(wall_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let committed_transactions = thread_count.saturating_mul(TRANSACTIONS_PER_THREAD);
 
-    let verification = open_connection(&db_path);
-    let row_count = (0..thread_count)
-        .map(|lane_id| {
-            let rows = verification
-                .query(&format!("SELECT COUNT(*) FROM lane_{lane_id}"))
-                .expect("count production matrix rows");
-            match rows.first().and_then(|row| row.get(0)) {
-                Some(SqliteValue::Integer(count)) => usize::try_from(*count).expect("row count"),
-                other => panic!("expected production matrix row count, got {other:?}"),
-            }
-        })
-        .sum::<usize>();
-    let integrity_check = query_single_text(&verification, "PRAGMA integrity_check;");
+    let verification = open_connection(&db_path).await;
+    let mut row_count = 0_usize;
+    for lane_id in 0..thread_count {
+        let rows = verification
+            .query(&format!("SELECT COUNT(*) FROM lane_{lane_id}"))
+            .await
+            .expect("count production matrix rows");
+        row_count += match rows.first().and_then(|row| row.get(0)) {
+            Some(SqliteValue::Integer(count)) => usize::try_from(*count).expect("row count"),
+            other => panic!("expected production matrix row count, got {other:?}"),
+        };
+    }
+    let integrity_check = query_single_text(&verification, "PRAGMA integrity_check;").await;
     verification
         .close_without_checkpoint()
+        .await
         .expect("close production matrix verification connection");
 
     // Setup commits precede the measured writers in the same log. Select the
@@ -1102,42 +1140,46 @@ fn bd_3wop3_1_3_parallel_wal_publication_modes_are_semantically_equivalent() {
 #[test]
 #[ignore = "helper entrypoint for the parent test harness; not meant to run directly"]
 fn bd_3wop3_1_3_parallel_wal_publication_child_entrypoint() {
-    let run_dir = PathBuf::from(
-        env::var(CHILD_RUN_DIR_ENV)
-            .expect("child run dir env must be present for child entrypoint"),
-    );
-    fs::create_dir_all(&run_dir).expect("create child run dir");
-    let mode = env::var(CHILD_MODE_ENV).expect("child mode env must be present");
-    let summary = run_child_workload(&run_dir, &mode);
-    fs::write(
-        run_dir.join("summary.json"),
-        serde_json::to_vec_pretty(&summary).expect("serialize child summary"),
-    )
-    .expect("write child summary");
+    asupersync::test_utils::run_test(|| async {
+        let run_dir = PathBuf::from(
+            env::var(CHILD_RUN_DIR_ENV)
+                .expect("child run dir env must be present for child entrypoint"),
+        );
+        fs::create_dir_all(&run_dir).expect("create child run dir");
+        let mode = env::var(CHILD_MODE_ENV).expect("child mode env must be present");
+        let summary = run_child_workload(&run_dir, &mode).await;
+        fs::write(
+            run_dir.join("summary.json"),
+            serde_json::to_vec_pretty(&summary).expect("serialize child summary"),
+        )
+        .expect("write child summary");
+    });
 }
 
 #[test]
 #[ignore = "helper entrypoint for the production performance matrix"]
 fn bd_3wop3_1_3_parallel_wal_publication_performance_child_entrypoint() {
-    let run_dir = PathBuf::from(
-        env::var(CHILD_RUN_DIR_ENV).expect("performance child run dir env must be present"),
-    );
-    fs::create_dir_all(&run_dir).expect("create performance child run dir");
-    let mode = env::var(CHILD_MODE_ENV).expect("performance child mode env must be present");
-    let thread_count = env::var(PERFORMANCE_THREADS_ENV)
-        .expect("performance thread-count env must be present")
-        .parse::<usize>()
-        .expect("performance thread count must be usize");
-    let repetition = env::var(PERFORMANCE_REPETITION_ENV)
-        .expect("performance repetition env must be present")
-        .parse::<usize>()
-        .expect("performance repetition must be usize");
-    assert!(matches!(thread_count, 8 | 16));
-    assert!(repetition < PERFORMANCE_REPETITIONS);
-    let summary = run_performance_workload(&run_dir, &mode, thread_count, repetition);
-    fs::write(
-        run_dir.join("performance-summary.json"),
-        serde_json::to_vec_pretty(&summary).expect("serialize performance child summary"),
-    )
-    .expect("write performance child summary");
+    asupersync::test_utils::run_test(|| async {
+        let run_dir = PathBuf::from(
+            env::var(CHILD_RUN_DIR_ENV).expect("performance child run dir env must be present"),
+        );
+        fs::create_dir_all(&run_dir).expect("create performance child run dir");
+        let mode = env::var(CHILD_MODE_ENV).expect("performance child mode env must be present");
+        let thread_count = env::var(PERFORMANCE_THREADS_ENV)
+            .expect("performance thread-count env must be present")
+            .parse::<usize>()
+            .expect("performance thread count must be usize");
+        let repetition = env::var(PERFORMANCE_REPETITION_ENV)
+            .expect("performance repetition env must be present")
+            .parse::<usize>()
+            .expect("performance repetition must be usize");
+        assert!(matches!(thread_count, 8 | 16));
+        assert!(repetition < PERFORMANCE_REPETITIONS);
+        let summary = run_performance_workload(&run_dir, &mode, thread_count, repetition).await;
+        fs::write(
+            run_dir.join("performance-summary.json"),
+            serde_json::to_vec_pretty(&summary).expect("serialize performance child summary"),
+        )
+        .expect("write performance child summary");
+    });
 }

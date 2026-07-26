@@ -3,6 +3,7 @@
 //! Bead: bd-mblr.2.3
 
 #![allow(clippy::too_many_lines)]
+#![recursion_limit = "512"]
 
 use std::io;
 use std::path::{Path, PathBuf};

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Benchmark: concurrent write throughput (2/4/8 threads).
 //!
 //! Bead: bd-3rze
@@ -9,13 +11,13 @@
 //! Do not cite the FrankenSQLite control in this file as concurrent-writer
 //! evidence; it is only a fairness-normalized same-total-work control.
 //!
-//! Thread counts: 2, 4, 8.  (16 is omitted because in-memory C SQLite
-//! doesn't benefit from higher thread counts — the `WAL_WRITE_LOCK`
-//! serialises writers regardless.)
+//! Thread counts: 2, 4, 8.  (16 is omitted because C SQLite's
+//! `WAL_WRITE_LOCK` serialises WAL writers regardless.)
 //!
 //! Each thread inserts into a non-overlapping key range so there is no
 //! primary-key contention, only write-lock contention.
 
+use std::hint::black_box;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
@@ -35,7 +37,9 @@ fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
         "PRAGMA synchronous = NORMAL;",
         "PRAGMA cache_size = -64000;",
     ] {
-        let _ = conn.execute(pragma);
+        fsqlite_e2e::block_on(conn.execute(pragma)).unwrap_or_else(|error| {
+            panic!("failed to apply FrankenSQLite benchmark pragma `{pragma}`: {error}")
+        });
     }
 }
 
@@ -97,7 +101,7 @@ fn bench_concurrent_csqlite(c: &mut Criterion, n_threads: usize, label: &str) {
                                 .prepare("INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7))")
                                 .unwrap();
                             for i in 0..ROWS_PER_THREAD {
-                                stmt.execute(rusqlite::params![base + i]).unwrap();
+                                black_box(stmt.execute(rusqlite::params![base + i]).unwrap());
                             }
                             conn.execute_batch("COMMIT").unwrap();
                         })
@@ -117,24 +121,29 @@ fn bench_concurrent_csqlite(c: &mut Criterion, n_threads: usize, label: &str) {
     group.bench_function("frankensqlite_sequential_prepared_control", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
                 apply_pragmas_fsqlite(&conn);
-                conn.execute(CREATE_TABLE).unwrap();
+                fsqlite_e2e::block_on(conn.execute(CREATE_TABLE)).unwrap();
                 conn
             },
             |conn| {
-                let stmt = conn
-                    .prepare("INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7));")
-                    .unwrap();
+                let stmt = fsqlite_e2e::block_on(
+                    conn.prepare("INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7));"),
+                )
+                .unwrap();
                 for tid in 0..n_threads {
-                    conn.execute("BEGIN").unwrap();
+                    fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
                     #[allow(clippy::cast_possible_wrap)]
                     let base = tid as i64 * RANGE_SIZE;
                     for i in 0..ROWS_PER_THREAD {
-                        stmt.execute_with_params(&[SqliteValue::Integer(base + i)])
-                            .unwrap();
+                        black_box(
+                            fsqlite_e2e::block_on(
+                                stmt.execute_with_params(&[SqliteValue::Integer(base + i)]),
+                            )
+                            .unwrap(),
+                        );
                     }
-                    conn.execute("COMMIT").unwrap();
+                    fsqlite_e2e::block_on(conn.execute("COMMIT")).unwrap();
                 }
             },
             criterion::BatchSize::LargeInput,

@@ -24,8 +24,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -63,11 +63,11 @@ const SETUP: &[&str] = &[
     "CREATE VIEW v AS SELECT a, b FROM t",
 ];
 
-fn engines() -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn engines() -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in SETUP {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
     (f, r)
@@ -75,9 +75,9 @@ fn engines() -> (Connection, rusqlite::Connection) {
 
 /// Run a statement on both engines (fresh setup each time) and return a mismatch
 /// if they disagree on success/failure.
-fn stmt_agreement(stmt: &str) -> Option<String> {
-    let (f, r) = engines();
-    let fe = f.execute(stmt);
+async fn stmt_agreement(stmt: &str) -> Option<String> {
+    let (f, r) = engines().await;
+    let fe = f.execute(stmt).await;
     let re = r.execute_batch(stmt);
     match (&fe, &re) {
         (Ok(_), Ok(())) | (Err(_), Err(_)) => None,
@@ -90,41 +90,53 @@ fn stmt_agreement(stmt: &str) -> Option<String> {
 
 #[test]
 fn dml_on_view_rejected() {
-    let mismatches: Vec<String> = [
-        "INSERT INTO v VALUES (4, 40)",
-        "UPDATE v SET b = 0",
-        "DELETE FROM v",
-        "DELETE FROM v WHERE a = 1",
-    ]
-    .iter()
-    .filter_map(|s| stmt_agreement(s))
-    .collect();
-    assert!(
-        mismatches.is_empty(),
-        "dml_on_view_rejected: {} mismatch(es)\n{}",
-        mismatches.len(),
-        mismatches.join("\n")
-    );
+    asupersync::test_utils::run_test(|| async {
+        let mut mismatches: Vec<String> = Vec::new();
+        for s in [
+            "INSERT INTO v VALUES (4, 40)",
+            "UPDATE v SET b = 0",
+            "DELETE FROM v",
+            "DELETE FROM v WHERE a = 1",
+        ]
+        .iter()
+        {
+            if let Some(m) = stmt_agreement(s).await {
+                mismatches.push(m);
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "dml_on_view_rejected: {} mismatch(es)\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    });
 }
 
 #[test]
 fn select_from_view_and_base_dml_ok() {
-    let (f, r) = engines();
-    // SELECT from the view returns the right rows...
-    let mut mismatches = Vec::new();
-    let q = "SELECT a, b FROM v ORDER BY a";
-    match (frank_rows(&f, q), sqlite_rows(&r, q)) {
-        (Ok(a), Ok(b)) if a == b => {}
-        (fa, rb) => mismatches.push(format!(
-            "SELECT mismatch: {q}\n  frank: {fa:?}\n  csql: {rb:?}"
-        )),
-    }
-    // ...and DML against the BASE table is fine on both, reflected by the view.
-    assert!(stmt_agreement("INSERT INTO t VALUES (4, 40)").is_none());
-    assert!(stmt_agreement("UPDATE t SET b = b + 1").is_none());
-    assert!(
-        mismatches.is_empty(),
-        "select_from_view_and_base_dml_ok:\n{}",
-        mismatches.join("\n")
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = engines().await;
+        // SELECT from the view returns the right rows...
+        let mut mismatches = Vec::new();
+        let q = "SELECT a, b FROM v ORDER BY a";
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
+            (Ok(a), Ok(b)) if a == b => {}
+            (fa, rb) => mismatches.push(format!(
+                "SELECT mismatch: {q}\n  frank: {fa:?}\n  csql: {rb:?}"
+            )),
+        }
+        // ...and DML against the BASE table is fine on both, reflected by the view.
+        assert!(
+            stmt_agreement("INSERT INTO t VALUES (4, 40)")
+                .await
+                .is_none()
+        );
+        assert!(stmt_agreement("UPDATE t SET b = b + 1").await.is_none());
+        assert!(
+            mismatches.is_empty(),
+            "select_from_view_and_base_dml_ok:\n{}",
+            mismatches.join("\n")
+        );
+    });
 }

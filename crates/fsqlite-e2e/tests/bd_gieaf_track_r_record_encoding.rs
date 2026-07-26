@@ -1,4 +1,5 @@
 //! Track R record-encoding oracle, roundtrip, and throughput coverage for `bd-gieaf`.
+#![recursion_limit = "512"]
 
 use std::{
     path::Path,
@@ -28,10 +29,12 @@ const TRACK_R_SELECT_SQL: &str =
 
 static TRACK_R_E2E_LOCK: Mutex<()> = Mutex::new(());
 
-fn open_fsqlite(path: &Path) -> fsqlite::Connection {
+async fn open_fsqlite(path: &Path) -> fsqlite::Connection {
     let path = path.to_str().expect("utf-8 db path");
-    let conn = fsqlite::Connection::open(path).expect("open fsqlite connection");
-    conn.execute("PRAGMA journal_mode=WAL").ok();
+    let conn = fsqlite::Connection::open(path)
+        .await
+        .expect("open fsqlite connection");
+    conn.execute("PRAGMA journal_mode=WAL").await.ok();
     conn
 }
 
@@ -141,18 +144,20 @@ fn from_rusqlite_value(value: RusqliteValue) -> SqliteValue {
     }
 }
 
-fn insert_records_fsqlite(conn: &fsqlite::Connection, rows: &[Vec<SqliteValue>]) -> Duration {
+async fn insert_records_fsqlite(conn: &fsqlite::Connection, rows: &[Vec<SqliteValue>]) -> Duration {
     let insert_stmt = conn
         .prepare(TRACK_R_INSERT_SQL)
+        .await
         .expect("prepare fsqlite insert");
     let start = Instant::now();
-    conn.execute("BEGIN;").expect("fsqlite begin");
+    conn.execute("BEGIN;").await.expect("fsqlite begin");
     for row in rows {
         insert_stmt
             .execute_with_params(row.as_slice())
+            .await
             .expect("fsqlite insert");
     }
-    conn.execute("COMMIT;").expect("fsqlite commit");
+    conn.execute("COMMIT;").await.expect("fsqlite commit");
     start.elapsed()
 }
 
@@ -172,8 +177,9 @@ fn insert_records_sqlite(conn: &rusqlite::Connection, rows: &[Vec<SqliteValue>])
     start.elapsed()
 }
 
-fn fetch_fsqlite_rows(conn: &fsqlite::Connection) -> Vec<Vec<SqliteValue>> {
+async fn fetch_fsqlite_rows(conn: &fsqlite::Connection) -> Vec<Vec<SqliteValue>> {
     conn.query(TRACK_R_SELECT_SQL)
+        .await
         .expect("query fsqlite rows")
         .into_iter()
         .map(|row| row.values().to_vec())
@@ -208,42 +214,45 @@ fn bd_gieaf_track_r_prepared_insert_10k_matches_sqlite_oracle() {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
 
-    let expected_rows = generated_records(INSERT_ROWS_ORACLE);
-    let temp = tempdir().expect("tempdir");
-    let fsqlite_db = temp.path().join("track_r_oracle_fsqlite.db");
-    let sqlite_db = temp.path().join("track_r_oracle_sqlite.db");
+    asupersync::test_utils::run_test(|| async {
+        let expected_rows = generated_records(INSERT_ROWS_ORACLE);
+        let temp = tempdir().expect("tempdir");
+        let fsqlite_db = temp.path().join("track_r_oracle_fsqlite.db");
+        let sqlite_db = temp.path().join("track_r_oracle_sqlite.db");
 
-    let fconn = open_fsqlite(&fsqlite_db);
-    let sconn = open_sqlite(&sqlite_db);
+        let fconn = open_fsqlite(&fsqlite_db).await;
+        let sconn = open_sqlite(&sqlite_db);
 
-    assert!(
-        fconn.is_concurrent_mode_default(),
-        "Track R coverage must keep concurrent_mode_default enabled by default"
-    );
+        assert!(
+            fconn.is_concurrent_mode_default(),
+            "Track R coverage must keep concurrent_mode_default enabled by default"
+        );
 
-    fconn
-        .execute(TRACK_R_SCHEMA_SQL)
-        .expect("create fsqlite table");
-    sconn
-        .execute_batch(&(TRACK_R_SCHEMA_SQL.to_owned() + ";"))
-        .expect("create sqlite table");
+        fconn
+            .execute(TRACK_R_SCHEMA_SQL)
+            .await
+            .expect("create fsqlite table");
+        sconn
+            .execute_batch(&(TRACK_R_SCHEMA_SQL.to_owned() + ";"))
+            .expect("create sqlite table");
 
-    let fsqlite_elapsed = insert_records_fsqlite(&fconn, &expected_rows);
-    let sqlite_elapsed = insert_records_sqlite(&sconn, &expected_rows);
+        let fsqlite_elapsed = insert_records_fsqlite(&fconn, &expected_rows).await;
+        let sqlite_elapsed = insert_records_sqlite(&sconn, &expected_rows);
 
-    let fsqlite_rows = fetch_fsqlite_rows(&fconn);
-    let sqlite_rows = fetch_sqlite_rows(&sconn);
-    assert_rows_eq(
-        &fsqlite_rows,
-        &sqlite_rows,
-        "Track R oracle rowset mismatch",
-    );
-    eprintln!(
-        "INFO bead_id={BEAD_ID} scenario=TRACK-R-ORACLE-10K rows={} fsqlite_rows_per_sec={:.1} sqlite_rows_per_sec={:.1} replay_command={REPLAY_COMMAND}",
-        INSERT_ROWS_ORACLE,
-        rows_per_sec(INSERT_ROWS_ORACLE, fsqlite_elapsed),
-        rows_per_sec(INSERT_ROWS_ORACLE, sqlite_elapsed),
-    );
+        let fsqlite_rows = fetch_fsqlite_rows(&fconn).await;
+        let sqlite_rows = fetch_sqlite_rows(&sconn);
+        assert_rows_eq(
+            &fsqlite_rows,
+            &sqlite_rows,
+            "Track R oracle rowset mismatch",
+        );
+        eprintln!(
+            "INFO bead_id={BEAD_ID} scenario=TRACK-R-ORACLE-10K rows={} fsqlite_rows_per_sec={:.1} sqlite_rows_per_sec={:.1} replay_command={REPLAY_COMMAND}",
+            INSERT_ROWS_ORACLE,
+            rows_per_sec(INSERT_ROWS_ORACLE, fsqlite_elapsed),
+            rows_per_sec(INSERT_ROWS_ORACLE, sqlite_elapsed),
+        );
+    });
 }
 
 #[test]
@@ -252,31 +261,34 @@ fn bd_gieaf_track_r_roundtrip_10k_query_is_lossless() {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
 
-    let expected_rows = generated_records(INSERT_ROWS_ORACLE);
-    let temp = tempdir().expect("tempdir");
-    let fsqlite_db = temp.path().join("track_r_roundtrip_fsqlite.db");
-    let fconn = open_fsqlite(&fsqlite_db);
+    asupersync::test_utils::run_test(|| async {
+        let expected_rows = generated_records(INSERT_ROWS_ORACLE);
+        let temp = tempdir().expect("tempdir");
+        let fsqlite_db = temp.path().join("track_r_roundtrip_fsqlite.db");
+        let fconn = open_fsqlite(&fsqlite_db).await;
 
-    assert!(
-        fconn.is_concurrent_mode_default(),
-        "Track R coverage must keep concurrent_mode_default enabled by default"
-    );
+        assert!(
+            fconn.is_concurrent_mode_default(),
+            "Track R coverage must keep concurrent_mode_default enabled by default"
+        );
 
-    fconn
-        .execute(TRACK_R_SCHEMA_SQL)
-        .expect("create fsqlite table");
-    let _insert_elapsed = insert_records_fsqlite(&fconn, &expected_rows);
-    let fsqlite_rows = fetch_fsqlite_rows(&fconn);
-    assert_rows_eq(
-        &fsqlite_rows,
-        &expected_rows,
-        "Track R roundtrip rowset mismatch",
-    );
+        fconn
+            .execute(TRACK_R_SCHEMA_SQL)
+            .await
+            .expect("create fsqlite table");
+        let _insert_elapsed = insert_records_fsqlite(&fconn, &expected_rows).await;
+        let fsqlite_rows = fetch_fsqlite_rows(&fconn).await;
+        assert_rows_eq(
+            &fsqlite_rows,
+            &expected_rows,
+            "Track R roundtrip rowset mismatch",
+        );
 
-    eprintln!(
-        "INFO bead_id={BEAD_ID} scenario=TRACK-R-ROUNDTRIP-10K rows={} replay_command={REPLAY_COMMAND}",
-        INSERT_ROWS_ORACLE,
-    );
+        eprintln!(
+            "INFO bead_id={BEAD_ID} scenario=TRACK-R-ROUNDTRIP-10K rows={} replay_command={REPLAY_COMMAND}",
+            INSERT_ROWS_ORACLE,
+        );
+    });
 }
 
 #[test]
@@ -286,38 +298,41 @@ fn bd_gieaf_track_r_prepared_insert_10k_perf_probe_emits_metrics() {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
 
-    let rows = generated_records(INSERT_ROWS_PERF);
-    let temp = tempdir().expect("tempdir");
-    let fsqlite_db = temp.path().join("track_r_perf_fsqlite.db");
-    let sqlite_db = temp.path().join("track_r_perf_sqlite.db");
+    asupersync::test_utils::run_test(|| async {
+        let rows = generated_records(INSERT_ROWS_PERF);
+        let temp = tempdir().expect("tempdir");
+        let fsqlite_db = temp.path().join("track_r_perf_fsqlite.db");
+        let sqlite_db = temp.path().join("track_r_perf_sqlite.db");
 
-    let fconn = open_fsqlite(&fsqlite_db);
-    let sconn = open_sqlite(&sqlite_db);
+        let fconn = open_fsqlite(&fsqlite_db).await;
+        let sconn = open_sqlite(&sqlite_db);
 
-    fconn
-        .execute(TRACK_R_SCHEMA_SQL)
-        .expect("create fsqlite table");
-    sconn
-        .execute_batch(&(TRACK_R_SCHEMA_SQL.to_owned() + ";"))
-        .expect("create sqlite table");
+        fconn
+            .execute(TRACK_R_SCHEMA_SQL)
+            .await
+            .expect("create fsqlite table");
+        sconn
+            .execute_batch(&(TRACK_R_SCHEMA_SQL.to_owned() + ";"))
+            .expect("create sqlite table");
 
-    let fsqlite_elapsed = insert_records_fsqlite(&fconn, &rows);
-    let sqlite_elapsed = insert_records_sqlite(&sconn, &rows);
+        let fsqlite_elapsed = insert_records_fsqlite(&fconn, &rows).await;
+        let sqlite_elapsed = insert_records_sqlite(&sconn, &rows);
 
-    assert_eq!(
-        fetch_fsqlite_rows(&fconn).len(),
-        INSERT_ROWS_PERF as usize,
-        "perf probe should persist the full Track R rowset"
-    );
-    assert_eq!(
-        fetch_sqlite_rows(&sconn).len(),
-        INSERT_ROWS_PERF as usize,
-        "sqlite perf probe should persist the full Track R rowset"
-    );
-    eprintln!(
-        "INFO bead_id={BEAD_ID} scenario=TRACK-R-PERF-10K rows={} fsqlite_rows_per_sec={:.1} sqlite_rows_per_sec={:.1} replay_command={REPLAY_COMMAND}",
-        INSERT_ROWS_PERF,
-        rows_per_sec(INSERT_ROWS_PERF, fsqlite_elapsed),
-        rows_per_sec(INSERT_ROWS_PERF, sqlite_elapsed),
-    );
+        assert_eq!(
+            fetch_fsqlite_rows(&fconn).await.len(),
+            INSERT_ROWS_PERF as usize,
+            "perf probe should persist the full Track R rowset"
+        );
+        assert_eq!(
+            fetch_sqlite_rows(&sconn).len(),
+            INSERT_ROWS_PERF as usize,
+            "sqlite perf probe should persist the full Track R rowset"
+        );
+        eprintln!(
+            "INFO bead_id={BEAD_ID} scenario=TRACK-R-PERF-10K rows={} fsqlite_rows_per_sec={:.1} sqlite_rows_per_sec={:.1} replay_command={REPLAY_COMMAND}",
+            INSERT_ROWS_PERF,
+            rows_per_sec(INSERT_ROWS_PERF, fsqlite_elapsed),
+            rows_per_sec(INSERT_ROWS_PERF, sqlite_elapsed),
+        );
+    });
 }

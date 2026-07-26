@@ -21,6 +21,7 @@
 //! 6. **Integrity** - Final integrity check
 //!
 //! Note: Stage 6 (MVCC concurrent writers) is tested separately in 5E tests.
+#![recursion_limit = "512"]
 
 use fsqlite_types::SqliteValue;
 use std::time::Instant;
@@ -81,30 +82,33 @@ impl StageReport {
 
 // ─── Diagnostic Dump ────────────────────────────────────────────────────────
 
-fn dump_diagnostics(conn: &fsqlite::Connection, path: &str) {
+async fn dump_diagnostics(conn: &fsqlite::Connection, path: &str) {
     eprintln!("[DIAG] Database path: {path}");
 
     // Query various PRAGMA values for diagnostics
-    if let Ok(rows) = conn.query("PRAGMA page_size") {
+    if let Ok(rows) = conn.query("PRAGMA page_size").await {
         if let Some(row) = rows.first() {
             eprintln!("[DIAG] Page size: {:?}", row.get(0));
         }
     }
 
-    if let Ok(rows) = conn.query("PRAGMA page_count") {
+    if let Ok(rows) = conn.query("PRAGMA page_count").await {
         if let Some(row) = rows.first() {
             eprintln!("[DIAG] Page count: {:?}", row.get(0));
         }
     }
 
-    if let Ok(rows) = conn.query("PRAGMA journal_mode") {
+    if let Ok(rows) = conn.query("PRAGMA journal_mode").await {
         if let Some(row) = rows.first() {
             eprintln!("[DIAG] Journal mode: {:?}", row.get(0));
         }
     }
 
     // Dump sqlite_master
-    if let Ok(rows) = conn.query("SELECT type, name, tbl_name, rootpage FROM sqlite_master") {
+    if let Ok(rows) = conn
+        .query("SELECT type, name, tbl_name, rootpage FROM sqlite_master")
+        .await
+    {
         for row in rows {
             eprintln!("[DIAG] sqlite_master: {:?}", row.values());
         }
@@ -113,7 +117,7 @@ fn dump_diagnostics(conn: &fsqlite::Connection, path: &str) {
 
 // ─── Stage 1: DDL (Database Creation and Schema) ────────────────────────────
 
-fn stage_1_ddl(conn: &fsqlite::Connection, _path: &str) -> StageReport {
+async fn stage_1_ddl(conn: &fsqlite::Connection, _path: &str) -> StageReport {
     let stage = "1_ddl";
     let start = Instant::now();
 
@@ -125,8 +129,9 @@ fn stage_1_ddl(conn: &fsqlite::Connection, _path: &str) -> StageReport {
         "create_table",
         "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)"
     );
-    if let Err(e) =
-        conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)")
+    if let Err(e) = conn
+        .execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)")
+        .await
     {
         return StageReport::failure(
             stage,
@@ -141,7 +146,10 @@ fn stage_1_ddl(conn: &fsqlite::Connection, _path: &str) -> StageReport {
         "verify_sqlite_master",
         "Checking sqlite_master entries"
     );
-    match conn.query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'") {
+    match conn
+        .query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'")
+        .await
+    {
         Ok(rows) => {
             if let Some(row) = rows.first() {
                 e2e_log_kv!(
@@ -169,7 +177,10 @@ fn stage_1_ddl(conn: &fsqlite::Connection, _path: &str) -> StageReport {
         "create_index",
         "CREATE INDEX idx_email ON users(email)"
     );
-    if let Err(e) = conn.execute("CREATE INDEX idx_email ON users(email)") {
+    if let Err(e) = conn
+        .execute("CREATE INDEX idx_email ON users(email)")
+        .await
+    {
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -178,7 +189,10 @@ fn stage_1_ddl(conn: &fsqlite::Connection, _path: &str) -> StageReport {
     }
 
     // Verify index in sqlite_master (optional - may not be fully queryable yet, see bd-3ly4)
-    match conn.query("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_email'") {
+    match conn
+        .query("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_email'")
+        .await
+    {
         Ok(rows) => {
             if let Some(row) = rows.first() {
                 e2e_log_kv!(stage, "index_check", "index entry", count = row.get(0));
@@ -208,7 +222,7 @@ fn stage_1_ddl(conn: &fsqlite::Connection, _path: &str) -> StageReport {
 
 // ─── Stage 2: Write Operations ──────────────────────────────────────────────
 
-fn stage_2_write(conn: &fsqlite::Connection) -> StageReport {
+async fn stage_2_write(conn: &fsqlite::Connection) -> StageReport {
     let stage = "2_write";
     let start = Instant::now();
 
@@ -229,7 +243,7 @@ fn stage_2_write(conn: &fsqlite::Connection) -> StageReport {
             "INSERT INTO users VALUES ({}, 'user{}', 'user{}@test.com')",
             i, i, i
         );
-        if let Err(e) = conn.execute(&sql) {
+        if let Err(e) = conn.execute(&sql).await {
             return StageReport::failure(
                 stage,
                 start.elapsed().as_millis(),
@@ -266,7 +280,10 @@ fn stage_2_write(conn: &fsqlite::Connection) -> StageReport {
 
     // Update some rows
     e2e_log!(stage, "update_batch", "Updating 50 rows");
-    if let Err(e) = conn.execute("UPDATE users SET name = name || '_updated' WHERE id <= 50") {
+    if let Err(e) = conn
+        .execute("UPDATE users SET name = name || '_updated' WHERE id <= 50")
+        .await
+    {
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -276,7 +293,7 @@ fn stage_2_write(conn: &fsqlite::Connection) -> StageReport {
 
     // Delete some rows
     e2e_log!(stage, "delete_batch", "Deleting 10 rows");
-    if let Err(e) = conn.execute("DELETE FROM users WHERE id > 90") {
+    if let Err(e) = conn.execute("DELETE FROM users WHERE id > 90").await {
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -285,7 +302,7 @@ fn stage_2_write(conn: &fsqlite::Connection) -> StageReport {
     }
 
     // Verify final count
-    match conn.query("SELECT COUNT(*) FROM users") {
+    match conn.query("SELECT COUNT(*) FROM users").await {
         Ok(rows) => {
             if let Some(row) = rows.first() {
                 let count = row.get(0);
@@ -324,7 +341,7 @@ fn stage_2_write(conn: &fsqlite::Connection) -> StageReport {
 
 // ─── Stage 3: Read Operations ───────────────────────────────────────────────
 
-fn stage_3_read(conn: &fsqlite::Connection) -> StageReport {
+async fn stage_3_read(conn: &fsqlite::Connection) -> StageReport {
     let stage = "3_read";
     let start = Instant::now();
 
@@ -333,7 +350,7 @@ fn stage_3_read(conn: &fsqlite::Connection) -> StageReport {
     // Full table scan
     e2e_log!(stage, "full_scan", "SELECT * FROM users ORDER BY id");
     let scan_start = Instant::now();
-    match conn.query("SELECT * FROM users ORDER BY id") {
+    match conn.query("SELECT * FROM users ORDER BY id").await {
         Ok(rows) => {
             e2e_log_kv!(
                 stage,
@@ -359,7 +376,10 @@ fn stage_3_read(conn: &fsqlite::Connection) -> StageReport {
         "SELECT * FROM users WHERE email = 'user50@test.com'"
     );
     let seek_start = Instant::now();
-    match conn.query("SELECT * FROM users WHERE email = 'user50@test.com'") {
+    match conn
+        .query("SELECT * FROM users WHERE email = 'user50@test.com'")
+        .await
+    {
         Ok(rows) => {
             e2e_log_kv!(
                 stage,
@@ -380,7 +400,7 @@ fn stage_3_read(conn: &fsqlite::Connection) -> StageReport {
 
     // Aggregate query
     e2e_log!(stage, "aggregate", "SELECT COUNT(*), SUM(id) FROM users");
-    match conn.query("SELECT COUNT(*), SUM(id) FROM users") {
+    match conn.query("SELECT COUNT(*), SUM(id) FROM users").await {
         Ok(rows) => {
             if let Some(row) = rows.first() {
                 e2e_log_kv!(
@@ -407,7 +427,10 @@ fn stage_3_read(conn: &fsqlite::Connection) -> StageReport {
         "subquery",
         "SELECT name FROM users WHERE id IN (SELECT id FROM users WHERE id < 10)"
     );
-    match conn.query("SELECT name FROM users WHERE id IN (SELECT id FROM users WHERE id < 10)") {
+    match conn
+        .query("SELECT name FROM users WHERE id IN (SELECT id FROM users WHERE id < 10)")
+        .await
+    {
         Ok(rows) => {
             e2e_log_kv!(
                 stage,
@@ -442,7 +465,7 @@ fn stage_3_read(conn: &fsqlite::Connection) -> StageReport {
 
 // ─── Stage 4: Transaction Lifecycle ─────────────────────────────────────────
 
-fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
+async fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
     let stage = "4_txn";
     let start = Instant::now();
 
@@ -450,7 +473,7 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
 
     // Test ROLLBACK
     e2e_log!(stage, "begin", "BEGIN");
-    if let Err(e) = conn.execute("BEGIN") {
+    if let Err(e) = conn.execute("BEGIN").await {
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -463,8 +486,11 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
         "insert",
         "INSERT INTO users VALUES (10001, 'txn_user', 'txn@test.com')"
     );
-    if let Err(e) = conn.execute("INSERT INTO users VALUES (10001, 'txn_user', 'txn@test.com')") {
-        let _ = conn.execute("ROLLBACK");
+    if let Err(e) = conn
+        .execute("INSERT INTO users VALUES (10001, 'txn_user', 'txn@test.com')")
+        .await
+    {
+        drop(conn.execute("ROLLBACK").await);
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -473,7 +499,7 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
     }
 
     e2e_log!(stage, "rollback", "ROLLBACK");
-    if let Err(e) = conn.execute("ROLLBACK") {
+    if let Err(e) = conn.execute("ROLLBACK").await {
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -482,7 +508,10 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
     }
 
     // Verify rollback
-    match conn.query("SELECT COUNT(*) FROM users WHERE id = 10001") {
+    match conn
+        .query("SELECT COUNT(*) FROM users WHERE id = 10001")
+        .await
+    {
         Ok(rows) => {
             if let Some(row) = rows.first() {
                 e2e_log_kv!(

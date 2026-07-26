@@ -23,8 +23,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -56,12 +56,13 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn setup(stmts: &[&str]) -> (Connection, rusqlite::Connection) {
-    let fconn = Connection::open(":memory:").expect("open frank");
+async fn setup(stmts: &[&str]) -> (Connection, rusqlite::Connection) {
+    let fconn = Connection::open(":memory:").await.expect("open frank");
     let rconn = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
         fconn
             .execute(s)
+            .await
             .unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
         rconn
             .execute_batch(s)
@@ -70,10 +71,15 @@ fn setup(stmts: &[&str]) -> (Connection, rusqlite::Connection) {
     (fconn, rconn)
 }
 
-fn assert_parity(fconn: &Connection, rconn: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn assert_parity(
+    fconn: &Connection,
+    rconn: &rusqlite::Connection,
+    queries: &[&str],
+    label: &str,
+) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(fconn, q), sqlite_rows(rconn, q)) {
+        match (frank_rows(fconn, q).await, sqlite_rows(rconn, q)) {
             (Ok(f), Ok(s)) if f == s => {}
             (Ok(f), Ok(s)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {f:?}\n  csql:  {s:?}"));
@@ -108,134 +114,157 @@ fn nullable_table() -> [&'static str; 2] {
 
 #[test]
 fn orderby_default_null_position() {
-    let (f, r) = setup(&nullable_table());
-    assert_parity(
-        &f,
-        &r,
-        &[
-            // Default: NULLs first on ASC, last on DESC.
-            "SELECT id, v FROM t ORDER BY v",
-            "SELECT id, v FROM t ORDER BY v ASC, id",
-            "SELECT id, v FROM t ORDER BY v DESC, id",
-            "SELECT id, s FROM t ORDER BY s, id",
-            "SELECT id, s FROM t ORDER BY s DESC, id",
-        ],
-        "orderby_default_null_position",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&nullable_table()).await;
+        assert_parity(
+            &f,
+            &r,
+            &[
+                // Default: NULLs first on ASC, last on DESC.
+                "SELECT id, v FROM t ORDER BY v",
+                "SELECT id, v FROM t ORDER BY v ASC, id",
+                "SELECT id, v FROM t ORDER BY v DESC, id",
+                "SELECT id, s FROM t ORDER BY s, id",
+                "SELECT id, s FROM t ORDER BY s DESC, id",
+            ],
+            "orderby_default_null_position",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn orderby_explicit_nulls_first_last() {
-    let (f, r) = setup(&nullable_table());
-    assert_parity(
-        &f,
-        &r,
-        &[
-            "SELECT id, v FROM t ORDER BY v ASC NULLS LAST, id",
-            "SELECT id, v FROM t ORDER BY v DESC NULLS FIRST, id",
-            "SELECT id, v FROM t ORDER BY v NULLS LAST, id",
-            "SELECT id, s FROM t ORDER BY s ASC NULLS LAST, id",
-        ],
-        "orderby_explicit_nulls_first_last",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&nullable_table()).await;
+        assert_parity(
+            &f,
+            &r,
+            &[
+                "SELECT id, v FROM t ORDER BY v ASC NULLS LAST, id",
+                "SELECT id, v FROM t ORDER BY v DESC NULLS FIRST, id",
+                "SELECT id, v FROM t ORDER BY v NULLS LAST, id",
+                "SELECT id, s FROM t ORDER BY s ASC NULLS LAST, id",
+            ],
+            "orderby_explicit_nulls_first_last",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn limit_negative_means_unlimited() {
-    let (f, r) = setup(&nullable_table());
-    assert_parity(
-        &f,
-        &r,
-        &[
-            // Negative LIMIT == no limit in SQLite.
-            "SELECT id FROM t ORDER BY id LIMIT -1",
-            "SELECT id FROM t ORDER BY id LIMIT -5",
-            // LIMIT 0 returns nothing.
-            "SELECT id FROM t ORDER BY id LIMIT 0",
-            // OFFSET with negative LIMIT still applies the offset.
-            "SELECT id FROM t ORDER BY id LIMIT -1 OFFSET 2",
-        ],
-        "limit_negative_means_unlimited",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&nullable_table()).await;
+        assert_parity(
+            &f,
+            &r,
+            &[
+                // Negative LIMIT == no limit in SQLite.
+                "SELECT id FROM t ORDER BY id LIMIT -1",
+                "SELECT id FROM t ORDER BY id LIMIT -5",
+                // LIMIT 0 returns nothing.
+                "SELECT id FROM t ORDER BY id LIMIT 0",
+                // OFFSET with negative LIMIT still applies the offset.
+                "SELECT id FROM t ORDER BY id LIMIT -1 OFFSET 2",
+            ],
+            "limit_negative_means_unlimited",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn limit_offset_bounds() {
-    let (f, r) = setup(&nullable_table());
-    assert_parity(
-        &f,
-        &r,
-        &[
-            "SELECT id FROM t ORDER BY id LIMIT 3",
-            "SELECT id FROM t ORDER BY id LIMIT 3 OFFSET 2",
-            "SELECT id FROM t ORDER BY id LIMIT 100", // beyond row count
-            "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 100", // offset beyond rows
-            "SELECT id FROM t ORDER BY id LIMIT 3, 2", // LIMIT offset, count form
-        ],
-        "limit_offset_bounds",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&nullable_table()).await;
+        assert_parity(
+            &f,
+            &r,
+            &[
+                "SELECT id FROM t ORDER BY id LIMIT 3",
+                "SELECT id FROM t ORDER BY id LIMIT 3 OFFSET 2",
+                "SELECT id FROM t ORDER BY id LIMIT 100", // beyond row count
+                "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 100", // offset beyond rows
+                "SELECT id FROM t ORDER BY id LIMIT 3, 2", // LIMIT offset, count form
+            ],
+            "limit_offset_bounds",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn orderby_by_ordinal_alias_expression() {
-    let (f, r) = setup(&nullable_table());
-    assert_parity(
-        &f,
-        &r,
-        &[
-            // Order by output-column ordinal.
-            "SELECT v, id FROM t ORDER BY 1, 2",
-            // Order by output alias.
-            "SELECT v AS val, id FROM t ORDER BY val, id",
-            // Order by arbitrary expression.
-            "SELECT id, v FROM t ORDER BY v * -1, id",
-            "SELECT id, v FROM t ORDER BY (v IS NULL), v, id",
-            // Mixed-direction multi-key.
-            "SELECT id, v, s FROM t ORDER BY v ASC, s DESC, id",
-        ],
-        "orderby_by_ordinal_alias_expression",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&nullable_table()).await;
+        assert_parity(
+            &f,
+            &r,
+            &[
+                // Order by output-column ordinal.
+                "SELECT v, id FROM t ORDER BY 1, 2",
+                // Order by output alias.
+                "SELECT v AS val, id FROM t ORDER BY val, id",
+                // Order by arbitrary expression.
+                "SELECT id, v FROM t ORDER BY v * -1, id",
+                "SELECT id, v FROM t ORDER BY (v IS NULL), v, id",
+                // Mixed-direction multi-key.
+                "SELECT id, v, s FROM t ORDER BY v ASC, s DESC, id",
+            ],
+            "orderby_by_ordinal_alias_expression",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn orderby_limit_on_compound_select() {
-    let (f, r) = setup(&[
-        "CREATE TABLE a (x INTEGER)",
-        "CREATE TABLE b (x INTEGER)",
-        "INSERT INTO a VALUES (3),(1),(2),(2)",
-        "INSERT INTO b VALUES (5),(2),(4)",
-    ]);
-    assert_parity(
-        &f,
-        &r,
-        &[
-            // UNION dedups; ORDER BY + LIMIT apply to the whole compound.
-            "SELECT x FROM a UNION SELECT x FROM b ORDER BY x LIMIT 3",
-            "SELECT x FROM a UNION ALL SELECT x FROM b ORDER BY x DESC LIMIT 4",
-            "SELECT x FROM a INTERSECT SELECT x FROM b ORDER BY x",
-            "SELECT x FROM a EXCEPT SELECT x FROM b ORDER BY x",
-            "SELECT x FROM a UNION SELECT x FROM b ORDER BY x LIMIT 2 OFFSET 1",
-        ],
-        "orderby_limit_on_compound_select",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE a (x INTEGER)",
+            "CREATE TABLE b (x INTEGER)",
+            "INSERT INTO a VALUES (3),(1),(2),(2)",
+            "INSERT INTO b VALUES (5),(2),(4)",
+        ])
+        .await;
+        assert_parity(
+            &f,
+            &r,
+            &[
+                // UNION dedups; ORDER BY + LIMIT apply to the whole compound.
+                "SELECT x FROM a UNION SELECT x FROM b ORDER BY x LIMIT 3",
+                "SELECT x FROM a UNION ALL SELECT x FROM b ORDER BY x DESC LIMIT 4",
+                "SELECT x FROM a INTERSECT SELECT x FROM b ORDER BY x",
+                "SELECT x FROM a EXCEPT SELECT x FROM b ORDER BY x",
+                "SELECT x FROM a UNION SELECT x FROM b ORDER BY x LIMIT 2 OFFSET 1",
+            ],
+            "orderby_limit_on_compound_select",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn orderby_limit_with_duplicates_stable() {
     // Ties broken by a unique key so the comparison is deterministic across
     // engines (SQLite's sort is not guaranteed stable without a tiebreaker).
-    let (f, r) = setup(&[
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, v INTEGER)",
-        "INSERT INTO t VALUES (1,1,10),(2,1,10),(3,2,10),(4,2,5),(5,1,5),(6,3,5)",
-    ]);
-    assert_parity(
-        &f,
-        &r,
-        &[
-            "SELECT id, grp, v FROM t ORDER BY v, grp, id LIMIT 4",
-            "SELECT id FROM t ORDER BY v DESC, id DESC LIMIT 3 OFFSET 1",
-            "SELECT grp, count(*) FROM t GROUP BY grp ORDER BY count(*) DESC, grp",
-        ],
-        "orderby_limit_with_duplicates_stable",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, v INTEGER)",
+            "INSERT INTO t VALUES (1,1,10),(2,1,10),(3,2,10),(4,2,5),(5,1,5),(6,3,5)",
+        ])
+        .await;
+        assert_parity(
+            &f,
+            &r,
+            &[
+                "SELECT id, grp, v FROM t ORDER BY v, grp, id LIMIT 4",
+                "SELECT id FROM t ORDER BY v DESC, id DESC LIMIT 3 OFFSET 1",
+                "SELECT grp, count(*) FROM t GROUP BY grp ORDER BY count(*) DESC, grp",
+            ],
+            "orderby_limit_with_duplicates_stable",
+        )
+        .await;
+    });
 }

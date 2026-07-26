@@ -8,6 +8,7 @@
 //! Each scenario compares results against rusqlite's bundled JSON1; operators
 //! and mutators (set/insert/replace/remove) live in their own functions so any
 //! divergence isolates cleanly.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -25,8 +26,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -58,11 +59,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -72,7 +73,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"));
@@ -96,99 +97,117 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 
 #[test]
 fn json_minify_and_validate() {
-    scenario(
-        &[],
-        &[
-            // json() validates and minifies (strips insignificant whitespace).
-            "SELECT json(' { \"a\" : 1 , \"b\" : [ 2 , 3 ] } ')",
-            "SELECT json('[1,2,3]')",
-            "SELECT json('\"hello\"')",
-        ],
-        "json_minify_and_validate",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[],
+            &[
+                // json() validates and minifies (strips insignificant whitespace).
+                "SELECT json(' { \"a\" : 1 , \"b\" : [ 2 , 3 ] } ')",
+                "SELECT json('[1,2,3]')",
+                "SELECT json('\"hello\"')",
+            ],
+            "json_minify_and_validate",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn json_valid_classification() {
-    scenario(
-        &[],
-        &[
-            "SELECT json_valid('{\"a\":1}')", // 1
-            "SELECT json_valid('[1,2,3]')",   // 1
-            "SELECT json_valid('not json')",  // 0
-            "SELECT json_valid('{\"a\":}')",  // 0
-            "SELECT json_valid('123')",       // 1 (a bare number is valid JSON)
-            "SELECT json_valid('null')",      // 1
-        ],
-        "json_valid_classification",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[],
+            &[
+                "SELECT json_valid('{\"a\":1}')", // 1
+                "SELECT json_valid('[1,2,3]')",   // 1
+                "SELECT json_valid('not json')",  // 0
+                "SELECT json_valid('{\"a\":}')",  // 0
+                "SELECT json_valid('123')",       // 1 (a bare number is valid JSON)
+                "SELECT json_valid('null')",      // 1
+            ],
+            "json_valid_classification",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn json_type_classification() {
-    scenario(
-        &[],
-        &[
-            "SELECT json_type('{\"a\":1}')",            // object
-            "SELECT json_type('[1,2]')",                // array
-            "SELECT json_type('123')",                  // integer
-            "SELECT json_type('1.5')",                  // real
-            "SELECT json_type('\"hi\"')",               // text
-            "SELECT json_type('true')",                 // true
-            "SELECT json_type('false')",                // false
-            "SELECT json_type('null')",                 // null
-            "SELECT json_type('{\"a\":[1,2]}', '$.a')", // array (path form)
-        ],
-        "json_type_classification",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[],
+            &[
+                "SELECT json_type('{\"a\":1}')",            // object
+                "SELECT json_type('[1,2]')",                // array
+                "SELECT json_type('123')",                  // integer
+                "SELECT json_type('1.5')",                  // real
+                "SELECT json_type('\"hi\"')",               // text
+                "SELECT json_type('true')",                 // true
+                "SELECT json_type('false')",                // false
+                "SELECT json_type('null')",                 // null
+                "SELECT json_type('{\"a\":[1,2]}', '$.a')", // array (path form)
+            ],
+            "json_type_classification",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn json_extract_paths_and_storage_class() {
-    scenario(
-        &[],
-        &[
-            "SELECT json_extract('{\"a\":1,\"b\":\"x\"}', '$.a')", // 1 (integer)
-            "SELECT json_extract('{\"a\":1,\"b\":\"x\"}', '$.b')", // x (text)
-            "SELECT json_extract('[10,20,30]', '$[1]')",           // 20
-            "SELECT json_extract('{\"a\":{\"b\":2}}', '$.a.b')",   // 2
-            "SELECT json_extract('{\"a\":1}', '$.missing')",       // NULL
-            "SELECT typeof(json_extract('{\"a\":1}', '$.a'))",     // integer
-            "SELECT typeof(json_extract('{\"a\":\"x\"}', '$.a'))", // text
-            "SELECT typeof(json_extract('{\"a\":1.5}', '$.a'))",   // real
-        ],
-        "json_extract_paths_and_storage_class",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[],
+            &[
+                "SELECT json_extract('{\"a\":1,\"b\":\"x\"}', '$.a')", // 1 (integer)
+                "SELECT json_extract('{\"a\":1,\"b\":\"x\"}', '$.b')", // x (text)
+                "SELECT json_extract('[10,20,30]', '$[1]')",           // 20
+                "SELECT json_extract('{\"a\":{\"b\":2}}', '$.a.b')",   // 2
+                "SELECT json_extract('{\"a\":1}', '$.missing')",       // NULL
+                "SELECT typeof(json_extract('{\"a\":1}', '$.a'))",     // integer
+                "SELECT typeof(json_extract('{\"a\":\"x\"}', '$.a'))", // text
+                "SELECT typeof(json_extract('{\"a\":1.5}', '$.a'))",   // real
+            ],
+            "json_extract_paths_and_storage_class",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn json_array_and_object_builders() {
-    scenario(
-        &[],
-        &[
-            "SELECT json_array(1, 2, 'x', NULL)",    // [1,2,"x",null]
-            "SELECT json_array(1.5, -3, 'a b')",     // [1.5,-3,"a b"]
-            "SELECT json_object('a', 1, 'b', 'x')",  // {"a":1,"b":"x"}
-            "SELECT json_object('n', NULL, 'k', 2)", // {"n":null,"k":2}
-            "SELECT json_array_length('[1,2,3,4]')", // 4
-            "SELECT json_array_length('[]')",        // 0
-            "SELECT json_array_length('{\"a\":[1,2,3]}', '$.a')", // 3
-        ],
-        "json_array_and_object_builders",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[],
+            &[
+                "SELECT json_array(1, 2, 'x', NULL)",    // [1,2,"x",null]
+                "SELECT json_array(1.5, -3, 'a b')",     // [1.5,-3,"a b"]
+                "SELECT json_object('a', 1, 'b', 'x')",  // {"a":1,"b":"x"}
+                "SELECT json_object('n', NULL, 'k', 2)", // {"n":null,"k":2}
+                "SELECT json_array_length('[1,2,3,4]')", // 4
+                "SELECT json_array_length('[]')",        // 0
+                "SELECT json_array_length('{\"a\":[1,2,3]}', '$.a')", // 3
+            ],
+            "json_array_and_object_builders",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn json_quote_function() {
-    scenario(
-        &[],
-        &[
-            "SELECT json_quote('hello')", // "hello"
-            "SELECT json_quote(3.14)",    // 3.14
-            "SELECT json_quote(42)",      // 42
-        ],
-        "json_quote_function",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[],
+            &[
+                "SELECT json_quote('hello')", // "hello"
+                "SELECT json_quote(3.14)",    // 3.14
+                "SELECT json_quote(42)",      // 42
+            ],
+            "json_quote_function",
+        )
+        .await;
+    });
 }
 
 /// `->` yields a JSON value (quoted text stays quoted); `->>` yields the SQL
@@ -199,60 +218,69 @@ fn json_quote_function() {
 /// Tracked in bd-m87j8.
 #[test]
 fn json_arrow_operators() {
-    scenario(
-        &[],
-        &[
-            "SELECT '{\"a\":1}' -> '$.a'",      // JSON 1
-            "SELECT '{\"a\":1}' ->> '$.a'",     // SQL 1
-            "SELECT '{\"a\":\"x\"}' -> '$.a'",  // JSON "x" (quoted)
-            "SELECT '{\"a\":\"x\"}' ->> '$.a'", // SQL x (unquoted)
-            "SELECT '[10,20]' -> 1",            // JSON 20 (bare int = array index)
-            "SELECT '[10,20]' ->> 1",           // SQL 20
-        ],
-        "json_arrow_operators",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[],
+            &[
+                "SELECT '{\"a\":1}' -> '$.a'",      // JSON 1
+                "SELECT '{\"a\":1}' ->> '$.a'",     // SQL 1
+                "SELECT '{\"a\":\"x\"}' -> '$.a'",  // JSON "x" (quoted)
+                "SELECT '{\"a\":\"x\"}' ->> '$.a'", // SQL x (unquoted)
+                "SELECT '[10,20]' -> 1",            // JSON 20 (bare int = array index)
+                "SELECT '[10,20]' ->> 1",           // SQL 20
+            ],
+            "json_arrow_operators",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn json_mutators_set_insert_replace_remove() {
     // Mutators differ in whether they create vs. only-overwrite vs. only-update.
     // Isolated so a divergence here doesn't taint the readers above.
-    scenario(
-        &[],
-        &[
-            // set: create or overwrite.
-            "SELECT json_set('{\"a\":1}', '$.a', 99)", // {"a":99}
-            "SELECT json_set('{\"a\":1}', '$.b', 2)",  // {"a":1,"b":2}
-            // insert: only create (no overwrite of existing).
-            "SELECT json_insert('{\"a\":1}', '$.a', 99)", // unchanged {"a":1}
-            "SELECT json_insert('{\"a\":1}', '$.b', 2)",  // {"a":1,"b":2}
-            // replace: only overwrite (no create).
-            "SELECT json_replace('{\"a\":1}', '$.a', 99)", // {"a":99}
-            "SELECT json_replace('{\"a\":1}', '$.b', 2)",  // unchanged {"a":1}
-            // remove: delete a path.
-            "SELECT json_remove('{\"a\":1,\"b\":2}', '$.a')", // {"b":2}
-            "SELECT json_remove('[1,2,3]', '$[0]')",          // [2,3]
-        ],
-        "json_mutators_set_insert_replace_remove",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[],
+            &[
+                // set: create or overwrite.
+                "SELECT json_set('{\"a\":1}', '$.a', 99)", // {"a":99}
+                "SELECT json_set('{\"a\":1}', '$.b', 2)",  // {"a":1,"b":2}
+                // insert: only create (no overwrite of existing).
+                "SELECT json_insert('{\"a\":1}', '$.a', 99)", // unchanged {"a":1}
+                "SELECT json_insert('{\"a\":1}', '$.b', 2)",  // {"a":1,"b":2}
+                // replace: only overwrite (no create).
+                "SELECT json_replace('{\"a\":1}', '$.a', 99)", // {"a":99}
+                "SELECT json_replace('{\"a\":1}', '$.b', 2)",  // unchanged {"a":1}
+                // remove: delete a path.
+                "SELECT json_remove('{\"a\":1,\"b\":2}', '$.a')", // {"b":2}
+                "SELECT json_remove('[1,2,3]', '$[0]')",          // [2,3]
+            ],
+            "json_mutators_set_insert_replace_remove",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn json_in_table_context() {
-    scenario(
-        &[
-            "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)",
-            "INSERT INTO docs VALUES (1,'{\"name\":\"ann\",\"age\":30}'), \
-             (2,'{\"name\":\"bob\",\"age\":25}'), (3,'{\"name\":\"cy\",\"age\":40}')",
-        ],
-        &[
-            "SELECT id, json_extract(body, '$.name') FROM docs ORDER BY id",
-            "SELECT json_extract(body, '$.name') FROM docs \
-             WHERE json_extract(body, '$.age') > 28 ORDER BY id",
-            "SELECT id FROM docs ORDER BY json_extract(body, '$.age')",
-        ],
-        "json_in_table_context",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)",
+                "INSERT INTO docs VALUES (1,'{\"name\":\"ann\",\"age\":30}'), \
+                 (2,'{\"name\":\"bob\",\"age\":25}'), (3,'{\"name\":\"cy\",\"age\":40}')",
+            ],
+            &[
+                "SELECT id, json_extract(body, '$.name') FROM docs ORDER BY id",
+                "SELECT json_extract(body, '$.name') FROM docs \
+                 WHERE json_extract(body, '$.age') > 28 ORDER BY id",
+                "SELECT id FROM docs ORDER BY json_extract(body, '$.age')",
+            ],
+            "json_in_table_context",
+        )
+        .await;
+    });
 }
 
 /// Companion to `json_arrow_operators`: the `->` / `->>` operators DO work when
@@ -261,19 +289,22 @@ fn json_in_table_context() {
 /// (bd-m87j8), not the operators themselves.
 #[test]
 fn json_arrow_operators_in_table_context() {
-    scenario(
-        &[
-            "CREATE TABLE d (id INTEGER PRIMARY KEY, body TEXT)",
-            "INSERT INTO d VALUES (1,'{\"a\":1,\"s\":\"x\"}'),(2,'[10,20]')",
-        ],
-        &[
-            "SELECT body -> '$.a' FROM d WHERE id = 1",  // JSON 1
-            "SELECT body ->> '$.a' FROM d WHERE id = 1", // SQL 1
-            "SELECT body -> '$.s' FROM d WHERE id = 1",  // JSON "x"
-            "SELECT body ->> '$.s' FROM d WHERE id = 1", // SQL x
-            "SELECT body -> 1 FROM d WHERE id = 2",      // JSON 20
-            "SELECT body ->> 1 FROM d WHERE id = 2",     // SQL 20
-        ],
-        "json_arrow_operators_in_table_context",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE d (id INTEGER PRIMARY KEY, body TEXT)",
+                "INSERT INTO d VALUES (1,'{\"a\":1,\"s\":\"x\"}'),(2,'[10,20]')",
+            ],
+            &[
+                "SELECT body -> '$.a' FROM d WHERE id = 1",  // JSON 1
+                "SELECT body ->> '$.a' FROM d WHERE id = 1", // SQL 1
+                "SELECT body -> '$.s' FROM d WHERE id = 1",  // JSON "x"
+                "SELECT body ->> '$.s' FROM d WHERE id = 1", // SQL x
+                "SELECT body -> 1 FROM d WHERE id = 2",      // JSON 20
+                "SELECT body ->> 1 FROM d WHERE id = 2",     // SQL 20
+            ],
+            "json_arrow_operators_in_table_context",
+        )
+        .await;
+    });
 }

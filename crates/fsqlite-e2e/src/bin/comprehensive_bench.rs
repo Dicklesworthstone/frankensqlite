@@ -16,8 +16,8 @@
 //!   cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --filter insert
 
 use std::collections::BTreeMap;
-use std::io::Write as _;
-use std::sync::{Arc, Barrier, OnceLock, mpsc};
+use std::io::{Read as _, Write as _};
+use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeBuilder};
@@ -26,6 +26,8 @@ use fsqlite_core::connection::{
     reset_hot_path_profile, set_hot_path_profile_enabled,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use tracing_subscriber::prelude::*;
 
 // ─── Configuration ─────────────────────────────────────────────────────
 
@@ -40,7 +42,8 @@ const ROW_COUNTS_QUICK: &[usize] = &[100, 1_000, 10_000];
 const CONCURRENT_THREAD_COUNTS: &[usize] = &[2, 4, 8];
 const CONCURRENT_ROWS_PER_THREAD: usize = 1_000;
 const CONCURRENT_RANGE_SIZE: i64 = 1_000_000;
-const JSON_REPORT_SCHEMA_V3: &str = "fsqlite-e2e.comprehensive-bench-report.v3";
+const JSON_REPORT_SCHEMA_V4: &str = "fsqlite-e2e.comprehensive-bench-report.v4";
+const BENCHMARK_PROVENANCE_SCHEMA_V1: &str = "fsqlite-e2e.benchmark-provenance.v1";
 const CI_REGRESSION_GATE_SCHEMA_V2: &str = "fsqlite-e2e.comprehensive-bench-ci-regression-gate.v2";
 const CI_REGRESSION_GATE_BEAD_ID: &str = "bd-m4tju";
 const CI_REGRESSION_BASELINE_BEAD_ID: &str = "bd-0winn";
@@ -419,22 +422,18 @@ fn bench_env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Optional symmetric `synchronous` override for the concurrent-writer section.
+/// Matched durability for both engines in the concurrent-writer section.
 ///
-/// Returns `None` (env unset) to preserve the historical concurrent baseline
-/// exactly: C writer connections inherit the compiled default and FrankenSQLite
-/// writers keep `apply_pragmas_fsqlite`'s NORMAL. When
-/// `FSQLITE_BENCH_CONCURRENT_SYNC` is set to `normal`/`full`, BOTH engines'
-/// writer connections are forced to that identical mode — used to (a) audit the
-/// fairness of the default (is C implicitly at FULL while F is at NORMAL?) and
-/// (b) probe whether group-commit coalescing engages under real per-commit
-/// fsync. Never defaults anything on; the baseline is unchanged unless the
-/// operator opts in.
-fn concurrent_sync_override() -> Option<&'static str> {
+/// NORMAL is the explicit default. FULL is available as a separate, labelled
+/// experiment. Silently allowing C SQLite to inherit FULL while FrankenSQLite
+/// receives NORMAL makes the comparison non-citable (bd-x5gzk).
+fn concurrent_sync_mode() -> &'static str {
     match std::env::var("FSQLITE_BENCH_CONCURRENT_SYNC") {
-        Ok(value) if value.eq_ignore_ascii_case("normal") => Some("NORMAL"),
-        Ok(value) if value.eq_ignore_ascii_case("full") => Some("FULL"),
-        _ => None,
+        Ok(value) if value.eq_ignore_ascii_case("normal") => "NORMAL",
+        Ok(value) if value.eq_ignore_ascii_case("full") => "FULL",
+        Ok(value) => panic!("FSQLITE_BENCH_CONCURRENT_SYNC must be NORMAL or FULL, got `{value}`"),
+        Err(std::env::VarError::NotPresent) => "NORMAL",
+        Err(error) => panic!("could not read FSQLITE_BENCH_CONCURRENT_SYNC: {error}"),
     }
 }
 
@@ -452,6 +451,13 @@ fn collect_rusqlite_rows<P: rusqlite::Params>(
         Ok(values)
     })?
     .collect::<Result<Vec<_>, _>>()
+}
+
+fn fsqlite_integer(row: &fsqlite::Row, column: usize, context: &str) -> i64 {
+    match row.get(column) {
+        Some(fsqlite::SqliteValue::Integer(value)) => *value,
+        value => panic!("{context}: expected INTEGER at column {column}, got {value:?}"),
+    }
 }
 
 struct BenchTask<T> {
@@ -542,7 +548,7 @@ fn apply_pragmas_csqlite(conn: &rusqlite::Connection) {
          PRAGMA cache_size = -64000;",
         benchmark_page_size_bytes()
     ))
-    .ok();
+    .unwrap_or_else(|error| panic!("failed to configure C SQLite benchmark connection: {error}"));
 }
 
 const FSQLITE_BENCHMARK_PRAGMAS: &[&str] = &[
@@ -556,15 +562,14 @@ const FSQLITE_BENCHMARK_PRAGMAS: &[&str] = &[
 ];
 
 fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
-    // Every pragma here is best-effort: an unsupported one must not abort the
-    // run. `drop(block_on(..))` — not `let _ = ..` — because `execute` returns a
-    // future now, and `let _` would bind (and immediately drop) it unpolled,
-    // silently skipping the pragma with no diagnostic.
-    drop(fsqlite_e2e::block_on(conn.execute(
-        format!("PRAGMA page_size = {};", benchmark_page_size_bytes()).as_str(),
-    )));
+    let page_size = format!("PRAGMA page_size = {};", benchmark_page_size_bytes());
+    fsqlite_e2e::block_on(conn.execute(&page_size)).unwrap_or_else(|error| {
+        panic!("failed to configure FrankenSQLite with `{page_size}`: {error}")
+    });
     for pragma in FSQLITE_BENCHMARK_PRAGMAS {
-        drop(fsqlite_e2e::block_on(conn.execute(pragma)));
+        fsqlite_e2e::block_on(conn.execute(pragma)).unwrap_or_else(|error| {
+            panic!("failed to configure FrankenSQLite with `{pragma}`: {error}")
+        });
     }
     // Opt-in LAB_UNSAFE write-merge mode for A/B perf measurement of the
     // SSI e-process skip gate. The gate is safe to leave on: under the
@@ -574,14 +579,351 @@ fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
         .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {
-        drop(fsqlite_e2e::block_on(
-            conn.execute("PRAGMA fsqlite.write_merge = LAB_UNSAFE;"),
-        ));
+        fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.write_merge = LAB_UNSAFE;"))
+            .unwrap_or_else(|error| panic!("failed to enable LAB_UNSAFE write merge: {error}"));
         // Tight alpha so the gate opens reasonably fast on the short
         // benchmark runs. `alpha = 1e-3` matches the default.
-        drop(fsqlite_e2e::block_on(
-            conn.execute("PRAGMA fsqlite.ssi_e_process_alpha = 0.001;"),
-        ));
+        fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.ssi_e_process_alpha = 0.001;"))
+            .unwrap_or_else(|error| panic!("failed to set SSI e-process alpha: {error}"));
+    }
+}
+
+fn normalize_csqlite_value(value: rusqlite::types::ValueRef<'_>) -> String {
+    match value {
+        rusqlite::types::ValueRef::Null => "null".to_owned(),
+        rusqlite::types::ValueRef::Integer(value) => value.to_string(),
+        rusqlite::types::ValueRef::Real(value) => value.to_string(),
+        rusqlite::types::ValueRef::Text(value) => {
+            String::from_utf8_lossy(value).to_ascii_lowercase()
+        }
+        rusqlite::types::ValueRef::Blob(value) => format!("blob:{}", value.len()),
+    }
+}
+
+fn normalize_fsqlite_value(value: &fsqlite::SqliteValue) -> String {
+    match value {
+        fsqlite::SqliteValue::Null => "null".to_owned(),
+        fsqlite::SqliteValue::Integer(value) => value.to_string(),
+        fsqlite::SqliteValue::Float(value) => value.to_string(),
+        fsqlite::SqliteValue::Text(value) => value.as_ref().to_ascii_lowercase(),
+        fsqlite::SqliteValue::Blob(value) => format!("blob:{}", value.len()),
+    }
+}
+
+fn query_effective_csqlite_pragmas(
+    conn: &rusqlite::Connection,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut values = BTreeMap::new();
+    for pragma in ["page_size", "journal_mode", "synchronous", "cache_size"] {
+        let sql = format!("PRAGMA {pragma};");
+        let value = conn
+            .query_row(&sql, [], |row| row.get_ref(0).map(normalize_csqlite_value))
+            .map_err(|error| format!("C SQLite `{sql}` failed: {error}"))?;
+        values.insert(pragma.to_owned(), value);
+    }
+    Ok(values)
+}
+
+fn query_effective_fsqlite_pragmas(
+    conn: &fsqlite::Connection,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut values = BTreeMap::new();
+    for pragma in ["page_size", "journal_mode", "synchronous", "cache_size"] {
+        let sql = format!("PRAGMA {pragma};");
+        let rows = fsqlite_e2e::block_on(conn.query(&sql))
+            .map_err(|error| format!("FrankenSQLite `{sql}` failed: {error}"))?;
+        let row = rows
+            .first()
+            .ok_or_else(|| format!("FrankenSQLite `{sql}` returned no row"))?;
+        let value = row
+            .get(0)
+            .ok_or_else(|| format!("FrankenSQLite `{sql}` returned no first column"))?;
+        values.insert(pragma.to_owned(), normalize_fsqlite_value(value));
+    }
+    Ok(values)
+}
+
+fn record_durability_profile(
+    profiles: &mut BTreeMap<String, BTreeMap<String, String>>,
+    errors: &mut Vec<String>,
+    name: &str,
+    result: Result<BTreeMap<String, String>, String>,
+) {
+    match result {
+        Ok(profile) => {
+            profiles.insert(name.to_owned(), profile);
+        }
+        Err(error) => errors.push(error),
+    }
+}
+
+fn capture_durability_identity() -> JsonDurabilityIdentity {
+    let mut effective_profiles = BTreeMap::new();
+    let mut validation_errors = Vec::new();
+
+    let csqlite_memory = rusqlite::Connection::open_in_memory()
+        .expect("durability certification must open C SQLite memory database");
+    apply_pragmas_csqlite(&csqlite_memory);
+    record_durability_profile(
+        &mut effective_profiles,
+        &mut validation_errors,
+        "memory.csqlite",
+        query_effective_csqlite_pragmas(&csqlite_memory),
+    );
+
+    let fsqlite_memory = open_fsqlite_memory_connection_for_benchmark();
+    apply_pragmas_fsqlite(&fsqlite_memory);
+    record_durability_profile(
+        &mut effective_profiles,
+        &mut validation_errors,
+        "memory.fsqlite",
+        query_effective_fsqlite_pragmas(&fsqlite_memory),
+    );
+
+    let directory =
+        tempfile::tempdir().expect("durability certification must create a temporary directory");
+    let csqlite_path = directory.path().join("csqlite.db");
+    let csqlite_file = rusqlite::Connection::open(&csqlite_path)
+        .expect("durability certification must open C SQLite file database");
+    apply_pragmas_csqlite(&csqlite_file);
+    record_durability_profile(
+        &mut effective_profiles,
+        &mut validation_errors,
+        "file.csqlite",
+        query_effective_csqlite_pragmas(&csqlite_file),
+    );
+
+    let fsqlite_path = directory.path().join("fsqlite.db");
+    let fsqlite_path = fsqlite_path
+        .to_str()
+        .expect("temporary benchmark path must be UTF-8");
+    let fsqlite_file = fsqlite_e2e::block_on(fsqlite::Connection::open_with_page_size(
+        fsqlite_path,
+        benchmark_page_size_bytes(),
+    ))
+    .expect("durability certification must open FrankenSQLite file database");
+    apply_pragmas_fsqlite(&fsqlite_file);
+    record_durability_profile(
+        &mut effective_profiles,
+        &mut validation_errors,
+        "file.fsqlite",
+        query_effective_fsqlite_pragmas(&fsqlite_file),
+    );
+
+    for kind in ["memory", "file"] {
+        let csqlite = effective_profiles.get(&format!("{kind}.csqlite"));
+        let fsqlite = effective_profiles.get(&format!("{kind}.fsqlite"));
+        if let (Some(csqlite), Some(fsqlite)) = (csqlite, fsqlite)
+            && csqlite != fsqlite
+        {
+            validation_errors.push(format!(
+                "{kind} effective PRAGMAs differ: C SQLite={csqlite:?}, FrankenSQLite={fsqlite:?}"
+            ));
+        }
+    }
+
+    let verified = effective_profiles.len() == 4;
+    let matched = verified && validation_errors.is_empty();
+    JsonDurabilityIdentity {
+        page_size_bytes: benchmark_page_size_bytes(),
+        default_synchronous: "NORMAL".to_owned(),
+        concurrent_synchronous_modes: vec![concurrent_sync_mode().to_owned()],
+        csqlite_pragmas: vec![
+            format!("PRAGMA page_size = {};", benchmark_page_size_bytes()),
+            "PRAGMA journal_mode = WAL;".to_owned(),
+            "PRAGMA synchronous = NORMAL;".to_owned(),
+            "PRAGMA cache_size = -64000;".to_owned(),
+        ],
+        fsqlite_pragmas: std::iter::once(format!(
+            "PRAGMA page_size = {};",
+            benchmark_page_size_bytes()
+        ))
+        .chain(
+            FSQLITE_BENCHMARK_PRAGMAS
+                .iter()
+                .map(|pragma| (*pragma).to_owned()),
+        )
+        .collect(),
+        concurrent_mode_default: true,
+        verified,
+        matched,
+        validation_errors,
+        effective_profiles,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FallbackDecisionLayer(Arc<Mutex<BTreeMap<String, u64>>>);
+
+#[derive(Default)]
+struct FallbackDecisionVisitor {
+    decision_reason: Option<String>,
+}
+
+impl tracing::field::Visit for FallbackDecisionVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "decision_reason" {
+            self.decision_reason = Some(value.to_owned());
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "decision_reason" && self.decision_reason.is_none() {
+            self.decision_reason = Some(format!("{value:?}").trim_matches('"').to_owned());
+        }
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for FallbackDecisionLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() != "fsqlite.fallback_decision" {
+            return;
+        }
+        let mut visitor = FallbackDecisionVisitor::default();
+        event.record(&mut visitor);
+        let reason = visitor
+            .decision_reason
+            .unwrap_or_else(|| "<missing-decision-reason>".to_owned());
+        let mut counts = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *counts.entry(reason).or_insert(0) += 1;
+    }
+}
+
+fn environment_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn certify_execution_routing() -> JsonExecutionRouting {
+    let previous_profile_enabled = hot_path_profile_enabled();
+    set_hot_path_profile_enabled(true);
+    reset_hot_path_profile();
+
+    let conn = open_fsqlite_memory_connection_for_benchmark();
+    apply_pragmas_fsqlite(&conn);
+    fs_execute(
+        &conn,
+        "CREATE TABLE routing_probe(id INTEGER PRIMARY KEY, grp INTEGER, value TEXT)",
+    );
+    let insert = fs_prepare(
+        &conn,
+        "INSERT INTO routing_probe(id, grp, value) VALUES (?1, ?2, ?3)",
+    );
+    for id in 1_i64..=4 {
+        fs_stmt_execute_with_params(
+            &insert,
+            &[
+                fsqlite::SqliteValue::Integer(id),
+                fsqlite::SqliteValue::Integer(id % 2),
+                fsqlite::SqliteValue::Text(format!("value-{id}").into()),
+            ],
+        );
+    }
+    let update = fs_prepare(&conn, "UPDATE routing_probe SET value = ?2 WHERE id = ?1");
+    fs_stmt_execute_with_params(
+        &update,
+        &[
+            fsqlite::SqliteValue::Integer(1),
+            fsqlite::SqliteValue::Text("updated".into()),
+        ],
+    );
+    let delete = fs_prepare(&conn, "DELETE FROM routing_probe WHERE id = ?1");
+    fs_stmt_execute_with_params(&delete, &[fsqlite::SqliteValue::Integer(4)]);
+
+    let fallback_counts = Arc::new(Mutex::new(BTreeMap::new()));
+    let subscriber = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::filter::Targets::new()
+                .with_target("fsqlite.fallback_decision", tracing::Level::DEBUG),
+        )
+        .with(FallbackDecisionLayer(Arc::clone(&fallback_counts)));
+    {
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let rows = fsqlite_e2e::block_on(
+            conn.query("SELECT grp, GROUP_CONCAT(value) FROM routing_probe GROUP BY grp"),
+        )
+        .expect("routing certification GROUP BY query must succeed");
+        std::hint::black_box(rows);
+    }
+
+    let profile = hot_path_profile_snapshot();
+    set_hot_path_profile_enabled(previous_profile_enabled);
+    let select_fallback_decisions = fallback_counts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let timed_execution_instrumented = [
+        "FSQLITE_BENCH_PROFILE_INSERT",
+        "FSQLITE_BENCH_PROFILE_CONCURRENT",
+        "FSQLITE_BENCH_PROFILE_DML",
+        "FSQLITE_BENCH_PROFILE_IDX",
+    ]
+    .into_iter()
+    .any(environment_flag_enabled);
+    let mut certification_errors = Vec::new();
+    if select_fallback_decisions.is_empty() {
+        certification_errors.push(
+            "fallback-decision collector saw no event for the certification GROUP BY query"
+                .to_owned(),
+        );
+    }
+    if timed_execution_instrumented {
+        certification_errors.push(
+            "a FSQLITE_BENCH_PROFILE_* switch instruments timed FrankenSQLite execution".to_owned(),
+        );
+    }
+
+    JsonExecutionRouting {
+        capture_scope:
+            "untimed certification pass; counters reset before the probe and excluded from score rows"
+                .to_owned(),
+        timed_execution_instrumented,
+        parser_fast_path_executions: profile.parser.fast_path_executions,
+        parser_slow_path_executions: profile.parser.slow_path_executions,
+        prepared_insert_fast_lane_hits: profile.prepared_insert_fast_lane_hits,
+        prepared_insert_instrumented_lane_hits: profile.prepared_insert_instrumented_lane_hits,
+        prepared_update_delete_fast_lane_hits: profile.prepared_update_delete_fast_lane_hits,
+        prepared_update_delete_instrumented_lane_hits: profile
+            .prepared_update_delete_instrumented_lane_hits,
+        prepared_dml_fallbacks: BTreeMap::from([
+            (
+                "returning".to_owned(),
+                profile.prepared_update_delete_fallback_returning,
+            ),
+            (
+                "sqlite_sequence".to_owned(),
+                profile.prepared_update_delete_fallback_sqlite_sequence,
+            ),
+            (
+                "without_rowid".to_owned(),
+                profile.prepared_update_delete_fallback_without_rowid,
+            ),
+            (
+                "live_vtab".to_owned(),
+                profile.prepared_update_delete_fallback_live_vtab,
+            ),
+            (
+                "trigger".to_owned(),
+                profile.prepared_update_delete_fallback_trigger,
+            ),
+            (
+                "foreign_key".to_owned(),
+                profile.prepared_update_delete_fallback_foreign_key,
+            ),
+        ]),
+        select_fallback_decisions,
+        certification_errors,
     }
 }
 
@@ -615,6 +957,7 @@ struct CliOptions {
     json_out_path: Option<String>,
     json_stdout: bool,
     print_json_schema: bool,
+    allow_unverified_provenance: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -694,6 +1037,97 @@ struct DetectedEnvironment {
     benchmark_binary_modified_unix_ts: Option<u64>,
     benchmark_binary_older_than_git_head: Option<bool>,
     build_profile: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonBuildIdentity {
+    workspace_root: String,
+    git_commit_sha: String,
+    git_branch: String,
+    git_dirty: Option<bool>,
+    input_tracking: String,
+    cargo_profile: String,
+    declared_profile: String,
+    opt_level: String,
+    debug: String,
+    target: String,
+    host: String,
+    panic_strategy: String,
+    package_features: Vec<String>,
+    encoded_rustflags_hex: String,
+    rustc_version: String,
+    cargo_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonRuntimeSourceIdentity {
+    verification_root: String,
+    git_commit_sha: Option<String>,
+    git_branch: Option<String>,
+    git_dirty: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonTracingIdentity {
+    rust_log: Option<String>,
+    statement_debug_enabled: bool,
+    statement_reuse_info_enabled: bool,
+    fallback_decision_debug_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonDurabilityIdentity {
+    page_size_bytes: u32,
+    default_synchronous: String,
+    concurrent_synchronous_modes: Vec<String>,
+    csqlite_pragmas: Vec<String>,
+    fsqlite_pragmas: Vec<String>,
+    concurrent_mode_default: bool,
+    verified: bool,
+    matched: bool,
+    validation_errors: Vec<String>,
+    effective_profiles: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonExecutionRouting {
+    capture_scope: String,
+    timed_execution_instrumented: bool,
+    parser_fast_path_executions: u64,
+    parser_slow_path_executions: u64,
+    prepared_insert_fast_lane_hits: u64,
+    prepared_insert_instrumented_lane_hits: u64,
+    prepared_update_delete_fast_lane_hits: u64,
+    prepared_update_delete_instrumented_lane_hits: u64,
+    prepared_dml_fallbacks: BTreeMap<String, u64>,
+    select_fallback_decisions: BTreeMap<String, u64>,
+    certification_errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonBenchmarkProvenance {
+    schema_version: String,
+    citable: bool,
+    status: String,
+    validation_errors: Vec<String>,
+    build: JsonBuildIdentity,
+    runtime_source: JsonRuntimeSourceIdentity,
+    working_directory: Option<String>,
+    binary_path: Option<String>,
+    binary_sha256: Option<String>,
+    binary_size_bytes: Option<u64>,
+    binary_modified_unix_ts: Option<u64>,
+    cargo_lock_sha256: Option<String>,
+    cargo_feature_graph_sha256: Option<String>,
+    cargo_feature_graph: Option<String>,
+    cargo_feature_graph_command: String,
+    command_line: Vec<String>,
+    benchmark_environment: BTreeMap<String, String>,
+    cpu_affinity: Option<String>,
+    runtime_bridge: String,
+    tracing: JsonTracingIdentity,
+    durability: JsonDurabilityIdentity,
+    execution_routing: JsonExecutionRouting,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -778,6 +1212,7 @@ struct JsonBenchmarkReport {
     total_elapsed_ms: u64,
     config: JsonRunConfig,
     environment: DetectedEnvironment,
+    provenance: JsonBenchmarkProvenance,
     summary: ReportSummaryStats,
     ci_regression_gate: JsonCiRegressionGateDraft,
     sections: Vec<JsonSection>,
@@ -1121,8 +1556,381 @@ impl JsonMeasurement {
     }
 }
 
+fn command_stdout_at(
+    current_dir: &std::path::Path,
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+) -> Option<String> {
+    std::process::Command::new(program)
+        .current_dir(current_dir)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|stdout| !stdout.is_empty())
+}
+
+fn git_stdout_at(current_dir: &std::path::Path, args: &[&str]) -> Option<String> {
+    command_stdout_at(current_dir, "git", args)
+}
+
+fn git_dirty_at(current_dir: &std::path::Path) -> Option<bool> {
+    std::process::Command::new("git")
+        .current_dir(current_dir)
+        .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| !output.stdout.is_empty())
+}
+
+fn parse_build_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{hasher:x}"))
+}
+
+fn cpu_affinity() -> Option<String> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                line.strip_prefix("Cpus_allowed_list:")
+                    .map(str::trim)
+                    .filter(|cpus| !cpus.is_empty())
+                    .map(str::to_owned)
+            })
+        })
+}
+
+fn capture_cargo_feature_graph(
+    workspace_root: &std::path::Path,
+    target: &str,
+    package_features: &[String],
+) -> Option<String> {
+    let mut command = std::process::Command::new("cargo");
+    command.current_dir(workspace_root).args([
+        "tree",
+        "--locked",
+        "--offline",
+        "-p",
+        "fsqlite-e2e",
+        "-e",
+        "features",
+        "--no-default-features",
+        "--target",
+        target,
+    ]);
+    if !package_features.is_empty() {
+        command.arg("--features").arg(package_features.join(","));
+    }
+    command
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|graph| !graph.is_empty())
+}
+
+impl JsonBenchmarkProvenance {
+    fn capture(command_line: Vec<String>, runtime_bridge: &str) -> Self {
+        let build_workspace_root = env!("FSQLITE_BENCH_BUILD_WORKSPACE_ROOT").to_owned();
+        let verification_root = std::env::var("FSQLITE_BENCH_SOURCE_ROOT")
+            .unwrap_or_else(|_| build_workspace_root.clone());
+        let verification_path = std::path::Path::new(&verification_root);
+        let package_features = env!("FSQLITE_BENCH_BUILD_FEATURES")
+            .split(',')
+            .filter(|feature| !feature.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let build_target = env!("FSQLITE_BENCH_BUILD_TARGET").to_owned();
+        let runtime_git_sha = git_stdout_at(verification_path, &["rev-parse", "--verify", "HEAD"]);
+        let runtime_git_branch = git_stdout_at(verification_path, &["branch", "--show-current"]);
+        let runtime_git_dirty = git_dirty_at(verification_path);
+        let binary_path = std::env::current_exe()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned());
+        let binary_metadata = binary_path
+            .as_deref()
+            .and_then(|path| std::fs::metadata(path).ok());
+        let binary_sha256 = binary_path
+            .as_deref()
+            .and_then(|path| sha256_file(std::path::Path::new(path)).ok());
+        let binary_size_bytes = binary_metadata.as_ref().map(std::fs::Metadata::len);
+        let binary_modified_unix_ts = binary_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| {
+                modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| duration.as_secs())
+            });
+        let cargo_lock_sha256 = sha256_file(&verification_path.join("Cargo.lock")).ok();
+        let cargo_feature_graph =
+            capture_cargo_feature_graph(verification_path, &build_target, &package_features);
+        let cargo_feature_graph_sha256 = cargo_feature_graph
+            .as_deref()
+            .map(str::as_bytes)
+            .map(sha256_bytes);
+        let cargo_feature_graph_command = format!(
+            "cargo tree --locked --offline -p fsqlite-e2e -e features \
+             --no-default-features --target {}{}",
+            build_target,
+            if package_features.is_empty() {
+                String::new()
+            } else {
+                format!(" --features {}", package_features.join(","))
+            }
+        );
+        let benchmark_environment = [
+            "FSQLITE_BENCH_CONCURRENT_SYNC",
+            "FSQLITE_BENCH_LAB_UNSAFE",
+            "FSQLITE_BENCH_PAGE_SIZE",
+            "FSQLITE_BENCH_PROFILE_CONCURRENT",
+            "FSQLITE_BENCH_PROFILE_DML",
+            "FSQLITE_BENCH_PROFILE_IDX",
+            "FSQLITE_BENCH_PROFILE_IDX_ITERS",
+            "FSQLITE_BENCH_PROFILE_INSERT",
+            "FSQLITE_BENCH_SOURCE_ROOT",
+            "RUST_LOG",
+        ]
+        .into_iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| (name.to_owned(), value))
+        })
+        .collect();
+
+        let build = JsonBuildIdentity {
+            workspace_root: build_workspace_root,
+            git_commit_sha: env!("FSQLITE_BENCH_BUILD_GIT_SHA").to_owned(),
+            git_branch: env!("FSQLITE_BENCH_BUILD_GIT_BRANCH").to_owned(),
+            git_dirty: parse_build_bool(env!("FSQLITE_BENCH_BUILD_GIT_DIRTY")),
+            input_tracking: env!("FSQLITE_BENCH_BUILD_INPUT_TRACKING").to_owned(),
+            cargo_profile: env!("FSQLITE_BENCH_BUILD_PROFILE").to_owned(),
+            declared_profile: env!("FSQLITE_BENCH_BUILD_PROFILE_LABEL").to_owned(),
+            opt_level: env!("FSQLITE_BENCH_BUILD_OPT_LEVEL").to_owned(),
+            debug: env!("FSQLITE_BENCH_BUILD_DEBUG").to_owned(),
+            target: build_target,
+            host: env!("FSQLITE_BENCH_BUILD_HOST").to_owned(),
+            panic_strategy: env!("FSQLITE_BENCH_BUILD_PANIC").to_owned(),
+            package_features,
+            encoded_rustflags_hex: env!("FSQLITE_BENCH_BUILD_RUSTFLAGS_HEX").to_owned(),
+            rustc_version: env!("FSQLITE_BENCH_BUILD_RUSTC_VERSION").to_owned(),
+            cargo_version: env!("FSQLITE_BENCH_BUILD_CARGO_VERSION").to_owned(),
+        };
+        let runtime_source = JsonRuntimeSourceIdentity {
+            verification_root,
+            git_commit_sha: runtime_git_sha,
+            git_branch: runtime_git_branch,
+            git_dirty: runtime_git_dirty,
+        };
+        let tracing = JsonTracingIdentity {
+            rust_log: std::env::var("RUST_LOG").ok(),
+            statement_debug_enabled: tracing::enabled!(
+                target: "fsqlite.statement",
+                tracing::Level::DEBUG
+            ),
+            statement_reuse_info_enabled: tracing::enabled!(
+                target: "fsqlite.statement_reuse",
+                tracing::Level::INFO
+            ),
+            fallback_decision_debug_enabled: tracing::enabled!(
+                target: "fsqlite.fallback_decision",
+                tracing::Level::DEBUG
+            ),
+        };
+        let durability = capture_durability_identity();
+        let execution_routing = certify_execution_routing();
+
+        let mut validation_errors = Vec::new();
+        if build.git_commit_sha.len() != 40
+            || !build
+                .git_commit_sha
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            validation_errors.push("build Git SHA is absent or malformed".to_owned());
+        }
+        if build.git_dirty != Some(false) {
+            validation_errors
+                .push("benchmark binary was built from a dirty or unknown tree".to_owned());
+        }
+        if build.input_tracking != "complete" {
+            validation_errors
+                .push("build script could not watch every tracked workspace input".to_owned());
+        }
+        if build.declared_profile == "unspecified" {
+            validation_errors.push(
+                "build profile label missing; set FSQLITE_BENCH_PROFILE_NAME while building"
+                    .to_owned(),
+            );
+        }
+        if runtime_source.git_commit_sha.as_deref() != Some(build.git_commit_sha.as_str()) {
+            validation_errors
+                .push("verification checkout SHA does not match the binary build SHA".to_owned());
+        }
+        if runtime_source.git_dirty != Some(false) {
+            validation_errors.push("verification checkout is dirty or unavailable".to_owned());
+        }
+        if binary_sha256.is_none() {
+            validation_errors.push("benchmark binary SHA-256 could not be computed".to_owned());
+        }
+        if binary_size_bytes.is_none() || binary_modified_unix_ts.is_none() {
+            validation_errors.push("benchmark binary metadata is incomplete".to_owned());
+        }
+        if cargo_lock_sha256.is_none() {
+            validation_errors.push("Cargo.lock SHA-256 could not be computed".to_owned());
+        }
+        if cargo_feature_graph.is_none() {
+            validation_errors.push(
+                "exact Cargo feature graph could not be captured from the verification checkout"
+                    .to_owned(),
+            );
+        }
+        if build.rustc_version == "unknown" || build.cargo_version == "unknown" {
+            validation_errors.push("build toolchain identity is incomplete".to_owned());
+        }
+        match build.declared_profile.as_str() {
+            "release-perf" if build.opt_level != "3" => validation_errors.push(format!(
+                "declared release-perf profile has effective opt-level {}",
+                build.opt_level
+            )),
+            "release" if build.opt_level != "z" => validation_errors.push(format!(
+                "declared release profile has effective opt-level {}",
+                build.opt_level
+            )),
+            "release-perf" | "release" => {}
+            other if other != "unspecified" => {
+                validation_errors.push(format!("unsupported citable build profile label `{other}`"))
+            }
+            _ => {}
+        }
+        if build.target == "unknown" || build.host == "unknown" || build.panic_strategy == "unknown"
+        {
+            validation_errors
+                .push("effective build target/host/panic identity is incomplete".to_owned());
+        }
+        if tracing.statement_debug_enabled || tracing.statement_reuse_info_enabled {
+            validation_errors.push(
+                "statement tracing or statement-reuse tracing changes the selected execution lane"
+                    .to_owned(),
+            );
+        }
+        if environment_flag_enabled("FSQLITE_BENCH_LAB_UNSAFE") {
+            validation_errors.push(
+                "FSQLITE_BENCH_LAB_UNSAFE is diagnostic-only and cannot produce a citable artifact"
+                    .to_owned(),
+            );
+        }
+        if !durability.verified || !durability.matched {
+            validation_errors.extend(
+                durability
+                    .validation_errors
+                    .iter()
+                    .map(|error| format!("durability certification: {error}")),
+            );
+            if durability.validation_errors.is_empty() {
+                validation_errors.push(
+                    "effective durability settings were not fully verified and matched".to_owned(),
+                );
+            }
+        }
+        validation_errors.extend(
+            execution_routing
+                .certification_errors
+                .iter()
+                .map(|error| format!("execution-routing certification: {error}")),
+        );
+        let citable = validation_errors.is_empty();
+
+        Self {
+            schema_version: BENCHMARK_PROVENANCE_SCHEMA_V1.to_owned(),
+            citable,
+            status: if citable {
+                "verified_citable".to_owned()
+            } else {
+                "unverified".to_owned()
+            },
+            validation_errors,
+            build,
+            runtime_source,
+            working_directory: std::env::current_dir()
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned()),
+            binary_path,
+            binary_sha256,
+            binary_size_bytes,
+            binary_modified_unix_ts,
+            cargo_lock_sha256,
+            cargo_feature_graph_sha256,
+            cargo_feature_graph,
+            cargo_feature_graph_command,
+            command_line,
+            benchmark_environment,
+            cpu_affinity: cpu_affinity(),
+            runtime_bridge: runtime_bridge.to_owned(),
+            tracing,
+            durability,
+            execution_routing,
+        }
+    }
+
+    fn verify_runtime_source_unchanged(&mut self) {
+        let verification_path = std::path::Path::new(&self.runtime_source.verification_root);
+        let current_sha = git_stdout_at(verification_path, &["rev-parse", "--verify", "HEAD"]);
+        let current_dirty = git_dirty_at(verification_path);
+        if current_sha != self.runtime_source.git_commit_sha {
+            self.validation_errors.push(
+                "verification checkout SHA changed while the benchmark was running".to_owned(),
+            );
+        }
+        if current_dirty != self.runtime_source.git_dirty || current_dirty != Some(false) {
+            self.validation_errors
+                .push("verification checkout dirty state changed or is no longer clean".to_owned());
+        }
+        self.validation_errors.sort();
+        self.validation_errors.dedup();
+        self.citable = self.validation_errors.is_empty();
+        self.status = if self.citable {
+            "verified_citable".to_owned()
+        } else {
+            "unverified".to_owned()
+        };
+    }
+
+    fn mark_explicit_override(&mut self) {
+        if !self.citable {
+            self.status = "unverified_explicit_override".to_owned();
+        }
+    }
+}
+
 impl DetectedEnvironment {
-    fn detect() -> Self {
+    fn detect(provenance: &JsonBenchmarkProvenance) -> Self {
         fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
             std::process::Command::new(program)
                 .args(args)
@@ -1190,16 +1998,14 @@ impl DetectedEnvironment {
             });
         let rust_version = command_stdout("rustc", &["--version"]);
         let cargo_version = command_stdout("cargo", &["--version"]);
-        let git_commit_sha = command_stdout("git", &["rev-parse", "HEAD"]);
-        let git_branch = command_stdout("git", &["branch", "--show-current"]);
-        let git_head_unix_ts = command_stdout("git", &["show", "-s", "--format=%ct", "HEAD"])
-            .and_then(|timestamp| timestamp.parse::<u64>().ok());
-        let git_dirty = std::process::Command::new("git")
-            .args(["status", "--porcelain"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| !output.stdout.is_empty());
+        let git_commit_sha = Some(provenance.build.git_commit_sha.clone());
+        let git_branch = Some(provenance.build.git_branch.clone());
+        let git_head_unix_ts = git_stdout_at(
+            std::path::Path::new(&provenance.runtime_source.verification_root),
+            &["show", "-s", "--format=%ct", "HEAD"],
+        )
+        .and_then(|timestamp| timestamp.parse::<u64>().ok());
+        let git_dirty = provenance.runtime_source.git_dirty;
         let benchmark_binary_modified_unix_ts = std::env::current_exe()
             .ok()
             .and_then(|exe| std::fs::metadata(exe).ok())
@@ -1229,7 +2035,7 @@ impl DetectedEnvironment {
             git_dirty,
             benchmark_binary_modified_unix_ts,
             benchmark_binary_older_than_git_head,
-            build_profile: "release-perf".to_owned(),
+            build_profile: provenance.build.declared_profile.clone(),
         }
     }
 
@@ -1286,7 +2092,7 @@ impl DetectedEnvironment {
         }
         emit_line(
             to_stdout,
-            format!("  Build: {} (opt-level 3, LTO)", self.build_profile),
+            format!("  Build profile: {}", self.build_profile),
         );
     }
 }
@@ -1296,6 +2102,7 @@ fn build_json_report(
     total_elapsed: Duration,
     config: JsonRunConfig,
     environment: DetectedEnvironment,
+    provenance: JsonBenchmarkProvenance,
 ) -> JsonBenchmarkReport {
     let summary = compute_report_summary(report);
     let sections = report
@@ -1328,11 +2135,12 @@ fn build_json_report(
         .collect();
 
     JsonBenchmarkReport {
-        schema_version: JSON_REPORT_SCHEMA_V3.to_owned(),
+        schema_version: JSON_REPORT_SCHEMA_V4.to_owned(),
         generated_at_utc: chrono_stamp(),
         total_elapsed_ms: u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX),
         config,
         environment,
+        provenance,
         ci_regression_gate: build_ci_regression_gate(report, &summary),
         summary,
         sections,
@@ -1343,7 +2151,7 @@ fn build_json_report(
 fn benchmark_json_schema() -> serde_json::Value {
     serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/comprehensive-bench-report.v3.json",
+        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/comprehensive-bench-report.v4.json",
         "title": "FrankenSQLite comprehensive benchmark JSON report",
         "type": "object",
         "additionalProperties": false,
@@ -1353,13 +2161,14 @@ fn benchmark_json_schema() -> serde_json::Value {
             "total_elapsed_ms",
             "config",
             "environment",
+            "provenance",
             "summary",
             "ci_regression_gate",
             "sections"
         ],
         "properties": {
             "schema_version": {
-                "const": JSON_REPORT_SCHEMA_V3
+                "const": JSON_REPORT_SCHEMA_V4
             },
             "generated_at_utc": {
                 "type": "string"
@@ -1377,6 +2186,58 @@ fn benchmark_json_schema() -> serde_json::Value {
                 "type": "object",
                 "additionalProperties": true,
                 "required": ["arch", "build_profile"]
+            },
+            "provenance": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "schema_version",
+                    "citable",
+                    "status",
+                    "validation_errors",
+                    "build",
+                    "runtime_source",
+                    "binary_path",
+                    "binary_sha256",
+                    "cargo_lock_sha256",
+                    "cargo_feature_graph_sha256",
+                    "cargo_feature_graph",
+                    "command_line",
+                    "cpu_affinity",
+                    "runtime_bridge",
+                    "tracing",
+                    "durability"
+                ],
+                "properties": {
+                    "schema_version": {"const": BENCHMARK_PROVENANCE_SCHEMA_V1},
+                    "citable": {"type": "boolean"},
+                    "status": {
+                        "enum": [
+                            "verified_citable",
+                            "unverified",
+                            "unverified_explicit_override"
+                        ]
+                    },
+                    "validation_errors": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "build": {"type": "object"},
+                    "runtime_source": {"type": "object"},
+                    "binary_path": {"type": ["string", "null"]},
+                    "binary_sha256": {"type": ["string", "null"]},
+                    "cargo_lock_sha256": {"type": ["string", "null"]},
+                    "cargo_feature_graph_sha256": {"type": ["string", "null"]},
+                    "cargo_feature_graph": {"type": ["string", "null"]},
+                    "command_line": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "cpu_affinity": {"type": ["string", "null"]},
+                    "runtime_bridge": {"type": "string"},
+                    "tracing": {"type": "object"},
+                    "durability": {"type": "object"}
+                }
             },
             "summary": {
                 "type": "object",
@@ -1744,7 +2605,7 @@ impl BenchReport {
         println!();
     }
 
-    fn write_html(&self, path: &str) {
+    fn write_html(&self, path: &str, provenance: &JsonBenchmarkProvenance) -> Result<(), String> {
         let mut html = String::with_capacity(32 * 1024);
 
         // Collect JSON data for charts.
@@ -2113,19 +2974,26 @@ document.querySelectorAll('[id^="section-"]').forEach(el => observer.observe(el)
             summary.csqlite_faster,
         ));
 
-        if !ensure_report_parent_dir(path, "HTML") {
-            return;
-        }
+        let provenance_json = serde_json::to_string(provenance)
+            .map_err(|error| format!("could not serialize HTML provenance: {error}"))?
+            .replace('<', "\\u003c")
+            .replace('>', "\\u003e");
+        let provenance_element = format!(
+            r#"<script id="benchmark-provenance" type="application/json">{provenance_json}</script>
+"#
+        );
+        let body_end = html
+            .rfind("</body>")
+            .ok_or_else(|| "generated HTML has no closing body element".to_owned())?;
+        html.insert_str(body_end, &provenance_element);
 
-        let Ok(mut file) = std::fs::File::create(path) else {
-            eprintln!("ERROR: Could not create HTML file at {path}");
-            return;
-        };
-        if file.write_all(html.as_bytes()).is_ok() {
-            eprintln!("HTML report written to: {path}");
-        } else {
-            eprintln!("ERROR: Failed to write HTML file");
-        }
+        ensure_report_parent_dir(path, "HTML")?;
+        let mut file = std::fs::File::create(path)
+            .map_err(|error| format!("could not create HTML report at {path}: {error}"))?;
+        file.write_all(html.as_bytes())
+            .map_err(|error| format!("could not write HTML report at {path}: {error}"))?;
+        eprintln!("HTML report written to: {path}");
+        Ok(())
     }
 }
 
@@ -2281,6 +3149,8 @@ Flags:
   --json-out <path>    Write the JSON report to an explicit path.
   --json-stdout        Emit only the structured JSON report to stdout.
   --print-json-schema  Emit the standardized benchmark JSON schema and exit.
+  --allow-unverified-provenance
+                       Emit explicitly non-citable artifacts when provenance validation fails.
   --help, -h           Show this help text."
     );
 }
@@ -2295,6 +3165,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
         json_out_path: None,
         json_stdout: false,
         print_json_schema: false,
+        allow_unverified_provenance: false,
     };
 
     let mut index = 1;
@@ -2340,6 +3211,10 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
             }
             "--print-json-schema" => {
                 options.print_json_schema = true;
+                index += 1;
+            }
+            "--allow-unverified-provenance" => {
+                options.allow_unverified_provenance = true;
                 index += 1;
             }
             unknown => {
@@ -3487,10 +4362,9 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                         let conn = rusqlite::Connection::open(&p).unwrap();
                         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
                             .unwrap();
-                        if let Some(mode) = concurrent_sync_override() {
-                            conn.execute_batch(&format!("PRAGMA synchronous={mode};"))
-                                .unwrap();
-                        }
+                        let mode = concurrent_sync_mode();
+                        conn.execute_batch(&format!("PRAGMA synchronous={mode};"))
+                            .unwrap();
 
                         conn.execute_batch("BEGIN").unwrap();
                         #[allow(clippy::cast_possible_wrap)]
@@ -3558,24 +4432,21 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                         bar.wait();
                         let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(&p)).unwrap();
                         apply_pragmas_fsqlite(&conn);
-                        if let Some(mode) = concurrent_sync_override() {
-                            drop(fsqlite_e2e::block_on(
-                                conn.execute(&format!("PRAGMA synchronous={mode};")),
-                            ));
-                        }
-                        let concurrent_ok = fsqlite_e2e::block_on(
-                            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;"),
-                        )
-                        .is_ok();
-                        drop(fsqlite_e2e::block_on(
-                            conn.execute("PRAGMA busy_timeout=5000;"),
-                        ));
+                        let mode = concurrent_sync_mode();
+                        fsqlite_e2e::block_on(conn.execute(&format!("PRAGMA synchronous={mode};")))
+                            .unwrap_or_else(|error| {
+                                panic!("failed to set FrankenSQLite synchronous={mode}: {error}")
+                            });
+                        fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;"))
+                            .unwrap_or_else(|error| {
+                                panic!("failed to enable concurrent writer mode: {error}")
+                            });
+                        fsqlite_e2e::block_on(conn.execute("PRAGMA busy_timeout=5000;"))
+                            .unwrap_or_else(|error| {
+                                panic!("failed to set FrankenSQLite busy_timeout: {error}")
+                            });
 
-                        let begin_sql = if concurrent_ok {
-                            "BEGIN CONCURRENT"
-                        } else {
-                            "BEGIN"
-                        };
+                        let begin_sql = "BEGIN CONCURRENT";
 
                         // Mirror `mt_mvcc_bench`'s pattern: wrap the entire
                         // BEGIN + N*INSERT + COMMIT in a retry loop, because
@@ -3609,7 +4480,13 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                                 ])) {
                                     Ok(_) => {}
                                     Err(e) if e.is_transient() && retry_count < TXN_MAX_RETRIES => {
-                                        drop(fsqlite_e2e::block_on(conn.execute("ROLLBACK")));
+                                        fsqlite_e2e::block_on(conn.execute("ROLLBACK"))
+                                            .unwrap_or_else(|rollback_error| {
+                                                panic!(
+                                                    "fsqlite rollback after INSERT retry failed: \
+                                                     {rollback_error}"
+                                                )
+                                            });
                                         sleep_bench_busy_backoff(retry_count, jitter_salt);
                                         retry_count += 1;
                                         continue 'txn;
@@ -3623,7 +4500,14 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                             match fsqlite_e2e::block_on(conn.execute("COMMIT")) {
                                 Ok(_) => break 'txn,
                                 Err(e) if e.is_transient() && retry_count < TXN_MAX_RETRIES => {
-                                    drop(fsqlite_e2e::block_on(conn.execute("ROLLBACK")));
+                                    fsqlite_e2e::block_on(conn.execute("ROLLBACK")).unwrap_or_else(
+                                        |rollback_error| {
+                                            panic!(
+                                                "fsqlite rollback after COMMIT retry failed: \
+                                                 {rollback_error}"
+                                            )
+                                        },
+                                    );
                                     sleep_bench_busy_backoff(retry_count, jitter_salt);
                                     retry_count += 1;
                                 }
@@ -3788,6 +4672,89 @@ mod tests {
         report
     }
 
+    fn sample_provenance() -> JsonBenchmarkProvenance {
+        JsonBenchmarkProvenance {
+            schema_version: BENCHMARK_PROVENANCE_SCHEMA_V1.to_owned(),
+            citable: true,
+            status: "verified_citable".to_owned(),
+            validation_errors: Vec::new(),
+            build: JsonBuildIdentity {
+                workspace_root: "/test/frankensqlite".to_owned(),
+                git_commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                git_branch: "main".to_owned(),
+                git_dirty: Some(false),
+                input_tracking: "complete".to_owned(),
+                cargo_profile: "release".to_owned(),
+                declared_profile: "release-perf".to_owned(),
+                opt_level: "3".to_owned(),
+                debug: "false".to_owned(),
+                target: "x86_64-unknown-linux-gnu".to_owned(),
+                host: "x86_64-unknown-linux-gnu".to_owned(),
+                panic_strategy: "abort".to_owned(),
+                package_features: Vec::new(),
+                encoded_rustflags_hex: String::new(),
+                rustc_version: "rustc test".to_owned(),
+                cargo_version: "cargo test".to_owned(),
+            },
+            runtime_source: JsonRuntimeSourceIdentity {
+                verification_root: "/test/frankensqlite".to_owned(),
+                git_commit_sha: Some(
+                    "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                ),
+                git_branch: Some("main".to_owned()),
+                git_dirty: Some(false),
+            },
+            working_directory: Some("/test/frankensqlite".to_owned()),
+            binary_path: Some("/test/comprehensive-bench".to_owned()),
+            binary_sha256: Some("ab".repeat(32)),
+            binary_size_bytes: Some(1024),
+            binary_modified_unix_ts: Some(1_700_000_001),
+            cargo_lock_sha256: Some("cd".repeat(32)),
+            cargo_feature_graph_sha256: Some("ef".repeat(32)),
+            cargo_feature_graph: Some("fsqlite-e2e v0.1.19".to_owned()),
+            cargo_feature_graph_command:
+                "cargo tree --locked --offline -p fsqlite-e2e -e features".to_owned(),
+            command_line: vec!["comprehensive-bench".to_owned(), "--quick".to_owned()],
+            benchmark_environment: BTreeMap::new(),
+            cpu_affinity: Some("0-7".to_owned()),
+            runtime_bridge: "per_operation_thread_local_block_on".to_owned(),
+            tracing: JsonTracingIdentity {
+                rust_log: None,
+                statement_debug_enabled: false,
+                statement_reuse_info_enabled: false,
+                fallback_decision_debug_enabled: false,
+            },
+            durability: JsonDurabilityIdentity {
+                page_size_bytes: 4096,
+                default_synchronous: "NORMAL".to_owned(),
+                concurrent_synchronous_modes: vec!["NORMAL".to_owned()],
+                csqlite_pragmas: vec!["PRAGMA synchronous = NORMAL;".to_owned()],
+                fsqlite_pragmas: vec!["PRAGMA synchronous = NORMAL;".to_owned()],
+                concurrent_mode_default: true,
+                verified: true,
+                matched: true,
+                validation_errors: Vec::new(),
+                effective_profiles: BTreeMap::new(),
+            },
+            execution_routing: JsonExecutionRouting {
+                capture_scope: "untimed test certification".to_owned(),
+                timed_execution_instrumented: false,
+                parser_fast_path_executions: 1,
+                parser_slow_path_executions: 1,
+                prepared_insert_fast_lane_hits: 1,
+                prepared_insert_instrumented_lane_hits: 0,
+                prepared_update_delete_fast_lane_hits: 2,
+                prepared_update_delete_instrumented_lane_hits: 0,
+                prepared_dml_fallbacks: BTreeMap::new(),
+                select_fallback_decisions: BTreeMap::from([(
+                    "group_by_fallback".to_owned(),
+                    1,
+                )]),
+                certification_errors: Vec::new(),
+            },
+        }
+    }
+
     #[test]
     fn benchmark_pragmas_disable_time_travel_capture() {
         assert!(
@@ -3905,6 +4872,7 @@ mod tests {
                 json_out_path: Some("bench.json".to_owned()),
                 json_stdout: true,
                 print_json_schema: false,
+                allow_unverified_provenance: false,
             }
         );
     }
@@ -4079,9 +5047,10 @@ mod tests {
                 benchmark_binary_older_than_git_head: Some(false),
                 build_profile: "release-perf".to_owned(),
             },
+            sample_provenance(),
         );
 
-        assert_eq!(json.schema_version, JSON_REPORT_SCHEMA_V3);
+        assert_eq!(json.schema_version, JSON_REPORT_SCHEMA_V4);
         assert_eq!(json.environment.git_head_unix_ts, Some(1_700_000_000));
         assert_eq!(json.environment.git_dirty, Some(false));
         assert_eq!(
@@ -4185,6 +5154,7 @@ mod tests {
                 benchmark_binary_older_than_git_head: None,
                 build_profile: "release-perf".to_owned(),
             },
+            sample_provenance(),
         );
 
         let profile = json.sections[0].rows[0]
@@ -4238,6 +5208,7 @@ mod tests {
                 benchmark_binary_older_than_git_head: None,
                 build_profile: "release-perf".to_owned(),
             },
+            sample_provenance(),
         );
         let temp = tempfile::tempdir().expect("temp directory should be created");
         let report_path = temp.path().join("nested").join("bench.json");
@@ -4245,11 +5216,11 @@ mod tests {
             .to_str()
             .expect("temp report path should be valid UTF-8");
 
-        write_json_report(&json, report_path);
+        write_json_report(&json, report_path).expect("JSON report should be written");
 
         let written = std::fs::read_to_string(report_path).expect("JSON report should be written");
         assert!(
-            written.contains(JSON_REPORT_SCHEMA_V3),
+            written.contains(JSON_REPORT_SCHEMA_V4),
             "written JSON should include the benchmark schema version"
         );
     }
@@ -4302,6 +5273,7 @@ mod tests {
                 benchmark_binary_older_than_git_head: None,
                 build_profile: "release-perf".to_owned(),
             },
+            sample_provenance(),
         );
 
         assert_eq!(
@@ -4325,7 +5297,7 @@ mod tests {
 
         assert_eq!(
             schema["properties"]["schema_version"]["const"],
-            JSON_REPORT_SCHEMA_V3
+            JSON_REPORT_SCHEMA_V4
         );
         assert_eq!(
             schema["properties"]["ci_regression_gate"]["properties"]["bead_id"]["const"],
@@ -5168,27 +6140,39 @@ fn bench_mixed_oltp(report: &mut BenchReport) {
             let roll = rng.next_usize(100);
             if roll < 40 {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                let _ = collect_rusqlite_rows(&mut select_pt, rusqlite::params![id]);
+                std::hint::black_box(
+                    collect_rusqlite_rows(&mut select_pt, rusqlite::params![id]).unwrap(),
+                );
             } else if roll < 60 {
                 let start = (rng.next_usize(seed_rows.saturating_sub(50)) + 1) as i64;
-                let _: i64 = select_range
+                let count: i64 = select_range
                     .query_row(rusqlite::params![start, start + 50], |r| r.get(0))
-                    .unwrap_or(0);
+                    .unwrap();
+                std::hint::black_box(count);
             } else if roll < 80 {
-                let _: (i64, i64) = select_agg
+                let aggregate: (i64, i64) = select_agg
                     .query_row([], |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())))
                     .unwrap();
+                std::hint::black_box(aggregate);
             } else if roll < 95 {
-                let _ = insert.execute(rusqlite::params![next_id]);
+                std::hint::black_box(insert.execute(rusqlite::params![next_id]).unwrap());
                 next_id += 1;
             } else if roll < 98 {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                let _ = update.execute(rusqlite::params![id, id * 99]);
+                std::hint::black_box(update.execute(rusqlite::params![id, id * 99]).unwrap());
             } else {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                let _ = delete.execute(rusqlite::params![id]);
+                std::hint::black_box(delete.execute(rusqlite::params![id]).unwrap());
             }
         }
+        let final_state: (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(score), 0) FROM bench",
+                [],
+                |row| Ok((row.get(0).unwrap(), row.get(1).unwrap())),
+            )
+            .unwrap();
+        std::hint::black_box(final_state);
     });
 
     eprintln!("C={}", format_duration(cs.median()));
@@ -5229,45 +6213,60 @@ fn bench_mixed_oltp(report: &mut BenchReport) {
         let update = fs_prepare(&conn, "UPDATE bench SET score = ?2 WHERE id = ?1");
         let delete = fs_prepare(&conn, "DELETE FROM bench WHERE id = ?1");
 
-        // Each op's result is deliberately discarded — the mix is what's being
-        // timed, not the rows. `drop(block_on(..))`, never `let _ = ..`: the
-        // latter would bind the future without polling it and time nothing.
         #[allow(clippy::cast_possible_wrap)]
         for _ in 0..ops {
             let roll = rng.next_usize(100);
             if roll < 40 {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                drop(fsqlite_e2e::block_on(
-                    select_pt.query_row_with_params(&[fsqlite::SqliteValue::Integer(id)]),
-                ));
+                std::hint::black_box(
+                    fsqlite_e2e::block_on(
+                        select_pt.query_with_params(&[fsqlite::SqliteValue::Integer(id)]),
+                    )
+                    .unwrap(),
+                );
             } else if roll < 60 {
                 let start = (rng.next_usize(seed_rows.saturating_sub(50)) + 1) as i64;
-                drop(fsqlite_e2e::block_on(select_range.query_row_with_params(
-                    &[
+                std::hint::black_box(
+                    fsqlite_e2e::block_on(select_range.query_row_with_params(&[
                         fsqlite::SqliteValue::Integer(start),
                         fsqlite::SqliteValue::Integer(start + 50),
-                    ],
-                )));
+                    ]))
+                    .unwrap(),
+                );
             } else if roll < 80 {
-                drop(fsqlite_e2e::block_on(select_agg.query_row()));
+                std::hint::black_box(fsqlite_e2e::block_on(select_agg.query_row()).unwrap());
             } else if roll < 95 {
-                drop(fsqlite_e2e::block_on(insert.execute_with_params(&[
-                    fsqlite::SqliteValue::Integer(next_id),
-                ])));
+                std::hint::black_box(
+                    fsqlite_e2e::block_on(
+                        insert.execute_with_params(&[fsqlite::SqliteValue::Integer(next_id)]),
+                    )
+                    .unwrap(),
+                );
                 next_id += 1;
             } else if roll < 98 {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                drop(fsqlite_e2e::block_on(update.execute_with_params(&[
-                    fsqlite::SqliteValue::Integer(id),
-                    fsqlite::SqliteValue::Integer(id * 99),
-                ])));
+                std::hint::black_box(
+                    fsqlite_e2e::block_on(update.execute_with_params(&[
+                        fsqlite::SqliteValue::Integer(id),
+                        fsqlite::SqliteValue::Integer(id * 99),
+                    ]))
+                    .unwrap(),
+                );
             } else {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                drop(fsqlite_e2e::block_on(
-                    delete.execute_with_params(&[fsqlite::SqliteValue::Integer(id)]),
-                ));
+                std::hint::black_box(
+                    fsqlite_e2e::block_on(
+                        delete.execute_with_params(&[fsqlite::SqliteValue::Integer(id)]),
+                    )
+                    .unwrap(),
+                );
             }
         }
+        let final_state = fsqlite_e2e::block_on(
+            fs_prepare(&conn, "SELECT COUNT(*), COALESCE(SUM(score), 0) FROM bench").query_row(),
+        )
+        .unwrap();
+        std::hint::black_box(final_state);
     });
 
     eprintln!("F={}", format_duration(fs.median()));
@@ -5381,7 +6380,7 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
             "SELECT c.name, o.amount FROM customers c INNER JOIN orders o ON o.customer_id = c.id",
         );
         let fs = measure(&format!("fs_inner_join_{count}"), count, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query()));
+            std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
         });
         eprintln!(
             "C={} F={}",
@@ -5403,7 +6402,7 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
             "SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON o.customer_id = c.id",
         );
         let fs = measure(&format!("fs_left_join_{count}"), count, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query()));
+            std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
         });
         eprintln!(
             "C={} F={}",
@@ -5425,7 +6424,7 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
             "SELECT c.name, COUNT(*), SUM(o.amount) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name",
         );
         let fs = measure(&format!("fs_join_agg_{count}"), customer_count, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query()));
+            std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
         });
         eprintln!(
             "C={} F={}",
@@ -5456,7 +6455,7 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
             );
             let stmt = fs_prepare(&fs_conn, &sql);
             measure(&format!("fs_join_having_{count}"), customer_count, || {
-                drop(fsqlite_e2e::block_on(stmt.query()));
+                std::hint::black_box(fsqlite_e2e::block_on(stmt.query()).unwrap());
             })
         };
         eprintln!(
@@ -5569,7 +6568,7 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
             "SELECT p.name, (SELECT c.name FROM categories c WHERE c.id = p.category_id) AS cat_name FROM products p LIMIT 100",
         );
         let fs = measure(&format!("fs_scalar_sub_{count}"), 100, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query()));
+            std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
         });
         eprintln!(
             "C={} F={}",
@@ -5582,25 +6581,54 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
             Some(fs),
         );
 
-        // EXISTS subquery.
-        eprint!("    EXISTS subquery... ");
-        let half = count / 2;
+        // Parameter-varying EXISTS subquery. Varying the bound prevents a
+        // one-entry exact-result cache from turning this into a warmed-result
+        // lookup while C SQLite still executes the query.
+        eprint!("    EXISTS subquery (parameter-varying)... ");
+        let exists_sql = "SELECT COUNT(*) FROM products p WHERE EXISTS \
+            (SELECT 1 FROM categories c \
+             WHERE c.id = p.category_id AND c.id <= ?1)";
+        #[allow(clippy::cast_possible_wrap)]
+        let cat_count_i64 = cat_count as i64;
+        let oracle_threshold = cat_count_i64.min(5);
+        let expected_exists: i64 = cs_conn
+            .query_row(exists_sql, rusqlite::params![oracle_threshold], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let exists_probe = fs_prepare(&fs_conn, exists_sql);
+        let actual_exists = fsqlite_e2e::block_on(
+            exists_probe.query_row_with_params(&[fsqlite::SqliteValue::Integer(oracle_threshold)]),
+        )
+        .unwrap();
+        assert_eq!(
+            fsqlite_integer(&actual_exists, 0, "EXISTS oracle"),
+            expected_exists,
+            "FrankenSQLite and C SQLite disagree on EXISTS benchmark oracle"
+        );
         let cs = {
-            let sql = format!(
-                "SELECT COUNT(*) FROM products p WHERE EXISTS (SELECT 1 FROM categories c WHERE c.id = p.category_id AND c.id <= {half})"
-            );
-            let mut stmt = cs_conn.prepare(&sql).unwrap();
+            let mut stmt = cs_conn.prepare(exists_sql).unwrap();
+            let mut iteration = 0_i64;
             measure(&format!("cs_exists_{count}"), 1, || {
-                let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+                let threshold = 1 + iteration % cat_count_i64;
+                iteration += 1;
+                let value: i64 = stmt
+                    .query_row(rusqlite::params![threshold], |row| row.get(0))
+                    .unwrap();
+                std::hint::black_box(value);
             })
         };
         let fs = {
-            let sql = format!(
-                "SELECT COUNT(*) FROM products p WHERE EXISTS (SELECT 1 FROM categories c WHERE c.id = p.category_id AND c.id <= {half})"
-            );
-            let stmt = fs_prepare(&fs_conn, &sql);
+            let stmt = fs_prepare(&fs_conn, exists_sql);
+            let mut iteration = 0_i64;
             measure(&format!("fs_exists_{count}"), 1, || {
-                drop(fsqlite_e2e::block_on(stmt.query_row()));
+                let threshold = 1 + iteration % cat_count_i64;
+                iteration += 1;
+                let row = fsqlite_e2e::block_on(
+                    stmt.query_row_with_params(&[fsqlite::SqliteValue::Integer(threshold)]),
+                )
+                .unwrap();
+                std::hint::black_box(fsqlite_integer(&row, 0, "EXISTS measurement"));
             })
         };
         eprintln!(
@@ -5609,33 +6637,66 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
             format_duration(fs.median())
         );
         section.add_row(
-            &format!("{count} rows / EXISTS subquery"),
+            &format!("{count} rows / EXISTS subquery (parameter-varying)"),
             Some(cs),
             Some(fs),
         );
 
-        // IN subquery.
-        eprint!("    IN subquery... ");
+        // Parameter-varying IN subquery. The previous constant `id <= 5`
+        // shape measured FrankenSQLite's warmed exact-result cache after the
+        // warmups, rather than general subquery execution (bd-czzlp).
+        eprint!("    IN subquery (parameter-varying)... ");
+        let in_sql = "SELECT COUNT(*) FROM products \
+            WHERE category_id IN \
+            (SELECT id FROM categories WHERE id <= ?1)";
+        let expected_in: i64 = cs_conn
+            .query_row(in_sql, rusqlite::params![oracle_threshold], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let in_probe = fs_prepare(&fs_conn, in_sql);
+        let actual_in = fsqlite_e2e::block_on(
+            in_probe.query_row_with_params(&[fsqlite::SqliteValue::Integer(oracle_threshold)]),
+        )
+        .unwrap();
+        assert_eq!(
+            fsqlite_integer(&actual_in, 0, "IN-subquery oracle"),
+            expected_in,
+            "FrankenSQLite and C SQLite disagree on IN-subquery benchmark oracle"
+        );
         let cs = {
-            let sql = "SELECT COUNT(*) FROM products WHERE category_id IN (SELECT id FROM categories WHERE id <= 5)";
-            let mut stmt = cs_conn.prepare(sql).unwrap();
+            let mut stmt = cs_conn.prepare(in_sql).unwrap();
+            let mut iteration = 0_i64;
             measure(&format!("cs_in_sub_{count}"), 1, || {
-                let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+                let threshold = 1 + iteration % cat_count_i64;
+                iteration += 1;
+                let value: i64 = stmt
+                    .query_row(rusqlite::params![threshold], |row| row.get(0))
+                    .unwrap();
+                std::hint::black_box(value);
             })
         };
-        let fs_stmt = fs_prepare(
-            &fs_conn,
-            "SELECT COUNT(*) FROM products WHERE category_id IN (SELECT id FROM categories WHERE id <= 5)",
-        );
+        let fs_stmt = fs_prepare(&fs_conn, in_sql);
+        let mut fs_iteration = 0_i64;
         let fs = measure(&format!("fs_in_sub_{count}"), 1, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query_row()));
+            let threshold = 1 + fs_iteration % cat_count_i64;
+            fs_iteration += 1;
+            let row = fsqlite_e2e::block_on(
+                fs_stmt.query_row_with_params(&[fsqlite::SqliteValue::Integer(threshold)]),
+            )
+            .unwrap();
+            std::hint::black_box(fsqlite_integer(&row, 0, "IN-subquery measurement"));
         });
         eprintln!(
             "C={} F={}",
             format_duration(cs.median()),
             format_duration(fs.median())
         );
-        section.add_row(&format!("{count} rows / IN subquery"), Some(cs), Some(fs));
+        section.add_row(
+            &format!("{count} rows / IN subquery (parameter-varying)"),
+            Some(cs),
+            Some(fs),
+        );
 
         // CTE (non-recursive).
         eprint!("    CTE (non-recursive)... ");
@@ -5654,7 +6715,7 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
              SELECT p.name, p.price FROM products p JOIN top_cats tc ON p.category_id = tc.category_id",
         );
         let fs = measure(&format!("fs_cte_{count}"), count, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query()));
+            std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
         });
         eprintln!(
             "C={} F={}",
@@ -5664,25 +6725,30 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
         section.add_row(&format!("{count} rows / CTE + JOIN"), Some(cs), Some(fs));
     }
 
-    // Recursive CTE.
-    eprint!("    Recursive CTE (generate_series 1..1000)... ");
+    // This exact SUM shape is intentionally specialized by FrankenSQLite.
+    // Keep it, but label it as such instead of presenting it as the general
+    // recursive-CTE executor.
+    const SPECIALIZED_RECURSIVE_CTE_SQL: &str = "WITH RECURSIVE cnt(x) AS \
+         (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 1000) \
+         SELECT SUM(x) FROM cnt";
+    eprint!("    Recursive CTE specialized integer-series SUM... ");
     let cs = {
         let cs_conn = rusqlite::Connection::open_in_memory().unwrap();
-        let mut stmt = cs_conn.prepare(
-            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 1000) SELECT SUM(x) FROM cnt"
-        ).unwrap();
+        let mut stmt = cs_conn.prepare(SPECIALIZED_RECURSIVE_CTE_SQL).unwrap();
         measure("cs_recursive_cte", 1000, || {
-            let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+            let value: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+            assert_eq!(value, 500_500);
+            std::hint::black_box(value);
         })
     };
     let fs = {
         let fs_conn = open_fsqlite_memory_connection_for_benchmark();
-        let stmt = fs_prepare(
-            &fs_conn,
-            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 1000) SELECT SUM(x) FROM cnt",
-        );
+        let stmt = fs_prepare(&fs_conn, SPECIALIZED_RECURSIVE_CTE_SQL);
         measure("fs_recursive_cte", 1000, || {
-            drop(fsqlite_e2e::block_on(stmt.query_row()));
+            let row = fsqlite_e2e::block_on(stmt.query_row()).unwrap();
+            let value = fsqlite_integer(&row, 0, "specialized recursive CTE");
+            assert_eq!(value, 500_500);
+            std::hint::black_box(value);
         })
     };
     eprintln!(
@@ -5690,7 +6756,43 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
         format_duration(cs.median()),
         format_duration(fs.median())
     );
-    section.add_row("Recursive CTE (1..1000 SUM)", Some(cs), Some(fs));
+    section.add_row(
+        "Recursive CTE specialized integer-series SUM (1..1000)",
+        Some(cs),
+        Some(fs),
+    );
+
+    // COUNT defeats the narrow SUM specialization and therefore measures the
+    // general recursive frontier executor.
+    const GENERAL_RECURSIVE_CTE_SQL: &str = "WITH RECURSIVE cnt(x) AS \
+         (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 1000) \
+         SELECT COUNT(*) FROM cnt";
+    eprint!("    Recursive CTE general COUNT... ");
+    let cs = {
+        let cs_conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut stmt = cs_conn.prepare(GENERAL_RECURSIVE_CTE_SQL).unwrap();
+        measure("cs_recursive_cte_general", 1000, || {
+            let value: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+            assert_eq!(value, 1_000);
+            std::hint::black_box(value);
+        })
+    };
+    let fs = {
+        let fs_conn = open_fsqlite_memory_connection_for_benchmark();
+        let stmt = fs_prepare(&fs_conn, GENERAL_RECURSIVE_CTE_SQL);
+        measure("fs_recursive_cte_general", 1000, || {
+            let row = fsqlite_e2e::block_on(stmt.query_row()).unwrap();
+            let value = fsqlite_integer(&row, 0, "general recursive CTE");
+            assert_eq!(value, 1_000);
+            std::hint::black_box(value);
+        })
+    };
+    eprintln!(
+        "C={} F={}",
+        format_duration(cs.median()),
+        format_duration(fs.median())
+    );
+    section.add_row("Recursive CTE general COUNT (1..1000)", Some(cs), Some(fs));
 }
 
 // ─── Section 10: String & LIKE performance ──────────────────────────────
@@ -5771,7 +6873,8 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 .prepare("SELECT COUNT(*) FROM docs WHERE title LIKE 'Document 1%'")
                 .unwrap();
             measure(&format!("cs_like_prefix_{count}"), 1, || {
-                let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+                let value: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+                std::hint::black_box(value);
             })
         };
         let fs_stmt = fs_prepare(
@@ -5779,7 +6882,8 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
             "SELECT COUNT(*) FROM docs WHERE title LIKE 'Document 1%'",
         );
         let fs = measure(&format!("fs_like_prefix_{count}"), 1, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query_row()));
+            let row = fsqlite_e2e::block_on(fs_stmt.query_row()).unwrap();
+            std::hint::black_box(fsqlite_integer(&row, 0, "LIKE prefix COUNT"));
         });
         eprintln!(
             "C={} F={}",
@@ -5799,7 +6903,8 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 .prepare("SELECT COUNT(*) FROM docs WHERE body LIKE '%benchmark%'")
                 .unwrap();
             measure(&format!("cs_like_wild_{count}"), 1, || {
-                let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+                let value: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+                std::hint::black_box(value);
             })
         };
         let fs_stmt = fs_prepare(
@@ -5807,7 +6912,8 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
             "SELECT COUNT(*) FROM docs WHERE body LIKE '%benchmark%'",
         );
         let fs = measure(&format!("fs_like_wild_{count}"), 1, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query_row()));
+            let row = fsqlite_e2e::block_on(fs_stmt.query_row()).unwrap();
+            std::hint::black_box(fsqlite_integer(&row, 0, "LIKE wildcard COUNT"));
         });
         eprintln!(
             "C={} F={}",
@@ -5827,7 +6933,8 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 .prepare("SELECT LENGTH(title), UPPER(tag), SUBSTR(body, 1, 50) FROM docs")
                 .unwrap();
             measure(&format!("cs_str_funcs_{count}"), count, || {
-                let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
+                let rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
+                std::hint::black_box(rows);
             })
         };
         let fs_stmt = fs_prepare(
@@ -5835,7 +6942,8 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
             "SELECT LENGTH(title), UPPER(tag), SUBSTR(body, 1, 50) FROM docs",
         );
         let fs = measure(&format!("fs_str_funcs_{count}"), count, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query()));
+            let rows = fsqlite_e2e::block_on(fs_stmt.query()).unwrap();
+            std::hint::black_box(rows);
         });
         eprintln!(
             "C={} F={}",
@@ -5855,7 +6963,8 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 .prepare("SELECT tag, GROUP_CONCAT(id, ',') FROM docs GROUP BY tag")
                 .unwrap();
             measure(&format!("cs_group_concat_{count}"), count, || {
-                let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
+                let rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
+                std::hint::black_box(rows);
             })
         };
         let fs_stmt = fs_prepare(
@@ -5863,7 +6972,8 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
             "SELECT tag, GROUP_CONCAT(id, ',') FROM docs GROUP BY tag",
         );
         let fs = measure(&format!("fs_group_concat_{count}"), count, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query()));
+            let rows = fsqlite_e2e::block_on(fs_stmt.query()).unwrap();
+            std::hint::black_box(rows);
         });
         eprintln!(
             "C={} F={}",
@@ -5876,41 +6986,31 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
 
 // ─── Main ──────────────────────────────────────────────────────────────
 
-fn write_json_report(report: &JsonBenchmarkReport, path: &str) {
-    let Ok(json) = serde_json::to_string_pretty(report) else {
-        eprintln!("ERROR: Could not serialize JSON report");
-        return;
-    };
-
-    if !ensure_report_parent_dir(path, "JSON") {
-        return;
-    }
-
-    match std::fs::write(path, format!("{json}\n")) {
-        Ok(()) => eprintln!("JSON report written to: {path}"),
-        Err(e) => eprintln!("ERROR: Could not write JSON report: {e}"),
-    }
+fn write_json_report(report: &JsonBenchmarkReport, path: &str) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|error| format!("could not serialize JSON report: {error}"))?;
+    ensure_report_parent_dir(path, "JSON")?;
+    std::fs::write(path, format!("{json}\n"))
+        .map_err(|error| format!("could not write JSON report at {path}: {error}"))?;
+    eprintln!("JSON report written to: {path}");
+    Ok(())
 }
 
-fn ensure_report_parent_dir(path: &str, report_kind: &str) -> bool {
+fn ensure_report_parent_dir(path: &str, report_kind: &str) -> Result<(), String> {
     let path = std::path::Path::new(path);
     let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     else {
-        return true;
+        return Ok(());
     };
 
-    match std::fs::create_dir_all(parent) {
-        Ok(()) => true,
-        Err(err) => {
-            eprintln!(
-                "ERROR: Could not create {report_kind} report parent directory {}: {err}",
-                parent.display()
-            );
-            false
-        }
-    }
+    std::fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "could not create {report_kind} report parent directory {}: {error}",
+            parent.display()
+        )
+    })
 }
 
 fn print_json_report(report: &JsonBenchmarkReport) {
@@ -5948,6 +7048,40 @@ fn main() {
     } else {
         ROW_COUNTS
     };
+    let html_file = if options.emit_html {
+        Some(
+            options
+                .html_path
+                .clone()
+                .unwrap_or_else(|| timestamp_filename("benchmark_report", "html")),
+        )
+    } else {
+        None
+    };
+    let json_file = if let Some(path) = options.json_out_path.clone() {
+        Some(path)
+    } else if options.emit_timestamped_json {
+        Some(timestamp_filename("benchmark_report", "json"))
+    } else {
+        None
+    };
+    let artifact_requested = html_file.is_some() || json_file.is_some() || options.json_stdout;
+    let mut provenance =
+        JsonBenchmarkProvenance::capture(args.clone(), "per_operation_thread_local_block_on");
+    if artifact_requested && !provenance.citable {
+        if options.allow_unverified_provenance {
+            provenance.mark_explicit_override();
+        } else {
+            eprintln!("ERROR: refusing to run a citable benchmark with invalid provenance:");
+            for error in &provenance.validation_errors {
+                eprintln!("  - {error}");
+            }
+            eprintln!(
+                "Use --allow-unverified-provenance only for an explicitly non-citable diagnostic run."
+            );
+            std::process::exit(2);
+        }
+    }
     let filter_lower = options.filter.as_ref().map(|filter| filter.to_lowercase());
 
     let should_run =
@@ -5956,7 +7090,7 @@ fn main() {
         |aliases: &[&str]| -> bool { section_filter_matches(filter_lower.as_deref(), aliases) };
 
     let bench_start = Instant::now();
-    let environment = DetectedEnvironment::detect();
+    let environment = DetectedEnvironment::detect(&provenance);
     print_run_banner(!options.json_stdout, &options, row_counts, &environment);
 
     let mut report = BenchReport::new();
@@ -6052,28 +7186,27 @@ fn main() {
     if !options.json_stdout {
         report.print(total_elapsed, &environment);
     }
-
-    let html_file = if options.emit_html {
-        Some(
-            options
-                .html_path
-                .clone()
-                .unwrap_or_else(|| timestamp_filename("benchmark_report", "html")),
-        )
-    } else {
-        None
-    };
-    if let Some(path) = html_file.as_deref() {
-        report.write_html(path);
+    provenance.verify_runtime_source_unchanged();
+    if artifact_requested && !provenance.citable {
+        if options.allow_unverified_provenance {
+            provenance.mark_explicit_override();
+        } else {
+            eprintln!(
+                "ERROR: source provenance changed during the benchmark; no artifact emitted:"
+            );
+            for error in &provenance.validation_errors {
+                eprintln!("  - {error}");
+            }
+            std::process::exit(2);
+        }
     }
 
-    let json_file = if let Some(path) = options.json_out_path.clone() {
-        Some(path)
-    } else if options.emit_timestamped_json {
-        Some(timestamp_filename("benchmark_report", "json"))
-    } else {
-        None
-    };
+    if let Some(path) = html_file.as_deref()
+        && let Err(error) = report.write_html(path, &provenance)
+    {
+        eprintln!("ERROR: {error}");
+        std::process::exit(1);
+    }
 
     if json_file.is_some() || options.json_stdout {
         let json_report = build_json_report(
@@ -6092,10 +7225,14 @@ fn main() {
                 json_stdout: options.json_stdout,
             },
             environment.clone(),
+            provenance,
         );
 
-        if let Some(path) = json_file.as_deref() {
-            write_json_report(&json_report, path);
+        if let Some(path) = json_file.as_deref()
+            && let Err(error) = write_json_report(&json_report, path)
+        {
+            eprintln!("ERROR: {error}");
+            std::process::exit(1);
         }
         if options.json_stdout {
             print_json_report(&json_report);

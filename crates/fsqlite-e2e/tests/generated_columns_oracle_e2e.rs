@@ -10,6 +10,7 @@
 //! Each scenario runs its full statement list on BOTH engines and reports the
 //! first place they diverge (a frank error where rusqlite succeeds is itself a
 //! finding), then compares query results.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -27,8 +28,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -62,11 +63,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
 
 /// Run `stmts` (DDL/DML) on both engines, asserting they agree on success/
 /// failure of each, then compare each query in `queries`.
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -76,7 +77,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -100,138 +101,161 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 
 #[test]
 fn generated_virtual_basic() {
-    scenario(
-        &[
-            "CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER AS (a + b) VIRTUAL)",
-            "INSERT INTO t(a, b) VALUES (1, 2), (10, 20), (100, 200)",
-        ],
-        &[
-            "SELECT a, b, c FROM t ORDER BY a",
-            "SELECT c FROM t WHERE c > 30 ORDER BY c",
-            "SELECT * FROM t ORDER BY a",
-        ],
-        "generated_virtual_basic",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER AS (a + b) VIRTUAL)",
+                "INSERT INTO t(a, b) VALUES (1, 2), (10, 20), (100, 200)",
+            ],
+            &[
+                "SELECT a, b, c FROM t ORDER BY a",
+                "SELECT c FROM t WHERE c > 30 ORDER BY c",
+                "SELECT * FROM t ORDER BY a",
+            ],
+            "generated_virtual_basic",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn generated_stored_basic() {
-    scenario(
-        &[
-            "CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER AS (a * b) STORED)",
-            "INSERT INTO t(a, b) VALUES (2, 3), (4, 5)",
-        ],
-        &[
-            "SELECT a, b, c FROM t ORDER BY a",
-            "SELECT * FROM t ORDER BY a",
-        ],
-        "generated_stored_basic",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER AS (a * b) STORED)",
+                "INSERT INTO t(a, b) VALUES (2, 3), (4, 5)",
+            ],
+            &[
+                "SELECT a, b, c FROM t ORDER BY a",
+                "SELECT * FROM t ORDER BY a",
+            ],
+            "generated_stored_basic",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn generated_always_long_form() {
-    scenario(
-        &[
-            "CREATE TABLE t (a INTEGER, \
-               v INTEGER GENERATED ALWAYS AS (a + 1) VIRTUAL, \
-               s INTEGER GENERATED ALWAYS AS (a * 10) STORED)",
-            "INSERT INTO t(a) VALUES (5), (7)",
-        ],
-        &["SELECT a, v, s FROM t ORDER BY a"],
-        "generated_always_long_form",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (a INTEGER, \
+                   v INTEGER GENERATED ALWAYS AS (a + 1) VIRTUAL, \
+                   s INTEGER GENERATED ALWAYS AS (a * 10) STORED)",
+                "INSERT INTO t(a) VALUES (5), (7)",
+            ],
+            &["SELECT a, v, s FROM t ORDER BY a"],
+            "generated_always_long_form",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn generated_expression_with_functions_and_text() {
-    scenario(
-        &[
-            "CREATE TABLE p (first TEXT, last TEXT, \
-               full TEXT AS (first || ' ' || last) VIRTUAL, \
-               initials TEXT AS (upper(substr(first,1,1)) || upper(substr(last,1,1))) STORED)",
-            "INSERT INTO p(first, last) VALUES ('ada','lovelace'),('alan','turing')",
-        ],
-        &[
-            "SELECT full, initials FROM p ORDER BY first",
-            "SELECT first FROM p WHERE full = 'ada lovelace'",
-        ],
-        "generated_expression_with_functions_and_text",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE p (first TEXT, last TEXT, \
+                   full TEXT AS (first || ' ' || last) VIRTUAL, \
+                   initials TEXT AS (upper(substr(first,1,1)) || upper(substr(last,1,1))) STORED)",
+                "INSERT INTO p(first, last) VALUES ('ada','lovelace'),('alan','turing')",
+            ],
+            &[
+                "SELECT full, initials FROM p ORDER BY first",
+                "SELECT first FROM p WHERE full = 'ada lovelace'",
+            ],
+            "generated_expression_with_functions_and_text",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn generated_type_affinity_coercion() {
     // The generated value is coerced to the column's declared affinity.
-    scenario(
-        &[
-            "CREATE TABLE t (a INTEGER, \
-               txt TEXT AS (a * 2) VIRTUAL, \
-               num INTEGER AS (a / 2.0) STORED)",
-            "INSERT INTO t(a) VALUES (3), (4)",
-        ],
-        &["SELECT a, typeof(txt), txt, typeof(num), num FROM t ORDER BY a"],
-        "generated_type_affinity_coercion",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (a INTEGER, \
+                   txt TEXT AS (a * 2) VIRTUAL, \
+                   num INTEGER AS (a / 2.0) STORED)",
+                "INSERT INTO t(a) VALUES (3), (4)",
+            ],
+            &["SELECT a, typeof(txt), txt, typeof(num), num FROM t ORDER BY a"],
+            "generated_type_affinity_coercion",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn generated_recomputes_on_update() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER AS (a + 1) VIRTUAL, d INTEGER AS (a + 1) STORED)",
-            "INSERT INTO t(id, a) VALUES (1, 10), (2, 20)",
-            "UPDATE t SET a = a * 2 WHERE id = 1",
-        ],
-        &["SELECT id, a, c, d FROM t ORDER BY id"],
-        "generated_recomputes_on_update",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER AS (a + 1) VIRTUAL, d INTEGER AS (a + 1) STORED)",
+                "INSERT INTO t(id, a) VALUES (1, 10), (2, 20)",
+                "UPDATE t SET a = a * 2 WHERE id = 1",
+            ],
+            &["SELECT id, a, c, d FROM t ORDER BY id"],
+            "generated_recomputes_on_update",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn generated_explicit_value_rejected() {
     // Supplying a value for a generated column must error on both engines.
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    {
-        let s = "CREATE TABLE t (a INTEGER, c INTEGER AS (a + 1) VIRTUAL)";
-        let fe = f.execute(s);
-        let re = r.execute_batch(s);
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        {
+            let s = "CREATE TABLE t (a INTEGER, c INTEGER AS (a + 1) VIRTUAL)";
+            let fe = f.execute(s).await;
+            let re = r.execute_batch(s);
+            assert!(
+                fe.is_ok() == re.is_ok(),
+                "generated_explicit_value_rejected setup `{s}`: frank ok={:?} csql ok={:?}",
+                fe.is_ok(),
+                re.is_ok()
+            );
+            if fe.is_err() {
+                return; // generated columns unsupported at DDL — covered elsewhere.
+            }
+        }
+        let fe = f.execute("INSERT INTO t(a, c) VALUES (1, 999)").await;
+        let re = r.execute_batch("INSERT INTO t(a, c) VALUES (1, 999)");
         assert!(
-            fe.is_ok() == re.is_ok(),
-            "generated_explicit_value_rejected setup `{s}`: frank ok={:?} csql ok={:?}",
+            fe.is_err() && re.is_err(),
+            "explicit value for generated column must be rejected: frank ok={:?}, csql ok={:?}",
             fe.is_ok(),
             re.is_ok()
         );
-        if fe.is_err() {
-            return; // generated columns unsupported at DDL — covered elsewhere.
-        }
-    }
-    let fe = f.execute("INSERT INTO t(a, c) VALUES (1, 999)");
-    let re = r.execute_batch("INSERT INTO t(a, c) VALUES (1, 999)");
-    assert!(
-        fe.is_err() && re.is_err(),
-        "explicit value for generated column must be rejected: frank ok={:?}, csql ok={:?}",
-        fe.is_ok(),
-        re.is_ok()
-    );
+    });
 }
 
 #[test]
 fn generated_indexed_lookup() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, hi INTEGER AS (a * 1000) VIRTUAL)",
-            "CREATE INDEX idx_hi ON t(hi)",
-            "INSERT INTO t(id, a) VALUES (1,3),(2,1),(3,2)",
-        ],
-        &[
-            "SELECT id, hi FROM t WHERE hi = 2000",
-            "SELECT id FROM t WHERE hi >= 2000 ORDER BY hi",
-            "SELECT a FROM t ORDER BY hi",
-        ],
-        "generated_indexed_lookup",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, hi INTEGER AS (a * 1000) VIRTUAL)",
+                "CREATE INDEX idx_hi ON t(hi)",
+                "INSERT INTO t(id, a) VALUES (1,3),(2,1),(3,2)",
+            ],
+            &[
+                "SELECT id, hi FROM t WHERE hi = 2000",
+                "SELECT id FROM t WHERE hi >= 2000 ORDER BY hi",
+                "SELECT a FROM t ORDER BY hi",
+            ],
+            "generated_indexed_lookup",
+        )
+        .await;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -241,47 +265,56 @@ fn generated_indexed_lookup() {
 
 #[test]
 fn generated_stored_with_functions_and_text() {
-    scenario(
-        &[
-            "CREATE TABLE p (first TEXT, last TEXT, \
-               full TEXT AS (first || ' ' || last) STORED, \
-               initials TEXT AS (upper(substr(first,1,1)) || upper(substr(last,1,1))) STORED)",
-            "INSERT INTO p(first, last) VALUES ('ada','lovelace'),('alan','turing')",
-        ],
-        &[
-            "SELECT full, initials FROM p ORDER BY first",
-            "SELECT first FROM p WHERE full = 'ada lovelace'",
-        ],
-        "generated_stored_with_functions_and_text",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE p (first TEXT, last TEXT, \
+                   full TEXT AS (first || ' ' || last) STORED, \
+                   initials TEXT AS (upper(substr(first,1,1)) || upper(substr(last,1,1))) STORED)",
+                "INSERT INTO p(first, last) VALUES ('ada','lovelace'),('alan','turing')",
+            ],
+            &[
+                "SELECT full, initials FROM p ORDER BY first",
+                "SELECT first FROM p WHERE full = 'ada lovelace'",
+            ],
+            "generated_stored_with_functions_and_text",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn generated_stored_recomputes_on_update() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, d INTEGER AS (a + 1) STORED)",
-            "INSERT INTO t(id, a) VALUES (1, 10), (2, 20)",
-            "UPDATE t SET a = a * 2 WHERE id = 1",
-        ],
-        &["SELECT id, a, d FROM t ORDER BY id"],
-        "generated_stored_recomputes_on_update",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, d INTEGER AS (a + 1) STORED)",
+                "INSERT INTO t(id, a) VALUES (1, 10), (2, 20)",
+                "UPDATE t SET a = a * 2 WHERE id = 1",
+            ],
+            &["SELECT id, a, d FROM t ORDER BY id"],
+            "generated_stored_recomputes_on_update",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn generated_stored_indexed_lookup() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, hi INTEGER AS (a * 1000) STORED)",
-            "CREATE INDEX idx_hi ON t(hi)",
-            "INSERT INTO t(id, a) VALUES (1,3),(2,1),(3,2)",
-        ],
-        &[
-            "SELECT id, hi FROM t WHERE hi = 2000",
-            "SELECT id FROM t WHERE hi >= 2000 ORDER BY hi",
-            "SELECT a FROM t ORDER BY hi",
-        ],
-        "generated_stored_indexed_lookup",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, hi INTEGER AS (a * 1000) STORED)",
+                "CREATE INDEX idx_hi ON t(hi)",
+                "INSERT INTO t(id, a) VALUES (1,3),(2,1),(3,2)",
+            ],
+            &[
+                "SELECT id, hi FROM t WHERE hi = 2000",
+                "SELECT id FROM t WHERE hi >= 2000 ORDER BY hi",
+                "SELECT a FROM t ORDER BY hi",
+            ],
+            "generated_stored_indexed_lookup",
+        )
+        .await;
+    });
 }

@@ -23,8 +23,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -56,21 +56,24 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn setup(stmts: &[&str]) -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn setup(stmts: &[&str]) -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        f.execute(s).unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
+        f.execute(s)
+            .await
+            .unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
         r.execute_batch(s)
             .unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
     }
     (f, r)
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        let frank = frank_rows(f, q).await;
+        match (frank, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -104,22 +107,25 @@ fn two_tables() -> [&'static str; 4] {
 
 #[test]
 fn scalar_subquery_empty_and_single() {
-    let (f, r) = setup(&two_tables());
-    check(
-        &f,
-        &r,
-        &[
-            // Empty subquery -> NULL.
-            "SELECT (SELECT name FROM dept WHERE id = 99)",
-            "SELECT (SELECT max(salary) FROM emp WHERE dept_id = 3)", // no rows -> NULL via aggregate
-            // Single-row scalar subquery.
-            "SELECT (SELECT name FROM dept WHERE id = 1)",
-            "SELECT (SELECT count(*) FROM emp)",
-            // Scalar subquery in arithmetic.
-            "SELECT (SELECT max(salary) FROM emp) - (SELECT min(salary) FROM emp)",
-        ],
-        "scalar_subquery_empty_and_single",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&two_tables()).await;
+        check(
+            &f,
+            &r,
+            &[
+                // Empty subquery -> NULL.
+                "SELECT (SELECT name FROM dept WHERE id = 99)",
+                "SELECT (SELECT max(salary) FROM emp WHERE dept_id = 3)", // no rows -> NULL via aggregate
+                // Single-row scalar subquery.
+                "SELECT (SELECT name FROM dept WHERE id = 1)",
+                "SELECT (SELECT count(*) FROM emp)",
+                // Scalar subquery in arithmetic.
+                "SELECT (SELECT max(salary) FROM emp) - (SELECT min(salary) FROM emp)",
+            ],
+            "scalar_subquery_empty_and_single",
+        )
+        .await;
+    });
 }
 
 #[test]
@@ -127,127 +133,149 @@ fn scalar_subquery_multi_row_takes_first() {
     // SQLite does not error on a multi-row scalar subquery; it uses the first
     // row in scan (rowid) order. Pin it both ways: the bare form and an
     // explicitly ordered form.
-    let (f, r) = setup(&two_tables());
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT (SELECT salary FROM emp WHERE dept_id = 1)", // first eng row (rowid order)
-            "SELECT (SELECT salary FROM emp WHERE dept_id = 1 ORDER BY salary DESC)",
-            "SELECT (SELECT name FROM emp ORDER BY salary)", // lowest-paid name
-        ],
-        "scalar_subquery_multi_row_takes_first",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&two_tables()).await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT (SELECT salary FROM emp WHERE dept_id = 1)", // first eng row (rowid order)
+                "SELECT (SELECT salary FROM emp WHERE dept_id = 1 ORDER BY salary DESC)",
+                "SELECT (SELECT name FROM emp ORDER BY salary)", // lowest-paid name
+            ],
+            "scalar_subquery_multi_row_takes_first",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn correlated_scalar_subquery() {
-    let (f, r) = setup(&two_tables());
-    check(
-        &f,
-        &r,
-        &[
-            // Per-dept max salary via correlated scalar subquery.
-            "SELECT d.name, (SELECT max(e.salary) FROM emp e WHERE e.dept_id = d.id) \
-             FROM dept d ORDER BY d.id",
-            // Per-employee: how many earn more in the same dept.
-            "SELECT e.name, (SELECT count(*) FROM emp x WHERE x.dept_id = e.dept_id AND x.salary > e.salary) \
-             FROM emp e ORDER BY e.id",
-        ],
-        "correlated_scalar_subquery",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&two_tables()).await;
+        check(
+            &f,
+            &r,
+            &[
+                // Per-dept max salary via correlated scalar subquery.
+                "SELECT d.name, (SELECT max(e.salary) FROM emp e WHERE e.dept_id = d.id) \
+                 FROM dept d ORDER BY d.id",
+                // Per-employee: how many earn more in the same dept.
+                "SELECT e.name, (SELECT count(*) FROM emp x WHERE x.dept_id = e.dept_id AND x.salary > e.salary) \
+                 FROM emp e ORDER BY e.id",
+            ],
+            "correlated_scalar_subquery",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn exists_not_exists() {
-    let (f, r) = setup(&two_tables());
-    check(
-        &f,
-        &r,
-        &[
-            // Depts that have employees.
-            "SELECT name FROM dept d WHERE EXISTS (SELECT 1 FROM emp e WHERE e.dept_id = d.id) ORDER BY d.id",
-            // Depts with no employees (the 'empty' dept).
-            "SELECT name FROM dept d WHERE NOT EXISTS (SELECT 1 FROM emp e WHERE e.dept_id = d.id) ORDER BY d.id",
-            // EXISTS with an additional predicate.
-            "SELECT name FROM dept d WHERE EXISTS (SELECT 1 FROM emp e WHERE e.dept_id = d.id AND e.salary > 250) ORDER BY d.id",
-        ],
-        "exists_not_exists",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&two_tables()).await;
+        check(
+            &f,
+            &r,
+            &[
+                // Depts that have employees.
+                "SELECT name FROM dept d WHERE EXISTS (SELECT 1 FROM emp e WHERE e.dept_id = d.id) ORDER BY d.id",
+                // Depts with no employees (the 'empty' dept).
+                "SELECT name FROM dept d WHERE NOT EXISTS (SELECT 1 FROM emp e WHERE e.dept_id = d.id) ORDER BY d.id",
+                // EXISTS with an additional predicate.
+                "SELECT name FROM dept d WHERE EXISTS (SELECT 1 FROM emp e WHERE e.dept_id = d.id AND e.salary > 250) ORDER BY d.id",
+            ],
+            "exists_not_exists",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn in_and_not_in_subquery() {
-    let (f, r) = setup(&two_tables());
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT name FROM dept WHERE id IN (SELECT dept_id FROM emp) ORDER BY id",
-            "SELECT name FROM dept WHERE id NOT IN (SELECT dept_id FROM emp WHERE salary > 250) ORDER BY id",
-            // Subquery on emp salaries.
-            "SELECT name FROM emp WHERE salary IN (SELECT salary FROM emp WHERE dept_id = 2) ORDER BY id",
-            // NOT IN against a subquery that yields no NULLs.
-            "SELECT name FROM emp WHERE dept_id NOT IN (SELECT id FROM dept WHERE name = 'sales') ORDER BY id",
-        ],
-        "in_and_not_in_subquery",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&two_tables()).await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT name FROM dept WHERE id IN (SELECT dept_id FROM emp) ORDER BY id",
+                "SELECT name FROM dept WHERE id NOT IN (SELECT dept_id FROM emp WHERE salary > 250) ORDER BY id",
+                // Subquery on emp salaries.
+                "SELECT name FROM emp WHERE salary IN (SELECT salary FROM emp WHERE dept_id = 2) ORDER BY id",
+                // NOT IN against a subquery that yields no NULLs.
+                "SELECT name FROM emp WHERE dept_id NOT IN (SELECT id FROM dept WHERE name = 'sales') ORDER BY id",
+            ],
+            "in_and_not_in_subquery",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn not_in_subquery_null_trap() {
     // A NULL in the NOT IN subquery result makes the whole predicate yield no
     // rows (the classic trap), as a correlated subquery as well.
-    let (f, r) = setup(&[
-        "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)",
-        "CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)",
-        "INSERT INTO a VALUES (1,10),(2,20),(3,30)",
-        "INSERT INTO b VALUES (1,10),(2,NULL)",
-    ]);
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT id FROM a WHERE v NOT IN (SELECT v FROM b) ORDER BY id", // NULL -> no rows
-            "SELECT id FROM a WHERE v IN (SELECT v FROM b) ORDER BY id",     // matches v=10
-            // Removing the NULL row restores normal NOT IN.
-            "SELECT id FROM a WHERE v NOT IN (SELECT v FROM b WHERE v IS NOT NULL) ORDER BY id",
-        ],
-        "not_in_subquery_null_trap",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)",
+            "CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)",
+            "INSERT INTO a VALUES (1,10),(2,20),(3,30)",
+            "INSERT INTO b VALUES (1,10),(2,NULL)",
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT id FROM a WHERE v NOT IN (SELECT v FROM b) ORDER BY id", // NULL -> no rows
+                "SELECT id FROM a WHERE v IN (SELECT v FROM b) ORDER BY id",     // matches v=10
+                // Removing the NULL row restores normal NOT IN.
+                "SELECT id FROM a WHERE v NOT IN (SELECT v FROM b WHERE v IS NOT NULL) ORDER BY id",
+            ],
+            "not_in_subquery_null_trap",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn nested_subqueries() {
-    let (f, r) = setup(&two_tables());
-    check(
-        &f,
-        &r,
-        &[
-            // Nested subqueries: depts whose max salary exceeds the overall avg.
-            "SELECT name FROM dept WHERE id IN ( \
-               SELECT dept_id FROM emp GROUP BY dept_id \
-               HAVING max(salary) > (SELECT avg(salary) FROM emp)) ORDER BY id",
-            // Three-level nesting.
-            "SELECT name FROM emp WHERE salary = ( \
-               SELECT max(salary) FROM emp WHERE dept_id = ( \
-                 SELECT id FROM dept WHERE name = 'eng')) ORDER BY id",
-        ],
-        "nested_subqueries",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&two_tables()).await;
+        check(
+            &f,
+            &r,
+            &[
+                // Nested subqueries: depts whose max salary exceeds the overall avg.
+                "SELECT name FROM dept WHERE id IN ( \
+                   SELECT dept_id FROM emp GROUP BY dept_id \
+                   HAVING max(salary) > (SELECT avg(salary) FROM emp)) ORDER BY id",
+                // Three-level nesting.
+                "SELECT name FROM emp WHERE salary = ( \
+                   SELECT max(salary) FROM emp WHERE dept_id = ( \
+                     SELECT id FROM dept WHERE name = 'eng')) ORDER BY id",
+            ],
+            "nested_subqueries",
+        )
+        .await;
+    });
 }
 
 /// Row-value IN against a subquery RHS is broken (matches nothing); tracked in
 /// bd-7ccda. Row-value IN against a literal list works.
 #[test]
 fn multi_column_in_subquery() {
-    let (f, r) = setup(&two_tables());
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT name FROM emp WHERE (dept_id, salary) IN (SELECT dept_id, max(salary) FROM emp GROUP BY dept_id) ORDER BY id",
-        ],
-        "multi_column_in_subquery",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&two_tables()).await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT name FROM emp WHERE (dept_id, salary) IN (SELECT dept_id, max(salary) FROM emp GROUP BY dept_id) ORDER BY id",
+            ],
+            "multi_column_in_subquery",
+        )
+        .await;
+    });
 }

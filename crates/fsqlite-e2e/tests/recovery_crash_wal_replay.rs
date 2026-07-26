@@ -31,9 +31,10 @@ fn wal_path_for_db(db_path: &Path) -> PathBuf {
     PathBuf::from(wal)
 }
 
-fn row_count(conn: &Connection) -> i64 {
+async fn row_count(conn: &Connection) -> i64 {
     let row = conn
         .query_row("SELECT COUNT(*) FROM t;")
+        .await
         .expect("count query");
     match row.get(0) {
         Some(SqliteValue::Integer(count)) => *count,
@@ -41,8 +42,9 @@ fn row_count(conn: &Connection) -> i64 {
     }
 }
 
-fn ordered_values_fsqlite(conn: &Connection) -> Vec<i64> {
+async fn ordered_values_fsqlite(conn: &Connection) -> Vec<i64> {
     conn.query("SELECT x FROM t ORDER BY x;")
+        .await
         .expect("query ordered values")
         .into_iter()
         .map(|row| match row.get(0) {
@@ -72,7 +74,7 @@ fn assert_stock_sqlite_integrity(db_path: &Path, label: &str) {
     assert_eq!(integrity, "ok", "[{label}] integrity_check = {integrity}");
 }
 
-fn assert_recovered_rows_match_oracle(db_path: &Path, expected: &[i64], label: &str) {
+async fn assert_recovered_rows_match_oracle(db_path: &Path, expected: &[i64], label: &str) {
     assert_stock_sqlite_integrity(db_path, label);
 
     let csqlite = rusqlite::Connection::open(db_path)
@@ -83,14 +85,15 @@ fn assert_recovered_rows_match_oracle(db_path: &Path, expected: &[i64], label: &
         "[{label}] stock SQLite recovered rows diverged from expectation"
     );
 
-    let fsqlite =
-        Connection::open(db_path.to_string_lossy().as_ref()).expect("open recovered fsqlite db");
+    let fsqlite = Connection::open(db_path.to_string_lossy().as_ref())
+        .await
+        .expect("open recovered fsqlite db");
     let concurrent_mode_default = fsqlite.is_concurrent_mode_default();
     assert!(
         concurrent_mode_default,
         "[{label}] recovered FrankenSQLite connection must keep concurrent mode enabled by default"
     );
-    let f_rows = ordered_values_fsqlite(&fsqlite);
+    let f_rows = ordered_values_fsqlite(&fsqlite).await;
     assert_eq!(
         f_rows, expected,
         "[{label}] FrankenSQLite recovered rows diverged from expectation"
@@ -140,17 +143,20 @@ fn emit_phase5_recovery_log(scenario_id: &str, extra: serde_json::Value) {
     );
 }
 
-fn insert_range(conn: &Connection, start: i64, end_exclusive: i64) {
+async fn insert_range(conn: &Connection, start: i64, end_exclusive: i64) {
     for value in start..end_exclusive {
         conn.execute_with_params("INSERT INTO t VALUES (?1);", &[SqliteValue::Integer(value)])
+            .await
             .expect("insert value");
     }
 }
 
-fn setup_table(conn: &Connection) {
+async fn setup_table(conn: &Connection) {
     conn.execute("PRAGMA journal_mode = WAL;")
+        .await
         .expect("enable WAL mode");
     conn.execute("CREATE TABLE IF NOT EXISTS t(x INTEGER);")
+        .await
         .expect("create table");
 }
 
@@ -172,154 +178,203 @@ fn spawn_crash_helper(mode: &str, db_path: &Path) {
 }
 
 fn helper_mode_committed(db_path: &Path) -> ! {
-    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open helper db");
-    setup_table(&conn);
-    conn.execute("BEGIN;").expect("begin committed helper txn");
-    insert_range(&conn, 0, 100);
-    conn.execute("COMMIT;").expect("commit helper txn");
-    std::process::abort();
+    // `std::process::abort()` stays INSIDE the async block so the connection is
+    // still live (never dropped, never checkpointed) when the process dies.
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(db_path.to_string_lossy().as_ref())
+            .await
+            .expect("open helper db");
+        setup_table(&conn).await;
+        conn.execute("BEGIN;")
+            .await
+            .expect("begin committed helper txn");
+        insert_range(&conn, 0, 100).await;
+        conn.execute("COMMIT;").await.expect("commit helper txn");
+        std::process::abort();
+    });
+    unreachable!("helper_mode_committed aborts inside the runtime");
 }
 
 fn helper_mode_uncommitted(db_path: &Path) -> ! {
-    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open helper db");
-    setup_table(&conn);
-    conn.execute("BEGIN;")
-        .expect("begin uncommitted helper txn");
-    insert_range(&conn, 50, 100);
-    std::process::abort();
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(db_path.to_string_lossy().as_ref())
+            .await
+            .expect("open helper db");
+        setup_table(&conn).await;
+        conn.execute("BEGIN;")
+            .await
+            .expect("begin uncommitted helper txn");
+        insert_range(&conn, 50, 100).await;
+        std::process::abort();
+    });
+    unreachable!("helper_mode_uncommitted aborts inside the runtime");
 }
 
 fn helper_mode_mixed(db_path: &Path) -> ! {
-    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open helper db");
-    setup_table(&conn);
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(db_path.to_string_lossy().as_ref())
+            .await
+            .expect("open helper db");
+        setup_table(&conn).await;
 
-    conn.execute("BEGIN;").expect("begin txn1");
-    insert_range(&conn, 0, 10);
-    conn.execute("COMMIT;").expect("commit txn1");
+        conn.execute("BEGIN;").await.expect("begin txn1");
+        insert_range(&conn, 0, 10).await;
+        conn.execute("COMMIT;").await.expect("commit txn1");
 
-    conn.execute("BEGIN;").expect("begin txn2");
-    insert_range(&conn, 10, 20);
-    conn.execute("COMMIT;").expect("commit txn2");
+        conn.execute("BEGIN;").await.expect("begin txn2");
+        insert_range(&conn, 10, 20).await;
+        conn.execute("COMMIT;").await.expect("commit txn2");
 
-    conn.execute("BEGIN;").expect("begin txn3");
-    insert_range(&conn, 20, 30);
-    std::process::abort();
+        conn.execute("BEGIN;").await.expect("begin txn3");
+        insert_range(&conn, 20, 30).await;
+        std::process::abort();
+    });
+    unreachable!("helper_mode_mixed aborts inside the runtime");
 }
 
 #[test]
 fn committed_transaction_survives_crash_recovery() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("committed_survives.db");
-    let wal_path = wal_path_for_db(&db_path);
-    let expected: Vec<i64> = (0..100).collect();
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("committed_survives.db");
+        let wal_path = wal_path_for_db(&db_path);
+        let expected: Vec<i64> = (0..100).collect();
 
-    spawn_crash_helper("committed", &db_path);
+        spawn_crash_helper("committed", &db_path);
 
-    let wal_meta = std::fs::metadata(&wal_path).expect("wal exists after crash");
-    assert!(
-        wal_meta.len() > 32,
-        "expected non-empty WAL after crash, len={}",
-        wal_meta.len()
-    );
+        let wal_meta = std::fs::metadata(&wal_path).expect("wal exists after crash");
+        assert!(
+            wal_meta.len() > 32,
+            "expected non-empty WAL after crash, len={}",
+            wal_meta.len()
+        );
 
-    assert_recovered_rows_match_oracle(&db_path, &expected, "committed_survives");
+        assert_recovered_rows_match_oracle(&db_path, &expected, "committed_survives").await;
 
-    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open recovered db");
-    assert_eq!(row_count(&conn), 100, "committed rows must survive crash");
+        let conn = Connection::open(db_path.to_string_lossy().as_ref())
+            .await
+            .expect("open recovered db");
+        assert_eq!(
+            row_count(&conn).await,
+            100,
+            "committed rows must survive crash"
+        );
+    });
 }
 
 #[test]
 fn uncommitted_transaction_is_discarded_after_crash() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("uncommitted_discarded.db");
-    let expected: Vec<i64> = (0..50).collect();
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("uncommitted_discarded.db");
+        let expected: Vec<i64> = (0..50).collect();
 
-    {
-        let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open seed db");
-        setup_table(&conn);
-        conn.execute("BEGIN;").expect("begin seed txn");
-        insert_range(&conn, 0, 50);
-        conn.execute("COMMIT;").expect("commit seed txn");
-        conn.close().expect("close seed connection");
-    }
+        {
+            let conn = Connection::open(db_path.to_string_lossy().as_ref())
+                .await
+                .expect("open seed db");
+            setup_table(&conn).await;
+            conn.execute("BEGIN;").await.expect("begin seed txn");
+            insert_range(&conn, 0, 50).await;
+            conn.execute("COMMIT;").await.expect("commit seed txn");
+            conn.close().await.expect("close seed connection");
+        }
 
-    spawn_crash_helper("uncommitted", &db_path);
+        spawn_crash_helper("uncommitted", &db_path);
 
-    assert_recovered_rows_match_oracle(&db_path, &expected, "uncommitted_discarded");
+        assert_recovered_rows_match_oracle(&db_path, &expected, "uncommitted_discarded").await;
 
-    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open recovered db");
-    assert_eq!(
-        row_count(&conn),
-        50,
-        "uncommitted rows must be discarded after crash"
-    );
+        let conn = Connection::open(db_path.to_string_lossy().as_ref())
+            .await
+            .expect("open recovered db");
+        assert_eq!(
+            row_count(&conn).await,
+            50,
+            "uncommitted rows must be discarded after crash"
+        );
+    });
 }
 
 #[test]
 fn only_committed_prefix_survives_multi_transaction_crash() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("multi_commit_prefix.db");
-    let expected: Vec<i64> = (0..20).collect();
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("multi_commit_prefix.db");
+        let expected: Vec<i64> = (0..20).collect();
 
-    spawn_crash_helper("mixed", &db_path);
+        spawn_crash_helper("mixed", &db_path);
 
-    assert_recovered_rows_match_oracle(&db_path, &expected, "multi_commit_prefix");
+        assert_recovered_rows_match_oracle(&db_path, &expected, "multi_commit_prefix").await;
 
-    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open recovered db");
-    assert_eq!(
-        row_count(&conn),
-        20,
-        "two committed transactions should survive while trailing uncommitted writes are discarded"
-    );
+        let conn = Connection::open(db_path.to_string_lossy().as_ref())
+            .await
+            .expect("open recovered db");
+        assert_eq!(
+            row_count(&conn).await,
+            20,
+            "two committed transactions should survive while trailing uncommitted writes are discarded"
+        );
+    });
 }
 
 #[test]
 fn recovered_database_accepts_follow_up_schema_and_writes() {
-    let dir = tempdir().expect("tempdir");
-    let db_path = dir.path().join("recovered_follow_up_work.db");
-    let expected: Vec<i64> = (0..102).collect();
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("recovered_follow_up_work.db");
+        let expected: Vec<i64> = (0..102).collect();
 
-    spawn_crash_helper("committed", &db_path);
-    assert_recovered_rows_match_oracle(&db_path, &(0..100).collect::<Vec<_>>(), "follow_up_seed");
-
-    let recovered =
-        Connection::open(db_path.to_string_lossy().as_ref()).expect("open recovered db");
-    recovered
-        .execute("CREATE INDEX idx_t_x_post_recovery ON t(x);")
-        .expect("create follow-up index");
-    recovered
-        .execute("INSERT INTO t VALUES (100);")
-        .expect("insert row 100 after recovery");
-    recovered
-        .execute("INSERT INTO t VALUES (101);")
-        .expect("insert row 101 after recovery");
-    recovered.close().expect("close recovered connection");
-
-    assert_recovered_rows_match_oracle(&db_path, &expected, "follow_up_after_recovery");
-
-    let sqlite = rusqlite::Connection::open(&db_path).expect("open recovered sqlite db");
-    let index_count: i64 = sqlite
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_t_x_post_recovery';",
-            [],
-            |row| row.get(0),
+        spawn_crash_helper("committed", &db_path);
+        assert_recovered_rows_match_oracle(
+            &db_path,
+            &(0..100).collect::<Vec<_>>(),
+            "follow_up_seed",
         )
-        .expect("query index count");
-    assert_eq!(
-        index_count, 1,
-        "follow-up index must persist after recovery"
-    );
+        .await;
 
-    emit_crash_replay_log(
-        "recovered_database_accepts_follow_up_schema_and_writes",
-        "result",
-        json!({
-            "row_count": expected.len(),
-            "index_count": index_count,
-            "min_row": expected.first().copied(),
-            "max_row": expected.last().copied()
-        }),
-    );
+        let recovered = Connection::open(db_path.to_string_lossy().as_ref())
+            .await
+            .expect("open recovered db");
+        recovered
+            .execute("CREATE INDEX idx_t_x_post_recovery ON t(x);")
+            .await
+            .expect("create follow-up index");
+        recovered
+            .execute("INSERT INTO t VALUES (100);")
+            .await
+            .expect("insert row 100 after recovery");
+        recovered
+            .execute("INSERT INTO t VALUES (101);")
+            .await
+            .expect("insert row 101 after recovery");
+        recovered.close().await.expect("close recovered connection");
+
+        assert_recovered_rows_match_oracle(&db_path, &expected, "follow_up_after_recovery").await;
+
+        let sqlite = rusqlite::Connection::open(&db_path).expect("open recovered sqlite db");
+        let index_count: i64 = sqlite
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_t_x_post_recovery';",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query index count");
+        assert_eq!(
+            index_count, 1,
+            "follow-up index must persist after recovery"
+        );
+
+        emit_crash_replay_log(
+            "recovered_database_accepts_follow_up_schema_and_writes",
+            "result",
+            json!({
+                "row_count": expected.len(),
+                "index_count": index_count,
+                "min_row": expected.first().copied(),
+                "max_row": expected.last().copied()
+            }),
+        );
+    });
 }
 
 #[test]

@@ -25,6 +25,7 @@
 //! opens a SEPARATE Connection per thread, never sharing one across threads.
 //!
 //! No code changes required.
+#![recursion_limit = "512"]
 
 const _BEAD_ID: &str = "bd-3v5ci";
 
@@ -78,16 +79,21 @@ fn per_thread_connection_pattern_is_correct() {
     let path = tmp.path().to_string_lossy().into_owned();
 
     let handle = std::thread::spawn(move || {
-        let conn = fsqlite::Connection::open(path).unwrap();
-        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
-        conn.execute("INSERT INTO t VALUES (42)").unwrap();
-        let row = conn
-            .prepare("SELECT x FROM t")
-            .unwrap()
-            .query_row()
-            .unwrap();
-        let val = row.get(0).cloned();
-        drop(conn);
+        let mut val = None;
+        asupersync::test_utils::run_test(|| async {
+            let conn = fsqlite::Connection::open(path).await.unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER)").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (42)").await.unwrap();
+            let row = conn
+                .prepare("SELECT x FROM t")
+                .await
+                .unwrap()
+                .query_row()
+                .await
+                .unwrap();
+            val = row.get(0).cloned();
+            drop(conn);
+        });
         val
     });
 
@@ -101,53 +107,67 @@ fn per_thread_connection_pattern_is_correct() {
 
 #[test]
 fn multiple_threads_own_separate_connections() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let path: String = tmp.path().to_string_lossy().into_owned();
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path: String = tmp.path().to_string_lossy().into_owned();
 
-    // Create schema from main thread
-    {
-        let conn = fsqlite::Connection::open(path.clone()).unwrap();
-        let _ = conn.execute("PRAGMA fsqlite.concurrent_mode=ON;");
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        // Create schema from main thread
+        {
+            let conn = fsqlite::Connection::open(path.clone()).await.unwrap();
+            drop(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").await);
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+                .await
+                .unwrap();
+        }
+
+        let path = std::sync::Arc::new(path);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+
+        for tid in 0..4u32 {
+            let path = std::sync::Arc::clone(&path);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                asupersync::test_utils::run_test(|| async {
+                    let conn = fsqlite::Connection::open(path.as_str().to_owned())
+                        .await
+                        .unwrap();
+                    drop(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").await);
+                    drop(conn.execute("PRAGMA busy_timeout=5000;").await);
+                    barrier.wait();
+
+                    let id_base = i64::from(tid) * 100;
+                    for i in 0..10i64 {
+                        drop(
+                            conn.execute(&format!(
+                                "INSERT INTO t VALUES ({}, 'thread_{tid}')",
+                                id_base + i
+                            ))
+                            .await,
+                        );
+                    }
+                });
+                tid
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Verify some rows were inserted (exact count depends on contention)
+        let conn = fsqlite::Connection::open(path.as_str().to_owned())
+            .await
             .unwrap();
-    }
-
-    let path = std::sync::Arc::new(path);
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
-    let mut handles = Vec::new();
-
-    for tid in 0..4u32 {
-        let path = std::sync::Arc::clone(&path);
-        let barrier = std::sync::Arc::clone(&barrier);
-        handles.push(std::thread::spawn(move || {
-            let conn = fsqlite::Connection::open(path.as_str().to_owned()).unwrap();
-            let _ = conn.execute("PRAGMA fsqlite.concurrent_mode=ON;");
-            let _ = conn.execute("PRAGMA busy_timeout=5000;");
-            barrier.wait();
-
-            let id_base = i64::from(tid) * 100;
-            for i in 0..10i64 {
-                let _ = conn.execute(&format!(
-                    "INSERT INTO t VALUES ({}, 'thread_{tid}')",
-                    id_base + i
-                ));
-            }
-            tid
-        }));
-    }
-
-    for h in handles {
-        h.join().unwrap();
-    }
-
-    // Verify some rows were inserted (exact count depends on contention)
-    let conn = fsqlite::Connection::open(path.as_str().to_owned()).unwrap();
-    let row = conn
-        .prepare("SELECT COUNT(*) FROM t")
-        .unwrap()
-        .query_row()
-        .unwrap();
-    if let Some(fsqlite::SqliteValue::Integer(count)) = row.get(0) {
-        assert!(count > &0, "at least some rows should have been inserted");
-    }
+        let row = conn
+            .prepare("SELECT COUNT(*) FROM t")
+            .await
+            .unwrap()
+            .query_row()
+            .await
+            .unwrap();
+        if let Some(fsqlite::SqliteValue::Integer(count)) = row.get(0) {
+            assert!(count > &0, "at least some rows should have been inserted");
+        }
+    });
 }

@@ -24,8 +24,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -57,12 +57,13 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn assert_scalar(queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn assert_scalar(queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        let frank = frank_rows(&f, q).await;
+        match (frank, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"));
@@ -86,42 +87,51 @@ fn assert_scalar(queries: &[&str], label: &str) {
 
 #[test]
 fn shift_count_at_or_beyond_64() {
-    assert_scalar(
-        &[
-            "SELECT 1 << 63",                   // -9223372036854775808 (sign bit)
-            "SELECT 1 << 64",                   // 0
-            "SELECT 1 << 100",                  // 0
-            "SELECT 255 >> 64",                 // 0
-            "SELECT 9223372036854775807 >> 63", // 0
-            "SELECT -1 >> 64",                  // -1 (arithmetic, sign fills)
-        ],
-        "shift_count_at_or_beyond_64",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT 1 << 63",                   // -9223372036854775808 (sign bit)
+                "SELECT 1 << 64",                   // 0
+                "SELECT 1 << 100",                  // 0
+                "SELECT 255 >> 64",                 // 0
+                "SELECT 9223372036854775807 >> 63", // 0
+                "SELECT -1 >> 64",                  // -1 (arithmetic, sign fills)
+            ],
+            "shift_count_at_or_beyond_64",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn shift_negative_count_reverses_direction() {
-    assert_scalar(
-        &[
-            "SELECT 1 << -1",    // 1 >> 1 -> 0
-            "SELECT 1024 << -2", // 1024 >> 2 -> 256
-            "SELECT 256 >> -1",  // 256 << 1 -> 512
-            "SELECT 1 >> -3",    // 1 << 3 -> 8
-        ],
-        "shift_negative_count_reverses_direction",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT 1 << -1",    // 1 >> 1 -> 0
+                "SELECT 1024 << -2", // 1024 >> 2 -> 256
+                "SELECT 256 >> -1",  // 256 << 1 -> 512
+                "SELECT 1 >> -3",    // 1 << 3 -> 8
+            ],
+            "shift_negative_count_reverses_direction",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn arithmetic_right_shift_on_negatives() {
-    assert_scalar(
-        &[
-            "SELECT -8 >> 1",   // -4
-            "SELECT -1 >> 1",   // -1
-            "SELECT -1 >> 63",  // -1
-            "SELECT -256 >> 4", // -16
-            "SELECT -2 << 1",   // -4
-        ],
-        "arithmetic_right_shift_on_negatives",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT -8 >> 1",   // -4
+                "SELECT -1 >> 1",   // -1
+                "SELECT -1 >> 63",  // -1
+                "SELECT -256 >> 4", // -16
+                "SELECT -2 << 1",   // -4
+            ],
+            "arithmetic_right_shift_on_negatives",
+        )
+        .await;
+    });
 }

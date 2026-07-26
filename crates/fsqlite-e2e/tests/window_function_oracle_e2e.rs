@@ -25,8 +25,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -58,7 +58,7 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn setup() -> (Connection, rusqlite::Connection) {
+async fn setup() -> (Connection, rusqlite::Connection) {
     let ddl = [
         "CREATE TABLE s (id INTEGER PRIMARY KEY, grp TEXT, score INTEGER)",
         // Note repeated scores within a group to exercise RANK ties / RANGE peers.
@@ -66,10 +66,11 @@ fn setup() -> (Connection, rusqlite::Connection) {
          (1,'a',10),(2,'a',20),(3,'a',20),(4,'a',30),\
          (5,'b',5),(6,'b',15),(7,'b',15),(8,'b',25),(9,'b',25)",
     ];
-    let f = Connection::open(":memory:").expect("open frank");
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for stmt in ddl {
         f.execute(stmt)
+            .await
             .unwrap_or_else(|e| panic!("frank `{stmt}`: {e}"));
         r.execute_batch(stmt)
             .unwrap_or_else(|e| panic!("rusqlite `{stmt}`: {e}"));
@@ -77,10 +78,10 @@ fn setup() -> (Connection, rusqlite::Connection) {
     (f, r)
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -104,8 +105,9 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
 
 #[test]
 fn window_ranking_functions() {
-    let (f, r) = setup();
-    check(
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup().await;
+        check(
         &f,
         &r,
         &[
@@ -117,13 +119,16 @@ fn window_ranking_functions() {
             "SELECT id, grp, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score, id) FROM s ORDER BY id",
         ],
         "window_ranking_functions",
-    );
+    )
+    .await;
+    });
 }
 
 #[test]
 fn window_ntile() {
-    let (f, r) = setup();
-    check(
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup().await;
+        check(
         &f,
         &r,
         &[
@@ -132,13 +137,16 @@ fn window_ntile() {
             "SELECT id, NTILE(100) OVER (ORDER BY id) FROM s ORDER BY id",
         ],
         "window_ntile",
-    );
+    )
+    .await;
+    });
 }
 
 #[test]
 fn window_lag_lead() {
-    let (f, r) = setup();
-    check(
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup().await;
+        check(
         &f,
         &r,
         &[
@@ -151,13 +159,16 @@ fn window_lag_lead() {
             "SELECT id, grp, LAG(score, 1, -99) OVER (PARTITION BY grp ORDER BY id) FROM s ORDER BY id",
         ],
         "window_lag_lead",
-    );
+    )
+    .await;
+    });
 }
 
 #[test]
 fn window_first_last_nth_value() {
-    let (f, r) = setup();
-    check(
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup().await;
+        check(
         &f,
         &r,
         &[
@@ -171,13 +182,16 @@ fn window_first_last_nth_value() {
                ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM s ORDER BY id",
         ],
         "window_first_last_nth_value",
-    );
+    )
+    .await;
+    });
 }
 
 #[test]
 fn window_running_aggregates_rows_frame() {
-    let (f, r) = setup();
-    check(
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup().await;
+        check(
         &f,
         &r,
         &[
@@ -191,13 +205,16 @@ fn window_running_aggregates_rows_frame() {
             "SELECT id, grp, SUM(score) OVER (PARTITION BY grp ORDER BY id ROWS UNBOUNDED PRECEDING) FROM s ORDER BY id",
         ],
         "window_running_aggregates_rows_frame",
-    );
+    )
+    .await;
+    });
 }
 
 #[test]
 fn window_range_frame_peer_groups() {
-    let (f, r) = setup();
-    check(
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup().await;
+        check(
         &f,
         &r,
         &[
@@ -209,42 +226,48 @@ fn window_range_frame_peer_groups() {
             "SELECT id, score, SUM(score) OVER (ORDER BY score, id ROWS UNBOUNDED PRECEDING) FROM s ORDER BY id",
         ],
         "window_range_frame_peer_groups",
-    );
+    )
+    .await;
+    });
 }
 
 #[test]
 fn window_count_star_counts_null_order_peers() {
-    let (f, r) = setup();
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT id, COUNT(*) OVER (
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup().await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT id, COUNT(*) OVER (
                  ORDER BY CASE WHEN id <= 2 THEN NULL ELSE id END
                  RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
              ) FROM s ORDER BY id",
-            "SELECT id, COUNT() OVER (
+                "SELECT id, COUNT() OVER (
                  ORDER BY CASE WHEN id <= 2 THEN NULL ELSE id END
                  RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
              ) FROM s ORDER BY id",
-        ],
-        "window_count_star_counts_null_order_peers",
-    );
+            ],
+            "window_count_star_counts_null_order_peers",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn group_by_window_materializes_args_and_filter() {
-    let (f, r) = setup();
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT grp,
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup().await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT grp,
                     SUM(SUM(score)) FILTER (WHERE grp = 'b') OVER ()
              FROM s
              GROUP BY grp
              ORDER BY grp",
-            "SELECT grp,
+                "SELECT grp,
                     COUNT() OVER (
                         ORDER BY CASE WHEN grp = 'a' THEN NULL ELSE grp END
                         RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
@@ -252,23 +275,28 @@ fn group_by_window_materializes_args_and_filter() {
              FROM s
              GROUP BY grp
              ORDER BY grp",
-        ],
-        "group_by_window_materializes_args_and_filter",
-    );
+            ],
+            "group_by_window_materializes_args_and_filter",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn window_named_window_clause() {
-    let (f, r) = setup();
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT id, RANK() OVER w, ROW_NUMBER() OVER w FROM s \
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup().await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT id, RANK() OVER w, ROW_NUMBER() OVER w FROM s \
              WINDOW w AS (PARTITION BY grp ORDER BY score, id) ORDER BY id",
-            "SELECT id, SUM(score) OVER w FROM s \
+                "SELECT id, SUM(score) OVER w FROM s \
              WINDOW w AS (PARTITION BY grp ORDER BY id ROWS UNBOUNDED PRECEDING) ORDER BY id",
-        ],
-        "window_named_window_clause",
-    );
+            ],
+            "window_named_window_clause",
+        )
+        .await;
+    });
 }

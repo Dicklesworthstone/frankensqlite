@@ -24,8 +24,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -59,17 +59,18 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
 
 /// Run `stmts` (a transaction script) on both engines, asserting they agree on
 /// success/failure of each statement, then compare `queries`.
-fn scenario(init: &[&str], stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(init: &[&str], stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in init {
         f.execute(s)
+            .await
             .unwrap_or_else(|e| panic!("{label} init frank `{s}`: {e}"));
         r.execute_batch(s)
             .unwrap_or_else(|e| panic!("{label} init rusqlite `{s}`: {e}"));
     }
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -79,7 +80,7 @@ fn scenario(init: &[&str], stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -108,158 +109,179 @@ const INIT: [&str; 2] = [
 
 #[test]
 fn txn_commit_and_rollback() {
-    scenario(
-        &INIT,
-        &[
-            "BEGIN",
-            "INSERT INTO t VALUES (3,30)",
-            "UPDATE t SET v = 99 WHERE id = 1",
-            "COMMIT",
-        ],
-        &["SELECT id, v FROM t ORDER BY id"],
-        "txn_commit",
-    );
-    scenario(
-        &INIT,
-        &[
-            "BEGIN",
-            "INSERT INTO t VALUES (3,30)",
-            "DELETE FROM t WHERE id = 1",
-            "ROLLBACK",
-        ],
-        &["SELECT id, v FROM t ORDER BY id"], // unchanged
-        "txn_rollback",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &INIT,
+            &[
+                "BEGIN",
+                "INSERT INTO t VALUES (3,30)",
+                "UPDATE t SET v = 99 WHERE id = 1",
+                "COMMIT",
+            ],
+            &["SELECT id, v FROM t ORDER BY id"],
+            "txn_commit",
+        )
+        .await;
+        scenario(
+            &INIT,
+            &[
+                "BEGIN",
+                "INSERT INTO t VALUES (3,30)",
+                "DELETE FROM t WHERE id = 1",
+                "ROLLBACK",
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // unchanged
+            "txn_rollback",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn savepoint_rollback_to_and_release() {
-    // ROLLBACK TO undoes work since the savepoint but keeps the savepoint.
-    scenario(
-        &INIT,
-        &[
-            "BEGIN",
-            "INSERT INTO t VALUES (3,30)",
-            "SAVEPOINT sp",
-            "INSERT INTO t VALUES (4,40)",
-            "UPDATE t SET v = 0 WHERE id = 1",
-            "ROLLBACK TO sp", // undo the (4,40) insert and the update
-            "INSERT INTO t VALUES (5,50)",
-            "RELEASE sp",
-            "COMMIT",
-        ],
-        &["SELECT id, v FROM t ORDER BY id"], // 1..3 original + (5,50)
-        "savepoint_rollback_to_then_continue",
-    );
-    // RELEASE merges the savepoint's work into the enclosing transaction.
-    scenario(
-        &INIT,
-        &[
-            "BEGIN",
-            "SAVEPOINT sp",
-            "INSERT INTO t VALUES (3,30)",
-            "RELEASE sp",
-            "COMMIT",
-        ],
-        &["SELECT id, v FROM t ORDER BY id"],
-        "savepoint_release_merges",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // ROLLBACK TO undoes work since the savepoint but keeps the savepoint.
+        scenario(
+            &INIT,
+            &[
+                "BEGIN",
+                "INSERT INTO t VALUES (3,30)",
+                "SAVEPOINT sp",
+                "INSERT INTO t VALUES (4,40)",
+                "UPDATE t SET v = 0 WHERE id = 1",
+                "ROLLBACK TO sp", // undo the (4,40) insert and the update
+                "INSERT INTO t VALUES (5,50)",
+                "RELEASE sp",
+                "COMMIT",
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // 1..3 original + (5,50)
+            "savepoint_rollback_to_then_continue",
+        )
+        .await;
+        // RELEASE merges the savepoint's work into the enclosing transaction.
+        scenario(
+            &INIT,
+            &[
+                "BEGIN",
+                "SAVEPOINT sp",
+                "INSERT INTO t VALUES (3,30)",
+                "RELEASE sp",
+                "COMMIT",
+            ],
+            &["SELECT id, v FROM t ORDER BY id"],
+            "savepoint_release_merges",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn savepoint_nested_rollback_to_outer() {
-    // ROLLBACK TO an outer savepoint discards inner savepoints' work too.
-    scenario(
-        &INIT,
-        &[
-            "BEGIN",
-            "SAVEPOINT outer_sp",
-            "INSERT INTO t VALUES (3,30)",
-            "SAVEPOINT inner_sp",
-            "INSERT INTO t VALUES (4,40)",
-            "UPDATE t SET v = -1",
-            "ROLLBACK TO outer_sp", // discards 3,4 and the update
-            "INSERT INTO t VALUES (9,90)",
-            "RELEASE outer_sp",
-            "COMMIT",
-        ],
-        &["SELECT id, v FROM t ORDER BY id"], // original + (9,90)
-        "savepoint_nested_rollback_outer",
-    );
-    // Release inner, then roll back outer.
-    scenario(
-        &INIT,
-        &[
-            "BEGIN",
-            "SAVEPOINT a",
-            "INSERT INTO t VALUES (3,30)",
-            "SAVEPOINT b",
-            "INSERT INTO t VALUES (4,40)",
-            "RELEASE b",     // b's work folds into a
-            "ROLLBACK TO a", // discards both 3 and 4
-            "RELEASE a",
-            "COMMIT",
-        ],
-        &["SELECT id, v FROM t ORDER BY id"], // unchanged
-        "savepoint_release_inner_rollback_outer",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // ROLLBACK TO an outer savepoint discards inner savepoints' work too.
+        scenario(
+            &INIT,
+            &[
+                "BEGIN",
+                "SAVEPOINT outer_sp",
+                "INSERT INTO t VALUES (3,30)",
+                "SAVEPOINT inner_sp",
+                "INSERT INTO t VALUES (4,40)",
+                "UPDATE t SET v = -1",
+                "ROLLBACK TO outer_sp", // discards 3,4 and the update
+                "INSERT INTO t VALUES (9,90)",
+                "RELEASE outer_sp",
+                "COMMIT",
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // original + (9,90)
+            "savepoint_nested_rollback_outer",
+        )
+        .await;
+        // Release inner, then roll back outer.
+        scenario(
+            &INIT,
+            &[
+                "BEGIN",
+                "SAVEPOINT a",
+                "INSERT INTO t VALUES (3,30)",
+                "SAVEPOINT b",
+                "INSERT INTO t VALUES (4,40)",
+                "RELEASE b",     // b's work folds into a
+                "ROLLBACK TO a", // discards both 3 and 4
+                "RELEASE a",
+                "COMMIT",
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // unchanged
+            "savepoint_release_inner_rollback_outer",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn savepoint_implicit_transaction() {
-    // SAVEPOINT outside an explicit BEGIN starts an implicit transaction.
-    scenario(
-        &INIT,
-        &[
-            "SAVEPOINT sp",
-            "INSERT INTO t VALUES (3,30)",
-            "INSERT INTO t VALUES (4,40)",
-            "ROLLBACK TO sp",
-            "INSERT INTO t VALUES (5,50)",
-            "RELEASE sp", // commits the implicit transaction
-        ],
-        &["SELECT id, v FROM t ORDER BY id"], // original + (5,50)
-        "savepoint_implicit_txn",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // SAVEPOINT outside an explicit BEGIN starts an implicit transaction.
+        scenario(
+            &INIT,
+            &[
+                "SAVEPOINT sp",
+                "INSERT INTO t VALUES (3,30)",
+                "INSERT INTO t VALUES (4,40)",
+                "ROLLBACK TO sp",
+                "INSERT INTO t VALUES (5,50)",
+                "RELEASE sp", // commits the implicit transaction
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // original + (5,50)
+            "savepoint_implicit_txn",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn txn_ddl_rollback() {
-    // DDL inside a rolled-back transaction is undone (table must not exist).
-    scenario(
-        &INIT,
-        &[
-            "BEGIN",
-            "CREATE TABLE temp_t (x INTEGER)",
-            "INSERT INTO temp_t VALUES (1),(2)",
-            "ALTER TABLE t ADD COLUMN extra TEXT DEFAULT 'z'",
-            "ROLLBACK",
-        ],
-        &[
-            "SELECT count(*) FROM sqlite_master WHERE name = 'temp_t'", // 0
-            "SELECT id, v FROM t ORDER BY id",                          // no extra column added
-        ],
-        "txn_ddl_rollback",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // DDL inside a rolled-back transaction is undone (table must not exist).
+        scenario(
+            &INIT,
+            &[
+                "BEGIN",
+                "CREATE TABLE temp_t (x INTEGER)",
+                "INSERT INTO temp_t VALUES (1),(2)",
+                "ALTER TABLE t ADD COLUMN extra TEXT DEFAULT 'z'",
+                "ROLLBACK",
+            ],
+            &[
+                "SELECT count(*) FROM sqlite_master WHERE name = 'temp_t'", // 0
+                "SELECT id, v FROM t ORDER BY id",                          // no extra column added
+            ],
+            "txn_ddl_rollback",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn savepoint_reuse_name_after_release() {
-    // The same savepoint name can be reused after RELEASE.
-    scenario(
-        &INIT,
-        &[
-            "BEGIN",
-            "SAVEPOINT sp",
-            "INSERT INTO t VALUES (3,30)",
-            "RELEASE sp",
-            "SAVEPOINT sp",
-            "INSERT INTO t VALUES (4,40)",
-            "ROLLBACK TO sp",
-            "RELEASE sp",
-            "COMMIT",
-        ],
-        &["SELECT id, v FROM t ORDER BY id"], // original + (3,30)
-        "savepoint_reuse_name",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // The same savepoint name can be reused after RELEASE.
+        scenario(
+            &INIT,
+            &[
+                "BEGIN",
+                "SAVEPOINT sp",
+                "INSERT INTO t VALUES (3,30)",
+                "RELEASE sp",
+                "SAVEPOINT sp",
+                "INSERT INTO t VALUES (4,40)",
+                "ROLLBACK TO sp",
+                "RELEASE sp",
+                "COMMIT",
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // original + (3,30)
+            "savepoint_reuse_name",
+        )
+        .await;
+    });
 }

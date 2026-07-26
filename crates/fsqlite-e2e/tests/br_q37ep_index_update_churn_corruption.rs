@@ -20,6 +20,7 @@
 //! a canonical-SQLite cross-check of the committed file. Sizes are tunable via
 //! `Q37EP_ROWS` / `Q37EP_ROUNDS` so the workload can be cranked without a
 //! recompile when hunting a probabilistic trigger.
+#![recursion_limit = "512"]
 
 use fsqlite_types::SqliteValue;
 use tempfile::TempDir;
@@ -34,9 +35,10 @@ fn env_i64(key: &str, default: i64) -> i64 {
 /// `PRAGMA quick_check` -> `Ok(())` when the single row is `"ok"`, else the
 /// first reported corruption line. This is the exact surface the prod incident
 /// tripped (`invalid page number` on an interior cell).
-fn quick_check(conn: &fsqlite::Connection) -> Result<(), String> {
+async fn quick_check(conn: &fsqlite::Connection) -> Result<(), String> {
     let rows = conn
         .query("PRAGMA quick_check")
+        .await
         .map_err(|e| e.to_string())?;
     match rows.first().map(|r| r.values().first().cloned()) {
         Some(Some(SqliteValue::Text(s))) => {
@@ -52,11 +54,15 @@ fn quick_check(conn: &fsqlite::Connection) -> Result<(), String> {
 /// the index always holds four key-regions separated by interior dividers —
 /// maximizing interior-cell rebalancing. Pure autocommit (each UPDATE is its
 /// own MVCC-versioned commit under the default `concurrent_mode = ON`).
-fn churn_indexed_state(rows: i64, rounds: i64, stripe: i64) {
-    let conn = fsqlite::Connection::open(":memory:").expect("open frank");
+async fn churn_indexed_state(rows: i64, rounds: i64, stripe: i64) {
+    let conn = fsqlite::Connection::open(":memory:")
+        .await
+        .expect("open frank");
     conn.execute("CREATE TABLE atc_experiences (id INTEGER PRIMARY KEY, state TEXT, payload TEXT)")
+        .await
         .expect("create table");
     conn.execute("CREATE INDEX idx_atc_exp_open ON atc_experiences(state)")
+        .await
         .expect("create index");
 
     let states = ["planned", "dispatched", "executed", "resolved"];
@@ -71,11 +77,14 @@ fn churn_indexed_state(rows: i64, rounds: i64, stripe: i64) {
             conn.execute(&format!(
                 "INSERT INTO atc_experiences (id, state, payload) VALUES {chunk}"
             ))
+            .await
             .expect("seed insert");
             chunk.clear();
         }
     }
-    quick_check(&conn).unwrap_or_else(|e| panic!("corrupt right after seed: {e}"));
+    quick_check(&conn)
+        .await
+        .unwrap_or_else(|e| panic!("corrupt right after seed: {e}"));
 
     let advance = "UPDATE atc_experiences SET state = CASE state \
          WHEN 'planned' THEN 'dispatched' \
@@ -86,9 +95,10 @@ fn churn_indexed_state(rows: i64, rounds: i64, stripe: i64) {
     for round in 0..rounds {
         let sql = format!("{advance}{stripe} = {}", round % stripe);
         conn.execute(&sql)
+            .await
             .unwrap_or_else(|e| panic!("update round {round} failed: {e}"));
         if round % 8 == 0 || round == rounds - 1 {
-            if let Err(msg) = quick_check(&conn) {
+            if let Err(msg) = quick_check(&conn).await {
                 panic!(
                     "INDEX CORRUPTION after round {round} (rows={rows}, stripe={stripe}): {msg}"
                 );
@@ -100,22 +110,28 @@ fn churn_indexed_state(rows: i64, rounds: i64, stripe: i64) {
 /// Small/fast: a 2-level index B-tree (a few thousand entries) under churn.
 #[test]
 fn index_update_churn_small_stays_intact() {
-    churn_indexed_state(
-        env_i64("Q37EP_ROWS", 2_000),
-        env_i64("Q37EP_ROUNDS", 120),
-        7,
-    );
+    asupersync::test_utils::run_test(|| async {
+        churn_indexed_state(
+            env_i64("Q37EP_ROWS", 2_000),
+            env_i64("Q37EP_ROUNDS", 120),
+            7,
+        )
+        .await;
+    });
 }
 
 /// Larger: enough rows to push the index B-tree to multiple interior levels,
 /// with many rounds of churn — the conditions the prod incident hit.
 #[test]
 fn index_update_churn_large_stays_intact() {
-    churn_indexed_state(
-        env_i64("Q37EP_ROWS", 20_000),
-        env_i64("Q37EP_ROUNDS", 240),
-        11,
-    );
+    asupersync::test_utils::run_test(|| async {
+        churn_indexed_state(
+            env_i64("Q37EP_ROWS", 20_000),
+            env_i64("Q37EP_ROUNDS", 240),
+            11,
+        )
+        .await;
+    });
 }
 
 /// Faithful ATC profile against a real file: a low-cardinality `state` index
@@ -125,13 +141,15 @@ fn index_update_churn_large_stays_intact() {
 /// cell). After the churn the COMMITTED file is cross-checked with canonical
 /// SQLite (the prod incident was confirmed by canonical sqlite3 reading the
 /// fsqlite-written file).
-fn churn_delete_reinsert_with_overflow(rows: i64, cycles: i64) {
+async fn churn_delete_reinsert_with_overflow(rows: i64, cycles: i64) {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("q37ep_atc.db");
     let path = db_path.to_string_lossy().into_owned();
     {
-        let conn = fsqlite::Connection::open(path.clone()).expect("open frank");
-        conn.execute("PRAGMA foreign_keys=off").unwrap();
+        let conn = fsqlite::Connection::open(path.clone())
+            .await
+            .expect("open frank");
+        conn.execute("PRAGMA foreign_keys=off").await.unwrap();
         conn.execute_batch(
             "CREATE TABLE atc_experiences (
                  id INTEGER PRIMARY KEY,
@@ -142,6 +160,7 @@ fn churn_delete_reinsert_with_overflow(rows: i64, cycles: i64) {
              CREATE INDEX idx_atc_exp_open ON atc_experiences(state);
              CREATE INDEX idx_atc_exp_sm ON atc_experiences(state, method);",
         )
+        .await
         .expect("schema");
 
         let states = ["planned", "dispatched", "executed", "resolved"];
@@ -150,7 +169,13 @@ fn churn_delete_reinsert_with_overflow(rows: i64, cycles: i64) {
         let big = "x".repeat(900);
 
         let mut next_id: i64 = 1;
-        let seed = |conn: &fsqlite::Connection, from: i64, to: i64| {
+        async fn seed(
+            conn: &fsqlite::Connection,
+            states: &[&str],
+            big: &str,
+            from: i64,
+            to: i64,
+        ) {
             let mut chunk = String::new();
             for id in from..to {
                 if !chunk.is_empty() {
@@ -163,29 +188,31 @@ fn churn_delete_reinsert_with_overflow(rows: i64, cycles: i64) {
                     conn.execute(&format!(
                         "INSERT INTO atc_experiences (id,state,method,payload) VALUES {chunk}"
                     ))
+                    .await
                     .unwrap_or_else(|e| panic!("seed insert: {e}"));
                     chunk.clear();
                 }
             }
-        };
-        conn.execute("BEGIN IMMEDIATE").unwrap();
-        seed(&conn, next_id, next_id + rows);
-        conn.execute("COMMIT").unwrap();
+        }
+        conn.execute("BEGIN IMMEDIATE").await.unwrap();
+        seed(&conn, &states, &big, next_id, next_id + rows).await;
+        conn.execute("COMMIT").await.unwrap();
         next_id += rows;
 
         let mut lo: i64 = 1;
         let batch = (rows * 7) / 10; // ~70% churn per cycle
         for cycle in 0..cycles {
-            conn.execute("BEGIN IMMEDIATE").unwrap();
+            conn.execute("BEGIN IMMEDIATE").await.unwrap();
             // Free a contiguous id-range (B-tree + overflow pages -> freelist).
             let hi = lo + batch - 1;
             conn.execute(&format!(
                 "DELETE FROM atc_experiences WHERE id BETWEEN {lo} AND {hi}"
             ))
+            .await
             .unwrap_or_else(|e| panic!("delete cycle {cycle}: {e}"));
             lo = hi + 1;
             // Reinsert fresh rows (reallocates freed pages).
-            seed(&conn, next_id, next_id + batch);
+            seed(&conn, &states, &big, next_id, next_id + batch).await;
             next_id += batch;
             // Advance the indexed column for a stripe (index churn within txn).
             conn.execute(
@@ -194,12 +221,13 @@ fn churn_delete_reinsert_with_overflow(rows: i64, cycles: i64) {
                  WHEN 'executed' THEN 'resolved' WHEN 'resolved' THEN 'planned' END \
                  WHERE id % 5 = 0",
             )
+            .await
             .unwrap_or_else(|e| panic!("update cycle {cycle}: {e}"));
             // Interleaved in-transaction full btree walk (a GH#113 trigger).
-            let _ = conn.query("PRAGMA integrity_check");
-            conn.execute("COMMIT").unwrap();
+            drop(conn.query("PRAGMA integrity_check").await);
+            conn.execute("COMMIT").await.unwrap();
 
-            if let Err(msg) = quick_check(&conn) {
+            if let Err(msg) = quick_check(&conn).await {
                 panic!("INDEX CORRUPTION after cycle {cycle} (committed): {msg}");
             }
         }
@@ -248,7 +276,13 @@ fn churn_delete_reinsert_with_overflow(rows: i64, cycles: i64) {
 /// low-cardinality index, cross-checked by canonical SQLite.
 #[test]
 fn index_delete_reinsert_overflow_stays_intact() {
-    churn_delete_reinsert_with_overflow(env_i64("Q37EP_ROWS", 8_000), env_i64("Q37EP_ROUNDS", 16));
+    asupersync::test_utils::run_test(|| async {
+        churn_delete_reinsert_with_overflow(
+            env_i64("Q37EP_ROWS", 8_000),
+            env_i64("Q37EP_ROUNDS", 16),
+        )
+        .await;
+    });
 }
 
 /// GH#132 field reports consistently localize committed damage to a composite
@@ -280,7 +314,7 @@ fn collect_gh132_rows(
         .expect("collect GH#132 comparison")
 }
 
-fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
+async fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
     const SEED: u64 = 0x132D_57A9;
     const CYCLES: i64 = 8;
     const ROWS_PER_CYCLE: i64 = 80;
@@ -293,20 +327,24 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
 
     for cycle in 0..CYCLES {
         {
-            let conn = fsqlite::Connection::open(path.clone()).unwrap_or_else(|error| {
-                panic!("GH#132 seed={SEED:#x} cycle={cycle}: reopen failed: {error}")
-            });
+            let conn = fsqlite::Connection::open(path.clone())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("GH#132 seed={SEED:#x} cycle={cycle}: reopen failed: {error}")
+                });
             let oracle = rusqlite::Connection::open(&oracle_path).unwrap_or_else(|error| {
                 panic!("GH#132 seed={SEED:#x} cycle={cycle}: oracle reopen failed: {error}")
             });
             if cycle == 0 {
                 conn.execute("PRAGMA page_size=512")
+                    .await
                     .expect("set tiny page size before schema creation");
                 oracle
                     .execute_batch("PRAGMA page_size=512;")
                     .expect("set oracle tiny page size before schema creation");
             }
             conn.execute(&format!("PRAGMA journal_mode='{journal_mode}'"))
+                .await
                 .unwrap_or_else(|error| {
                     panic!("GH#132 seed={SEED:#x} cycle={cycle}: set journal mode failed: {error}")
                 });
@@ -328,6 +366,7 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
                          UNIQUE(source_id, agent_id, external_id)
                      );";
                 conn.execute_batch(schema)
+                    .await
                     .expect("create GH#132 composite UNIQUE schema");
                 oracle
                     .execute_batch(schema)
@@ -345,6 +384,7 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
                      VALUES({id},'source-{source:02}',{agent},'{external}','title-{operation:06}')"
                 );
                 conn.execute(&insert)
+                .await
                 .unwrap_or_else(|error| {
                     panic!(
                         "GH#132 seed={SEED:#x} cycle={cycle} operation={operation}: insert failed: {error}"
@@ -365,6 +405,7 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
                     );
                     let duplicate_error = conn
                         .execute(&duplicate)
+                        .await
                         .expect_err("composite UNIQUE duplicate must be rejected");
                     assert!(
                         matches!(
@@ -384,6 +425,7 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
                              WHERE source_id='source-{source:02}' \
                                AND agent_id={agent} AND external_id='{external}'"
                         ))
+                        .await
                         .unwrap_or_else(|error| {
                             panic!(
                                 "GH#132 seed={SEED:#x} cycle={cycle} operation={operation}: \
@@ -416,7 +458,7 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
                     let update = format!(
                         "UPDATE conversations SET title='recovered-{operation:06}' WHERE id={id}"
                     );
-                    conn.execute(&update).unwrap_or_else(|error| {
+                    conn.execute(&update).await.unwrap_or_else(|error| {
                         panic!(
                             "GH#132 seed={SEED:#x} cycle={cycle} operation={operation}: \
                              recovery merge failed: {error}"
@@ -439,6 +481,7 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
                     "DELETE FROM conversations WHERE id BETWEEN {retired_start} AND {retired_end}"
                 );
                 conn.execute(&delete)
+                .await
                 .unwrap_or_else(|error| {
                     panic!(
                         "GH#132 seed={SEED:#x} cycle={cycle}: freelist-producing delete failed: {error}"
@@ -459,7 +502,7 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
                                 'replacement-{cycle:02}-{replacement:03}','replacement')",
                         replacement % 11
                     );
-                    conn.execute(&insert).unwrap_or_else(|error| {
+                    conn.execute(&insert).await.unwrap_or_else(|error| {
                         panic!(
                             "GH#132 seed={SEED:#x} cycle={cycle} replacement={replacement}: \
                              freelist reuse insert failed: {error}"
@@ -476,6 +519,7 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
 
             if journal_mode == "WAL" && cycle % 2 == 1 {
                 conn.query("PRAGMA wal_checkpoint(PASSIVE)")
+                    .await
                     .unwrap_or_else(|error| {
                         panic!(
                             "GH#132 seed={SEED:#x} cycle={cycle}: WAL checkpoint failed: {error}"
@@ -490,7 +534,7 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
                         )
                     });
             }
-            quick_check(&conn).unwrap_or_else(|error| {
+            quick_check(&conn).await.unwrap_or_else(|error| {
                 panic!("GH#132 seed={SEED:#x} cycle={cycle}: fsqlite quick_check failed: {error}")
             });
         }
@@ -554,12 +598,16 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
 
 #[test]
 fn composite_unique_duplicate_recovery_wal_stays_stock_canonical() {
-    composite_unique_duplicate_recovery_churn("WAL");
+    asupersync::test_utils::run_test(|| async {
+        composite_unique_duplicate_recovery_churn("WAL").await;
+    });
 }
 
 #[test]
 fn composite_unique_duplicate_recovery_rollback_stays_stock_canonical() {
-    composite_unique_duplicate_recovery_churn("DELETE");
+    asupersync::test_utils::run_test(|| async {
+        composite_unique_duplicate_recovery_churn("DELETE").await;
+    });
 }
 
 // ============================================================================
@@ -583,13 +631,14 @@ fn gh289_key(ordinal: i64) -> String {
     key
 }
 
-fn gh289_insert_target_row(conn: &fsqlite::Connection, ordinal: i64, payload: &str) {
+async fn gh289_insert_target_row(conn: &fsqlite::Connection, ordinal: i64, payload: &str) {
     let key = gh289_key(ordinal);
     conn.execute(&format!(
         "INSERT INTO gh289_objects(object_key,bucket,payload) \
          VALUES('{key}',{},'{payload}-{ordinal:08}')",
         ordinal.rem_euclid(97)
     ))
+    .await
     .unwrap_or_else(|error| panic!("GH#289 insert ordinal={ordinal} failed: {error}"));
 }
 
@@ -706,9 +755,12 @@ fn gh289_post_stock_vacuum_stress(seed_rows: i64, transactions: i64, readers: us
         assert_eq!(page_size, 512, "GH#289 stock seed must use tiny pages");
     }
 
-    {
-        let conn = fsqlite::Connection::open(path.clone()).expect("GH#289 seed open");
+    asupersync::test_utils::run_test(|| async {
+        let conn = fsqlite::Connection::open(path.clone())
+            .await
+            .expect("GH#289 seed open");
         conn.execute("PRAGMA journal_mode=WAL")
+            .await
             .expect("GH#289 WAL mode");
         conn.execute_batch(
             "CREATE TABLE gh289_objects (
@@ -723,6 +775,7 @@ fn gh289_post_stock_vacuum_stress(seed_rows: i64, transactions: i64, readers: us
                  payload BLOB NOT NULL
              );",
         )
+        .await
         .expect("GH#289 core schema");
         for table in 0..AUX_TABLES {
             conn.execute_batch(&format!(
@@ -732,20 +785,26 @@ fn gh289_post_stock_vacuum_stress(seed_rows: i64, transactions: i64, readers: us
                  );
                  CREATE INDEX gh289_aux_{table}_value ON gh289_aux_{table}(value);"
             ))
+            .await
             .unwrap_or_else(|error| panic!("GH#289 auxiliary schema {table}: {error}"));
         }
 
         conn.execute("BEGIN IMMEDIATE")
+            .await
             .expect("GH#289 seed transaction begin");
         for ordinal in 0..seed_rows {
-            gh289_insert_target_row(&conn, ordinal, &payload);
+            gh289_insert_target_row(&conn, ordinal, &payload).await;
         }
         conn.execute("COMMIT")
+            .await
             .expect("GH#289 seed transaction commit");
-        quick_check(&conn).unwrap_or_else(|error| panic!("GH#289 seed corrupt: {error}"));
+        quick_check(&conn)
+            .await
+            .unwrap_or_else(|error| panic!("GH#289 seed corrupt: {error}"));
         conn.query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .await
             .expect("GH#289 seed checkpoint");
-    }
+    });
 
     gh289_stock_repack(&path);
 
@@ -757,117 +816,132 @@ fn gh289_post_stock_vacuum_stress(seed_rows: i64, transactions: i64, readers: us
             let stop = std::sync::Arc::clone(&stop_readers);
             let errors = std::sync::Arc::clone(&reader_errors);
             std::thread::spawn(move || {
-                let conn = match fsqlite::Connection::open(path) {
-                    Ok(conn) => conn,
-                    Err(error) => {
-                        errors
-                            .lock()
-                            .unwrap()
-                            .push(format!("reader {reader_id} open failed: {error}"));
-                        return;
-                    }
-                };
-                let _ = conn.execute("PRAGMA busy_timeout=10000");
-                while !stop.load(std::sync::atomic::Ordering::Acquire) {
-                    match conn.query(
-                        "SELECT object_key,rowid
-                         FROM gh289_objects
-                         INDEXED BY sqlite_autoindex_gh289_objects_1
-                         ORDER BY object_key LIMIT 64",
-                    ) {
-                        Ok(rows) => {
-                            if rows.windows(2).any(|pair| {
-                                let left = match pair[0].values().first() {
-                                    Some(SqliteValue::Text(value)) => value.as_ref(),
-                                    other => panic!(
-                                        "GH#289 reader expected a TEXT autoindex key, got {other:?}"
-                                    ),
-                                };
-                                let right = match pair[1].values().first() {
-                                    Some(SqliteValue::Text(value)) => value.as_ref(),
-                                    other => panic!(
-                                        "GH#289 reader expected a TEXT autoindex key, got {other:?}"
-                                    ),
-                                };
-                                left > right
-                            }) {
-                                errors.lock().unwrap().push(format!(
-                                    "reader {reader_id} observed out-of-order autoindex keys"
-                                ));
-                                return;
-                            }
-                        }
-                        Err(error) if cc_is_transient(&error) => {}
+                asupersync::test_utils::run_test(move || async move {
+                    let conn = match fsqlite::Connection::open(path).await {
+                        Ok(conn) => conn,
                         Err(error) => {
                             errors
                                 .lock()
                                 .unwrap()
-                                .push(format!("reader {reader_id} index scan failed: {error}"));
+                                .push(format!("reader {reader_id} open failed: {error}"));
                             return;
                         }
+                    };
+                    drop(conn.execute("PRAGMA busy_timeout=10000").await);
+                    while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                        match conn
+                            .query(
+                                "SELECT object_key,rowid
+                         FROM gh289_objects
+                         INDEXED BY sqlite_autoindex_gh289_objects_1
+                         ORDER BY object_key LIMIT 64",
+                            )
+                            .await
+                        {
+                            Ok(rows) => {
+                                if rows.windows(2).any(|pair| {
+                                    let left = match pair[0].values().first() {
+                                        Some(SqliteValue::Text(value)) => value.as_ref(),
+                                        other => panic!(
+                                            "GH#289 reader expected a TEXT autoindex key, got {other:?}"
+                                        ),
+                                    };
+                                    let right = match pair[1].values().first() {
+                                        Some(SqliteValue::Text(value)) => value.as_ref(),
+                                        other => panic!(
+                                            "GH#289 reader expected a TEXT autoindex key, got {other:?}"
+                                        ),
+                                    };
+                                    left > right
+                                }) {
+                                    errors.lock().unwrap().push(format!(
+                                        "reader {reader_id} observed out-of-order autoindex keys"
+                                    ));
+                                    return;
+                                }
+                            }
+                            Err(error) if cc_is_transient(&error) => {}
+                            Err(error) => {
+                                errors
+                                    .lock()
+                                    .unwrap()
+                                    .push(format!("reader {reader_id} index scan failed: {error}"));
+                                return;
+                            }
+                        }
+                        std::thread::yield_now();
                     }
-                    std::thread::yield_now();
-                }
+                });
             })
         })
         .collect::<Vec<_>>();
 
     let writer_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let conn = fsqlite::Connection::open(path.clone()).expect("GH#289 writer reopen");
-        conn.execute("PRAGMA busy_timeout=10000")
-            .expect("GH#289 writer busy timeout");
-        conn.execute("PRAGMA journal_mode=WAL")
-            .expect("GH#289 writer WAL mode");
+        asupersync::test_utils::run_test(|| async {
+            let conn = fsqlite::Connection::open(path.clone())
+                .await
+                .expect("GH#289 writer reopen");
+            conn.execute("PRAGMA busy_timeout=10000")
+                .await
+                .expect("GH#289 writer busy timeout");
+            conn.execute("PRAGMA journal_mode=WAL")
+                .await
+                .expect("GH#289 writer WAL mode");
 
-        for transaction in 0..transactions {
-            conn.execute("BEGIN IMMEDIATE")
-                .unwrap_or_else(|error| panic!("GH#289 txn {transaction} begin: {error}"));
-            for offset in 0..ROWS_PER_TRANSACTION {
-                let ordinal = seed_rows + transaction * ROWS_PER_TRANSACTION + offset;
-                gh289_insert_target_row(&conn, ordinal, &payload);
-            }
-            conn.execute(&format!(
-                "INSERT INTO gh289_blobs(txn_id,payload) VALUES({transaction},zeroblob({}))",
-                4_096 + transaction.rem_euclid(13) * 4_096
-            ))
-            .unwrap_or_else(|error| panic!("GH#289 txn {transaction} blob write: {error}"));
-            for table in 0..AUX_TABLES {
+            for transaction in 0..transactions {
+                conn.execute("BEGIN IMMEDIATE")
+                    .await
+                    .unwrap_or_else(|error| panic!("GH#289 txn {transaction} begin: {error}"));
+                for offset in 0..ROWS_PER_TRANSACTION {
+                    let ordinal = seed_rows + transaction * ROWS_PER_TRANSACTION + offset;
+                    gh289_insert_target_row(&conn, ordinal, &payload).await;
+                }
                 conn.execute(&format!(
-                    "INSERT INTO gh289_aux_{table}(id,value) \
-                     VALUES({transaction},'txn-{transaction:06}-table-{table}')"
+                    "INSERT INTO gh289_blobs(txn_id,payload) VALUES({transaction},zeroblob({}))",
+                    4_096 + transaction.rem_euclid(13) * 4_096
                 ))
-                .unwrap_or_else(|error| {
-                    panic!("GH#289 txn {transaction} auxiliary table {table}: {error}")
-                });
-            }
-            conn.execute("COMMIT")
-                .unwrap_or_else(|error| panic!("GH#289 txn {transaction} commit: {error}"));
+                .await
+                .unwrap_or_else(|error| panic!("GH#289 txn {transaction} blob write: {error}"));
+                for table in 0..AUX_TABLES {
+                    conn.execute(&format!(
+                        "INSERT INTO gh289_aux_{table}(id,value) \
+                         VALUES({transaction},'txn-{transaction:06}-table-{table}')"
+                    ))
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("GH#289 txn {transaction} auxiliary table {table}: {error}")
+                    });
+                }
+                conn.execute("COMMIT")
+                    .await
+                    .unwrap_or_else(|error| panic!("GH#289 txn {transaction} commit: {error}"));
 
-            for rollback in 0..3_i64 {
-                let ordinal = 10_000_000 + transaction * 10 + rollback;
-                conn.execute("BEGIN IMMEDIATE").unwrap_or_else(|error| {
-                    panic!("GH#289 txn {transaction} rollback {rollback} begin: {error}")
-                });
-                gh289_insert_target_row(&conn, ordinal, &payload);
-                conn.execute("ROLLBACK").unwrap_or_else(|error| {
-                    panic!("GH#289 txn {transaction} rollback {rollback}: {error}")
-                });
-            }
+                for rollback in 0..3_i64 {
+                    let ordinal = 10_000_000 + transaction * 10 + rollback;
+                    conn.execute("BEGIN IMMEDIATE").await.unwrap_or_else(|error| {
+                        panic!("GH#289 txn {transaction} rollback {rollback} begin: {error}")
+                    });
+                    gh289_insert_target_row(&conn, ordinal, &payload).await;
+                    conn.execute("ROLLBACK").await.unwrap_or_else(|error| {
+                        panic!("GH#289 txn {transaction} rollback {rollback}: {error}")
+                    });
+                }
 
-            if transaction % 5 == 0 || transaction + 1 == transactions {
-                quick_check(&conn).unwrap_or_else(|error| {
-                    panic!("GH#289 committed corruption after txn {transaction}: {error}")
-                });
-            }
-            if transaction % 10 == 9 {
-                if let Err(error) = conn.query("PRAGMA wal_checkpoint(PASSIVE)") {
-                    assert!(
-                        error.to_string().contains("database is busy"),
-                        "GH#289 checkpoint after txn {transaction}: {error}"
-                    );
+                if transaction % 5 == 0 || transaction + 1 == transactions {
+                    quick_check(&conn).await.unwrap_or_else(|error| {
+                        panic!("GH#289 committed corruption after txn {transaction}: {error}")
+                    });
+                }
+                if transaction % 10 == 9 {
+                    if let Err(error) = conn.query("PRAGMA wal_checkpoint(PASSIVE)").await {
+                        assert!(
+                            error.to_string().contains("database is busy"),
+                            "GH#289 checkpoint after txn {transaction}: {error}"
+                        );
+                    }
                 }
             }
-        }
+        });
     }));
 
     stop_readers.store(true, std::sync::atomic::Ordering::Release);
@@ -884,11 +958,15 @@ fn gh289_post_stock_vacuum_stress(seed_rows: i64, transactions: i64, readers: us
         std::panic::resume_unwind(payload);
     }
 
-    let final_checkpoint =
-        fsqlite::Connection::open(&path).expect("GH#289 final checkpoint connection");
-    final_checkpoint
-        .query("PRAGMA wal_checkpoint(TRUNCATE)")
-        .expect("GH#289 final FrankenSQLite checkpoint after readers stopped");
+    asupersync::test_utils::run_test(|| async {
+        let final_checkpoint = fsqlite::Connection::open(&path)
+            .await
+            .expect("GH#289 final checkpoint connection");
+        final_checkpoint
+            .query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .await
+            .expect("GH#289 final FrankenSQLite checkpoint after readers stopped");
+    });
 
     gh289_assert_stock_canonical(&path, seed_rows + transactions * ROWS_PER_TRANSACTION);
 }
@@ -916,64 +994,73 @@ fn gh289_post_stock_vacuum_with_concurrent_readers_stays_canonical() {
 /// SQLite, which natively parses the 512-byte-page file.
 #[test]
 fn index_churn_tiny_pages_deep_tree_stays_intact() {
-    let rows = env_i64("Q37EP_ROWS", 6_000);
-    let rounds = env_i64("Q37EP_ROUNDS", 80);
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("q37ep_deep.db");
-    let path = db_path.to_string_lossy().into_owned();
-    {
-        let conn = fsqlite::Connection::open(path.clone()).expect("open frank");
-        // Tiny pages + WAL BEFORE any table is created.
-        conn.execute("PRAGMA page_size=512").unwrap();
-        conn.execute("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("PRAGMA foreign_keys=off").unwrap();
-        conn.execute_batch(
-            "CREATE TABLE atc_experiences (id INTEGER PRIMARY KEY, state TEXT, method TEXT);
+    asupersync::test_utils::run_test(|| async {
+        let rows = env_i64("Q37EP_ROWS", 6_000);
+        let rounds = env_i64("Q37EP_ROUNDS", 80);
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("q37ep_deep.db");
+        let path = db_path.to_string_lossy().into_owned();
+        {
+            let conn = fsqlite::Connection::open(path.clone())
+                .await
+                .expect("open frank");
+            // Tiny pages + WAL BEFORE any table is created.
+            conn.execute("PRAGMA page_size=512").await.unwrap();
+            conn.execute("PRAGMA journal_mode=WAL").await.unwrap();
+            conn.execute("PRAGMA foreign_keys=off").await.unwrap();
+            conn.execute_batch(
+                "CREATE TABLE atc_experiences (id INTEGER PRIMARY KEY, state TEXT, method TEXT);
              CREATE INDEX idx_atc_exp_open ON atc_experiences(state);
              CREATE INDEX idx_atc_exp_sm ON atc_experiences(state, method);",
-        )
-        .expect("schema");
+            )
+            .await
+            .expect("schema");
 
-        let states = ["planned", "dispatched", "executed", "resolved"];
-        let mut chunk = String::new();
-        for id in 1..=rows {
-            if !chunk.is_empty() {
-                chunk.push(',');
+            let states = ["planned", "dispatched", "executed", "resolved"];
+            let mut chunk = String::new();
+            for id in 1..=rows {
+                if !chunk.is_empty() {
+                    chunk.push(',');
+                }
+                let st = states[(id as usize) % states.len()];
+                chunk.push_str(&format!("({id},'{st}','m{}')", id % 19));
+                if chunk.len() > 20_000 || id == rows {
+                    conn.execute(&format!(
+                        "INSERT INTO atc_experiences (id,state,method) VALUES {chunk}"
+                    ))
+                    .await
+                    .expect("seed");
+                    chunk.clear();
+                }
             }
-            let st = states[(id as usize) % states.len()];
-            chunk.push_str(&format!("({id},'{st}','m{}')", id % 19));
-            if chunk.len() > 20_000 || id == rows {
+            quick_check(&conn)
+                .await
+                .unwrap_or_else(|e| panic!("corrupt after seed: {e}"));
+
+            for round in 0..rounds {
                 conn.execute(&format!(
-                    "INSERT INTO atc_experiences (id,state,method) VALUES {chunk}"
-                ))
-                .expect("seed");
-                chunk.clear();
-            }
-        }
-        quick_check(&conn).unwrap_or_else(|e| panic!("corrupt after seed: {e}"));
-
-        for round in 0..rounds {
-            conn.execute(&format!(
-                "UPDATE atc_experiences SET state = CASE state \
+                    "UPDATE atc_experiences SET state = CASE state \
                  WHEN 'planned' THEN 'dispatched' WHEN 'dispatched' THEN 'executed' \
                  WHEN 'executed' THEN 'resolved' WHEN 'resolved' THEN 'planned' END \
                  WHERE id % 7 = {}",
-                round % 7
-            ))
-            .unwrap_or_else(|e| panic!("update round {round}: {e}"));
-            if round % 8 == 0 || round == rounds - 1 {
-                if let Err(msg) = quick_check(&conn) {
-                    panic!("INDEX CORRUPTION (tiny pages) after round {round}: {msg}");
+                    round % 7
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("update round {round}: {e}"));
+                if round % 8 == 0 || round == rounds - 1 {
+                    if let Err(msg) = quick_check(&conn).await {
+                        panic!("INDEX CORRUPTION (tiny pages) after round {round}: {msg}");
+                    }
                 }
             }
         }
-    }
 
-    let cconn = rusqlite::Connection::open(&path).expect("open canonical");
-    let ic: String = cconn
-        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-        .expect("canonical integrity_check");
-    assert_eq!(ic, "ok", "canonical SQLite on tiny-page fsqlite file: {ic}");
+        let cconn = rusqlite::Connection::open(&path).expect("open canonical");
+        let ic: String = cconn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .expect("canonical integrity_check");
+        assert_eq!(ic, "ok", "canonical SQLite on tiny-page fsqlite file: {ic}");
+    });
 }
 
 // ============================================================================
@@ -1005,14 +1092,14 @@ fn cc_is_transient(err: &fsqlite::FrankenError) -> bool {
     )
 }
 
-fn cc_with_retry<T>(
+async fn cc_with_retry<T>(
     label: &str,
-    mut f: impl FnMut() -> Result<T, fsqlite::FrankenError>,
+    mut f: impl std::ops::AsyncFnMut() -> Result<T, fsqlite::FrankenError>,
 ) -> Result<T, String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let mut attempt = 0u32;
     loop {
-        match f() {
+        match f().await {
             Ok(v) => return Ok(v),
             Err(err) if cc_is_transient(&err) && std::time::Instant::now() < deadline => {
                 attempt = attempt.saturating_add(1);
@@ -1024,7 +1111,7 @@ fn cc_with_retry<T>(
     }
 }
 
-fn cc_writer(
+async fn cc_writer(
     path: &str,
     writer_id: usize,
     writers: usize,
@@ -1033,12 +1120,15 @@ fn cc_writer(
     wal: bool,
     barrier: &std::sync::Barrier,
 ) -> Result<(), String> {
-    let conn = fsqlite::Connection::open(path.to_string()).map_err(|e| format!("open: {e}"))?;
-    let _ = conn.execute("PRAGMA busy_timeout=10000;");
+    let conn = fsqlite::Connection::open(path.to_string())
+        .await
+        .map_err(|e| format!("open: {e}"))?;
+    drop(conn.execute("PRAGMA busy_timeout=10000;").await);
     if wal {
-        cc_with_retry("journal_mode=WAL", || {
-            conn.execute("PRAGMA journal_mode=WAL;").map(|_| ())
-        })?;
+        cc_with_retry("journal_mode=WAL", async || {
+            conn.execute("PRAGMA journal_mode=WAL;").await.map(|_| ())
+        })
+        .await?;
     }
     assert!(
         conn.is_concurrent_mode_default(),
@@ -1058,17 +1148,20 @@ fn cc_writer(
              WHEN 'executed' THEN 'resolved' WHEN 'resolved' THEN 'planned' END \
              WHERE id % {n} = {w}"
         );
-        cc_with_retry(&format!("advance w{writer_id} r{round}"), || {
-            conn.execute(&advance).map(|_| ())
-        })?;
+        cc_with_retry(&format!("advance w{writer_id} r{round}"), async || {
+            conn.execute(&advance).await.map(|_| ())
+        })
+        .await?;
 
         // Every 4th round: free this writer's stripe then reinsert it (freelist
         // page reuse in the shared index B-tree).
         if round % 4 == 3 {
-            cc_with_retry(&format!("delete w{writer_id} r{round}"), || {
+            cc_with_retry(&format!("delete w{writer_id} r{round}"), async || {
                 conn.execute(&format!("DELETE FROM atc_experiences WHERE id % {n} = {w}"))
+                    .await
                     .map(|_| ())
-            })?;
+            })
+            .await?;
             let mut chunk = String::new();
             for id in 1..=rows {
                 if id % n != w {
@@ -1082,40 +1175,46 @@ fn cc_writer(
                 if chunk.len() > 40_000 {
                     let stmt =
                         format!("INSERT INTO atc_experiences(id,state,payload) VALUES {chunk}");
-                    cc_with_retry(&format!("reinsert w{writer_id} r{round}"), || {
-                        conn.execute(&stmt).map(|_| ())
-                    })?;
+                    cc_with_retry(&format!("reinsert w{writer_id} r{round}"), async || {
+                        conn.execute(&stmt).await.map(|_| ())
+                    })
+                    .await?;
                     chunk.clear();
                 }
             }
             if !chunk.is_empty() {
                 let stmt = format!("INSERT INTO atc_experiences(id,state,payload) VALUES {chunk}");
-                cc_with_retry(&format!("reinsert tail w{writer_id} r{round}"), || {
-                    conn.execute(&stmt).map(|_| ())
-                })?;
+                cc_with_retry(&format!("reinsert tail w{writer_id} r{round}"), async || {
+                    conn.execute(&stmt).await.map(|_| ())
+                })
+                .await?;
             }
         }
     }
     Ok(())
 }
 
-fn concurrent_shared_index_churn(writers: usize, rows: i64, rounds: i64, wal: bool) {
+async fn concurrent_shared_index_churn(writers: usize, rows: i64, rounds: i64, wal: bool) {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("q37ep_concurrent.db");
     let path = db_path.to_string_lossy().into_owned();
 
     // Seed rows 1..=rows partitioned by id % writers across the writers.
     {
-        let conn = fsqlite::Connection::open(path.clone()).expect("open seed");
+        let conn = fsqlite::Connection::open(path.clone())
+            .await
+            .expect("open seed");
         if wal {
-            conn.execute("PRAGMA journal_mode=WAL").unwrap();
+            conn.execute("PRAGMA journal_mode=WAL").await.unwrap();
         }
-        conn.execute("PRAGMA foreign_keys=off").unwrap();
+        conn.execute("PRAGMA foreign_keys=off").await.unwrap();
         conn.execute(
             "CREATE TABLE atc_experiences (id INTEGER PRIMARY KEY, state TEXT, payload TEXT)",
         )
+        .await
         .expect("create table");
         conn.execute("CREATE INDEX idx_atc_exp_open ON atc_experiences(state)")
+            .await
             .expect("create index");
         let states = ["planned", "dispatched", "executed", "resolved"];
         let mut chunk = String::new();
@@ -1129,11 +1228,14 @@ fn concurrent_shared_index_churn(writers: usize, rows: i64, rounds: i64, wal: bo
                 conn.execute(&format!(
                     "INSERT INTO atc_experiences(id,state,payload) VALUES {chunk}"
                 ))
+                .await
                 .expect("seed");
                 chunk.clear();
             }
         }
-        quick_check(&conn).unwrap_or_else(|e| panic!("corrupt after seed: {e}"));
+        quick_check(&conn)
+            .await
+            .unwrap_or_else(|e| panic!("corrupt after seed: {e}"));
     }
 
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(writers));
@@ -1145,10 +1247,12 @@ fn concurrent_shared_index_churn(writers: usize, rows: i64, rounds: i64, wal: bo
             let barrier = std::sync::Arc::clone(&barrier);
             let errors = std::sync::Arc::clone(&errors);
             std::thread::spawn(move || {
-                if let Err(e) = cc_writer(&path, w, writers, rows, rounds, wal, &barrier) {
-                    eprintln!("[cc writer {w}] FAILED: {e}");
-                    errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
+                asupersync::test_utils::run_test(|| async {
+                    if let Err(e) = cc_writer(&path, w, writers, rows, rounds, wal, &barrier).await {
+                        eprintln!("[cc writer {w}] FAILED: {e}");
+                        errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
             })
         })
         .collect();
@@ -1157,11 +1261,13 @@ fn concurrent_shared_index_churn(writers: usize, rows: i64, rounds: i64, wal: bo
     }
 
     // frank quick_check on the committed state.
-    let verify = fsqlite::Connection::open(path.clone()).expect("verify open");
+    let verify = fsqlite::Connection::open(path.clone())
+        .await
+        .expect("verify open");
     if wal {
-        let _ = verify.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+        drop(verify.execute("PRAGMA wal_checkpoint(TRUNCATE)").await);
     }
-    if let Err(msg) = quick_check(&verify) {
+    if let Err(msg) = quick_check(&verify).await {
         panic!("INDEX CORRUPTION (concurrent, frank quick_check, wal={wal}): {msg}");
     }
     drop(verify);
@@ -1215,12 +1321,15 @@ fn concurrent_shared_index_churn(writers: usize, rows: i64, rounds: i64, wal: bo
 #[test]
 #[ignore = "bd-9inpb/bd-l9yii concurrent shared-index churn stress harness; run with --ignored"]
 fn concurrent_shared_index_churn_rollback_journal_stays_intact() {
-    concurrent_shared_index_churn(
-        env_i64("Q37EP_WRITERS", 8) as usize,
-        env_i64("Q37EP_ROWS", 6_000),
-        env_i64("Q37EP_ROUNDS", 160),
-        false,
-    );
+    asupersync::test_utils::run_test(|| async {
+        concurrent_shared_index_churn(
+            env_i64("Q37EP_WRITERS", 8) as usize,
+            env_i64("Q37EP_ROWS", 6_000),
+            env_i64("Q37EP_ROUNDS", 160),
+            false,
+        )
+        .await;
+    });
 }
 
 /// Concurrent shared-index churn in WAL mode (first-committer-wins page conflict
@@ -1228,10 +1337,13 @@ fn concurrent_shared_index_churn_rollback_journal_stays_intact() {
 #[test]
 #[ignore = "bd-9inpb/bd-l9yii concurrent shared-index churn stress harness; run with --ignored"]
 fn concurrent_shared_index_churn_wal_stays_intact() {
-    concurrent_shared_index_churn(
-        env_i64("Q37EP_WRITERS", 8) as usize,
-        env_i64("Q37EP_ROWS", 6_000),
-        env_i64("Q37EP_ROUNDS", 160),
-        true,
-    );
+    asupersync::test_utils::run_test(|| async {
+        concurrent_shared_index_churn(
+            env_i64("Q37EP_WRITERS", 8) as usize,
+            env_i64("Q37EP_ROWS", 6_000),
+            env_i64("Q37EP_ROUNDS", 160),
+            true,
+        )
+        .await;
+    });
 }

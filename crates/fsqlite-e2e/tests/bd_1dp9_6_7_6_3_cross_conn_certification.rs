@@ -12,6 +12,7 @@
 //! - B1: Backend identity — file-backed connections return consistent data
 //! - B2: Multiple databases on same connection set (isolation)
 //! - S1: Stale reader after writer commits (snapshot advancement)
+#![recursion_limit = "512"]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -26,12 +27,12 @@ fn test_tmpdir() -> tempfile::TempDir {
         .expect("tempdir")
 }
 
-fn count_rows(conn: &Connection, sql: &str) -> usize {
-    conn.query(sql).expect("count query").len()
+async fn count_rows(conn: &Connection, sql: &str) -> usize {
+    conn.query(sql).await.expect("count query").len()
 }
 
-fn get_int(conn: &Connection, sql: &str) -> Option<i64> {
-    let rows = conn.query(sql).ok()?;
+async fn get_int(conn: &Connection, sql: &str) -> Option<i64> {
+    let rows = conn.query(sql).await.ok()?;
     let row = rows.first()?;
     match row.get(0)? {
         SqliteValue::Integer(v) => Some(*v),
@@ -43,291 +44,329 @@ fn get_int(conn: &Connection, sql: &str) -> Option<i64> {
 
 #[test]
 fn v1_cross_connection_visibility() {
-    let dir = test_tmpdir();
-    let db_path = dir.path().join("v1.db");
-    let path_str = db_path.to_str().expect("path");
+    asupersync::test_utils::run_test(|| async {
+        let dir = test_tmpdir();
+        let db_path = dir.path().join("v1.db");
+        let path_str = db_path.to_str().expect("path");
 
-    // Writer connection creates and populates
-    let writer = Connection::open(path_str).expect("writer open");
-    writer
-        .execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
-        .expect("create");
-    writer.execute("BEGIN").expect("begin");
-    for i in 1..=50 {
+        // Writer connection creates and populates
+        let writer = Connection::open(path_str).await.expect("writer open");
         writer
-            .execute(&format!("INSERT INTO items VALUES ({i}, 'item_{i}')"))
-            .expect("insert");
-    }
-    writer.execute("COMMIT").expect("commit");
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+            .await
+            .expect("create");
+        writer.execute("BEGIN").await.expect("begin");
+        for i in 1..=50 {
+            writer
+                .execute(&format!("INSERT INTO items VALUES ({i}, 'item_{i}')"))
+                .await
+                .expect("insert");
+        }
+        writer.execute("COMMIT").await.expect("commit");
 
-    // Reader connection (opened AFTER commit) must see all 50 rows
-    let reader = Connection::open(path_str).expect("reader open");
-    let rows = count_rows(&reader, "SELECT * FROM items");
-    assert_eq!(
-        rows, 50,
-        "V1: reader should see all 50 committed rows, got {rows}"
-    );
+        // Reader connection (opened AFTER commit) must see all 50 rows
+        let reader = Connection::open(path_str).await.expect("reader open");
+        let rows = count_rows(&reader, "SELECT * FROM items").await;
+        assert_eq!(
+            rows, 50,
+            "V1: reader should see all 50 committed rows, got {rows}"
+        );
 
-    // Writer adds more
-    writer.execute("BEGIN").expect("begin2");
-    for i in 51..=100 {
-        writer
-            .execute(&format!("INSERT INTO items VALUES ({i}, 'item_{i}')"))
-            .expect("insert2");
-    }
-    writer.execute("COMMIT").expect("commit2");
+        // Writer adds more
+        writer.execute("BEGIN").await.expect("begin2");
+        for i in 51..=100 {
+            writer
+                .execute(&format!("INSERT INTO items VALUES ({i}, 'item_{i}')"))
+                .await
+                .expect("insert2");
+        }
+        writer.execute("COMMIT").await.expect("commit2");
 
-    // Reader should see 100 rows after new query (no stale cache)
-    let rows2 = count_rows(&reader, "SELECT * FROM items");
-    assert!(
-        rows2 >= 100,
-        "V1: reader should see at least 100 rows after 2nd commit, got {rows2}"
-    );
+        // Reader should see 100 rows after new query (no stale cache)
+        let rows2 = count_rows(&reader, "SELECT * FROM items").await;
+        assert!(
+            rows2 >= 100,
+            "V1: reader should see at least 100 rows after 2nd commit, got {rows2}"
+        );
 
-    eprintln!("V1: cross-connection visibility OK — {rows} then {rows2} rows");
+        eprintln!("V1: cross-connection visibility OK — {rows} then {rows2} rows");
+    });
 }
 
 // ─── V2: Cross-connection concurrent read+write ───────────────────
 
 #[test]
 fn v2_concurrent_cross_connection_readwrite() {
-    let dir = test_tmpdir();
-    let db_path = dir.path().join("v2.db");
-    let path_str = db_path.to_str().expect("path");
+    asupersync::test_utils::run_test(|| async {
+        let dir = test_tmpdir();
+        let db_path = dir.path().join("v2.db");
+        let path_str = db_path.to_str().expect("path");
 
-    {
-        let conn = Connection::open(path_str).expect("open");
-        conn.execute("CREATE TABLE counters (id INTEGER PRIMARY KEY, val INTEGER)")
-            .expect("create");
-        conn.execute("INSERT INTO counters VALUES (1, 0)")
-            .expect("seed");
-    }
+        {
+            let conn = Connection::open(path_str).await.expect("open");
+            conn.execute("CREATE TABLE counters (id INTEGER PRIMARY KEY, val INTEGER)")
+                .await
+                .expect("create");
+            conn.execute("INSERT INTO counters VALUES (1, 0)")
+                .await
+                .expect("seed");
+        }
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let writes_done = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let writes_done = Arc::new(AtomicU64::new(0));
 
-    // Writer thread: increments counter
-    let w_path = path_str.to_string();
-    let w_stop = Arc::clone(&stop);
-    let w_done = Arc::clone(&writes_done);
-    let writer = std::thread::spawn(move || {
-        let conn = Connection::open(&w_path).expect("w open");
-        let mut ops = 0u64;
-        while !w_stop.load(Ordering::Relaxed) {
-            if conn.execute("BEGIN").is_ok() {
-                conn.execute("UPDATE counters SET val = val + 1 WHERE id = 1")
-                    .ok();
-                if conn.execute("COMMIT").is_ok() {
-                    ops += 1;
-                    w_done.store(ops, Ordering::Relaxed);
-                } else {
-                    conn.execute("ROLLBACK").ok();
+        // Writer thread: increments counter
+        let w_path = path_str.to_string();
+        let w_stop = Arc::clone(&stop);
+        let w_done = Arc::clone(&writes_done);
+        let writer = std::thread::spawn(move || {
+            let mut ops = 0u64;
+            asupersync::test_utils::run_test(|| async {
+                let conn = Connection::open(&w_path).await.expect("w open");
+                while !w_stop.load(Ordering::Relaxed) {
+                    if conn.execute("BEGIN").await.is_ok() {
+                        conn.execute("UPDATE counters SET val = val + 1 WHERE id = 1")
+                            .await
+                            .ok();
+                        if conn.execute("COMMIT").await.is_ok() {
+                            ops += 1;
+                            w_done.store(ops, Ordering::Relaxed);
+                        } else {
+                            conn.execute("ROLLBACK").await.ok();
+                        }
+                    }
                 }
-            }
-        }
-        ops
+            });
+            ops
+        });
+
+        // Reader thread: reads counter value, asserts monotonic
+        let r_path = path_str.to_string();
+        let r_stop = Arc::clone(&stop);
+        let reader = std::thread::spawn(move || {
+            let mut last_val: i64 = 0;
+            let mut reads = 0u64;
+            asupersync::test_utils::run_test(|| async {
+                let conn = Connection::open(&r_path).await.expect("r open");
+                while !r_stop.load(Ordering::Relaxed) {
+                    if let Some(val) = get_int(&conn, "SELECT val FROM counters WHERE id = 1").await
+                    {
+                        assert!(
+                            val >= last_val,
+                            "V2: counter went backwards: {last_val} -> {val}"
+                        );
+                        last_val = val;
+                        reads += 1;
+                    }
+                }
+            });
+            (reads, last_val)
+        });
+
+        std::thread::sleep(Duration::from_secs(2));
+        stop.store(true, Ordering::Relaxed);
+
+        let total_writes = writer.join().expect("writer must not panic");
+        let (total_reads, final_val) = reader.join().expect("reader must not panic");
+
+        assert!(total_writes > 0, "V2: no writes completed");
+        assert!(total_reads > 0, "V2: no reads completed");
+        eprintln!("V2: {total_writes} writes, {total_reads} reads, final counter={final_val}");
     });
-
-    // Reader thread: reads counter value, asserts monotonic
-    let r_path = path_str.to_string();
-    let r_stop = Arc::clone(&stop);
-    let reader = std::thread::spawn(move || {
-        let conn = Connection::open(&r_path).expect("r open");
-        let mut last_val: i64 = 0;
-        let mut reads = 0u64;
-        while !r_stop.load(Ordering::Relaxed) {
-            if let Some(val) = get_int(&conn, "SELECT val FROM counters WHERE id = 1") {
-                assert!(
-                    val >= last_val,
-                    "V2: counter went backwards: {last_val} -> {val}"
-                );
-                last_val = val;
-                reads += 1;
-            }
-        }
-        (reads, last_val)
-    });
-
-    std::thread::sleep(Duration::from_secs(2));
-    stop.store(true, Ordering::Relaxed);
-
-    let total_writes = writer.join().expect("writer must not panic");
-    let (total_reads, final_val) = reader.join().expect("reader must not panic");
-
-    assert!(total_writes > 0, "V2: no writes completed");
-    assert!(total_reads > 0, "V2: no reads completed");
-    eprintln!("V2: {total_writes} writes, {total_reads} reads, final counter={final_val}");
 }
 
 // ─── R1: ROLLBACK reverts uncommitted writes ──────────────────────
 
 #[test]
 fn r1_rollback_reverts_uncommitted() {
-    let dir = test_tmpdir();
-    let db_path = dir.path().join("r1.db");
-    let path_str = db_path.to_str().expect("path");
+    asupersync::test_utils::run_test(|| async {
+        let dir = test_tmpdir();
+        let db_path = dir.path().join("r1.db");
+        let path_str = db_path.to_str().expect("path");
 
-    let conn = Connection::open(path_str).expect("open");
-    conn.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT)")
-        .expect("create");
+        let conn = Connection::open(path_str).await.expect("open");
+        conn.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .expect("create");
 
-    // Committed batch
-    conn.execute("BEGIN").expect("begin");
-    for i in 1..=10 {
-        conn.execute(&format!("INSERT INTO data VALUES ({i}, 'committed')"))
-            .expect("insert committed");
-    }
-    conn.execute("COMMIT").expect("commit");
+        // Committed batch
+        conn.execute("BEGIN").await.expect("begin");
+        for i in 1..=10 {
+            conn.execute(&format!("INSERT INTO data VALUES ({i}, 'committed')"))
+                .await
+                .expect("insert committed");
+        }
+        conn.execute("COMMIT").await.expect("commit");
 
-    assert_eq!(count_rows(&conn, "SELECT * FROM data"), 10);
+        assert_eq!(count_rows(&conn, "SELECT * FROM data").await, 10);
 
-    // Rolled-back batch
-    conn.execute("BEGIN").expect("begin2");
-    for i in 11..=20 {
-        conn.execute(&format!("INSERT INTO data VALUES ({i}, 'rollback_me')"))
-            .expect("insert rollback");
-    }
-    // Before rollback, should see 20 inside the txn
-    assert_eq!(count_rows(&conn, "SELECT * FROM data"), 20);
+        // Rolled-back batch
+        conn.execute("BEGIN").await.expect("begin2");
+        for i in 11..=20 {
+            conn.execute(&format!("INSERT INTO data VALUES ({i}, 'rollback_me')"))
+                .await
+                .expect("insert rollback");
+        }
+        // Before rollback, should see 20 inside the txn
+        assert_eq!(count_rows(&conn, "SELECT * FROM data").await, 20);
 
-    conn.execute("ROLLBACK").expect("rollback");
+        conn.execute("ROLLBACK").await.expect("rollback");
 
-    // After rollback, back to 10
-    assert_eq!(
-        count_rows(&conn, "SELECT * FROM data"),
-        10,
-        "R1: rollback did not revert uncommitted rows"
-    );
+        // After rollback, back to 10
+        assert_eq!(
+            count_rows(&conn, "SELECT * FROM data").await,
+            10,
+            "R1: rollback did not revert uncommitted rows"
+        );
 
-    // Cross-connection verification
-    let reader = Connection::open(path_str).expect("reader");
-    assert_eq!(
-        count_rows(&reader, "SELECT * FROM data"),
-        10,
-        "R1: other connection sees rolled-back rows"
-    );
+        // Cross-connection verification
+        let reader = Connection::open(path_str).await.expect("reader");
+        assert_eq!(
+            count_rows(&reader, "SELECT * FROM data").await,
+            10,
+            "R1: other connection sees rolled-back rows"
+        );
 
-    eprintln!("R1: ROLLBACK correctly reverts uncommitted writes");
+        eprintln!("R1: ROLLBACK correctly reverts uncommitted writes");
+    });
 }
 
 // ─── R2: SAVEPOINT ROLLBACK partial undo ──────────────────────────
 
 #[test]
 fn r2_savepoint_rollback_partial_undo() {
-    let dir = test_tmpdir();
-    let db_path = dir.path().join("r2.db");
-    let path_str = db_path.to_str().expect("path");
+    asupersync::test_utils::run_test(|| async {
+        let dir = test_tmpdir();
+        let db_path = dir.path().join("r2.db");
+        let path_str = db_path.to_str().expect("path");
 
-    let conn = Connection::open(path_str).expect("open");
-    conn.execute("CREATE TABLE log (seq INTEGER PRIMARY KEY, msg TEXT)")
-        .expect("create");
+        let conn = Connection::open(path_str).await.expect("open");
+        conn.execute("CREATE TABLE log (seq INTEGER PRIMARY KEY, msg TEXT)")
+            .await
+            .expect("create");
 
-    conn.execute("BEGIN").expect("begin");
+        conn.execute("BEGIN").await.expect("begin");
 
-    // Phase 1: insert 1-5
-    for i in 1..=5 {
-        conn.execute(&format!("INSERT INTO log VALUES ({i}, 'phase1')"))
-            .expect("phase1 insert");
-    }
-    assert_eq!(count_rows(&conn, "SELECT * FROM log"), 5);
+        // Phase 1: insert 1-5
+        for i in 1..=5 {
+            conn.execute(&format!("INSERT INTO log VALUES ({i}, 'phase1')"))
+                .await
+                .expect("phase1 insert");
+        }
+        assert_eq!(count_rows(&conn, "SELECT * FROM log").await, 5);
 
-    // Savepoint
-    conn.execute("SAVEPOINT sp1").expect("savepoint");
+        // Savepoint
+        conn.execute("SAVEPOINT sp1").await.expect("savepoint");
 
-    // Phase 2: insert 6-10
-    for i in 6..=10 {
-        conn.execute(&format!("INSERT INTO log VALUES ({i}, 'phase2')"))
-            .expect("phase2 insert");
-    }
-    assert_eq!(count_rows(&conn, "SELECT * FROM log"), 10);
+        // Phase 2: insert 6-10
+        for i in 6..=10 {
+            conn.execute(&format!("INSERT INTO log VALUES ({i}, 'phase2')"))
+                .await
+                .expect("phase2 insert");
+        }
+        assert_eq!(count_rows(&conn, "SELECT * FROM log").await, 10);
 
-    // Rollback savepoint — only phase 2 reverted
-    conn.execute("ROLLBACK TO sp1").expect("rollback to sp1");
+        // Rollback savepoint — only phase 2 reverted
+        conn.execute("ROLLBACK TO sp1")
+            .await
+            .expect("rollback to sp1");
 
-    let after_sp_rollback = count_rows(&conn, "SELECT * FROM log");
-    assert_eq!(
-        after_sp_rollback, 5,
-        "R2: savepoint rollback should leave 5 rows, got {after_sp_rollback}"
-    );
+        let after_sp_rollback = count_rows(&conn, "SELECT * FROM log").await;
+        assert_eq!(
+            after_sp_rollback, 5,
+            "R2: savepoint rollback should leave 5 rows, got {after_sp_rollback}"
+        );
 
-    // Commit — phase 1 persists
-    conn.execute("COMMIT").expect("commit");
+        // Commit — phase 1 persists
+        conn.execute("COMMIT").await.expect("commit");
 
-    let final_count = count_rows(&conn, "SELECT * FROM log");
-    assert_eq!(final_count, 5, "R2: final count after commit should be 5");
+        let final_count = count_rows(&conn, "SELECT * FROM log").await;
+        assert_eq!(final_count, 5, "R2: final count after commit should be 5");
 
-    // Cross-connection
-    let reader = Connection::open(path_str).expect("reader");
-    assert_eq!(count_rows(&reader, "SELECT * FROM log"), 5);
+        // Cross-connection
+        let reader = Connection::open(path_str).await.expect("reader");
+        assert_eq!(count_rows(&reader, "SELECT * FROM log").await, 5);
 
-    eprintln!("R2: SAVEPOINT ROLLBACK partial undo verified");
+        eprintln!("R2: SAVEPOINT ROLLBACK partial undo verified");
+    });
 }
 
 // ─── R3: Nested savepoint rollback chains ─────────────────────────
 
 #[test]
 fn r3_nested_savepoint_chains() {
-    let dir = test_tmpdir();
-    let db_path = dir.path().join("r3.db");
-    let path_str = db_path.to_str().expect("path");
+    asupersync::test_utils::run_test(|| async {
+        let dir = test_tmpdir();
+        let db_path = dir.path().join("r3.db");
+        let path_str = db_path.to_str().expect("path");
 
-    let conn = Connection::open(path_str).expect("open");
-    conn.execute("CREATE TABLE nested (id INTEGER PRIMARY KEY, level INTEGER)")
-        .expect("create");
+        let conn = Connection::open(path_str).await.expect("open");
+        conn.execute("CREATE TABLE nested (id INTEGER PRIMARY KEY, level INTEGER)")
+            .await
+            .expect("create");
 
-    conn.execute("BEGIN").expect("begin");
+        conn.execute("BEGIN").await.expect("begin");
 
-    // Level 0: insert 1-3
-    for i in 1..=3 {
-        conn.execute(&format!("INSERT INTO nested VALUES ({i}, 0)"))
-            .expect("l0");
-    }
+        // Level 0: insert 1-3
+        for i in 1..=3 {
+            conn.execute(&format!("INSERT INTO nested VALUES ({i}, 0)"))
+                .await
+                .expect("l0");
+        }
 
-    conn.execute("SAVEPOINT sp_a").expect("sp_a");
+        conn.execute("SAVEPOINT sp_a").await.expect("sp_a");
 
-    // Level 1: insert 4-6
-    for i in 4..=6 {
-        conn.execute(&format!("INSERT INTO nested VALUES ({i}, 1)"))
-            .expect("l1");
-    }
+        // Level 1: insert 4-6
+        for i in 4..=6 {
+            conn.execute(&format!("INSERT INTO nested VALUES ({i}, 1)"))
+                .await
+                .expect("l1");
+        }
 
-    conn.execute("SAVEPOINT sp_b").expect("sp_b");
+        conn.execute("SAVEPOINT sp_b").await.expect("sp_b");
 
-    // Level 2: insert 7-9
-    for i in 7..=9 {
-        conn.execute(&format!("INSERT INTO nested VALUES ({i}, 2)"))
-            .expect("l2");
-    }
-    assert_eq!(count_rows(&conn, "SELECT * FROM nested"), 9);
+        // Level 2: insert 7-9
+        for i in 7..=9 {
+            conn.execute(&format!("INSERT INTO nested VALUES ({i}, 2)"))
+                .await
+                .expect("l2");
+        }
+        assert_eq!(count_rows(&conn, "SELECT * FROM nested").await, 9);
 
-    // Rollback sp_b — removes level 2 (7-9)
-    conn.execute("ROLLBACK TO sp_b").expect("rollback sp_b");
-    assert_eq!(count_rows(&conn, "SELECT * FROM nested"), 6);
+        // Rollback sp_b — removes level 2 (7-9)
+        conn.execute("ROLLBACK TO sp_b")
+            .await
+            .expect("rollback sp_b");
+        assert_eq!(count_rows(&conn, "SELECT * FROM nested").await, 6);
 
-    // Re-insert at level 2 after rollback
-    for i in 7..=8 {
-        conn.execute(&format!("INSERT INTO nested VALUES ({i}, 2)"))
-            .expect("l2 redo");
-    }
-    assert_eq!(count_rows(&conn, "SELECT * FROM nested"), 8);
+        // Re-insert at level 2 after rollback
+        for i in 7..=8 {
+            conn.execute(&format!("INSERT INTO nested VALUES ({i}, 2)"))
+                .await
+                .expect("l2 redo");
+        }
+        assert_eq!(count_rows(&conn, "SELECT * FROM nested").await, 8);
 
-    // Release sp_b — merges into sp_a
-    conn.execute("RELEASE sp_b").expect("release sp_b");
+        // Release sp_b — merges into sp_a
+        conn.execute("RELEASE sp_b").await.expect("release sp_b");
 
-    // Rollback sp_a — removes levels 1+2 (4-8)
-    conn.execute("ROLLBACK TO sp_a").expect("rollback sp_a");
-    assert_eq!(
-        count_rows(&conn, "SELECT * FROM nested"),
-        3,
-        "R3: after rolling back sp_a, only level 0 should remain"
-    );
+        // Rollback sp_a — removes levels 1+2 (4-8)
+        conn.execute("ROLLBACK TO sp_a")
+            .await
+            .expect("rollback sp_a");
+        assert_eq!(
+            count_rows(&conn, "SELECT * FROM nested").await,
+            3,
+            "R3: after rolling back sp_a, only level 0 should remain"
+        );
 
-    conn.execute("COMMIT").expect("commit");
+        conn.execute("COMMIT").await.expect("commit");
 
-    let final_count = count_rows(&conn, "SELECT * FROM nested");
-    assert_eq!(final_count, 3, "R3: final committed count should be 3");
+        let final_count = count_rows(&conn, "SELECT * FROM nested").await;
+        assert_eq!(final_count, 3, "R3: final committed count should be 3");
 
-    eprintln!("R3: nested savepoint chains verified");
+        eprintln!("R3: nested savepoint chains verified");
+    });
 }
 
 // ─── P1: Restart recovery — close all, reopen ─────────────────────

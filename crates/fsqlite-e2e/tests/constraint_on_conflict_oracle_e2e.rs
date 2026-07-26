@@ -8,6 +8,7 @@
 //! the constraint's. unique_conflict_oracle covers one case (UNIQUE ON CONFLICT
 //! IGNORE); this fills the matrix. Each scenario asserts per-statement agreement
 //! with rusqlite, then compares the resulting rows.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -25,8 +26,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -58,11 +59,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -72,7 +73,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -98,74 +99,89 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 /// the conflicting row; frank errors instead (only UNIQUE+IGNORE is honored).
 #[test]
 fn unique_on_conflict_replace() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE ON CONFLICT REPLACE, label TEXT)",
-            "INSERT INTO t VALUES (1,10,'a'),(2,20,'b')",
-            "INSERT INTO t VALUES (3,10,'c')", // u=10 conflicts -> REPLACE removes id1
-        ],
-        &["SELECT id, u, label FROM t ORDER BY id"], // (2,20,'b'),(3,10,'c')
-        "unique_on_conflict_replace",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE ON CONFLICT REPLACE, label TEXT)",
+                "INSERT INTO t VALUES (1,10,'a'),(2,20,'b')",
+                "INSERT INTO t VALUES (3,10,'c')", // u=10 conflicts -> REPLACE removes id1
+            ],
+            &["SELECT id, u, label FROM t ORDER BY id"], // (2,20,'b'),(3,10,'c')
+            "unique_on_conflict_replace",
+        )
+        .await;
+    });
 }
 
 /// bd-587fx: PRIMARY KEY ON CONFLICT IGNORE should skip a duplicate-PK insert;
 /// frank errors instead.
 #[test]
 fn primary_key_on_conflict_ignore() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY ON CONFLICT IGNORE, v TEXT)",
-            "INSERT INTO t VALUES (1,'a'),(2,'b')",
-            "INSERT INTO t VALUES (1,'dup')", // PK conflict -> ignored
-            "INSERT INTO t VALUES (3,'c')",
-        ],
-        &["SELECT id, v FROM t ORDER BY id"], // (1,'a'),(2,'b'),(3,'c')
-        "primary_key_on_conflict_ignore",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY ON CONFLICT IGNORE, v TEXT)",
+                "INSERT INTO t VALUES (1,'a'),(2,'b')",
+                "INSERT INTO t VALUES (1,'dup')", // PK conflict -> ignored
+                "INSERT INTO t VALUES (3,'c')",
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // (1,'a'),(2,'b'),(3,'c')
+            "primary_key_on_conflict_ignore",
+        )
+        .await;
+    });
 }
 
 /// bd-587fx: NOT NULL ON CONFLICT IGNORE should skip a row with a NULL in that
 /// column; frank errors instead.
 #[test]
 fn not_null_on_conflict_ignore() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL ON CONFLICT IGNORE)",
-            "INSERT INTO t VALUES (1,10)",
-            "INSERT INTO t VALUES (2,NULL)", // NOT NULL violated -> row ignored
-            "INSERT INTO t VALUES (3,30)",
-        ],
-        &["SELECT id, v FROM t ORDER BY id"], // (1,10),(3,30)
-        "not_null_on_conflict_ignore",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL ON CONFLICT IGNORE)",
+                "INSERT INTO t VALUES (1,10)",
+                "INSERT INTO t VALUES (2,NULL)", // NOT NULL violated -> row ignored
+                "INSERT INTO t VALUES (3,30)",
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // (1,10),(3,30)
+            "not_null_on_conflict_ignore",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn statement_or_overrides_constraint_on_conflict() {
-    scenario(
-        &[
-            // Constraint says IGNORE, but INSERT OR REPLACE overrides it.
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE ON CONFLICT IGNORE, label TEXT)",
-            "INSERT INTO t VALUES (1,10,'a')",
-            "INSERT OR REPLACE INTO t VALUES (2,10,'b')", // statement OR REPLACE wins -> replaces id1
-        ],
-        &["SELECT id, u, label FROM t ORDER BY id"], // (2,10,'b')
-        "statement_or_overrides_constraint_on_conflict",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                // Constraint says IGNORE, but INSERT OR REPLACE overrides it.
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE ON CONFLICT IGNORE, label TEXT)",
+                "INSERT INTO t VALUES (1,10,'a')",
+                "INSERT OR REPLACE INTO t VALUES (2,10,'b')", // statement OR REPLACE wins -> replaces id1
+            ],
+            &["SELECT id, u, label FROM t ORDER BY id"], // (2,10,'b')
+            "statement_or_overrides_constraint_on_conflict",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn unique_on_conflict_fail_errors() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE ON CONFLICT FAIL)",
-            "INSERT INTO t VALUES (1,10),(2,20)",
-            "INSERT INTO t VALUES (3,10)", // conflict -> FAIL -> error on both
-        ],
-        &["SELECT id, u FROM t ORDER BY id"], // (1,10),(2,20)
-        "unique_on_conflict_fail_errors",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE ON CONFLICT FAIL)",
+                "INSERT INTO t VALUES (1,10),(2,20)",
+                "INSERT INTO t VALUES (3,10)", // conflict -> FAIL -> error on both
+            ],
+            &["SELECT id, u FROM t ORDER BY id"], // (1,10),(2,20)
+            "unique_on_conflict_fail_errors",
+        )
+        .await;
+    });
 }
 
 /// A declared per-constraint `ON CONFLICT` must survive a file-backed
@@ -175,44 +191,49 @@ fn unique_on_conflict_fail_errors() {
 /// `:memory:` scenarios never exercise.
 #[test]
 fn unique_on_conflict_replace_survives_reopen() {
-    let dir = tempfile::tempdir_in(std::env::temp_dir())
-        .or_else(|_| tempfile::tempdir_in("."))
-        .expect("tempdir");
-    let db_path = dir.path().join("on_conflict_reopen.db");
-    let db_str = db_path.to_string_lossy().into_owned();
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir_in(std::env::temp_dir())
+            .or_else(|_| tempfile::tempdir_in("."))
+            .expect("tempdir");
+        let db_path = dir.path().join("on_conflict_reopen.db");
+        let db_str = db_path.to_string_lossy().into_owned();
 
-    // Reference: run the whole sequence against rusqlite in memory.
-    let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
-    let ddl_dml = [
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE ON CONFLICT REPLACE, label TEXT)",
-        "INSERT INTO t VALUES (1,10,'a'),(2,20,'b')",
-    ];
-    for s in ddl_dml {
-        r.execute_batch(s)
-            .unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
-    }
-
-    // frank: create + seed, then DROP the connection to flush to disk.
-    {
-        let f = Connection::open(&db_str).expect("open frank");
+        // Reference: run the whole sequence against rusqlite in memory.
+        let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
+        let ddl_dml = [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE ON CONFLICT REPLACE, label TEXT)",
+            "INSERT INTO t VALUES (1,10,'a'),(2,20,'b')",
+        ];
         for s in ddl_dml {
-            f.execute(s).unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
+            r.execute_batch(s)
+                .unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
         }
-    }
 
-    // The conflicting INSERT runs AFTER reopen, so the REPLACE must come from the
-    // reloaded autoindex's conflict_action (not the in-memory writer state).
-    let conflicting = "INSERT INTO t VALUES (3,10,'c')"; // u=10 conflicts -> REPLACE id1
-    r.execute_batch(conflicting)
-        .expect("rusqlite conflict insert");
-    let f = Connection::open(&db_str).expect("reopen frank");
-    f.execute(conflicting)
-        .unwrap_or_else(|e| panic!("frank reopened `{conflicting}`: {e}"));
+        // frank: create + seed, then DROP the connection to flush to disk.
+        {
+            let f = Connection::open(&db_str).await.expect("open frank");
+            for s in ddl_dml {
+                f.execute(s)
+                    .await
+                    .unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
+            }
+        }
 
-    let q = "SELECT id, u, label FROM t ORDER BY id";
-    assert_eq!(
-        frank_rows(&f, q).expect("frank query"),
-        sqlite_rows(&r, q).expect("rusqlite query"),
-        "unique_on_conflict_replace_survives_reopen: rows differ after reopen"
-    );
+        // The conflicting INSERT runs AFTER reopen, so the REPLACE must come from the
+        // reloaded autoindex's conflict_action (not the in-memory writer state).
+        let conflicting = "INSERT INTO t VALUES (3,10,'c')"; // u=10 conflicts -> REPLACE id1
+        r.execute_batch(conflicting)
+            .expect("rusqlite conflict insert");
+        let f = Connection::open(&db_str).await.expect("reopen frank");
+        f.execute(conflicting)
+            .await
+            .unwrap_or_else(|e| panic!("frank reopened `{conflicting}`: {e}"));
+
+        let q = "SELECT id, u, label FROM t ORDER BY id";
+        assert_eq!(
+            frank_rows(&f, q).await.expect("frank query"),
+            sqlite_rows(&r, q).expect("rusqlite query"),
+            "unique_on_conflict_replace_survives_reopen: rows differ after reopen"
+        );
+    });
 }

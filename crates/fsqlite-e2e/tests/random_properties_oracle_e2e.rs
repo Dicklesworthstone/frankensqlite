@@ -23,8 +23,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -56,12 +56,12 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn assert_scalar(queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn assert_scalar(queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -85,27 +85,33 @@ fn assert_scalar(queries: &[&str], label: &str) {
 
 #[test]
 fn random_returns_integer_in_i64_range() {
-    assert_scalar(
-        &[
-            "SELECT typeof(random())", // integer
-            // every random() result fits in signed i64 -- deterministic predicate.
-            "SELECT random() BETWEEN -9223372036854775808 AND 9223372036854775807",
-        ],
-        "random_returns_integer_in_i64_range",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT typeof(random())", // integer
+                // every random() result fits in signed i64 -- deterministic predicate.
+                "SELECT random() BETWEEN -9223372036854775808 AND 9223372036854775807",
+            ],
+            "random_returns_integer_in_i64_range",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn randomblob_type_and_length() {
-    assert_scalar(
-        &[
-            "SELECT typeof(randomblob(16))",  // blob
-            "SELECT length(randomblob(0))",   // 0 -> empty blob
-            "SELECT length(randomblob(1))",   // 1
-            "SELECT length(randomblob(16))",  // 16
-            "SELECT length(randomblob(256))", // 256
-            "SELECT randomblob(0) = X''",     // 1 (empty matches empty)
-        ],
-        "randomblob_type_and_length",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT typeof(randomblob(16))",  // blob
+                "SELECT length(randomblob(0))",   // 0 -> empty blob
+                "SELECT length(randomblob(1))",   // 1
+                "SELECT length(randomblob(16))",  // 16
+                "SELECT length(randomblob(256))", // 256
+                "SELECT randomblob(0) = X''",     // 1 (empty matches empty)
+            ],
+            "randomblob_type_and_length",
+        )
+        .await;
+    });
 }

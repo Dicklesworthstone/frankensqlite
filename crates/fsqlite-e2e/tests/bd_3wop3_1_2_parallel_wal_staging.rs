@@ -1,4 +1,5 @@
 //! E2E verification for `bd-3wop3.1.2` lane-local WAL staging.
+#![recursion_limit = "512"]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -64,14 +65,14 @@ fn is_lock_contention(error: &fsqlite::FrankenError) -> bool {
     )
 }
 
-fn retry_lock_contention<T>(
+async fn retry_lock_contention<T>(
     context: &str,
-    mut operation: impl FnMut() -> Result<T, fsqlite::FrankenError>,
+    mut operation: impl std::ops::AsyncFnMut() -> Result<T, fsqlite::FrankenError>,
 ) -> Result<T, String> {
     let started = Instant::now();
     let mut attempt = 0_u32;
     loop {
-        match operation() {
+        match operation().await {
             Ok(value) => return Ok(value),
             Err(error) if is_lock_contention(&error) && started.elapsed() < OPEN_RETRY_BUDGET => {
                 attempt = attempt.saturating_add(1);
@@ -84,16 +85,18 @@ fn retry_lock_contention<T>(
     }
 }
 
-fn try_open_connection(path: &Path) -> Result<fsqlite::Connection, String> {
+async fn try_open_connection(path: &Path) -> Result<fsqlite::Connection, String> {
     let path = path
         .to_str()
         .ok_or_else(|| format!("database path is not UTF-8: {}", path.display()))?;
-    let conn = retry_lock_contention("open FrankenSQLite connection", || {
-        fsqlite::Connection::open(path)
-    })?;
-    retry_lock_contention("enable WAL mode", || {
-        conn.execute("PRAGMA journal_mode=WAL;").map(|_| ())
-    })?;
+    let conn = retry_lock_contention("open FrankenSQLite connection", async || {
+        fsqlite::Connection::open(path).await
+    })
+    .await?;
+    retry_lock_contention("enable WAL mode", async || {
+        conn.execute("PRAGMA journal_mode=WAL;").await.map(|_| ())
+    })
+    .await?;
     if !conn.is_concurrent_mode_default() {
         return Err(format!(
             "bead_id={BEAD_ID} case=concurrent_mode_default_guard"
@@ -102,34 +105,39 @@ fn try_open_connection(path: &Path) -> Result<fsqlite::Connection, String> {
     Ok(conn)
 }
 
-fn open_connection(path: &Path) -> fsqlite::Connection {
-    try_open_connection(path).unwrap_or_else(|error| panic!("{error}"))
+async fn open_connection(path: &Path) -> fsqlite::Connection {
+    try_open_connection(path)
+        .await
+        .unwrap_or_else(|error| panic!("{error}"))
 }
 
-fn insert_row(path: &Path, table_name: &'static str, id: i64, barrier: Arc<Barrier>) {
+async fn insert_row(path: &Path, table_name: &'static str, id: i64, barrier: Arc<Barrier>) {
     // Always rendezvous, even when connection setup fails.  Otherwise the
     // healthy peer can block forever at the barrier and hide the real error.
-    let conn = try_open_connection(path);
+    let conn = try_open_connection(path).await;
     barrier.wait();
     let conn = conn.unwrap_or_else(|error| panic!("{error}"));
     conn.execute("BEGIN CONCURRENT;")
+        .await
         .expect("begin concurrent transaction");
     conn.execute(&format!(
         "INSERT INTO {table_name} VALUES ({id}, '{table_name}-{id}')"
     ))
+    .await
     .expect("insert row");
-    conn.execute("COMMIT;").expect("commit transaction");
+    conn.execute("COMMIT;").await.expect("commit transaction");
     // The peer writer can still own the WAL checkpoint lock here.  The
     // durability boundary under test is the successful COMMIT above; making
     // this helper run a passive close-time checkpoint introduces an unrelated
     // transient SQLITE_BUSY race.  Preserve the committed WAL frames and let
     // `fetch_final_rows` exercise recovery plus the final uncontended close.
     conn.close_without_checkpoint()
+        .await
         .expect("close writer connection without checkpoint");
 }
 
-fn fetch_final_rows(path: &Path) -> Vec<FinalRow> {
-    let conn = open_connection(path);
+async fn fetch_final_rows(path: &Path) -> Vec<FinalRow> {
+    let conn = open_connection(path).await;
     let rows = conn
         .query(
             "SELECT table_name, id, value FROM (\
@@ -138,6 +146,7 @@ fn fetch_final_rows(path: &Path) -> Vec<FinalRow> {
              SELECT 'b' AS table_name, id, value FROM b\
          ) ORDER BY table_name, id",
         )
+        .await
         .expect("query final rows")
         .into_iter()
         .map(|row| {
@@ -160,7 +169,7 @@ fn fetch_final_rows(path: &Path) -> Vec<FinalRow> {
             }
         })
         .collect();
-    conn.close().expect("close final row connection");
+    conn.close().await.expect("close final row connection");
     rows
 }
 
@@ -317,18 +326,20 @@ fn summarize_lane_logs(
     }
 }
 
-fn run_child_workload(run_dir: &Path, mode: &str) -> LaneRunSummary {
+async fn run_child_workload(run_dir: &Path, mode: &str) -> LaneRunSummary {
     let _guard = init_logging(run_dir, true).expect("initialize child logging");
 
     let db_path = run_dir.join("parallel_wal_staging.db");
     let log_path = run_dir.join("test.log.jsonl");
     {
-        let conn = open_connection(&db_path);
+        let conn = open_connection(&db_path).await;
         conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, value TEXT)")
+            .await
             .expect("create table a");
         conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, value TEXT)")
+            .await
             .expect("create table b");
-        conn.close().expect("close setup connection");
+        conn.close().await.expect("close setup connection");
     }
 
     let mut wave_lane_ids = Vec::new();
@@ -341,10 +352,14 @@ fn run_child_workload(run_dir: &Path, mode: &str) -> LaneRunSummary {
         let barrier_b = Arc::clone(&barrier);
 
         let writer_a = thread::spawn(move || {
-            insert_row(&db_path_a, "a", wave + 1, barrier_a);
+            asupersync::test_utils::run_test(|| async {
+                insert_row(&db_path_a, "a", wave + 1, barrier_a).await;
+            });
         });
         let writer_b = thread::spawn(move || {
-            insert_row(&db_path_b, "b", wave + 1, barrier_b);
+            asupersync::test_utils::run_test(|| async {
+                insert_row(&db_path_b, "b", wave + 1, barrier_b).await;
+            });
         });
 
         barrier.wait();
@@ -360,7 +375,7 @@ fn run_child_workload(run_dir: &Path, mode: &str) -> LaneRunSummary {
         wave_lane_ids.push(observed_lane_ids);
     }
 
-    let final_rows = fetch_final_rows(&db_path);
+    let final_rows = fetch_final_rows(&db_path).await;
     summarize_lane_logs(&log_path, mode, final_rows, wave_lane_ids)
 }
 
@@ -616,17 +631,19 @@ fn bd_3wop3_1_2_parallel_wal_staging_lane_overflow_falls_back_without_row_drift(
 #[test]
 #[ignore = "helper entrypoint for the parent test harness; not meant to run directly"]
 fn bd_3wop3_1_2_parallel_wal_staging_child_entrypoint() {
-    let run_dir = PathBuf::from(
-        env::var(CHILD_RUN_DIR_ENV)
-            .expect("child run dir env must be present for child entrypoint"),
-    );
-    fs::create_dir_all(&run_dir).expect("create child run dir");
-    let mode =
-        env::var(CHILD_MODE_ENV).expect("child mode env must be present for child entrypoint");
-    let summary = run_child_workload(&run_dir, &mode);
-    fs::write(
-        run_dir.join("summary.json"),
-        serde_json::to_vec_pretty(&summary).expect("serialize lane run summary"),
-    )
-    .expect("write lane run summary");
+    asupersync::test_utils::run_test(|| async {
+        let run_dir = PathBuf::from(
+            env::var(CHILD_RUN_DIR_ENV)
+                .expect("child run dir env must be present for child entrypoint"),
+        );
+        fs::create_dir_all(&run_dir).expect("create child run dir");
+        let mode =
+            env::var(CHILD_MODE_ENV).expect("child mode env must be present for child entrypoint");
+        let summary = run_child_workload(&run_dir, &mode).await;
+        fs::write(
+            run_dir.join("summary.json"),
+            serde_json::to_vec_pretty(&summary).expect("serialize lane run summary"),
+        )
+        .expect("write lane run summary");
+    });
 }

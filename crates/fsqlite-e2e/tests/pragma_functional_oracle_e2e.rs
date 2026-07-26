@@ -25,8 +25,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -58,11 +58,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -72,7 +72,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -96,53 +96,68 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 
 #[test]
 fn pragma_user_version_default_zero() {
-    scenario(
-        &[],
-        &["PRAGMA user_version"], // 0 on a fresh database
-        "pragma_user_version_default_zero",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[],
+            &["PRAGMA user_version"], // 0 on a fresh database
+            "pragma_user_version_default_zero",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn pragma_user_version_roundtrip() {
-    scenario(
-        &["PRAGMA user_version = 42"],
-        &["PRAGMA user_version"], // 42
-        "pragma_user_version_roundtrip",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &["PRAGMA user_version = 42"],
+            &["PRAGMA user_version"], // 42
+            "pragma_user_version_roundtrip",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn pragma_application_id_roundtrip() {
-    scenario(
-        &["PRAGMA application_id = 12345"],
-        &["PRAGMA application_id"], // 12345
-        "pragma_application_id_roundtrip",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &["PRAGMA application_id = 12345"],
+            &["PRAGMA application_id"], // 12345
+            "pragma_application_id_roundtrip",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn pragma_foreign_keys_setting() {
-    scenario(
-        &["PRAGMA foreign_keys = ON"],
-        &["PRAGMA foreign_keys"], // 1
-        "pragma_foreign_keys_setting",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &["PRAGMA foreign_keys = ON"],
+            &["PRAGMA foreign_keys"], // 1
+            "pragma_foreign_keys_setting",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn pragma_foreign_key_check_clean() {
-    scenario(
-        &[
-            "PRAGMA foreign_keys = ON",
-            "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
-            "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
-            "INSERT INTO parent VALUES (1),(2)",
-            "INSERT INTO child VALUES (10,1),(11,2)",
-        ],
-        &["PRAGMA foreign_key_check"], // no violations -> empty
-        "pragma_foreign_key_check_clean",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "PRAGMA foreign_keys = ON",
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
+                "INSERT INTO parent VALUES (1),(2)",
+                "INSERT INTO child VALUES (10,1),(11,2)",
+            ],
+            &["PRAGMA foreign_key_check"], // no violations -> empty
+            "pragma_foreign_key_check_clean",
+        )
+        .await;
+    });
 }
 
 /// bd-avlou: PRAGMA foreign_key_check is unimplemented — frank returns an empty
@@ -150,19 +165,22 @@ fn pragma_foreign_key_check_clean() {
 /// database. (The clean-database case passes only because it is also empty.)
 #[test]
 fn pragma_foreign_key_check_reports_violation() {
-    // With FK enforcement OFF we can insert an orphan, then foreign_key_check
-    // reports it. The reported columns: (table, rowid, referred_table, fkid).
-    scenario(
-        &[
-            "PRAGMA foreign_keys = OFF",
-            "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
-            "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
-            "INSERT INTO parent VALUES (1)",
-            "INSERT INTO child VALUES (10,1),(11,99)", // 99 is an orphan
-        ],
-        &["PRAGMA foreign_key_check"],
-        "pragma_foreign_key_check_reports_violation",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // With FK enforcement OFF we can insert an orphan, then foreign_key_check
+        // reports it. The reported columns: (table, rowid, referred_table, fkid).
+        scenario(
+            &[
+                "PRAGMA foreign_keys = OFF",
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
+                "INSERT INTO parent VALUES (1)",
+                "INSERT INTO child VALUES (10,1),(11,99)", // 99 is an orphan
+            ],
+            &["PRAGMA foreign_key_check"],
+            "pragma_foreign_key_check_reports_violation",
+        )
+        .await;
+    });
 }
 
 /// br-xugii: `PRAGMA foreign_key_check` must scale. The previous implementation
@@ -173,52 +191,56 @@ fn pragma_foreign_key_check_reports_violation() {
 /// matches rusqlite at scale (and completes effectively instantly).
 #[test]
 fn pragma_foreign_key_check_scale() {
-    const N: i64 = 1500;
-    let f = Connection::open(":memory:").expect("open frank");
-    let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
+    asupersync::test_utils::run_test(|| async {
+        const N: i64 = 1500;
+        let f = Connection::open(":memory:").await.expect("open frank");
+        let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
 
-    for stmt in [
-        "PRAGMA foreign_keys = OFF",
-        "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
-        "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
-    ] {
-        f.execute(stmt).expect("frank ddl");
-        r.execute_batch(stmt).expect("sqlite ddl");
-    }
-
-    // Insert N parent rows and N child rows in chunks. Every 200th child is an
-    // orphan (pid points past the parent range), so there are exactly N/200.
-    let mut parent_chunk = String::new();
-    let mut child_chunk = String::new();
-    for id in 1..=N {
-        if !parent_chunk.is_empty() {
-            parent_chunk.push(',');
-            child_chunk.push(',');
+        for stmt in [
+            "PRAGMA foreign_keys = OFF",
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
+        ] {
+            f.execute(stmt).await.expect("frank ddl");
+            r.execute_batch(stmt).expect("sqlite ddl");
         }
-        parent_chunk.push_str(&format!("({id})"));
-        let pid = if id % 200 == 0 { id + 1_000_000 } else { id };
-        child_chunk.push_str(&format!("({id},{pid})"));
-        if id % 300 == 0 || id == N {
-            let psql = format!("INSERT INTO parent (id) VALUES {parent_chunk}");
-            let csql = format!("INSERT INTO child (id, pid) VALUES {child_chunk}");
-            f.execute(&psql).expect("frank parent insert");
-            r.execute_batch(&psql).expect("sqlite parent insert");
-            f.execute(&csql).expect("frank child insert");
-            r.execute_batch(&csql).expect("sqlite child insert");
-            parent_chunk.clear();
-            child_chunk.clear();
-        }
-    }
 
-    let fc = frank_rows(&f, "PRAGMA foreign_key_check").expect("frank fkc");
-    let rc = sqlite_rows(&r, "PRAGMA foreign_key_check").expect("sqlite fkc");
-    assert_eq!(
-        fc, rc,
-        "foreign_key_check orphan report must match rusqlite at scale"
-    );
-    assert_eq!(
-        i64::try_from(fc.len()).unwrap(),
-        N / 200,
-        "expected exactly N/200 planted orphans"
-    );
+        // Insert N parent rows and N child rows in chunks. Every 200th child is an
+        // orphan (pid points past the parent range), so there are exactly N/200.
+        let mut parent_chunk = String::new();
+        let mut child_chunk = String::new();
+        for id in 1..=N {
+            if !parent_chunk.is_empty() {
+                parent_chunk.push(',');
+                child_chunk.push(',');
+            }
+            parent_chunk.push_str(&format!("({id})"));
+            let pid = if id % 200 == 0 { id + 1_000_000 } else { id };
+            child_chunk.push_str(&format!("({id},{pid})"));
+            if id % 300 == 0 || id == N {
+                let psql = format!("INSERT INTO parent (id) VALUES {parent_chunk}");
+                let csql = format!("INSERT INTO child (id, pid) VALUES {child_chunk}");
+                f.execute(&psql).await.expect("frank parent insert");
+                r.execute_batch(&psql).expect("sqlite parent insert");
+                f.execute(&csql).await.expect("frank child insert");
+                r.execute_batch(&csql).expect("sqlite child insert");
+                parent_chunk.clear();
+                child_chunk.clear();
+            }
+        }
+
+        let fc = frank_rows(&f, "PRAGMA foreign_key_check")
+            .await
+            .expect("frank fkc");
+        let rc = sqlite_rows(&r, "PRAGMA foreign_key_check").expect("sqlite fkc");
+        assert_eq!(
+            fc, rc,
+            "foreign_key_check orphan report must match rusqlite at scale"
+        );
+        assert_eq!(
+            i64::try_from(fc.len()).unwrap(),
+            N / 200,
+            "expected exactly N/200 planted orphans"
+        );
+    });
 }

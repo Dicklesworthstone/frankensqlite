@@ -24,8 +24,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -57,11 +57,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -71,7 +71,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -102,42 +102,51 @@ const TREE: [&str; 3] = [
 
 #[test]
 fn recursive_triggers_default_off_one_level() {
-    scenario(
-        &{
-            let mut v = vec!["PRAGMA recursive_triggers = OFF"];
-            v.extend_from_slice(&TREE);
-            v.push("DELETE FROM t WHERE id = 1");
-            v
-        },
-        // OFF: deleting 1 fires the trigger once -> removes direct children 2,4;
-        // those deletes do NOT re-fire, so 3 (child of 2) survives.
-        &["SELECT id FROM t ORDER BY id"], // [3]
-        "recursive_triggers_default_off_one_level",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &{
+                let mut v = vec!["PRAGMA recursive_triggers = OFF"];
+                v.extend_from_slice(&TREE);
+                v.push("DELETE FROM t WHERE id = 1");
+                v
+            },
+            // OFF: deleting 1 fires the trigger once -> removes direct children 2,4;
+            // those deletes do NOT re-fire, so 3 (child of 2) survives.
+            &["SELECT id FROM t ORDER BY id"], // [3]
+            "recursive_triggers_default_off_one_level",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn recursive_triggers_on_full_cascade() {
-    scenario(
-        &{
-            let mut v = vec!["PRAGMA recursive_triggers = ON"];
-            v.extend_from_slice(&TREE);
-            v.push("DELETE FROM t WHERE id = 1");
-            v
-        },
-        // ON: the cascade re-fires through the whole subtree -> all gone.
-        &["SELECT count(*) FROM t"], // 0
-        "recursive_triggers_on_full_cascade",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &{
+                let mut v = vec!["PRAGMA recursive_triggers = ON"];
+                v.extend_from_slice(&TREE);
+                v.push("DELETE FROM t WHERE id = 1");
+                v
+            },
+            // ON: the cascade re-fires through the whole subtree -> all gone.
+            &["SELECT count(*) FROM t"], // 0
+            "recursive_triggers_on_full_cascade",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn recursive_triggers_pragma_roundtrip() {
-    // Default is OFF (0); turning it on reads back 1.
-    scenario(&[], &["PRAGMA recursive_triggers"], "rt_default");
-    scenario(
-        &["PRAGMA recursive_triggers = ON"],
-        &["PRAGMA recursive_triggers"], // 1
-        "rt_on",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // Default is OFF (0); turning it on reads back 1.
+        scenario(&[], &["PRAGMA recursive_triggers"], "rt_default").await;
+        scenario(
+            &["PRAGMA recursive_triggers = ON"],
+            &["PRAGMA recursive_triggers"], // 1
+            "rt_on",
+        )
+        .await;
+    });
 }

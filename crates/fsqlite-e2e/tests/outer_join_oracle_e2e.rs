@@ -25,8 +25,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -58,11 +58,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -72,7 +72,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -104,96 +104,114 @@ const LR: [&str; 4] = [
 
 #[test]
 fn right_join_keeps_all_right_rows() {
-    scenario(
-        &LR,
-        &[
-            // Every r row appears; the orphan (l_id 99) NULL-extends l.
-            "SELECT l.name, r.tag FROM l RIGHT JOIN r ON l.id = r.l_id ORDER BY r.id",
-            "SELECT count(*) FROM l RIGHT JOIN r ON l.id = r.l_id", // 4
-            // l.id projects correctly across the null-extension (matched + orphan).
-            "SELECT l.id, r.tag FROM l RIGHT JOIN r ON l.id = r.l_id ORDER BY r.id",
-            "SELECT count(*) FROM l RIGHT JOIN r ON l.id = r.l_id WHERE l.id IS NOT NULL", // 3
-        ],
-        "right_join_keeps_all_right_rows",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &LR,
+            &[
+                // Every r row appears; the orphan (l_id 99) NULL-extends l.
+                "SELECT l.name, r.tag FROM l RIGHT JOIN r ON l.id = r.l_id ORDER BY r.id",
+                "SELECT count(*) FROM l RIGHT JOIN r ON l.id = r.l_id", // 4
+                // l.id projects correctly across the null-extension (matched + orphan).
+                "SELECT l.id, r.tag FROM l RIGHT JOIN r ON l.id = r.l_id ORDER BY r.id",
+                "SELECT count(*) FROM l RIGHT JOIN r ON l.id = r.l_id WHERE l.id IS NOT NULL", // 3
+            ],
+            "right_join_keeps_all_right_rows",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn right_join_mirrors_swapped_left_join() {
-    scenario(
-        &LR,
-        &[
-            // `r RIGHT JOIN l` keeps all l rows == `l LEFT JOIN r`.
-            "SELECT l.name, r.tag FROM r RIGHT JOIN l ON l.id = r.l_id ORDER BY l.id, r.id",
-            "SELECT l.name, r.tag FROM l LEFT JOIN r ON l.id = r.l_id ORDER BY l.id, r.id",
-        ],
-        "right_join_mirrors_swapped_left_join",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &LR,
+            &[
+                // `r RIGHT JOIN l` keeps all l rows == `l LEFT JOIN r`.
+                "SELECT l.name, r.tag FROM r RIGHT JOIN l ON l.id = r.l_id ORDER BY l.id, r.id",
+                "SELECT l.name, r.tag FROM l LEFT JOIN r ON l.id = r.l_id ORDER BY l.id, r.id",
+            ],
+            "right_join_mirrors_swapped_left_join",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn full_outer_join_matched_left_only_right_only() {
-    scenario(
-        &LR,
-        &[
-            // Matched (a,x),(a,y),(b,z); left-only (c,NULL); right-only (NULL,orphan).
-            "SELECT l.name, r.tag FROM l FULL OUTER JOIN r ON l.id = r.l_id \
-             ORDER BY coalesce(l.id, 999), coalesce(r.id, 999)",
-            "SELECT count(*) FROM l FULL OUTER JOIN r ON l.id = r.l_id", // 5
-            // Filtering on the preserved side (r.id IS NULL) works correctly.
-            "SELECT count(*) FROM l FULL OUTER JOIN r ON l.id = r.l_id WHERE r.id IS NULL", // 1
-        ],
-        "full_outer_join_matched_left_only_right_only",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &LR,
+            &[
+                // Matched (a,x),(a,y),(b,z); left-only (c,NULL); right-only (NULL,orphan).
+                "SELECT l.name, r.tag FROM l FULL OUTER JOIN r ON l.id = r.l_id \
+                 ORDER BY coalesce(l.id, 999), coalesce(r.id, 999)",
+                "SELECT count(*) FROM l FULL OUTER JOIN r ON l.id = r.l_id", // 5
+                // Filtering on the preserved side (r.id IS NULL) works correctly.
+                "SELECT count(*) FROM l FULL OUTER JOIN r ON l.id = r.l_id WHERE r.id IS NULL", // 1
+            ],
+            "full_outer_join_matched_left_only_right_only",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn full_outer_join_no_overlap() {
-    scenario(
-        &[
-            "CREATE TABLE a (id INTEGER PRIMARY KEY)",
-            "CREATE TABLE b (id INTEGER PRIMARY KEY)",
-            "INSERT INTO a VALUES (1),(2)",
-            "INSERT INTO b VALUES (3),(4)",
-        ],
-        &[
-            // No matches: every row from both sides, NULL-extended.
-            "SELECT a.id, b.id FROM a FULL OUTER JOIN b ON a.id = b.id \
-             ORDER BY coalesce(a.id, b.id)",
-            "SELECT count(*) FROM a FULL OUTER JOIN b ON a.id = b.id", // 4
-        ],
-        "full_outer_join_no_overlap",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE a (id INTEGER PRIMARY KEY)",
+                "CREATE TABLE b (id INTEGER PRIMARY KEY)",
+                "INSERT INTO a VALUES (1),(2)",
+                "INSERT INTO b VALUES (3),(4)",
+            ],
+            &[
+                // No matches: every row from both sides, NULL-extended.
+                "SELECT a.id, b.id FROM a FULL OUTER JOIN b ON a.id = b.id \
+                 ORDER BY coalesce(a.id, b.id)",
+                "SELECT count(*) FROM a FULL OUTER JOIN b ON a.id = b.id", // 4
+            ],
+            "full_outer_join_no_overlap",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn full_outer_join_using_coalesces_column() {
-    scenario(
-        &[
-            "CREATE TABLE t1 (id INTEGER PRIMARY KEY, v1 TEXT)",
-            "CREATE TABLE t2 (id INTEGER PRIMARY KEY, v2 TEXT)",
-            "INSERT INTO t1 VALUES (1,'a'),(2,'b')",
-            "INSERT INTO t2 VALUES (2,'x'),(3,'y')",
-        ],
-        &[
-            // USING(id) yields a single coalesced id column.
-            "SELECT id, v1, v2 FROM t1 FULL OUTER JOIN t2 USING(id) ORDER BY id",
-        ],
-        "full_outer_join_using_coalesces_column",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t1 (id INTEGER PRIMARY KEY, v1 TEXT)",
+                "CREATE TABLE t2 (id INTEGER PRIMARY KEY, v2 TEXT)",
+                "INSERT INTO t1 VALUES (1,'a'),(2,'b')",
+                "INSERT INTO t2 VALUES (2,'x'),(3,'y')",
+            ],
+            &[
+                // USING(id) yields a single coalesced id column.
+                "SELECT id, v1, v2 FROM t1 FULL OUTER JOIN t2 USING(id) ORDER BY id",
+            ],
+            "full_outer_join_using_coalesces_column",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn aggregate_over_right_join() {
-    scenario(
-        &LR,
-        &[
-            // count(r.id) per left group; the orphan forms a NULL-name group.
-            "SELECT l.name, count(r.id) FROM l RIGHT JOIN r ON l.id = r.l_id \
-             GROUP BY l.name ORDER BY l.name",
-        ],
-        "aggregate_over_right_join",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &LR,
+            &[
+                // count(r.id) per left group; the orphan forms a NULL-name group.
+                "SELECT l.name, count(r.id) FROM l RIGHT JOIN r ON l.id = r.l_id \
+                 GROUP BY l.name ORDER BY l.name",
+            ],
+            "aggregate_over_right_join",
+        )
+        .await;
+    });
 }
 
 /// Bug A (bd-41syy): `<outer_col> IS NULL` in WHERE over a RIGHT/FULL join matches
@@ -203,13 +221,16 @@ fn aggregate_over_right_join() {
 /// mis-compiled to constant-true for the null-extendable side.
 #[test]
 fn outer_join_where_outer_col_is_null() {
-    scenario(
-        &LR,
-        &[
-            "SELECT count(*) FROM l RIGHT JOIN r ON l.id = r.l_id WHERE l.id IS NULL", // 1
-            "SELECT r.tag FROM l RIGHT JOIN r ON l.id = r.l_id WHERE l.id IS NULL",    // orphan
-            "SELECT count(*) FROM l FULL OUTER JOIN r ON l.id = r.l_id WHERE l.id IS NULL", // 1
-        ],
-        "outer_join_where_outer_col_is_null",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &LR,
+            &[
+                "SELECT count(*) FROM l RIGHT JOIN r ON l.id = r.l_id WHERE l.id IS NULL", // 1
+                "SELECT r.tag FROM l RIGHT JOIN r ON l.id = r.l_id WHERE l.id IS NULL",    // orphan
+                "SELECT count(*) FROM l FULL OUTER JOIN r ON l.id = r.l_id WHERE l.id IS NULL", // 1
+            ],
+            "outer_join_where_outer_col_is_null",
+        )
+        .await;
+    });
 }

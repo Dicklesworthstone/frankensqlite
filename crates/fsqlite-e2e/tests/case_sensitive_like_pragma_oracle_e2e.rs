@@ -9,6 +9,7 @@
 //! and the behavior inside a WHERE filter, against rusqlite. The pragma is
 //! set-only (it returns no rows), so each phase sets it on both engines and then
 //! compares query results.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -26,8 +27,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -59,10 +60,10 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -86,8 +87,8 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
 
 /// Run a setter statement (e.g. a PRAGMA) on both engines, asserting they agree
 /// on success/failure.
-fn exec_both(f: &Connection, r: &rusqlite::Connection, sql: &str, label: &str) {
-    let fe = f.execute(sql);
+async fn exec_both(f: &Connection, r: &rusqlite::Connection, sql: &str, label: &str) {
+    let fe = f.execute(sql).await;
     let re = r.execute_batch(sql);
     match (&fe, &re) {
         (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -98,132 +99,153 @@ fn exec_both(f: &Connection, r: &rusqlite::Connection, sql: &str, label: &str) {
 
 #[test]
 fn like_default_is_ascii_case_insensitive() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT 'A' LIKE 'a'",         // 1 (ASCII fold)
-            "SELECT 'apple' LIKE 'APPLE'", // 1
-            "SELECT 'a' LIKE 'A'",         // 1
-            "SELECT 'aBcD' LIKE 'AbCd'",   // 1
-            "SELECT 'abc' LIKE 'abx'",     // 0 (real mismatch)
-            // Non-ASCII letters are NEVER folded by LIKE, pragma or not.
-            "SELECT 'À' LIKE 'à'", // 0
-        ],
-        "like_default_is_ascii_case_insensitive",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT 'A' LIKE 'a'",         // 1 (ASCII fold)
+                "SELECT 'apple' LIKE 'APPLE'", // 1
+                "SELECT 'a' LIKE 'A'",         // 1
+                "SELECT 'aBcD' LIKE 'AbCd'",   // 1
+                "SELECT 'abc' LIKE 'abx'",     // 0 (real mismatch)
+                // Non-ASCII letters are NEVER folded by LIKE, pragma or not.
+                "SELECT 'À' LIKE 'à'", // 0
+            ],
+            "like_default_is_ascii_case_insensitive",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn like_case_sensitive_pragma_on() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    exec_both(
-        &f,
-        &r,
-        "PRAGMA case_sensitive_like = ON",
-        "like_case_sensitive_pragma_on",
-    );
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT 'A' LIKE 'a'",         // 0 (now case-sensitive)
-            "SELECT 'A' LIKE 'A'",         // 1
-            "SELECT 'apple' LIKE 'apple'", // 1
-            "SELECT 'apple' LIKE 'APPLE'", // 0
-            // wildcards still work, but the literal part is now case-sensitive
-            "SELECT 'Apple' LIKE 'A%'", // 1
-            "SELECT 'apple' LIKE 'A%'", // 0
-        ],
-        "like_case_sensitive_pragma_on",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        exec_both(
+            &f,
+            &r,
+            "PRAGMA case_sensitive_like = ON",
+            "like_case_sensitive_pragma_on",
+        )
+        .await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT 'A' LIKE 'a'",         // 0 (now case-sensitive)
+                "SELECT 'A' LIKE 'A'",         // 1
+                "SELECT 'apple' LIKE 'apple'", // 1
+                "SELECT 'apple' LIKE 'APPLE'", // 0
+                // wildcards still work, but the literal part is now case-sensitive
+                "SELECT 'Apple' LIKE 'A%'", // 1
+                "SELECT 'apple' LIKE 'A%'", // 0
+            ],
+            "like_case_sensitive_pragma_on",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn like_pragma_toggles_back_off() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    // Phase 1: ON -> case-sensitive.
-    exec_both(
-        &f,
-        &r,
-        "PRAGMA case_sensitive_like = ON",
-        "like_pragma_toggles_back_off",
-    );
-    check(&f, &r, &["SELECT 'A' LIKE 'a'"], "toggle ON phase"); // 0
-    // Phase 2: OFF -> restores ASCII-insensitive default.
-    exec_both(
-        &f,
-        &r,
-        "PRAGMA case_sensitive_like = OFF",
-        "like_pragma_toggles_back_off",
-    );
-    check(&f, &r, &["SELECT 'A' LIKE 'a'"], "toggle OFF phase"); // 1
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        // Phase 1: ON -> case-sensitive.
+        exec_both(
+            &f,
+            &r,
+            "PRAGMA case_sensitive_like = ON",
+            "like_pragma_toggles_back_off",
+        )
+        .await;
+        check(&f, &r, &["SELECT 'A' LIKE 'a'"], "toggle ON phase").await; // 0
+        // Phase 2: OFF -> restores ASCII-insensitive default.
+        exec_both(
+            &f,
+            &r,
+            "PRAGMA case_sensitive_like = OFF",
+            "like_pragma_toggles_back_off",
+        )
+        .await;
+        check(&f, &r, &["SELECT 'A' LIKE 'a'"], "toggle OFF phase").await; // 1
+    });
 }
 
 #[test]
 fn glob_unaffected_by_case_sensitive_like() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    // GLOB is always case-sensitive in the default state...
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT 'A' GLOB 'a'", // 0
-            "SELECT 'a' GLOB 'a'", // 1
-        ],
-        "glob default",
-    );
-    // ...and turning the LIKE pragma ON leaves GLOB exactly the same.
-    exec_both(
-        &f,
-        &r,
-        "PRAGMA case_sensitive_like = ON",
-        "glob_unaffected_by_case_sensitive_like",
-    );
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT 'A' GLOB 'a'", // still 0
-            "SELECT 'a' GLOB 'a'", // still 1
-        ],
-        "glob after pragma ON",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        // GLOB is always case-sensitive in the default state...
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT 'A' GLOB 'a'", // 0
+                "SELECT 'a' GLOB 'a'", // 1
+            ],
+            "glob default",
+        )
+        .await;
+        // ...and turning the LIKE pragma ON leaves GLOB exactly the same.
+        exec_both(
+            &f,
+            &r,
+            "PRAGMA case_sensitive_like = ON",
+            "glob_unaffected_by_case_sensitive_like",
+        )
+        .await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT 'A' GLOB 'a'", // still 0
+                "SELECT 'a' GLOB 'a'", // still 1
+            ],
+            "glob after pragma ON",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn like_pragma_in_where_filter() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    for s in [
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
-        "INSERT INTO t VALUES (1,'apple'),(2,'Apple'),(3,'APPLE'),(4,'banana')",
-    ] {
-        exec_both(&f, &r, s, "like_pragma_in_where_filter");
-    }
-    // Default: case-insensitive -> all three apple variants.
-    check(
-        &f,
-        &r,
-        &["SELECT id FROM t WHERE name LIKE 'apple' ORDER BY id"], // 1,2,3
-        "where default",
-    );
-    // ON: case-sensitive -> only the exact 'apple'.
-    exec_both(
-        &f,
-        &r,
-        "PRAGMA case_sensitive_like = ON",
-        "like_pragma_in_where_filter",
-    );
-    check(
-        &f,
-        &r,
-        &["SELECT id FROM t WHERE name LIKE 'apple' ORDER BY id"], // 1
-        "where pragma ON",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for s in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+            "INSERT INTO t VALUES (1,'apple'),(2,'Apple'),(3,'APPLE'),(4,'banana')",
+        ] {
+            exec_both(&f, &r, s, "like_pragma_in_where_filter").await;
+        }
+        // Default: case-insensitive -> all three apple variants.
+        check(
+            &f,
+            &r,
+            &["SELECT id FROM t WHERE name LIKE 'apple' ORDER BY id"], // 1,2,3
+            "where default",
+        )
+        .await;
+        // ON: case-sensitive -> only the exact 'apple'.
+        exec_both(
+            &f,
+            &r,
+            "PRAGMA case_sensitive_like = ON",
+            "like_pragma_in_where_filter",
+        )
+        .await;
+        check(
+            &f,
+            &r,
+            &["SELECT id FROM t WHERE name LIKE 'apple' ORDER BY id"], // 1
+            "where pragma ON",
+        )
+        .await;
+    });
 }

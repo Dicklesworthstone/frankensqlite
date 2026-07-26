@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! General end-to-end benchmark suite.
 //!
 //! Benchmark discipline: when the rusqlite side uses prepared statements or
@@ -5,6 +7,7 @@
 //! statement-lifecycle mode. Otherwise the benchmark mostly measures avoidable
 //! parse/compile churn rather than engine behavior.
 
+use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -23,7 +26,7 @@ fn apply_subquery_pragmas_csqlite(conn: &rusqlite::Connection) {
          PRAGMA synchronous = NORMAL;\
          PRAGMA cache_size = -64000;",
     )
-    .ok();
+    .expect("failed to apply C SQLite subquery benchmark pragmas");
 }
 
 fn apply_subquery_pragmas_fsqlite(conn: &fsqlite::Connection) {
@@ -33,7 +36,9 @@ fn apply_subquery_pragmas_fsqlite(conn: &fsqlite::Connection) {
         "PRAGMA synchronous = NORMAL;",
         "PRAGMA cache_size = -64000;",
     ] {
-        let _ = conn.execute(pragma);
+        fsqlite_e2e::block_on(conn.execute(pragma)).unwrap_or_else(|error| {
+            panic!("failed to apply FrankenSQLite subquery benchmark pragma `{pragma}`: {error}")
+        });
     }
 }
 
@@ -66,27 +71,29 @@ fn setup_csqlite_exists_regression_bench(row_count: i64) -> rusqlite::Connection
 }
 
 fn setup_fsqlite_exists_regression_bench(row_count: i64) -> fsqlite::Connection {
-    let conn = fsqlite::Connection::open(":memory:").unwrap();
+    let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
     apply_subquery_pragmas_fsqlite(&conn);
-    conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL)")
-        .unwrap();
-    conn.execute(
-        "CREATE TABLE product_flags (product_id INTEGER PRIMARY KEY, active INTEGER NOT NULL)",
+    fsqlite_e2e::block_on(
+        conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL)"),
     )
     .unwrap();
-    conn.execute("BEGIN").unwrap();
+    fsqlite_e2e::block_on(conn.execute(
+        "CREATE TABLE product_flags (product_id INTEGER PRIMARY KEY, active INTEGER NOT NULL)",
+    ))
+    .unwrap();
+    fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
     for i in 1..=row_count {
         let price = i as f64 * 3.14;
-        conn.execute(&format!(
+        fsqlite_e2e::block_on(conn.execute(&format!(
             "INSERT INTO products VALUES ({i}, 'prod_{i}', {price})"
-        ))
+        )))
         .unwrap();
     }
     for i in (1..=row_count).step_by(2) {
-        conn.execute(&format!("INSERT INTO product_flags VALUES ({i}, 1)"))
+        fsqlite_e2e::block_on(conn.execute(&format!("INSERT INTO product_flags VALUES ({i}, 1)")))
             .unwrap();
     }
-    conn.execute("COMMIT").unwrap();
+    fsqlite_e2e::block_on(conn.execute("COMMIT")).unwrap();
     conn
 }
 
@@ -116,23 +123,25 @@ fn setup_csqlite_in_regression_bench(row_count: i64) -> rusqlite::Connection {
 }
 
 fn setup_fsqlite_in_regression_bench(row_count: i64) -> fsqlite::Connection {
-    let conn = fsqlite::Connection::open(":memory:").unwrap();
+    let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
     apply_subquery_pragmas_fsqlite(&conn);
-    conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL)")
+    fsqlite_e2e::block_on(
+        conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL)"),
+    )
+    .unwrap();
+    fsqlite_e2e::block_on(conn.execute("CREATE TABLE selected_ids (id INTEGER PRIMARY KEY)"))
         .unwrap();
-    conn.execute("CREATE TABLE selected_ids (id INTEGER PRIMARY KEY)")
-        .unwrap();
-    conn.execute("BEGIN").unwrap();
+    fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
     for i in 1..=row_count {
         let price = i as f64 * 3.14;
-        conn.execute(&format!(
+        fsqlite_e2e::block_on(conn.execute(&format!(
             "INSERT INTO products VALUES ({i}, 'prod_{i}', {price})"
-        ))
+        )))
         .unwrap();
-        conn.execute(&format!("INSERT INTO selected_ids VALUES ({i})"))
+        fsqlite_e2e::block_on(conn.execute(&format!("INSERT INTO selected_ids VALUES ({i})")))
             .unwrap();
     }
-    conn.execute("COMMIT").unwrap();
+    fsqlite_e2e::block_on(conn.execute("COMMIT")).unwrap();
     conn
 }
 
@@ -161,7 +170,7 @@ fn bench_sequential_inserts(c: &mut Criterion) {
             |conn| {
                 let mut stmt = conn.prepare("INSERT INTO t VALUES (?1, 'val');").unwrap();
                 for i in 0..100_i64 {
-                    stmt.execute(rusqlite::params![i]).unwrap();
+                    black_box(stmt.execute(rusqlite::params![i]).unwrap());
                 }
             },
             BatchSize::LargeInput,
@@ -171,16 +180,21 @@ fn bench_sequential_inserts(c: &mut Criterion) {
     group.bench_function("frankensqlite", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
-                conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
-                    .unwrap();
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
+                fsqlite_e2e::block_on(
+                    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);"),
+                )
+                .unwrap();
                 conn
             },
             |conn| {
-                let stmt = conn.prepare("INSERT INTO t VALUES (?1, 'val');").unwrap();
+                let stmt = fsqlite_e2e::block_on(conn.prepare("INSERT INTO t VALUES (?1, 'val');"))
+                    .unwrap();
                 for i in 0..100_i64 {
-                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
-                        .unwrap();
+                    black_box(
+                        fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
+                            .unwrap(),
+                    );
                 }
             },
             BatchSize::LargeInput,
@@ -215,7 +229,7 @@ fn bench_sequential_inserts_single_txn(c: &mut Criterion) {
                 conn.execute_batch("BEGIN").unwrap();
                 let mut stmt = conn.prepare("INSERT INTO t VALUES (?1, 'val');").unwrap();
                 for i in 0..100_i64 {
-                    stmt.execute(rusqlite::params![i]).unwrap();
+                    black_box(stmt.execute(rusqlite::params![i]).unwrap());
                 }
                 conn.execute_batch("COMMIT").unwrap();
             },
@@ -226,19 +240,24 @@ fn bench_sequential_inserts_single_txn(c: &mut Criterion) {
     group.bench_function("frankensqlite", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
-                conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
-                    .unwrap();
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
+                fsqlite_e2e::block_on(
+                    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);"),
+                )
+                .unwrap();
                 conn
             },
             |conn| {
-                conn.execute("BEGIN").unwrap();
-                let stmt = conn.prepare("INSERT INTO t VALUES (?1, 'val');").unwrap();
+                fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
+                let stmt = fsqlite_e2e::block_on(conn.prepare("INSERT INTO t VALUES (?1, 'val');"))
+                    .unwrap();
                 for i in 0..100_i64 {
-                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
-                        .unwrap();
+                    black_box(
+                        fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
+                            .unwrap(),
+                    );
                 }
-                conn.execute("COMMIT").unwrap();
+                fsqlite_e2e::block_on(conn.execute("COMMIT")).unwrap();
             },
             BatchSize::LargeInput,
         );
@@ -272,7 +291,7 @@ fn bench_bulk_inserts(c: &mut Criterion) {
                     .prepare("INSERT INTO t VALUES (?1, ('name_' || ?1), (?1 * 1.1));")
                     .unwrap();
                 for i in 0..1000_i64 {
-                    stmt.execute(rusqlite::params![i]).unwrap();
+                    black_box(stmt.execute(rusqlite::params![i]).unwrap());
                 }
                 conn.execute_batch("COMMIT;").unwrap();
             },
@@ -283,21 +302,26 @@ fn bench_bulk_inserts(c: &mut Criterion) {
     group.bench_function("frankensqlite", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
-                conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, value REAL);")
-                    .unwrap();
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
+                fsqlite_e2e::block_on(
+                    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, value REAL);"),
+                )
+                .unwrap();
                 conn
             },
             |conn| {
-                conn.execute("BEGIN;").unwrap();
-                let stmt = conn
-                    .prepare("INSERT INTO t VALUES (?1, ('name_' || ?1), (?1 * 1.1));")
-                    .unwrap();
+                fsqlite_e2e::block_on(conn.execute("BEGIN;")).unwrap();
+                let stmt = fsqlite_e2e::block_on(
+                    conn.prepare("INSERT INTO t VALUES (?1, ('name_' || ?1), (?1 * 1.1));"),
+                )
+                .unwrap();
                 for i in 0..1000_i64 {
-                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
-                        .unwrap();
+                    black_box(
+                        fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
+                            .unwrap(),
+                    );
                 }
-                conn.execute("COMMIT;").unwrap();
+                fsqlite_e2e::block_on(conn.execute("COMMIT;")).unwrap();
             },
             BatchSize::LargeInput,
         );
@@ -337,29 +361,31 @@ fn bench_select_queries(c: &mut Criterion) {
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
+            black_box(&rows);
             assert_eq!(rows.len(), 50);
         });
     });
 
     group.bench_function("frankensqlite", |b| {
-        let conn = fsqlite::Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
+        let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
+        fsqlite_e2e::block_on(conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);"))
             .unwrap();
         {
-            let stmt = conn
-                .prepare("INSERT INTO t VALUES (?1, ('v' || ?1));")
-                .unwrap();
+            let stmt =
+                fsqlite_e2e::block_on(conn.prepare("INSERT INTO t VALUES (?1, ('v' || ?1));"))
+                    .unwrap();
             for i in 0..100_i64 {
-                stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
                     .unwrap();
             }
         }
-        let stmt = conn
-            .prepare("SELECT * FROM t WHERE id >= 25 AND id < 75")
-            .unwrap();
+        let stmt =
+            fsqlite_e2e::block_on(conn.prepare("SELECT * FROM t WHERE id >= 25 AND id < 75"))
+                .unwrap();
 
         b.iter(|| {
-            let rows = stmt.query().unwrap();
+            let rows = fsqlite_e2e::block_on(stmt.query()).unwrap();
+            black_box(&rows);
             assert_eq!(rows.len(), 50);
         });
     });
@@ -398,13 +424,13 @@ fn bench_mixed_dml(c: &mut Criterion) {
                         .prepare("UPDATE t SET n = (?1 * 100) WHERE id = ?1;")
                         .unwrap();
                     for i in 0..50_i64 {
-                        stmt.execute(rusqlite::params![i]).unwrap();
+                        black_box(stmt.execute(rusqlite::params![i]).unwrap());
                     }
                 }
                 {
                     let mut stmt = conn.prepare("DELETE FROM t WHERE id = ?1;").unwrap();
                     for i in 150..200_i64 {
-                        stmt.execute(rusqlite::params![i]).unwrap();
+                        black_box(stmt.execute(rusqlite::params![i]).unwrap());
                     }
                 }
                 {
@@ -412,11 +438,12 @@ fn bench_mixed_dml(c: &mut Criterion) {
                         .prepare("INSERT INTO t VALUES (?1, ('new_' || ?1), ?1);")
                         .unwrap();
                     for i in 200..250_i64 {
-                        stmt.execute(rusqlite::params![i]).unwrap();
+                        black_box(stmt.execute(rusqlite::params![i]).unwrap());
                     }
                 }
                 let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
                 let count: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+                black_box(count);
                 assert_eq!(count, 200);
             },
             BatchSize::LargeInput,
@@ -426,44 +453,61 @@ fn bench_mixed_dml(c: &mut Criterion) {
     group.bench_function("frankensqlite", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
-                conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, n INTEGER);")
-                    .unwrap();
-                let insert_stmt = conn
-                    .prepare("INSERT INTO t VALUES (?1, ('val_' || ?1), (?1 * 10));")
-                    .unwrap();
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
+                fsqlite_e2e::block_on(
+                    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, n INTEGER);"),
+                )
+                .unwrap();
+                let insert_stmt = fsqlite_e2e::block_on(
+                    conn.prepare("INSERT INTO t VALUES (?1, ('val_' || ?1), (?1 * 10));"),
+                )
+                .unwrap();
                 for i in 0..200_i64 {
-                    insert_stmt
-                        .execute_with_params(&[SqliteValue::Integer(i)])
-                        .unwrap();
+                    fsqlite_e2e::block_on(
+                        insert_stmt.execute_with_params(&[SqliteValue::Integer(i)]),
+                    )
+                    .unwrap();
                 }
                 conn
             },
             |conn| {
-                let update_stmt = conn
-                    .prepare("UPDATE t SET n = (?1 * 100) WHERE id = ?1;")
-                    .unwrap();
+                let update_stmt = fsqlite_e2e::block_on(
+                    conn.prepare("UPDATE t SET n = (?1 * 100) WHERE id = ?1;"),
+                )
+                .unwrap();
                 for i in 0..50_i64 {
-                    update_stmt
-                        .execute_with_params(&[SqliteValue::Integer(i)])
-                        .unwrap();
+                    black_box(
+                        fsqlite_e2e::block_on(
+                            update_stmt.execute_with_params(&[SqliteValue::Integer(i)]),
+                        )
+                        .unwrap(),
+                    );
                 }
-                let delete_stmt = conn.prepare("DELETE FROM t WHERE id = ?1;").unwrap();
+                let delete_stmt =
+                    fsqlite_e2e::block_on(conn.prepare("DELETE FROM t WHERE id = ?1;")).unwrap();
                 for i in 150..200_i64 {
-                    delete_stmt
-                        .execute_with_params(&[SqliteValue::Integer(i)])
-                        .unwrap();
+                    black_box(
+                        fsqlite_e2e::block_on(
+                            delete_stmt.execute_with_params(&[SqliteValue::Integer(i)]),
+                        )
+                        .unwrap(),
+                    );
                 }
-                let insert_stmt = conn
-                    .prepare("INSERT INTO t VALUES (?1, ('new_' || ?1), ?1);")
-                    .unwrap();
+                let insert_stmt = fsqlite_e2e::block_on(
+                    conn.prepare("INSERT INTO t VALUES (?1, ('new_' || ?1), ?1);"),
+                )
+                .unwrap();
                 for i in 200..250_i64 {
-                    insert_stmt
-                        .execute_with_params(&[SqliteValue::Integer(i)])
-                        .unwrap();
+                    black_box(
+                        fsqlite_e2e::block_on(
+                            insert_stmt.execute_with_params(&[SqliteValue::Integer(i)]),
+                        )
+                        .unwrap(),
+                    );
                 }
-                let stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
-                let row = stmt.query_row().unwrap();
+                let stmt = fsqlite_e2e::block_on(conn.prepare("SELECT count(*) FROM t")).unwrap();
+                let row = fsqlite_e2e::block_on(stmt.query_row()).unwrap();
+                black_box(&row);
                 let count = &row.values()[0];
                 assert_eq!(*count, SqliteValue::Integer(200));
             },
@@ -498,7 +542,7 @@ fn bench_write_throughput_autocommit(c: &mut Criterion) {
                     .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));")
                     .unwrap();
                 for i in 0..10_000_i64 {
-                    stmt.execute(rusqlite::params![i]).unwrap();
+                    black_box(stmt.execute(rusqlite::params![i]).unwrap());
                 }
             },
             BatchSize::LargeInput,
@@ -508,18 +552,23 @@ fn bench_write_throughput_autocommit(c: &mut Criterion) {
     group.bench_function("frankensqlite", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
-                conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, data TEXT, value REAL);")
-                    .unwrap();
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
+                fsqlite_e2e::block_on(conn.execute(
+                    "CREATE TABLE bench (id INTEGER PRIMARY KEY, data TEXT, value REAL);",
+                ))
+                .unwrap();
                 conn
             },
             |conn| {
-                let stmt = conn
-                    .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));")
-                    .unwrap();
+                let stmt = fsqlite_e2e::block_on(
+                    conn.prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));"),
+                )
+                .unwrap();
                 for i in 0..10_000_i64 {
-                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
-                        .unwrap();
+                    black_box(
+                        fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
+                            .unwrap(),
+                    );
                 }
             },
             BatchSize::LargeInput,
@@ -554,7 +603,7 @@ fn bench_write_throughput_batched(c: &mut Criterion) {
                     conn.execute_batch("BEGIN;").unwrap();
                     let base = batch * 1000;
                     for i in base..base + 1000 {
-                        stmt.execute(rusqlite::params![i]).unwrap();
+                        black_box(stmt.execute(rusqlite::params![i]).unwrap());
                     }
                     conn.execute_batch("COMMIT;").unwrap();
                 }
@@ -566,23 +615,30 @@ fn bench_write_throughput_batched(c: &mut Criterion) {
     group.bench_function("frankensqlite", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
-                conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, data TEXT, value REAL);")
-                    .unwrap();
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
+                fsqlite_e2e::block_on(conn.execute(
+                    "CREATE TABLE bench (id INTEGER PRIMARY KEY, data TEXT, value REAL);",
+                ))
+                .unwrap();
                 conn
             },
             |conn| {
-                let stmt = conn
-                    .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));")
-                    .unwrap();
+                let stmt = fsqlite_e2e::block_on(
+                    conn.prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));"),
+                )
+                .unwrap();
                 for batch in 0..10 {
-                    conn.execute("BEGIN;").unwrap();
+                    fsqlite_e2e::block_on(conn.execute("BEGIN;")).unwrap();
                     let base = batch as i64 * 1000;
                     for i in base..base + 1000 {
-                        stmt.execute_with_params(&[SqliteValue::Integer(i)])
-                            .unwrap();
+                        black_box(
+                            fsqlite_e2e::block_on(
+                                stmt.execute_with_params(&[SqliteValue::Integer(i)]),
+                            )
+                            .unwrap(),
+                        );
                     }
-                    conn.execute("COMMIT;").unwrap();
+                    fsqlite_e2e::block_on(conn.execute("COMMIT;")).unwrap();
                 }
             },
             BatchSize::LargeInput,
@@ -615,7 +671,7 @@ fn bench_write_throughput_single_txn(c: &mut Criterion) {
                     .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));")
                     .unwrap();
                 for i in 0..10_000_i64 {
-                    stmt.execute(rusqlite::params![i]).unwrap();
+                    black_box(stmt.execute(rusqlite::params![i]).unwrap());
                 }
                 conn.execute_batch("COMMIT;").unwrap();
             },
@@ -626,21 +682,26 @@ fn bench_write_throughput_single_txn(c: &mut Criterion) {
     group.bench_function("frankensqlite", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
-                conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, data TEXT, value REAL);")
-                    .unwrap();
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
+                fsqlite_e2e::block_on(conn.execute(
+                    "CREATE TABLE bench (id INTEGER PRIMARY KEY, data TEXT, value REAL);",
+                ))
+                .unwrap();
                 conn
             },
             |conn| {
-                conn.execute("BEGIN;").unwrap();
-                let stmt = conn
-                    .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));")
-                    .unwrap();
+                fsqlite_e2e::block_on(conn.execute("BEGIN;")).unwrap();
+                let stmt = fsqlite_e2e::block_on(
+                    conn.prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));"),
+                )
+                .unwrap();
                 for i in 0..10_000_i64 {
-                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
-                        .unwrap();
+                    black_box(
+                        fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
+                            .unwrap(),
+                    );
                 }
-                conn.execute("COMMIT;").unwrap();
+                fsqlite_e2e::block_on(conn.execute("COMMIT;")).unwrap();
             },
             BatchSize::LargeInput,
         );
@@ -695,9 +756,11 @@ fn bench_read_heavy_select(c: &mut Criterion) {
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
+            black_box(&rows);
             assert_eq!(rows.len(), 101);
 
             let count: i64 = q_agg.query_row([], |row| row.get(0)).unwrap();
+            black_box(count);
             assert_eq!(count, 1000);
 
             let groups: Vec<(String, i64)> = q_group
@@ -705,56 +768,66 @@ fn bench_read_heavy_select(c: &mut Criterion) {
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
+            black_box(&groups);
             assert_eq!(groups.len(), 10);
 
-            let _rows: Vec<i64> = q_compound
+            let rows: Vec<i64> = q_compound
                 .query_map([], |row| row.get(0))
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
+            black_box(&rows);
         });
     });
 
     group.bench_function("frankensqlite", |b| {
-        let conn = fsqlite::Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, tag TEXT, val INTEGER);")
-            .unwrap();
+        let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
+        fsqlite_e2e::block_on(
+            conn.execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, tag TEXT, val INTEGER);",
+            ),
+        )
+        .unwrap();
         {
-            let stmt = conn
-                .prepare(
-                    "INSERT INTO t VALUES (?1, ('name_' || ?1), \
+            let stmt = fsqlite_e2e::block_on(conn.prepare(
+                "INSERT INTO t VALUES (?1, ('name_' || ?1), \
                      ('tag_' || (?1 % 10)), (?1 * 7));",
-                )
-                .unwrap();
+            ))
+            .unwrap();
             for i in 0..1000_i64 {
-                stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
                     .unwrap();
             }
         }
-        let q_range = conn
-            .prepare("SELECT * FROM t WHERE id BETWEEN 100 AND 200")
-            .unwrap();
-        let q_agg = conn
-            .prepare("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM t")
-            .unwrap();
-        let q_group = conn
-            .prepare("SELECT tag, COUNT(*) FROM t GROUP BY tag")
-            .unwrap();
-        let q_compound = conn
-            .prepare("SELECT * FROM t WHERE val > 3500 AND val < 5000")
-            .unwrap();
+        let q_range =
+            fsqlite_e2e::block_on(conn.prepare("SELECT * FROM t WHERE id BETWEEN 100 AND 200"))
+                .unwrap();
+        let q_agg = fsqlite_e2e::block_on(
+            conn.prepare("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM t"),
+        )
+        .unwrap();
+        let q_group =
+            fsqlite_e2e::block_on(conn.prepare("SELECT tag, COUNT(*) FROM t GROUP BY tag"))
+                .unwrap();
+        let q_compound =
+            fsqlite_e2e::block_on(conn.prepare("SELECT * FROM t WHERE val > 3500 AND val < 5000"))
+                .unwrap();
 
         b.iter(|| {
-            let rows = q_range.query().unwrap();
+            let rows = fsqlite_e2e::block_on(q_range.query()).unwrap();
+            black_box(&rows);
             assert_eq!(rows.len(), 101);
 
-            let agg = q_agg.query().unwrap();
+            let agg = fsqlite_e2e::block_on(q_agg.query()).unwrap();
+            black_box(&agg);
             assert_eq!(agg.len(), 1);
 
-            let groups = q_group.query().unwrap();
+            let groups = fsqlite_e2e::block_on(q_group.query()).unwrap();
+            black_box(&groups);
             assert_eq!(groups.len(), 10);
 
-            let _ = q_compound.query().unwrap();
+            let rows = fsqlite_e2e::block_on(q_compound.query()).unwrap();
+            black_box(&rows);
         });
     });
 
@@ -777,15 +850,17 @@ fn bench_exists_subquery_100k(c: &mut Criterion) {
         let mut stmt = conn.prepare(sql).unwrap();
         b.iter(|| {
             let count: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+            black_box(count);
             assert_eq!(count, expected_count);
         });
     });
 
     group.bench_function("frankensqlite", |b| {
         let conn = setup_fsqlite_exists_regression_bench(SUBQUERY_ROWS_100K);
-        let stmt = conn.prepare(sql).unwrap();
+        let stmt = fsqlite_e2e::block_on(conn.prepare(sql)).unwrap();
         b.iter(|| {
-            let row = stmt.query_row().unwrap();
+            let row = fsqlite_e2e::block_on(stmt.query_row()).unwrap();
+            black_box(&row);
             assert_eq!(row.values()[0], SqliteValue::Integer(expected_count));
         });
     });
@@ -809,15 +884,17 @@ fn bench_in_subquery_100k(c: &mut Criterion) {
         let mut stmt = conn.prepare(sql).unwrap();
         b.iter(|| {
             let count: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+            black_box(count);
             assert_eq!(count, expected_count);
         });
     });
 
     group.bench_function("frankensqlite", |b| {
         let conn = setup_fsqlite_in_regression_bench(SUBQUERY_ROWS_100K);
-        let stmt = conn.prepare(sql).unwrap();
+        let stmt = fsqlite_e2e::block_on(conn.prepare(sql)).unwrap();
         b.iter(|| {
-            let row = stmt.query_row().unwrap();
+            let row = fsqlite_e2e::block_on(stmt.query_row()).unwrap();
+            black_box(&row);
             assert_eq!(row.values()[0], SqliteValue::Integer(expected_count));
         });
     });
@@ -858,28 +935,33 @@ fn bench_mixed_oltp(c: &mut Criterion) {
                 for op in 0_i64..100 {
                     if op % 5 == 0 {
                         if op % 10 == 0 {
-                            conn.execute(
-                                "INSERT INTO t VALUES (?1, 'new', ?1)",
-                                rusqlite::params![next_id],
-                            )
-                            .unwrap();
+                            black_box(
+                                conn.execute(
+                                    "INSERT INTO t VALUES (?1, 'new', ?1)",
+                                    rusqlite::params![next_id],
+                                )
+                                .unwrap(),
+                            );
                             next_id += 1;
                         } else {
-                            conn.execute(
-                                "UPDATE t SET val = ?1 WHERE id = ?2",
-                                rusqlite::params![op * 100, op],
-                            )
-                            .unwrap();
+                            black_box(
+                                conn.execute(
+                                    "UPDATE t SET val = ?1 WHERE id = ?2",
+                                    rusqlite::params![op * 100, op],
+                                )
+                                .unwrap(),
+                            );
                         }
                     } else {
                         let target = (op * 5) % 500;
-                        let _: i64 = conn
+                        let value: i64 = conn
                             .query_row(
                                 "SELECT val FROM t WHERE id = ?1",
                                 rusqlite::params![target],
                                 |row| row.get(0),
                             )
                             .unwrap();
+                        black_box(value);
                     }
                 }
             },
@@ -890,16 +972,22 @@ fn bench_mixed_oltp(c: &mut Criterion) {
     group.bench_function("frankensqlite", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
-                conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER);")
-                    .unwrap();
-                let insert_stmt = conn
-                    .prepare("INSERT INTO t VALUES (?1, ('name_' || ?1), (?1 * 3));")
-                    .unwrap();
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
+                fsqlite_e2e::block_on(
+                    conn.execute(
+                        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER);",
+                    ),
+                )
+                .unwrap();
+                let insert_stmt = fsqlite_e2e::block_on(
+                    conn.prepare("INSERT INTO t VALUES (?1, ('name_' || ?1), (?1 * 3));"),
+                )
+                .unwrap();
                 for i in 0..500_i64 {
-                    insert_stmt
-                        .execute_with_params(&[SqliteValue::Integer(i)])
-                        .unwrap();
+                    fsqlite_e2e::block_on(
+                        insert_stmt.execute_with_params(&[SqliteValue::Integer(i)]),
+                    )
+                    .unwrap();
                 }
                 conn
             },
@@ -908,27 +996,31 @@ fn bench_mixed_oltp(c: &mut Criterion) {
                 for op in 0..100_i64 {
                     if op % 5 == 0 {
                         if op % 10 == 0 {
-                            conn.execute_with_params(
-                                "INSERT INTO t VALUES (?1, 'new', ?1)",
-                                &[SqliteValue::Integer(next_id)],
-                            )
-                            .unwrap();
+                            black_box(
+                                fsqlite_e2e::block_on(conn.execute_with_params(
+                                    "INSERT INTO t VALUES (?1, 'new', ?1)",
+                                    &[SqliteValue::Integer(next_id)],
+                                ))
+                                .unwrap(),
+                            );
                             next_id += 1;
                         } else {
-                            conn.execute_with_params(
-                                "UPDATE t SET val = ?1 WHERE id = ?2",
-                                &[SqliteValue::Integer(op * 100), SqliteValue::Integer(op)],
-                            )
-                            .unwrap();
+                            black_box(
+                                fsqlite_e2e::block_on(conn.execute_with_params(
+                                    "UPDATE t SET val = ?1 WHERE id = ?2",
+                                    &[SqliteValue::Integer(op * 100), SqliteValue::Integer(op)],
+                                ))
+                                .unwrap(),
+                            );
                         }
                     } else {
                         let target = (op * 5) % 500;
-                        let row = conn
-                            .query_row_with_params(
-                                "SELECT val FROM t WHERE id = ?1",
-                                &[SqliteValue::Integer(target)],
-                            )
-                            .unwrap();
+                        let row = fsqlite_e2e::block_on(conn.query_row_with_params(
+                            "SELECT val FROM t WHERE id = ?1",
+                            &[SqliteValue::Integer(target)],
+                        ))
+                        .unwrap();
+                        black_box(&row);
                         assert_eq!(row.values().len(), 1);
                     }
                 }
@@ -965,7 +1057,7 @@ fn bench_large_txn_100k(c: &mut Criterion) {
                     .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 3));")
                     .unwrap();
                 for i in 0..100_000_i64 {
-                    stmt.execute(rusqlite::params![i]).unwrap();
+                    black_box(stmt.execute(rusqlite::params![i]).unwrap());
                 }
                 conn.execute_batch("COMMIT;").unwrap();
             },
@@ -976,23 +1068,26 @@ fn bench_large_txn_100k(c: &mut Criterion) {
     group.bench_function("frankensqlite", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
-                conn.execute(
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
+                fsqlite_e2e::block_on(conn.execute(
                     "CREATE TABLE bench (id INTEGER PRIMARY KEY, data TEXT, val INTEGER);",
-                )
+                ))
                 .unwrap();
                 conn
             },
             |conn| {
-                conn.execute("BEGIN;").unwrap();
-                let stmt = conn
-                    .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 3));")
-                    .unwrap();
+                fsqlite_e2e::block_on(conn.execute("BEGIN;")).unwrap();
+                let stmt = fsqlite_e2e::block_on(
+                    conn.prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 3));"),
+                )
+                .unwrap();
                 for i in 0..100_000_i64 {
-                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
-                        .unwrap();
+                    black_box(
+                        fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
+                            .unwrap(),
+                    );
                 }
-                conn.execute("COMMIT;").unwrap();
+                fsqlite_e2e::block_on(conn.execute("COMMIT;")).unwrap();
             },
             BatchSize::LargeInput,
         );
@@ -1024,7 +1119,7 @@ fn bench_large_txn_1m(c: &mut Criterion) {
                     .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 3));")
                     .unwrap();
                 for i in 0..1_000_000_i64 {
-                    stmt.execute(rusqlite::params![i]).unwrap();
+                    black_box(stmt.execute(rusqlite::params![i]).unwrap());
                 }
                 conn.execute_batch("COMMIT;").unwrap();
             },
@@ -1035,23 +1130,26 @@ fn bench_large_txn_1m(c: &mut Criterion) {
     group.bench_function("frankensqlite", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
-                conn.execute(
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
+                fsqlite_e2e::block_on(conn.execute(
                     "CREATE TABLE bench (id INTEGER PRIMARY KEY, data TEXT, val INTEGER);",
-                )
+                ))
                 .unwrap();
                 conn
             },
             |conn| {
-                conn.execute("BEGIN;").unwrap();
-                let stmt = conn
-                    .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 3));")
-                    .unwrap();
+                fsqlite_e2e::block_on(conn.execute("BEGIN;")).unwrap();
+                let stmt = fsqlite_e2e::block_on(
+                    conn.prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 3));"),
+                )
+                .unwrap();
                 for i in 0..1_000_000_i64 {
-                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
-                        .unwrap();
+                    black_box(
+                        fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
+                            .unwrap(),
+                    );
                 }
-                conn.execute("COMMIT;").unwrap();
+                fsqlite_e2e::block_on(conn.execute("COMMIT;")).unwrap();
             },
             BatchSize::LargeInput,
         );
@@ -1065,9 +1163,11 @@ fn bench_large_txn_1m(c: &mut Criterion) {
 // Each thread creates its own in-memory database and inserts 1000 rows
 // in a single transaction.  FrankenSQLite's Connection uses Rc (not Send),
 // so connections must be created inside each thread.
+// This is an independent-database scaling control, not shared-database
+// concurrent-writer evidence.
 
-// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=concurrent
-// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=concurrent
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=concurrent, comparison=independent_db_control
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=concurrent, comparison=independent_db_control
 fn bench_concurrent_writes(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent_write_throughput");
     group.sample_size(10);
@@ -1092,7 +1192,7 @@ fn bench_concurrent_writes(c: &mut Criterion) {
                                     .prepare("INSERT INTO t VALUES (?1, ('v' || ?1));")
                                     .unwrap();
                                 for i in 0..1000_i64 {
-                                    stmt.execute(rusqlite::params![i]).unwrap();
+                                    black_box(stmt.execute(rusqlite::params![i]).unwrap());
                                 }
                                 conn.execute_batch("COMMIT;").unwrap();
                             });
@@ -1110,18 +1210,29 @@ fn bench_concurrent_writes(c: &mut Criterion) {
                     std::thread::scope(|s| {
                         for _ in 0..threads {
                             s.spawn(|| {
-                                let conn = fsqlite::Connection::open(":memory:").unwrap();
-                                conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
-                                    .unwrap();
-                                conn.execute("BEGIN;").unwrap();
-                                let stmt = conn
-                                    .prepare("INSERT INTO t VALUES (?1, ('v' || ?1));")
-                                    .unwrap();
-                                for i in 0..1000_i64 {
-                                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                                let conn =
+                                    fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:"))
                                         .unwrap();
+                                fsqlite_e2e::block_on(
+                                    conn.execute(
+                                        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);",
+                                    ),
+                                )
+                                .unwrap();
+                                fsqlite_e2e::block_on(conn.execute("BEGIN;")).unwrap();
+                                let stmt = fsqlite_e2e::block_on(
+                                    conn.prepare("INSERT INTO t VALUES (?1, ('v' || ?1));"),
+                                )
+                                .unwrap();
+                                for i in 0..1000_i64 {
+                                    black_box(
+                                        fsqlite_e2e::block_on(
+                                            stmt.execute_with_params(&[SqliteValue::Integer(i)]),
+                                        )
+                                        .unwrap(),
+                                    );
                                 }
-                                conn.execute("COMMIT;").unwrap();
+                                fsqlite_e2e::block_on(conn.execute("COMMIT;")).unwrap();
                             });
                         }
                     });

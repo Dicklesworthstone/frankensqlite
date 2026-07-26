@@ -27,6 +27,7 @@
 //! assertions are enabled. Replay it explicitly with `--profile release-perf`.
 
 #![allow(clippy::cast_precision_loss)]
+#![recursion_limit = "512"]
 
 use serde_json::json;
 use std::sync::{Arc, Barrier};
@@ -68,125 +69,133 @@ fn jains_fairness_index(values: &[f64]) -> f64 {
 
 #[test]
 fn p1_crash_recovery_round_trip() {
-    let tn = "p1_crash_recovery";
-    emit_log(tn, "start", json!({}));
+    asupersync::test_utils::run_test(|| async {
+        let tn = "p1_crash_recovery";
+        emit_log(tn, "start", json!({}));
 
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("p1.db");
-    let path_str = db_path.to_str().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("p1.db");
+        let path_str = db_path.to_str().unwrap();
 
-    // Write data
-    {
-        let conn = fsqlite::Connection::open(path_str).unwrap();
-        conn.execute("CREATE TABLE p1 (id INTEGER PRIMARY KEY, val TEXT)")
-            .unwrap();
-        conn.execute("BEGIN").unwrap();
-        for i in 0..500 {
-            conn.execute(&format!("INSERT INTO p1 VALUES ({i}, 'row_{i:04}')"))
+        // Write data
+        {
+            let conn = fsqlite::Connection::open(path_str).await.unwrap();
+            conn.execute("CREATE TABLE p1 (id INTEGER PRIMARY KEY, val TEXT)")
+                .await
                 .unwrap();
+            conn.execute("BEGIN").await.unwrap();
+            for i in 0..500 {
+                conn.execute(&format!("INSERT INTO p1 VALUES ({i}, 'row_{i:04}')"))
+                    .await
+                    .unwrap();
+            }
+            conn.execute("COMMIT").await.unwrap();
+            // Drop connection to simulate crash-like close
         }
-        conn.execute("COMMIT").unwrap();
-        // Drop connection to simulate crash-like close
-    }
 
-    // Reopen and verify
-    let conn = fsqlite::Connection::open(path_str).unwrap();
-    let rows = conn.query("SELECT COUNT(*) FROM p1").unwrap();
-    let count = match &rows[0].values()[0] {
-        fsqlite_types::value::SqliteValue::Integer(n) => *n,
-        other => panic!("unexpected: {other:?}"),
-    };
+        // Reopen and verify
+        let conn = fsqlite::Connection::open(path_str).await.unwrap();
+        let rows = conn.query("SELECT COUNT(*) FROM p1").await.unwrap();
+        let count = match &rows[0].values()[0] {
+            fsqlite_types::value::SqliteValue::Integer(n) => *n,
+            other => panic!("unexpected: {other:?}"),
+        };
 
-    // Cross-verify with csqlite
-    let cconn = rusqlite::Connection::open(path_str).unwrap();
-    let c_count: i64 = cconn
-        .query_row("SELECT COUNT(*) FROM p1", [], |r| r.get(0))
-        .unwrap();
+        // Cross-verify with csqlite
+        let cconn = rusqlite::Connection::open(path_str).unwrap();
+        let c_count: i64 = cconn
+            .query_row("SELECT COUNT(*) FROM p1", [], |r| r.get(0))
+            .unwrap();
 
-    emit_log(
-        tn,
-        "result",
-        json!({
-            "fsqlite_count": count,
-            "csqlite_count": c_count,
-            "expected": 500,
-        }),
-    );
+        emit_log(
+            tn,
+            "result",
+            json!({
+                "fsqlite_count": count,
+                "csqlite_count": c_count,
+                "expected": 500,
+            }),
+        );
 
-    assert_eq!(
-        count, 500,
-        "[P1] expected 500 rows after reopen, got {count}"
-    );
-    assert_eq!(c_count, 500, "[P1] csqlite also sees 500 rows");
+        assert_eq!(
+            count, 500,
+            "[P1] expected 500 rows after reopen, got {count}"
+        );
+        assert_eq!(c_count, 500, "[P1] csqlite also sees 500 rows");
+    });
 }
 
 // ─── P2: Corruption freedom — integrity check ───────────────────────
 
 #[test]
 fn p2_corruption_freedom_integrity() {
-    let tn = "p2_integrity";
-    emit_log(tn, "start", json!({}));
+    asupersync::test_utils::run_test(|| async {
+        let tn = "p2_integrity";
+        emit_log(tn, "start", json!({}));
 
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("p2.db");
-    let path_str = db_path.to_str().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("p2.db");
+        let path_str = db_path.to_str().unwrap();
 
-    let conn = fsqlite::Connection::open(path_str).unwrap();
-    conn.execute("CREATE TABLE p2 (id INTEGER PRIMARY KEY, data BLOB)")
-        .unwrap();
-
-    // Bulk write with varied data sizes to exercise multiple pages
-    conn.execute("BEGIN").unwrap();
-    for i in 0..200 {
-        let blob_size = 50 + (i % 100) * 10;
-        let blob_hex: String = (0..blob_size)
-            .map(|b| format!("{:02x}", (b + i) & 0xFF))
-            .collect();
-        conn.execute(&format!("INSERT INTO p2 VALUES ({i}, X'{blob_hex}')"))
+        let conn = fsqlite::Connection::open(path_str).await.unwrap();
+        conn.execute("CREATE TABLE p2 (id INTEGER PRIMARY KEY, data BLOB)")
+            .await
             .unwrap();
-    }
-    conn.execute("COMMIT").unwrap();
 
-    // Run integrity check
-    let integrity = conn.query("PRAGMA integrity_check").unwrap();
-    let integrity_result = match &integrity[0].values()[0] {
-        fsqlite_types::value::SqliteValue::Text(s) => s.as_str().to_owned(),
-        other => format!("{other:?}"),
-    };
+        // Bulk write with varied data sizes to exercise multiple pages
+        conn.execute("BEGIN").await.unwrap();
+        for i in 0..200 {
+            let blob_size = 50 + (i % 100) * 10;
+            let blob_hex: String = (0..blob_size)
+                .map(|b| format!("{:02x}", (b + i) & 0xFF))
+                .collect();
+            conn.execute(&format!("INSERT INTO p2 VALUES ({i}, X'{blob_hex}')"))
+                .await
+                .unwrap();
+        }
+        conn.execute("COMMIT").await.unwrap();
 
-    // Verify data round-trip
-    let count_rows = conn.query("SELECT COUNT(*) FROM p2").unwrap();
-    let count = match &count_rows[0].values()[0] {
-        fsqlite_types::value::SqliteValue::Integer(n) => *n,
-        other => panic!("unexpected: {other:?}"),
-    };
+        // Run integrity check
+        let integrity = conn.query("PRAGMA integrity_check").await.unwrap();
+        let integrity_result = match &integrity[0].values()[0] {
+            fsqlite_types::value::SqliteValue::Text(s) => s.as_str().to_owned(),
+            other => format!("{other:?}"),
+        };
 
-    // Oracle comparison
-    let cconn = rusqlite::Connection::open(path_str).unwrap();
-    let c_count: i64 = cconn
-        .query_row("SELECT COUNT(*) FROM p2", [], |r| r.get(0))
-        .unwrap();
-    let c_integrity: String = cconn
-        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-        .unwrap();
+        // Verify data round-trip
+        let count_rows = conn.query("SELECT COUNT(*) FROM p2").await.unwrap();
+        let count = match &count_rows[0].values()[0] {
+            fsqlite_types::value::SqliteValue::Integer(n) => *n,
+            other => panic!("unexpected: {other:?}"),
+        };
 
-    emit_log(
-        tn,
-        "result",
-        json!({
-            "integrity_result": integrity_result,
-            "csqlite_integrity": c_integrity,
-            "row_count": count,
-            "csqlite_count": c_count,
-        }),
-    );
+        // Oracle comparison
+        let cconn = rusqlite::Connection::open(path_str).unwrap();
+        let c_count: i64 = cconn
+            .query_row("SELECT COUNT(*) FROM p2", [], |r| r.get(0))
+            .unwrap();
+        let c_integrity: String = cconn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
 
-    assert_eq!(
-        integrity_result, "ok",
-        "[P2] integrity_check should be 'ok', got '{integrity_result}'"
-    );
-    assert_eq!(count, 200, "[P2] expected 200 rows");
-    assert_eq!(c_count, 200, "[P2] csqlite should also see 200 rows");
+        emit_log(
+            tn,
+            "result",
+            json!({
+                "integrity_result": integrity_result,
+                "csqlite_integrity": c_integrity,
+                "row_count": count,
+                "csqlite_count": c_count,
+            }),
+        );
+
+        assert_eq!(
+            integrity_result, "ok",
+            "[P2] integrity_check should be 'ok', got '{integrity_result}'"
+        );
+        assert_eq!(count, 200, "[P2] expected 200 rows");
+        assert_eq!(c_count, 200, "[P2] csqlite should also see 200 rows");
+    });
 }
 
 // ─── P3: Fair wakeup — multi-writer Jain's fairness ─────────────────
@@ -207,11 +216,14 @@ fn p3_fair_wakeup_multi_writer() {
     let path_str = db_path.to_str().unwrap().to_owned();
 
     {
-        let conn = fsqlite::Connection::open(&path_str).unwrap();
-        conn.execute(
-            "CREATE TABLE p3 (tid INTEGER, seq INTEGER, val INTEGER, PRIMARY KEY (tid, seq))",
-        )
-        .unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let conn = fsqlite::Connection::open(&path_str).await.unwrap();
+            conn.execute(
+                "CREATE TABLE p3 (tid INTEGER, seq INTEGER, val INTEGER, PRIMARY KEY (tid, seq))",
+            )
+            .await
+            .unwrap();
+        });
     }
 
     let barrier = Arc::new(Barrier::new(thread_count));
@@ -222,42 +234,31 @@ fn p3_fair_wakeup_multi_writer() {
             let barrier = Arc::clone(&barrier);
             let path = Arc::clone(&path_arc);
             std::thread::spawn(move || {
-                let conn = fsqlite::Connection::open(path.as_str()).unwrap();
-                barrier.wait();
+                let mut outcome: Option<(usize, u64, u64, u64)> = None;
+                asupersync::test_utils::run_test(|| async {
+                    let conn = fsqlite::Connection::open(path.as_str()).await.unwrap();
+                    barrier.wait();
 
-                let mut commits = 0u64;
-                let mut retries = 0u64;
-                let start = Instant::now();
+                    let mut commits = 0u64;
+                    let mut retries = 0u64;
+                    let start = Instant::now();
 
-                for seq in 0..target_commits_per_thread {
-                    let max_retries = 100;
-                    let mut attempt = 0;
-                    loop {
-                        attempt += 1;
-                        if conn.execute("BEGIN").is_err() {
-                            std::thread::sleep(std::time::Duration::from_millis(1));
-                            continue;
-                        }
-                        let val = tid as i64 * 100_000 + seq as i64;
-                        if conn
-                            .execute(&format!("INSERT INTO p3 VALUES ({tid}, {seq}, {val})"))
-                            .is_err()
-                        {
-                            let _ = conn.execute("ROLLBACK");
-                            retries += 1;
-                            std::thread::sleep(std::time::Duration::from_millis(1 + (attempt % 5)));
-                            if attempt >= max_retries {
-                                panic!("thread {tid} exceeded retries at seq={seq}");
+                    for seq in 0..target_commits_per_thread {
+                        let max_retries = 100;
+                        let mut attempt = 0;
+                        loop {
+                            attempt += 1;
+                            if conn.execute("BEGIN").await.is_err() {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                                continue;
                             }
-                            continue;
-                        }
-                        match conn.execute("COMMIT") {
-                            Ok(_) => {
-                                commits += 1;
-                                break;
-                            }
-                            Err(_) => {
-                                let _ = conn.execute("ROLLBACK");
+                            let val = tid as i64 * 100_000 + seq as i64;
+                            if conn
+                                .execute(&format!("INSERT INTO p3 VALUES ({tid}, {seq}, {val})"))
+                                .await
+                                .is_err()
+                            {
+                                let _ = conn.execute("ROLLBACK").await;
                                 retries += 1;
                                 std::thread::sleep(std::time::Duration::from_millis(
                                     1 + (attempt % 5),
@@ -265,13 +266,31 @@ fn p3_fair_wakeup_multi_writer() {
                                 if attempt >= max_retries {
                                     panic!("thread {tid} exceeded retries at seq={seq}");
                                 }
+                                continue;
+                            }
+                            match conn.execute("COMMIT").await {
+                                Ok(_) => {
+                                    commits += 1;
+                                    break;
+                                }
+                                Err(_) => {
+                                    let _ = conn.execute("ROLLBACK").await;
+                                    retries += 1;
+                                    std::thread::sleep(std::time::Duration::from_millis(
+                                        1 + (attempt % 5),
+                                    ));
+                                    if attempt >= max_retries {
+                                        panic!("thread {tid} exceeded retries at seq={seq}");
+                                    }
+                                }
                             }
                         }
                     }
-                }
 
-                let elapsed = start.elapsed();
-                (tid, commits, retries, elapsed.as_millis() as u64)
+                    let elapsed = start.elapsed();
+                    outcome = Some((tid, commits, retries, elapsed.as_millis() as u64));
+                });
+                outcome.expect("p3 writer thread outcome")
             })
         })
         .collect();
@@ -294,12 +313,15 @@ fn p3_fair_wakeup_multi_writer() {
     let fairness = jains_fairness_index(&per_thread_commits);
 
     // Verify total row count
-    let verify_conn = fsqlite::Connection::open(&path_str).unwrap();
-    let total_rows = verify_conn.query("SELECT COUNT(*) FROM p3").unwrap();
-    let total = match &total_rows[0].values()[0] {
-        fsqlite_types::value::SqliteValue::Integer(n) => *n,
-        other => panic!("unexpected: {other:?}"),
-    };
+    let mut total = 0i64;
+    asupersync::test_utils::run_test(|| async {
+        let verify_conn = fsqlite::Connection::open(&path_str).await.unwrap();
+        let total_rows = verify_conn.query("SELECT COUNT(*) FROM p3").await.unwrap();
+        total = match &total_rows[0].values()[0] {
+            fsqlite_types::value::SqliteValue::Integer(n) => *n,
+            other => panic!("unexpected: {other:?}"),
+        };
+    });
 
     let expected = thread_count as i64 * target_commits_per_thread as i64;
 
@@ -328,16 +350,22 @@ fn p3_fair_wakeup_multi_writer() {
 
 // ─── P4: Non-regression throughput ───────────────────────────────────
 
-fn measure_fsqlite_insert_batch(row_count: i64) -> u64 {
+async fn measure_fsqlite_insert_batch(row_count: i64) -> u64 {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("p4_f.db");
-    let conn = fsqlite::Connection::open(path.to_str().unwrap()).unwrap();
-    conn.execute("CREATE TABLE p4 (id INTEGER PRIMARY KEY, val INTEGER)")
+    let conn = fsqlite::Connection::open(path.to_str().unwrap())
+        .await
         .unwrap();
-    let stmt = conn.prepare("INSERT INTO p4 VALUES (?1, ?2)").unwrap();
+    conn.execute("CREATE TABLE p4 (id INTEGER PRIMARY KEY, val INTEGER)")
+        .await
+        .unwrap();
+    let stmt = conn
+        .prepare("INSERT INTO p4 VALUES (?1, ?2)")
+        .await
+        .unwrap();
 
     let start = Instant::now();
-    conn.execute("BEGIN").unwrap();
+    conn.execute("BEGIN").await.unwrap();
     for i in 0..row_count {
         conn.execute_prepared_with_params(
             &stmt,
@@ -346,9 +374,10 @@ fn measure_fsqlite_insert_batch(row_count: i64) -> u64 {
                 fsqlite_types::value::SqliteValue::Integer(i * 7),
             ],
         )
+        .await
         .unwrap();
     }
-    conn.execute("COMMIT").unwrap();
+    conn.execute("COMMIT").await.unwrap();
     start.elapsed().as_nanos() as u64
 }
 

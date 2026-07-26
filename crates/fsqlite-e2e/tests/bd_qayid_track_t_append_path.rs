@@ -1,4 +1,5 @@
 //! Track T append-path oracle and throughput evidence for `bd-qayid`.
+#![recursion_limit = "512"]
 
 use std::{
     env, fs,
@@ -23,10 +24,12 @@ const PERF_SEED: u64 = 0x71A2_1002;
 
 static TRACK_T_E2E_LOCK: Mutex<()> = Mutex::new(());
 
-fn capture_vdbe_metrics<T>(f: impl FnOnce() -> T) -> (T, VdbeMetricsSnapshot) {
+async fn capture_vdbe_metrics<T, Fut: std::future::Future<Output = T>>(
+    f: impl FnOnce() -> Fut,
+) -> (T, VdbeMetricsSnapshot) {
     set_vdbe_metrics_enabled(true);
     reset_vdbe_metrics();
-    let result = f();
+    let result = f().await;
     let snapshot = vdbe_metrics_snapshot();
     reset_vdbe_metrics();
     set_vdbe_metrics_enabled(false);
@@ -42,10 +45,12 @@ fn explicit_row_insert_sql(table: &str, rowids: &[i64]) -> String {
     format!("INSERT INTO {table} VALUES {values}")
 }
 
-fn open_fsqlite(path: &Path) -> fsqlite::Connection {
+async fn open_fsqlite(path: &Path) -> fsqlite::Connection {
     let path = path.to_str().expect("utf-8 db path");
-    let conn = fsqlite::Connection::open(path).expect("open fsqlite connection");
-    conn.execute("PRAGMA journal_mode=WAL").ok();
+    let conn = fsqlite::Connection::open(path)
+        .await
+        .expect("open fsqlite connection");
+    conn.execute("PRAGMA journal_mode=WAL").await.ok();
     conn
 }
 
@@ -56,9 +61,10 @@ fn open_sqlite(path: &Path) -> rusqlite::Connection {
     conn
 }
 
-fn fetch_fsqlite_rows(conn: &fsqlite::Connection, table: &str) -> Vec<(i64, String)> {
+async fn fetch_fsqlite_rows(conn: &fsqlite::Connection, table: &str) -> Vec<(i64, String)> {
     let sql = format!("SELECT id, val FROM {table} ORDER BY id");
     conn.query(&sql)
+        .await
         .expect("query fsqlite rows")
         .into_iter()
         .map(|row| {
@@ -111,104 +117,112 @@ fn write_artifact(path: &Path, payload: serde_json::Value) {
 #[test]
 fn bd_qayid_track_t_oracle_10k_sequential_append_matches_sqlite() {
     let _guard = TRACK_T_E2E_LOCK.lock().unwrap();
-    let run_id = "bd-qayid-track-t-oracle";
-    let trace_id = 0x71A2_1001_u64;
-    let scenario_id = "TRACK-T-ORACLE-10K-SEQ";
-    let rows: Vec<i64> = (1..=10_000).collect();
 
-    let temp = tempdir().expect("tempdir");
-    let fsqlite_db = temp.path().join("track_t_oracle_fsqlite.db");
-    let sqlite_db = temp.path().join("track_t_oracle_sqlite.db");
+    asupersync::test_utils::run_test(|| async {
+        let run_id = "bd-qayid-track-t-oracle";
+        let trace_id = 0x71A2_1001_u64;
+        let scenario_id = "TRACK-T-ORACLE-10K-SEQ";
+        let rows: Vec<i64> = (1..=10_000).collect();
 
-    let fconn = open_fsqlite(&fsqlite_db);
-    let sconn = open_sqlite(&sqlite_db);
-    fconn
-        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
-        .expect("create fsqlite table");
-    sconn
-        .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
-        .expect("create sqlite table");
+        let temp = tempdir().expect("tempdir");
+        let fsqlite_db = temp.path().join("track_t_oracle_fsqlite.db");
+        let sqlite_db = temp.path().join("track_t_oracle_sqlite.db");
 
-    let insert_sql = explicit_row_insert_sql("t", &rows);
+        let fconn = open_fsqlite(&fsqlite_db).await;
+        let sconn = open_sqlite(&sqlite_db);
+        fconn
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .expect("create fsqlite table");
+        sconn
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .expect("create sqlite table");
 
-    let fsqlite_start = Instant::now();
-    let (_result, metrics) = capture_vdbe_metrics(|| {
-        fconn.execute("BEGIN").expect("fsqlite begin");
-        fconn.execute(&insert_sql).expect("fsqlite bulk insert");
-        fconn.execute("COMMIT").expect("fsqlite commit");
-    });
-    let fsqlite_elapsed = fsqlite_start.elapsed();
+        let insert_sql = explicit_row_insert_sql("t", &rows);
 
-    let sqlite_start = Instant::now();
-    sconn.execute_batch("BEGIN;").expect("sqlite begin");
-    sconn
-        .execute_batch(&(insert_sql.clone() + ";"))
-        .expect("sqlite bulk insert");
-    sconn.execute_batch("COMMIT;").expect("sqlite commit");
-    let sqlite_elapsed = sqlite_start.elapsed();
+        let fsqlite_start = Instant::now();
+        let (_result, metrics) = capture_vdbe_metrics(|| async {
+            fconn.execute("BEGIN").await.expect("fsqlite begin");
+            fconn
+                .execute(&insert_sql)
+                .await
+                .expect("fsqlite bulk insert");
+            fconn.execute("COMMIT").await.expect("fsqlite commit");
+        })
+        .await;
+        let fsqlite_elapsed = fsqlite_start.elapsed();
 
-    let fsqlite_rows = fetch_fsqlite_rows(&fconn, "t");
-    let sqlite_rows = fetch_sqlite_rows(&sconn, "t");
-    assert_eq!(fsqlite_rows, sqlite_rows, "oracle rowset mismatch");
+        let sqlite_start = Instant::now();
+        sconn.execute_batch("BEGIN;").expect("sqlite begin");
+        sconn
+            .execute_batch(&(insert_sql.clone() + ";"))
+            .expect("sqlite bulk insert");
+        sconn.execute_batch("COMMIT;").expect("sqlite commit");
+        let sqlite_elapsed = sqlite_start.elapsed();
 
-    assert!(
-        metrics.insert_append_count >= 9_900,
-        "sequential 10K insert should stay overwhelmingly append-driven, got {:?}",
-        metrics
-    );
-    assert!(
-        metrics.insert_seek_count <= 32,
-        "sequential 10K insert should avoid repeated existence seeks, got {:?}",
-        metrics
-    );
-    assert!(
-        metrics.insert_append_hint_clear_count <= 4,
-        "sequential 10K insert should not repeatedly clear the append hint, got {:?}",
-        metrics
-    );
+        let fsqlite_rows = fetch_fsqlite_rows(&fconn, "t").await;
+        let sqlite_rows = fetch_sqlite_rows(&sconn, "t");
+        assert_eq!(fsqlite_rows, sqlite_rows, "oracle rowset mismatch");
 
-    if let Ok(path) = env::var("FSQLITE_TRACK_T_E2E_ARTIFACT") {
-        let artifact_path = PathBuf::from(path);
-        write_artifact(
-            &artifact_path,
-            json!({
-                "bead_id": BEAD_ID,
-                "run_id": run_id,
-                "trace_id": trace_id,
-                "scenario_id": scenario_id,
-                "seed": ORACLE_SEED,
-                "log_standard_ref": LOG_STANDARD_REF,
-                "replay_command": REPLAY_COMMAND,
-                "overall_status": "pass",
-                "rows": rows.len(),
-                "fsqlite_elapsed_ms": fsqlite_elapsed.as_millis(),
-                "sqlite_elapsed_ms": sqlite_elapsed.as_millis(),
-                "fsqlite_rows_per_sec": rows_per_sec(rows.len(), fsqlite_elapsed),
-                "sqlite_rows_per_sec": rows_per_sec(rows.len(), sqlite_elapsed),
-                "vdbe_metrics": {
-                    "append_count": metrics.insert_append_count,
-                    "seek_count": metrics.insert_seek_count,
-                    "append_hint_clear_count": metrics.insert_append_hint_clear_count,
-                    "make_record_calls_total": metrics.make_record_calls_total
-                }
-            }),
+        assert!(
+            metrics.insert_append_count >= 9_900,
+            "sequential 10K insert should stay overwhelmingly append-driven, got {:?}",
+            metrics
         );
+        assert!(
+            metrics.insert_seek_count <= 32,
+            "sequential 10K insert should avoid repeated existence seeks, got {:?}",
+            metrics
+        );
+        assert!(
+            metrics.insert_append_hint_clear_count <= 4,
+            "sequential 10K insert should not repeatedly clear the append hint, got {:?}",
+            metrics
+        );
+
+        if let Ok(path) = env::var("FSQLITE_TRACK_T_E2E_ARTIFACT") {
+            let artifact_path = PathBuf::from(path);
+            write_artifact(
+                &artifact_path,
+                json!({
+                    "bead_id": BEAD_ID,
+                    "run_id": run_id,
+                    "trace_id": trace_id,
+                    "scenario_id": scenario_id,
+                    "seed": ORACLE_SEED,
+                    "log_standard_ref": LOG_STANDARD_REF,
+                    "replay_command": REPLAY_COMMAND,
+                    "overall_status": "pass",
+                    "rows": rows.len(),
+                    "fsqlite_elapsed_ms": fsqlite_elapsed.as_millis(),
+                    "sqlite_elapsed_ms": sqlite_elapsed.as_millis(),
+                    "fsqlite_rows_per_sec": rows_per_sec(rows.len(), fsqlite_elapsed),
+                    "sqlite_rows_per_sec": rows_per_sec(rows.len(), sqlite_elapsed),
+                    "vdbe_metrics": {
+                        "append_count": metrics.insert_append_count,
+                        "seek_count": metrics.insert_seek_count,
+                        "append_hint_clear_count": metrics.insert_append_hint_clear_count,
+                        "make_record_calls_total": metrics.make_record_calls_total
+                    }
+                }),
+            );
+            eprintln!(
+                "DEBUG bead_id={BEAD_ID} run_id={run_id} trace_id={trace_id} scenario_id={scenario_id} seed={ORACLE_SEED} artifact_path={} replay_command={REPLAY_COMMAND}",
+                artifact_path.display()
+            );
+        }
+
         eprintln!(
-            "DEBUG bead_id={BEAD_ID} run_id={run_id} trace_id={trace_id} scenario_id={scenario_id} seed={ORACLE_SEED} artifact_path={} replay_command={REPLAY_COMMAND}",
-            artifact_path.display()
+            "INFO bead_id={BEAD_ID} run_id={run_id} trace_id={trace_id} scenario_id={scenario_id} seed={ORACLE_SEED} rows={} append_count={} seek_count={} append_hint_clear_count={} make_record_calls_total={} fsqlite_rows_per_sec={:.1} sqlite_rows_per_sec={:.1} log_standard_ref={LOG_STANDARD_REF}",
+            rows.len(),
+            metrics.insert_append_count,
+            metrics.insert_seek_count,
+            metrics.insert_append_hint_clear_count,
+            metrics.make_record_calls_total,
+            rows_per_sec(rows.len(), fsqlite_elapsed),
+            rows_per_sec(rows.len(), sqlite_elapsed),
         );
-    }
-
-    eprintln!(
-        "INFO bead_id={BEAD_ID} run_id={run_id} trace_id={trace_id} scenario_id={scenario_id} seed={ORACLE_SEED} rows={} append_count={} seek_count={} append_hint_clear_count={} make_record_calls_total={} fsqlite_rows_per_sec={:.1} sqlite_rows_per_sec={:.1} log_standard_ref={LOG_STANDARD_REF}",
-        rows.len(),
-        metrics.insert_append_count,
-        metrics.insert_seek_count,
-        metrics.insert_append_hint_clear_count,
-        metrics.make_record_calls_total,
-        rows_per_sec(rows.len(), fsqlite_elapsed),
-        rows_per_sec(rows.len(), sqlite_elapsed),
-    );
+    });
 }
 
 #[test]

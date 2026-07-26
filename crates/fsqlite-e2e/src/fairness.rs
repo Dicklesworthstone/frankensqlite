@@ -325,7 +325,7 @@ mod tests {
         verify_rusqlite_pragmas(&rconn).unwrap();
 
         // FrankenSQLite (in-memory is fine for the PRAGMAs it supports)
-        let fconn = fsqlite::Connection::open(":memory:").unwrap();
+        let fconn = crate::block_on(fsqlite::Connection::open(":memory:")).unwrap();
         apply_benchmark_pragmas_fsqlite(&fconn).unwrap();
         verify_fsqlite_pragmas(&fconn).unwrap();
     }

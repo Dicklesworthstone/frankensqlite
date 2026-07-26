@@ -19,15 +19,17 @@
 //! shape, which is why the existing churn suites (which checkpoint before the
 //! canonical cross-check, or only verify the committed main file) never saw
 //! it.
+#![recursion_limit = "512"]
 
 use fsqlite_types::SqliteValue;
 use tempfile::TempDir;
 
 /// `PRAGMA quick_check` -> `Ok(())` when the single row is `"ok"`, else the
 /// first reported corruption line.
-fn quick_check(conn: &fsqlite::Connection) -> Result<(), String> {
+async fn quick_check(conn: &fsqlite::Connection) -> Result<(), String> {
     let rows = conn
         .query("PRAGMA quick_check")
+        .await
         .map_err(|e| e.to_string())?;
     match rows.first().map(|r| r.values().first().cloned()) {
         Some(Some(SqliteValue::Text(s))) => {
@@ -40,18 +42,21 @@ fn quick_check(conn: &fsqlite::Connection) -> Result<(), String> {
 
 /// Run the minimal REPLACE-churn workload and hand the resulting file —
 /// including any live WAL — to canonical SQLite.
-fn replace_churn_then_stock_check(replaces: usize) {
+async fn replace_churn_then_stock_check(replaces: usize) {
     let tmp = TempDir::new().expect("tempdir");
     let path = tmp.path().join("replace_churn.db");
 
     {
-        let conn =
-            fsqlite::Connection::open(path.to_string_lossy().as_ref()).expect("open fsqlite");
+        let conn = fsqlite::Connection::open(path.to_string_lossy().as_ref())
+            .await
+            .expect("open fsqlite");
         conn.execute("CREATE TABLE t (id TEXT PRIMARY KEY, payload TEXT)")
+            .await
             .expect("create table");
         let payload_x = "x".repeat(900);
         for i in 0..12 {
             conn.execute(&format!("INSERT INTO t VALUES ('k{i:02}', '{payload_x}')"))
+                .await
                 .unwrap_or_else(|e| panic!("insert {i}: {e}"));
         }
         let payload_y = "y".repeat(900);
@@ -59,14 +64,15 @@ fn replace_churn_then_stock_check(replaces: usize) {
             conn.execute(&format!(
                 "INSERT OR REPLACE INTO t VALUES ('k{i:02}', '{payload_y}')"
             ))
+            .await
             .unwrap_or_else(|e| panic!("replace {i}: {e}"));
         }
 
         // fsqlite's own view must be consistent...
-        if let Err(msg) = quick_check(&conn) {
+        if let Err(msg) = quick_check(&conn).await {
             panic!("fsqlite quick_check after replace churn: {msg}");
         }
-        let rows = conn.query("SELECT count(*) FROM t").expect("count");
+        let rows = conn.query("SELECT count(*) FROM t").await.expect("count");
         assert_eq!(
             rows.first().and_then(|r| r.values().first().cloned()),
             Some(SqliteValue::Integer(12)),
@@ -92,11 +98,15 @@ fn replace_churn_then_stock_check(replaces: usize) {
 /// The minimal production shape: 4 REPLACEs drain one leaf of a 4-leaf tree.
 #[test]
 fn replace_churn_minimal_stays_stock_readable_with_live_wal() {
-    replace_churn_then_stock_check(4);
+    asupersync::test_utils::run_test(|| async {
+        replace_churn_then_stock_check(4).await;
+    });
 }
 
 /// The full jsm-sync shape: every row REPLACEd (cache refresh of all 12).
 #[test]
 fn replace_churn_full_refresh_stays_stock_readable_with_live_wal() {
-    replace_churn_then_stock_check(12);
+    asupersync::test_utils::run_test(|| async {
+        replace_churn_then_stock_check(12).await;
+    });
 }

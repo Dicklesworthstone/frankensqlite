@@ -42,6 +42,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 
 [dev-dependencies]
+# Test targets drive the async engine through `asupersync::test_utils::run_test`,
+# which lives behind `test-internals`. The non-dev dependency above stays
+# feature-clean: neither `src/` nor `benches/` uses `test_utils`.
+asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
 jsonschema = { version = "0.48.5", default-features = false }
 fsqlite-ext-session = { workspace = true }
