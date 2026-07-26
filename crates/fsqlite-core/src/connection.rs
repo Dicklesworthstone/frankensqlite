@@ -397,16 +397,19 @@ static FSQLITE_HOT_PATH_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Opt-in for the per-column INSERT preserialize sub-timers.
 ///
-/// The insert preserialize path can time seven nested regions per row
+/// The insert preserialize path times up to seven nested regions per row
 /// (`row_build`, `preserialize`, `cell_build`, `eval`, `affinity`, `layout`,
 /// `encode`). One region is `Instant::now()` + `elapsed()` (a second clock read)
-/// + an `AtomicU64::fetch_add`, measured at ~55 ns on this hardware; seven cost
-/// ~360 ns/row. A `tiny_1col` row's *entire* reported `row_build_ns` is
-/// ~139 ns/row, so with all seven armed the observer is ~2.6x the quantity it
-/// reports, and because the regions nest, the outer counters absorb the inner
-/// counters' clock cost — which is why `row_build_ns` ranked as the largest
-/// component of the small-N write gap and why that profile concluded "no single
-/// fat component" (bd-he3ua).
+/// + an `AtomicU64::fetch_add`, measured at ~48-56 ns on this hardware.
+///
+/// `tiny_1col` (`CREATE TABLE bench (id INTEGER PRIMARY KEY)`) takes the
+/// `is_rowid_alias` branch, which skips the affinity region: six regions,
+/// measured at ~289-305 ns/row. That row's *entire* reported `row_build_ns` is
+/// ~139 ns/row, so the observer is ~2.1x the quantity it reports and ~35% of the
+/// row's unprofiled ~850 ns. Because the regions nest, the outer counters absorb
+/// the inner counters' clock cost — which is why `row_build_ns` ranked as the
+/// largest component of the small-N write gap and why that profile concluded
+/// "no single fat component" (bd-he3ua).
 ///
 /// So the sub-timers are OFF unless `FSQLITE_DML_PROFILE_DEEP` is set, leaving
 /// one timed region per row (~55 ns, ~6.5% of a ~850 ns row) in the default
@@ -22491,8 +22494,8 @@ impl Connection {
                 direct.columns.len()
             )));
         }
-        // Per-column sub-timers only under deep mode: at ~55 ns per timed region
-        // they otherwise cost more than the row they measure (bd-he3ua).
+        // Per-column sub-timers only under deep mode: at ~48-56 ns per timed
+        // region they otherwise cost more than the row they measure (bd-he3ua).
         let deep_profile = profile_enabled && dml_profile_deep_enabled();
         let cell_build_start = deep_profile.then(Instant::now);
         text_scratch.clear();
