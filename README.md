@@ -1188,6 +1188,52 @@ The human-readable scope lock for that contract lives in
 
 ## Performance Characteristics
 
+> ### ⚠ These numbers are under re-verification and do not describe current `main`
+>
+> Every figure in this section was measured on the **pre-async** engine. The
+> storage stack has since been migrated to `async`, and a same-hardware
+> comparison (control `b612eb7b` vs post-migration, identical `release-perf`
+> flags, same idle host) measured a **FrankenSQLite-side regression**: the
+> median scenario timing factor moved 1.895x while the C SQLite arm in the same
+> runs moved 1.005x. The primary scorecard metric
+> (`per_category_weighted.score`) moved 0.4004 -> 0.8319.
+>
+> The cause is **not yet attributed**. That comparison spans 194 commits, so it
+> establishes that a regression exists on the FrankenSQLite side, not that the
+> async migration caused it. Attribution work is tracked in `bd-dqdoe`.
+>
+> Separately, three defects were found in the benchmark harness itself, which
+> affect published numbers in *both* directions and must be fixed before any
+> figure here is re-stated:
+>
+> | Defect | Effect on reported numbers |
+> |---|---|
+> | `bd-i8pt6` — mt_oltp reader loop bound its query with `let _ =` and never polled the future, timing future construction rather than execution | made FrankenSQLite look **faster**; prior mt_oltp reader figures are void |
+> | `bd-fd1ra` — benchmark PRAGMAs were silently dropped on the FrankenSQLite side | made FrankenSQLite look **slower** (unconfigured vs configured C SQLite) |
+> | Concurrent arm omitted connection-local `cache_size` for C workers and hardcoded page_size 4096 | scored an asymmetric comparison |
+>
+> Separately again, an audit of this section's own citations found that most of
+> them cannot be checked. AGENTS.md requires every numeric performance claim to
+> name a real artifact path or commit; these do not resolve:
+>
+> | Cited reference | Status |
+> |---|---|
+> | `tests/artifacts/perf/cod-fullquick-refresh-20260722T1800Z/full-quick.json` | present |
+> | `tests/artifacts/perf/codex-dml-profile-after-active-probe-fix-20260517T1730Z/update-delete-profile.json` | **missing from the repo** |
+> | `tests/artifacts/perf/codex-mt-shared-16-recheck-27d5f71d-20260512T2032Z-iters3/mt-shared-16.json` | **missing from the repo** |
+> | `tests/artifacts/perf/may8-current-gap-audit-20260508T2330Z/` | **missing from the repo** |
+> | source snapshot `140e77df` | **not a reachable git object** |
+>
+> So the concurrent-writer headline figures (including `40.99x`) currently cite
+> evidence that is not in the repository and cannot be reproduced by a reader.
+> That is a pre-existing documentation gap, not a consequence of the async
+> migration, but it has the same effect: the numbers are unverifiable as
+> published.
+>
+> Until `bd-dqdoe` produces a citation-grade artifact on a verified-quiet host,
+> treat this whole section as **historical and unverified**: accurate at most
+> for the commit it names, not for `main`. Releases are held on this.
+
 ### Workloads That Benefit Most from MVCC
 
 Current full-quick benchmark source of truth: `comprehensive-bench --quick` in
