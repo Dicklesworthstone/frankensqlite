@@ -15,7 +15,7 @@ pub use lexer::{
     tokenize_metrics_snapshot,
 };
 pub use parser::{
-    ParseError, ParseMetricsSnapshot, Parser, StatementParseScratch,
+    ParseError, ParseErrorKind, ParseMetricsSnapshot, Parser, StatementParseScratch,
     parse_first_statement_with_tail, parse_metrics_enabled, parse_metrics_snapshot,
     parse_single_statement_with_scratch, parse_statements_with_scratch, reset_parse_metrics,
     set_parse_metrics_enabled,

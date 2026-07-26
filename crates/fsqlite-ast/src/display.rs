@@ -285,6 +285,48 @@ fn write_operand(f: &mut fmt::Formatter<'_>, expr: &crate::Expr) -> fmt::Result 
     }
 }
 
+/// Render one associative boolean chain without recursively walking its
+/// left-nested AST spine.
+///
+/// Pratt parsing represents `a AND b AND c` as `((a AND b) AND c)`. Treating
+/// every binary child as an opaque operand would therefore serialize a flat
+/// predicate as `((a AND b) AND c)`, adding one physical parser stack frame
+/// per term when schema SQL is reopened. AND and OR are associative under
+/// SQLite's three-valued boolean semantics, so equal-operator children can be
+/// emitted as one flat chain. Mixed operators and every non-binary operand
+/// still pass through `write_operand`, retaining the parentheses needed to
+/// preserve precedence and semantic boundaries.
+fn write_associative_boolean_chain(
+    f: &mut fmt::Formatter<'_>,
+    root: &crate::Expr,
+    chain_op: BinaryOp,
+) -> fmt::Result {
+    let mut pending = vec![root];
+    let mut first = true;
+
+    while let Some(expr) = pending.pop() {
+        if let crate::Expr::BinaryOp {
+            left, op, right, ..
+        } = expr
+            && *op == chain_op
+        {
+            // LIFO order: push right first so the original left-to-right term
+            // order remains byte-stable.
+            pending.push(right);
+            pending.push(left);
+            continue;
+        }
+
+        if !first {
+            write!(f, " {chain_op} ")?;
+        }
+        write_operand(f, expr)?;
+        first = false;
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Literal
 // ---------------------------------------------------------------------------
@@ -409,9 +451,13 @@ impl fmt::Display for Expr {
             Self::BinaryOp {
                 left, op, right, ..
             } => {
-                write_operand(f, left)?;
-                write!(f, " {op} ")?;
-                write_operand(f, right)
+                if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                    write_associative_boolean_chain(f, self, *op)
+                } else {
+                    write_operand(f, left)?;
+                    write!(f, " {op} ")?;
+                    write_operand(f, right)
+                }
             }
             Self::UnaryOp { op, expr, .. } => {
                 if matches!(op, UnaryOp::Not) {

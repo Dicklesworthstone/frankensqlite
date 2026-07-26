@@ -70,6 +70,14 @@ const OE_REPLACE: u16 = 5;
 /// This intentionally lives above the low 4 OE_* bits because this engine
 /// encodes conflict handling directly in `p5`, unlike SQLite's native layout.
 const OPFLAG_ISUPDATE: u16 = 0x10;
+/// Marks a WITHOUT ROWID table-row `IdxDelete` as an implicit REPLACE
+/// deletion whose exact OLD row must be reported to the connection layer for
+/// inbound foreign-key action enforcement.
+const OPFLAG_REPLACE_VICTIM: u16 = 0x20;
+/// Marks an `IdxInsert` that writes a WITHOUT ROWID table row, rather than a
+/// secondary-index entry. A successful table-row write contributes exactly
+/// one to the statement change count.
+const OPFLAG_IDX_NCHANGE: u16 = 0x40;
 
 /// Convert AST `ConflictAction` to p5 OE_* flag value.
 fn conflict_action_to_oe(action: Option<&ConflictAction>) -> u16 {
@@ -19978,6 +19986,86 @@ fn emit_without_rowid_index_deletes(
     }
 }
 
+/// Resolve secondary-UNIQUE `REPLACE` conflicts for a WITHOUT ROWID row before
+/// inserting the new table record.
+///
+/// Secondary entries end in the complete primary-key suffix rather than a
+/// rowid. The VDBE is therefore the only layer with enough cursor state to
+/// identify the canonical victim: probe the unique prefix, follow its PK
+/// suffix back to the table row, delete every secondary entry for that exact
+/// row, then delete/report the table row.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_without_rowid_replace_secondary_victims(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    table_cursor: i32,
+    val_regs: i32,
+    pk_indices: &[usize],
+    stmt_conflict: Option<ConflictAction>,
+) {
+    for (idx_offset, index) in table.indexes.iter().enumerate() {
+        if !index.is_unique || effective_oe(stmt_conflict, index.conflict_action) != OE_REPLACE {
+            continue;
+        }
+
+        let idx_cursor = table_cursor + 1 + idx_offset as i32;
+        let no_conflict = b.emit_label();
+        let scan_ctx = ScanCtx {
+            cursor: table_cursor,
+            table,
+            table_alias: None,
+            schema: None,
+            register_base: Some(val_regs),
+            secondaries: &[],
+        };
+        emit_index_predicate_guard(b, index, &scan_ctx, no_conflict);
+
+        let n_idx_cols = index.key_term_count();
+        let probe_regs = b.alloc_regs(n_idx_cols as i32);
+        for key_pos in 0..n_idx_cols {
+            emit_index_key_term(b, index, key_pos, probe_regs + key_pos as i32, &scan_ctx);
+        }
+        let probe_record = b.alloc_reg();
+        b.emit_op(
+            Opcode::MakeRecord,
+            probe_regs,
+            n_idx_cols as i32,
+            probe_record,
+            P4::None,
+            0,
+        );
+        b.emit_jump_to_label(
+            Opcode::NoConflict,
+            idx_cursor,
+            probe_record,
+            no_conflict,
+            P4::None,
+            0,
+        );
+
+        // Conflict: the secondary cursor is positioned on the canonical
+        // entry. Follow its PK suffix to the corresponding table record.
+        emit_without_rowid_index_to_table_seek(
+            b,
+            table_cursor,
+            idx_cursor,
+            index,
+            pk_indices,
+            no_conflict,
+        );
+        emit_without_rowid_index_deletes(b, table, table_cursor, None, pk_indices);
+        b.emit_op(
+            Opcode::IdxDelete,
+            table_cursor,
+            0,
+            0,
+            P4::Table(table.name.clone()),
+            OPFLAG_REPLACE_VICTIM,
+        );
+        b.resolve_label(no_conflict);
+    }
+}
+
 /// Emit the per-row insert for a WITHOUT ROWID table.
 ///
 /// `val_regs` holds the full row image in declared column order. Handles
@@ -20094,9 +20182,24 @@ fn emit_without_rowid_row_insert(
             // REPLACE: delete the conflicting row's secondary index entries and
             // the old table row, then fall through to insert the new row.
             emit_without_rowid_index_deletes(b, table, table_cursor, None, pk_indices);
-            b.emit_op(Opcode::IdxDelete, table_cursor, 0, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::IdxDelete,
+                table_cursor,
+                0,
+                0,
+                P4::Table(table.name.clone()),
+                OPFLAG_REPLACE_VICTIM,
+            );
         }
         b.resolve_label(do_insert);
+        emit_without_rowid_replace_secondary_victims(
+            b,
+            table,
+            table_cursor,
+            val_regs,
+            pk_indices,
+            stmt_level,
+        );
         // Any conflicting row has been removed, so insert cannot conflict.
         let rec_reg = b.alloc_reg();
         b.emit_op(
@@ -20113,11 +20216,19 @@ fn emit_without_rowid_row_insert(
             rec_reg,
             n_pk as i32,
             P4::Table(format!("{}.{}", table.name, pk_label)),
-            1u16 | (OE_ABORT << 1),
+            OPFLAG_IDX_NCHANGE | 1u16 | (OE_ABORT << 1),
         );
     } else {
         // ABORT / FAIL / ROLLBACK: rely on the engine's UNIQUE check on the
         // leading `n_pk` (primary-key) columns of the record.
+        emit_without_rowid_replace_secondary_victims(
+            b,
+            table,
+            table_cursor,
+            val_regs,
+            pk_indices,
+            stmt_level,
+        );
         let rec_reg = b.alloc_reg();
         b.emit_op(
             Opcode::MakeRecord,
@@ -20133,7 +20244,7 @@ fn emit_without_rowid_row_insert(
             rec_reg,
             n_pk as i32,
             P4::Table(format!("{}.{}", table.name, pk_label)),
-            1u16 | (oe_flag << 1),
+            OPFLAG_IDX_NCHANGE | 1u16 | (oe_flag << 1),
         );
     }
 
@@ -20319,7 +20430,7 @@ fn emit_without_rowid_upsert_row(
             table.name,
             without_rowid_pk_label(table, pk_indices)
         )),
-        1u16 | (OE_ABORT << 1),
+        OPFLAG_IDX_NCHANGE | 1u16 | (OE_ABORT << 1),
     );
     emit_without_rowid_index_inserts(
         b,
@@ -21199,7 +21310,7 @@ fn codegen_update_without_rowid(
             table.name,
             without_rowid_pk_label(table, &pk_indices)
         )),
-        1u16 | (oe_flag << 1),
+        OPFLAG_IDX_NCHANGE | 1u16 | (oe_flag << 1),
     );
     emit_without_rowid_index_inserts(
         b,
@@ -21626,7 +21737,7 @@ fn codegen_update_from_without_rowid(
             table.name,
             without_rowid_pk_label(table, &pk_indices)
         )),
-        1u16 | (oe_flag << 1),
+        OPFLAG_IDX_NCHANGE | 1u16 | (oe_flag << 1),
     );
     emit_without_rowid_index_inserts(
         b,
@@ -43807,6 +43918,83 @@ mod tests {
             open_read.p2, 2,
             "bd-wwqen.1: COUNT(*) with no indexes should open table (root=2), got root={}",
             open_read.p2
+        );
+    }
+
+    #[test]
+    fn test_without_rowid_replace_marks_primary_and_secondary_unique_victims() {
+        let schema = vec![TableSchema {
+            name: "wr_parent".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("venue", 'B', false),
+                ColumnInfo::basic("symbol", 'B', false),
+                ColumnInfo::basic("payload", 'B', false),
+            ],
+            indexes: vec![IndexSchema {
+                name: "wr_parent_symbol_uq".to_owned(),
+                root_page: 3,
+                columns: vec!["symbol".to_owned()],
+                key_expressions: vec!["symbol".to_owned()],
+                key_sort_directions: vec![],
+                where_clause: None,
+                is_unique: true,
+                key_collations: vec![],
+                conflict_action: None,
+            }],
+            strict: false,
+            without_rowid: true,
+            primary_key_constraints: vec![vec!["venue".to_owned(), "symbol".to_owned()]],
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }];
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: Some(ConflictAction::Replace),
+            table: QualifiedName::bare("wr_parent"),
+            alias: None,
+            columns: Vec::new(),
+            source: InsertSource::Values(vec![vec![
+                Expr::Literal(Literal::String("XNAS".to_owned()), Span::ZERO),
+                Expr::Literal(Literal::String("DUAL".to_owned()), Span::ZERO),
+                Expr::Literal(Literal::String("new".to_owned()), Span::ZERO),
+            ]]),
+            upsert: Vec::new(),
+            returning: Vec::new(),
+        };
+
+        let mut builder = ProgramBuilder::new();
+        codegen_insert(&mut builder, &stmt, &schema, &CodegenContext::default()).unwrap();
+        let program = builder.finish().unwrap();
+        let marked_table_deletes = program
+            .ops()
+            .iter()
+            .filter(|op| {
+                op.opcode == Opcode::IdxDelete && op.p1 == 0 && op.p5 & OPFLAG_REPLACE_VICTIM != 0
+            })
+            .count();
+        assert_eq!(
+            marked_table_deletes, 2,
+            "OR REPLACE must report both the PK-conflict and secondary-UNIQUE victim paths"
+        );
+        assert!(
+            program
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::NoConflict && op.p1 == 1),
+            "secondary UNIQUE REPLACE must probe the secondary index before table insertion"
+        );
+        assert!(
+            program.ops().iter().any(|op| {
+                op.opcode == Opcode::IdxInsert && op.p1 == 0 && op.p5 & OPFLAG_IDX_NCHANGE != 0
+            }),
+            "WITHOUT ROWID table insertion must contribute one statement change"
+        );
+        assert!(
+            program.ops().iter().all(|op| {
+                op.opcode != Opcode::IdxInsert || op.p1 == 0 || op.p5 & OPFLAG_IDX_NCHANGE == 0
+            }),
+            "secondary-index maintenance must not increment the table-row change count"
         );
     }
 }

@@ -86,8 +86,19 @@ pub fn reset_parse_metrics() {
 // Error type
 // ---------------------------------------------------------------------------
 
+/// Stable high-level classification for parser failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseErrorKind {
+    /// The input does not satisfy the SQL grammar.
+    Syntax,
+    /// A configured parser resource limit was reached.
+    Limit,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
+    /// Whether the failure is invalid syntax or a deterministic resource limit.
+    pub kind: ParseErrorKind,
     pub message: String,
     pub span: Span,
     pub line: u32,
@@ -99,6 +110,7 @@ impl ParseError {
     pub(crate) fn at(message: impl Into<String>, token: Option<&Token>) -> Self {
         if let Some(t) = token {
             Self {
+                kind: ParseErrorKind::Syntax,
                 message: message.into(),
                 span: t.span,
                 line: t.line,
@@ -106,12 +118,20 @@ impl ParseError {
             }
         } else {
             Self {
+                kind: ParseErrorKind::Syntax,
                 message: message.into(),
                 span: Span::ZERO,
                 line: 0,
                 col: 0,
             }
         }
+    }
+
+    #[must_use]
+    pub(crate) fn limit(message: impl Into<String>, token: Option<&Token>) -> Self {
+        let mut error = Self::at(message, token);
+        error.kind = ParseErrorKind::Limit;
+        error
     }
 }
 
@@ -181,18 +201,23 @@ impl StatementParseScratch {
 // Parser
 // ---------------------------------------------------------------------------
 
-/// Maximum expression nesting depth.
+/// Maximum recursion depth in the hand-written parser.
 ///
-/// Matches C SQLite's default `SQLITE_MAX_EXPR_DEPTH` (1000). C SQLite
-/// allows compile-time override; this constant could be made generic or
-/// builder-configurable if needed.
-pub const MAX_PARSE_DEPTH: u32 = 1000;
+/// C SQLite's generated parser can admit an expression depth of 1000 without
+/// consuming one native call frame per level. This recursive-descent parser
+/// cannot safely mirror that number on FrankenSQLite's minimum supported
+/// 2 MiB worker stack, especially in debug builds where expression frames are
+/// comparatively large. A 128-frame limit leaves a conservative 2x margin
+/// below the observed physical-stack failure point while ordinary flat Pratt
+/// chains remain effectively unbounded by this recursion counter.
+pub const MAX_PARSE_DEPTH: u32 = 128;
 
 pub struct Parser {
     pub(crate) tokens: Vec<Token>,
     pub(crate) pos: usize,
     pub(crate) errors: Vec<ParseError>,
     pub(crate) depth: u32,
+    pub(crate) statement_class: &'static str,
 }
 
 impl Parser {
@@ -203,14 +228,20 @@ impl Parser {
             pos: 0,
             errors: Vec::new(),
             depth: 0,
+            statement_class: "EXPRESSION",
         }
     }
 
     pub(crate) fn enter_recursion(&mut self) -> Result<(), ParseError> {
         if self.depth >= MAX_PARSE_DEPTH {
-            return Err(self.err_msg(format!(
-                "expression tree is too deep (maximum depth {MAX_PARSE_DEPTH})"
-            )));
+            return Err(ParseError::limit(
+                format!(
+                    "parser recursion limit exceeded \
+                     (statement={}, depth={}, limit={MAX_PARSE_DEPTH})",
+                    self.statement_class, self.depth
+                ),
+                self.current(),
+            ));
         }
         self.depth += 1;
         Ok(())
@@ -291,7 +322,49 @@ impl Parser {
     }
 
     pub fn parse_statement(&mut self) -> Result<Statement, ParseError> {
-        self.parse_statement_inner()
+        let prior_class = self.statement_class;
+        self.statement_class = self.classify_current_statement();
+        let result = self.parse_statement_inner();
+        self.statement_class = prior_class;
+        result
+    }
+
+    fn classify_current_statement(&self) -> &'static str {
+        match self.peek() {
+            TokenKind::KwSelect | TokenKind::KwValues => "SELECT",
+            TokenKind::KwWith => "WITH",
+            TokenKind::KwInsert | TokenKind::KwReplace => "INSERT",
+            TokenKind::KwUpdate => "UPDATE",
+            TokenKind::KwDelete => "DELETE",
+            TokenKind::KwCreate => {
+                for offset in 1..=4 {
+                    match self.peek_nth(offset) {
+                        TokenKind::KwTable => return "CREATE TABLE",
+                        TokenKind::KwIndex => return "CREATE INDEX",
+                        TokenKind::KwView => return "CREATE VIEW",
+                        TokenKind::KwTrigger => return "CREATE TRIGGER",
+                        TokenKind::KwVirtual => return "CREATE VIRTUAL TABLE",
+                        _ => {}
+                    }
+                }
+                "CREATE"
+            }
+            TokenKind::KwDrop => "DROP",
+            TokenKind::KwAlter => "ALTER TABLE",
+            TokenKind::KwBegin => "BEGIN",
+            TokenKind::KwCommit | TokenKind::KwEnd => "COMMIT",
+            TokenKind::KwRollback => "ROLLBACK",
+            TokenKind::KwSavepoint => "SAVEPOINT",
+            TokenKind::KwRelease => "RELEASE",
+            TokenKind::KwAttach => "ATTACH",
+            TokenKind::KwDetach => "DETACH",
+            TokenKind::KwPragma => "PRAGMA",
+            TokenKind::KwVacuum => "VACUUM",
+            TokenKind::KwReindex => "REINDEX",
+            TokenKind::KwAnalyze => "ANALYZE",
+            TokenKind::KwExplain => "EXPLAIN",
+            _ => "UNKNOWN",
+        }
     }
 
     #[must_use]
@@ -2246,6 +2319,7 @@ fn parse_statements_with_scratch_inner(
         pos: 0,
         errors: std::mem::take(&mut scratch.errors),
         depth: 0,
+        statement_class: "UNKNOWN",
     };
     let (statements, errors) = parser.parse_all();
     scratch.tokens = parser.tokens;
@@ -2470,6 +2544,176 @@ mod tests {
         stmts.into_iter().next().unwrap()
     }
 
+    fn maximum_parenthesis_depth(sql: &str) -> usize {
+        let mut depth = 0_usize;
+        let mut maximum = 0_usize;
+        for byte in sql.bytes() {
+            match byte {
+                b'(' => {
+                    depth = depth.saturating_add(1);
+                    maximum = maximum.max(depth);
+                }
+                b')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        maximum
+    }
+
+    #[test]
+    fn ddl_boolean_chain_rendering_has_bounded_parenthesis_depth() {
+        let predicate = (0..256)
+            .map(|term| format!("NEW.value != {term}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let sql = format!(
+            "CREATE TRIGGER trg_guard AFTER INSERT ON guarded WHEN {predicate} \
+             BEGIN SELECT 1; END"
+        );
+        let rendered = parse_one(&sql).to_string();
+        let original_depth = maximum_parenthesis_depth(&sql);
+        let rendered_depth = maximum_parenthesis_depth(&rendered);
+        eprintln!(
+            "scenario=ddl_boolean_chain terms=256 original_bytes={} rendered_bytes={} \
+             original_parenthesis_depth={original_depth} rendered_parenthesis_depth={rendered_depth}",
+            sql.len(),
+            rendered.len()
+        );
+
+        assert!(
+            rendered_depth <= original_depth.saturating_add(2),
+            "flat boolean DDL must not become a physical-stack-sized parenthesis tree: \
+            original_depth={original_depth}, rendered_depth={rendered_depth}"
+        );
+    }
+
+    #[test]
+    fn ddl_expression_matrix_is_idempotent_without_depth_growth() {
+        let flat_or = (0..96)
+            .map(|term| format!("NEW.value = {term}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let cases = [
+            (
+                "flat_or_trigger_when",
+                format!(
+                    "CREATE TRIGGER trg_flat_or AFTER INSERT ON guarded WHEN {flat_or} \
+                     BEGIN SELECT 1; END"
+                ),
+            ),
+            (
+                "mixed_and_or_trigger_when",
+                "CREATE TRIGGER trg_mixed AFTER INSERT ON guarded \
+                 WHEN NEW.a = 1 OR NEW.b = 2 AND NEW.c = 3 OR NEW.d = 4 \
+                 BEGIN SELECT 1; END"
+                    .to_owned(),
+            ),
+            (
+                "nested_not_trigger_when",
+                "CREATE TRIGGER trg_not AFTER INSERT ON guarded \
+                 WHEN NOT (NOT (NEW.a = 1)) AND NEW.b = 2 \
+                 BEGIN SELECT 1; END"
+                    .to_owned(),
+            ),
+            (
+                "collate_trigger_when",
+                "CREATE TRIGGER trg_collate AFTER INSERT ON guarded \
+                 WHEN NEW.name COLLATE NOCASE = 'alpha' AND NEW.a = 1 \
+                 BEGIN SELECT 1; END"
+                    .to_owned(),
+            ),
+            (
+                "between_trigger_when",
+                "CREATE TRIGGER trg_between AFTER INSERT ON guarded \
+                 WHEN NEW.a BETWEEN 1 AND 3 AND NEW.b NOT BETWEEN 4 AND 6 \
+                 BEGIN SELECT 1; END"
+                    .to_owned(),
+            ),
+            (
+                "case_trigger_when",
+                "CREATE TRIGGER trg_case AFTER INSERT ON guarded \
+                 WHEN CASE WHEN NEW.a = 1 THEN 1 ELSE 0 END = 1 AND NEW.b = 2 \
+                 BEGIN SELECT 1; END"
+                    .to_owned(),
+            ),
+            (
+                "scalar_subquery_trigger_when",
+                "CREATE TRIGGER trg_scalar AFTER INSERT ON guarded \
+                 WHEN (SELECT COUNT(*) FROM lookup) > 0 AND NEW.a = 1 \
+                 BEGIN SELECT 1; END"
+                    .to_owned(),
+            ),
+            (
+                "exists_trigger_when",
+                "CREATE TRIGGER trg_exists AFTER INSERT ON guarded \
+                 WHEN EXISTS (SELECT 1 FROM lookup WHERE lookup.id = NEW.a) AND NEW.b = 2 \
+                 BEGIN SELECT 1; END"
+                    .to_owned(),
+            ),
+            (
+                "check_constraint",
+                "CREATE TABLE check_guard (\
+                    a INTEGER, b INTEGER, \
+                    CHECK (a BETWEEN 1 AND 9 AND NOT (b = 4 OR b = 5))\
+                 )"
+                .to_owned(),
+            ),
+            (
+                "partial_index",
+                "CREATE INDEX idx_partial_guard ON guarded(a) \
+                 WHERE a COLLATE BINARY = 1 OR b BETWEEN 2 AND 8"
+                    .to_owned(),
+            ),
+            (
+                "generated_column",
+                "CREATE TABLE generated_guard (\
+                    a INTEGER, b INTEGER, \
+                    c INTEGER GENERATED ALWAYS AS (\
+                        CASE WHEN a = 1 AND b = 2 THEN 1 ELSE 0 END\
+                    ) STORED\
+                 )"
+                .to_owned(),
+            ),
+            (
+                "view_predicate",
+                "CREATE VIEW guarded_view AS \
+                 SELECT a, CASE WHEN a BETWEEN 1 AND 3 THEN 'inside' ELSE 'outside' END AS bucket \
+                 FROM guarded WHERE a = 1 OR b = 2 AND c = 3"
+                    .to_owned(),
+            ),
+        ];
+
+        for (case, sql) in cases {
+            let parsed_once = parse_one(&sql);
+            let rendered_once = parsed_once.to_string();
+            let parsed_twice = parse_one(&rendered_once);
+            let rendered_twice = parsed_twice.to_string();
+            let first_depth = maximum_parenthesis_depth(&rendered_once);
+            let second_depth = maximum_parenthesis_depth(&rendered_twice);
+            eprintln!(
+                "scenario=ddl_expression_matrix case={case} original_bytes={} \
+                 rendered_bytes={} replay_bytes={} rendered_parenthesis_depth={first_depth} \
+                 replay_parenthesis_depth={second_depth}",
+                sql.len(),
+                rendered_once.len(),
+                rendered_twice.len()
+            );
+
+            assert_eq!(
+                rendered_twice, rendered_once,
+                "DDL rendering must reach a byte-stable fixed point after one parse: case={case}"
+            );
+            assert_eq!(
+                parsed_twice, parsed_once,
+                "DDL rendering must preserve the parsed semantics: case={case}"
+            );
+            assert_eq!(
+                second_depth, first_depth,
+                "DDL rendering must not grow parenthesis depth on replay: case={case}"
+            );
+        }
+    }
+
     #[test]
     fn test_parse_metrics_emitted_when_enabled() {
         let _guard = PARSE_OBSERVABILITY_LOCK
@@ -2541,6 +2785,54 @@ mod tests {
             MAX_PARSE_DEPTH - 1,
             "depth must remain stable across repeated recursion-limit errors"
         );
+    }
+
+    #[test]
+    fn deeply_nested_trigger_returns_typed_limit_on_two_mib_stack() {
+        const STACK_BYTES: usize = 2 * 1024 * 1024;
+        let handle = std::thread::Builder::new()
+            .name("parser-depth-2mib".to_owned())
+            .stack_size(STACK_BYTES)
+            .spawn(|| {
+                let admitted_nesting = 64_usize;
+                let admitted_sql = format!(
+                    "CREATE TRIGGER trg_admitted AFTER INSERT ON guarded WHEN {}1{} \
+                     BEGIN SELECT 1; END",
+                    "(".repeat(admitted_nesting),
+                    ")".repeat(admitted_nesting)
+                );
+                let mut admitted_scratch = StatementParseScratch::default();
+                parse_single_statement_with_scratch(&admitted_sql, &mut admitted_scratch)
+                    .expect("a practical nested expression must remain supported");
+
+                let nesting = usize::try_from(MAX_PARSE_DEPTH).unwrap_or(usize::MAX) + 64;
+                let sql = format!(
+                    "CREATE TRIGGER trg_depth AFTER INSERT ON guarded WHEN {}1{} \
+                     BEGIN SELECT 1; END",
+                    "(".repeat(nesting),
+                    ")".repeat(nesting)
+                );
+                let mut scratch = StatementParseScratch::default();
+                let error = parse_single_statement_with_scratch(&sql, &mut scratch)
+                    .expect_err("over-limit DDL must return a typed parse error");
+                eprintln!(
+                    "scenario=parser_recursion_limit stack_bytes={STACK_BYTES} \
+                     admitted_depth={admitted_nesting} requested_depth={nesting} \
+                     error_kind={:?} error={}",
+                    error.kind, error
+                );
+                assert_eq!(error.kind, ParseErrorKind::Limit);
+                assert!(
+                    error.message.contains("statement=CREATE TRIGGER")
+                        && error.message.contains(&format!("limit={MAX_PARSE_DEPTH}")),
+                    "limit error must identify the statement class and configured depth: {error}"
+                );
+            })
+            .expect("spawn fixed-stack parser test");
+
+        handle
+            .join()
+            .expect("typed recursion refusal must not panic or abort");
     }
 
     #[test]

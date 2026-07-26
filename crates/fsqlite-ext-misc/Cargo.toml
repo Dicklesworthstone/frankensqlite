@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-ext-misc"
-version = "0.1.18"
+version = "0.1.19"
 description = "Miscellaneous extensions: generate_series, carray, dbstat, dbpage"
 edition.workspace = true
 license-file.workspace = true

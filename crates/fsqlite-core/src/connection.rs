@@ -156,7 +156,7 @@ use fsqlite_vdbe::codegen::{
 use fsqlite_vdbe::engine::set_vdbe_metrics_enabled;
 use fsqlite_vdbe::engine::{
     ExactResultRowOutcome, ExecOutcome, MemDatabase, MemDbVersionToken, MemRowValues,
-    ReusableTableExecutionState, SharedTxnPageIo, VdbeEngine, VdbeMetricsSnapshot,
+    ReplaceVictim, ReusableTableExecutionState, SharedTxnPageIo, VdbeEngine, VdbeMetricsSnapshot,
     reset_vdbe_metrics, vdbe_metrics_snapshot,
 };
 #[cfg(feature = "diagnostic-pragmas")]
@@ -6867,6 +6867,20 @@ fn trigger_when_matches(
     }
     let row: [SqliteValue; 0] = [];
     let col_map: [(String, String, bool); 0] = [];
+    // Binding rewrites OLD/NEW references to literals before evaluation, but
+    // an explicit COLLATE on those literals must still use the connection's
+    // registered comparator.  Without a join-evaluation context,
+    // `compare_join_expr_values` deliberately falls back to bytewise
+    // comparison, so `NEW.label COLLATE NOCASE = 'fire'` incorrectly becomes
+    // false for a bound value such as `FiRe`.  No live columns remain in this
+    // outer expression, hence the empty metadata vectors; nested SELECTs push
+    // their own column context while inheriting the same registry stack.
+    let _join_eval_collation_guard =
+        JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
+            column_collations: Vec::new(),
+            column_affinities: Vec::new(),
+            registry: lock_unpoisoned(connection.collation_registry.as_ref()).clone(),
+        });
     connection
         .eval_expr_with_subqueries(&bound_expr, &row, &col_map, None)
         .map(|value| is_sqlite_truthy(&value))
@@ -8947,6 +8961,23 @@ pub struct Connection {
     /// When `true`, deferred FK checks are forced to run immediately (used while
     /// rechecking the deferred set at COMMIT so the recheck actually errors).
     fk_force_immediate_check: Cell<bool>,
+    /// Nesting depth for a logical DML statement that is internally replayed as
+    /// one physical statement per row. Immediate child-side FK checks are
+    /// collected while this is non-zero and validated once, against the final
+    /// database image, before the outer statement savepoint is released.
+    statement_fk_validation_depth: Cell<usize>,
+    /// Child tables touched while a row-replayed statement is active. We retain
+    /// table identities rather than row snapshots because a later REPLACE,
+    /// trigger, or cascade may remove or modify an earlier row before the
+    /// statement reaches its FK-validation boundary.
+    statement_fk_validation_tables: RefCell<Vec<String>>,
+    /// Prevents the statement-end validation scan from re-enqueuing itself.
+    statement_fk_validation_rechecking: Cell<bool>,
+    /// Exact logical rows implicitly deleted by the most recently completed
+    /// table-program REPLACE execution. The VDBE owns conflict discovery;
+    /// the connection drains these rows immediately after the table program so
+    /// inbound FK actions run before AFTER INSERT/UPDATE triggers.
+    last_replace_victims: RefCell<Vec<ReplaceVictim>>,
     /// Cache for successful FK parent-existence probes.
     ///
     /// Two activation modes share this slot:
@@ -9607,6 +9638,10 @@ impl Connection {
             fk_cascade_depth: Cell::new(0),
             deferred_fk_checks: RefCell::new(Vec::new()),
             fk_force_immediate_check: Cell::new(false),
+            statement_fk_validation_depth: Cell::new(0),
+            statement_fk_validation_tables: RefCell::new(Vec::new()),
+            statement_fk_validation_rechecking: Cell::new(false),
+            last_replace_victims: RefCell::new(Vec::new()),
             fk_parent_validation_cache: RefCell::new(None),
             conflict_observer: Arc::clone(&shared_mvcc_state.conflict_observer),
             trace_registration: RefCell::new(None),
@@ -10014,6 +10049,10 @@ impl Connection {
             fk_cascade_depth: Cell::new(0),
             deferred_fk_checks: RefCell::new(Vec::new()),
             fk_force_immediate_check: Cell::new(false),
+            statement_fk_validation_depth: Cell::new(0),
+            statement_fk_validation_tables: RefCell::new(Vec::new()),
+            statement_fk_validation_rechecking: Cell::new(false),
+            last_replace_victims: RefCell::new(Vec::new()),
             fk_parent_validation_cache: RefCell::new(None),
             // MVCC conflict observability (bd-t6sv2.1)
             conflict_observer: Arc::clone(&shared_mvcc_state.conflict_observer),
@@ -12390,9 +12429,19 @@ impl Connection {
     }
 
     fn record_table_program_error_state(&self, changes: usize, last_insert_rowid: Option<i64>) {
+        self.record_table_program_error_state_with_total_changes(changes, last_insert_rowid, None);
+    }
+
+    fn record_table_program_error_state_with_total_changes(
+        &self,
+        changes: usize,
+        last_insert_rowid: Option<i64>,
+        total_changes: Option<usize>,
+    ) {
         *self.last_table_program_error_state.borrow_mut() = Some(TableProgramErrorState {
             changes,
             last_insert_rowid,
+            total_changes,
         });
     }
 
@@ -12408,19 +12457,32 @@ impl Connection {
         previous_last_insert_rowid: i64,
     ) {
         let error_state = self.take_table_program_error_state();
-        if preserve_prior_changes_on_constraint_violation && error_is_constraint_violation(error) {
-            if let Some(state) = error_state {
-                self.restore_change_tracking_state(
-                    state.changes,
-                    previous_total_changes.saturating_add(state.changes),
-                    state
-                        .last_insert_rowid
-                        .unwrap_or(previous_last_insert_rowid),
-                );
-                return;
-            }
+        if error_preserves_prior_statement_rows(
+            preserve_prior_changes_on_constraint_violation,
+            error,
+        ) && let Some(state) = error_state
+        {
+            let retained_total_changes = state.total_changes.unwrap_or_else(|| {
+                self.total_changes
+                    .get()
+                    .max(previous_total_changes.saturating_add(state.changes))
+            });
+            self.restore_change_tracking_state(
+                state.changes,
+                retained_total_changes,
+                state
+                    .last_insert_rowid
+                    .unwrap_or(previous_last_insert_rowid),
+            );
+            return;
         }
-        self.restore_change_tracking_state(0, previous_total_changes, previous_last_insert_rowid);
+        let failed_last_insert_rowid = error_state
+            .and_then(|state| state.last_insert_rowid)
+            .unwrap_or(previous_last_insert_rowid);
+        let failed_total_changes = error_state
+            .and_then(|state| state.total_changes)
+            .unwrap_or(previous_total_changes);
+        self.restore_change_tracking_state(0, failed_total_changes, failed_last_insert_rowid);
     }
 
     fn record_last_insert_rowid(&self, rowid: i64) {
@@ -18844,11 +18906,16 @@ impl Connection {
         let execute_body_start = hot_path_profile_enabled().then(Instant::now);
         let mut execute_body = Some(execute_body);
         let result = if use_statement_savepoint {
-            self.with_internal_statement_savepoint_and_cx(execution_cx, statement_kind, || {
-                execute_body
-                    .take()
-                    .expect("prepared DML body should only run once")()
-            })
+            self.with_internal_statement_savepoint_and_cx_policy(
+                execution_cx,
+                statement_kind,
+                preserve_prior_changes_on_constraint_violation,
+                || {
+                    execute_body
+                        .take()
+                        .expect("prepared DML body should only run once")()
+                },
+            )
         } else {
             execute_body
                 .take()
@@ -18875,10 +18942,12 @@ impl Connection {
             }
         };
         let commit_autocommit_on_error = was_auto
-            && preserve_prior_changes_on_constraint_violation
             && matches!(
                 result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
+                Err(error) if error_preserves_prior_statement_rows(
+                    preserve_prior_changes_on_constraint_violation,
+                    error,
+                )
             );
         let execution_ok = result.is_ok() || commit_autocommit_on_error;
         let autocommit_resolve_start =
@@ -19186,11 +19255,13 @@ impl Connection {
             }
         };
 
-        let commit_autocommit_on_error = preserve_prior_changes_on_constraint_violation
-            && matches!(
-                result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
-            );
+        let commit_autocommit_on_error = matches!(
+            result.as_ref(),
+            Err(error) if error_preserves_prior_statement_rows(
+                preserve_prior_changes_on_constraint_violation,
+                error,
+            )
+        );
         let ok = result.is_ok() || commit_autocommit_on_error;
         let autocommit_resolve_start = hot_path_profile_enabled().then(Instant::now);
         if matches!(result.as_ref(), Ok(0)) {
@@ -19428,7 +19499,21 @@ impl Connection {
                     "prepared INSERT FK enforcement expected canonical INSERT SQL",
                 ));
             };
-            self.enforce_fk_on_insert(&insert, table_name, params)?;
+            if let Err(error) = self.enforce_fk_on_insert(&insert, table_name, params) {
+                // The reusable table program has already completed every
+                // physical row before this statement-boundary FK validation.
+                // SQLite rolls those rows back and reports changes() == 0,
+                // while retaining the last rowid attempted by the completed
+                // multi-row program. Publish that attempted rowid to the
+                // statement error unwinder without counting the rolled-back
+                // outer rows in total_changes().
+                self.record_table_program_error_state_with_total_changes(
+                    0,
+                    last_insert_rowid,
+                    Some(self.total_changes.get()),
+                );
+                return Err(error);
+            }
         }
         match post_write_action {
             PreparedInsertPostWriteAction::None => {}
@@ -21944,11 +22029,13 @@ impl Connection {
                 Err(rollback_error) => Err(rollback_error),
             },
         };
-        let commit_autocommit_on_error = preserve_prior_changes_on_constraint_violation
-            && matches!(
-                result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
-            );
+        let commit_autocommit_on_error = matches!(
+            result.as_ref(),
+            Err(error) if error_preserves_prior_statement_rows(
+                preserve_prior_changes_on_constraint_violation,
+                error,
+            )
+        );
         let ok = result.is_ok() || commit_autocommit_on_error;
         if matches!(result.as_ref(), Ok(0)) {
             // Direct rowid UPDATE/DELETE can be a true no-op. In a retained
@@ -23118,6 +23205,7 @@ impl Connection {
         self.execute_rollback(&rollback_stmt)
     }
 
+    #[cfg(test)]
     fn with_internal_statement_savepoint<T>(
         &self,
         purpose: &str,
@@ -23127,10 +23215,29 @@ impl Connection {
         self.with_internal_statement_savepoint_and_cx(&cx, purpose, body)
     }
 
+    #[cfg(test)]
     fn with_internal_statement_savepoint_and_cx<T>(
         &self,
         cx: &Cx,
         purpose: &str,
+        body: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.with_internal_statement_savepoint_and_cx_policy(cx, purpose, false, body)
+    }
+
+    /// Execute one logical statement behind an internal savepoint while
+    /// honoring SQLite's conflict-algorithm distinction between row-local
+    /// `FAIL` and statement-aborting errors.
+    ///
+    /// `OR FAIL` keeps rows completed before an ordinary uniqueness/NOT NULL/
+    /// CHECK failure. Foreign-key violations are different: SQLite always
+    /// treats them as `ABORT`, even when the DML spells `OR FAIL`, so they must
+    /// roll back to this statement boundary.
+    fn with_internal_statement_savepoint_and_cx_policy<T>(
+        &self,
+        cx: &Cx,
+        purpose: &str,
+        preserve_constraint_failure_rows: bool,
         body: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         // Pending direct-write runs belong to already-successful statements.
@@ -23210,10 +23317,14 @@ impl Connection {
                 Ok(value)
             }
             Err(statement_error) => {
-                // RAISE(FAIL): the statement fails but its already-applied rows
-                // are KEPT. Release the savepoint exactly as on success (instead
-                // of rolling back to it), then propagate the error.
-                if matches!(statement_error, FrankenError::RaiseFail(_)) {
+                // RAISE(FAIL), and ordinary constraint failures under an
+                // explicit OR FAIL policy, keep rows completed before the
+                // failure. Foreign-key violations are deliberately excluded
+                // by `error_preserves_prior_statement_rows`.
+                if error_preserves_prior_statement_rows(
+                    preserve_constraint_failure_rows,
+                    &statement_error,
+                ) {
                     if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
                         txn.release_savepoint(cx, &savepoint_name)?;
                     }
@@ -23302,6 +23413,10 @@ impl Connection {
                 if pager_rollback_succeeded {
                     self.txn_metrics_note_rollback();
                     self.clear_prepared_direct_insert_append_hint();
+                    // Rollback invalidates every cursor position established
+                    // against the discarded statement image. Reopen storage
+                    // cursors on the next statement.
+                    self.discard_cached_vdbe_engine();
                     self.restore_snapshot(cx, &snapshot)?;
                 }
 
@@ -23752,11 +23867,10 @@ impl Connection {
     fn should_use_statement_savepoint(
         &self,
         was_auto: bool,
-        preserve_prior_changes_on_constraint_violation: bool,
+        _preserve_prior_changes_on_constraint_violation: bool,
     ) -> bool {
         self.active_txn_is_open_or_borrowed()
             && self.internal_statement_savepoint_depth.get() == 0
-            && !preserve_prior_changes_on_constraint_violation
             && (!was_auto || self.retained_autocommit_batch_active())
     }
 
@@ -24021,9 +24135,11 @@ impl Connection {
                 }
             }
         }
+        let preserve_prior_changes_on_constraint_violation =
+            statement_preserves_prior_changes_on_constraint(statement.as_ref());
         let use_statement_savepoint = self.should_use_statement_savepoint(
             was_auto,
-            statement_preserves_prior_changes_on_constraint(statement.as_ref()),
+            preserve_prior_changes_on_constraint_violation,
         ) && matches!(
             statement.as_ref(),
             Statement::Insert(_)
@@ -24036,15 +24152,20 @@ impl Connection {
             statement_rolls_back_transaction_on_constraint(statement.as_ref());
         let execute_body_start = hot_path_profile_enabled().then(Instant::now);
         let result = if use_statement_savepoint {
-            self.with_internal_statement_savepoint_and_cx(&op_cx, statement_kind, || {
-                self.execute_statement_dispatch_impl(
-                    &op_cx,
-                    statement.as_ref(),
-                    params,
-                    precompiled,
-                    derived_storage_log_select.as_ref(),
-                )
-            })
+            self.with_internal_statement_savepoint_and_cx_policy(
+                &op_cx,
+                statement_kind,
+                preserve_prior_changes_on_constraint_violation,
+                || {
+                    self.execute_statement_dispatch_impl(
+                        &op_cx,
+                        statement.as_ref(),
+                        params,
+                        precompiled,
+                        derived_storage_log_select.as_ref(),
+                    )
+                },
+            )
         } else {
             self.execute_statement_dispatch_impl(
                 &op_cx,
@@ -24063,7 +24184,7 @@ impl Connection {
                     Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
                 ) {
                     self.restore_failed_statement_tracking(
-                        statement_preserves_prior_changes_on_constraint(statement.as_ref()),
+                        preserve_prior_changes_on_constraint_violation,
                         &error,
                         previous_total_changes,
                         previous_last_insert_rowid,
@@ -24080,14 +24201,13 @@ impl Connection {
             }
         };
         let commit_autocommit_on_error = was_auto
-            && ((statement_preserves_prior_changes_on_constraint(statement.as_ref())
-                && matches!(
-                    result.as_ref(),
-                    Err(error) if error_is_constraint_violation(error)
-                ))
-                // RAISE(FAIL) keeps the statement's already-applied rows, so an
-                // autocommit statement must commit them rather than roll back.
-                || matches!(result.as_ref(), Err(FrankenError::RaiseFail(_))));
+            && matches!(
+                result.as_ref(),
+                Err(error) if error_preserves_prior_statement_rows(
+                    preserve_prior_changes_on_constraint_violation,
+                    error,
+                )
+            );
         let ok = result.is_ok() || commit_autocommit_on_error;
         let dirty_table_name = if is_write {
             Self::extract_written_table_name(statement.as_ref())
@@ -24801,8 +24921,7 @@ impl Connection {
                     // tracking, so route around the outer trigger path here.
                     let needs_row_by_row_replay =
                         has_before_insert || has_after_insert || self.fk_enforcement_enabled();
-                    if !is_simple_values || (insert.returning.is_empty() && needs_row_by_row_replay)
-                    {
+                    if !is_simple_values || needs_row_by_row_replay {
                         self.log_mem_execution_fallback(
                             "insert_select",
                             "insert_select_row_by_row_fallback",
@@ -24820,7 +24939,6 @@ impl Connection {
                     }
                 }
                 if !is_live_vtab
-                    && insert.returning.is_empty()
                     && (has_before_insert || has_after_insert || self.fk_enforcement_enabled())
                     && let fsqlite_ast::InsertSource::Values(rows) = &insert.source
                     && rows.len() > 1
@@ -24830,8 +24948,9 @@ impl Connection {
                         "insert_values_row_by_row_trigger_or_fk_fallback",
                     )?;
                     let source_rows = self.materialize_insert_values_source_rows(rows, params)?;
-                    let _ = self.execute_insert_select_materialized_rows(insert, &source_rows)?;
-                    return Ok(Vec::new());
+                    let outcome =
+                        self.execute_insert_select_materialized_rows_outcome(insert, &source_rows)?;
+                    return Ok(outcome.returning_rows);
                 }
                 // bd-xb07w: morsel-driven INSERT for large multi-row VALUES
                 // without triggers, FK, RETURNING, or UPSERT. The morsel
@@ -24950,76 +25069,95 @@ impl Connection {
                 // from the pager via StorageCursor instead of MemDatabase.
                 // The VDBE path is correct; this is an optimization only.
 
-                let arc_prog;
-                let program: &VdbeProgram = if let Some(p) = precompiled {
-                    p
-                } else {
-                    let plan_span = tracing::span!(
-                        target: "fsqlite.plan",
-                        tracing::Level::TRACE,
-                        "plan",
-                        stage = "compile_table_insert"
-                    );
-                    record_trace_span_created();
-                    let _plan_guard = plan_span.enter();
-                    let sql_text = statement.to_string();
-                    let sql_key = Self::sql_hash(&sql_text);
-                    arc_prog = self.compile_with_cache(sql_key, &sql_text, |conn| {
-                        conn.compile_table_insert(insert)
-                    })?;
-                    &arc_prog
-                };
-                let runtime_requirements = self.insert_runtime_requirements(insert)?;
-                let (rows, affected, last_insert_rowid) = self.execute_table_program_with_cx(
-                    program,
-                    params,
-                    true,
-                    runtime_requirements,
-                    cx,
-                    true,
-                )?;
-
-                // bd-thqgm: FK constraint checking on INSERT.
-                // Skip FK enforcement when no row was written (e.g. an OR IGNORE
-                // PK conflict, affected == 0): SQLite does not FK-check a row it
-                // never inserted (#111).
-                if affected > 0 && self.fk_enforcement_enabled() {
-                    self.enforce_fk_on_insert(insert, table_name, params)?;
-                }
-
-                // Patch trigger NEW rows: fill in auto-assigned INTEGER
-                // PRIMARY KEY rowids that were NULL at pre-computation time.
-                if has_after_insert && !trigger_new_rows.is_empty() {
-                    if affected == 0 {
-                        trigger_new_rows.clear();
+                let execute_insert_and_after_triggers = || {
+                    let arc_prog;
+                    let program: &VdbeProgram = if let Some(p) = precompiled {
+                        p
                     } else {
-                        let tbl_key = table_name.to_ascii_lowercase();
-                        if let Some(&ipk_idx) = self.rowid_alias_columns.borrow().get(&tbl_key) {
-                            let last_rowid = self.current_last_insert_rowid();
-                            let count = trigger_new_rows.len();
-                            for (i, new_row) in trigger_new_rows.iter_mut().enumerate() {
-                                if ipk_idx < new_row.len() && new_row[ipk_idx] == SqliteValue::Null
-                                {
-                                    #[allow(clippy::cast_possible_wrap)]
-                                    let rowid = last_rowid - (count as i64 - 1) + i as i64;
-                                    new_row[ipk_idx] = SqliteValue::Integer(rowid);
+                        let plan_span = tracing::span!(
+                            target: "fsqlite.plan",
+                            tracing::Level::TRACE,
+                            "plan",
+                            stage = "compile_table_insert"
+                        );
+                        record_trace_span_created();
+                        let _plan_guard = plan_span.enter();
+                        let sql_text = statement.to_string();
+                        let sql_key = Self::sql_hash(&sql_text);
+                        arc_prog = self.compile_with_cache(sql_key, &sql_text, |conn| {
+                            conn.compile_table_insert(insert)
+                        })?;
+                        &arc_prog
+                    };
+                    let runtime_requirements = self.insert_runtime_requirements(insert)?;
+                    let (rows, affected, last_insert_rowid) = self.execute_table_program_with_cx(
+                        program,
+                        params,
+                        true,
+                        runtime_requirements,
+                        cx,
+                        true,
+                    )?;
+
+                    // Implicit REPLACE deletes are real parent-row deletions for
+                    // inbound FK purposes. The VDBE reports the exact victims
+                    // after canonical conflict discovery; enforce their actions
+                    // before validating the inserted child row or firing AFTER
+                    // INSERT triggers.
+                    self.enforce_fk_on_replace_victims(table_name)?;
+
+                    // bd-thqgm: FK constraint checking on INSERT.
+                    // Skip FK enforcement when no row was written (e.g. an OR IGNORE
+                    // PK conflict, affected == 0): SQLite does not FK-check a row it
+                    // never inserted (#111).
+                    if affected > 0 && self.fk_enforcement_enabled() {
+                        self.enforce_fk_on_insert(insert, table_name, params)?;
+                    }
+
+                    // Patch trigger NEW rows: fill in auto-assigned INTEGER
+                    // PRIMARY KEY rowids that were NULL at pre-computation time.
+                    if has_after_insert && !trigger_new_rows.is_empty() {
+                        if affected == 0 {
+                            trigger_new_rows.clear();
+                        } else {
+                            let tbl_key = table_name.to_ascii_lowercase();
+                            if let Some(&ipk_idx) = self.rowid_alias_columns.borrow().get(&tbl_key)
+                            {
+                                let last_rowid = self.current_last_insert_rowid();
+                                let count = trigger_new_rows.len();
+                                for (i, new_row) in trigger_new_rows.iter_mut().enumerate() {
+                                    if ipk_idx < new_row.len()
+                                        && new_row[ipk_idx] == SqliteValue::Null
+                                    {
+                                        #[allow(clippy::cast_possible_wrap)]
+                                        let rowid = last_rowid - (count as i64 - 1) + i as i64;
+                                        new_row[ipk_idx] = SqliteValue::Integer(rowid);
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                // Phase 5G.3: Fire AFTER INSERT triggers.
-                if has_after_insert {
-                    for new_values in &trigger_new_rows {
-                        self.fire_after_triggers(
-                            table_name,
-                            &insert_event,
-                            None,
-                            Some(new_values),
-                        )?;
+                    // Phase 5G.3: Fire AFTER INSERT triggers.
+                    if has_after_insert {
+                        for new_values in &trigger_new_rows {
+                            self.fire_after_triggers(
+                                table_name,
+                                &insert_event,
+                                None,
+                                Some(new_values),
+                            )?;
+                        }
                     }
-                }
+
+                    Ok((rows, affected, last_insert_rowid))
+                };
+                let (rows, affected, last_insert_rowid) = self.with_replace_fk_validation_scope(
+                    table_name,
+                    insert.or_conflict,
+                    has_after_insert,
+                    execute_insert_and_after_triggers,
+                )?;
 
                 if table_name.eq_ignore_ascii_case("sqlite_sequence") {
                     self.refresh_sqlite_sequence_cache()?;
@@ -25076,6 +25214,26 @@ impl Connection {
                     fsqlite_ast::TriggerTiming::After,
                     &update_event,
                 );
+                let needs_row_by_row_replay = effective_update.from.is_none()
+                    && (has_before_update
+                        || has_after_update
+                        || self.fk_cascade_propagation_enabled());
+                if needs_row_by_row_replay
+                    && let Some((locator_columns, locator_rows)) =
+                        self.materialize_update_replay_locators(&effective_update, params)?
+                    && locator_rows.len() > 1
+                {
+                    self.log_mem_execution_fallback(
+                        "update",
+                        "update_row_by_row_trigger_or_fk_fallback",
+                    )?;
+                    return self.execute_update_row_by_row(
+                        &effective_update,
+                        params,
+                        &locator_columns,
+                        &locator_rows,
+                    );
+                }
                 let trigger_rows = if has_before_update || has_after_update {
                     self.collect_update_trigger_rows(&effective_update, params)?
                 } else {
@@ -25137,45 +25295,60 @@ impl Connection {
                     }
                 }
 
-                let arc_prog;
-                let program: &VdbeProgram = if let Some(p) = precompiled {
-                    p
-                } else {
-                    let plan_span = tracing::span!(
-                        target: "fsqlite.plan",
-                        tracing::Level::TRACE,
-                        "plan",
-                        stage = "compile_table_update"
-                    );
-                    record_trace_span_created();
-                    let _plan_guard = plan_span.enter();
-                    let sql_text = effective_update.to_string();
-                    let sql_key = Self::sql_hash(&sql_text);
-                    arc_prog = self.compile_with_cache(sql_key, &sql_text, |conn| {
-                        conn.compile_table_update(&effective_update)
-                    })?;
-                    &arc_prog
-                };
-                let (rows, affected, _) = self.execute_table_program_with_cx(
-                    program,
-                    params,
-                    false,
-                    TableExecutionRuntimeRequirements::read_path(),
-                    cx,
-                    true,
-                )?;
+                let execute_update_and_after_triggers = || {
+                    let arc_prog;
+                    let program: &VdbeProgram = if let Some(p) = precompiled {
+                        p
+                    } else {
+                        let plan_span = tracing::span!(
+                            target: "fsqlite.plan",
+                            tracing::Level::TRACE,
+                            "plan",
+                            stage = "compile_table_update"
+                        );
+                        record_trace_span_created();
+                        let _plan_guard = plan_span.enter();
+                        let sql_text = effective_update.to_string();
+                        let sql_key = Self::sql_hash(&sql_text);
+                        arc_prog = self.compile_with_cache(sql_key, &sql_text, |conn| {
+                            conn.compile_table_update(&effective_update)
+                        })?;
+                        &arc_prog
+                    };
+                    let (rows, affected, _) = self.execute_table_program_with_cx(
+                        program,
+                        params,
+                        false,
+                        TableExecutionRuntimeRequirements::read_path(),
+                        cx,
+                        true,
+                    )?;
 
-                // Phase 5G.3: Fire AFTER UPDATE triggers.
-                if has_after_update {
-                    for (old_values, new_values) in &trigger_rows {
-                        self.fire_after_triggers(
-                            table_name,
-                            &update_event,
-                            Some(old_values),
-                            Some(new_values),
-                        )?;
+                    // UPDATE OR REPLACE may implicitly delete a different row that
+                    // conflicts with the updated value. Apply inbound FK effects
+                    // for that exact victim before AFTER UPDATE triggers.
+                    self.enforce_fk_on_replace_victims(table_name)?;
+
+                    // Phase 5G.3: Fire AFTER UPDATE triggers.
+                    if has_after_update {
+                        for (old_values, new_values) in &trigger_rows {
+                            self.fire_after_triggers(
+                                table_name,
+                                &update_event,
+                                Some(old_values),
+                                Some(new_values),
+                            )?;
+                        }
                     }
-                }
+
+                    Ok((rows, affected))
+                };
+                let (rows, affected) = self.with_replace_fk_validation_scope(
+                    table_name,
+                    effective_update.or_conflict,
+                    has_after_update,
+                    execute_update_and_after_triggers,
+                )?;
 
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 self.record_statement_changes(affected);
@@ -25861,6 +26034,44 @@ impl Connection {
         select_stmt: &fsqlite_ast::SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<InsertSelectReplayOutcome> {
+        let preserve_prior_changes_on_constraint_violation =
+            insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
+        let completed_changes = Cell::new(0usize);
+        let completed_last_insert_rowid = Cell::new(None);
+        let body_completed = Cell::new(false);
+        let result = self.with_statement_fk_validation_scope(
+            preserve_prior_changes_on_constraint_violation,
+            || {
+                let outcome = self.execute_insert_select_fallback_outcome_scoped(
+                    insert,
+                    select_stmt,
+                    params,
+                )?;
+                completed_changes.set(outcome.changes);
+                if outcome.changes > 0 {
+                    completed_last_insert_rowid.set(Some(self.current_last_insert_rowid()));
+                }
+                body_completed.set(true);
+                Ok(outcome)
+            },
+        );
+        if result.is_err() && body_completed.get() {
+            let statement_changes = completed_changes.get();
+            self.record_table_program_error_state_with_total_changes(
+                0,
+                completed_last_insert_rowid.get(),
+                Some(self.total_changes.get().saturating_sub(statement_changes)),
+            );
+        }
+        result
+    }
+
+    fn execute_insert_select_fallback_outcome_scoped(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        select_stmt: &fsqlite_ast::SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<InsertSelectReplayOutcome> {
         if let Some(changes) =
             self.try_execute_streaming_insert_select_fallback_outcome(insert, select_stmt, params)?
         {
@@ -25937,21 +26148,24 @@ impl Connection {
             preserve_prior_changes_on_constraint_violation,
         );
         let result = if use_statement_savepoint {
-            self.with_internal_statement_savepoint("insert_select", || {
-                self.execute_insert_select_materialized_rows(insert, source_rows)
-            })
+            let cx = self.op_cx()?;
+            self.with_internal_statement_savepoint_and_cx_policy(
+                &cx,
+                "insert_select",
+                preserve_prior_changes_on_constraint_violation,
+                || self.execute_insert_select_materialized_rows(insert, source_rows),
+            )
         } else {
             self.execute_insert_select_materialized_rows(insert, source_rows)
         };
         let commit_autocommit_on_error = was_auto
-            && ((preserve_prior_changes_on_constraint_violation
-                && matches!(
-                    result.as_ref(),
-                    Err(error) if error_is_constraint_violation(error)
-                ))
-                // RAISE(FAIL) in a BEFORE trigger keeps the rows already inserted
-                // by this statement; commit them instead of rolling back.
-                || matches!(result.as_ref(), Err(FrankenError::RaiseFail(_))));
+            && matches!(
+                result.as_ref(),
+                Err(error) if error_preserves_prior_statement_rows(
+                    preserve_prior_changes_on_constraint_violation,
+                    error,
+                )
+            );
         let ok = result.is_ok() || commit_autocommit_on_error;
         self.resolve_autocommit_txn_with_capture(was_auto, ok, false)?;
         result
@@ -26252,101 +26466,149 @@ impl Connection {
         let collect_returning = !insert.returning.is_empty();
         let preserve_prior_changes_on_constraint_violation =
             insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
-        let previous_total_changes = self.total_changes.get();
-        let previous_last_insert_rowid = self.current_last_insert_rowid();
+        let completed_statement_changes = Cell::new(0usize);
+        let completed_statement_last_insert_rowid = Cell::new(None);
+        let replay_error_recorded = Cell::new(false);
         let mut execute_rows = || -> Result<InsertSelectReplayOutcome> {
-            let _fk_parent_validation_cache =
-                self.enter_fk_parent_validation_cache_scope(&insert.table.name);
-            let prepared = if collect_returning {
-                None
-            } else {
-                Some(self.prepare_after_background_status(&insert_sql)?)
-            };
-            let returning_statement = if collect_returning {
-                Some(parse_single_statement(&insert_sql)?)
-            } else {
-                None
-            };
-            let mut statement_changes = 0usize;
-            let mut returning_rows = Vec::new();
-            let mut produced_rows = 0usize;
-            let mut error_state_recorded = false;
-            let record_error_state = |statement_changes: usize| {
-                if self.internal_statement_savepoint_depth.get() > 0 {
-                    self.restore_change_tracking_state(
-                        0,
-                        previous_total_changes,
-                        previous_last_insert_rowid,
-                    );
-                } else {
+            let result = self.with_statement_fk_validation_scope(
+                preserve_prior_changes_on_constraint_violation,
+                || {
+                    let _fk_parent_validation_cache =
+                        self.enter_fk_parent_validation_cache_scope(&insert.table.name);
+                    let prepared = if collect_returning {
+                        None
+                    } else {
+                        Some(self.prepare_after_background_status(&insert_sql)?)
+                    };
+                    let returning_statement = if collect_returning {
+                        Some(parse_single_statement(&insert_sql)?)
+                    } else {
+                        None
+                    };
+                    let mut statement_changes = 0usize;
+                    let mut returning_rows = Vec::new();
+                    let mut produced_rows = 0usize;
+                    let mut error_state_recorded = false;
+                    let record_error_state =
+                        |statement_changes: usize, error: &FrankenError| {
+                            if error_preserves_prior_statement_rows(
+                                preserve_prior_changes_on_constraint_violation,
+                                error,
+                            ) {
+                                self.set_statement_change_count(statement_changes);
+                                self.record_table_program_error_state_with_total_changes(
+                                    statement_changes,
+                                    (statement_changes > 0)
+                                        .then(|| self.current_last_insert_rowid()),
+                                    Some(self.total_changes.get()),
+                                );
+                            } else {
+                                // ABORT/ROLLBACK undo the outer statement's
+                                // rows, but SQLite still exposes the rowid of
+                                // the last successful outer INSERT and retains
+                                // total_changes contributions from completed
+                                // nested trigger statements.
+                                self.set_statement_change_count(0);
+                                self.record_table_program_error_state_with_total_changes(
+                                    0,
+                                    (statement_changes > 0)
+                                        .then(|| self.current_last_insert_rowid()),
+                                    Some(
+                                        self.total_changes
+                                            .get()
+                                            .saturating_sub(statement_changes),
+                                    ),
+                                );
+                            }
+                        };
+                    let mut emit_row = |row_values: &[SqliteValue]| -> Result<()> {
+                        let row_idx = produced_rows;
+                        produced_rows = produced_rows.saturating_add(1);
+                        if row_values.len() != source_column_count {
+                            return Err(FrankenError::Internal(format!(
+                                "INSERT ... SELECT column count mismatch: source row {row_idx} has {} values, SELECT produced {source_column_count}",
+                                row_values.len()
+                            )));
+                        }
+                        let row_result =
+                            if let Some(returning_statement) = returning_statement.as_ref() {
+                                self.execute_statement_impl_after_background_status(
+                                    returning_statement,
+                                    Some(row_values),
+                                    None,
+                                )
+                                .map(|rows| {
+                                    let affected = self.last_changes.get();
+                                    returning_rows.extend(rows);
+                                    affected
+                                })
+                            } else {
+                                self.execute_prepared_with_params_after_background_status(
+                                    prepared.as_ref().ok_or_else(|| {
+                                        FrankenError::internal(
+                                            "INSERT ... SELECT replay missing prepared statement",
+                                        )
+                                    })?,
+                                    row_values,
+                                    false,
+                                )
+                            };
+                        match row_result {
+                            Ok(affected) => {
+                                statement_changes = statement_changes.saturating_add(affected);
+                                completed_statement_changes.set(statement_changes);
+                                if affected > 0 {
+                                    completed_statement_last_insert_rowid
+                                        .set(Some(self.current_last_insert_rowid()));
+                                }
+                                Ok(())
+                            }
+                            Err(error) => {
+                                error_state_recorded = true;
+                                replay_error_recorded.set(true);
+                                record_error_state(statement_changes, &error);
+                                Err(error)
+                            }
+                        }
+                    };
+                    if let Err(error) = producer(&mut emit_row) {
+                        if !error_state_recorded {
+                            replay_error_recorded.set(true);
+                            record_error_state(statement_changes, &error);
+                        }
+                        return Err(error);
+                    }
                     self.set_statement_change_count(statement_changes);
-                    self.record_table_program_error_state(
-                        statement_changes,
-                        (statement_changes > 0).then(|| self.current_last_insert_rowid()),
-                    );
-                }
-            };
-            let mut emit_row = |row_values: &[SqliteValue]| -> Result<()> {
-                let row_idx = produced_rows;
-                produced_rows = produced_rows.saturating_add(1);
-                if row_values.len() != source_column_count {
-                    return Err(FrankenError::Internal(format!(
-                        "INSERT ... SELECT column count mismatch: source row {row_idx} has {} values, SELECT produced {source_column_count}",
-                        row_values.len()
-                    )));
-                }
-                let row_result = if let Some(returning_statement) = returning_statement.as_ref() {
-                    self.execute_statement_impl_after_background_status(
-                        returning_statement,
-                        Some(row_values),
-                        None,
-                    )
-                    .map(|rows| {
-                        let affected = self.last_changes.get();
-                        returning_rows.extend(rows);
-                        affected
+                    Ok(InsertSelectReplayOutcome {
+                        changes: statement_changes,
+                        returning_rows,
                     })
-                } else {
-                    self.execute_prepared_with_params_after_background_status(
-                        prepared.as_ref().ok_or_else(|| {
-                            FrankenError::internal(
-                                "INSERT ... SELECT replay missing prepared statement",
-                            )
-                        })?,
-                        row_values,
-                        false,
-                    )
-                };
-                match row_result {
-                    Ok(affected) => {
-                        statement_changes = statement_changes.saturating_add(affected);
-                        Ok(())
-                    }
-                    Err(error) => {
-                        error_state_recorded = true;
-                        record_error_state(statement_changes);
-                        Err(error)
-                    }
-                }
-            };
-            if let Err(error) = producer(&mut emit_row) {
-                if !error_state_recorded {
-                    record_error_state(statement_changes);
-                }
-                return Err(error);
+                },
+            );
+            // A statement-boundary FK validation error happens after every
+            // physical row replayed successfully, so the per-row error branch
+            // above never records it.  Preserve SQLite's attempted-insert
+            // rowid while excluding rolled-back outer rows from total_changes.
+            if result.is_err() && !replay_error_recorded.get() {
+                let statement_changes = completed_statement_changes.get();
+                self.record_table_program_error_state_with_total_changes(
+                    0,
+                    completed_statement_last_insert_rowid.get(),
+                    Some(self.total_changes.get().saturating_sub(statement_changes)),
+                );
             }
-            self.set_statement_change_count(statement_changes);
-            Ok(InsertSelectReplayOutcome {
-                changes: statement_changes,
-                returning_rows,
-            })
+            result
         };
 
-        if !preserve_prior_changes_on_constraint_violation
-            && self.active_txn.borrow().is_some()
-            && self.internal_statement_savepoint_depth.get() == 0
+        if self.active_txn.borrow().is_some() && self.internal_statement_savepoint_depth.get() == 0
         {
-            self.with_internal_statement_savepoint("insert_select", execute_rows)
+            let cx = self.op_cx()?;
+            self.with_internal_statement_savepoint_and_cx_policy(
+                &cx,
+                "insert_select",
+                preserve_prior_changes_on_constraint_violation,
+                execute_rows,
+            )
         } else {
             execute_rows()
         }
@@ -27722,6 +27984,15 @@ impl Connection {
 
         let table_name = insert.table.name.as_str();
         if self.has_live_vtab_instance(table_name) {
+            return false;
+        }
+        if insert.or_conflict == Some(fsqlite_ast::ConflictAction::Replace)
+            && self.table_is_foreign_key_parent(table_name)
+        {
+            // The direct-simple insert lane cannot report the exact row that
+            // REPLACE implicitly deletes. Keep FK-parent REPLACE statements on
+            // the VDBE path even if this statement was prepared while
+            // PRAGMA foreign_keys was OFF and enabled before execution.
             return false;
         }
         let insert_event = fsqlite_ast::TriggerEvent::Insert;
@@ -31802,6 +32073,215 @@ impl Connection {
             limit,
         );
         self.execute_statement(&Statement::Select(select), params)
+    }
+
+    /// Freeze stable row locators for a multi-row UPDATE before its first
+    /// trigger or mutation runs. Rowid tables use the first unshadowed hidden
+    /// rowid alias (falling back to an INTEGER PRIMARY KEY alias); WITHOUT
+    /// ROWID tables use the complete declared composite primary key.
+    ///
+    /// `None` means the table has no unambiguous locator expressible through
+    /// the SQL surface, in which case callers retain the ordinary VDBE path
+    /// instead of risking duplicate or skipped updates.
+    fn materialize_update_replay_locators(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<UpdateReplayLocatorSet>> {
+        let table_name = &update.table.name.name;
+        let schema = self.schema.borrow();
+        let table = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(table_name))
+            .ok_or_else(|| FrankenError::NoSuchTable {
+                name: table_name.clone(),
+            })?;
+
+        let locator_columns = if table.without_rowid {
+            let primary_key = table.primary_key_constraints.first().ok_or_else(|| {
+                FrankenError::NotImplemented(format!(
+                    "WITHOUT ROWID table {} has no PRIMARY KEY",
+                    table.name
+                ))
+            })?;
+            if primary_key.is_empty() {
+                return Err(FrankenError::NotImplemented(format!(
+                    "WITHOUT ROWID table {} has an empty PRIMARY KEY",
+                    table.name
+                )));
+            }
+            for column in primary_key {
+                if table.column_index(column).is_none() {
+                    return Err(FrankenError::Internal(format!(
+                        "no such column: {column} in table {}",
+                        table.name
+                    )));
+                }
+            }
+            primary_key.clone()
+        } else {
+            let shadowed = table
+                .columns
+                .iter()
+                .map(|column| column.name.to_ascii_lowercase())
+                .collect::<HashSet<_>>();
+            if let Some(hidden_rowid) = ["rowid", "_rowid_", "oid"]
+                .into_iter()
+                .find(|candidate| !shadowed.contains(*candidate))
+            {
+                vec![hidden_rowid.to_owned()]
+            } else if let Some(ipk_column) = table.columns.iter().find(|column| column.is_ipk) {
+                vec![ipk_column.name.clone()]
+            } else {
+                return Ok(None);
+            }
+        };
+        drop(schema);
+
+        if locator_columns.is_empty() {
+            return Ok(None);
+        }
+        let projections = locator_columns
+            .iter()
+            .map(|column| ResultColumn::Expr {
+                expr: Self::build_limit_scope_projection_expr(&update.table, column),
+                alias: None,
+            })
+            .collect();
+        let select = Self::build_single_table_select(
+            &update.table,
+            projections,
+            update.where_clause.as_ref(),
+            &[],
+            None,
+        );
+        let locator_rows = self
+            .execute_statement(&Statement::Select(select), params)?
+            .into_iter()
+            .map(|row| row.values().to_vec())
+            .collect();
+        Ok(Some((locator_columns, locator_rows)))
+    }
+
+    fn build_update_replay_locator_filter(
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+        locator_columns: &[String],
+        locator_values: &[SqliteValue],
+    ) -> Result<Expr> {
+        if locator_columns.len() != locator_values.len() || locator_columns.is_empty() {
+            return Err(FrankenError::Internal(format!(
+                "UPDATE row replay locator arity mismatch: columns={}, values={}",
+                locator_columns.len(),
+                locator_values.len()
+            )));
+        }
+
+        let mut predicates = locator_columns
+            .iter()
+            .zip(locator_values)
+            .map(|(column, value)| Expr::BinaryOp {
+                left: Box::new(Self::build_limit_scope_projection_expr(table_ref, column)),
+                op: BinaryOp::Eq,
+                right: Box::new(value_to_literal_expr(value.clone())),
+                span: Span::ZERO,
+            });
+        let first = predicates.next().ok_or_else(|| {
+            FrankenError::Internal("UPDATE row replay locator cannot be empty".to_owned())
+        })?;
+        Ok(predicates.fold(first, |left, right| Expr::BinaryOp {
+            left: Box::new(left),
+            op: BinaryOp::And,
+            right: Box::new(right),
+            span: Span::ZERO,
+        }))
+    }
+
+    fn execute_update_row_by_row(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+        params: Option<&[SqliteValue]>,
+        locator_columns: &[String],
+        locator_rows: &[Vec<SqliteValue>],
+    ) -> Result<Vec<Row>> {
+        let preserve_prior_changes_on_constraint_violation =
+            update.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
+        let completed_statement_changes = Cell::new(0usize);
+
+        let result = self.with_statement_fk_validation_scope(
+            preserve_prior_changes_on_constraint_violation,
+            || {
+                let mut statement_changes = 0usize;
+                let mut returning_rows = Vec::new();
+                for (row_index, locator_values) in locator_rows.iter().enumerate() {
+                    let mut row_update = update.clone();
+                    row_update.where_clause = Some(Self::build_update_replay_locator_filter(
+                        &row_update.table,
+                        locator_columns,
+                        locator_values,
+                    )?);
+                    row_update.order_by.clear();
+                    row_update.limit = None;
+
+                    match self.execute_statement_impl_after_background_status(
+                        &Statement::Update(row_update),
+                        params,
+                        None,
+                    ) {
+                        Ok(rows) => {
+                            statement_changes =
+                                statement_changes.saturating_add(self.last_changes.get());
+                            completed_statement_changes.set(statement_changes);
+                            returning_rows.extend(rows);
+                        }
+                        Err(error) => {
+                            if error_preserves_prior_statement_rows(
+                                preserve_prior_changes_on_constraint_violation,
+                                &error,
+                            ) {
+                                self.set_statement_change_count(statement_changes);
+                                self.record_table_program_error_state_with_total_changes(
+                                    statement_changes,
+                                    (statement_changes > 0)
+                                        .then(|| self.current_last_insert_rowid()),
+                                    Some(self.total_changes.get()),
+                                );
+                            } else {
+                                self.set_statement_change_count(0);
+                                self.record_table_program_error_state_with_total_changes(
+                                    0,
+                                    (statement_changes > 0)
+                                        .then(|| self.current_last_insert_rowid()),
+                                    Some(
+                                        self.total_changes.get().saturating_sub(statement_changes),
+                                    ),
+                                );
+                            }
+                            tracing::debug!(
+                                target: "fsqlite.statement",
+                                table = %update.table.name.name,
+                                row_index,
+                                locator_columns = ?locator_columns,
+                                locator_values = ?locator_values,
+                                error = %error,
+                                "row-replayed UPDATE failed"
+                            );
+                            return Err(error);
+                        }
+                    }
+                }
+                self.set_statement_change_count(statement_changes);
+                Ok(returning_rows)
+            },
+        );
+        if result.is_err() && self.last_table_program_error_state.borrow().is_none() {
+            let statement_changes = completed_statement_changes.get();
+            self.record_table_program_error_state_with_total_changes(
+                0,
+                (statement_changes > 0).then(|| self.current_last_insert_rowid()),
+                Some(self.total_changes.get().saturating_sub(statement_changes)),
+            );
+        }
+        result
     }
 
     /// Pre-evaluate and inline scalar subqueries in `expr` that reference
@@ -42778,6 +43258,144 @@ impl Connection {
         result
     }
 
+    /// Run internally row-replayed DML as one immediate-FK validation unit.
+    ///
+    /// Triggers remain interleaved with each physical row mutation, while
+    /// `NO ACTION` and child-parent existence checks observe the final image of
+    /// the outer SQL statement. Table identities, rather than stale row
+    /// snapshots, are queued because later rows, triggers, or cascades may
+    /// delete or rewrite an earlier candidate.
+    fn with_statement_fk_validation_scope<T>(
+        &self,
+        preserve_constraint_failure_rows: bool,
+        body: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if !self.pragma_state.borrow().foreign_keys {
+            return body();
+        }
+
+        let outermost = self.statement_fk_validation_depth.get() == 0;
+        let table_start = self.statement_fk_validation_tables.borrow().len();
+        let deferred_start = self.deferred_fk_checks.borrow().len();
+        self.statement_fk_validation_depth
+            .set(self.statement_fk_validation_depth.get().saturating_add(1));
+
+        let result = body();
+        self.statement_fk_validation_depth
+            .set(self.statement_fk_validation_depth.get().saturating_sub(1));
+        if !outermost {
+            return result;
+        }
+
+        // A FAIL error retains the rows completed before it. Those retained
+        // rows still need their statement-end FK check. An ABORT-class error
+        // will be rolled back wholesale, so discard its queued validation.
+        if result.as_ref().is_err_and(|error| {
+            !error_preserves_prior_statement_rows(preserve_constraint_failure_rows, error)
+        }) {
+            self.statement_fk_validation_tables
+                .borrow_mut()
+                .truncate(table_start);
+            self.deferred_fk_checks
+                .borrow_mut()
+                .truncate(deferred_start);
+            return result;
+        }
+
+        let mut child_tables = self
+            .statement_fk_validation_tables
+            .borrow_mut()
+            .split_off(table_start);
+        child_tables.sort_by_key(|table| table.to_ascii_lowercase());
+        child_tables.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+
+        let previous_rechecking = self.statement_fk_validation_rechecking.replace(true);
+        let validation_result = (|| {
+            for child_table in &child_tables {
+                let sql = format!("SELECT * FROM {}", quote_identifier(child_table));
+                for row in self.fk_validation_query(&sql, &[])? {
+                    self.check_fk_parent_exists(child_table, row.values())?;
+                }
+            }
+            Ok(())
+        })();
+        self.statement_fk_validation_rechecking
+            .set(previous_rechecking);
+
+        if let Err(error) = validation_result {
+            // The statement-end FK violation is ABORT-class even when the
+            // original DML used OR FAIL.
+            self.deferred_fk_checks
+                .borrow_mut()
+                .truncate(deferred_start);
+            return Err(error);
+        }
+        result
+    }
+
+    /// Keep implicit deletes from `INSERT/UPDATE OR REPLACE` and the outer
+    /// statement's AFTER triggers in one immediate-FK validation unit.
+    ///
+    /// SQLite checks `RESTRICT` at the implicit deletion point, but postpones
+    /// `NO ACTION` until the statement finishes. An AFTER trigger may therefore
+    /// repair a `NO ACTION` reference before validation. Row-replay paths
+    /// already own a wider logical statement scope, so only establish one at
+    /// the normal single-program dispatch boundary when no outer scope exists.
+    /// REPLACE may come from the statement or from a UNIQUE / PRIMARY KEY
+    /// constraint's declared conflict policy; an explicit non-REPLACE statement
+    /// policy overrides the schema default.
+    fn with_replace_fk_validation_scope<T>(
+        &self,
+        table_name: &str,
+        conflict_action: Option<fsqlite_ast::ConflictAction>,
+        has_after_trigger: bool,
+        body: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if !has_after_trigger || self.statement_fk_validation_depth.get() > 0 {
+            return body();
+        }
+        let may_replace = conflict_action.map_or_else(
+            || {
+                self.schema
+                    .borrow()
+                    .iter()
+                    .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                    .is_some_and(|table| {
+                        table.columns.iter().any(|column| {
+                            column.is_ipk
+                                && column.conflict_action
+                                    == Some(fsqlite_ast::ConflictAction::Replace)
+                        }) || table.indexes.iter().any(|index| {
+                            index.is_unique
+                                && index.conflict_action
+                                    == Some(fsqlite_ast::ConflictAction::Replace)
+                        })
+                    })
+            },
+            |action| action == fsqlite_ast::ConflictAction::Replace,
+        );
+        if may_replace {
+            self.with_statement_fk_validation_scope(false, body)
+        } else {
+            body()
+        }
+    }
+
+    fn queue_statement_fk_validation_table(&self, table_name: &str) {
+        if self.statement_fk_validation_depth.get() == 0
+            || self.statement_fk_validation_rechecking.get()
+        {
+            return;
+        }
+        let mut tables = self.statement_fk_validation_tables.borrow_mut();
+        if !tables
+            .iter()
+            .any(|table| table.eq_ignore_ascii_case(table_name))
+        {
+            tables.push(table_name.to_owned());
+        }
+    }
+
     /// Enforce parent-existence checks for rows inserted by an INSERT statement.
     ///
     /// This resolves inserted row values in table-column order (including
@@ -42812,6 +43430,13 @@ impl Connection {
         }
         let fk_defs = table.foreign_keys.clone();
         drop(schema);
+
+        if self.statement_fk_validation_depth.get() > 0
+            && !self.statement_fk_validation_rechecking.get()
+        {
+            self.queue_statement_fk_validation_table(table_name);
+            return Ok(());
+        }
 
         // Issue #110: activate the transaction-scoped parent-validation cache
         // (no-op if a statement-scoped INSERT … SELECT cache is already live,
@@ -43135,6 +43760,29 @@ impl Connection {
         table_name: &str,
         row_values: &[SqliteValue],
     ) -> Result<Vec<FkDeleteAction>> {
+        self.plan_fk_on_delete(table_name, row_values, false)
+    }
+
+    /// Plan inbound FK effects for an exact row implicitly deleted by
+    /// `INSERT/UPDATE OR REPLACE`.
+    ///
+    /// `RESTRICT` fails at the deletion point. `NO ACTION` is validated at the
+    /// outer statement boundary, where the newly inserted replacement may
+    /// legitimately restore the parent key.
+    fn check_fk_on_replace_victim(
+        &self,
+        table_name: &str,
+        row_values: &[SqliteValue],
+    ) -> Result<Vec<FkDeleteAction>> {
+        self.plan_fk_on_delete(table_name, row_values, true)
+    }
+
+    fn plan_fk_on_delete(
+        &self,
+        table_name: &str,
+        row_values: &[SqliteValue],
+        defer_no_action_to_statement_end: bool,
+    ) -> Result<Vec<FkDeleteAction>> {
         let schema = self.schema.borrow();
         // Find all child tables that have FK references to this parent table.
         let mut actions: Vec<(String, FkDef, Vec<String>)> = Vec::new();
@@ -43243,6 +43891,23 @@ impl Connection {
                             child_defaults,
                             parent_values: parent_values.clone(),
                         });
+                        if defer_no_action_to_statement_end {
+                            // SET DEFAULT runs under cascade depth, which
+                            // suppresses the ordinary child-side check. Recheck
+                            // the resulting child rows at this REPLACE
+                            // statement's boundary.
+                            self.queue_statement_fk_validation_table(child_table);
+                        }
+                    }
+                    FkActionType::NoAction if defer_no_action_to_statement_end => {
+                        if self.statement_fk_validation_depth.get() == 0
+                            || self.statement_fk_validation_rechecking.get()
+                        {
+                            return Err(FrankenError::internal(
+                                "REPLACE NO ACTION validation requires a logical statement scope",
+                            ));
+                        }
+                        self.queue_statement_fk_validation_table(child_table);
                     }
                     FkActionType::NoAction | FkActionType::Restrict => {
                         return Err(FrankenError::ForeignKeyViolation);
@@ -43251,6 +43916,45 @@ impl Connection {
             }
         }
         Ok(result_actions)
+    }
+
+    /// Apply inbound FK actions to the exact logical rows deleted by VDBE
+    /// REPLACE conflict handling.
+    ///
+    /// The VDBE remains authoritative for canonical victim selection. Victims
+    /// are drained only after successful bytecode execution, and all resulting
+    /// actions stay inside the caller's statement savepoint/autocommit
+    /// transaction.
+    fn enforce_fk_on_replace_victims(&self, table_name: &str) -> Result<()> {
+        let victims = std::mem::take(&mut *self.last_replace_victims.borrow_mut());
+        if victims.is_empty() || !self.fk_cascade_propagation_enabled() {
+            return Ok(());
+        }
+
+        let table_root_page = self
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(table_name))
+            .map(|table| table.root_page)
+            .ok_or_else(|| FrankenError::NoSuchTable {
+                name: table_name.to_owned(),
+            })?;
+
+        self.with_statement_fk_validation_scope(false, || {
+            for victim in victims {
+                if victim.root_page != table_root_page {
+                    return Err(FrankenError::internal(format!(
+                        "REPLACE victim root-page mismatch for {table_name}: expected {table_root_page}, got {}",
+                        victim.root_page
+                    )));
+                }
+                for action in self.check_fk_on_replace_victim(table_name, &victim.values)? {
+                    self.execute_fk_delete_action(&action)?;
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Resolve the SQL DEFAULT expression text for each child FK column, used by
@@ -43495,6 +44199,15 @@ impl Connection {
                         });
                     }
                     fsqlite_vdbe::codegen::FkActionType::NoAction
+                        if self.statement_fk_validation_depth.get() > 0
+                            && !self.statement_fk_validation_rechecking.get() =>
+                    {
+                        // NO ACTION is checked at the end of the logical SQL
+                        // statement, unlike RESTRICT. A later replayed row may
+                        // update the referencing child.
+                        self.queue_statement_fk_validation_table(child_table);
+                    }
+                    fsqlite_vdbe::codegen::FkActionType::NoAction
                     | fsqlite_vdbe::codegen::FkActionType::Restrict => {
                         return Err(FrankenError::ForeignKeyViolation);
                     }
@@ -43647,7 +44360,8 @@ impl Connection {
                     self.in_transaction.get() || self.active_txn_is_open_or_borrowed();
                 if has_active_txn {
                     let rollback_stmt = fsqlite_ast::RollbackStatement { to_savepoint: None };
-                    self.execute_rollback(&rollback_stmt)?;
+                    let cx = self.op_cx()?;
+                    self.execute_rollback_with_cx_impl(&cx, &rollback_stmt, true)?;
                 }
                 Err(FrankenError::TransactionRolledBack { reason })
             }
@@ -43685,6 +44399,33 @@ impl Connection {
         }
         self.execute_statement(&statement, None)?;
         Ok(TriggerStatementOutcome::Continue)
+    }
+
+    /// SQLite exposes rowids generated inside a trigger only while that
+    /// trigger program is running. Restore the caller's value on every exit
+    /// path, including RAISE errors and nested-trigger unwinding.
+    fn with_trigger_last_insert_rowid_scope<T>(
+        &self,
+        body: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let saved_last_insert_rowid = self.current_last_insert_rowid();
+        let result = body();
+        let completed_trigger_total_changes = self.total_changes.get();
+        self.set_last_insert_rowid_without_sync(saved_last_insert_rowid);
+        self.sync_change_tracking_context();
+        if result.is_err() {
+            // The enclosing statement owns changes(), but SQLite retains
+            // total_changes() contributions from trigger statements that
+            // completed before a later RAISE/error even when ABORT rolls the
+            // database image back. Hand that exact trigger-frame state to the
+            // statement error unwinder together with the caller-visible rowid.
+            self.record_table_program_error_state_with_total_changes(
+                0,
+                Some(saved_last_insert_rowid),
+                Some(completed_trigger_total_changes),
+            );
+        }
+        result
     }
 
     /// Fire BEFORE triggers for a DML event on a table.
@@ -43743,22 +44484,30 @@ impl Connection {
             {
                 continue;
             }
-            let mut frame = base_frame.clone();
-            frame.trigger_name.clone_from(&trigger.name);
-            let _frame_guard = self.push_trigger_frame(frame.clone());
-            // Evaluate the bound WHEN predicate against the current OLD/NEW frame.
-            if !trigger_when_matches(self, trigger.when_clause.as_ref(), Some(&frame))? {
-                continue;
-            }
-
-            // Execute each statement in the trigger body.
-            for stmt in &trigger.body {
-                let mut bound_stmt = stmt.clone();
-                bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
-                match self.execute_bound_trigger_statement(bound_stmt)? {
-                    TriggerStatementOutcome::Continue => {}
-                    TriggerStatementOutcome::SkipDml => return Ok(true),
+            let outcome = self.with_trigger_last_insert_rowid_scope(|| {
+                let mut frame = base_frame.clone();
+                frame.trigger_name.clone_from(&trigger.name);
+                let _frame_guard = self.push_trigger_frame(frame.clone());
+                // Evaluate the bound WHEN predicate against the current OLD/NEW frame.
+                if !trigger_when_matches(self, trigger.when_clause.as_ref(), Some(&frame))? {
+                    return Ok(TriggerStatementOutcome::Continue);
                 }
+
+                // Execute each statement in the trigger body.
+                for stmt in &trigger.body {
+                    let mut bound_stmt = stmt.clone();
+                    bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
+                    match self.execute_bound_trigger_statement(bound_stmt)? {
+                        TriggerStatementOutcome::Continue => {}
+                        TriggerStatementOutcome::SkipDml => {
+                            return Ok(TriggerStatementOutcome::SkipDml);
+                        }
+                    }
+                }
+                Ok(TriggerStatementOutcome::Continue)
+            })?;
+            if outcome == TriggerStatementOutcome::SkipDml {
+                return Ok(true);
             }
         }
 
@@ -43813,21 +44562,29 @@ impl Connection {
             {
                 continue;
             }
-            let mut frame = base_frame.clone();
-            frame.trigger_name.clone_from(&trigger.name);
-            let _frame_guard = self.push_trigger_frame(frame.clone());
-            if !trigger_when_matches(self, trigger.when_clause.as_ref(), Some(&frame))? {
-                continue;
-            }
-
-            // Execute each statement in the trigger body.
-            for stmt in &trigger.body {
-                let mut bound_stmt = stmt.clone();
-                bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
-                match self.execute_bound_trigger_statement(bound_stmt)? {
-                    TriggerStatementOutcome::Continue => {}
-                    TriggerStatementOutcome::SkipDml => return Ok(()),
+            let outcome = self.with_trigger_last_insert_rowid_scope(|| {
+                let mut frame = base_frame.clone();
+                frame.trigger_name.clone_from(&trigger.name);
+                let _frame_guard = self.push_trigger_frame(frame.clone());
+                if !trigger_when_matches(self, trigger.when_clause.as_ref(), Some(&frame))? {
+                    return Ok(TriggerStatementOutcome::Continue);
                 }
+
+                // Execute each statement in the trigger body.
+                for stmt in &trigger.body {
+                    let mut bound_stmt = stmt.clone();
+                    bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
+                    match self.execute_bound_trigger_statement(bound_stmt)? {
+                        TriggerStatementOutcome::Continue => {}
+                        TriggerStatementOutcome::SkipDml => {
+                            return Ok(TriggerStatementOutcome::SkipDml);
+                        }
+                    }
+                }
+                Ok(TriggerStatementOutcome::Continue)
+            })?;
+            if outcome == TriggerStatementOutcome::SkipDml {
+                return Ok(());
             }
         }
 
@@ -44880,6 +45637,16 @@ impl Connection {
     /// Restore a snapshot, replacing the current database + schema state.
     fn restore_snapshot(&self, cx: &Cx, snap: &DbSnapshot) -> Result<()> {
         self.db.borrow_mut().rollback_to(snap.db_version);
+        // The pager savepoint is authoritative. Some storage-backed DML paths
+        // do not record every physical row change in the compatibility
+        // MemDatabase undo log, so rolling that log back is not sufficient to
+        // prove an exact row mirror. Invalidate deferred deltas and force the
+        // next read boundary to rebuild from the restored pager transaction.
+        // This is especially important for interpreted correlated subqueries
+        // such as PRAGMA foreign_key_check's NOT EXISTS anti-join: a normal
+        // pager-backed scan can already be clean while a stale MemDatabase
+        // mirror still contains the rolled-back row.
+        self.abandon_exact_memdb_row_mirror();
         // bd-e6zfc: rebuild the case-insensitive side indices from the snapshot
         // (positions match the about-to-be-cloned Vecs) and publish each data
         // Vec paired with its index, so `schema_by_name`/`views_by_name`/
@@ -46233,6 +47000,15 @@ impl Connection {
     }
 
     fn execute_rollback_with_cx(&self, cx: &Cx, rb: &fsqlite_ast::RollbackStatement) -> Result<()> {
+        self.execute_rollback_with_cx_impl(cx, rb, false)
+    }
+
+    fn execute_rollback_with_cx_impl(
+        &self,
+        cx: &Cx,
+        rb: &fsqlite_ast::RollbackStatement,
+        allow_statement_owned_transaction: bool,
+    ) -> Result<()> {
         // bd-do0d6: a full rollback discards any postponed deferred FK checks.
         if rb.to_savepoint.is_none() {
             self.deferred_fk_checks.borrow_mut().clear();
@@ -46340,7 +47116,13 @@ impl Connection {
             // 5D.2 (bd-1ene): Use pager rollback and reload from committed state.
             // bd-2yqp6.4.3: SQLite errors on ROLLBACK outside a transaction,
             // matching upstream COMMIT behavior.
-            if !self.in_transaction.get() {
+            // A trigger's RAISE(ROLLBACK, ...) must also tear down the current
+            // autocommit statement's pager transaction. Public ROLLBACK keeps
+            // SQLite's outside-a-transaction refusal; only the trigger path
+            // opts into the statement-owned transaction.
+            let statement_owned_transaction_is_active =
+                allow_statement_owned_transaction && self.active_txn_is_open_or_borrowed();
+            if !self.in_transaction.get() && !statement_owned_transaction_is_active {
                 return Err(FrankenError::Internal(
                     "cannot rollback - no transaction is active".to_owned(),
                 ));
@@ -47097,6 +47879,7 @@ impl Connection {
     }
 
     fn row_matches_partial_index_for_integrity(
+        &self,
         table: &TableSchema,
         predicate: Option<&Expr>,
         rowid: i64,
@@ -47131,6 +47914,32 @@ impl Connection {
             col_map.push((table.name.clone(), "rowid".to_owned(), true));
         }
 
+        // Reuse the authoritative expression evaluator's collation and
+        // affinity context.  A partial predicate such as
+        // `label COLLATE NOCASE = 'fire'` must be evaluated with the same
+        // comparison semantics that built the index; binary-only integrity
+        // re-evaluation otherwise falsely reports a valid database as
+        // malformed.
+        let mut column_collations = table
+            .columns
+            .iter()
+            .map(|column| column.collation.clone())
+            .collect::<Vec<_>>();
+        let mut column_affinities = table
+            .columns
+            .iter()
+            .map(|column| affinity_char_to_type(column.affinity))
+            .collect::<Vec<_>>();
+        if col_map.len() > table.columns.len() {
+            column_collations.push(None);
+            column_affinities.push(TypeAffinity::Integer);
+        }
+        let _join_eval_collation_guard =
+            JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
+                column_collations,
+                column_affinities,
+                registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
+            });
         let predicate_value = eval_join_expr(&predicate, &eval_row, &col_map)?;
         Ok(is_sqlite_truthy(&predicate_value))
     }
@@ -47898,7 +48707,7 @@ impl Connection {
                             for (index_spec, expected_keys) in
                                 index_specs.iter().zip(expected_index_keys.iter_mut())
                             {
-                                if !Self::row_matches_partial_index_for_integrity(
+                                if !self.row_matches_partial_index_for_integrity(
                                     table,
                                     index_spec.predicate.as_ref(),
                                     rowid,
@@ -49855,6 +50664,7 @@ impl Connection {
                     fkid: i64,
                     child_cols: Vec<String>,
                     parent_cols: Vec<String>,
+                    child_without_rowid: bool,
                 }
                 let checks: Vec<FkCheck> = {
                     let schema = self.schema.borrow();
@@ -49906,6 +50716,7 @@ impl Connection {
                                 fkid,
                                 child_cols,
                                 parent_cols,
+                                child_without_rowid: t.without_rowid,
                             });
                         }
                     }
@@ -49944,8 +50755,19 @@ impl Connection {
                         })
                         .collect::<Vec<_>>()
                         .join(" AND ");
+                    // C SQLite reports NULL in foreign_key_check's `rowid`
+                    // column for WITHOUT ROWID child tables.  Such tables do
+                    // not expose rowid/_rowid_/oid at all, so attempting to
+                    // project `<child>.rowid` is both semantically wrong and
+                    // a hard query error even when the table has no
+                    // violations.
+                    let row_locator = if chk.child_without_rowid {
+                        "NULL".to_owned()
+                    } else {
+                        format!("{child_q}.rowid")
+                    };
                     let sql = format!(
-                        "SELECT {child_q}.rowid FROM {child_q} WHERE {not_null} \
+                        "SELECT {row_locator} FROM {child_q} WHERE {not_null} \
                          AND NOT EXISTS (SELECT 1 FROM {parent_q} AS p WHERE {join_eq})"
                     );
                     let violating = self.query_with_params(&sql, &[])?;
@@ -61146,6 +61968,7 @@ impl Connection {
         execution_cx: &Cx,
         invalidate_memdb_count_shortcuts_on_success: bool,
     ) -> Result<(Vec<Row>, usize, Option<i64>)> {
+        self.last_replace_victims.borrow_mut().clear();
         let execution_span = tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG)
             .then(|| {
                 let span = tracing::span!(
@@ -61179,7 +62002,7 @@ impl Connection {
         // `OP_OpenWrite` still gates reuse by cursor id, root page, and backend
         // kind, so mixed DML shapes replace incompatible retained cursors.
         let allow_retained_cursor_reuse = invalidate_memdb_count_shortcuts_on_success;
-        let ((result, txn_back), engine_back) = execute_table_program_with_db(
+        let ((result, txn_back), mut engine_back) = execute_table_program_with_db(
             program,
             params,
             &func_reg,
@@ -61211,6 +62034,10 @@ impl Connection {
         let memdb_count_shortcuts_safe_after_exec = engine_back
             .as_ref()
             .is_some_and(|engine| engine.storage_cursor_memdb_count_shortcuts_safe());
+        let replace_victims = engine_back
+            .as_mut()
+            .map(VdbeEngine::take_replace_victims)
+            .unwrap_or_default();
         // Park the engine for reuse by the next statement.
         *self.cached_vdbe_engine.borrow_mut() = engine_back;
         // Always restore the transaction handle, even on error.
@@ -61219,6 +62046,7 @@ impl Connection {
         }
         match result {
             Ok((rows, changes, last_insert_rowid)) => {
+                *self.last_replace_victims.borrow_mut() = replace_victims;
                 self.clear_table_program_error_state();
                 if track_last_insert_rowid {
                     if let Some(last_insert_rowid) = last_insert_rowid {
@@ -62539,27 +63367,77 @@ impl Connection {
 
         for entry in &master_entries {
             if entry.len() < 5 {
-                continue;
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "sqlite_master row has {} columns; expected at least 5",
+                        entry.len()
+                    ),
+                });
             }
             let entry_type = match &entry[0] {
                 SqliteValue::Text(s) => s,
-                _ => continue,
+                other => {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_master type must be TEXT, found {:?}",
+                            other.storage_class()
+                        ),
+                    });
+                }
             };
 
             if entry_type.eq_ignore_ascii_case("trigger") {
+                let trigger_name = match &entry[1] {
+                    SqliteValue::Text(name) => name,
+                    other => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master trigger name must be TEXT, found {:?}",
+                                other.storage_class()
+                            ),
+                        });
+                    }
+                };
                 let create_sql = match &entry[4] {
                     SqliteValue::Text(s) => s.clone(),
-                    _ => continue,
+                    other => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master trigger `{trigger_name}` SQL must be TEXT, found {:?}",
+                                other.storage_class()
+                            ),
+                        });
+                    }
                 };
-                match &entry[1] {
-                    SqliteValue::Text(_) => {}
-                    _ => continue,
-                }
-                if let Ok(Statement::CreateTrigger(stmt)) = parse_single_statement(&create_sql) {
-                    new_triggers.push(TriggerDef::from_create_statement(
-                        &stmt,
-                        create_sql.to_string(),
-                    ));
+                match parse_single_statement(&create_sql) {
+                    Ok(Statement::CreateTrigger(stmt)) => {
+                        if !stmt.name.name.eq_ignore_ascii_case(trigger_name) {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "sqlite_master trigger name `{trigger_name}` does not match CREATE TRIGGER name `{}`",
+                                    stmt.name.name
+                                ),
+                            });
+                        }
+                        new_triggers.push(TriggerDef::from_create_statement(
+                            &stmt,
+                            create_sql.to_string(),
+                        ));
+                    }
+                    Ok(_) => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master trigger `{trigger_name}` SQL did not parse as CREATE TRIGGER"
+                            ),
+                        });
+                    }
+                    Err(error) => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master trigger `{trigger_name}` SQL failed to parse as CREATE TRIGGER: {error}"
+                            ),
+                        });
+                    }
                 }
                 continue;
             }
@@ -62654,23 +63532,61 @@ impl Connection {
                 continue;
             }
 
-            // Handle view entries — parse and rebuild ViewDef.
+            // Handle view entries — require a valid CREATE VIEW catalog row.
             if entry_type.eq_ignore_ascii_case("view") {
-                let create_sql = match &entry[4] {
-                    SqliteValue::Text(s) => s.clone(),
-                    _ => continue,
-                };
                 let view_name = match &entry[1] {
-                    SqliteValue::Text(s) => s.clone(),
-                    _ => continue,
+                    SqliteValue::Text(name) => name,
+                    other => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master view name must be TEXT, found {:?}",
+                                other.storage_class()
+                            ),
+                        });
+                    }
+                };
+                let create_sql = match &entry[4] {
+                    SqliteValue::Text(sql) => sql,
+                    other => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master view `{view_name}` SQL must be TEXT, found {:?}",
+                                other.storage_class()
+                            ),
+                        });
+                    }
                 };
                 new_original_ddl_sql.insert(view_name.to_ascii_lowercase(), create_sql.to_string());
-                if let Ok(Statement::CreateView(stmt)) = parse_single_statement(&create_sql) {
-                    new_views.push(ViewDef {
-                        name: stmt.name.name.clone(),
-                        columns: stmt.columns.clone(),
-                        query: stmt.query.clone(),
-                    });
+                match parse_single_statement(create_sql) {
+                    Ok(Statement::CreateView(stmt)) => {
+                        if !stmt.name.name.eq_ignore_ascii_case(view_name) {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "sqlite_master view name `{view_name}` does not match CREATE VIEW name `{}`",
+                                    stmt.name.name
+                                ),
+                            });
+                        }
+                        new_views.push(ViewDef {
+                            name: stmt.name.name.clone(),
+                            columns: stmt.columns.clone(),
+                            query: stmt.query.clone(),
+                        });
+                    }
+                    Ok(_) => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master view `{view_name}` SQL did not parse as CREATE VIEW"
+                            ),
+                        });
+                    }
+                    Err(error) => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master view `{view_name}` SQL failed to parse as CREATE VIEW: {error}"
+                            ),
+                        });
+                    }
                 }
                 continue;
             }
@@ -83563,7 +84479,14 @@ struct ConcurrentPageIoContext {
 struct TableProgramErrorState {
     changes: usize,
     last_insert_rowid: Option<i64>,
+    /// Exact connection total to expose after error handling when nested
+    /// trigger statements completed before the outer statement failed.
+    /// SQLite retains those trigger contributions even when ABORT rolls back
+    /// the outer row mutations.
+    total_changes: Option<usize>,
 }
+
+type UpdateReplayLocatorSet = (Vec<String>, Vec<Vec<SqliteValue>>);
 
 #[derive(Debug)]
 struct TableProgramExecError {
@@ -89174,6 +90097,22 @@ fn error_is_constraint_violation(error: &FrankenError) -> bool {
                 ErrorCode::Constraint as i32
             ))
     )
+}
+
+/// Whether an error keeps rows that the logical statement completed before it
+/// failed.
+///
+/// `RAISE(FAIL)` always has that behavior. `OR FAIL` extends it to ordinary
+/// row constraints, but SQLite specifies that foreign-key violations use
+/// `ABORT` semantics regardless of the conflict clause.
+fn error_preserves_prior_statement_rows(
+    preserve_constraint_failure_rows: bool,
+    error: &FrankenError,
+) -> bool {
+    matches!(error, FrankenError::RaiseFail(_))
+        || (preserve_constraint_failure_rows
+            && error_is_constraint_violation(error)
+            && !matches!(error, FrankenError::ForeignKeyViolation))
 }
 
 fn error_triggers_conflict_action_rollback(error: &FrankenError) -> bool {
@@ -109074,6 +110013,37 @@ mod tests {
         let rows = conn.query("SELECT msg FROM log;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("fired".into()));
+    }
+
+    #[test]
+    fn test_trigger_when_bound_literals_honor_explicit_collation() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (label TEXT);").unwrap();
+        conn.execute("CREATE TABLE log (kind TEXT);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_when_nocase AFTER INSERT ON t \
+             WHEN NEW.label COLLATE NOCASE = 'fire' \
+              AND CASE WHEN NEW.label COLLATE NOCASE = 'fire' THEN 1 ELSE 0 END = 1 \
+             BEGIN INSERT INTO log VALUES ('nocase'); END;",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_when_binary AFTER INSERT ON t \
+             WHEN NEW.label COLLATE BINARY = 'fire' \
+             BEGIN INSERT INTO log VALUES ('binary'); END;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t VALUES ('FiRe');").unwrap();
+
+        let rows = conn.query("SELECT kind FROM log ORDER BY kind;").unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row_values(row)[0].clone())
+                .collect::<Vec<_>>(),
+            vec![SqliteValue::Text("nocase".into())],
+            "NOCASE must admit the mixed-case bound NEW literal while BINARY rejects it"
+        );
     }
 
     #[test]

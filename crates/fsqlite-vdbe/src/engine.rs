@@ -203,6 +203,10 @@ const VDBE_EXECUTION_CHECKPOINT_INTERVAL: u64 = 4096;
 /// The low 4 bits of `Insert.p5` are reserved for OE_* conflict behavior in
 /// this engine, so the UPDATE marker must live above them.
 const OPFLAG_ISUPDATE: u16 = 0x10;
+const OPFLAG_REPLACE_VICTIM: u16 = 0x20;
+/// `IdxInsert` writes a WITHOUT ROWID table row and must increment the
+/// statement change counter after a successful insertion.
+const OPFLAG_IDX_NCHANGE: u16 = 0x40;
 const STORAGE_CURSOR_LAYOUT_PREFIX_BYTES: usize = 256;
 #[cfg(test)]
 const VDBE_ENGINE_INLINE_SIZE_BUDGET_BYTES: usize = 3 * 1024;
@@ -5372,6 +5376,19 @@ pub enum ExecOutcome {
     Error { code: i32, message: String },
 }
 
+/// Logical pre-delete row captured when SQLite REPLACE conflict handling
+/// removes an existing table row.
+///
+/// Conflict discovery remains owned by the VDBE (including collations,
+/// expression indexes, and partial indexes). The connection layer drains these
+/// rows after successful execution so inbound foreign-key actions can be
+/// enforced against the exact victims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplaceVictim {
+    pub root_page: i32,
+    pub values: Vec<SqliteValue>,
+}
+
 /// Inline register storage for the 1-indexed VDBE register file.
 ///
 /// The engine keeps `SqliteValue` cells directly in a `SmallVec` so the hot
@@ -5599,6 +5616,8 @@ pub struct VdbeEngine {
     last_compare_result: Option<Ordering>,
     /// Number of rows modified (inserted, deleted, or updated) during execution.
     changes: usize,
+    /// Exact logical rows implicitly deleted by REPLACE during this execution.
+    replace_victims: Vec<ReplaceVictim>,
     /// Rowid of the last INSERT operation (for `last_insert_rowid()` support).
     last_insert_rowid: i64,
     /// Whether this execution recorded a real last-insert rowid.
@@ -6154,6 +6173,7 @@ impl VdbeEngine {
             schema_cookie: 0,
             last_compare_result: None,
             changes: 0,
+            replace_victims: Vec::new(),
             last_insert_rowid: 0,
             last_insert_rowid_valid: false,
             last_insert_cursor_id: None,
@@ -6385,6 +6405,7 @@ impl VdbeEngine {
         }
         self.last_compare_result = None;
         self.changes = 0;
+        self.replace_victims.clear();
         self.last_insert_rowid = 0;
         self.last_insert_rowid_valid = false;
         self.last_insert_cursor_id = None;
@@ -6654,6 +6675,13 @@ impl VdbeEngine {
     /// Returns the number of rows modified (inserted, deleted, or updated).
     pub fn changes(&self) -> usize {
         self.changes
+    }
+
+    /// Drain exact logical rows implicitly deleted by REPLACE in this
+    /// execution. The caller must consume these before resetting/reusing the
+    /// engine.
+    pub fn take_replace_victims(&mut self) -> Vec<ReplaceVictim> {
+        std::mem::take(&mut self.replace_victims)
     }
 
     /// Returns the rowid of the last INSERT operation, if this execution
@@ -6955,6 +6983,46 @@ impl VdbeEngine {
         key_values
     }
 
+    fn logical_replace_victim(
+        &self,
+        root_page: i32,
+        stored_values: &[SqliteValue],
+        rowid: Option<i64>,
+    ) -> ReplaceVictim {
+        let column_count = self
+            .table_column_count_by_root_page
+            .get(&root_page)
+            .copied()
+            .unwrap_or(stored_values.len());
+        let values = (0..column_count)
+            .map(|column_index| {
+                rowid.map_or_else(
+                    || {
+                        stored_values
+                            .get(column_index)
+                            .cloned()
+                            .or_else(|| {
+                                self.column_defaults_by_root_page
+                                    .get(&root_page)
+                                    .and_then(|defaults| defaults.get(column_index))
+                                    .and_then(Clone::clone)
+                            })
+                            .unwrap_or(SqliteValue::Null)
+                    },
+                    |rowid| {
+                        self.logical_table_payload_value(
+                            Some(root_page),
+                            stored_values,
+                            rowid,
+                            column_index,
+                        )
+                    },
+                )
+            })
+            .collect();
+        ReplaceVictim { root_page, values }
+    }
+
     /// Handles REPLACE conflict resolution natively (bd-2yqp6.x).
     /// Deletes the conflicting row from the table AND from all associated indexes.
     fn native_replace_row(&mut self, tbl_cursor_id: i32, conflict_rowid: i64) -> Result<()> {
@@ -6981,6 +7049,9 @@ impl VdbeEngine {
             FrankenError::internal("delete_secondary_index_entries: malformed table record")
         })?;
         let table_root_page = self.table_root_page_for_cursor(tbl_cursor_id);
+        let replace_victim = table_root_page.map(|root_page| {
+            self.logical_replace_victim(root_page, &old_row, Some(conflict_rowid))
+        });
 
         // Delete secondary index entries for the old row using the metadata
         // registered by the codegen. For each index cursor, build the index
@@ -7028,6 +7099,9 @@ impl VdbeEngine {
             );
         }
         self.sync_storage_table_delete_into_memdb_mirror(tbl_cursor_id, conflict_rowid);
+        if let Some(replace_victim) = replace_victim {
+            self.replace_victims.push(replace_victim);
+        }
 
         Ok(())
     }
@@ -7736,6 +7810,7 @@ impl VdbeEngine {
             self.results.clear();
             self.last_compare_result = None;
             self.changes = 0;
+            self.replace_victims.clear();
             self.last_insert_rowid = 0;
             self.last_insert_rowid_valid = false;
             self.last_insert_cursor_id = None;
@@ -10147,6 +10222,7 @@ impl VdbeEngine {
                     #[allow(clippy::cast_possible_truncation)]
                     let oe_flag = ((op.p5 >> 1) & 0x0F) as u8;
                     let n_idx_cols = op.p3 as usize;
+                    let mut inserted = false;
 
                     // If a previous IdxInsert for the same row triggered IGNORE,
                     // skip all remaining index inserts for this row before touching
@@ -10486,10 +10562,14 @@ impl VdbeEngine {
                                 );
                                 self.push_pending_idx_entry(cursor_id, key_blob.clone());
                             }
+                            inserted = true;
                         }
                     }
                     // No MemDatabase fallback: Phase 4 in-memory backend doesn't
                     // support indexes (they're a no-op there).
+                    if inserted && op.p5 & OPFLAG_IDX_NCHANGE != 0 {
+                        self.changes += 1;
+                    }
                     if sideband_active {
                         self.make_record_lookaside.replace_cleared_buf(key_blob);
                     }
@@ -10535,6 +10615,29 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let key_start_reg = op.p2;
                     let key_count = op.p3;
+                    let replace_victim = if op.p5 & OPFLAG_REPLACE_VICTIM != 0 {
+                        let cursor = self
+                            .storage_cursors
+                            .get_mut(&cursor_id)
+                            .filter(|cursor| cursor.writable && !cursor.cursor.eof())
+                            .ok_or_else(|| {
+                                FrankenError::internal(
+                                    "REPLACE victim capture requires a positioned writable cursor",
+                                )
+                            })?;
+                        let root_page = cursor.root_page;
+                        let payload = cursor.cursor.payload(&cursor.cx)?;
+                        let stored_values = parse_record(&payload).ok_or_else(|| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: "REPLACE victim capture encountered a malformed WITHOUT ROWID record"
+                                    .to_owned(),
+                            }
+                        })?;
+                        Some(self.logical_replace_victim(root_page, &stored_values, None))
+                    } else {
+                        None
+                    };
+                    let mut deleted = false;
 
                     // Collect key bytes BEFORE borrowing cursor (borrow checker).
                     let key_bytes: Option<Vec<u8>> = if key_count > 0 {
@@ -10561,6 +10664,7 @@ impl VdbeEngine {
                                 sc.last_rightmost_unique_index_prefix = None;
                                 sc.last_rightmost_unique_index_position = None;
                                 sc.cursor.delete(&sc.cx)?;
+                                deleted = true;
                                 invalidate_storage_cursor_row_cache_with_reason(
                                     sc,
                                     self.collect_vdbe_metrics,
@@ -10574,12 +10678,16 @@ impl VdbeEngine {
                             sc.last_rightmost_unique_index_prefix = None;
                             sc.last_rightmost_unique_index_position = None;
                             sc.cursor.delete(&sc.cx)?;
+                            deleted = true;
                             invalidate_storage_cursor_row_cache_with_reason(
                                 sc,
                                 self.collect_vdbe_metrics,
                                 DecodeCacheInvalidationReason::WriteMutation,
                             );
                         }
+                    }
+                    if deleted && let Some(replace_victim) = replace_victim {
+                        self.replace_victims.push(replace_victim);
                     }
                     // No MemDatabase fallback for indexes.
                     pc += 1;

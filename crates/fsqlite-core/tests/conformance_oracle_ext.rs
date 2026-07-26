@@ -32809,3 +32809,1025 @@ fn test_conformance_time_travel_timestamp_and_live_state_preservation_s76l() {
         "time_travel_select_preserves_live_source_state",
     );
 }
+
+fn assert_logged_atomic_oracle_snapshot(
+    case: &str,
+    fconn: &Connection,
+    rconn: &rusqlite::Connection,
+    queries: &[&str],
+) {
+    eprintln!(
+        "ATOMIC_HISTORY case={case} phase=snapshot engine=fsqlite version={} oracle=c-sqlite",
+        env!("CARGO_PKG_VERSION")
+    );
+    for query in queries {
+        let frank = query_fsqlite_strings(fconn, query);
+        let oracle = query_rusqlite_strings(rconn, query);
+        eprintln!(
+            "ATOMIC_HISTORY case={case} phase=query sql={query:?} frank={frank:?} oracle={oracle:?}"
+        );
+        assert_eq!(
+            frank, oracle,
+            "atomic-history oracle mismatch case={case} sql={query}"
+        );
+    }
+}
+
+/// Regression for the exact HFDT migration shape: a parameterized, single-row
+/// INSERT SELECT into a WITHOUT ROWID destination with both BEFORE and AFTER
+/// triggers. The destination change count must be one (trigger side effects do
+/// not change `changes()`), while `total_changes()` includes both audit writes.
+#[test]
+fn test_conformance_atomic_insert_select_without_rowid_triggers_counters_s76m() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let setup = [
+        "CREATE TABLE capture_facts (accession TEXT NOT NULL, member TEXT NOT NULL, enabled INTEGER NOT NULL)",
+        "INSERT INTO capture_facts VALUES ('0001-26-000001', 'Revenue', 1)",
+        "CREATE TABLE projection_members (accession TEXT NOT NULL, member TEXT NOT NULL, ordinal INTEGER NOT NULL, PRIMARY KEY(accession, member)) WITHOUT ROWID",
+        "CREATE TABLE projection_audit (seq INTEGER PRIMARY KEY, phase TEXT NOT NULL, accession TEXT NOT NULL, member TEXT NOT NULL, visible_rows INTEGER NOT NULL)",
+        "CREATE TRIGGER projection_members_bi BEFORE INSERT ON projection_members BEGIN INSERT INTO projection_audit(phase, accession, member, visible_rows) VALUES ('BEFORE', NEW.accession, NEW.member, (SELECT count(*) FROM projection_members)); END",
+        "CREATE TRIGGER projection_members_ai AFTER INSERT ON projection_members BEGIN INSERT INTO projection_audit(phase, accession, member, visible_rows) VALUES ('AFTER', NEW.accession, NEW.member, (SELECT count(*) FROM projection_members)); END",
+    ];
+    apply_fsqlite_statements(&fconn, &setup);
+    apply_rusqlite_statements(&rconn, &setup);
+
+    let sql = "INSERT INTO projection_members(accession, member, ordinal) SELECT ?1, member, ?2 FROM capture_facts WHERE accession = ?3 AND enabled = ?4";
+    let fparams = [
+        SqliteValue::Text("0001-26-000001".into()),
+        SqliteValue::Integer(7),
+        SqliteValue::Text("0001-26-000001".into()),
+        SqliteValue::Integer(1),
+    ];
+    let frank_affected = fconn.execute_with_params(sql, &fparams).unwrap();
+    let oracle_affected = rconn
+        .execute(
+            sql,
+            rusqlite::params!["0001-26-000001", 7_i64, "0001-26-000001", 1_i64],
+        )
+        .unwrap();
+    eprintln!(
+        "ATOMIC_HISTORY case=insert_select_without_rowid phase=execute sql_class=parameterized_single_row_insert_select destination=without_rowid triggers=before_after frank_affected={frank_affected} oracle_affected={oracle_affected}"
+    );
+    assert_logged_atomic_oracle_snapshot(
+        "insert_select_without_rowid",
+        &fconn,
+        &rconn,
+        &[
+            "SELECT accession, member, ordinal FROM projection_members ORDER BY accession, member",
+            "SELECT phase, accession, member, visible_rows FROM projection_audit ORDER BY seq",
+            "SELECT changes(), total_changes(), last_insert_rowid()",
+        ],
+    );
+    assert_eq!(frank_affected, 1);
+    assert_eq!(frank_affected, oracle_affected);
+    assert_eq!(
+        query_fsqlite_strings(
+            &fconn,
+            "SELECT phase, visible_rows FROM projection_audit ORDER BY seq"
+        )
+        .unwrap(),
+        vec![
+            vec!["'BEFORE'".to_owned(), "0".to_owned()],
+            vec!["'AFTER'".to_owned(), "1".to_owned()],
+        ]
+    );
+}
+
+/// Multi-row INSERT and UPDATE triggers must observe each completed mutation
+/// before the next row's BEFORE trigger. RETURNING preserves the frozen target
+/// order and counters describe the outer statement.
+#[test]
+fn test_conformance_atomic_trigger_interleaving_and_returning_s76n() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let setup = [
+        "CREATE TABLE atomic_rows (id INTEGER PRIMARY KEY, value INTEGER NOT NULL UNIQUE)",
+        "CREATE TABLE atomic_audit (seq INTEGER PRIMARY KEY, phase TEXT NOT NULL, row_id INTEGER NOT NULL, visible_sum INTEGER)",
+        "CREATE TRIGGER atomic_rows_bi BEFORE INSERT ON atomic_rows BEGIN INSERT INTO atomic_audit(phase, row_id, visible_sum) VALUES ('BI', NEW.id, (SELECT total(value) FROM atomic_rows)); END",
+        "CREATE TRIGGER atomic_rows_ai AFTER INSERT ON atomic_rows BEGIN INSERT INTO atomic_audit(phase, row_id, visible_sum) VALUES ('AI', NEW.id, (SELECT total(value) FROM atomic_rows)); END",
+        "CREATE TRIGGER atomic_rows_bu BEFORE UPDATE ON atomic_rows BEGIN INSERT INTO atomic_audit(phase, row_id, visible_sum) VALUES ('BU', OLD.id, (SELECT total(value) FROM atomic_rows)); END",
+        "CREATE TRIGGER atomic_rows_au AFTER UPDATE ON atomic_rows BEGIN INSERT INTO atomic_audit(phase, row_id, visible_sum) VALUES ('AU', NEW.id, (SELECT total(value) FROM atomic_rows)); END",
+    ];
+    apply_fsqlite_statements(&fconn, &setup);
+    apply_rusqlite_statements(&rconn, &setup);
+
+    let insert_sql =
+        "INSERT INTO atomic_rows(id, value) VALUES (1, 10), (2, 20), (3, 30) RETURNING id, value";
+    let frank_insert = query_fsqlite_strings(&fconn, insert_sql).unwrap();
+    let oracle_insert = query_rusqlite_strings(&rconn, insert_sql).unwrap();
+    eprintln!(
+        "ATOMIC_HISTORY case=insert_values_returning phase=returning order=source frank={frank_insert:?} oracle={oracle_insert:?}"
+    );
+    assert_eq!(frank_insert, oracle_insert);
+    assert_eq!(
+        frank_insert,
+        vec![
+            vec!["1".to_owned(), "10".to_owned()],
+            vec!["2".to_owned(), "20".to_owned()],
+            vec!["3".to_owned(), "30".to_owned()],
+        ]
+    );
+    assert_logged_atomic_oracle_snapshot(
+        "insert_values_returning",
+        &fconn,
+        &rconn,
+        &[
+            "SELECT phase, row_id, visible_sum FROM atomic_audit ORDER BY seq",
+            "SELECT changes(), last_insert_rowid()",
+            "SELECT id, value FROM atomic_rows ORDER BY id",
+        ],
+    );
+    assert_eq!(
+        query_fsqlite_strings(
+            &fconn,
+            "SELECT phase, row_id, visible_sum FROM atomic_audit ORDER BY seq"
+        )
+        .unwrap(),
+        vec![
+            vec!["'BI'".to_owned(), "1".to_owned(), "0".to_owned()],
+            vec!["'AI'".to_owned(), "1".to_owned(), "10".to_owned()],
+            vec!["'BI'".to_owned(), "2".to_owned(), "10".to_owned()],
+            vec!["'AI'".to_owned(), "2".to_owned(), "30".to_owned()],
+            vec!["'BI'".to_owned(), "3".to_owned(), "30".to_owned()],
+            vec!["'AI'".to_owned(), "3".to_owned(), "60".to_owned()],
+        ]
+    );
+
+    fconn.execute("DELETE FROM atomic_audit").unwrap();
+    rconn.execute_batch("DELETE FROM atomic_audit").unwrap();
+    let update_sql = "UPDATE atomic_rows SET value = value + 1 WHERE id <= 3 RETURNING id, value";
+    let frank_update = query_fsqlite_strings(&fconn, update_sql).unwrap();
+    let oracle_update = query_rusqlite_strings(&rconn, update_sql).unwrap();
+    eprintln!(
+        "ATOMIC_HISTORY case=update_returning phase=returning order=frozen_target frank={frank_update:?} oracle={oracle_update:?}"
+    );
+    assert_eq!(frank_update, oracle_update);
+    assert_logged_atomic_oracle_snapshot(
+        "update_returning",
+        &fconn,
+        &rconn,
+        &[
+            "SELECT phase, row_id, visible_sum FROM atomic_audit ORDER BY seq",
+            "SELECT changes(), last_insert_rowid()",
+            "SELECT id, value FROM atomic_rows ORDER BY id",
+        ],
+    );
+    assert_eq!(
+        query_fsqlite_strings(
+            &fconn,
+            "SELECT phase, row_id, visible_sum FROM atomic_audit ORDER BY seq"
+        )
+        .unwrap(),
+        vec![
+            vec!["'BU'".to_owned(), "1".to_owned(), "60".to_owned()],
+            vec!["'AU'".to_owned(), "1".to_owned(), "61".to_owned()],
+            vec!["'BU'".to_owned(), "2".to_owned(), "61".to_owned()],
+            vec!["'AU'".to_owned(), "2".to_owned(), "62".to_owned()],
+            vec!["'BU'".to_owned(), "3".to_owned(), "62".to_owned()],
+            vec!["'AU'".to_owned(), "3".to_owned(), "63".to_owned()],
+        ]
+    );
+}
+
+/// WITHOUT ROWID replay must freeze the complete declared composite primary
+/// key, otherwise preceding trigger work can make later targets disappear or
+/// execute twice.
+#[test]
+fn test_conformance_atomic_update_without_rowid_composite_locator_s76o() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let setup = [
+        "CREATE TABLE wr_rows (venue TEXT NOT NULL, symbol TEXT NOT NULL, value INTEGER NOT NULL, PRIMARY KEY(venue, symbol)) WITHOUT ROWID",
+        "CREATE TABLE wr_audit (seq INTEGER PRIMARY KEY, phase TEXT, venue TEXT, symbol TEXT, visible_sum INTEGER)",
+        "INSERT INTO wr_rows VALUES ('XLON', 'AAA', 1), ('XNAS', 'BBB', 2), ('XNYS', 'CCC', 3)",
+        "CREATE TRIGGER wr_rows_bu BEFORE UPDATE ON wr_rows BEGIN INSERT INTO wr_audit(phase, venue, symbol, visible_sum) VALUES ('BU', OLD.venue, OLD.symbol, (SELECT sum(value) FROM wr_rows)); END",
+        "CREATE TRIGGER wr_rows_au AFTER UPDATE ON wr_rows BEGIN INSERT INTO wr_audit(phase, venue, symbol, visible_sum) VALUES ('AU', NEW.venue, NEW.symbol, (SELECT sum(value) FROM wr_rows)); END",
+    ];
+    apply_fsqlite_statements(&fconn, &setup);
+    apply_rusqlite_statements(&rconn, &setup);
+
+    let sql = "UPDATE wr_rows SET value = value + 10 RETURNING venue, symbol, value";
+    let frank = query_fsqlite_strings(&fconn, sql).unwrap();
+    let oracle = query_rusqlite_strings(&rconn, sql).unwrap();
+    eprintln!(
+        "ATOMIC_HISTORY case=without_rowid_composite_update phase=returning locator=declared_composite_pk frank={frank:?} oracle={oracle:?}"
+    );
+    assert_eq!(frank, oracle);
+    assert_logged_atomic_oracle_snapshot(
+        "without_rowid_composite_update",
+        &fconn,
+        &rconn,
+        &[
+            "SELECT venue, symbol, value FROM wr_rows ORDER BY venue, symbol",
+            "SELECT phase, venue, symbol, visible_sum FROM wr_audit ORDER BY seq",
+            "SELECT changes(), total_changes(), last_insert_rowid()",
+        ],
+    );
+}
+
+/// Immediate self references use the final statement image, unresolved
+/// references roll back the whole statement, and FK failures remain ABORT
+/// class even when the DML requests OR FAIL.
+#[test]
+fn test_conformance_atomic_foreign_key_statement_boundary_s76p() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let setup = [
+        "PRAGMA foreign_keys = ON",
+        "CREATE TABLE self_nodes (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES self_nodes(id))",
+    ];
+    apply_fsqlite_statements(&fconn, &setup);
+    apply_rusqlite_statements(&rconn, &setup);
+
+    let valid = "INSERT INTO self_nodes VALUES (1, 2), (2, NULL)";
+    assert_eq!(fconn.execute(valid).unwrap(), 2);
+    assert_eq!(rconn.execute(valid, []).unwrap(), 2);
+    eprintln!(
+        "ATOMIC_HISTORY case=self_fk_child_before_parent phase=execute outcome=success rows=2"
+    );
+
+    let invalid = "INSERT INTO self_nodes VALUES (3, 99), (4, NULL)";
+    assert_both_execute_error(&fconn, &rconn, invalid, "self_fk_invalid_batch");
+    assert_logged_atomic_oracle_snapshot(
+        "self_fk_valid_and_invalid",
+        &fconn,
+        &rconn,
+        &[
+            "SELECT id, parent_id FROM self_nodes ORDER BY id",
+            "SELECT changes(), total_changes(), last_insert_rowid()",
+            "PRAGMA foreign_key_check",
+        ],
+    );
+
+    // A single-row immediate FK failure is detected before SQLite publishes a
+    // new last_insert_rowid(), unlike the completed multi-row program above.
+    // Keep this negative control beside the batch case so the error-state
+    // handoff cannot accidentally expose an attempted rowid from the direct
+    // single-row lane.
+    let invalid_single = "INSERT INTO self_nodes VALUES (5, 99)";
+    assert_both_execute_error(&fconn, &rconn, invalid_single, "self_fk_invalid_single");
+    assert_logged_atomic_oracle_snapshot(
+        "self_fk_invalid_single",
+        &fconn,
+        &rconn,
+        &[
+            "SELECT id, parent_id FROM self_nodes ORDER BY id",
+            "SELECT changes(), total_changes(), last_insert_rowid()",
+            "PRAGMA foreign_key_check",
+        ],
+    );
+
+    for explicit_transaction in [false, true] {
+        let case = if explicit_transaction {
+            "fk_or_fail_explicit"
+        } else {
+            "fk_or_fail_autocommit"
+        };
+        if explicit_transaction {
+            fconn.execute("BEGIN").unwrap();
+            rconn.execute_batch("BEGIN").unwrap();
+        }
+        // Use disjoint rowids in the two lifecycle modes.  If an autocommit
+        // rollback leaks physical pager state into the later explicit
+        // transaction, the violating locator identifies the originating
+        // statement instead of being masked by identical test inputs.
+        let (first_id, second_id) = if explicit_transaction {
+            (20, 21)
+        } else {
+            (10, 11)
+        };
+        let sql =
+            format!("INSERT OR FAIL INTO self_nodes VALUES ({first_id}, NULL), ({second_id}, 999)");
+        assert_both_execute_error(&fconn, &rconn, &sql, case);
+        assert_logged_atomic_oracle_snapshot(
+            case,
+            &fconn,
+            &rconn,
+            &[
+                "SELECT id, parent_id FROM self_nodes ORDER BY id",
+                "SELECT changes(), total_changes(), last_insert_rowid()",
+                "PRAGMA foreign_key_check",
+            ],
+        );
+        if explicit_transaction {
+            fconn.execute("COMMIT").unwrap();
+            rconn.execute_batch("COMMIT").unwrap();
+        }
+    }
+
+    let cascade_setup = [
+        "CREATE TABLE cascade_parent (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE cascade_child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES cascade_parent(id) ON UPDATE CASCADE)",
+        "INSERT INTO cascade_parent VALUES (10), (20)",
+        "INSERT INTO cascade_child VALUES (1, 10), (2, 20)",
+    ];
+    apply_fsqlite_statements(&fconn, &cascade_setup);
+    apply_rusqlite_statements(&rconn, &cascade_setup);
+    let cascade_sql = "UPDATE cascade_parent SET id = id + 100";
+    assert_eq!(fconn.execute(cascade_sql).unwrap(), 2);
+    assert_eq!(rconn.execute(cascade_sql, []).unwrap(), 2);
+    assert_logged_atomic_oracle_snapshot(
+        "fk_on_update_cascade",
+        &fconn,
+        &rconn,
+        &[
+            "SELECT id FROM cascade_parent ORDER BY id",
+            "SELECT id, parent_id FROM cascade_child ORDER BY id",
+            "SELECT changes(), total_changes(), last_insert_rowid()",
+            "PRAGMA foreign_key_check",
+        ],
+    );
+
+    let deferred_setup = [
+        "CREATE TABLE deferred_parent (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE deferred_child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES deferred_parent(id) DEFERRABLE INITIALLY DEFERRED)",
+    ];
+    apply_fsqlite_statements(&fconn, &deferred_setup);
+    apply_rusqlite_statements(&rconn, &deferred_setup);
+    for sql in [
+        "BEGIN",
+        "INSERT INTO deferred_child VALUES (1, 500)",
+        "INSERT INTO deferred_parent VALUES (500)",
+        "COMMIT",
+    ] {
+        fconn.execute(sql).unwrap();
+        rconn.execute_batch(sql).unwrap();
+    }
+    fconn.execute("BEGIN").unwrap();
+    rconn.execute_batch("BEGIN").unwrap();
+    fconn
+        .execute("INSERT INTO deferred_child VALUES (2, 999)")
+        .unwrap();
+    rconn
+        .execute_batch("INSERT INTO deferred_child VALUES (2, 999)")
+        .unwrap();
+    let frank_commit = fconn.execute("COMMIT");
+    let oracle_commit = rconn.execute_batch("COMMIT");
+    eprintln!(
+        "ATOMIC_HISTORY case=deferred_fk phase=invalid_commit frank={frank_commit:?} oracle={oracle_commit:?}"
+    );
+    assert!(frank_commit.is_err());
+    assert!(oracle_commit.is_err());
+    fconn.execute("ROLLBACK").unwrap();
+    rconn.execute_batch("ROLLBACK").unwrap();
+    assert_logged_atomic_oracle_snapshot(
+        "deferred_fk",
+        &fconn,
+        &rconn,
+        &[
+            "SELECT id FROM deferred_parent ORDER BY id",
+            "SELECT id, parent_id FROM deferred_child ORDER BY id",
+            "SELECT changes(), total_changes(), last_insert_rowid()",
+            "PRAGMA foreign_key_check",
+        ],
+    );
+}
+
+/// `PRAGMA foreign_key_check` reports the physical rowid for ordinary child
+/// tables and NULL for WITHOUT ROWID children.  Both the database-wide and
+/// table-scoped forms must accept clean tables and report the same violating
+/// row as C SQLite.  The pragma intentionally runs with enforcement disabled
+/// so a real orphan can be persisted and inspected.
+#[test]
+fn test_conformance_atomic_foreign_key_check_row_locator_matrix_s76w() {
+    for (case, child_table, create_child, valid_insert, invalid_insert, rowid_value) in [
+        (
+            "rowid",
+            "child_rowid",
+            "CREATE TABLE child_rowid (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+            "INSERT INTO child_rowid VALUES (1, 7)",
+            "INSERT INTO child_rowid VALUES (2, 99)",
+            "2",
+        ),
+        (
+            "without_rowid",
+            "child_wr",
+            "CREATE TABLE child_wr (key TEXT PRIMARY KEY, parent_id INTEGER REFERENCES parent(id)) WITHOUT ROWID",
+            "INSERT INTO child_wr VALUES ('valid', 7)",
+            "INSERT INTO child_wr VALUES ('orphan', 99)",
+            "NULL",
+        ),
+    ] {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = [
+            "PRAGMA foreign_keys = OFF",
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+            create_child,
+            "INSERT INTO parent VALUES (7)",
+            valid_insert,
+        ];
+        apply_fsqlite_statements(&fconn, &setup);
+        apply_rusqlite_statements(&rconn, &setup);
+
+        let pragma_sql = [
+            "PRAGMA foreign_key_check".to_owned(),
+            format!("PRAGMA foreign_key_check({child_table})"),
+        ];
+        for sql in &pragma_sql {
+            let frank = query_fsqlite_strings(&fconn, sql).unwrap();
+            let oracle = query_rusqlite_strings(&rconn, sql).unwrap();
+            eprintln!(
+                "ATOMIC_HISTORY case=foreign_key_check_{case} phase=clean sql={sql:?} frank={frank:?} oracle={oracle:?}"
+            );
+            assert_eq!(frank, oracle);
+            assert!(
+                frank.is_empty(),
+                "clean {case} foreign-key image must not report violations"
+            );
+        }
+
+        fconn.execute(invalid_insert).unwrap();
+        rconn.execute_batch(invalid_insert).unwrap();
+        let expected = vec![vec![
+            format!("'{child_table}'"),
+            rowid_value.to_owned(),
+            "'parent'".to_owned(),
+            "0".to_owned(),
+        ]];
+        for sql in &pragma_sql {
+            let frank = query_fsqlite_strings(&fconn, sql).unwrap();
+            let oracle = query_rusqlite_strings(&rconn, sql).unwrap();
+            eprintln!(
+                "ATOMIC_HISTORY case=foreign_key_check_{case} phase=violation sql={sql:?} frank={frank:?} oracle={oracle:?}"
+            );
+            assert_eq!(frank, oracle);
+            assert_eq!(
+                frank, expected,
+                "{case} foreign-key violation must expose SQLite's exact row locator"
+            );
+        }
+    }
+}
+
+/// REPLACE's implicit delete must run inbound actions for the exact VDBE
+/// victim. This matrix covers final-image NO ACTION, immediate RESTRICT,
+/// CASCADE, SET NULL, SET DEFAULT, RETURNING order, and a WITHOUT ROWID
+/// secondary-UNIQUE victim.
+#[test]
+fn test_conformance_replace_victim_inbound_foreign_key_actions_s76q() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    apply_fsqlite_statements(&fconn, &["PRAGMA foreign_keys = ON"]);
+    apply_rusqlite_statements(&rconn, &["PRAGMA foreign_keys = ON"]);
+
+    let setup = [
+        "CREATE TABLE p_no_action (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE)",
+        "CREATE TABLE c_no_action (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES p_no_action(id) ON DELETE NO ACTION)",
+        "INSERT INTO p_no_action VALUES (1, 'AAA')",
+        "INSERT INTO c_no_action VALUES (1, 1)",
+        "CREATE TABLE p_restrict (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE)",
+        "CREATE TABLE c_restrict (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES p_restrict(id) ON DELETE RESTRICT)",
+        "INSERT INTO p_restrict VALUES (1, 'AAA')",
+        "INSERT INTO c_restrict VALUES (1, 1)",
+        "CREATE TABLE replace_timing_audit (event TEXT PRIMARY KEY)",
+        "CREATE TABLE p_no_action_repair (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE)",
+        "CREATE TABLE c_no_action_repair (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES p_no_action_repair(id) ON DELETE NO ACTION)",
+        "INSERT INTO p_no_action_repair VALUES (1, 'REPAIR')",
+        "INSERT INTO c_no_action_repair VALUES (1, 1)",
+        "CREATE TRIGGER p_no_action_repair_ai AFTER INSERT ON p_no_action_repair WHEN NEW.id <> 1 BEGIN UPDATE c_no_action_repair SET parent_id = NEW.id WHERE parent_id = 1; INSERT INTO replace_timing_audit VALUES ('no_action_after'); END",
+        "CREATE TABLE p_restrict_repair (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE)",
+        "CREATE TABLE c_restrict_repair (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES p_restrict_repair(id) ON DELETE RESTRICT)",
+        "INSERT INTO p_restrict_repair VALUES (1, 'RESTRICT')",
+        "INSERT INTO c_restrict_repair VALUES (1, 1)",
+        "CREATE TRIGGER p_restrict_repair_ai AFTER INSERT ON p_restrict_repair WHEN NEW.id <> 1 BEGIN UPDATE c_restrict_repair SET parent_id = NEW.id WHERE parent_id = 1; INSERT INTO replace_timing_audit VALUES ('restrict_after'); END",
+        "CREATE TABLE p_update_no_action_repair (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE)",
+        "CREATE TABLE c_update_no_action_repair (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES p_update_no_action_repair(id) ON DELETE NO ACTION)",
+        "INSERT INTO p_update_no_action_repair VALUES (1, 'LEFT'), (2, 'RIGHT')",
+        "INSERT INTO c_update_no_action_repair VALUES (1, 2)",
+        "CREATE TRIGGER p_update_no_action_repair_au AFTER UPDATE ON p_update_no_action_repair WHEN NEW.id = 1 BEGIN UPDATE c_update_no_action_repair SET parent_id = NEW.id WHERE parent_id = 2; INSERT INTO replace_timing_audit VALUES ('update_no_action_after'); END",
+        "CREATE TABLE p_update_restrict_repair (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE)",
+        "CREATE TABLE c_update_restrict_repair (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES p_update_restrict_repair(id) ON DELETE RESTRICT)",
+        "INSERT INTO p_update_restrict_repair VALUES (1, 'LEFT'), (2, 'RIGHT')",
+        "INSERT INTO c_update_restrict_repair VALUES (1, 2)",
+        "CREATE TRIGGER p_update_restrict_repair_au AFTER UPDATE ON p_update_restrict_repair WHEN NEW.id = 1 BEGIN UPDATE c_update_restrict_repair SET parent_id = NEW.id WHERE parent_id = 2; INSERT INTO replace_timing_audit VALUES ('update_restrict_after'); END",
+        "CREATE TABLE p_declared_no_action_repair (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE ON CONFLICT REPLACE)",
+        "CREATE TABLE c_declared_no_action_repair (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES p_declared_no_action_repair(id) ON DELETE NO ACTION)",
+        "INSERT INTO p_declared_no_action_repair VALUES (1, 'DECLARED-REPAIR')",
+        "INSERT INTO c_declared_no_action_repair VALUES (1, 1)",
+        "CREATE TRIGGER p_declared_no_action_repair_ai AFTER INSERT ON p_declared_no_action_repair WHEN NEW.id <> 1 BEGIN UPDATE c_declared_no_action_repair SET parent_id = NEW.id WHERE parent_id = 1; INSERT INTO replace_timing_audit VALUES ('declared_no_action_after'); END",
+        "CREATE TABLE p_declared_restrict_repair (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE ON CONFLICT REPLACE)",
+        "CREATE TABLE c_declared_restrict_repair (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES p_declared_restrict_repair(id) ON DELETE RESTRICT)",
+        "INSERT INTO p_declared_restrict_repair VALUES (1, 'DECLARED-RESTRICT')",
+        "INSERT INTO c_declared_restrict_repair VALUES (1, 1)",
+        "CREATE TRIGGER p_declared_restrict_repair_ai AFTER INSERT ON p_declared_restrict_repair WHEN NEW.id <> 1 BEGIN UPDATE c_declared_restrict_repair SET parent_id = NEW.id WHERE parent_id = 1; INSERT INTO replace_timing_audit VALUES ('declared_restrict_after'); END",
+        "CREATE TABLE p_declared_update_no_action_repair (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE ON CONFLICT REPLACE)",
+        "CREATE TABLE c_declared_update_no_action_repair (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES p_declared_update_no_action_repair(id) ON DELETE NO ACTION)",
+        "INSERT INTO p_declared_update_no_action_repair VALUES (1, 'DECLARED-LEFT'), (2, 'DECLARED-RIGHT')",
+        "INSERT INTO c_declared_update_no_action_repair VALUES (1, 2)",
+        "CREATE TRIGGER p_declared_update_no_action_repair_au AFTER UPDATE ON p_declared_update_no_action_repair WHEN NEW.id = 1 BEGIN UPDATE c_declared_update_no_action_repair SET parent_id = NEW.id WHERE parent_id = 2; INSERT INTO replace_timing_audit VALUES ('declared_update_no_action_after'); END",
+        "CREATE TABLE p_declared_update_restrict_repair (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE ON CONFLICT REPLACE)",
+        "CREATE TABLE c_declared_update_restrict_repair (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES p_declared_update_restrict_repair(id) ON DELETE RESTRICT)",
+        "INSERT INTO p_declared_update_restrict_repair VALUES (1, 'DECLARED-LEFT'), (2, 'DECLARED-RIGHT')",
+        "INSERT INTO c_declared_update_restrict_repair VALUES (1, 2)",
+        "CREATE TRIGGER p_declared_update_restrict_repair_au AFTER UPDATE ON p_declared_update_restrict_repair WHEN NEW.id = 1 BEGIN UPDATE c_declared_update_restrict_repair SET parent_id = NEW.id WHERE parent_id = 2; INSERT INTO replace_timing_audit VALUES ('declared_update_restrict_after'); END",
+        "CREATE TABLE p_cascade (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE)",
+        "CREATE TABLE c_cascade (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES p_cascade(id) ON DELETE CASCADE)",
+        "INSERT INTO p_cascade VALUES (1, 'AAA'), (2, 'BBB')",
+        "INSERT INTO c_cascade VALUES (1, 1), (2, 2)",
+        "CREATE TABLE p_null (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE)",
+        "CREATE TABLE c_null (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES p_null(id) ON DELETE SET NULL)",
+        "INSERT INTO p_null VALUES (1, 'AAA')",
+        "INSERT INTO c_null VALUES (1, 1)",
+        "CREATE TABLE p_default (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE)",
+        "CREATE TABLE c_default (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 0 REFERENCES p_default(id) ON DELETE SET DEFAULT)",
+        "INSERT INTO p_default VALUES (0, 'DEFAULT'), (1, 'AAA')",
+        "INSERT INTO c_default VALUES (1, 1)",
+        "CREATE TABLE p_multi_victim (id INTEGER PRIMARY KEY, left_key TEXT UNIQUE, right_key TEXT UNIQUE)",
+        "CREATE TABLE c_multi_victim (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES p_multi_victim(id) ON DELETE CASCADE)",
+        "INSERT INTO p_multi_victim VALUES (1, 'LEFT-A', 'RIGHT-X'), (2, 'LEFT-B', 'RIGHT-Y')",
+        "INSERT INTO c_multi_victim VALUES (1, 1), (2, 2)",
+        "CREATE TABLE p_wr (venue TEXT NOT NULL, symbol TEXT NOT NULL UNIQUE, payload TEXT, PRIMARY KEY(venue, symbol)) WITHOUT ROWID",
+        "CREATE TABLE c_wr (id INTEGER PRIMARY KEY, venue TEXT, symbol TEXT, FOREIGN KEY(venue, symbol) REFERENCES p_wr(venue, symbol) ON DELETE CASCADE)",
+        "INSERT INTO p_wr VALUES ('XNYS', 'DUAL', 'old')",
+        "INSERT INTO c_wr VALUES (1, 'XNYS', 'DUAL')",
+    ];
+    apply_fsqlite_statements(&fconn, &setup);
+    apply_rusqlite_statements(&rconn, &setup);
+
+    let same_key = "INSERT OR REPLACE INTO p_no_action VALUES (1, 'AAA')";
+    assert_eq!(fconn.execute(same_key).unwrap(), 1);
+    assert_eq!(rconn.execute(same_key, []).unwrap(), 1);
+    assert_both_execute_error(
+        &fconn,
+        &rconn,
+        "INSERT OR REPLACE INTO p_no_action VALUES (2, 'AAA')",
+        "replace_no_action_final_image",
+    );
+    assert_both_execute_error(
+        &fconn,
+        &rconn,
+        "INSERT OR REPLACE INTO p_restrict VALUES (1, 'AAA')",
+        "replace_restrict_same_key",
+    );
+    let no_action_repair = "INSERT OR REPLACE INTO p_no_action_repair VALUES (2, 'REPAIR')";
+    assert_eq!(fconn.execute(no_action_repair).unwrap(), 1);
+    assert_eq!(rconn.execute(no_action_repair, []).unwrap(), 1);
+    assert_both_execute_error(
+        &fconn,
+        &rconn,
+        "INSERT OR REPLACE INTO p_restrict_repair VALUES (2, 'RESTRICT')",
+        "replace_restrict_prevents_after_trigger_repair",
+    );
+    let update_no_action_repair =
+        "UPDATE OR REPLACE p_update_no_action_repair SET symbol = 'RIGHT' WHERE id = 1";
+    assert_eq!(fconn.execute(update_no_action_repair).unwrap(), 1);
+    assert_eq!(rconn.execute(update_no_action_repair, []).unwrap(), 1);
+    assert_both_execute_error(
+        &fconn,
+        &rconn,
+        "UPDATE OR REPLACE p_update_restrict_repair SET symbol = 'RIGHT' WHERE id = 1",
+        "update_replace_restrict_prevents_after_trigger_repair",
+    );
+    let declared_no_action_repair =
+        "INSERT INTO p_declared_no_action_repair VALUES (2, 'DECLARED-REPAIR')";
+    assert_eq!(fconn.execute(declared_no_action_repair).unwrap(), 1);
+    assert_eq!(rconn.execute(declared_no_action_repair, []).unwrap(), 1);
+    assert_both_execute_error(
+        &fconn,
+        &rconn,
+        "INSERT INTO p_declared_restrict_repair VALUES (2, 'DECLARED-RESTRICT')",
+        "declared_replace_restrict_prevents_after_trigger_repair",
+    );
+    let declared_update_no_action_repair =
+        "UPDATE p_declared_update_no_action_repair SET symbol = 'DECLARED-RIGHT' WHERE id = 1";
+    assert_eq!(fconn.execute(declared_update_no_action_repair).unwrap(), 1);
+    assert_eq!(
+        rconn.execute(declared_update_no_action_repair, []).unwrap(),
+        1
+    );
+    assert_both_execute_error(
+        &fconn,
+        &rconn,
+        "UPDATE p_declared_update_restrict_repair SET symbol = 'DECLARED-RIGHT' WHERE id = 1",
+        "declared_update_replace_restrict_prevents_after_trigger_repair",
+    );
+
+    let cascade_returning =
+        "INSERT OR REPLACE INTO p_cascade VALUES (10, 'AAA'), (20, 'BBB') RETURNING id, symbol";
+    let frank_returning = query_fsqlite_strings(&fconn, cascade_returning).unwrap();
+    let oracle_returning = query_rusqlite_strings(&rconn, cascade_returning).unwrap();
+    eprintln!(
+        "ATOMIC_HISTORY case=replace_cascade_multirow phase=returning frank={frank_returning:?} oracle={oracle_returning:?}"
+    );
+    assert_eq!(frank_returning, oracle_returning);
+    for sql in [
+        "INSERT OR REPLACE INTO p_null VALUES (2, 'AAA')",
+        "INSERT OR REPLACE INTO p_default VALUES (2, 'AAA')",
+        "INSERT OR REPLACE INTO p_multi_victim VALUES (3, 'LEFT-A', 'RIGHT-Y')",
+        "INSERT OR REPLACE INTO p_wr VALUES ('XNAS', 'DUAL', 'new')",
+    ] {
+        assert_eq!(fconn.execute(sql).unwrap(), 1);
+        assert_eq!(rconn.execute(sql, []).unwrap(), 1);
+    }
+
+    assert_logged_atomic_oracle_snapshot(
+        "replace_fk_actions",
+        &fconn,
+        &rconn,
+        &[
+            "SELECT id, symbol FROM p_no_action ORDER BY id",
+            "SELECT id, parent_id FROM c_no_action ORDER BY id",
+            "SELECT id, symbol FROM p_restrict ORDER BY id",
+            "SELECT id, parent_id FROM c_restrict ORDER BY id",
+            "SELECT id, symbol FROM p_no_action_repair ORDER BY id",
+            "SELECT id, parent_id FROM c_no_action_repair ORDER BY id",
+            "SELECT id, symbol FROM p_restrict_repair ORDER BY id",
+            "SELECT id, parent_id FROM c_restrict_repair ORDER BY id",
+            "SELECT id, symbol FROM p_update_no_action_repair ORDER BY id",
+            "SELECT id, parent_id FROM c_update_no_action_repair ORDER BY id",
+            "SELECT id, symbol FROM p_update_restrict_repair ORDER BY id",
+            "SELECT id, parent_id FROM c_update_restrict_repair ORDER BY id",
+            "SELECT id, symbol FROM p_declared_no_action_repair ORDER BY id",
+            "SELECT id, parent_id FROM c_declared_no_action_repair ORDER BY id",
+            "SELECT id, symbol FROM p_declared_restrict_repair ORDER BY id",
+            "SELECT id, parent_id FROM c_declared_restrict_repair ORDER BY id",
+            "SELECT id, symbol FROM p_declared_update_no_action_repair ORDER BY id",
+            "SELECT id, parent_id FROM c_declared_update_no_action_repair ORDER BY id",
+            "SELECT id, symbol FROM p_declared_update_restrict_repair ORDER BY id",
+            "SELECT id, parent_id FROM c_declared_update_restrict_repair ORDER BY id",
+            "SELECT event FROM replace_timing_audit ORDER BY event",
+            "SELECT id, symbol FROM p_cascade ORDER BY id",
+            "SELECT id, parent_id FROM c_cascade ORDER BY id",
+            "SELECT id, parent_id FROM c_null ORDER BY id",
+            "SELECT id, parent_id FROM c_default ORDER BY id",
+            "SELECT id, left_key, right_key FROM p_multi_victim ORDER BY id",
+            "SELECT id, parent_id FROM c_multi_victim ORDER BY id",
+            "SELECT venue, symbol, payload FROM p_wr ORDER BY venue, symbol",
+            "SELECT id, venue, symbol FROM c_wr ORDER BY id",
+            "PRAGMA foreign_key_check",
+            "SELECT changes(), total_changes(), last_insert_rowid()",
+        ],
+    );
+}
+
+/// Trigger conflict modes must retain SQLite's row-history semantics under
+/// replay: IGNORE skips only its row, FAIL retains prior rows, and ABORT rolls
+/// the logical statement back. The same assertions run in autocommit and an
+/// explicit transaction.
+#[test]
+fn test_conformance_atomic_trigger_raise_conflict_matrix_s76s() {
+    for explicit_transaction in [false, true] {
+        for mode in ["IGNORE", "FAIL", "ABORT"] {
+            let fconn = Connection::open(":memory:").unwrap();
+            let rconn = rusqlite::Connection::open_in_memory().unwrap();
+            let trigger_body = if mode == "IGNORE" {
+                "SELECT RAISE(IGNORE)"
+            } else if mode == "FAIL" {
+                "SELECT RAISE(FAIL, 'stop-on-two')"
+            } else {
+                "SELECT RAISE(ABORT, 'stop-on-two')"
+            };
+            let create_trigger = format!(
+                "CREATE TRIGGER raise_bi BEFORE INSERT ON raise_rows WHEN NEW.id = 2 BEGIN {trigger_body}; END"
+            );
+            apply_fsqlite_statements(
+                &fconn,
+                &["CREATE TABLE raise_rows (id INTEGER PRIMARY KEY, value TEXT)"],
+            );
+            apply_rusqlite_statements(
+                &rconn,
+                &["CREATE TABLE raise_rows (id INTEGER PRIMARY KEY, value TEXT)"],
+            );
+            fconn.execute(&create_trigger).unwrap();
+            rconn.execute_batch(&create_trigger).unwrap();
+            if explicit_transaction {
+                fconn.execute("BEGIN").unwrap();
+                rconn.execute_batch("BEGIN").unwrap();
+            }
+
+            let sql =
+                "INSERT INTO raise_rows VALUES (1, 'one'), (2, 'two'), (3, 'three') RETURNING id";
+            let frank_result = query_fsqlite_strings(&fconn, sql);
+            let oracle_result = query_rusqlite_strings(&rconn, sql);
+            eprintln!(
+                "ATOMIC_HISTORY case=raise_{mode}_{explicit_transaction} phase=execute frank={frank_result:?} oracle={oracle_result:?}"
+            );
+            assert_eq!(frank_result.is_ok(), oracle_result.is_ok());
+            if let (Ok(frank_rows), Ok(oracle_rows)) = (&frank_result, &oracle_result) {
+                assert_eq!(
+                    frank_rows, oracle_rows,
+                    "RAISE({mode}) RETURNING rows diverged"
+                );
+            }
+            assert_logged_atomic_oracle_snapshot(
+                &format!("raise_{mode}_{explicit_transaction}"),
+                &fconn,
+                &rconn,
+                &[
+                    "SELECT id, value FROM raise_rows ORDER BY id",
+                    "SELECT changes(), total_changes(), last_insert_rowid()",
+                ],
+            );
+            if explicit_transaction {
+                fconn.execute("COMMIT").unwrap();
+                rconn.execute_batch("COMMIT").unwrap();
+            }
+        }
+    }
+}
+
+/// A trigger frame temporarily owns `last_insert_rowid()`: nested trigger
+/// writes are visible while the nested program runs, the outer trigger's value
+/// is restored when the nested program returns, and the caller's pre-trigger
+/// value is restored when the outer program unwinds.  Verify that exact C
+/// SQLite contract after success and after every RAISE exit.
+#[test]
+fn test_conformance_atomic_nested_trigger_last_insert_rowid_raise_matrix_s76v() {
+    for mode in ["SUCCESS", "IGNORE", "FAIL", "ABORT", "ROLLBACK"] {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = [
+            "CREATE TABLE seed (id INTEGER PRIMARY KEY)",
+            "INSERT INTO seed VALUES (41)",
+            "CREATE TABLE outer_wr (key TEXT PRIMARY KEY) WITHOUT ROWID",
+            "CREATE TABLE nested_rows (id INTEGER PRIMARY KEY, mode TEXT NOT NULL)",
+            "CREATE TABLE deep_rows (id INTEGER PRIMARY KEY, observed_last_id INTEGER NOT NULL)",
+            "CREATE TABLE last_id_observations (stage TEXT PRIMARY KEY, observed_last_id INTEGER NOT NULL) WITHOUT ROWID",
+            "CREATE TRIGGER nested_rows_ai AFTER INSERT ON nested_rows BEGIN INSERT INTO last_id_observations VALUES ('nested_entry', last_insert_rowid()); INSERT INTO deep_rows VALUES (201, last_insert_rowid()); INSERT INTO last_id_observations VALUES ('nested_after_deep', last_insert_rowid()); END",
+        ];
+        apply_fsqlite_statements(&fconn, &setup);
+        apply_rusqlite_statements(&rconn, &setup);
+
+        let raise_clause = match mode {
+            "SUCCESS" => "",
+            "IGNORE" => "SELECT RAISE(IGNORE);",
+            "FAIL" => "SELECT RAISE(FAIL, 'nested-fail');",
+            "ABORT" => "SELECT RAISE(ABORT, 'nested-abort');",
+            "ROLLBACK" => "SELECT RAISE(ROLLBACK, 'nested-rollback');",
+            _ => unreachable!(),
+        };
+        let create_outer_trigger = format!(
+            "CREATE TRIGGER outer_wr_bi BEFORE INSERT ON outer_wr BEGIN \
+             INSERT INTO nested_rows VALUES (101, NEW.key); \
+             INSERT INTO last_id_observations VALUES ('outer_after_nested', last_insert_rowid()); \
+             {raise_clause} END"
+        );
+        fconn.execute(&create_outer_trigger).unwrap();
+        rconn.execute_batch(&create_outer_trigger).unwrap();
+
+        let sql = format!("INSERT INTO outer_wr VALUES ('{mode}') RETURNING key");
+        let frank_result = query_fsqlite_strings(&fconn, &sql);
+        let oracle_result = query_rusqlite_strings(&rconn, &sql);
+        eprintln!(
+            "ATOMIC_HISTORY case=nested_trigger_last_insert_rowid_{mode} phase=execute frank={frank_result:?} oracle={oracle_result:?}"
+        );
+        assert_eq!(
+            frank_result.is_ok(),
+            oracle_result.is_ok(),
+            "nested trigger RAISE({mode}) result class diverged"
+        );
+        if let (Ok(frank_rows), Ok(oracle_rows)) = (&frank_result, &oracle_result) {
+            assert_eq!(
+                frank_rows, oracle_rows,
+                "nested trigger RAISE({mode}) RETURNING rows diverged"
+            );
+        } else if let (Err(frank_error), Err(oracle_error)) = (&frank_result, &oracle_result) {
+            let expected_message = match mode {
+                "FAIL" => "nested-fail",
+                "ABORT" => "nested-abort",
+                "ROLLBACK" => "nested-rollback",
+                _ => unreachable!("only failing RAISE modes reach this branch"),
+            };
+            assert!(
+                frank_error.ends_with(expected_message),
+                "nested trigger RAISE({mode}) lost its verbatim error payload: {frank_error}"
+            );
+            assert!(
+                oracle_error.ends_with(expected_message),
+                "C SQLite unexpectedly lost the RAISE({mode}) payload: {oracle_error}"
+            );
+        }
+
+        assert_logged_atomic_oracle_snapshot(
+            &format!("nested_trigger_last_insert_rowid_{mode}"),
+            &fconn,
+            &rconn,
+            &[
+                "SELECT key FROM outer_wr ORDER BY key",
+                "SELECT id, mode FROM nested_rows ORDER BY id",
+                "SELECT id, observed_last_id FROM deep_rows ORDER BY id",
+                "SELECT stage, observed_last_id FROM last_id_observations ORDER BY stage",
+                "SELECT changes(), total_changes(), last_insert_rowid()",
+            ],
+        );
+        let caller_last_id = query_fsqlite_strings(&fconn, "SELECT last_insert_rowid()").unwrap();
+        assert_eq!(
+            caller_last_id,
+            vec![vec!["41".to_owned()]],
+            "caller last_insert_rowid must be restored after nested trigger mode={mode}"
+        );
+    }
+}
+
+/// FK actions caused by implicit REPLACE deletes stay inside user savepoint
+/// and transaction rollback boundaries, and the committed image survives a
+/// file reopen.
+#[test]
+fn test_conformance_replace_victim_savepoint_rollback_and_reopen_s76r() {
+    let temp = tempfile::tempdir().unwrap();
+    let frank_path = temp.path().join("frank.db");
+    let oracle_path = temp.path().join("oracle.db");
+    let setup = [
+        "PRAGMA foreign_keys = ON",
+        "CREATE TABLE parent (id INTEGER PRIMARY KEY, symbol TEXT UNIQUE)",
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE)",
+        "INSERT INTO parent VALUES (1, 'AAA')",
+        "INSERT INTO child VALUES (1, 1)",
+    ];
+    {
+        let fconn = Connection::open(frank_path.to_str().unwrap()).unwrap();
+        let rconn = rusqlite::Connection::open(&oracle_path).unwrap();
+        apply_fsqlite_statements(&fconn, &setup);
+        apply_rusqlite_statements(&rconn, &setup);
+        for sql in [
+            "SAVEPOINT replace_probe",
+            "INSERT OR REPLACE INTO parent VALUES (2, 'AAA')",
+        ] {
+            fconn.execute(sql).unwrap();
+            rconn.execute_batch(sql).unwrap();
+        }
+        assert_logged_atomic_oracle_snapshot(
+            "replace_savepoint_mutated",
+            &fconn,
+            &rconn,
+            &[
+                "SELECT id, symbol FROM parent ORDER BY id",
+                "SELECT id, parent_id FROM child ORDER BY id",
+            ],
+        );
+        for sql in ["ROLLBACK TO replace_probe", "RELEASE replace_probe"] {
+            fconn.execute(sql).unwrap();
+            rconn.execute_batch(sql).unwrap();
+        }
+        assert_logged_atomic_oracle_snapshot(
+            "replace_savepoint_rolled_back",
+            &fconn,
+            &rconn,
+            &[
+                "SELECT id, symbol FROM parent ORDER BY id",
+                "SELECT id, parent_id FROM child ORDER BY id",
+                "PRAGMA foreign_key_check",
+            ],
+        );
+        for sql in [
+            "BEGIN",
+            "INSERT OR REPLACE INTO parent VALUES (2, 'AAA')",
+            "COMMIT",
+        ] {
+            fconn.execute(sql).unwrap();
+            rconn.execute_batch(sql).unwrap();
+        }
+    }
+
+    let fconn = Connection::open(frank_path.to_str().unwrap()).unwrap();
+    let rconn = rusqlite::Connection::open(&oracle_path).unwrap();
+    fconn.execute("PRAGMA foreign_keys = ON").unwrap();
+    rconn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+    assert_logged_atomic_oracle_snapshot(
+        "replace_reopen_committed",
+        &fconn,
+        &rconn,
+        &[
+            "SELECT id, symbol FROM parent ORDER BY id",
+            "SELECT id, parent_id FROM child ORDER BY id",
+            "PRAGMA foreign_key_check",
+        ],
+    );
+}
+
+/// Ordinary UNIQUE failures under OR FAIL retain the completed row history,
+/// including interleaved trigger effects, but not the failed row's table
+/// mutation. Exercise both INSERT and UPDATE with RETURNING in autocommit and
+/// explicit transactions so internal savepoints cannot silently turn FAIL
+/// into ABORT.
+#[test]
+fn test_conformance_atomic_or_fail_unique_history_s76u() {
+    for explicit_transaction in [false, true] {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = [
+            "CREATE TABLE fail_insert_rows (id INTEGER PRIMARY KEY, value INTEGER UNIQUE)",
+            "CREATE TABLE fail_insert_audit (seq INTEGER PRIMARY KEY, phase TEXT, row_id INTEGER)",
+            "CREATE TRIGGER fail_insert_bi BEFORE INSERT ON fail_insert_rows BEGIN INSERT INTO fail_insert_audit(phase, row_id) VALUES ('BI', NEW.id); END",
+            "CREATE TRIGGER fail_insert_ai AFTER INSERT ON fail_insert_rows BEGIN INSERT INTO fail_insert_audit(phase, row_id) VALUES ('AI', NEW.id); END",
+        ];
+        apply_fsqlite_statements(&fconn, &setup);
+        apply_rusqlite_statements(&rconn, &setup);
+        if explicit_transaction {
+            fconn.execute("BEGIN").unwrap();
+            rconn.execute_batch("BEGIN").unwrap();
+        }
+
+        let sql = "INSERT OR FAIL INTO fail_insert_rows VALUES (1, 10), (2, 20), (3, 10) RETURNING id, value";
+        let frank = query_fsqlite_strings(&fconn, sql);
+        let oracle = query_rusqlite_strings(&rconn, sql);
+        eprintln!(
+            "ATOMIC_HISTORY case=insert_or_fail_unique_{explicit_transaction} phase=execute frank={frank:?} oracle={oracle:?}"
+        );
+        assert!(frank.is_err(), "FrankenSQLite OR FAIL INSERT must fail");
+        assert!(oracle.is_err(), "C SQLite OR FAIL INSERT must fail");
+        assert_logged_atomic_oracle_snapshot(
+            &format!("insert_or_fail_unique_{explicit_transaction}"),
+            &fconn,
+            &rconn,
+            &[
+                "SELECT id, value FROM fail_insert_rows ORDER BY id",
+                "SELECT phase, row_id FROM fail_insert_audit ORDER BY seq",
+                "SELECT changes(), total_changes(), last_insert_rowid()",
+            ],
+        );
+        if explicit_transaction {
+            fconn.execute("COMMIT").unwrap();
+            rconn.execute_batch("COMMIT").unwrap();
+        }
+    }
+
+    for explicit_transaction in [false, true] {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = [
+            "CREATE TABLE fail_update_rows (id INTEGER PRIMARY KEY, value INTEGER UNIQUE)",
+            "INSERT INTO fail_update_rows VALUES (1, 10), (2, 20), (3, 30)",
+            "CREATE TABLE fail_update_audit (seq INTEGER PRIMARY KEY, phase TEXT, row_id INTEGER, visible_sum INTEGER)",
+            "CREATE TRIGGER fail_update_bu BEFORE UPDATE ON fail_update_rows BEGIN INSERT INTO fail_update_audit(phase, row_id, visible_sum) VALUES ('BU', OLD.id, (SELECT sum(value) FROM fail_update_rows)); END",
+            "CREATE TRIGGER fail_update_au AFTER UPDATE ON fail_update_rows BEGIN INSERT INTO fail_update_audit(phase, row_id, visible_sum) VALUES ('AU', NEW.id, (SELECT sum(value) FROM fail_update_rows)); END",
+        ];
+        apply_fsqlite_statements(&fconn, &setup);
+        apply_rusqlite_statements(&rconn, &setup);
+        if explicit_transaction {
+            fconn.execute("BEGIN").unwrap();
+            rconn.execute_batch("BEGIN").unwrap();
+        }
+
+        let sql = "UPDATE OR FAIL fail_update_rows SET value = CASE id WHEN 1 THEN 11 WHEN 2 THEN 12 ELSE 12 END RETURNING id, value";
+        let frank = query_fsqlite_strings(&fconn, sql);
+        let oracle = query_rusqlite_strings(&rconn, sql);
+        eprintln!(
+            "ATOMIC_HISTORY case=update_or_fail_unique_{explicit_transaction} phase=execute frank={frank:?} oracle={oracle:?}"
+        );
+        assert!(frank.is_err(), "FrankenSQLite OR FAIL UPDATE must fail");
+        assert!(oracle.is_err(), "C SQLite OR FAIL UPDATE must fail");
+        assert_logged_atomic_oracle_snapshot(
+            &format!("update_or_fail_unique_{explicit_transaction}"),
+            &fconn,
+            &rconn,
+            &[
+                "SELECT id, value FROM fail_update_rows ORDER BY id",
+                "SELECT phase, row_id, visible_sum FROM fail_update_audit ORDER BY seq",
+                "SELECT changes(), total_changes(), last_insert_rowid()",
+            ],
+        );
+        if explicit_transaction {
+            fconn.execute("COMMIT").unwrap();
+            rconn.execute_batch("COMMIT").unwrap();
+        }
+    }
+}
+
+/// Row replay must choose an unshadowed hidden rowid alias, then fall back to
+/// the declared INTEGER PRIMARY KEY when all three aliases are shadowed.
+#[test]
+fn test_conformance_atomic_update_rowid_alias_locator_matrix_s76t() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let setup = [
+        "CREATE TABLE shadow_rowid (rowid TEXT, value INTEGER)",
+        "INSERT INTO shadow_rowid VALUES ('a', 1), ('b', 2)",
+        "CREATE TABLE shadow_two (rowid TEXT, _rowid_ TEXT, value INTEGER)",
+        "INSERT INTO shadow_two VALUES ('a', 'x', 1), ('b', 'y', 2)",
+        "CREATE TABLE shadow_all (rowid INTEGER PRIMARY KEY, _rowid_ TEXT, oid TEXT, value INTEGER)",
+        "INSERT INTO shadow_all VALUES (1, 'x', 'm', 1), (2, 'y', 'n', 2)",
+        "CREATE TABLE alias_audit (seq INTEGER PRIMARY KEY, table_name TEXT, visible_sum INTEGER)",
+        "CREATE TRIGGER shadow_rowid_bu BEFORE UPDATE ON shadow_rowid BEGIN INSERT INTO alias_audit(table_name, visible_sum) VALUES ('shadow_rowid', (SELECT sum(value) FROM shadow_rowid)); END",
+        "CREATE TRIGGER shadow_two_bu BEFORE UPDATE ON shadow_two BEGIN INSERT INTO alias_audit(table_name, visible_sum) VALUES ('shadow_two', (SELECT sum(value) FROM shadow_two)); END",
+        "CREATE TRIGGER shadow_all_bu BEFORE UPDATE ON shadow_all BEGIN INSERT INTO alias_audit(table_name, visible_sum) VALUES ('shadow_all', (SELECT sum(value) FROM shadow_all)); END",
+    ];
+    apply_fsqlite_statements(&fconn, &setup);
+    apply_rusqlite_statements(&rconn, &setup);
+
+    for sql in [
+        "UPDATE shadow_rowid SET value = value + 10 RETURNING rowid, value",
+        "UPDATE shadow_two SET value = value + 10 RETURNING rowid, _rowid_, value",
+        "UPDATE shadow_all SET value = value + 10 RETURNING rowid, _rowid_, oid, value",
+    ] {
+        let frank = query_fsqlite_strings(&fconn, sql).unwrap();
+        let oracle = query_rusqlite_strings(&rconn, sql).unwrap();
+        eprintln!(
+            "ATOMIC_HISTORY case=rowid_alias_locator phase=returning sql={sql:?} frank={frank:?} oracle={oracle:?}"
+        );
+        assert_eq!(frank, oracle);
+    }
+    assert_logged_atomic_oracle_snapshot(
+        "rowid_alias_locator",
+        &fconn,
+        &rconn,
+        &[
+            "SELECT rowid, value FROM shadow_rowid ORDER BY rowid",
+            "SELECT rowid, _rowid_, value FROM shadow_two ORDER BY rowid",
+            "SELECT rowid, _rowid_, oid, value FROM shadow_all ORDER BY rowid",
+            "SELECT table_name, visible_sum FROM alias_audit ORDER BY seq",
+        ],
+    );
+}

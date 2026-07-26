@@ -22,7 +22,7 @@ use fsqlite_ast::{
 };
 use std::sync::Arc;
 
-use crate::parser::{ParseError, Parser, is_nonreserved_kw, kw_to_str};
+use crate::parser::{ParseError, ParseErrorKind, Parser, is_nonreserved_kw, kw_to_str};
 use crate::token::{Token, TokenKind};
 
 // Binding powers: higher = tighter binding.
@@ -166,6 +166,7 @@ impl Parser {
             TokenKind::OversizedInt(s) => match s.parse::<f64>() {
                 Ok(v) => Ok(Expr::Literal(Literal::Float(v), token_span)),
                 Err(_) => Err(ParseError {
+                    kind: ParseErrorKind::Syntax,
                     message: "integer out of range".to_owned(),
                     span: token_span,
                     line,
@@ -369,6 +370,7 @@ impl Parser {
             }
 
             kind => Err(ParseError {
+                kind: ParseErrorKind::Syntax,
                 message: format!("unexpected token in expression: {kind:?}"),
                 span: token_span,
                 line,

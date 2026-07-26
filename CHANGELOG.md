@@ -17,6 +17,53 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
+## [0.1.19] -- 2026-07-26 (atomic SQL semantics and migration-scale DDL reopening)
+
+Full-workspace lockstep release (`0.1.18 -> 0.1.19`). Semver-compatible 0.1.x;
+no breaking API changes.
+
+### Correctness
+
+- Multi-row `INSERT ... SELECT`, rowid and `WITHOUT ROWID` updates, nested
+  triggers, `RETURNING`, conflict actions, and foreign-key validation now share
+  statement-scoped rollback and change-counter semantics with C SQLite. The
+  execution path preserves the correct effects for `FAIL`, rolls back the
+  complete statement for `ABORT`/`ROLLBACK`, restores nested-trigger
+  `last_insert_rowid()`, and retains exact transaction/savepoint history.
+- `INSERT OR REPLACE` now records every logical victim, applies inbound
+  foreign-key actions at the correct statement boundary, and handles
+  `WITHOUT ROWID` primary and secondary uniqueness victims without leaking a
+  partial delete or double-counting changes.
+- Trigger `WHEN` expressions honor explicit collations after `OLD`/`NEW`
+  binding, including bound literals under `COLLATE NOCASE`.
+
+### DDL durability and fail-closed parsing
+
+- Flat associative `AND`/`OR` predicates are serialized without recursive
+  parenthesis growth, so repeatedly reopening a migration-heavy database no
+  longer inflates catalog SQL until the parser exhausts a bounded stack.
+- Parser nesting is tracked explicitly and returns a typed recursion-limit
+  error rather than overflowing a 2 MiB worker stack.
+- Catalog hydration now refuses malformed trigger definitions instead of
+  silently dropping them. File-backed reopen tests pin exact catalog SQL and
+  BLAKE3 hashes across four close/open cycles while executing triggers, partial
+  indexes, views, rowid and `WITHOUT ROWID` foreign keys, and integrity checks.
+
+### Verification
+
+- Eleven atomic C-SQLite differential scenarios cover trigger interleavings,
+  composite locators, foreign-key matrices, REPLACE cascades, savepoint/reopen
+  behavior, `OR FAIL` history, and rowid-alias updates.
+- The migration-scale DDL harness covers scalar and `EXISTS` trigger
+  predicates, binary and `NOCASE` partial indexes, four durable reopen cycles,
+  and nine deliberately corrupted catalog variants that must all fail closed.
+
+### CI / Release
+
+- All publishable `fsqlite` / `fsqlite-*` crates are released in lockstep at
+  `0.1.19`, with native signed artifacts for Linux x86-64 and arm64, macOS
+  x86-64 and arm64, and Windows x86-64.
+
 ## [0.1.18] -- 2026-07-18 (streaming composite-index count semijoins)
 
 Full-workspace lockstep release (`0.1.17 -> 0.1.18`). Semver-compatible 0.1.x;
