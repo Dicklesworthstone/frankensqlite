@@ -143,6 +143,54 @@ are provenance only and must never gate the verdict.
   Attribute any residual engine cost only after CPU/allocation profiles and a
   one-variable A/B; keep profiling outside the timing matrix.
 
+## 2026-07-26 - DIAGNOSTIC: per-operation runtime entry is large; the worker facade is not the fix
+
+- Target: resolve the boundary hold above with a same-source bridge experiment
+  on prepared INSERT, raw `execute_with_params` INSERT, and a ready-future
+  control. Source
+  `413ed24cd0ff8dcfa2bbc7ed395dd1cf5db4e25f` compares one
+  reused `Runtime::block_on` around the complete timed sample, one reused
+  thread-local `Runtime::block_on` per timed operation, and the public
+  `AsyncConnection` synchronous worker facade. The four-process outer profile
+  order is ABBA (`release-perf`, `release`, `release`, `release-perf`) across
+  two seeds, with 48 samples per arm and 1,000 operations per database sample.
+- Evidence:
+  `tests/artifacts/perf/gate0-bridge-413ed24c-20260726T0806Z-trj/`.
+  All four v2 reports pass independent structural validation and retain 2,496
+  raw samples plus exact complete-cluster bootstrap and sign-randomization
+  results. They are explicitly **non-citable**: every process records 224
+  provenance errors from active SBH, excess load, excess I/O PSI, and the
+  declared watchdog/topology limitations.
+- Diagnostic result: under `release-perf`, per-operation entry versus one
+  enclosing runtime is `2.2003x` for prepared INSERT (`+621.7 ns/op`) and
+  `1.4866x` for raw INSERT (`+441.9 ns/op`), replicated across both seeds.
+  Under shipped `release`, the same contrasts are `2.2946x`
+  (`+1,177.1 ns/op`) and `1.5383x` (`+840.0 ns/op`). Exact within-process
+  randomization rejects a zero paired effect in every replication. The
+  ready-future slopes, 217.1 ns/entry and 316.1 ns/entry respectively, explain
+  only part of the real-operation gap: the proven mechanism is repeated
+  runtime entry plus scheduler/future interaction, not runtime construction or
+  a single constant entry cost.
+- Rejection: do not use the current worker facade as the sync-throughput fix.
+  It is deliberately a whole-system arm—SQL/parameter cloning, response-channel
+  allocation, channel transit, worker scheduling, and
+  `futures_lite::block_on`—and measured `6.3993x` slower than per-operation
+  entry (`9.5134x` slower than inside-runtime) under `release-perf`, and
+  `4.2968x` (`6.6099x`) under shipped `release`.
+- Profile hold: the `opt-level=z` binary is 30.8% smaller than the
+  `opt-level=3` binary, while selected prepared/raw engine arms are
+  `1.7206-1.8291x` slower in the counterbalanced profile point estimates.
+  With two profile-level seed replications and non-citable host provenance,
+  this is a release-profile risk signal, not a final profile choice.
+- Retry the runtime bridge only with isolated-host provenance if a citable
+  magnitude is needed. The engineering retry condition is more useful:
+  benchmark one runtime per scenario as primary engine throughput, retain the
+  per-operation sync adapter as a separate score, add a batched sync entry
+  point, and profile the residual before changing WAL dispatch. Retry the
+  worker approach only after removing or amortizing its measured cloning,
+  channel, scheduling, and secondary-executor costs. Decide the release profile
+  with a citable size/throughput Pareto matrix, not this diagnostic alone.
+
 ## 2026-07-26 - REJECTED ATTRIBUTION: boxed WAL futures are not yet a measured root cause
 
 - Target: the hypothesis that one `Box::pin` allocation per `WalBackend` call

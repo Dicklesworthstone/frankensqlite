@@ -1,0 +1,53 @@
+{
+  "runs": [
+    {
+      "host_checkpoints": 72,
+      "profile": "release-perf",
+      "provenance_error_contract": "only SBH, load, I/O PSI, watchdog, and isolation limitations",
+      "provenance_status": "unverified_explicit_override",
+      "provenance_validation_errors": 224,
+      "run": "01-release-perf-seed2026072601",
+      "samples": 624,
+      "schema": "fsqlite-e2e.bridge-experiment.v2",
+      "seed": 2026072601,
+      "structural_validation": "pass"
+    },
+    {
+      "host_checkpoints": 72,
+      "profile": "release",
+      "provenance_error_contract": "only SBH, load, I/O PSI, watchdog, and isolation limitations",
+      "provenance_status": "unverified_explicit_override",
+      "provenance_validation_errors": 224,
+      "run": "02-release-seed2026072601",
+      "samples": 624,
+      "schema": "fsqlite-e2e.bridge-experiment.v2",
+      "seed": 2026072601,
+      "structural_validation": "pass"
+    },
+    {
+      "host_checkpoints": 72,
+      "profile": "release",
+      "provenance_error_contract": "only SBH, load, I/O PSI, watchdog, and isolation limitations",
+      "provenance_status": "unverified_explicit_override",
+      "provenance_validation_errors": 224,
+      "run": "03-release-seed2026072602",
+      "samples": 624,
+      "schema": "fsqlite-e2e.bridge-experiment.v2",
+      "seed": 2026072602,
+      "structural_validation": "pass"
+    },
+    {
+      "host_checkpoints": 72,
+      "profile": "release-perf",
+      "provenance_error_contract": "only SBH, load, I/O PSI, watchdog, and isolation limitations",
+      "provenance_status": "unverified_explicit_override",
+      "provenance_validation_errors": 224,
+      "run": "04-release-perf-seed2026072602",
+      "samples": 624,
+      "schema": "fsqlite-e2e.bridge-experiment.v2",
+      "seed": 2026072602,
+      "structural_validation": "pass"
+    }
+  ],
+  "source_sha": "413ed24cd0ff8dcfa2bbc7ed395dd1cf5db4e25f"
+}

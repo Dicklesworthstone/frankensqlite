@@ -1,0 +1,5 @@
+run	profile	seed	outer_order
+01	release-perf	2026072601	A
+02	release	2026072601	B
+03	release	2026072602	B
+04	release-perf	2026072602	A

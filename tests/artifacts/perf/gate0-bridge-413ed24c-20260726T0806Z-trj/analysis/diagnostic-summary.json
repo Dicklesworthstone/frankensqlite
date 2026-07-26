@@ -1,0 +1,737 @@
+{
+  "caveats": [
+    "all runs explicitly overridden non-citable provenance",
+    "SBH active at every checkpoint",
+    "host load and I/O PSI exceeded declared ceilings",
+    "no fail-bounded bridge watchdog",
+    "no isolated cpuset/full-dynticks/IRQ/per-thread-frequency receipt"
+  ],
+  "citable": false,
+  "design": {
+    "host_checkpoints_total": 288,
+    "outer_profile_order": "ABBA: release-perf, release, release, release-perf",
+    "profiles": [
+      "release-perf opt-level=3",
+      "release opt-level=z"
+    ],
+    "raw_samples_total": 2496,
+    "samples_per_arm_per_run": 48,
+    "seeds": [
+      2026072601,
+      2026072602
+    ]
+  },
+  "profile_penalty_aggregate": [
+    {
+      "ABBA_balanced_release_over_release_perf_geomean_ratio": 1.7538009594470674,
+      "arm": "inside_existing_runtime",
+      "inference": "diagnostic point estimate only; profile is assigned at run level with two counterbalanced seeds",
+      "operation_count": 1000,
+      "seed_ratios": [
+        1.8135568132039268,
+        1.6960140332871891
+      ],
+      "workload": "prepared_insert"
+    },
+    {
+      "ABBA_balanced_release_over_release_perf_geomean_ratio": 1.829125725647327,
+      "arm": "per_operation_block_on",
+      "inference": "diagnostic point estimate only; profile is assigned at run level with two counterbalanced seeds",
+      "operation_count": 1000,
+      "seed_ratios": [
+        1.9148679291172863,
+        1.7472228080853376
+      ],
+      "workload": "prepared_insert"
+    },
+    {
+      "ABBA_balanced_release_over_release_perf_geomean_ratio": 1.720645815477201,
+      "arm": "inside_existing_runtime",
+      "inference": "diagnostic point estimate only; profile is assigned at run level with two counterbalanced seeds",
+      "operation_count": 1000,
+      "seed_ratios": [
+        1.7139494230867853,
+        1.7273683706414082
+      ],
+      "workload": "raw_execute_with_params"
+    },
+    {
+      "ABBA_balanced_release_over_release_perf_geomean_ratio": 1.7801833634554103,
+      "arm": "per_operation_block_on",
+      "inference": "diagnostic point estimate only; profile is assigned at run level with two counterbalanced seeds",
+      "operation_count": 1000,
+      "seed_ratios": [
+        1.7732008367390644,
+        1.787193386030282
+      ],
+      "workload": "raw_execute_with_params"
+    },
+    {
+      "ABBA_balanced_release_over_release_perf_geomean_ratio": 1.1951539421308373,
+      "arm": "worker_sync_facade",
+      "inference": "diagnostic point estimate only; profile is assigned at run level with two counterbalanced seeds",
+      "operation_count": 1000,
+      "seed_ratios": [
+        1.1857265617457093,
+        1.2046562769816853
+      ],
+      "workload": "raw_execute_with_params"
+    },
+    {
+      "ABBA_balanced_release_over_release_perf_geomean_ratio": 1.16232633738259,
+      "arm": "inside_existing_runtime",
+      "inference": "diagnostic point estimate only; profile is assigned at run level with two counterbalanced seeds",
+      "operation_count": 1,
+      "seed_ratios": [
+        1.2304292804844121,
+        1.0979928192551998
+      ],
+      "workload": "ready_future"
+    },
+    {
+      "ABBA_balanced_release_over_release_perf_geomean_ratio": 1.5381467720222455,
+      "arm": "per_operation_block_on",
+      "inference": "diagnostic point estimate only; profile is assigned at run level with two counterbalanced seeds",
+      "operation_count": 1,
+      "seed_ratios": [
+        1.6117673035757085,
+        1.46788899801709
+      ],
+      "workload": "ready_future"
+    },
+    {
+      "ABBA_balanced_release_over_release_perf_geomean_ratio": 1.687456738832438,
+      "arm": "inside_existing_runtime",
+      "inference": "diagnostic point estimate only; profile is assigned at run level with two counterbalanced seeds",
+      "operation_count": 10,
+      "seed_ratios": [
+        1.6878026263797057,
+        1.687110922169167
+      ],
+      "workload": "ready_future"
+    },
+    {
+      "ABBA_balanced_release_over_release_perf_geomean_ratio": 1.4811521989260827,
+      "arm": "per_operation_block_on",
+      "inference": "diagnostic point estimate only; profile is assigned at run level with two counterbalanced seeds",
+      "operation_count": 10,
+      "seed_ratios": [
+        1.5440826982213975,
+        1.4207864895517477
+      ],
+      "workload": "ready_future"
+    },
+    {
+      "ABBA_balanced_release_over_release_perf_geomean_ratio": 3.1767669767413502,
+      "arm": "inside_existing_runtime",
+      "inference": "diagnostic point estimate only; profile is assigned at run level with two counterbalanced seeds",
+      "operation_count": 100,
+      "seed_ratios": [
+        3.2862567962689924,
+        3.0709250829004056
+      ],
+      "workload": "ready_future"
+    },
+    {
+      "ABBA_balanced_release_over_release_perf_geomean_ratio": 1.4769692282945805,
+      "arm": "per_operation_block_on",
+      "inference": "diagnostic point estimate only; profile is assigned at run level with two counterbalanced seeds",
+      "operation_count": 100,
+      "seed_ratios": [
+        1.515187235322522,
+        1.4397152051408015
+      ],
+      "workload": "ready_future"
+    },
+    {
+      "ABBA_balanced_release_over_release_perf_geomean_ratio": 3.852952150146125,
+      "arm": "inside_existing_runtime",
+      "inference": "diagnostic point estimate only; profile is assigned at run level with two counterbalanced seeds",
+      "operation_count": 1000,
+      "seed_ratios": [
+        3.9838596209544614,
+        3.7263462279725084
+      ],
+      "workload": "ready_future"
+    },
+    {
+      "ABBA_balanced_release_over_release_perf_geomean_ratio": 1.4649325444139616,
+      "arm": "per_operation_block_on",
+      "inference": "diagnostic point estimate only; profile is assigned at run level with two counterbalanced seeds",
+      "operation_count": 1000,
+      "seed_ratios": [
+        1.5204018129574663,
+        1.4114869775830758
+      ],
+      "workload": "ready_future"
+    }
+  ],
+  "profile_penalty_by_seed": [
+    {
+      "arm": "inside_existing_runtime",
+      "operation_count": 1000,
+      "outer_profile_order": "release-perf_then_release",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 414.92912500000006,
+      "release_over_release_perf_geomean_ratio": 1.8135568132039268,
+      "seed": 2026072601,
+      "workload": "prepared_insert"
+    },
+    {
+      "arm": "per_operation_block_on",
+      "operation_count": 1000,
+      "outer_profile_order": "release-perf_then_release",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 1024.30575,
+      "release_over_release_perf_geomean_ratio": 1.9148679291172863,
+      "seed": 2026072601,
+      "workload": "prepared_insert"
+    },
+    {
+      "arm": "inside_existing_runtime",
+      "operation_count": 1000,
+      "outer_profile_order": "release-perf_then_release",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 658.2779375,
+      "release_over_release_perf_geomean_ratio": 1.7139494230867853,
+      "seed": 2026072601,
+      "workload": "raw_execute_with_params"
+    },
+    {
+      "arm": "per_operation_block_on",
+      "operation_count": 1000,
+      "outer_profile_order": "release-perf_then_release",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 1057.4392291666666,
+      "release_over_release_perf_geomean_ratio": 1.7732008367390644,
+      "seed": 2026072601,
+      "workload": "raw_execute_with_params"
+    },
+    {
+      "arm": "worker_sync_facade",
+      "operation_count": 1000,
+      "outer_profile_order": "release-perf_then_release",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 1615.4377916666665,
+      "release_over_release_perf_geomean_ratio": 1.1857265617457093,
+      "seed": 2026072601,
+      "workload": "raw_execute_with_params"
+    },
+    {
+      "arm": "inside_existing_runtime",
+      "operation_count": 1,
+      "outer_profile_order": "release-perf_then_release",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 5.645833333333333,
+      "release_over_release_perf_geomean_ratio": 1.2304292804844121,
+      "seed": 2026072601,
+      "workload": "ready_future"
+    },
+    {
+      "arm": "per_operation_block_on",
+      "operation_count": 1,
+      "outer_profile_order": "release-perf_then_release",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 141.5625,
+      "release_over_release_perf_geomean_ratio": 1.6117673035757085,
+      "seed": 2026072601,
+      "workload": "ready_future"
+    },
+    {
+      "arm": "inside_existing_runtime",
+      "operation_count": 10,
+      "outer_profile_order": "release-perf_then_release",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 1.8791666666666667,
+      "release_over_release_perf_geomean_ratio": 1.6878026263797057,
+      "seed": 2026072601,
+      "workload": "ready_future"
+    },
+    {
+      "arm": "per_operation_block_on",
+      "operation_count": 10,
+      "outer_profile_order": "release-perf_then_release",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 115.73333333333333,
+      "release_over_release_perf_geomean_ratio": 1.5440826982213975,
+      "seed": 2026072601,
+      "workload": "ready_future"
+    },
+    {
+      "arm": "inside_existing_runtime",
+      "operation_count": 100,
+      "outer_profile_order": "release-perf_then_release",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 2.0502083333333334,
+      "release_over_release_perf_geomean_ratio": 3.2862567962689924,
+      "seed": 2026072601,
+      "workload": "ready_future"
+    },
+    {
+      "arm": "per_operation_block_on",
+      "operation_count": 100,
+      "outer_profile_order": "release-perf_then_release",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 108.573125,
+      "release_over_release_perf_geomean_ratio": 1.515187235322522,
+      "seed": 2026072601,
+      "workload": "ready_future"
+    },
+    {
+      "arm": "inside_existing_runtime",
+      "operation_count": 1000,
+      "outer_profile_order": "release-perf_then_release",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 2.0496875,
+      "release_over_release_perf_geomean_ratio": 3.9838596209544614,
+      "seed": 2026072601,
+      "workload": "ready_future"
+    },
+    {
+      "arm": "per_operation_block_on",
+      "operation_count": 1000,
+      "outer_profile_order": "release-perf_then_release",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 109.89472916666666,
+      "release_over_release_perf_geomean_ratio": 1.5204018129574663,
+      "seed": 2026072601,
+      "workload": "ready_future"
+    },
+    {
+      "arm": "inside_existing_runtime",
+      "operation_count": 1000,
+      "outer_profile_order": "release_then_release-perf",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 367.1034375,
+      "release_over_release_perf_geomean_ratio": 1.6960140332871891,
+      "seed": 2026072602,
+      "workload": "prepared_insert"
+    },
+    {
+      "arm": "per_operation_block_on",
+      "operation_count": 1000,
+      "outer_profile_order": "release_then_release-perf",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 868.5630625,
+      "release_over_release_perf_geomean_ratio": 1.7472228080853376,
+      "seed": 2026072602,
+      "workload": "prepared_insert"
+    },
+    {
+      "arm": "inside_existing_runtime",
+      "operation_count": 1000,
+      "outer_profile_order": "release_then_release-perf",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 646.588875,
+      "release_over_release_perf_geomean_ratio": 1.7273683706414082,
+      "seed": 2026072602,
+      "workload": "raw_execute_with_params"
+    },
+    {
+      "arm": "per_operation_block_on",
+      "operation_count": 1000,
+      "outer_profile_order": "release_then_release-perf",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 1043.7103749999999,
+      "release_over_release_perf_geomean_ratio": 1.787193386030282,
+      "seed": 2026072602,
+      "workload": "raw_execute_with_params"
+    },
+    {
+      "arm": "worker_sync_facade",
+      "operation_count": 1000,
+      "outer_profile_order": "release_then_release-perf",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 1748.4803333333332,
+      "release_over_release_perf_geomean_ratio": 1.2046562769816853,
+      "seed": 2026072602,
+      "workload": "raw_execute_with_params"
+    },
+    {
+      "arm": "inside_existing_runtime",
+      "operation_count": 1,
+      "outer_profile_order": "release_then_release-perf",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 2.6458333333333335,
+      "release_over_release_perf_geomean_ratio": 1.0979928192551998,
+      "seed": 2026072602,
+      "workload": "ready_future"
+    },
+    {
+      "arm": "per_operation_block_on",
+      "operation_count": 1,
+      "outer_profile_order": "release_then_release-perf",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 118.27083333333333,
+      "release_over_release_perf_geomean_ratio": 1.46788899801709,
+      "seed": 2026072602,
+      "workload": "ready_future"
+    },
+    {
+      "arm": "inside_existing_runtime",
+      "operation_count": 10,
+      "outer_profile_order": "release_then_release-perf",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 1.8875,
+      "release_over_release_perf_geomean_ratio": 1.687110922169167,
+      "seed": 2026072602,
+      "workload": "ready_future"
+    },
+    {
+      "arm": "per_operation_block_on",
+      "operation_count": 10,
+      "outer_profile_order": "release_then_release-perf",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 96.1125,
+      "release_over_release_perf_geomean_ratio": 1.4207864895517477,
+      "seed": 2026072602,
+      "workload": "ready_future"
+    },
+    {
+      "arm": "inside_existing_runtime",
+      "operation_count": 100,
+      "outer_profile_order": "release_then_release-perf",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 1.9195833333333334,
+      "release_over_release_perf_geomean_ratio": 3.0709250829004056,
+      "seed": 2026072602,
+      "workload": "ready_future"
+    },
+    {
+      "arm": "per_operation_block_on",
+      "operation_count": 100,
+      "outer_profile_order": "release_then_release-perf",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 97.60291666666666,
+      "release_over_release_perf_geomean_ratio": 1.4397152051408015,
+      "seed": 2026072602,
+      "workload": "ready_future"
+    },
+    {
+      "arm": "inside_existing_runtime",
+      "operation_count": 1000,
+      "outer_profile_order": "release_then_release-perf",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 1.9305625,
+      "release_over_release_perf_geomean_ratio": 3.7263462279725084,
+      "seed": 2026072602,
+      "workload": "ready_future"
+    },
+    {
+      "arm": "per_operation_block_on",
+      "operation_count": 1000,
+      "outer_profile_order": "release_then_release-perf",
+      "paired_samples": 48,
+      "release_minus_release_perf_mean_ns_per_operation": 92.30229166666668,
+      "release_over_release_perf_geomean_ratio": 1.4114869775830758,
+      "seed": 2026072602,
+      "workload": "ready_future"
+    }
+  ],
+  "runtime_entry_residuals": [
+    {
+      "bare_ready_runtime_entry_slope_ns": 318.29147663308606,
+      "bare_ready_slope_fraction_of_bridge_gap": 0.26106827943304184,
+      "bridge_gap_fraction_of_current_per_operation_time": 0.5688708290450882,
+      "gap_beyond_bare_ready_slope_ns": 900.8971483669139,
+      "inside_existing_runtime_mean_ns_per_operation": 923.9844166666667,
+      "mean_time_ratio": 2.3194904621858248,
+      "paired_gap_ns_per_operation": 1219.188625,
+      "per_operation_block_on_mean_ns_per_operation": 2143.1730416666664,
+      "profile": "release",
+      "seed": 2026072601,
+      "workload": "prepared_insert"
+    },
+    {
+      "bare_ready_runtime_entry_slope_ns": 318.29147663308606,
+      "bare_ready_slope_fraction_of_bridge_gap": 0.3749423708811534,
+      "bridge_gap_fraction_of_current_per_operation_time": 0.3488073318176131,
+      "gap_beyond_bare_ready_slope_ns": 530.6162525335806,
+      "inside_existing_runtime_mean_ns_per_operation": 1584.8362083333332,
+      "mean_time_ratio": 1.535643825338523,
+      "paired_gap_ns_per_operation": 848.9077291666666,
+      "per_operation_block_on_mean_ns_per_operation": 2433.7439375,
+      "profile": "release",
+      "seed": 2026072601,
+      "workload": "raw_execute_with_params"
+    },
+    {
+      "bare_ready_runtime_entry_slope_ns": 313.9199205574105,
+      "bare_ready_slope_fraction_of_bridge_gap": 0.2765626603267341,
+      "bridge_gap_fraction_of_current_per_operation_time": 0.559435391794034,
+      "gap_beyond_bare_ready_slope_ns": 821.1571002759229,
+      "inside_existing_runtime_mean_ns_per_operation": 893.8918958333334,
+      "mean_time_ratio": 2.2698146455116412,
+      "paired_gap_ns_per_operation": 1135.0770208333333,
+      "per_operation_block_on_mean_ns_per_operation": 2028.9689166666667,
+      "profile": "release",
+      "seed": 2026072602,
+      "workload": "prepared_insert"
+    },
+    {
+      "bare_ready_runtime_entry_slope_ns": 313.9199205574105,
+      "bare_ready_slope_fraction_of_bridge_gap": 0.37770596804476453,
+      "bridge_gap_fraction_of_current_per_operation_time": 0.35129457869209557,
+      "gap_beyond_bare_ready_slope_ns": 517.2025586092562,
+      "inside_existing_runtime_mean_ns_per_operation": 1534.76225,
+      "mean_time_ratio": 1.5415317448462567,
+      "paired_gap_ns_per_operation": 831.1224791666667,
+      "per_operation_block_on_mean_ns_per_operation": 2365.8847291666666,
+      "profile": "release",
+      "seed": 2026072602,
+      "workload": "raw_execute_with_params"
+    },
+    {
+      "bare_ready_runtime_entry_slope_ns": 210.44694454868227,
+      "bare_ready_slope_fraction_of_bridge_gap": 0.3451013501680555,
+      "bridge_gap_fraction_of_current_per_operation_time": 0.5450262104736505,
+      "gap_beyond_bare_ready_slope_ns": 399.36505545131774,
+      "inside_existing_runtime_mean_ns_per_operation": 509.0552916666667,
+      "mean_time_ratio": 2.197928810450928,
+      "paired_gap_ns_per_operation": 609.812,
+      "per_operation_block_on_mean_ns_per_operation": 1118.8672916666667,
+      "profile": "release-perf",
+      "seed": 2026072601,
+      "workload": "prepared_insert"
+    },
+    {
+      "bare_ready_runtime_entry_slope_ns": 210.44694454868227,
+      "bare_ready_slope_fraction_of_bridge_gap": 0.4679235386910259,
+      "bridge_gap_fraction_of_current_per_operation_time": 0.3267782452365729,
+      "gap_beyond_bare_ready_slope_ns": 239.2994929513177,
+      "inside_existing_runtime_mean_ns_per_operation": 926.5582708333334,
+      "mean_time_ratio": 1.485394660710874,
+      "paired_gap_ns_per_operation": 449.74643749999996,
+      "per_operation_block_on_mean_ns_per_operation": 1376.3047083333333,
+      "profile": "release-perf",
+      "seed": 2026072601,
+      "workload": "raw_execute_with_params"
+    },
+    {
+      "bare_ready_runtime_entry_slope_ns": 223.70744503993646,
+      "bare_ready_slope_fraction_of_bridge_gap": 0.3530639255030499,
+      "bridge_gap_fraction_of_current_per_operation_time": 0.5460308508081071,
+      "gap_beyond_bare_ready_slope_ns": 409.9099507933968,
+      "inside_existing_runtime_mean_ns_per_operation": 526.7884583333333,
+      "mean_time_ratio": 2.2027928588982157,
+      "paired_gap_ns_per_operation": 633.6173958333333,
+      "per_operation_block_on_mean_ns_per_operation": 1160.4058541666668,
+      "profile": "release-perf",
+      "seed": 2026072602,
+      "workload": "prepared_insert"
+    },
+    {
+      "bare_ready_runtime_entry_slope_ns": 223.70744503993646,
+      "bare_ready_slope_fraction_of_bridge_gap": 0.5154537795501782,
+      "bridge_gap_fraction_of_current_per_operation_time": 0.3282479181349774,
+      "gap_beyond_bare_ready_slope_ns": 210.29353412673018,
+      "inside_existing_runtime_mean_ns_per_operation": 888.173375,
+      "mean_time_ratio": 1.4886444374294228,
+      "paired_gap_ns_per_operation": 434.00097916666664,
+      "per_operation_block_on_mean_ns_per_operation": 1322.1743541666667,
+      "profile": "release-perf",
+      "seed": 2026072602,
+      "workload": "raw_execute_with_params"
+    }
+  ],
+  "schema": "fsqlite-gate0.diagnostic-summary.v1",
+  "source_sha": "413ed24cd0ff8dcfa2bbc7ed395dd1cf5db4e25f",
+  "within_profile_aggregate": [
+    {
+      "mean": 217.07719479430938,
+      "metric": "ready_runtime_entry_slope_ns",
+      "profile": "release-perf",
+      "run_level_inference": "two exact within-run analyses; no pooling across seeds",
+      "seed_estimates": [
+        210.44694454868227,
+        223.70744503993646
+      ]
+    },
+    {
+      "denominator": "inside_existing_runtime",
+      "mean_ns_per_operation_difference_across_seeds": 621.7146979166666,
+      "numerator": "per_operation_block_on",
+      "operation_count": 1000,
+      "profile": "release-perf",
+      "replicated_geomean_ratio": 2.2003346233143946,
+      "run_level_inference": "two seed replications; no pooled CI",
+      "seed_geomean_ratios": [
+        2.197498911707942,
+        2.203173994199253
+      ],
+      "seed_mean_ns_per_operation_differences": [
+        609.812,
+        633.6173958333333
+      ],
+      "within_run_exact_randomization_p_two_sided": [
+        0.00048828125,
+        0.00048828125
+      ],
+      "workload": "prepared_insert"
+    },
+    {
+      "denominator": "inside_existing_runtime",
+      "mean_ns_per_operation_difference_across_seeds": 441.8737083333333,
+      "numerator": "per_operation_block_on",
+      "operation_count": 1000,
+      "profile": "release-perf",
+      "replicated_geomean_ratio": 1.486631876816077,
+      "run_level_inference": "two seed replications; no pooled CI",
+      "seed_geomean_ratios": [
+        1.484303597680512,
+        1.4889638080910974
+      ],
+      "seed_mean_ns_per_operation_differences": [
+        449.74643749999996,
+        434.00097916666664
+      ],
+      "within_run_exact_randomization_p_two_sided": [
+        0.0078125,
+        0.0078125
+      ],
+      "workload": "raw_execute_with_params"
+    },
+    {
+      "denominator": "inside_existing_runtime",
+      "mean_ns_per_operation_difference_across_seeds": 7719.61021875,
+      "numerator": "worker_sync_facade",
+      "operation_count": 1000,
+      "profile": "release-perf",
+      "replicated_geomean_ratio": 9.51341692315663,
+      "run_level_inference": "two seed replications; no pooled CI",
+      "seed_geomean_ratios": [
+        9.471518292269513,
+        9.555500898696634
+      ],
+      "seed_mean_ns_per_operation_differences": [
+        7842.5879375,
+        7596.6325
+      ],
+      "within_run_exact_randomization_p_two_sided": [
+        0.0078125,
+        0.0078125
+      ],
+      "workload": "raw_execute_with_params"
+    },
+    {
+      "denominator": "per_operation_block_on",
+      "mean_ns_per_operation_difference_across_seeds": 7277.7365104166665,
+      "numerator": "worker_sync_facade",
+      "operation_count": 1000,
+      "profile": "release-perf",
+      "replicated_geomean_ratio": 6.399309117151139,
+      "run_level_inference": "two seed replications; no pooled CI",
+      "seed_geomean_ratios": [
+        6.381119271738237,
+        6.417550814043703
+      ],
+      "seed_mean_ns_per_operation_differences": [
+        7392.8414999999995,
+        7162.6315208333335
+      ],
+      "within_run_exact_randomization_p_two_sided": [
+        0.0078125,
+        0.0078125
+      ],
+      "workload": "raw_execute_with_params"
+    },
+    {
+      "mean": 316.10569859524827,
+      "metric": "ready_runtime_entry_slope_ns",
+      "profile": "release",
+      "run_level_inference": "two exact within-run analyses; no pooling across seeds",
+      "seed_estimates": [
+        318.29147663308606,
+        313.9199205574105
+      ]
+    },
+    {
+      "denominator": "inside_existing_runtime",
+      "mean_ns_per_operation_difference_across_seeds": 1177.1328229166666,
+      "numerator": "per_operation_block_on",
+      "operation_count": 1000,
+      "profile": "release",
+      "replicated_geomean_ratio": 2.2946410960721466,
+      "run_level_inference": "two seed replications; no pooled CI",
+      "seed_geomean_ratios": [
+        2.319843435136101,
+        2.26971255043954
+      ],
+      "seed_mean_ns_per_operation_differences": [
+        1219.188625,
+        1135.0770208333333
+      ],
+      "within_run_exact_randomization_p_two_sided": [
+        0.00048828125,
+        0.00048828125
+      ],
+      "workload": "prepared_insert"
+    },
+    {
+      "denominator": "inside_existing_runtime",
+      "mean_ns_per_operation_difference_across_seeds": 840.0151041666667,
+      "numerator": "per_operation_block_on",
+      "operation_count": 1000,
+      "profile": "release",
+      "replicated_geomean_ratio": 1.538327322774625,
+      "run_level_inference": "two seed replications; no pooled CI",
+      "seed_geomean_ratios": [
+        1.5359043646535226,
+        1.5407541032209917
+      ],
+      "seed_mean_ns_per_operation_differences": [
+        848.9077291666666,
+        831.1224791666667
+      ],
+      "within_run_exact_randomization_p_two_sided": [
+        0.0078125,
+        0.0078125
+      ],
+      "workload": "raw_execute_with_params"
+    },
+    {
+      "denominator": "inside_existing_runtime",
+      "mean_ns_per_operation_difference_across_seeds": 8749.135875,
+      "numerator": "worker_sync_facade",
+      "operation_count": 1000,
+      "profile": "release",
+      "replicated_geomean_ratio": 6.6098707630574935,
+      "run_level_inference": "two seed replications; no pooled CI",
+      "seed_geomean_ratios": [
+        6.5548318592189805,
+        6.665371811616237
+      ],
+      "seed_mean_ns_per_operation_differences": [
+        8799.747791666667,
+        8698.523958333333
+      ],
+      "within_run_exact_randomization_p_two_sided": [
+        0.0078125,
+        0.0078125
+      ],
+      "workload": "raw_execute_with_params"
+    },
+    {
+      "denominator": "per_operation_block_on",
+      "mean_ns_per_operation_difference_across_seeds": 7909.120770833333,
+      "numerator": "worker_sync_facade",
+      "operation_count": 1000,
+      "profile": "release",
+      "replicated_geomean_ratio": 4.296790848865318,
+      "run_level_inference": "two seed replications; no pooled CI",
+      "seed_geomean_ratios": [
+        4.267734378564419,
+        4.326045147426238
+      ],
+      "seed_mean_ns_per_operation_differences": [
+        7950.8400624999995,
+        7867.401479166667
+      ],
+      "within_run_exact_randomization_p_two_sided": [
+        0.0078125,
+        0.0078125
+      ],
+      "workload": "raw_execute_with_params"
+    }
+  ]
+}
