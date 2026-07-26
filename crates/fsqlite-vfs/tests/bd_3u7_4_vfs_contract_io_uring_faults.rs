@@ -352,90 +352,72 @@ impl<F: VfsFile> VfsFile for TestFaultFile<F> {
         self.inner.close(cx)
     }
 
-    fn read<'a>(
-        &'a self,
-        cx: &'a Cx,
-        buf: &'a mut [u8],
-        offset: u64,
-    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
-        async move {
-            let maybe_fault = self
-                .faults
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .next_read
-                .take();
-            match maybe_fault {
-                Some(InjectedReadFault::Io) => {
-                    Err(injected_io_error("fault injection: read failure"))
-                }
-                None => self.inner.read(cx, buf, offset).await,
-            }
+    async fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        let maybe_fault = self
+            .faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .next_read
+            .take();
+        match maybe_fault {
+            Some(InjectedReadFault::Io) => Err(injected_io_error("fault injection: read failure")),
+            None => self.inner.read(cx, buf, offset).await,
         }
     }
 
-    fn write<'a>(
-        &'a self,
-        cx: &'a Cx,
-        buf: &'a [u8],
-        offset: u64,
-    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        async move {
-            let maybe_fault = self
-                .faults
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .next_write
-                .take();
-            match maybe_fault {
-                Some(InjectedWriteFault::Io) => {
-                    Err(injected_io_error("fault injection: write failure"))
-                }
-                Some(InjectedWriteFault::Partial { valid_bytes }) => {
-                    let applied = valid_bytes.min(buf.len());
-                    if applied > 0 {
-                        self.inner.write(cx, &buf[..applied], offset).await?;
-                    }
-                    Err(injected_io_error("fault injection: partial write"))
-                }
-                None => self.inner.write(cx, buf, offset).await,
+    async fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        let maybe_fault = self
+            .faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .next_write
+            .take();
+        match maybe_fault {
+            Some(InjectedWriteFault::Io) => {
+                Err(injected_io_error("fault injection: write failure"))
             }
+            Some(InjectedWriteFault::Partial { valid_bytes }) => {
+                let applied = valid_bytes.min(buf.len());
+                if applied > 0 {
+                    self.inner.write(cx, &buf[..applied], offset).await?;
+                }
+                Err(injected_io_error("fault injection: partial write"))
+            }
+            None => self.inner.write(cx, buf, offset).await,
         }
     }
 
-    fn write_tracked<'a>(
-        &'a self,
-        cx: &'a Cx,
-        buf: &'a [u8],
+    async fn write_tracked(
+        &self,
+        cx: &Cx,
+        buf: &[u8],
         offset: u64,
         completion: VfsWriteCompletion,
-    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        async move {
-            let maybe_fault = self
-                .faults
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .next_write
-                .take();
-            match maybe_fault {
-                Some(InjectedWriteFault::Io) => {
-                    completion.complete_error();
-                    Err(injected_io_error("fault injection: write failure"))
-                }
-                Some(InjectedWriteFault::Partial { valid_bytes }) => {
-                    let applied = valid_bytes.min(buf.len());
-                    if applied > 0 {
-                        let partial_completion = completion.error_mapped_child();
-                        self.inner
-                            .write_tracked(cx, &buf[..applied], offset, partial_completion)
-                            .await?;
-                    } else {
-                        completion.complete_error();
-                    }
-                    Err(injected_io_error("fault injection: partial write"))
-                }
-                None => self.inner.write_tracked(cx, buf, offset, completion).await,
+    ) -> Result<()> {
+        let maybe_fault = self
+            .faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .next_write
+            .take();
+        match maybe_fault {
+            Some(InjectedWriteFault::Io) => {
+                completion.complete_error();
+                Err(injected_io_error("fault injection: write failure"))
             }
+            Some(InjectedWriteFault::Partial { valid_bytes }) => {
+                let applied = valid_bytes.min(buf.len());
+                if applied > 0 {
+                    let partial_completion = completion.error_mapped_child();
+                    self.inner
+                        .write_tracked(cx, &buf[..applied], offset, partial_completion)
+                        .await?;
+                } else {
+                    completion.complete_error();
+                }
+                Err(injected_io_error("fault injection: partial write"))
+            }
+            None => self.inner.write_tracked(cx, buf, offset, completion).await,
         }
     }
 
