@@ -193,6 +193,10 @@ stimulus, so a dump-restored database is not the same input.
 | `pristine-input.db.gz` | The exact pre-corruption 18 MB database that `br sync --merge --force` corrupts. | `9bc6c17c69d76db6fd0daa31727c980404d97d3c357800a1c26c4dbfcb58a87b` |
 | `corrupting-stream.sqllog.gz` | Open-only capture: 5,019 statements — `BEGIN IMMEDIATE` (line 34), 1,024 `REPLACE INTO export_hashes`, ~3,981 SELECTs, `ROLLBACK` (line 5017). Line format: `SQL \x1f JSON-params`. | `9f41c9da8cd4594df971ca845452b27b9c9496af4b7ddf74822af4fea26895b4` |
 
-Additional durable artifacts — corrupted outputs, the instrumented capture,
-rebuild failure traces — are outside the repo at
-`/data/tmp/beads-recovery-20260726T042107Z/`.
+The two files above are the **only surviving copies**. A larger out-of-repo
+artifact set (corrupted outputs, the instrumented capture, rebuild failure
+traces) lived at `/data/tmp/beads-recovery-20260726T042107Z/` and was **reaped
+by disk cleanup within hours of being created** — which is precisely why the
+corrupting input is committed here despite its size. Do not move these back out
+of the repository, and do not assume any `/data/tmp` path in this project's
+notes still resolves.
