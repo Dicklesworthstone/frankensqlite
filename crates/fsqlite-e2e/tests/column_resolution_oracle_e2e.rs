@@ -7,6 +7,7 @@
 //! ALIAS is visible in ORDER BY but NOT in WHERE (where SQLite reports "no such
 //! column"). The shared comparison treats (Err,Err) as agreement and flags a
 //! divergence (one engine errors, the other succeeds).
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -24,8 +25,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -57,10 +58,10 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -82,8 +83,8 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
     );
 }
 
-fn ab() -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").unwrap();
+async fn ab() -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in [
         "CREATE TABLE a (id INTEGER, x INTEGER)",
@@ -91,7 +92,7 @@ fn ab() -> (Connection, rusqlite::Connection) {
         "INSERT INTO a VALUES (1,10),(2,20)",
         "INSERT INTO b VALUES (1,100),(2,200),(3,300)",
     ] {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
     (f, r)
@@ -99,63 +100,75 @@ fn ab() -> (Connection, rusqlite::Connection) {
 
 #[test]
 fn ambiguous_column_in_join_is_rejected() {
-    let (f, r) = ab();
-    check(
-        &f,
-        &r,
-        &[
-            // `id` exists in both a and b -> ambiguous -> error on both.
-            "SELECT id FROM a JOIN b ON a.id = b.id",
-        ],
-        "ambiguous_column_in_join_is_rejected",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = ab().await;
+        check(
+            &f,
+            &r,
+            &[
+                // `id` exists in both a and b -> ambiguous -> error on both.
+                "SELECT id FROM a JOIN b ON a.id = b.id",
+            ],
+            "ambiguous_column_in_join_is_rejected",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn qualified_or_unique_column_resolves() {
-    let (f, r) = ab();
-    check(
-        &f,
-        &r,
-        &[
-            // Qualified references disambiguate.
-            "SELECT a.id, b.id, y FROM a JOIN b ON a.id = b.id ORDER BY a.id",
-            // x is unique to a, y unique to b -> unambiguous.
-            "SELECT x, y FROM a JOIN b ON a.id = b.id ORDER BY x",
-        ],
-        "qualified_or_unique_column_resolves",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = ab().await;
+        check(
+            &f,
+            &r,
+            &[
+                // Qualified references disambiguate.
+                "SELECT a.id, b.id, y FROM a JOIN b ON a.id = b.id ORDER BY a.id",
+                // x is unique to a, y unique to b -> unambiguous.
+                "SELECT x, y FROM a JOIN b ON a.id = b.id ORDER BY x",
+            ],
+            "qualified_or_unique_column_resolves",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn nonexistent_column_or_table_is_rejected() {
-    let (f, r) = ab();
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT no_such FROM a",       // no such column
-            "SELECT a.nope FROM a",        // no such column on a
-            "SELECT * FROM no_such_table", // no such table
-        ],
-        "nonexistent_column_or_table_is_rejected",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = ab().await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT no_such FROM a",       // no such column
+                "SELECT a.nope FROM a",        // no such column on a
+                "SELECT * FROM no_such_table", // no such table
+            ],
+            "nonexistent_column_or_table_is_rejected",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn output_alias_resolves_in_order_by_and_group_by() {
-    let (f, r) = ab();
-    check(
-        &f,
-        &r,
-        &[
-            // Alias `w` is visible in ORDER BY...
-            "SELECT x AS w FROM a ORDER BY w",
-            // ...and in GROUP BY.
-            "SELECT x AS w, count(*) FROM a GROUP BY w ORDER BY w",
-        ],
-        "output_alias_resolves_in_order_by_and_group_by",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = ab().await;
+        check(
+            &f,
+            &r,
+            &[
+                // Alias `w` is visible in ORDER BY...
+                "SELECT x AS w FROM a ORDER BY w",
+                // ...and in GROUP BY.
+                "SELECT x AS w, count(*) FROM a GROUP BY w ORDER BY w",
+            ],
+            "output_alias_resolves_in_order_by_and_group_by",
+        )
+        .await;
+    });
 }
 
 /// bd-ujuzr: SQLite resolves a result-column alias in WHERE (leniency); frank
@@ -163,11 +176,14 @@ fn output_alias_resolves_in_order_by_and_group_by() {
 /// work, so frank is stricter than SQLite only in the WHERE clause.
 #[test]
 fn output_alias_in_where() {
-    let (f, r) = ab();
-    check(
-        &f,
-        &r,
-        &["SELECT x AS w FROM a WHERE w > 5"], // SQLite -> [10,20]
-        "output_alias_in_where",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = ab().await;
+        check(
+            &f,
+            &r,
+            &["SELECT x AS w FROM a WHERE w > 5"], // SQLite -> [10,20]
+            "output_alias_in_where",
+        )
+        .await;
+    });
 }

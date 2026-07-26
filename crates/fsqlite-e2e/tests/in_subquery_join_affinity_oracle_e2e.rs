@@ -6,6 +6,7 @@
 //! coerces the text values to integers and matches. A JOIN `ON a.int = b.text`
 //! comparison applies NUMERIC affinity to the text side (one operand numeric,
 //! the other text). These verify both against rusqlite, with same-type controls.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -23,8 +24,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -56,10 +57,10 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -81,8 +82,8 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
     );
 }
 
-fn data() -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").unwrap();
+async fn data() -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
@@ -92,7 +93,7 @@ fn data() -> (Connection, rusqlite::Connection) {
         "CREATE TABLE t2 (tid INTEGER PRIMARY KEY, code TEXT)",
         "INSERT INTO t2 VALUES (1,'5'),(2,'10')",
     ] {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
     (f, r)
@@ -100,30 +101,36 @@ fn data() -> (Connection, rusqlite::Connection) {
 
 #[test]
 fn in_subquery_same_type_control() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            // Same-type IN subquery (control): n IN (n>7) -> 10,15.
-            "SELECT id FROM t WHERE n IN (SELECT n FROM t WHERE n > 7) ORDER BY id",
-        ],
-        "in_subquery_same_type_control",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                // Same-type IN subquery (control): n IN (n>7) -> 10,15.
+                "SELECT id FROM t WHERE n IN (SELECT n FROM t WHERE n > 7) ORDER BY id",
+            ],
+            "in_subquery_same_type_control",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn join_on_cross_affinity_key() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            // ON int = text -> NUMERIC applied to the text side: 5='5', 10='10'.
-            "SELECT t.id, t2.code FROM t JOIN t2 ON t.n = t2.code ORDER BY t.id", // (1,'5'),(2,'10')
-        ],
-        "join_on_cross_affinity_key",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                // ON int = text -> NUMERIC applied to the text side: 5='5', 10='10'.
+                "SELECT t.id, t2.code FROM t JOIN t2 ON t.n = t2.code ORDER BY t.id", // (1,'5'),(2,'10')
+            ],
+            "join_on_cross_affinity_key",
+        )
+        .await;
+    });
 }
 
 /// bd-56aj2 (IN-subquery extension): `INTEGER_col IN (SELECT text_numeric)` does
@@ -133,16 +140,19 @@ fn join_on_cross_affinity_key() {
 /// IN-subqueries work.)
 #[test]
 fn in_subquery_applies_lhs_affinity() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            // n (INTEGER) IN (text-numeric subquery): '5'->5, '15'->15 match -> 1,3.
-            "SELECT id FROM t WHERE n IN (SELECT c FROM codes) ORDER BY id",
-            // NOT IN: only n=10 is absent from {5,15,99} -> 2.
-            "SELECT id FROM t WHERE n NOT IN (SELECT c FROM codes) ORDER BY id",
-        ],
-        "in_subquery_applies_lhs_affinity",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                // n (INTEGER) IN (text-numeric subquery): '5'->5, '15'->15 match -> 1,3.
+                "SELECT id FROM t WHERE n IN (SELECT c FROM codes) ORDER BY id",
+                // NOT IN: only n=10 is absent from {5,15,99} -> 2.
+                "SELECT id FROM t WHERE n NOT IN (SELECT c FROM codes) ORDER BY id",
+            ],
+            "in_subquery_applies_lhs_affinity",
+        )
+        .await;
+    });
 }

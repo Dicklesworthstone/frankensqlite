@@ -7,6 +7,7 @@
 //! (lookups stay correct and UNIQUE enforcement still holds); and a REINDEX
 //! after INSERT/UPDATE/DELETE churn leaves index-driven queries correct. (Stat
 //! VALUES are engine-specific and not compared — only results and existence.)
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -24,8 +25,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -57,11 +58,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -71,7 +72,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -101,105 +102,123 @@ const SEED: [&str; 3] = [
 
 #[test]
 fn analyze_keeps_queries_correct() {
-    scenario(
-        &{
-            let mut v = SEED.to_vec();
-            v.push("ANALYZE");
-            v
-        },
-        &[
-            "SELECT id FROM t WHERE a = 20 ORDER BY id",       // 2,3
-            "SELECT id FROM t WHERE a > 15 ORDER BY id",       // 2,3,4
-            "SELECT count(*), sum(a) FROM t",                  // 5, 90
-            "SELECT a, count(*) FROM t GROUP BY a ORDER BY a", // (10,2),(20,2),(30,1)
-        ],
-        "analyze_keeps_queries_correct",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &{
+                let mut v = SEED.to_vec();
+                v.push("ANALYZE");
+                v
+            },
+            &[
+                "SELECT id FROM t WHERE a = 20 ORDER BY id",       // 2,3
+                "SELECT id FROM t WHERE a > 15 ORDER BY id",       // 2,3,4
+                "SELECT count(*), sum(a) FROM t",                  // 5, 90
+                "SELECT a, count(*) FROM t GROUP BY a ORDER BY a", // (10,2),(20,2),(30,1)
+            ],
+            "analyze_keeps_queries_correct",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn analyze_creates_stat1() {
-    scenario(
-        &{
-            let mut v = SEED.to_vec();
-            v.push("ANALYZE");
-            v
-        },
-        &[
-            // ANALYZE materializes the sqlite_stat1 table.
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'", // 1
-        ],
-        "analyze_creates_stat1",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &{
+                let mut v = SEED.to_vec();
+                v.push("ANALYZE");
+                v
+            },
+            &[
+                // ANALYZE materializes the sqlite_stat1 table.
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'", // 1
+            ],
+            "analyze_creates_stat1",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn reindex_rebuilds_unique_index() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE, label TEXT)",
-            "INSERT INTO t VALUES (1,10,'a'),(2,20,'b'),(3,30,'c')",
-            "REINDEX",
-            "INSERT INTO t VALUES (4,20,'d')", // still rejected after REINDEX -> error both
-        ],
-        &[
-            "SELECT id, u FROM t WHERE u = 20 ORDER BY id", // 2
-            "SELECT count(*) FROM t",                       // 3
-        ],
-        "reindex_rebuilds_unique_index",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE, label TEXT)",
+                "INSERT INTO t VALUES (1,10,'a'),(2,20,'b'),(3,30,'c')",
+                "REINDEX",
+                "INSERT INTO t VALUES (4,20,'d')", // still rejected after REINDEX -> error both
+            ],
+            &[
+                "SELECT id, u FROM t WHERE u = 20 ORDER BY id", // 2
+                "SELECT count(*) FROM t",                       // 3
+            ],
+            "reindex_rebuilds_unique_index",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn reindex_after_dml_churn() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
-            "CREATE INDEX idx_a ON t(a)",
-            "INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40),(5,50)",
-            "DELETE FROM t WHERE a = 30",
-            "UPDATE t SET a = 99 WHERE id = 1",
-            "INSERT INTO t VALUES (6,15)",
-            "REINDEX idx_a",
-        ],
-        &[
-            "SELECT id, a FROM t ORDER BY id", // (1,99),(2,20),(4,40),(5,50),(6,15)
-            "SELECT id FROM t WHERE a >= 40 ORDER BY id", // 1(99),4(40),5(50)
-            "SELECT id FROM t WHERE a = 99",   // 1
-        ],
-        "reindex_after_dml_churn",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+                "CREATE INDEX idx_a ON t(a)",
+                "INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40),(5,50)",
+                "DELETE FROM t WHERE a = 30",
+                "UPDATE t SET a = 99 WHERE id = 1",
+                "INSERT INTO t VALUES (6,15)",
+                "REINDEX idx_a",
+            ],
+            &[
+                "SELECT id, a FROM t ORDER BY id", // (1,99),(2,20),(4,40),(5,50),(6,15)
+                "SELECT id FROM t WHERE a >= 40 ORDER BY id", // 1(99),4(40),5(50)
+                "SELECT id FROM t WHERE a = 99",   // 1
+            ],
+            "reindex_after_dml_churn",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn reindex_specific_table() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)",
-            "CREATE INDEX idx_name ON t(name)",
-            "INSERT INTO t VALUES (1,'Alpha'),(2,'beta'),(3,'GAMMA')",
-            "REINDEX t", // rebuild all indexes on t
-        ],
-        &[
-            "SELECT id FROM t WHERE name = 'alpha'", // NOCASE -> 1
-            "SELECT id, name FROM t ORDER BY name",  // NOCASE order: Alpha,beta,GAMMA
-        ],
-        "reindex_specific_table",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)",
+                "CREATE INDEX idx_name ON t(name)",
+                "INSERT INTO t VALUES (1,'Alpha'),(2,'beta'),(3,'GAMMA')",
+                "REINDEX t", // rebuild all indexes on t
+            ],
+            &[
+                "SELECT id FROM t WHERE name = 'alpha'", // NOCASE -> 1
+                "SELECT id, name FROM t ORDER BY name",  // NOCASE order: Alpha,beta,GAMMA
+            ],
+            "reindex_specific_table",
+        )
+        .await;
+    });
 }
 
 /// bd-n3ukk: REINDEX <collation-name> (rebuild all indexes using that collation)
 /// is not supported — frank only resolves table/index targets.
 #[test]
 fn reindex_collation_name() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)",
-            "CREATE INDEX idx_name ON t(name)",
-            "INSERT INTO t VALUES (1,'Alpha'),(2,'beta'),(3,'GAMMA')",
-            "REINDEX NOCASE", // rebuild all NOCASE-collation indexes
-        ],
-        &["SELECT id FROM t WHERE name = 'alpha'"],
-        "reindex_collation_name",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)",
+                "CREATE INDEX idx_name ON t(name)",
+                "INSERT INTO t VALUES (1,'Alpha'),(2,'beta'),(3,'GAMMA')",
+                "REINDEX NOCASE", // rebuild all NOCASE-collation indexes
+            ],
+            &["SELECT id FROM t WHERE name = 'alpha'"],
+            "reindex_collation_name",
+        )
+        .await;
+    });
 }

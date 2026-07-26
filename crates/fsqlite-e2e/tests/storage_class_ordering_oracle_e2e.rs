@@ -27,8 +27,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -74,11 +74,11 @@ const MIXED_SEED: &[&str] = &[
     "INSERT INTO t VALUES (5)",
 ];
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -88,7 +88,8 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        let frank = frank_rows(&f, q).await;
+        match (frank, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -110,12 +111,13 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     );
 }
 
-fn assert_scalar(queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn assert_scalar(queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        let frank = frank_rows(&f, q).await;
+        match (frank, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -141,77 +143,89 @@ fn assert_scalar(queries: &[&str], label: &str) {
 fn sort_order_across_storage_classes() {
     // ASC: NULL first, then numbers numerically, then TEXT (binary), then BLOB.
     // DESC: exactly reversed.
-    scenario(
-        MIXED_SEED,
-        &[
-            // NULL, 2.5, 5, 10, 'apple', 'banana', X'00', X'0102'
-            "SELECT x FROM t ORDER BY x",
-            // X'0102', X'00', 'banana', 'apple', 10, 5, 2.5, NULL
-            "SELECT x FROM t ORDER BY x DESC",
-            // typeof in canonical order confirms class boundaries
-            "SELECT typeof(x) FROM t ORDER BY x",
-        ],
-        "sort_order_across_storage_classes",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            MIXED_SEED,
+            &[
+                // NULL, 2.5, 5, 10, 'apple', 'banana', X'00', X'0102'
+                "SELECT x FROM t ORDER BY x",
+                // X'0102', X'00', 'banana', 'apple', 10, 5, 2.5, NULL
+                "SELECT x FROM t ORDER BY x DESC",
+                // typeof in canonical order confirms class boundaries
+                "SELECT typeof(x) FROM t ORDER BY x",
+            ],
+            "sort_order_across_storage_classes",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn cross_class_constant_comparisons() {
     // Any number ranks below any text, any text below any blob; NULL compares
     // to NULL on any operand. INTEGER vs REAL compares numerically.
-    assert_scalar(
-        &[
-            "SELECT 5 < 'apple'",               // number < text -> 1
-            "SELECT 'apple' < X'00'",           // text < blob   -> 1
-            "SELECT 100 > 'abc'",               // number > text -> 0
-            "SELECT X'00' > 'zzz'",             // blob > text   -> 1
-            "SELECT 2.5 < 10",                  // numeric       -> 1
-            "SELECT 5 < 5.0",                   // equal numerically -> 0
-            "SELECT 9223372036854775807 < 'a'", // any int < any text -> 1
-            "SELECT NULL < 5",                  // NULL operand  -> NULL
-            "SELECT 5 < NULL",                  // NULL operand  -> NULL
-            "SELECT X'01' < X'02'",             // memcmp        -> 1
-            "SELECT X'0100' > X'01'",           // longer prefix > shorter -> 1
-        ],
-        "cross_class_constant_comparisons",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT 5 < 'apple'",               // number < text -> 1
+                "SELECT 'apple' < X'00'",           // text < blob   -> 1
+                "SELECT 100 > 'abc'",               // number > text -> 0
+                "SELECT X'00' > 'zzz'",             // blob > text   -> 1
+                "SELECT 2.5 < 10",                  // numeric       -> 1
+                "SELECT 5 < 5.0",                   // equal numerically -> 0
+                "SELECT 9223372036854775807 < 'a'", // any int < any text -> 1
+                "SELECT NULL < 5",                  // NULL operand  -> NULL
+                "SELECT 5 < NULL",                  // NULL operand  -> NULL
+                "SELECT X'01' < X'02'",             // memcmp        -> 1
+                "SELECT X'0100' > X'01'",           // longer prefix > shorter -> 1
+            ],
+            "cross_class_constant_comparisons",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn min_max_count_across_classes() {
     // Aggregates ignore NULL; MIN/MAX honour the cross-class ranking, so MIN is
     // the smallest number and MAX is the largest blob.
-    scenario(
-        MIXED_SEED,
-        &[
-            "SELECT min(x) FROM t",            // 2.5 (smallest non-null number)
-            "SELECT max(x) FROM t",            // X'0102' (largest blob)
-            "SELECT count(x) FROM t",          // 7 (NULL excluded)
-            "SELECT count(*) FROM t",          // 8
-            "SELECT count(DISTINCT x) FROM t", // 7
-            "SELECT typeof(min(x)), typeof(max(x)) FROM t", // real | blob
-        ],
-        "min_max_count_across_classes",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            MIXED_SEED,
+            &[
+                "SELECT min(x) FROM t",            // 2.5 (smallest non-null number)
+                "SELECT max(x) FROM t",            // X'0102' (largest blob)
+                "SELECT count(x) FROM t",          // 7 (NULL excluded)
+                "SELECT count(*) FROM t",          // 8
+                "SELECT count(DISTINCT x) FROM t", // 7
+                "SELECT typeof(min(x)), typeof(max(x)) FROM t", // real | blob
+            ],
+            "min_max_count_across_classes",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn where_filter_crosses_class_boundary() {
     // A boundary literal selects everything that ranks above/below it across
     // class lines, not just same-class values.
-    scenario(
-        MIXED_SEED,
-        &[
-            // > 5: 10 (number), both texts, both blobs (all rank above an int)
-            "SELECT x FROM t WHERE x > 5 ORDER BY x",
-            // < 'apple': all three numbers (numbers rank below text); no text/blob
-            "SELECT x FROM t WHERE x < 'apple' ORDER BY x",
-            // > X'00': only the larger blob (everything else ranks below blobs)
-            "SELECT x FROM t WHERE x > X'00' ORDER BY x",
-            // class predicate via typeof
-            "SELECT x FROM t WHERE typeof(x) = 'integer' ORDER BY x", // 5, 10
-            "SELECT x FROM t WHERE x IS NULL",                        // NULL
-        ],
-        "where_filter_crosses_class_boundary",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            MIXED_SEED,
+            &[
+                // > 5: 10 (number), both texts, both blobs (all rank above an int)
+                "SELECT x FROM t WHERE x > 5 ORDER BY x",
+                // < 'apple': all three numbers (numbers rank below text); no text/blob
+                "SELECT x FROM t WHERE x < 'apple' ORDER BY x",
+                // > X'00': only the larger blob (everything else ranks below blobs)
+                "SELECT x FROM t WHERE x > X'00' ORDER BY x",
+                // class predicate via typeof
+                "SELECT x FROM t WHERE typeof(x) = 'integer' ORDER BY x", // 5, 10
+                "SELECT x FROM t WHERE x IS NULL",                        // NULL
+            ],
+            "where_filter_crosses_class_boundary",
+        )
+        .await;
+    });
 }

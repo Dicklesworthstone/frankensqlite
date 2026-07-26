@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Benchmark: single-threaded sequential write throughput.
 //!
 //! Bead: bd-1dus
@@ -13,9 +15,10 @@
 //!    and codegen tax stays explicit instead of being accidentally folded into
 //!    a backend comparison.
 //!
-//! Both backends use identical PRAGMA settings (best-effort for in-memory) and
+//! Both backends require identical PRAGMA setup to succeed and
 //! verify final row counts to confirm correctness.
 
+use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
@@ -27,7 +30,7 @@ const NUM_BATCHES: i64 = 10;
 
 // ─── PRAGMA helpers ─────────────────────────────────────────────────────
 
-/// Apply normalised PRAGMA settings on C `SQLite` (best-effort for in-memory).
+/// Apply normalised PRAGMA settings on C `SQLite`.
 fn apply_pragmas_csqlite(conn: &rusqlite::Connection) {
     // page_size must be set before any table creation; journal_mode and
     // synchronous are no-ops for in-memory but included for parity.
@@ -37,10 +40,10 @@ fn apply_pragmas_csqlite(conn: &rusqlite::Connection) {
          PRAGMA synchronous = NORMAL;\
          PRAGMA cache_size = -64000;",
     )
-    .ok();
+    .expect("failed to apply C SQLite benchmark pragmas");
 }
 
-/// Apply normalised PRAGMA settings on `FrankenSQLite` (best-effort).
+/// Apply normalised PRAGMA settings on `FrankenSQLite`.
 fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
     for pragma in [
         "PRAGMA page_size = 4096;",
@@ -48,7 +51,9 @@ fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
         "PRAGMA synchronous = NORMAL;",
         "PRAGMA cache_size = -64000;",
     ] {
-        let _ = conn.execute(pragma);
+        fsqlite_e2e::block_on(conn.execute(pragma)).unwrap_or_else(|error| {
+            panic!("failed to apply FrankenSQLite benchmark pragma `{pragma}`: {error}")
+        });
     }
 }
 
@@ -60,28 +65,31 @@ const INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0
 fn run_csqlite_prepared_inserts(conn: &rusqlite::Connection, start: i64, end: i64) {
     let mut stmt = conn.prepare(INSERT_SQL).unwrap();
     for i in start..end {
-        stmt.execute(rusqlite::params![i]).unwrap();
+        black_box(stmt.execute(rusqlite::params![i]).unwrap());
     }
 }
 
 fn run_csqlite_ad_hoc_inserts(conn: &rusqlite::Connection, start: i64, end: i64) {
     for i in start..end {
-        conn.execute(INSERT_SQL, rusqlite::params![i]).unwrap();
+        black_box(conn.execute(INSERT_SQL, rusqlite::params![i]).unwrap());
     }
 }
 
 fn run_fsqlite_prepared_inserts(conn: &fsqlite::Connection, start: i64, end: i64) {
-    let stmt = conn.prepare(INSERT_SQL).unwrap();
+    let stmt = fsqlite_e2e::block_on(conn.prepare(INSERT_SQL)).unwrap();
     for i in start..end {
-        stmt.execute_with_params(&[SqliteValue::Integer(i)])
-            .unwrap();
+        black_box(
+            fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)])).unwrap(),
+        );
     }
 }
 
 fn run_fsqlite_ad_hoc_inserts(conn: &fsqlite::Connection, start: i64, end: i64) {
     for i in start..end {
-        conn.execute_with_params(INSERT_SQL, &[SqliteValue::Integer(i)])
-            .unwrap();
+        black_box(
+            fsqlite_e2e::block_on(conn.execute_with_params(INSERT_SQL, &[SqliteValue::Integer(i)]))
+                .unwrap(),
+        );
     }
 }
 
@@ -89,11 +97,13 @@ fn verify_row_count_csqlite(conn: &rusqlite::Connection) {
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM bench", [], |row| row.get(0))
         .unwrap();
+    black_box(count);
     assert_eq!(count, ROW_COUNT);
 }
 
 fn verify_row_count_fsqlite(conn: &fsqlite::Connection) {
-    let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
+    let rows = fsqlite_e2e::block_on(conn.query("SELECT COUNT(*) FROM bench")).unwrap();
+    black_box(&rows);
     assert_eq!(rows[0].values()[0], SqliteValue::Integer(ROW_COUNT));
 }
 
@@ -150,9 +160,9 @@ fn bench_write_autocommit(c: &mut Criterion) {
     group.bench_function("frankensqlite_prepared", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
                 apply_pragmas_fsqlite(&conn);
-                conn.execute(CREATE_TABLE).unwrap();
+                fsqlite_e2e::block_on(conn.execute(CREATE_TABLE)).unwrap();
                 conn
             },
             |conn| {
@@ -166,9 +176,9 @@ fn bench_write_autocommit(c: &mut Criterion) {
     group.bench_function("frankensqlite_ad_hoc", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
                 apply_pragmas_fsqlite(&conn);
-                conn.execute(CREATE_TABLE).unwrap();
+                fsqlite_e2e::block_on(conn.execute(CREATE_TABLE)).unwrap();
                 conn
             },
             |conn| {
@@ -239,17 +249,17 @@ fn bench_write_batched(c: &mut Criterion) {
     group.bench_function("frankensqlite_prepared", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
                 apply_pragmas_fsqlite(&conn);
-                conn.execute(CREATE_TABLE).unwrap();
+                fsqlite_e2e::block_on(conn.execute(CREATE_TABLE)).unwrap();
                 conn
             },
             |conn| {
                 for batch in 0..NUM_BATCHES {
-                    conn.execute("BEGIN").unwrap();
+                    fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
                     let start = batch * BATCH_SIZE;
                     run_fsqlite_prepared_inserts(&conn, start, start + BATCH_SIZE);
-                    conn.execute("COMMIT").unwrap();
+                    fsqlite_e2e::block_on(conn.execute("COMMIT")).unwrap();
                 }
                 verify_row_count_fsqlite(&conn);
             },
@@ -260,17 +270,17 @@ fn bench_write_batched(c: &mut Criterion) {
     group.bench_function("frankensqlite_ad_hoc", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
                 apply_pragmas_fsqlite(&conn);
-                conn.execute(CREATE_TABLE).unwrap();
+                fsqlite_e2e::block_on(conn.execute(CREATE_TABLE)).unwrap();
                 conn
             },
             |conn| {
                 for batch in 0..NUM_BATCHES {
-                    conn.execute("BEGIN").unwrap();
+                    fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
                     let start = batch * BATCH_SIZE;
                     run_fsqlite_ad_hoc_inserts(&conn, start, start + BATCH_SIZE);
-                    conn.execute("COMMIT").unwrap();
+                    fsqlite_e2e::block_on(conn.execute("COMMIT")).unwrap();
                 }
                 verify_row_count_fsqlite(&conn);
             },
@@ -332,15 +342,15 @@ fn bench_write_single_txn(c: &mut Criterion) {
     group.bench_function("frankensqlite_prepared", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
                 apply_pragmas_fsqlite(&conn);
-                conn.execute(CREATE_TABLE).unwrap();
+                fsqlite_e2e::block_on(conn.execute(CREATE_TABLE)).unwrap();
                 conn
             },
             |conn| {
-                conn.execute("BEGIN").unwrap();
+                fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
                 run_fsqlite_prepared_inserts(&conn, 0, ROW_COUNT);
-                conn.execute("COMMIT").unwrap();
+                fsqlite_e2e::block_on(conn.execute("COMMIT")).unwrap();
                 verify_row_count_fsqlite(&conn);
             },
             BatchSize::LargeInput,
@@ -350,15 +360,15 @@ fn bench_write_single_txn(c: &mut Criterion) {
     group.bench_function("frankensqlite_ad_hoc", |b| {
         b.iter_batched(
             || {
-                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:")).unwrap();
                 apply_pragmas_fsqlite(&conn);
-                conn.execute(CREATE_TABLE).unwrap();
+                fsqlite_e2e::block_on(conn.execute(CREATE_TABLE)).unwrap();
                 conn
             },
             |conn| {
-                conn.execute("BEGIN").unwrap();
+                fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
                 run_fsqlite_ad_hoc_inserts(&conn, 0, ROW_COUNT);
-                conn.execute("COMMIT").unwrap();
+                fsqlite_e2e::block_on(conn.execute("COMMIT")).unwrap();
                 verify_row_count_fsqlite(&conn);
             },
             BatchSize::LargeInput,

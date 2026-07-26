@@ -24,8 +24,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -57,11 +57,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -71,7 +71,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -95,68 +95,83 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 
 #[test]
 fn update_or_ignore_skips_conflicting_row() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)",
-            "INSERT INTO t VALUES (1,10),(2,20),(3,30)",
-            "UPDATE OR IGNORE t SET u = 20 WHERE id = 1", // collides with id2 -> skipped
-            "UPDATE OR IGNORE t SET u = 99 WHERE id = 3", // no collision -> applied
-        ],
-        &["SELECT id, u FROM t ORDER BY id"], // (1,10),(2,20),(3,99)
-        "update_or_ignore_skips_conflicting_row",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)",
+                "INSERT INTO t VALUES (1,10),(2,20),(3,30)",
+                "UPDATE OR IGNORE t SET u = 20 WHERE id = 1", // collides with id2 -> skipped
+                "UPDATE OR IGNORE t SET u = 99 WHERE id = 3", // no collision -> applied
+            ],
+            &["SELECT id, u FROM t ORDER BY id"], // (1,10),(2,20),(3,99)
+            "update_or_ignore_skips_conflicting_row",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn update_or_replace_deletes_conflict_on_unique() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE, label TEXT)",
-            "INSERT INTO t VALUES (1,10,'a'),(2,20,'b'),(3,30,'c')",
-            // Setting id1.u=20 collides with id2 -> REPLACE deletes id2.
-            "UPDATE OR REPLACE t SET u = 20 WHERE id = 1",
-        ],
-        &["SELECT id, u, label FROM t ORDER BY id"], // (1,20,'a'),(3,30,'c')
-        "update_or_replace_deletes_conflict_on_unique",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE, label TEXT)",
+                "INSERT INTO t VALUES (1,10,'a'),(2,20,'b'),(3,30,'c')",
+                // Setting id1.u=20 collides with id2 -> REPLACE deletes id2.
+                "UPDATE OR REPLACE t SET u = 20 WHERE id = 1",
+            ],
+            &["SELECT id, u, label FROM t ORDER BY id"], // (1,20,'a'),(3,30,'c')
+            "update_or_replace_deletes_conflict_on_unique",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn update_or_replace_on_primary_key() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)",
-            "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')",
-            // Changing id1 -> 2 collides with existing id2 -> REPLACE removes old id2.
-            "UPDATE OR REPLACE t SET id = 2 WHERE id = 1",
-        ],
-        &["SELECT id, label FROM t ORDER BY id"], // (2,'a'),(3,'c')
-        "update_or_replace_on_primary_key",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)",
+                "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')",
+                // Changing id1 -> 2 collides with existing id2 -> REPLACE removes old id2.
+                "UPDATE OR REPLACE t SET id = 2 WHERE id = 1",
+            ],
+            &["SELECT id, label FROM t ORDER BY id"], // (2,'a'),(3,'c')
+            "update_or_replace_on_primary_key",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn update_default_abort_errors_on_violation() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)",
-            "INSERT INTO t VALUES (1,10),(2,20)",
-            "UPDATE t SET u = 20 WHERE id = 1", // default OR ABORT -> error on both
-        ],
-        &["SELECT id, u FROM t ORDER BY id"], // unchanged (1,10),(2,20)
-        "update_default_abort_errors_on_violation",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)",
+                "INSERT INTO t VALUES (1,10),(2,20)",
+                "UPDATE t SET u = 20 WHERE id = 1", // default OR ABORT -> error on both
+            ],
+            &["SELECT id, u FROM t ORDER BY id"], // unchanged (1,10),(2,20)
+            "update_default_abort_errors_on_violation",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn update_or_fail_errors_on_violation() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)",
-            "INSERT INTO t VALUES (1,10),(2,20)",
-            "UPDATE OR FAIL t SET u = 20 WHERE id = 1", // conflict -> error on both
-        ],
-        &["SELECT id, u FROM t ORDER BY id"], // unchanged
-        "update_or_fail_errors_on_violation",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)",
+                "INSERT INTO t VALUES (1,10),(2,20)",
+                "UPDATE OR FAIL t SET u = 20 WHERE id = 1", // conflict -> error on both
+            ],
+            &["SELECT id, u FROM t ORDER BY id"], // unchanged
+            "update_or_fail_errors_on_violation",
+        )
+        .await;
+    });
 }

@@ -23,8 +23,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -56,24 +56,25 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn engines() -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn engines() -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in [
         "CREATE TABLE t (a INTEGER)",
         "INSERT INTO t VALUES (10),(20),(30)",
     ] {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
     (f, r)
 }
 
-fn check(queries: &[&str], label: &str) {
-    let (f, r) = engines();
+async fn check(queries: &[&str], label: &str) {
+    let (f, r) = engines().await;
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        let frank = frank_rows(&f, q).await;
+        match (frank, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -97,27 +98,33 @@ fn check(queries: &[&str], label: &str) {
 
 #[test]
 fn scalar_subquery_single_column_ok() {
-    check(
-        &[
-            "SELECT (SELECT 1)",                     // 1
-            "SELECT (SELECT a FROM t WHERE a = 20)", // 20
-            // multi-row is NOT an error -- SQLite takes the first
-            "SELECT (SELECT a FROM t ORDER BY a)", // 10
-        ],
-        "scalar_subquery_single_column_ok",
-    );
+    asupersync::test_utils::run_test(|| async {
+        check(
+            &[
+                "SELECT (SELECT 1)",                     // 1
+                "SELECT (SELECT a FROM t WHERE a = 20)", // 20
+                // multi-row is NOT an error -- SQLite takes the first
+                "SELECT (SELECT a FROM t ORDER BY a)", // 10
+            ],
+            "scalar_subquery_single_column_ok",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn scalar_subquery_multi_column_rejected() {
     // Multi-column scalar subquery -> SQLite errors. (Multi-row is fine; multi-
     // *column* is not.)
-    check(
-        &[
-            "SELECT (SELECT 1, 2)",
-            "SELECT (SELECT 1, 2, 3)",
-            "SELECT (SELECT a, a*2 FROM t LIMIT 1)",
-        ],
-        "scalar_subquery_multi_column_rejected",
-    );
+    asupersync::test_utils::run_test(|| async {
+        check(
+            &[
+                "SELECT (SELECT 1, 2)",
+                "SELECT (SELECT 1, 2, 3)",
+                "SELECT (SELECT a, a*2 FROM t LIMIT 1)",
+            ],
+            "scalar_subquery_multi_column_rejected",
+        )
+        .await;
+    });
 }

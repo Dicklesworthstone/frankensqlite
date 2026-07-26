@@ -7,6 +7,7 @@
 //! FILTER + DISTINCT, FILTER on a window aggregate (`... FILTER (...) OVER (...)`),
 //! and an empty filter (sum -> NULL, count -> 0). Each scenario compares results
 //! against rusqlite (bundled SQLite ~3.46); the windowed-FILTER case is isolated.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -24,8 +25,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -57,10 +58,10 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -82,14 +83,14 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
     );
 }
 
-fn data() -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").unwrap();
+async fn data() -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, x INTEGER)",
         "INSERT INTO t VALUES (1,'a',5),(2,'a',-3),(3,'b',20),(4,'b',-10),(5,'a',15),(6,'b',NULL)",
     ] {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
     (f, r)
@@ -97,89 +98,107 @@ fn data() -> (Connection, rusqlite::Connection) {
 
 #[test]
 fn filter_conditional_vs_unfiltered() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            // positives 5,20,15 -> 40; total non-null 27.
-            "SELECT sum(x) FILTER (WHERE x > 0), sum(x) FROM t",
-            // group 'a' rows -> 3; all rows -> 6.
-            "SELECT count(*) FILTER (WHERE g = 'a'), count(*) FROM t",
-            // count(x) skips NULL anyway; FILTER narrows further.
-            "SELECT count(x) FILTER (WHERE x IS NOT NULL) FROM t", // 5
-        ],
-        "filter_conditional_vs_unfiltered",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                // positives 5,20,15 -> 40; total non-null 27.
+                "SELECT sum(x) FILTER (WHERE x > 0), sum(x) FROM t",
+                // group 'a' rows -> 3; all rows -> 6.
+                "SELECT count(*) FILTER (WHERE g = 'a'), count(*) FROM t",
+                // count(x) skips NULL anyway; FILTER narrows further.
+                "SELECT count(x) FILTER (WHERE x IS NOT NULL) FROM t", // 5
+            ],
+            "filter_conditional_vs_unfiltered",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn filter_with_group_by() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            // a: x>10 -> only 15 (sum 15, count 1); b: x>10 -> only 20 (sum 20, count 1).
-            "SELECT g, sum(x) FILTER (WHERE x > 10), count(*) FILTER (WHERE x > 10) \
-             FROM t GROUP BY g ORDER BY g",
-        ],
-        "filter_with_group_by",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                // a: x>10 -> only 15 (sum 15, count 1); b: x>10 -> only 20 (sum 20, count 1).
+                "SELECT g, sum(x) FILTER (WHERE x > 10), count(*) FILTER (WHERE x > 10) \
+                 FROM t GROUP BY g ORDER BY g",
+            ],
+            "filter_with_group_by",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn filter_multiple_predicates() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            // pos = 40, neg = -13.
-            "SELECT sum(x) FILTER (WHERE x > 0) AS pos, sum(x) FILTER (WHERE x < 0) AS neg FROM t",
-        ],
-        "filter_multiple_predicates",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                // pos = 40, neg = -13.
+                "SELECT sum(x) FILTER (WHERE x > 0) AS pos, sum(x) FILTER (WHERE x < 0) AS neg FROM t",
+            ],
+            "filter_multiple_predicates",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn filter_with_distinct() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            // rows with x>0: g in {a,b} -> distinct count 2.
-            "SELECT count(DISTINCT g) FILTER (WHERE x > 0) FROM t",
-        ],
-        "filter_with_distinct",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                // rows with x>0: g in {a,b} -> distinct count 2.
+                "SELECT count(DISTINCT g) FILTER (WHERE x > 0) FROM t",
+            ],
+            "filter_with_distinct",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn filter_empty_set() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            // No row matches -> sum NULL, count 0.
-            "SELECT sum(x) FILTER (WHERE x > 1000), count(*) FILTER (WHERE x > 1000) FROM t",
-        ],
-        "filter_empty_set",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                // No row matches -> sum NULL, count 0.
+                "SELECT sum(x) FILTER (WHERE x > 1000), count(*) FILTER (WHERE x > 1000) FROM t",
+            ],
+            "filter_empty_set",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn filter_over_window() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            // Cumulative sum of positive x by id: 5,5,25,25,40,40.
-            "SELECT id, sum(x) FILTER (WHERE x > 0) OVER (ORDER BY id) FROM t ORDER BY id",
-        ],
-        "filter_over_window",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                // Cumulative sum of positive x by id: 5,5,25,25,40,40.
+                "SELECT id, sum(x) FILTER (WHERE x > 0) OVER (ORDER BY id) FROM t ORDER BY id",
+            ],
+            "filter_over_window",
+        )
+        .await;
+    });
 }

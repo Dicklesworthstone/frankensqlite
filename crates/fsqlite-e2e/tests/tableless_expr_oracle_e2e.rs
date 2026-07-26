@@ -25,8 +25,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -58,12 +58,12 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn assert_scalar(queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn assert_scalar(queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -87,69 +87,84 @@ fn assert_scalar(queries: &[&str], label: &str) {
 
 #[test]
 fn tableless_like_glob_collate_between() {
-    assert_scalar(
-        &[
-            "SELECT 'abc' LIKE 'a%'",          // 1
-            "SELECT 'abc' LIKE 'A%'",          // 1 (LIKE is ASCII case-insensitive)
-            "SELECT 'abc' GLOB 'a*'",          // 1
-            "SELECT 'abc' GLOB 'A*'",          // 0 (GLOB is case-sensitive)
-            "SELECT 'a' = 'A' COLLATE NOCASE", // 1
-            "SELECT 5 BETWEEN 1 AND 10",       // 1
-            "SELECT 5 NOT BETWEEN 1 AND 10",   // 0
-        ],
-        "tableless_like_glob_collate_between",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT 'abc' LIKE 'a%'",          // 1
+                "SELECT 'abc' LIKE 'A%'",          // 1 (LIKE is ASCII case-insensitive)
+                "SELECT 'abc' GLOB 'a*'",          // 1
+                "SELECT 'abc' GLOB 'A*'",          // 0 (GLOB is case-sensitive)
+                "SELECT 'a' = 'A' COLLATE NOCASE", // 1
+                "SELECT 5 BETWEEN 1 AND 10",       // 1
+                "SELECT 5 NOT BETWEEN 1 AND 10",   // 0
+            ],
+            "tableless_like_glob_collate_between",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn tableless_case_cast_is() {
-    assert_scalar(
-        &[
-            "SELECT CASE WHEN 1 THEN 'y' ELSE 'n' END", // 'y'
-            "SELECT CAST('5' AS INTEGER) + 1",          // 6
-            "SELECT 1 IS NOT NULL, NULL IS NULL",       // 1, 1
-            "SELECT 1 IS 1, 1 IS NOT 2",                // 1, 1
-        ],
-        "tableless_case_cast_is",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT CASE WHEN 1 THEN 'y' ELSE 'n' END", // 'y'
+                "SELECT CAST('5' AS INTEGER) + 1",          // 6
+                "SELECT 1 IS NOT NULL, NULL IS NULL",       // 1, 1
+                "SELECT 1 IS 1, 1 IS NOT 2",                // 1, 1
+            ],
+            "tableless_case_cast_is",
+        )
+        .await;
+    });
 }
 
 /// Scalar subqueries with no outer FROM clause (the constant path).
 #[test]
 fn tableless_scalar_subquery() {
-    assert_scalar(
-        &[
-            "SELECT (SELECT 42)",                                                     // 42
-            "SELECT (SELECT (SELECT 7))",                                             // 7 (nested)
-            "SELECT (SELECT 3) + (SELECT 4)", // 7 (arithmetic over subqueries)
-            "SELECT (SELECT count(*) FROM (SELECT 1 UNION SELECT 2 UNION SELECT 3))", // 3
-        ],
-        "tableless_scalar_subquery",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT (SELECT 42)",                                                     // 42
+                "SELECT (SELECT (SELECT 7))",     // 7 (nested)
+                "SELECT (SELECT 3) + (SELECT 4)", // 7 (arithmetic over subqueries)
+                "SELECT (SELECT count(*) FROM (SELECT 1 UNION SELECT 2 UNION SELECT 3))", // 3
+            ],
+            "tableless_scalar_subquery",
+        )
+        .await;
+    });
 }
 
 /// EXISTS / NOT EXISTS as a constant SELECT.
 #[test]
 fn tableless_exists() {
-    assert_scalar(
-        &[
-            "SELECT EXISTS(SELECT 1)",             // 1
-            "SELECT EXISTS(SELECT 1 WHERE 0)",     // 0
-            "SELECT NOT EXISTS(SELECT 1 WHERE 0)", // 1
-        ],
-        "tableless_exists",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT EXISTS(SELECT 1)",             // 1
+                "SELECT EXISTS(SELECT 1 WHERE 0)",     // 0
+                "SELECT NOT EXISTS(SELECT 1 WHERE 0)", // 1
+            ],
+            "tableless_exists",
+        )
+        .await;
+    });
 }
 
 /// IN against a subquery as a constant SELECT.
 #[test]
 fn tableless_in_subquery() {
-    assert_scalar(
-        &[
-            "SELECT 1 IN (SELECT 1 UNION SELECT 2)",     // 1
-            "SELECT 5 IN (SELECT 1 UNION SELECT 2)",     // 0
-            "SELECT 5 NOT IN (SELECT 1 UNION SELECT 2)", // 1
-        ],
-        "tableless_in_subquery",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT 1 IN (SELECT 1 UNION SELECT 2)",     // 1
+                "SELECT 5 IN (SELECT 1 UNION SELECT 2)",     // 0
+                "SELECT 5 NOT IN (SELECT 1 UNION SELECT 2)", // 1
+            ],
+            "tableless_in_subquery",
+        )
+        .await;
+    });
 }

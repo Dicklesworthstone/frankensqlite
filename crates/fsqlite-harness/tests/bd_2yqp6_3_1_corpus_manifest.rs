@@ -272,10 +272,13 @@ struct ExecutionProbe {
     error_debug: String,
 }
 
-fn run_execution_probe(seed: u64) -> ExecutionProbe {
-    let conn = Connection::open(":memory:").expect("open in-memory connection");
+async fn run_execution_probe(seed: u64) -> ExecutionProbe {
+    let conn = Connection::open(":memory:")
+        .await
+        .expect("open in-memory connection");
 
     conn.execute("CREATE TABLE replay_probe(id INTEGER PRIMARY KEY, amount INTEGER, label TEXT);")
+        .await
         .expect("create replay_probe");
 
     let base = i64::try_from(seed % 97).expect("seed modulo fits into i64");
@@ -283,18 +286,22 @@ fn run_execution_probe(seed: u64) -> ExecutionProbe {
         "INSERT INTO replay_probe VALUES (1, {}, 'alpha');",
         base + 10
     ))
+    .await
     .expect("insert row 1");
     conn.execute(&format!(
         "INSERT INTO replay_probe VALUES (2, {}, 'beta');",
         base + 20
     ))
+    .await
     .expect("insert row 2");
 
     conn.execute("UPDATE replay_probe SET amount = amount + 5 WHERE id = 2;")
+        .await
         .expect("update row 2");
 
     let rows = conn
         .query("SELECT id, amount, label FROM replay_probe ORDER BY id;")
+        .await
         .expect("select deterministic rows")
         .iter()
         .map(|row| row.values().to_vec())
@@ -302,12 +309,14 @@ fn run_execution_probe(seed: u64) -> ExecutionProbe {
 
     let aggregate_row = conn
         .query_row("SELECT COUNT(*), SUM(amount) FROM replay_probe;")
+        .await
         .expect("select aggregate row")
         .values()
         .to_vec();
 
     let pragma_row = conn
         .query_row("PRAGMA page_size;")
+        .await
         .expect("pragma page_size")
         .values()
         .to_vec();
@@ -315,6 +324,7 @@ fn run_execution_probe(seed: u64) -> ExecutionProbe {
     let error_debug = format!(
         "{:?}",
         conn.query("SELECT FROM broken_sql")
+            .await
             .expect_err("syntax error path should fail deterministically")
     );
 
@@ -621,21 +631,23 @@ fn ingestion_and_normalization_replay_are_deterministic() {
 
 #[test]
 fn execution_replay_probe_is_deterministic() {
-    let manifest = load_manifest();
-    let probe_a = run_execution_probe(manifest.meta.root_seed);
-    let probe_b = run_execution_probe(manifest.meta.root_seed);
-    assert_eq!(probe_a, probe_b, "execution replay probe drifted");
+    asupersync::test_utils::run_test(|| async {
+        let manifest = load_manifest();
+        let probe_a = run_execution_probe(manifest.meta.root_seed).await;
+        let probe_b = run_execution_probe(manifest.meta.root_seed).await;
+        assert_eq!(probe_a, probe_b, "execution replay probe drifted");
 
-    let required_exec_entries = manifest
-        .entries
-        .iter()
-        .filter(|entry| entry.in_scope && entry.execution_required)
-        .count();
-    assert!(
-        required_exec_entries >= 8,
-        "expected at least 8 execution-required entries, got {}",
-        required_exec_entries
-    );
+        let required_exec_entries = manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.in_scope && entry.execution_required)
+            .count();
+        assert!(
+            required_exec_entries >= 8,
+            "expected at least 8 execution-required entries, got {}",
+            required_exec_entries
+        );
+    });
 }
 
 proptest! {

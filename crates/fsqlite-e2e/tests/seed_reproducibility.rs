@@ -224,53 +224,59 @@ fn oplog_different_seeds_differ() {
 
 #[test]
 fn database_state_is_reproducible() {
-    // Executing the same OpLog twice must produce identical database states.
-    let seed = FRANKEN_SEED;
+    asupersync::test_utils::run_test(|| async {
+        // Executing the same OpLog twice must produce identical database states.
+        let seed = FRANKEN_SEED;
 
-    // Generate a workload.
-    let oplog = preset_commutative_inserts_disjoint_keys("db-repro-test", seed, 2, 100);
+        // Generate a workload.
+        let oplog = preset_commutative_inserts_disjoint_keys("db-repro-test", seed, 2, 100);
 
-    // Execute on FrankenSQLite twice.
-    let state1 = execute_oplog_and_hash(&oplog);
-    let state2 = execute_oplog_and_hash(&oplog);
+        // Execute on FrankenSQLite twice.
+        let state1 = execute_oplog_and_hash(&oplog).await;
+        let state2 = execute_oplog_and_hash(&oplog).await;
 
-    assert_eq!(
-        state1, state2,
-        "Same OpLog must produce identical database states"
-    );
+        assert_eq!(
+            state1, state2,
+            "Same OpLog must produce identical database states"
+        );
+    });
 }
 
 #[test]
 fn database_state_commutative_inserts_seed_independent() {
-    // The commutative_inserts_disjoint_keys preset produces data values
-    // that are deterministic based on worker/row indices, NOT the seed.
-    // The seed only affects operation ordering (which doesn't matter for
-    // commutative operations with disjoint keys).
-    //
-    // This test verifies that for commutative presets, different seeds
-    // produce EQUIVALENT final states (which is the design intent).
-    let seed1 = FRANKEN_SEED;
-    let seed2 = FRANKEN_SEED + 1;
+    asupersync::test_utils::run_test(|| async {
+        // The commutative_inserts_disjoint_keys preset produces data values
+        // that are deterministic based on worker/row indices, NOT the seed.
+        // The seed only affects operation ordering (which doesn't matter for
+        // commutative operations with disjoint keys).
+        //
+        // This test verifies that for commutative presets, different seeds
+        // produce EQUIVALENT final states (which is the design intent).
+        let seed1 = FRANKEN_SEED;
+        let seed2 = FRANKEN_SEED + 1;
 
-    let oplog1 = preset_commutative_inserts_disjoint_keys("db-equiv-1", seed1, 2, 100);
-    let oplog2 = preset_commutative_inserts_disjoint_keys("db-equiv-2", seed2, 2, 100);
+        let oplog1 = preset_commutative_inserts_disjoint_keys("db-equiv-1", seed1, 2, 100);
+        let oplog2 = preset_commutative_inserts_disjoint_keys("db-equiv-2", seed2, 2, 100);
 
-    let state1 = execute_oplog_and_hash(&oplog1);
-    let state2 = execute_oplog_and_hash(&oplog2);
+        let state1 = execute_oplog_and_hash(&oplog1).await;
+        let state2 = execute_oplog_and_hash(&oplog2).await;
 
-    assert_eq!(
-        state1, state2,
-        "Commutative presets with disjoint keys should produce equivalent states regardless of seed"
-    );
+        assert_eq!(
+            state1, state2,
+            "Commutative presets with disjoint keys should produce equivalent states regardless of seed"
+        );
+    });
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 /// Execute an OpLog on FrankenSQLite and return a hash of the final state.
-fn execute_oplog_and_hash(oplog: &fsqlite_e2e::oplog::OpLog) -> String {
+async fn execute_oplog_and_hash(oplog: &fsqlite_e2e::oplog::OpLog) -> String {
     use sha2::{Digest, Sha256};
 
-    let conn = fsqlite::Connection::open(":memory:").expect("open connection");
+    let conn = fsqlite::Connection::open(":memory:")
+        .await
+        .expect("open connection");
 
     // Execute each operation from the OpLog.
     // The OpLog includes CREATE TABLE as the first operation.
@@ -303,12 +309,13 @@ fn execute_oplog_and_hash(oplog: &fsqlite_e2e::oplog::OpLog) -> String {
         };
 
         // Ignore errors for transaction control that may fail legitimately.
-        let _ = conn.execute(&sql);
+        drop(conn.execute(&sql).await);
     }
 
     // Query all data from table t0 (created by the preset) and hash it.
     let rows = conn
         .query("SELECT * FROM t0 ORDER BY id")
+        .await
         .unwrap_or_default();
 
     let mut hasher = Sha256::new();

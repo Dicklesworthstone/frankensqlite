@@ -8,8 +8,8 @@
 use fsqlite::{Connection, Row};
 use fsqlite_types::SqliteValue;
 
-fn setup() -> Connection {
-    let conn = Connection::open(":memory:").unwrap();
+async fn setup() -> Connection {
+    let conn = Connection::open(":memory:").await.unwrap();
     conn.execute(
         "CREATE TABLE issues (
             id TEXT PRIMARY KEY,
@@ -17,6 +17,7 @@ fn setup() -> Connection {
             status TEXT NOT NULL
         );",
     )
+    .await
     .unwrap();
     conn.execute(
         "CREATE TABLE labels (
@@ -26,14 +27,19 @@ fn setup() -> Connection {
             FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
         );",
     )
+    .await
     .unwrap();
     conn.execute("INSERT INTO issues VALUES ('a', 'task',    'open');")
+        .await
         .unwrap();
     conn.execute("INSERT INTO issues VALUES ('b', 'feature', 'open');")
+        .await
         .unwrap();
     conn.execute("INSERT INTO labels VALUES ('a', 'core');")
+        .await
         .unwrap();
     conn.execute("INSERT INTO labels VALUES ('b', 'core');")
+        .await
         .unwrap();
     conn
 }
@@ -49,83 +55,98 @@ fn ids(rows: &[Row]) -> Vec<String> {
 
 #[test]
 fn in_subquery_alone_works() {
-    let conn = setup();
-    let rows = conn
-        .query_with_params(
-            "SELECT id FROM issues \
+    asupersync::test_utils::run_test(|| async {
+        let conn = setup().await;
+        let rows = conn
+            .query_with_params(
+                "SELECT id FROM issues \
              WHERE id IN (SELECT issue_id FROM labels WHERE label = ?) \
              ORDER BY id",
-            &[SqliteValue::Text("core".into())],
-        )
-        .unwrap();
-    assert_eq!(ids(&rows), vec!["a".to_string(), "b".to_string()]);
+                &[SqliteValue::Text("core".into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(&rows), vec!["a".to_string(), "b".to_string()]);
+    });
 }
 
 #[test]
 fn in_param_alone_works() {
-    let conn = setup();
-    let rows = conn
-        .query_with_params(
-            "SELECT id FROM issues WHERE issue_type IN (?) ORDER BY id",
-            &[SqliteValue::Text("task".into())],
-        )
-        .unwrap();
-    assert_eq!(ids(&rows), vec!["a".to_string()]);
+    asupersync::test_utils::run_test(|| async {
+        let conn = setup().await;
+        let rows = conn
+            .query_with_params(
+                "SELECT id FROM issues WHERE issue_type IN (?) ORDER BY id",
+                &[SqliteValue::Text("task".into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(&rows), vec!["a".to_string()]);
+    });
 }
 
 #[test]
 fn in_subquery_combined_with_in_param_returns_intersection() {
-    let conn = setup();
-    let rows = conn
-        .query_with_params(
-            "SELECT id FROM issues \
+    asupersync::test_utils::run_test(|| async {
+        let conn = setup().await;
+        let rows = conn
+            .query_with_params(
+                "SELECT id FROM issues \
              WHERE id IN (SELECT issue_id FROM labels WHERE label = ?) \
                AND issue_type IN (?) \
              ORDER BY id",
-            &[
-                SqliteValue::Text("core".into()),
-                SqliteValue::Text("task".into()),
-            ],
-        )
-        .unwrap();
-    assert_eq!(ids(&rows), vec!["a".to_string()]);
+                &[
+                    SqliteValue::Text("core".into()),
+                    SqliteValue::Text("task".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(&rows), vec!["a".to_string()]);
+    });
 }
 
 #[test]
 fn in_subquery_combined_with_in_param_order_swapped() {
-    let conn = setup();
-    let rows = conn
-        .query_with_params(
-            "SELECT id FROM issues \
+    asupersync::test_utils::run_test(|| async {
+        let conn = setup().await;
+        let rows = conn
+            .query_with_params(
+                "SELECT id FROM issues \
              WHERE issue_type IN (?) \
                AND id IN (SELECT issue_id FROM labels WHERE label = ?) \
              ORDER BY id",
-            &[
-                SqliteValue::Text("task".into()),
-                SqliteValue::Text("core".into()),
-            ],
-        )
-        .unwrap();
-    assert_eq!(ids(&rows), vec!["a".to_string()]);
+                &[
+                    SqliteValue::Text("task".into()),
+                    SqliteValue::Text("core".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(&rows), vec!["a".to_string()]);
+    });
 }
 
 #[test]
 fn exists_form_continues_to_work() {
-    let conn = setup();
-    let rows = conn
-        .query_with_params(
-            "SELECT id FROM issues \
+    asupersync::test_utils::run_test(|| async {
+        let conn = setup().await;
+        let rows = conn
+            .query_with_params(
+                "SELECT id FROM issues \
              WHERE EXISTS ( \
                  SELECT 1 FROM labels \
                  WHERE labels.issue_id = issues.id AND labels.label = ? \
              ) \
                AND issue_type IN (?) \
              ORDER BY id",
-            &[
-                SqliteValue::Text("core".into()),
-                SqliteValue::Text("task".into()),
-            ],
-        )
-        .unwrap();
-    assert_eq!(ids(&rows), vec!["a".to_string()]);
+                &[
+                    SqliteValue::Text("core".into()),
+                    SqliteValue::Text("task".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(&rows), vec!["a".to_string()]);
+    });
 }

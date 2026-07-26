@@ -892,8 +892,8 @@ impl FsqliteExecutor {
     ///
     /// Returns an error string if the connection fails.
     pub fn open_in_memory() -> Result<Self, String> {
-        let conn = crate::block_on(fsqlite::Connection::open(":memory:"))
-            .map_err(|e| e.to_string())?;
+        let conn =
+            crate::block_on(fsqlite::Connection::open(":memory:")).map_err(|e| e.to_string())?;
         Ok(Self { conn })
     }
 }

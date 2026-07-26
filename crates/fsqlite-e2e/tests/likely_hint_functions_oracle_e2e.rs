@@ -7,6 +7,7 @@
 //! preserve its storage class, pass NULL through, and never change a WHERE
 //! filter's outcome. `likelihood` with a probability outside [0,1] (or a
 //! non-constant one) is an error. Compared against rusqlite.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -24,8 +25,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -57,10 +58,10 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -82,65 +83,74 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
     );
 }
 
-fn assert_scalar(queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn assert_scalar(queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
-    check(&f, &r, queries, label);
+    check(&f, &r, queries, label).await;
 }
 
 #[test]
 fn likely_unlikely_identity() {
-    assert_scalar(
-        &[
-            "SELECT likely(1)",               // 1
-            "SELECT unlikely(0)",             // 0
-            "SELECT likely('x')",             // 'x'
-            "SELECT unlikely(3.5)",           // 3.5
-            "SELECT likely(NULL)",            // NULL
-            "SELECT typeof(likely(5))",       // integer
-            "SELECT typeof(likely(5.0))",     // real
-            "SELECT typeof(unlikely('a'))",   // text
-            "SELECT likely(2) + unlikely(3)", // 5
-        ],
-        "likely_unlikely_identity",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT likely(1)",               // 1
+                "SELECT unlikely(0)",             // 0
+                "SELECT likely('x')",             // 'x'
+                "SELECT unlikely(3.5)",           // 3.5
+                "SELECT likely(NULL)",            // NULL
+                "SELECT typeof(likely(5))",       // integer
+                "SELECT typeof(likely(5.0))",     // real
+                "SELECT typeof(unlikely('a'))",   // text
+                "SELECT likely(2) + unlikely(3)", // 5
+            ],
+            "likely_unlikely_identity",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn likelihood_with_probability() {
-    assert_scalar(
-        &[
-            "SELECT likelihood(42, 0.5)",         // 42
-            "SELECT likelihood('a', 0.9)",        // 'a'
-            "SELECT likelihood(NULL, 0.1)",       // NULL
-            "SELECT likelihood(7, 0.0)",          // 7 (boundary)
-            "SELECT likelihood(7, 1.0)",          // 7 (boundary)
-            "SELECT typeof(likelihood(9, 0.25))", // integer
-        ],
-        "likelihood_with_probability",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT likelihood(42, 0.5)",         // 42
+                "SELECT likelihood('a', 0.9)",        // 'a'
+                "SELECT likelihood(NULL, 0.1)",       // NULL
+                "SELECT likelihood(7, 0.0)",          // 7 (boundary)
+                "SELECT likelihood(7, 1.0)",          // 7 (boundary)
+                "SELECT typeof(likelihood(9, 0.25))", // integer
+            ],
+            "likelihood_with_probability",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn likely_unlikely_in_where_filter() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    for s in [
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)",
-        "INSERT INTO t VALUES (1,10),(2,3),(3,7),(4,5)",
-    ] {
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
-    check(
-        &f,
-        &r,
-        &[
-            // the hint must not change which rows match
-            "SELECT id FROM t WHERE likely(x > 5) ORDER BY id", // 1,3
-            "SELECT id FROM t WHERE unlikely(x = 3) ORDER BY id", // 2
-            "SELECT id FROM t WHERE likelihood(x >= 5, 0.5) ORDER BY id", // 1,3,4
-        ],
-        "likely_unlikely_in_where_filter",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for s in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)",
+            "INSERT INTO t VALUES (1,10),(2,3),(3,7),(4,5)",
+        ] {
+            f.execute(s).await.unwrap();
+            r.execute_batch(s).unwrap();
+        }
+        check(
+            &f,
+            &r,
+            &[
+                // the hint must not change which rows match
+                "SELECT id FROM t WHERE likely(x > 5) ORDER BY id", // 1,3
+                "SELECT id FROM t WHERE unlikely(x = 3) ORDER BY id", // 2
+                "SELECT id FROM t WHERE likelihood(x >= 5, 0.5) ORDER BY id", // 1,3,4
+            ],
+            "likely_unlikely_in_where_filter",
+        )
+        .await;
+    });
 }

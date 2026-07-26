@@ -26,6 +26,10 @@ rusqlite = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
+# Inline `#[cfg(test)]` modules and the integration tests drive the async engine
+# API through `asupersync::test_utils::run_test`, which lives behind
+# `test-internals`. The non-dev dependency above stays feature-clean.
+asupersync = { workspace = true, features = ["test-internals"] }
 blake3 = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }

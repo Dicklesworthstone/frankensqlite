@@ -27,23 +27,25 @@ fn run_one_iteration(n_threads: usize) -> Vec<String> {
     let path = tmp.path().to_str().unwrap().to_owned();
 
     // Setup: create tables
-    {
-        let setup = fsqlite::Connection::open(&path).unwrap();
-        setup.execute("PRAGMA page_size = 4096;").unwrap();
-        setup.execute("PRAGMA journal_mode = WAL;").unwrap();
-        setup.execute("PRAGMA synchronous = NORMAL;").unwrap();
-        setup.execute("PRAGMA cache_size = -64000;").unwrap();
+    asupersync::test_utils::run_test(|| async {
+        let setup = fsqlite::Connection::open(&path).await.unwrap();
+        setup.execute("PRAGMA page_size = 4096;").await.unwrap();
+        setup.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+        setup.execute("PRAGMA synchronous = NORMAL;").await.unwrap();
+        setup.execute("PRAGMA cache_size = -64000;").await.unwrap();
         setup
             .execute("PRAGMA fsqlite.concurrent_mode = ON;")
+            .await
             .unwrap();
         for tid in 0..n_threads {
             setup
                 .execute(&format!(
                     "CREATE TABLE IF NOT EXISTS bench_{tid} (id INTEGER PRIMARY KEY, name TEXT, score INTEGER);"
                 ))
+                .await
                 .unwrap();
         }
-    }
+    });
 
     let barrier = Arc::new(Barrier::new(n_threads));
     let errors: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -56,15 +58,16 @@ fn run_one_iteration(n_threads: usize) -> Vec<String> {
             let errs = errors.clone();
             let conflicts = conflict_count.clone();
             thread::spawn(move || {
-                let conn = fsqlite::Connection::open(&p).unwrap();
-                conn.execute("PRAGMA journal_mode = WAL;").unwrap();
-                conn.execute("PRAGMA synchronous = NORMAL;").unwrap();
-                conn.execute("PRAGMA cache_size = -64000;").unwrap();
-                conn.execute("PRAGMA fsqlite.concurrent_mode = ON;").unwrap();
+                asupersync::test_utils::run_test(|| async {
+                let conn = fsqlite::Connection::open(&p).await.unwrap();
+                conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+                conn.execute("PRAGMA synchronous = NORMAL;").await.unwrap();
+                conn.execute("PRAGMA cache_size = -64000;").await.unwrap();
+                conn.execute("PRAGMA fsqlite.concurrent_mode = ON;").await.unwrap();
                 let insert_sql = format!(
                     "INSERT INTO bench_{tid} VALUES (?1, ('t' || ?1), (?1 * 7));"
                 );
-                let stmt = conn.prepare(&insert_sql).unwrap();
+                let stmt = conn.prepare(&insert_sql).await.unwrap();
                 bar.wait();
 
                 for i in 0..ROWS_PER_THREAD {
@@ -72,7 +75,7 @@ fn run_one_iteration(n_threads: usize) -> Vec<String> {
                     'txn: loop {
                         // BEGIN
                         loop {
-                            match conn.execute("BEGIN CONCURRENT") {
+                            match conn.execute("BEGIN CONCURRENT").await {
                                 Ok(_) => break,
                                 Err(e) if is_retryable(&e) => {
                                     conflicts.fetch_add(1, Ordering::Relaxed);
@@ -98,9 +101,9 @@ fn run_one_iteration(n_threads: usize) -> Vec<String> {
 
                         // INSERT
                         if let Err(e) =
-                            stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
+                            stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)]).await
                         {
-                            let _ = conn.execute("ROLLBACK");
+                            drop(conn.execute("ROLLBACK").await);
                             if !is_retryable(&e) {
                                 let msg = format!("{e:?}");
                                 if msg.contains("Bad file descriptor") {
@@ -131,11 +134,11 @@ fn run_one_iteration(n_threads: usize) -> Vec<String> {
                         }
 
                         // COMMIT
-                        match conn.execute("COMMIT") {
+                        match conn.execute("COMMIT").await {
                             Ok(_) => break 'txn,
                             Err(e) if is_retryable(&e) => {
                                 conflicts.fetch_add(1, Ordering::Relaxed);
-                                let _ = conn.execute("ROLLBACK");
+                                drop(conn.execute("ROLLBACK").await);
                                 retries += 1;
                                 if retries >= MAX_RETRIES {
                                     errs.lock().unwrap().push(format!(
@@ -150,12 +153,13 @@ fn run_one_iteration(n_threads: usize) -> Vec<String> {
                                 errs.lock().unwrap().push(format!(
                                     "[t{tid}] COMMIT non-retryable at row {i}: {msg}"
                                 ));
-                                let _ = conn.execute("ROLLBACK");
+                                drop(conn.execute("ROLLBACK").await);
                                 return;
                             }
                         }
                     }
                 }
+                });
             })
         })
         .collect();
@@ -217,20 +221,23 @@ fn repro_bad_fd_asymmetric_close_timing() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_str().unwrap().to_owned();
 
-        {
-            let setup = fsqlite::Connection::open(&path).unwrap();
-            setup.execute("PRAGMA journal_mode = WAL;").unwrap();
-            setup.execute("PRAGMA synchronous = NORMAL;").unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let setup = fsqlite::Connection::open(&path).await.unwrap();
+            setup.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+            setup.execute("PRAGMA synchronous = NORMAL;").await.unwrap();
             setup
                 .execute("PRAGMA fsqlite.concurrent_mode = ON;")
+                .await
                 .unwrap();
             setup
                 .execute("CREATE TABLE t0 (id INTEGER PRIMARY KEY);")
+                .await
                 .unwrap();
             setup
                 .execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY);")
+                .await
                 .unwrap();
-        }
+        });
 
         let barrier = Arc::new(Barrier::new(2));
         let error_msg: Arc<std::sync::Mutex<Option<String>>> =
@@ -242,21 +249,24 @@ fn repro_bad_fd_asymmetric_close_timing() {
 
         // Thread 0: does 5 rows then DROPS connection immediately
         let t0 = thread::spawn(move || {
-            let conn = fsqlite::Connection::open(&p1).unwrap();
-            conn.execute("PRAGMA journal_mode = WAL;").unwrap();
-            conn.execute("PRAGMA synchronous = NORMAL;").unwrap();
-            conn.execute("PRAGMA fsqlite.concurrent_mode = ON;")
-                .unwrap();
-            bar1.wait();
+            asupersync::test_utils::run_test(|| async {
+                let conn = fsqlite::Connection::open(&p1).await.unwrap();
+                conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+                conn.execute("PRAGMA synchronous = NORMAL;").await.unwrap();
+                conn.execute("PRAGMA fsqlite.concurrent_mode = ON;")
+                    .await
+                    .unwrap();
+                bar1.wait();
 
-            for i in 0..5_i64 {
-                let _ = conn.execute("BEGIN CONCURRENT");
-                let _ = conn.execute(&format!("INSERT INTO t0 VALUES ({i});"));
-                let _ = conn.execute("COMMIT");
-            }
-            // Connection dropped here — triggers passive checkpoint
-            drop(conn);
-            eprintln!("[t0 iter {iteration}] connection dropped");
+                for i in 0..5_i64 {
+                    drop(conn.execute("BEGIN CONCURRENT").await);
+                    drop(conn.execute(&format!("INSERT INTO t0 VALUES ({i});")).await);
+                    drop(conn.execute("COMMIT").await);
+                }
+                // Connection dropped here — triggers passive checkpoint
+                drop(conn);
+                eprintln!("[t0 iter {iteration}] connection dropped");
+            });
         });
 
         let p2 = path;
@@ -264,48 +274,53 @@ fn repro_bad_fd_asymmetric_close_timing() {
 
         // Thread 1: does 500 rows — runs longer
         let t1 = thread::spawn(move || {
-            let conn = fsqlite::Connection::open(&p2).unwrap();
-            conn.execute("PRAGMA journal_mode = WAL;").unwrap();
-            conn.execute("PRAGMA synchronous = NORMAL;").unwrap();
-            conn.execute("PRAGMA fsqlite.concurrent_mode = ON;")
-                .unwrap();
-            bar2.wait();
+            asupersync::test_utils::run_test(|| async {
+                let conn = fsqlite::Connection::open(&p2).await.unwrap();
+                conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+                conn.execute("PRAGMA synchronous = NORMAL;").await.unwrap();
+                conn.execute("PRAGMA fsqlite.concurrent_mode = ON;")
+                    .await
+                    .unwrap();
+                bar2.wait();
 
-            for i in 0..500_i64 {
-                let mut retries = 0u32;
-                loop {
-                    match conn.execute("BEGIN CONCURRENT") {
-                        Ok(_) => break,
-                        Err(_) => {
-                            retries += 1;
-                            if retries > 50 {
+                for i in 0..500_i64 {
+                    let mut retries = 0u32;
+                    loop {
+                        match conn.execute("BEGIN CONCURRENT").await {
+                            Ok(_) => break,
+                            Err(_) => {
+                                retries += 1;
+                                if retries > 50 {
+                                    return;
+                                }
+                                thread::sleep(Duration::from_micros(200));
+                            }
+                        }
+                    }
+                    if conn
+                        .execute(&format!("INSERT INTO t1 VALUES ({i});"))
+                        .await
+                        .is_err()
+                    {
+                        drop(conn.execute("ROLLBACK").await);
+                        continue;
+                    }
+                    match conn.execute("COMMIT").await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            let msg = format!("{e:?}");
+                            if msg.contains("Bad file descriptor") {
+                                *err1.lock().unwrap() = Some(format!(
+                                    "iter {iteration}: EBADF during COMMIT at row {i}"
+                                ));
+                                drop(conn.execute("ROLLBACK").await);
                                 return;
                             }
-                            thread::sleep(Duration::from_micros(200));
+                            drop(conn.execute("ROLLBACK").await);
                         }
                     }
                 }
-                if conn
-                    .execute(&format!("INSERT INTO t1 VALUES ({i});"))
-                    .is_err()
-                {
-                    let _ = conn.execute("ROLLBACK");
-                    continue;
-                }
-                match conn.execute("COMMIT") {
-                    Ok(_) => {}
-                    Err(e) => {
-                        let msg = format!("{e:?}");
-                        if msg.contains("Bad file descriptor") {
-                            *err1.lock().unwrap() =
-                                Some(format!("iter {iteration}: EBADF during COMMIT at row {i}"));
-                            let _ = conn.execute("ROLLBACK");
-                            return;
-                        }
-                        let _ = conn.execute("ROLLBACK");
-                    }
-                }
-            }
+            });
         });
 
         t0.join().unwrap();

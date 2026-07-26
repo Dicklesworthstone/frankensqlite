@@ -17,9 +17,10 @@ fn render(v: &SqliteValue) -> String {
         ),
     }
 }
-fn frank(c: &Connection, sql: &str) -> Vec<Vec<String>> {
+async fn frank(c: &Connection, sql: &str) -> Vec<Vec<String>> {
     let mut r: Vec<Vec<String>> = c
         .query(sql)
+        .await
         .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"))
         .iter()
         .map(|row| row.values().iter().map(render).collect())
@@ -53,27 +54,31 @@ fn sqlite(c: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
     r.sort();
     r
 }
-fn has_seek(c: &Connection, sql: &str) -> bool {
-    c.query(&format!("EXPLAIN {sql}")).unwrap().iter().any(|row| matches!(row.values().get(1), Some(SqliteValue::Text(o)) if o.to_string().starts_with("Seek")))
+async fn has_seek(c: &Connection, sql: &str) -> bool {
+    c.query(&format!("EXPLAIN {sql}")).await.unwrap().iter().any(|row| matches!(row.values().get(1), Some(SqliteValue::Text(o)) if o.to_string().starts_with("Seek")))
 }
-fn setup(ddl: &[&str]) -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").unwrap();
+async fn setup(ddl: &[&str]) -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in ddl {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
     (f, r)
 }
-fn ins(f: &Connection, r: &rusqlite::Connection, s: &str) {
-    f.execute(s).unwrap();
+async fn ins(f: &Connection, r: &rusqlite::Connection, s: &str) {
+    f.execute(s).await.unwrap();
     r.execute_batch(s).unwrap();
 }
-fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, l: &str) {
-    assert_eq!(frank(f, sql), sqlite(r, sql), "[{l}] diverged: `{sql}`");
+async fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, l: &str) {
+    assert_eq!(
+        frank(f, sql).await,
+        sqlite(r, sql),
+        "[{l}] diverged: `{sql}`"
+    );
 }
-fn check(label: &str, ddl: &[&str]) {
-    let (f, r) = setup(ddl);
+async fn check(label: &str, ddl: &[&str]) {
+    let (f, r) = setup(ddl).await;
     for i in 1..=600_i64 {
         let a = if i % 17 == 0 {
             "NULL".to_owned()
@@ -93,7 +98,8 @@ fn check(label: &str, ddl: &[&str]) {
                 i % 7,
                 i % 9
             ),
-        );
+        )
+        .await;
     }
     // IN + residual: seek the IN runs, filter the residual. Covering (id/a) and non-covering (x/c/*).
     let seeks = [
@@ -106,9 +112,9 @@ fn check(label: &str, ddl: &[&str]) {
         "SELECT a FROM t WHERE a IN (5,6) AND c = 3",
     ];
     for sql in seeks {
-        cmp(&f, &r, sql, label);
+        cmp(&f, &r, sql, label).await;
         assert!(
-            has_seek(&f, sql),
+            has_seek(&f, sql).await,
             "[{label}] IN+residual must seek: `{sql}`"
         );
     }
@@ -117,29 +123,33 @@ fn check(label: &str, ddl: &[&str]) {
         "SELECT id FROM t WHERE a IN (1,2,3)",
         "SELECT x FROM t WHERE a IN (5,6,7)",
     ] {
-        cmp(&f, &r, sql, label);
+        cmp(&f, &r, sql, label).await;
         assert!(
-            has_seek(&f, sql),
+            has_seek(&f, sql).await,
             "[{label}] exact IN must still seek: `{sql}`"
         );
     }
 }
 #[test]
 fn nonagg_in_residual_matches_sqlite() {
-    check(
-        "single",
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER, x TEXT, s TEXT);",
-            "CREATE INDEX idx_a ON t(a);",
-            "CREATE INDEX idx_c ON t(c);",
-        ],
-    );
-    check(
-        "shadowed",
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER, x TEXT, s TEXT);",
-            "CREATE INDEX idx_ax ON t(a, x);",
-            "CREATE INDEX idx_a ON t(a);",
-        ],
-    );
+    asupersync::test_utils::run_test(|| async {
+        check(
+            "single",
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER, x TEXT, s TEXT);",
+                "CREATE INDEX idx_a ON t(a);",
+                "CREATE INDEX idx_c ON t(c);",
+            ],
+        )
+        .await;
+        check(
+            "shadowed",
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER, x TEXT, s TEXT);",
+                "CREATE INDEX idx_ax ON t(a, x);",
+                "CREATE INDEX idx_a ON t(a);",
+            ],
+        )
+        .await;
+    });
 }

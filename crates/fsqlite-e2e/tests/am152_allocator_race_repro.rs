@@ -38,6 +38,7 @@
 //! `BusySnapshot` (first-committer-wins) when a write-set page aliases the
 //! peer-claimed page range. These remain `#[ignore]`d heavy stress harnesses;
 //! run with `--ignored` on demand to validate that the fix holds.
+#![recursion_limit = "512"]
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -68,11 +69,15 @@ fn backoff(attempt: u32) -> Duration {
 }
 
 /// Run `f` retrying on transient (busy/snapshot) errors until RETRY_BUDGET.
-fn with_retry<T>(label: &str, mut f: impl FnMut() -> Result<T, FrankenError>) -> Result<T, String> {
+async fn with_retry<T, Fut, F>(label: &str, mut f: F) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, FrankenError>>,
+{
     let deadline = Instant::now() + RETRY_BUDGET;
     let mut attempt = 0_u32;
     loop {
-        match f() {
+        match f().await {
             Ok(v) => return Ok(v),
             Err(err) if is_transient(&err) && Instant::now() < deadline => {
                 attempt = attempt.saturating_add(1);
@@ -83,15 +88,17 @@ fn with_retry<T>(label: &str, mut f: impl FnMut() -> Result<T, FrankenError>) ->
     }
 }
 
-fn open(path: &Path, wal: bool) -> Result<Connection, String> {
-    let conn =
-        Connection::open(path.to_string_lossy().to_string()).map_err(|e| format!("open: {e}"))?;
+async fn open(path: &Path, wal: bool) -> Result<Connection, String> {
+    let conn = Connection::open(path.to_string_lossy().to_string())
+        .await
+        .map_err(|e| format!("open: {e}"))?;
     // Generous busy_timeout so the engine's own retry loop has room.
-    let _ = conn.execute("PRAGMA busy_timeout=10000;");
+    let _ = conn.execute("PRAGMA busy_timeout=10000;").await;
     if wal {
-        with_retry("journal_mode=WAL", || {
-            conn.execute("PRAGMA journal_mode=WAL;").map(|_| ())
-        })?;
+        with_retry("journal_mode=WAL", || async {
+            conn.execute("PRAGMA journal_mode=WAL;").await.map(|_| ())
+        })
+        .await?;
     }
     // concurrent_mode is ON by default; assert it stayed on (that is the
     // whole point of the repro).
@@ -102,8 +109,8 @@ fn open(path: &Path, wal: bool) -> Result<Connection, String> {
     Ok(conn)
 }
 
-fn writer_body(path: &Path, writer_id: usize, wal: bool) -> Result<(), String> {
-    let conn = open(path, wal)?;
+async fn writer_body(path: &Path, writer_id: usize, wal: bool) -> Result<(), String> {
+    let conn = open(path, wal).await?;
     for t in 0..TABLES_PER_WRITER {
         // Tables are pre-created in the seed phase so the DDL schema-visibility
         // window does not short-circuit this writer before it builds enough
@@ -116,7 +123,7 @@ fn writer_body(path: &Path, writer_id: usize, wal: bool) -> Result<(), String> {
                 (writer_id * 131 + r) as u128
             );
             let payload_b = format!("{:050x}", (t * 977 + r) as u128);
-            with_retry(&format!("insert {table} r{r}"), || {
+            with_retry(&format!("insert {table} r{r}"), || async {
                 conn.query_with_params(
                     &format!("INSERT INTO {table} (a, b, c) VALUES (?, ?, ?);"),
                     &[
@@ -125,15 +132,20 @@ fn writer_body(path: &Path, writer_id: usize, wal: bool) -> Result<(), String> {
                         SqliteValue::Integer((writer_id * 1000 + r) as i64),
                     ],
                 )
+                .await
                 .map(|_| ())
-            })?;
+            })
+            .await?;
         }
     }
     Ok(())
 }
 
-fn integrity_messages(conn: &Connection) -> Result<Vec<String>, String> {
-    let rows: Vec<Row> = with_retry("integrity_check", || conn.query("PRAGMA integrity_check;"))?;
+async fn integrity_messages(conn: &Connection) -> Result<Vec<String>, String> {
+    let rows: Vec<Row> = with_retry("integrity_check", || async {
+        conn.query("PRAGMA integrity_check;").await
+    })
+    .await?;
     rows.iter()
         .map(|row| match row.values().first() {
             Some(SqliteValue::Text(t)) => Ok(t.to_string()),
@@ -151,22 +163,34 @@ fn run_scenario(wal: bool) -> Result<(), String> {
     // opportunity). Pre-create every writer's tables here so the only
     // concurrent work is page-allocating INSERTs.
     {
-        let conn = open(&db_path, wal)?;
-        with_retry("seed", || {
-            conn.execute("CREATE TABLE IF NOT EXISTS _seed (id INTEGER PRIMARY KEY, v TEXT);")
-                .map(|_| ())
-        })?;
-        for w in 0..WRITERS {
-            for t in 0..TABLES_PER_WRITER {
-                let table = format!("w{w}_t{t}");
-                with_retry(&format!("seed create {table}"), || {
-                    conn.execute(&format!(
-                        "CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY, a TEXT, b TEXT, c INTEGER);"
-                    ))
-                    .map(|_| ())
-                })?;
+        let mut seed_outcome: Result<(), String> = Ok(());
+        asupersync::test_utils::run_test(|| async {
+            seed_outcome = async {
+                let conn = open(&db_path, wal).await?;
+                with_retry("seed", || async {
+                    conn.execute("CREATE TABLE IF NOT EXISTS _seed (id INTEGER PRIMARY KEY, v TEXT);")
+                        .await
+                        .map(|_| ())
+                })
+                .await?;
+                for w in 0..WRITERS {
+                    for t in 0..TABLES_PER_WRITER {
+                        let table = format!("w{w}_t{t}");
+                        with_retry(&format!("seed create {table}"), || async {
+                            conn.execute(&format!(
+                                "CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY, a TEXT, b TEXT, c INTEGER);"
+                            ))
+                            .await
+                            .map(|_| ())
+                        })
+                        .await?;
+                    }
+                }
+                Ok(())
             }
-        }
+            .await;
+        });
+        seed_outcome?;
     }
 
     let errors = Arc::new(AtomicUsize::new(0));
@@ -176,10 +200,12 @@ fn run_scenario(wal: bool) -> Result<(), String> {
             let path = Arc::clone(&path_arc);
             let errors = Arc::clone(&errors);
             thread::spawn(move || {
-                if let Err(e) = writer_body(&path, w, wal) {
-                    eprintln!("[writer {w}] FAILED: {e}");
-                    errors.fetch_add(1, Ordering::Relaxed);
-                }
+                asupersync::test_utils::run_test(|| async {
+                    if let Err(e) = writer_body(&path, w, wal).await {
+                        eprintln!("[writer {w}] FAILED: {e}");
+                        errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
             })
         })
         .collect();
@@ -190,13 +216,21 @@ fn run_scenario(wal: bool) -> Result<(), String> {
     let writer_errors = errors.load(Ordering::Relaxed);
 
     // Integrity check via frank.
-    let verify = open(&db_path, wal)?;
-    if wal {
-        // Fold the WAL back so a fresh rusqlite open sees everything.
-        let _ = verify.execute("PRAGMA wal_checkpoint(TRUNCATE);");
-    }
-    let frank_msgs = integrity_messages(&verify)?;
-    drop(verify);
+    let mut verify_outcome: Result<Vec<String>, String> = Ok(Vec::new());
+    asupersync::test_utils::run_test(|| async {
+        verify_outcome = async {
+            let verify = open(&db_path, wal).await?;
+            if wal {
+                // Fold the WAL back so a fresh rusqlite open sees everything.
+                let _ = verify.execute("PRAGMA wal_checkpoint(TRUNCATE);").await;
+            }
+            let frank_msgs = integrity_messages(&verify).await?;
+            drop(verify);
+            Ok(frank_msgs)
+        }
+        .await;
+    });
+    let frank_msgs = verify_outcome?;
 
     // Cross-check with canonical rusqlite (stock SQLite) too.
     let rusqlite_msg: String = {
@@ -302,42 +336,49 @@ const BARRIER_ROWS_PER_TXN: usize = 60;
 /// INSERT, or at COMMIT) rolls back and retries the whole txn. This is the
 /// correct concurrent-writer contract: the engine may abort a writer that
 /// raced on a page, and the writer retries against a fresh snapshot.
-fn concurrent_txn_insert(
+async fn concurrent_txn_insert(
     conn: &Connection,
     table: &str,
     writer_id: usize,
     round: usize,
     rows: usize,
 ) -> Result<(), String> {
-    let attempt_once = || -> Result<(), FrankenError> {
-        conn.execute("BEGIN CONCURRENT;")?;
+    let attempt_once = || async {
+        conn.execute("BEGIN CONCURRENT;").await?;
         for r in 0..rows {
             let payload = format!(
                 "{table}-rnd{round}-r{r}-{:0220x}",
                 (writer_id * 7919 + round * 131 + r) as u128
             );
-            if let Err(e) = conn.query_with_params(
-                &format!("INSERT INTO {table} (payload) VALUES (?);"),
-                &[SqliteValue::Text(payload.into())],
-            ) {
-                let _ = conn.execute("ROLLBACK;");
+            if let Err(e) = conn
+                .query_with_params(
+                    &format!("INSERT INTO {table} (payload) VALUES (?);"),
+                    &[SqliteValue::Text(payload.into())],
+                )
+                .await
+            {
+                let _ = conn.execute("ROLLBACK;").await;
                 return Err(e);
             }
         }
-        conn.execute("COMMIT;").map(|_| ()).inspect_err(|_| {
-            let _ = conn.execute("ROLLBACK;");
-        })
+        match conn.execute("COMMIT;").await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK;").await;
+                Err(e)
+            }
+        }
     };
-    with_retry(&format!("concurrent txn {table} rnd{round}"), attempt_once)
+    with_retry(&format!("concurrent txn {table} rnd{round}"), attempt_once).await
 }
 
-fn barrier_writer(
+async fn barrier_writer(
     path: &Path,
     writer_id: usize,
     wal: bool,
     barrier: &Barrier,
 ) -> Result<usize, String> {
-    let conn = open(path, wal)?;
+    let conn = open(path, wal).await?;
     let table = format!("bw{writer_id}");
     // Tables are pre-created in the seed phase. One alignment barrier before
     // the loop lines all writers up so they allocate data pages from the same
@@ -348,7 +389,7 @@ fn barrier_writer(
 
     let mut committed_rows = 0usize;
     for round in 0..BARRIER_ROUNDS {
-        concurrent_txn_insert(&conn, &table, writer_id, round, BARRIER_ROWS_PER_TXN)?;
+        concurrent_txn_insert(&conn, &table, writer_id, round, BARRIER_ROWS_PER_TXN).await?;
         committed_rows += BARRIER_ROWS_PER_TXN;
     }
     Ok(committed_rows)
@@ -358,19 +399,31 @@ fn run_barrier_scenario(wal: bool) -> Result<(), String> {
     let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
     let db_path = dir.path().join("am152_barrier.db");
     {
-        let conn = open(&db_path, wal)?;
-        with_retry("seed", || {
-            conn.execute("CREATE TABLE IF NOT EXISTS _seed (id INTEGER PRIMARY KEY);")
-                .map(|_| ())
-        })?;
-        for w in 0..BARRIER_WRITERS {
-            with_retry(&format!("seed create bw{w}"), || {
-                conn.execute(&format!(
-                    "CREATE TABLE IF NOT EXISTS bw{w} (id INTEGER PRIMARY KEY, payload TEXT);"
-                ))
-                .map(|_| ())
-            })?;
-        }
+        let mut seed_outcome: Result<(), String> = Ok(());
+        asupersync::test_utils::run_test(|| async {
+            seed_outcome = async {
+                let conn = open(&db_path, wal).await?;
+                with_retry("seed", || async {
+                    conn.execute("CREATE TABLE IF NOT EXISTS _seed (id INTEGER PRIMARY KEY);")
+                        .await
+                        .map(|_| ())
+                })
+                .await?;
+                for w in 0..BARRIER_WRITERS {
+                    with_retry(&format!("seed create bw{w}"), || async {
+                        conn.execute(&format!(
+                            "CREATE TABLE IF NOT EXISTS bw{w} (id INTEGER PRIMARY KEY, payload TEXT);"
+                        ))
+                        .await
+                        .map(|_| ())
+                    })
+                    .await?;
+                }
+                Ok(())
+            }
+            .await;
+        });
+        seed_outcome?;
     }
 
     let barrier = Arc::new(Barrier::new(BARRIER_WRITERS));
@@ -384,14 +437,18 @@ fn run_barrier_scenario(wal: bool) -> Result<(), String> {
             let barrier = Arc::clone(&barrier);
             let committed = Arc::clone(&committed);
             let errors = Arc::clone(&errors);
-            thread::spawn(move || match barrier_writer(&path, w, wal, &barrier) {
-                Ok(n) => {
-                    committed.fetch_add(n, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    eprintln!("[barrier writer {w}] FAILED: {e}");
-                    errors.fetch_add(1, Ordering::Relaxed);
-                }
+            thread::spawn(move || {
+                asupersync::test_utils::run_test(|| async {
+                    match barrier_writer(&path, w, wal, &barrier).await {
+                        Ok(n) => {
+                            committed.fetch_add(n, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            eprintln!("[barrier writer {w}] FAILED: {e}");
+                            errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
             })
         })
         .collect();
@@ -402,22 +459,32 @@ fn run_barrier_scenario(wal: bool) -> Result<(), String> {
     let total_committed = committed.load(Ordering::Relaxed);
 
     // Verify via frank.
-    let verify = open(&db_path, wal)?;
-    if wal {
-        let _ = verify.execute("PRAGMA wal_checkpoint(TRUNCATE);");
-    }
-    let frank_msgs = integrity_messages(&verify)?;
-    // Sum actual rows present per writer table.
-    let mut actual_total = 0i64;
-    for w in 0..BARRIER_WRITERS {
-        let rows = with_retry(&format!("count bw{w}"), || {
-            verify.query(&format!("SELECT COUNT(*) FROM bw{w};"))
-        })?;
-        if let Some(SqliteValue::Integer(n)) = rows.first().and_then(|r| r.values().first()) {
-            actual_total += *n;
+    let mut verify_outcome: Result<(Vec<String>, i64), String> = Ok((Vec::new(), 0));
+    asupersync::test_utils::run_test(|| async {
+        verify_outcome = async {
+            let verify = open(&db_path, wal).await?;
+            if wal {
+                let _ = verify.execute("PRAGMA wal_checkpoint(TRUNCATE);").await;
+            }
+            let frank_msgs = integrity_messages(&verify).await?;
+            // Sum actual rows present per writer table.
+            let mut actual_total = 0i64;
+            for w in 0..BARRIER_WRITERS {
+                let rows = with_retry(&format!("count bw{w}"), || async {
+                    verify.query(&format!("SELECT COUNT(*) FROM bw{w};")).await
+                })
+                .await?;
+                if let Some(SqliteValue::Integer(n)) = rows.first().and_then(|r| r.values().first())
+                {
+                    actual_total += *n;
+                }
+            }
+            drop(verify);
+            Ok((frank_msgs, actual_total))
         }
-    }
-    drop(verify);
+        .await;
+    });
+    let (frank_msgs, actual_total) = verify_outcome?;
 
     // Cross-check with rusqlite.
     let rusqlite_msg: String = {

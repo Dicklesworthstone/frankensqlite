@@ -28,8 +28,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -61,11 +61,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -75,7 +75,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -99,60 +99,69 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 
 #[test]
 fn integer_pk_is_rowid_alias() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
-            "INSERT INTO t(v) VALUES ('a')", // id auto = 1
-            "INSERT INTO t(id, v) VALUES (100, 'b')",
-            "INSERT INTO t(id, v) VALUES (NULL, 'c')", // NULL alias -> auto = 101
-        ],
-        &[
-            "SELECT id, rowid, v FROM t ORDER BY id", // (1,1,a),(100,100,b),(101,101,c)
-            "SELECT count(*) FROM t WHERE id = rowid", // 3 (alias)
-            "SELECT typeof(id) FROM t ORDER BY id",   // integer x3
-        ],
-        "integer_pk_is_rowid_alias",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
+                "INSERT INTO t(v) VALUES ('a')", // id auto = 1
+                "INSERT INTO t(id, v) VALUES (100, 'b')",
+                "INSERT INTO t(id, v) VALUES (NULL, 'c')", // NULL alias -> auto = 101
+            ],
+            &[
+                "SELECT id, rowid, v FROM t ORDER BY id", // (1,1,a),(100,100,b),(101,101,c)
+                "SELECT count(*) FROM t WHERE id = rowid", // 3 (alias)
+                "SELECT typeof(id) FROM t ORDER BY id",   // integer x3
+            ],
+            "integer_pk_is_rowid_alias",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn integer_pk_desc_is_not_rowid_alias() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY DESC, v TEXT)",
-            "INSERT INTO t(id, v) VALUES (5, 'a')", // hidden rowid = 1
-            "INSERT INTO t(id, v) VALUES (10, 'b')", // hidden rowid = 2
-            // not the alias, so NULL is allowed and stays NULL
-            "INSERT INTO t(id, v) VALUES (NULL, 'c')", // hidden rowid = 3, id = NULL
-        ],
-        &[
-            // id and rowid diverge: rowid 1,2,3 vs id 5,10,NULL
-            "SELECT id, rowid, v FROM t ORDER BY rowid",
-            "SELECT count(*) FROM t WHERE id <> rowid", // 2 (the 5 and 10 rows)
-            "SELECT v FROM t WHERE id IS NULL",         // 'c'
-            "SELECT id FROM t ORDER BY id",             // NULL, 5, 10
-        ],
-        "integer_pk_desc_is_not_rowid_alias",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY DESC, v TEXT)",
+                "INSERT INTO t(id, v) VALUES (5, 'a')", // hidden rowid = 1
+                "INSERT INTO t(id, v) VALUES (10, 'b')", // hidden rowid = 2
+                // not the alias, so NULL is allowed and stays NULL
+                "INSERT INTO t(id, v) VALUES (NULL, 'c')", // hidden rowid = 3, id = NULL
+            ],
+            &[
+                // id and rowid diverge: rowid 1,2,3 vs id 5,10,NULL
+                "SELECT id, rowid, v FROM t ORDER BY rowid",
+                "SELECT count(*) FROM t WHERE id <> rowid", // 2 (the 5 and 10 rows)
+                "SELECT v FROM t WHERE id IS NULL",         // 'c'
+                "SELECT id FROM t ORDER BY id",             // NULL, 5, 10
+            ],
+            "integer_pk_desc_is_not_rowid_alias",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn nonalias_primary_key_allows_nulls() {
     // A TEXT PRIMARY KEY in a rowid table does NOT imply NOT NULL, and the
     // unique index treats NULLs as distinct, so multiple NULLs are accepted.
-    scenario(
-        &[
-            "CREATE TABLE t (a INTEGER, b TEXT PRIMARY KEY)",
-            "INSERT INTO t VALUES (1, 'x')",
-            "INSERT INTO t VALUES (2, NULL)", // NULL PK allowed
-            "INSERT INTO t VALUES (3, NULL)", // second NULL PK also allowed
-            "INSERT INTO t VALUES (4, 'x')",  // duplicate non-NULL -> UNIQUE error
-        ],
-        &[
-            "SELECT count(*) FROM t",                 // 3 (the dup failed)
-            "SELECT count(*) FROM t WHERE b IS NULL", // 2
-            "SELECT a FROM t WHERE b = 'x'",          // 1
-        ],
-        "nonalias_primary_key_allows_nulls",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (a INTEGER, b TEXT PRIMARY KEY)",
+                "INSERT INTO t VALUES (1, 'x')",
+                "INSERT INTO t VALUES (2, NULL)", // NULL PK allowed
+                "INSERT INTO t VALUES (3, NULL)", // second NULL PK also allowed
+                "INSERT INTO t VALUES (4, 'x')",  // duplicate non-NULL -> UNIQUE error
+            ],
+            &[
+                "SELECT count(*) FROM t",                 // 3 (the dup failed)
+                "SELECT count(*) FROM t WHERE b IS NULL", // 2
+                "SELECT a FROM t WHERE b = 'x'",          // 1
+            ],
+            "nonalias_primary_key_allows_nulls",
+        )
+        .await;
+    });
 }

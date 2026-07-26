@@ -7,6 +7,7 @@
 //! scientific-notation thresholds. The riskier cases are repeating decimals,
 //! integer-valued floats (`3.0`), and large/small magnitudes where exponent
 //! formatting (`1.0e+20` vs `1e20`) commonly differs. Those are isolated.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -24,8 +25,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -57,12 +58,12 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn assert_scalar(queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn assert_scalar(queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -86,58 +87,70 @@ fn assert_scalar(queries: &[&str], label: &str) {
 
 #[test]
 fn float_text_simple_decimals() {
-    assert_scalar(
-        &[
-            "SELECT CAST(0.5 AS TEXT)",   // '0.5'
-            "SELECT CAST(2.5 AS TEXT)",   // '2.5'
-            "SELECT CAST(3.14 AS TEXT)",  // '3.14'
-            "SELECT CAST(-0.25 AS TEXT)", // '-0.25'
-            "SELECT 1.5 || ''",           // '1.5'
-        ],
-        "float_text_simple_decimals",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT CAST(0.5 AS TEXT)",   // '0.5'
+                "SELECT CAST(2.5 AS TEXT)",   // '2.5'
+                "SELECT CAST(3.14 AS TEXT)",  // '3.14'
+                "SELECT CAST(-0.25 AS TEXT)", // '-0.25'
+                "SELECT 1.5 || ''",           // '1.5'
+            ],
+            "float_text_simple_decimals",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn float_text_repeating_and_precision() {
-    assert_scalar(
-        &[
-            "SELECT CAST(1.0/3.0 AS TEXT)",   // 0.33333333333333332
-            "SELECT CAST(2.0/3.0 AS TEXT)",   // 0.66666666666666663
-            "SELECT CAST(0.1 + 0.2 AS TEXT)", // 0.30000000000000004
-            "SELECT (10.0/3.0) || ''",
-        ],
-        "float_text_repeating_and_precision",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT CAST(1.0/3.0 AS TEXT)",   // 0.33333333333333332
+                "SELECT CAST(2.0/3.0 AS TEXT)",   // 0.66666666666666663
+                "SELECT CAST(0.1 + 0.2 AS TEXT)", // 0.30000000000000004
+                "SELECT (10.0/3.0) || ''",
+            ],
+            "float_text_repeating_and_precision",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn float_text_integer_valued() {
-    assert_scalar(
-        &[
-            "SELECT CAST(3.0 AS TEXT)",   // '3.0'
-            "SELECT CAST(100.0 AS TEXT)", // '100.0'
-            "SELECT CAST(-7.0 AS TEXT)",  // '-7.0'
-            "SELECT 42.0 || ''",          // '42.0'
-        ],
-        "float_text_integer_valued",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT CAST(3.0 AS TEXT)",   // '3.0'
+                "SELECT CAST(100.0 AS TEXT)", // '100.0'
+                "SELECT CAST(-7.0 AS TEXT)",  // '-7.0'
+                "SELECT 42.0 || ''",          // '42.0'
+            ],
+            "float_text_integer_valued",
+        )
+        .await;
+    });
 }
 
 /// Large/small magnitudes: scientific-notation thresholds and exponent format
 /// are the most likely to diverge between frank's and SQLite's formatters.
 #[test]
 fn float_text_magnitude_scientific() {
-    assert_scalar(
-        &[
-            "SELECT CAST(1e20 AS TEXT)",
-            "SELECT CAST(1e-10 AS TEXT)",
-            "SELECT CAST(1.5e15 AS TEXT)",
-            "SELECT CAST(1.5e16 AS TEXT)",
-            "SELECT CAST(1e308 AS TEXT)",
-            "SELECT CAST(1e-300 AS TEXT)",
-            "SELECT CAST(123456789012345.6 AS TEXT)",
-        ],
-        "float_text_magnitude_scientific",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT CAST(1e20 AS TEXT)",
+                "SELECT CAST(1e-10 AS TEXT)",
+                "SELECT CAST(1.5e15 AS TEXT)",
+                "SELECT CAST(1.5e16 AS TEXT)",
+                "SELECT CAST(1e308 AS TEXT)",
+                "SELECT CAST(1e-300 AS TEXT)",
+                "SELECT CAST(123456789012345.6 AS TEXT)",
+            ],
+            "float_text_magnitude_scientific",
+        )
+        .await;
+    });
 }

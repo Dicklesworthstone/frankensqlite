@@ -31,8 +31,9 @@ fn render(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+async fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     conn.query(sql)
+        .await
         .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"))
         .iter()
         .map(|row| row.values().iter().map(render).collect())
@@ -65,8 +66,9 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
 
 /// True if the plan opens an index cursor (an `OpenRead` whose P4 text is one of `idx_names`) — i.e.
 /// it seeks/walks the index rather than table-scanning.
-fn opens_index(conn: &Connection, sql: &str, idx_names: &[&str]) -> bool {
+async fn opens_index(conn: &Connection, sql: &str, idx_names: &[&str]) -> bool {
     conn.query(&format!("EXPLAIN {sql}"))
+        .await
         .unwrap()
         .iter()
         .any(|row| {
@@ -80,8 +82,9 @@ fn opens_index(conn: &Connection, sql: &str, idx_names: &[&str]) -> bool {
 }
 
 /// True if the plan opens the base table `t` (a full-scan tell for a covering aggregate).
-fn opens_table(conn: &Connection, sql: &str, table: &str) -> bool {
+async fn opens_table(conn: &Connection, sql: &str, table: &str) -> bool {
     conn.query(&format!("EXPLAIN {sql}"))
+        .await
         .unwrap()
         .iter()
         .any(|row| {
@@ -111,11 +114,11 @@ const RANGES: &[&str] = &[
     "SELECT COUNT(*) FROM t WHERE a < 0",
 ];
 
-fn check_schema(label: &str, ddl: &[&str], idx_names: &[&str]) {
-    let f = Connection::open(":memory:").expect("frank");
+async fn check_schema(label: &str, ddl: &[&str], idx_names: &[&str]) {
+    let f = Connection::open(":memory:").await.expect("frank");
     let r = rusqlite::Connection::open_in_memory().expect("sqlite");
     for stmt in ddl {
-        f.execute(stmt).unwrap();
+        f.execute(stmt).await.unwrap();
         r.execute_batch(stmt).unwrap();
     }
     for i in 1..=3000_i64 {
@@ -126,19 +129,19 @@ fn check_schema(label: &str, ddl: &[&str], idx_names: &[&str]) {
             format!("{}", i % 10)
         };
         let stmt = format!("INSERT INTO t VALUES ({i}, {a}, {b}, {});", i % 100);
-        f.execute(&stmt).unwrap();
+        f.execute(&stmt).await.unwrap();
         r.execute_batch(&stmt).unwrap();
     }
 
     for sql in RANGES {
         assert_eq!(
-            frank_rows(&f, sql),
+            frank_rows(&f, sql).await,
             sqlite_rows(&r, sql),
             "[{label}] diverged: `{sql}`"
         );
         // The whole point: a pure range aggregate must open an index, never table-scan.
         assert!(
-            opens_index(&f, sql, idx_names),
+            opens_index(&f, sql, idx_names).await,
             "[{label}] range aggregate must open an index (not table-scan): `{sql}`"
         );
     }
@@ -149,37 +152,41 @@ fn check_schema(label: &str, ddl: &[&str], idx_names: &[&str]) {
         "SELECT SUM(a) FROM t WHERE a < 5",
     ] {
         assert!(
-            !opens_table(&f, sql, "t"),
+            !opens_table(&f, sql, "t").await,
             "[{label}] covering range aggregate must not open the table: `{sql}`"
         );
     }
     // SUM of a non-indexed column still needs the table lookup.
     assert!(
-        opens_table(&f, "SELECT SUM(x) FROM t WHERE a < 5", "t"),
+        opens_table(&f, "SELECT SUM(x) FROM t WHERE a < 5", "t").await,
         "[{label}] SUM(non-indexed col) range must open the table"
     );
 }
 
 #[test]
 fn agg_range_shadowed_index_matches_sqlite() {
-    // Single-column index only: control (already seeked before the fix).
-    check_schema(
-        "single idx_a",
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER);",
-            "CREATE INDEX idx_a ON t(a);",
-        ],
-        &["idx_a"],
-    );
-    // Composite index declared FIRST, shadowing idx_a: the regressing case. The single-column idx_a
-    // must still be found and seeked.
-    check_schema(
-        "idx_ab shadows idx_a",
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER);",
-            "CREATE INDEX idx_ab ON t(a, b);",
-            "CREATE INDEX idx_a ON t(a);",
-        ],
-        &["idx_a"],
-    );
+    asupersync::test_utils::run_test(|| async {
+        // Single-column index only: control (already seeked before the fix).
+        check_schema(
+            "single idx_a",
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER);",
+                "CREATE INDEX idx_a ON t(a);",
+            ],
+            &["idx_a"],
+        )
+        .await;
+        // Composite index declared FIRST, shadowing idx_a: the regressing case. The single-column idx_a
+        // must still be found and seeked.
+        check_schema(
+            "idx_ab shadows idx_a",
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER);",
+                "CREATE INDEX idx_ab ON t(a, b);",
+                "CREATE INDEX idx_a ON t(a);",
+            ],
+            &["idx_a"],
+        )
+        .await;
+    });
 }

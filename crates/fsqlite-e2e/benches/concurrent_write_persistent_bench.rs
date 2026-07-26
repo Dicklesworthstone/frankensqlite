@@ -73,8 +73,14 @@ const FSQLITE_ENGINE_ID: &str = "fsqlite_mvcc";
 // ─── PRAGMA helpers ─────────────────────────────────────────────────────
 
 fn run_fsqlite_pragma(conn: &fsqlite::Connection, pragma: &str) {
-    conn.execute(pragma)
+    fsqlite_e2e::block_on(conn.execute(pragma))
         .unwrap_or_else(|error| panic!("failed to execute benchmark pragma `{pragma}`: {error:?}"));
+}
+
+fn rollback_fsqlite(conn: &fsqlite::Connection, context: &str) {
+    fsqlite_e2e::block_on(conn.execute("ROLLBACK")).unwrap_or_else(|error| {
+        panic!("failed to roll back FrankenSQLite transaction after {context}: {error:?}")
+    });
 }
 
 fn apply_setup_pragmas_fsqlite(conn: &fsqlite::Connection) {
@@ -758,10 +764,12 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                 let path = tmp.path().to_str().unwrap().to_owned();
                 {
                     // Setup: create tables using a single connection
-                    let setup = fsqlite::Connection::open(&path).unwrap();
+                    let setup = fsqlite_e2e::block_on(fsqlite::Connection::open(&path))
+                        .expect("open FrankenSQLite setup connection");
                     apply_setup_pragmas_fsqlite(&setup);
                     for tid in 0..n_threads {
-                        setup.execute(&create_table_sql(tid)).unwrap();
+                        fsqlite_e2e::block_on(setup.execute(&create_table_sql(tid)))
+                            .expect("create FrankenSQLite benchmark table");
                     }
                 }
                 let conflict_count = Arc::new(AtomicU64::new(0));
@@ -794,10 +802,12 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                         let op_timings = operation_timings.clone();
                         let per_thread_retry_stages = retry_stage_counts.clone();
                         thread::spawn(move || {
-                            let conn = fsqlite::Connection::open(&p).unwrap();
+                            let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(&p))
+                                .expect("open FrankenSQLite writer connection");
                             apply_session_pragmas_fsqlite(&conn);
                             let insert_stmt = insert_sql(tid);
-                            let stmt = conn.prepare(&insert_stmt).unwrap();
+                            let stmt = fsqlite_e2e::block_on(conn.prepare(&insert_stmt))
+                                .expect("prepare FrankenSQLite INSERT");
                             bar.wait();
 
                             for i in 0..ROWS_PER_THREAD {
@@ -812,7 +822,9 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                     // BEGIN CONCURRENT with retry
                                     loop {
                                         let begin_start = Instant::now();
-                                        match conn.execute("BEGIN CONCURRENT") {
+                                        match fsqlite_e2e::block_on(
+                                            conn.execute("BEGIN CONCURRENT"),
+                                        ) {
                                             Ok(_) => {
                                                 operation_timing.begin_retry_handoff +=
                                                     begin_start.elapsed();
@@ -854,8 +866,9 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
 
                                     // INSERT
                                     let execute_start = Instant::now();
-                                    if let Err(e) =
-                                        stmt.execute_with_params(&[SqliteValue::Integer(row_id)])
+                                    if let Err(e) = fsqlite_e2e::block_on(
+                                        stmt.execute_with_params(&[SqliteValue::Integer(row_id)]),
+                                    )
                                     {
                                         operation_timing.statement_execute_body +=
                                             execute_start.elapsed();
@@ -872,7 +885,10 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                                         .saturating_add(1);
                                             }
                                             let rollback_start = Instant::now();
-                                            let _ = conn.execute("ROLLBACK");
+                                            rollback_fsqlite(
+                                                &conn,
+                                                "duplicate INSERT after retry",
+                                            );
                                             operation_timing.rollback_cleanup +=
                                                 rollback_start.elapsed();
                                             break 'txn;
@@ -883,7 +899,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                             // Snapshot conflict — rollback and retry
                                             conflicts.fetch_add(1, Ordering::Relaxed);
                                             let rollback_start = Instant::now();
-                                            let _ = conn.execute("ROLLBACK");
+                                            rollback_fsqlite(&conn, "INSERT conflict");
                                             operation_timing.rollback_cleanup +=
                                                 rollback_start.elapsed();
                                             retry_count += 1;
@@ -910,7 +926,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                         }
                                         if is_corruption_error(&e) {
                                             let rollback_start = Instant::now();
-                                            let _ = conn.execute("ROLLBACK");
+                                            rollback_fsqlite(&conn, "corrupt INSERT");
                                             operation_timing.rollback_cleanup +=
                                                 rollback_start.elapsed();
                                             panic!("CORRUPTION DETECTED: {e:?}");
@@ -922,7 +938,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
 
                                     // COMMIT with retry
                                     let commit_start = Instant::now();
-                                    match conn.execute("COMMIT") {
+                                    match fsqlite_e2e::block_on(conn.execute("COMMIT")) {
                                         Ok(_) => {
                                             operation_timing.commit_roundtrip +=
                                                 commit_start.elapsed();
@@ -936,7 +952,7 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                             {
                                                 conflicts.fetch_add(1, Ordering::Relaxed);
                                                 let rollback_start = Instant::now();
-                                                let _ = conn.execute("ROLLBACK");
+                                                rollback_fsqlite(&conn, "COMMIT conflict");
                                                 operation_timing.rollback_cleanup +=
                                                     rollback_start.elapsed();
                                                 retry_count += 1;

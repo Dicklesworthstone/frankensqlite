@@ -6,6 +6,7 @@
 //! constraints, AND/OR combinations, and CHECK enforcement on UPDATE (a failed
 //! UPDATE leaves the row unchanged). DML is autocommit; each scenario runs on
 //! both engines asserting per-statement agreement, then compares state.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -23,8 +24,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -56,11 +57,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -70,7 +71,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -94,110 +95,131 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 
 #[test]
 fn check_column_violation() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v > 0))",
-            "INSERT INTO t VALUES (1, 5)",   // ok
-            "INSERT INTO t VALUES (2, -1)",  // CHECK fails -> error on both
-            "INSERT INTO t VALUES (3, 0)",   // CHECK fails (0 not > 0)
-            "INSERT INTO t VALUES (4, 100)", // ok
-        ],
-        &["SELECT id, v FROM t ORDER BY id"], // only 1 and 4
-        "check_column_violation",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v > 0))",
+                "INSERT INTO t VALUES (1, 5)",   // ok
+                "INSERT INTO t VALUES (2, -1)",  // CHECK fails -> error on both
+                "INSERT INTO t VALUES (3, 0)",   // CHECK fails (0 not > 0)
+                "INSERT INTO t VALUES (4, 100)", // ok
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // only 1 and 4
+            "check_column_violation",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn check_null_passes() {
     // CHECK rejects only FALSE; a NULL operand makes the predicate NULL -> pass.
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v > 0))",
-            "INSERT INTO t VALUES (1, 5)",
-            "INSERT INTO t(id) VALUES (2)", // v defaults to NULL -> CHECK passes
-            "INSERT INTO t VALUES (3, NULL)", // explicit NULL -> passes
-        ],
-        &["SELECT id, v FROM t ORDER BY id"], // all three present
-        "check_null_passes",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v > 0))",
+                "INSERT INTO t VALUES (1, 5)",
+                "INSERT INTO t(id) VALUES (2)", // v defaults to NULL -> CHECK passes
+                "INSERT INTO t VALUES (3, NULL)", // explicit NULL -> passes
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // all three present
+            "check_null_passes",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn check_table_level() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, lo INTEGER, hi INTEGER, CHECK (lo <= hi))",
-            "INSERT INTO t VALUES (1, 1, 10)", // ok
-            "INSERT INTO t VALUES (2, 5, 5)",  // ok (equal)
-            "INSERT INTO t VALUES (3, 10, 1)", // fails
-        ],
-        &["SELECT id, lo, hi FROM t ORDER BY id"],
-        "check_table_level",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, lo INTEGER, hi INTEGER, CHECK (lo <= hi))",
+                "INSERT INTO t VALUES (1, 1, 10)", // ok
+                "INSERT INTO t VALUES (2, 5, 5)",  // ok (equal)
+                "INSERT INTO t VALUES (3, 10, 1)", // fails
+            ],
+            &["SELECT id, lo, hi FROM t ORDER BY id"],
+            "check_table_level",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn check_multiple_constraints() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, \
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, \
                age INTEGER CHECK (age >= 0), \
                score INTEGER CHECK (score BETWEEN 0 AND 100))",
-            "INSERT INTO t VALUES (1, 25, 80)",  // ok
-            "INSERT INTO t VALUES (2, -1, 80)",  // age fails
-            "INSERT INTO t VALUES (3, 25, 150)", // score fails
-            "INSERT INTO t VALUES (4, 0, 0)",    // ok (boundaries)
-        ],
-        &["SELECT id, age, score FROM t ORDER BY id"], // 1 and 4
-        "check_multiple_constraints",
-    );
+                "INSERT INTO t VALUES (1, 25, 80)",  // ok
+                "INSERT INTO t VALUES (2, -1, 80)",  // age fails
+                "INSERT INTO t VALUES (3, 25, 150)", // score fails
+                "INSERT INTO t VALUES (4, 0, 0)",    // ok (boundaries)
+            ],
+            &["SELECT id, age, score FROM t ORDER BY id"], // 1 and 4
+            "check_multiple_constraints",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn check_with_expression_and_function() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, \
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, \
                name TEXT CHECK (length(name) >= 3), \
                kind TEXT CHECK (kind IN ('a','b','c')), \
                n INTEGER CHECK (typeof(n) = 'integer'))",
-            "INSERT INTO t VALUES (1, 'abc', 'a', 10)", // ok
-            "INSERT INTO t VALUES (2, 'ab', 'a', 10)",  // name too short
-            "INSERT INTO t VALUES (3, 'abcd', 'x', 10)", // kind not in set
-            "INSERT INTO t VALUES (4, 'abcd', 'b', 20)", // ok
-        ],
-        &["SELECT id, name, kind, n FROM t ORDER BY id"], // 1 and 4
-        "check_with_expression_and_function",
-    );
+                "INSERT INTO t VALUES (1, 'abc', 'a', 10)", // ok
+                "INSERT INTO t VALUES (2, 'ab', 'a', 10)",  // name too short
+                "INSERT INTO t VALUES (3, 'abcd', 'x', 10)", // kind not in set
+                "INSERT INTO t VALUES (4, 'abcd', 'b', 20)", // ok
+            ],
+            &["SELECT id, name, kind, n FROM t ORDER BY id"], // 1 and 4
+            "check_with_expression_and_function",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn check_named_and_boolean_combo() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, \
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, \
                v INTEGER CONSTRAINT v_range CHECK (v > 0 AND v < 100), \
                flag INTEGER CONSTRAINT flag_bool CHECK (flag = 0 OR flag = 1))",
-            "INSERT INTO t VALUES (1, 50, 1)",  // ok
-            "INSERT INTO t VALUES (2, 150, 0)", // v out of range
-            "INSERT INTO t VALUES (3, 50, 2)",  // flag invalid
-            "INSERT INTO t VALUES (4, 1, 0)",   // ok
-        ],
-        &["SELECT id, v, flag FROM t ORDER BY id"], // 1 and 4
-        "check_named_and_boolean_combo",
-    );
+                "INSERT INTO t VALUES (1, 50, 1)",  // ok
+                "INSERT INTO t VALUES (2, 150, 0)", // v out of range
+                "INSERT INTO t VALUES (3, 50, 2)",  // flag invalid
+                "INSERT INTO t VALUES (4, 1, 0)",   // ok
+            ],
+            &["SELECT id, v, flag FROM t ORDER BY id"], // 1 and 4
+            "check_named_and_boolean_combo",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn check_enforced_on_update() {
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v >= 0))",
-            "INSERT INTO t VALUES (1, 10),(2, 20)",
-            "UPDATE t SET v = -5 WHERE id = 1", // violates CHECK -> fails, row unchanged
-            "UPDATE t SET v = 99 WHERE id = 2", // ok
-        ],
-        &["SELECT id, v FROM t ORDER BY id"], // (1,10) unchanged, (2,99)
-        "check_enforced_on_update",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v >= 0))",
+                "INSERT INTO t VALUES (1, 10),(2, 20)",
+                "UPDATE t SET v = -5 WHERE id = 1", // violates CHECK -> fails, row unchanged
+                "UPDATE t SET v = 99 WHERE id = 2", // ok
+            ],
+            &["SELECT id, v FROM t ORDER BY id"], // (1,10) unchanged, (2,99)
+            "check_enforced_on_update",
+        )
+        .await;
+    });
 }

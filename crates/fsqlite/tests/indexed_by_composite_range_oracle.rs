@@ -11,8 +11,9 @@
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 
-fn opcodes(conn: &Connection, sql: &str) -> Vec<String> {
+async fn opcodes(conn: &Connection, sql: &str) -> Vec<String> {
     conn.query(&format!("EXPLAIN {sql}"))
+        .await
         .unwrap_or_else(|e| panic!("explain `{sql}`: {e}"))
         .iter()
         .filter_map(|row| match row.values().get(1) {
@@ -22,8 +23,9 @@ fn opcodes(conn: &Connection, sql: &str) -> Vec<String> {
         .collect()
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+async fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     conn.query(sql)
+        .await
         .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"))
         .iter()
         .map(|row| {
@@ -62,15 +64,15 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
     .collect()
 }
 
-fn assert_rows_match(f: &Connection, r: &rusqlite::Connection, sql: &str) {
-    let mut a = frank_rows(f, sql);
+async fn assert_rows_match(f: &Connection, r: &rusqlite::Connection, sql: &str) {
+    let mut a = frank_rows(f, sql).await;
     let mut b = sqlite_rows(r, sql);
     a.sort();
     b.sort();
     assert_eq!(a, b, "result diverged from C SQLite: `{sql}`");
 }
 
-fn seed(f: &Connection, r: &rusqlite::Connection) {
+async fn seed(f: &Connection, r: &rusqlite::Connection) {
     // The exact CASS shape from GH #291: UNIQUE(conversation_id, idx) gives
     // the two-key-term autoindex `sqlite_autoindex_messages_1`.
     for stmt in [
@@ -80,7 +82,7 @@ fn seed(f: &Connection, r: &rusqlite::Connection) {
          seq INTEGER NOT NULL, note TEXT);",
         "CREATE INDEX idx_events_kind_seq ON events(kind, seq);",
     ] {
-        f.execute(stmt).unwrap();
+        f.execute(stmt).await.unwrap();
         r.execute_batch(stmt).unwrap();
     }
     let mut id = 0_i64;
@@ -89,14 +91,14 @@ fn seed(f: &Connection, r: &rusqlite::Connection) {
             id += 1;
             let stmt =
                 format!("INSERT INTO messages VALUES ({id}, 'c{conv}', {idx}, 'm-{conv}-{idx}');");
-            f.execute(&stmt).unwrap();
+            f.execute(&stmt).await.unwrap();
             r.execute_batch(&stmt).unwrap();
             let stmt = format!(
                 "INSERT INTO events VALUES ({id}, {}, {}, 'e-{id}');",
                 conv % 7,
                 idx
             );
-            f.execute(&stmt).unwrap();
+            f.execute(&stmt).await.unwrap();
             r.execute_batch(&stmt).unwrap();
         }
     }
@@ -104,51 +106,53 @@ fn seed(f: &Connection, r: &rusqlite::Connection) {
 
 #[test]
 fn indexed_by_composite_range_seeks_instead_of_full_scan() {
-    let f = Connection::open(":memory:").expect("frank");
-    let r = rusqlite::Connection::open_in_memory().expect("sqlite");
-    seed(&f, &r);
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.expect("frank");
+        let r = rusqlite::Connection::open_in_memory().expect("sqlite");
+        seed(&f, &r).await;
 
-    let hinted_autoindex = "SELECT idx FROM messages INDEXED BY sqlite_autoindex_messages_1 \
+        let hinted_autoindex = "SELECT idx FROM messages INDEXED BY sqlite_autoindex_messages_1 \
          WHERE conversation_id = 'c7' AND idx >= 5 AND idx <= 34";
-    let unhinted = "SELECT idx FROM messages \
+        let unhinted = "SELECT idx FROM messages \
          WHERE conversation_id = 'c7' AND idx >= 5 AND idx <= 34";
-    let hinted_named = "SELECT seq FROM events INDEXED BY idx_events_kind_seq \
+        let hinted_named = "SELECT seq FROM events INDEXED BY idx_events_kind_seq \
          WHERE kind = 3 AND seq >= 2 AND seq <= 30";
-    let not_indexed = "SELECT idx FROM messages NOT INDEXED \
+        let not_indexed = "SELECT idx FROM messages NOT INDEXED \
          WHERE conversation_id = 'c7' AND idx >= 5 AND idx <= 34";
 
-    // GH #291 plan pin: the hinted queries must SEEK the composite index and
-    // must not Rewind (full-scan) the table.
-    for sql in [hinted_autoindex, unhinted, hinted_named] {
-        let ops = opcodes(&f, sql);
-        assert!(
-            ops.iter().any(|op| op.starts_with("Seek")),
-            "expected a composite index seek for `{sql}`, got ops {ops:?}"
-        );
-        assert!(
-            !ops.iter().any(|op| op == "Rewind"),
-            "hinted composite range must not degrade to a full scan (GH #291) \
+        // GH #291 plan pin: the hinted queries must SEEK the composite index and
+        // must not Rewind (full-scan) the table.
+        for sql in [hinted_autoindex, unhinted, hinted_named] {
+            let ops = opcodes(&f, sql).await;
+            assert!(
+                ops.iter().any(|op| op.starts_with("Seek")),
+                "expected a composite index seek for `{sql}`, got ops {ops:?}"
+            );
+            assert!(
+                !ops.iter().any(|op| op == "Rewind"),
+                "hinted composite range must not degrade to a full scan (GH #291) \
              for `{sql}`, got ops {ops:?}"
+            );
+        }
+
+        // `NOT INDEXED` demands a table scan by definition — it must keep one.
+        let ops = opcodes(&f, not_indexed).await;
+        assert!(
+            ops.iter().any(|op| op == "Rewind"),
+            "NOT INDEXED must full-scan, got ops {ops:?}"
         );
-    }
 
-    // `NOT INDEXED` demands a table scan by definition — it must keep one.
-    let ops = opcodes(&f, not_indexed);
-    assert!(
-        ops.iter().any(|op| op == "Rewind"),
-        "NOT INDEXED must full-scan, got ops {ops:?}"
-    );
+        // Row-level oracle: all four shapes match C SQLite exactly.
+        for sql in [hinted_autoindex, unhinted, hinted_named, not_indexed] {
+            assert_rows_match(&f, &r, sql).await;
+        }
 
-    // Row-level oracle: all four shapes match C SQLite exactly.
-    for sql in [hinted_autoindex, unhinted, hinted_named, not_indexed] {
-        assert_rows_match(&f, &r, sql);
-    }
-
-    // Hinting an index that cannot serve the shape must not mis-seek: a hint
-    // naming a different table's index is a prepare-time error in SQLite, so
-    // use a mismatched shape instead (leading-column range) and just require
-    // oracle-identical rows.
-    let mismatched = "SELECT idx FROM messages INDEXED BY sqlite_autoindex_messages_1 \
+        // Hinting an index that cannot serve the shape must not mis-seek: a hint
+        // naming a different table's index is a prepare-time error in SQLite, so
+        // use a mismatched shape instead (leading-column range) and just require
+        // oracle-identical rows.
+        let mismatched = "SELECT idx FROM messages INDEXED BY sqlite_autoindex_messages_1 \
          WHERE idx >= 5 AND idx <= 6";
-    assert_rows_match(&f, &r, mismatched);
+        assert_rows_match(&f, &r, mismatched).await;
+    });
 }

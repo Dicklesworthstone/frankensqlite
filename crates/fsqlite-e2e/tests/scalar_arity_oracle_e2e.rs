@@ -24,8 +24,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -57,12 +57,13 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn assert_scalar(queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn assert_scalar(queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        let frank = frank_rows(&f, q).await;
+        match (frank, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -86,37 +87,43 @@ fn assert_scalar(queries: &[&str], label: &str) {
 
 #[test]
 fn scalar_arity_wrong_count_rejected() {
-    assert_scalar(
-        &[
-            "SELECT abs()",           // too few (needs 1)
-            "SELECT abs(1, 2)",       // too many
-            "SELECT length()",        // too few
-            "SELECT upper()",         // too few
-            "SELECT lower('a', 'b')", // too many
-            "SELECT ifnull(1)",       // needs 2
-            "SELECT ifnull(1, 2, 3)", // too many
-            "SELECT nullif(1)",       // needs 2
-            "SELECT coalesce(1)",     // needs >= 2
-            "SELECT quote()",         // needs 1
-            "SELECT quote(1, 2)",     // too many
-        ],
-        "scalar_arity_wrong_count_rejected",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT abs()",           // too few (needs 1)
+                "SELECT abs(1, 2)",       // too many
+                "SELECT length()",        // too few
+                "SELECT upper()",         // too few
+                "SELECT lower('a', 'b')", // too many
+                "SELECT ifnull(1)",       // needs 2
+                "SELECT ifnull(1, 2, 3)", // too many
+                "SELECT nullif(1)",       // needs 2
+                "SELECT coalesce(1)",     // needs >= 2
+                "SELECT quote()",         // needs 1
+                "SELECT quote(1, 2)",     // too many
+            ],
+            "scalar_arity_wrong_count_rejected",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn scalar_arity_correct_ok() {
-    assert_scalar(
-        &[
-            "SELECT abs(-3)",                 // 3
-            "SELECT length('abc')",           // 3
-            "SELECT upper('a')",              // 'A'
-            "SELECT lower('AB')",             // 'ab'
-            "SELECT ifnull(NULL, 5)",         // 5
-            "SELECT nullif(1, 2)",            // 1
-            "SELECT coalesce(NULL, NULL, 7)", // 7
-            "SELECT quote('x')",              // 'x' quoted
-        ],
-        "scalar_arity_correct_ok",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT abs(-3)",                 // 3
+                "SELECT length('abc')",           // 3
+                "SELECT upper('a')",              // 'A'
+                "SELECT lower('AB')",             // 'ab'
+                "SELECT ifnull(NULL, 5)",         // 5
+                "SELECT nullif(1, 2)",            // 1
+                "SELECT coalesce(NULL, NULL, 7)", // 7
+                "SELECT quote('x')",              // 'x' quoted
+            ],
+            "scalar_arity_correct_ok",
+        )
+        .await;
+    });
 }

@@ -3500,7 +3500,7 @@ mod tests {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    fn persist_test_db(
+    async fn persist_test_db(
         path: &Path,
         schema: &[TableSchema],
         db: &MemDatabase,
@@ -3508,12 +3508,12 @@ mod tests {
         change_counter: u32,
     ) -> Result<()> {
         let cx = Cx::new();
-        persist_to_sqlite(&cx, path, schema, db, schema_cookie, change_counter)
+        persist_to_sqlite(&cx, path, schema, db, schema_cookie, change_counter).await
     }
 
-    fn load_test_db(path: &Path) -> Result<LoadedState> {
+    async fn load_test_db(path: &Path) -> Result<LoadedState> {
         let cx = Cx::new();
-        load_from_sqlite(&cx, path)
+        load_from_sqlite(&cx, path).await
     }
 
     #[test]
@@ -3627,68 +3627,74 @@ mod tests {
 
     #[test]
     fn test_roundtrip_persist_and_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("test.db");
 
-        let (schema, db) = make_test_schema_and_db();
-        persist_test_db(&db_path, &schema, &db, 0, 0).unwrap();
+            let (schema, db) = make_test_schema_and_db();
+            persist_test_db(&db_path, &schema, &db, 0, 0).await.unwrap();
 
-        assert!(db_path.exists(), "db file should exist");
-        assert!(is_sqlite_format(&db_path), "should have SQLite magic");
+            assert!(db_path.exists(), "db file should exist");
+            assert!(is_sqlite_format(&db_path), "should have SQLite magic");
 
-        let loaded = load_test_db(&db_path).unwrap();
-        assert_eq!(loaded.schema.len(), 1);
-        assert_eq!(loaded.schema[0].name, "test_table");
-        assert_eq!(loaded.schema[0].columns.len(), 2);
+            let loaded = load_test_db(&db_path).await.unwrap();
+            assert_eq!(loaded.schema.len(), 1);
+            assert_eq!(loaded.schema[0].name, "test_table");
+            assert_eq!(loaded.schema[0].columns.len(), 2);
 
-        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
-        let rows: Vec<_> = table.iter_rows().collect();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0, 1); // rowid
-        assert_eq!(rows[0].1[0], SqliteValue::Integer(42));
-        assert_eq!(rows[0].1[1], SqliteValue::Text("hello".into()));
-        assert_eq!(rows[1].0, 2);
-        assert_eq!(rows[1].1[0], SqliteValue::Integer(99));
-        assert_eq!(rows[1].1[1], SqliteValue::Text("world".into()));
+            let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+            let rows: Vec<_> = table.iter_rows().collect();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].0, 1); // rowid
+            assert_eq!(rows[0].1[0], SqliteValue::Integer(42));
+            assert_eq!(rows[0].1[1], SqliteValue::Text("hello".into()));
+            assert_eq!(rows[1].0, 2);
+            assert_eq!(rows[1].1[0], SqliteValue::Integer(99));
+            assert_eq!(rows[1].1[1], SqliteValue::Text("world".into()));
+        });
     }
 
     #[test]
     fn test_empty_database_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("empty.db");
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("empty.db");
 
-        let schema: Vec<TableSchema> = Vec::new();
-        let db = MemDatabase::new();
-        persist_test_db(&db_path, &schema, &db, 0, 0).unwrap();
+            let schema: Vec<TableSchema> = Vec::new();
+            let db = MemDatabase::new();
+            persist_test_db(&db_path, &schema, &db, 0, 0).await.unwrap();
 
-        assert!(is_sqlite_format(&db_path));
+            assert!(is_sqlite_format(&db_path));
 
-        let loaded = load_test_db(&db_path).unwrap();
-        assert!(loaded.schema.is_empty());
+            let loaded = load_test_db(&db_path).await.unwrap();
+            assert!(loaded.schema.is_empty());
+        });
     }
 
     #[test]
     fn test_persist_creates_sqlite3_readable_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("readable.db");
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("readable.db");
 
-        let (schema, db) = make_test_schema_and_db();
-        persist_test_db(&db_path, &schema, &db, 0, 0).unwrap();
+            let (schema, db) = make_test_schema_and_db();
+            persist_test_db(&db_path, &schema, &db, 0, 0).await.unwrap();
 
-        // Verify with rusqlite (C SQLite) that the file is valid.
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, name FROM test_table ORDER BY id")
-            .unwrap();
-        let rows: Vec<(i64, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+            // Verify with rusqlite (C SQLite) that the file is valid.
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT id, name FROM test_table ORDER BY id")
+                .unwrap();
+            let rows: Vec<(i64, String)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
 
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], (42, "hello".to_owned()));
-        assert_eq!(rows[1], (99, "world".to_owned()));
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0], (42, "hello".to_owned()));
+            assert_eq!(rows[1], (99, "world".to_owned()));
+        });
     }
 
     #[test]
@@ -3702,109 +3708,116 @@ mod tests {
 
     #[test]
     fn test_load_sqlite3_created_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("from_c.db");
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("from_c.db");
 
-        // Create with C SQLite via rusqlite.
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE items (val INTEGER, label TEXT);
+            // Create with C SQLite via rusqlite.
+            {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE items (val INTEGER, label TEXT);
                  INSERT INTO items VALUES (10, 'alpha');
                  INSERT INTO items VALUES (20, 'beta');",
-            )
-            .unwrap();
-        }
+                )
+                .unwrap();
+            }
 
-        // Load with our compat loader.
-        let loaded = load_test_db(&db_path).unwrap();
-        assert_eq!(loaded.schema.len(), 1);
-        assert_eq!(loaded.schema[0].name, "items");
+            // Load with our compat loader.
+            let loaded = load_test_db(&db_path).await.unwrap();
+            assert_eq!(loaded.schema.len(), 1);
+            assert_eq!(loaded.schema[0].name, "items");
 
-        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
-        let rows: Vec<_> = table.iter_rows().collect();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
-        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
-        assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
-        assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
+            let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+            let rows: Vec<_> = table.iter_rows().collect();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
+            assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
+            assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
+            assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
+        });
     }
 
     #[test]
     fn test_load_sqlite3_created_file_restores_integer_primary_key_alias_values() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("from_c_ipk.db");
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("from_c_ipk.db");
 
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT);
+            {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT);
                  INSERT INTO items (id, label) VALUES (10, 'alpha');
                  INSERT INTO items (id, label) VALUES (20, 'beta');",
-            )
-            .unwrap();
-        }
+                )
+                .unwrap();
+            }
 
-        let loaded = load_test_db(&db_path).unwrap();
-        assert_eq!(loaded.schema.len(), 1);
-        assert_eq!(loaded.schema[0].name, "items");
-        assert!(loaded.schema[0].columns[0].is_ipk);
-        assert!(
-            loaded.schema[0].indexes.is_empty(),
-            "table-level INTEGER PRIMARY KEY rowid aliases must not synthesize autoindexes"
-        );
+            let loaded = load_test_db(&db_path).await.unwrap();
+            assert_eq!(loaded.schema.len(), 1);
+            assert_eq!(loaded.schema[0].name, "items");
+            assert!(loaded.schema[0].columns[0].is_ipk);
+            assert!(
+                loaded.schema[0].indexes.is_empty(),
+                "table-level INTEGER PRIMARY KEY rowid aliases must not synthesize autoindexes"
+            );
 
-        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
-        let rows: Vec<_> = table.iter_rows().collect();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0, 10);
-        assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
-        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
-        assert_eq!(rows[1].0, 20);
-        assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
-        assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
+            let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+            let rows: Vec<_> = table.iter_rows().collect();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].0, 10);
+            assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
+            assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
+            assert_eq!(rows[1].0, 20);
+            assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
+            assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
+        });
     }
 
     #[test]
     fn test_load_sqlite3_created_file_restores_table_level_integer_primary_key_alias_values() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("from_c_table_pk.db");
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("from_c_table_pk.db");
 
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE items (id INTEGER, label TEXT, PRIMARY KEY(id));
+            {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE items (id INTEGER, label TEXT, PRIMARY KEY(id));
                  INSERT INTO items (id, label) VALUES (10, 'alpha');
                  INSERT INTO items (id, label) VALUES (20, 'beta');",
-            )
-            .unwrap();
-        }
+                )
+                .unwrap();
+            }
 
-        let loaded = load_test_db(&db_path).unwrap();
-        assert_eq!(loaded.schema.len(), 1);
-        assert_eq!(loaded.schema[0].name, "items");
-        assert!(loaded.schema[0].columns[0].is_ipk);
+            let loaded = load_test_db(&db_path).await.unwrap();
+            assert_eq!(loaded.schema.len(), 1);
+            assert_eq!(loaded.schema[0].name, "items");
+            assert!(loaded.schema[0].columns[0].is_ipk);
 
-        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
-        let rows: Vec<_> = table.iter_rows().collect();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0, 10);
-        assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
-        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
-        assert_eq!(rows[1].0, 20);
-        assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
-        assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
+            let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+            let rows: Vec<_> = table.iter_rows().collect();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].0, 10);
+            assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
+            assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
+            assert_eq!(rows[1].0, 20);
+            assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
+            assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
+        });
     }
 
     #[test]
     fn test_load_sqlite3_rowid_alias_multi_alter_short_rows_preserves_alignment() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("from_c_ipk_multi_alter.db");
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("from_c_ipk_multi_alter.db");
 
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE items (
+            {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE items (
                     prefix TEXT,
                     id INTEGER PRIMARY KEY,
                     nullable TEXT,
@@ -3814,82 +3827,87 @@ mod tests {
                  VALUES ('p', 7, NULL, 'keep');
                  ALTER TABLE items ADD COLUMN extra TEXT DEFAULT 'x';
                  ALTER TABLE items ADD COLUMN note INTEGER DEFAULT 9;",
-            )
-            .unwrap();
-        }
+                )
+                .unwrap();
+            }
 
-        let loaded = load_test_db(&db_path).unwrap();
-        assert_eq!(loaded.schema.len(), 1);
-        assert_eq!(loaded.schema[0].name, "items");
+            let loaded = load_test_db(&db_path).await.unwrap();
+            assert_eq!(loaded.schema.len(), 1);
+            assert_eq!(loaded.schema[0].name, "items");
 
-        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
-        let rows: Vec<_> = table.iter_rows().collect();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, 7);
-        assert_eq!(rows[0].1[0], SqliteValue::Text("p".into()));
-        assert_eq!(rows[0].1[1], SqliteValue::Integer(7));
-        assert_eq!(rows[0].1[2], SqliteValue::Null);
-        assert_eq!(rows[0].1[3], SqliteValue::Text("keep".into()));
-        assert_eq!(rows[0].1[4], SqliteValue::Text("x".into()));
-        assert_eq!(rows[0].1[5], SqliteValue::Integer(9));
+            let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+            let rows: Vec<_> = table.iter_rows().collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].0, 7);
+            assert_eq!(rows[0].1[0], SqliteValue::Text("p".into()));
+            assert_eq!(rows[0].1[1], SqliteValue::Integer(7));
+            assert_eq!(rows[0].1[2], SqliteValue::Null);
+            assert_eq!(rows[0].1[3], SqliteValue::Text("keep".into()));
+            assert_eq!(rows[0].1[4], SqliteValue::Text("x".into()));
+            assert_eq!(rows[0].1[5], SqliteValue::Integer(9));
+        });
     }
 
     #[test]
     fn test_load_sqlite3_rowid_alias_parenthesized_added_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("from_c_ipk_parenthesized_defaults.db");
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("from_c_ipk_parenthesized_defaults.db");
 
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
+            {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
                  INSERT INTO items(id, name) VALUES (3, 'alpha');
                  ALTER TABLE items ADD COLUMN score INTEGER DEFAULT (9);
                  ALTER TABLE items ADD COLUMN tag TEXT DEFAULT ('fallback');",
-            )
-            .unwrap();
-        }
+                )
+                .unwrap();
+            }
 
-        let loaded = load_test_db(&db_path).unwrap();
-        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
-        let rows: Vec<_> = table.iter_rows().collect();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, 3);
-        assert_eq!(rows[0].1[0], SqliteValue::Integer(3));
-        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
-        assert_eq!(rows[0].1[2], SqliteValue::Integer(9));
-        assert_eq!(rows[0].1[3], SqliteValue::Text("fallback".into()));
+            let loaded = load_test_db(&db_path).await.unwrap();
+            let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+            let rows: Vec<_> = table.iter_rows().collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].0, 3);
+            assert_eq!(rows[0].1[0], SqliteValue::Integer(3));
+            assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
+            assert_eq!(rows[0].1[2], SqliteValue::Integer(9));
+            assert_eq!(rows[0].1[3], SqliteValue::Text("fallback".into()));
+        });
     }
 
     #[test]
     fn test_load_sqlite3_altered_short_rows_parse_boolean_blob_and_quoted_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("from_c_ipk_literal_defaults.db");
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("from_c_ipk_literal_defaults.db");
 
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                r#"CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
+            {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute_batch(
+                    r#"CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
                  INSERT INTO items(id, name) VALUES (5, 'alpha');
                  ALTER TABLE items ADD COLUMN active BOOLEAN DEFAULT TRUE;
                  ALTER TABLE items ADD COLUMN disabled BOOLEAN DEFAULT FALSE;
                  ALTER TABLE items ADD COLUMN payload BLOB DEFAULT X'6162';
                  ALTER TABLE items ADD COLUMN tag TEXT DEFAULT "fallback";"#,
-            )
-            .unwrap();
-        }
+                )
+                .unwrap();
+            }
 
-        let loaded = load_test_db(&db_path).unwrap();
-        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
-        let rows: Vec<_> = table.iter_rows().collect();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, 5);
-        assert_eq!(rows[0].1[0], SqliteValue::Integer(5));
-        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
-        assert_eq!(rows[0].1[2], SqliteValue::Integer(1));
-        assert_eq!(rows[0].1[3], SqliteValue::Integer(0));
-        assert_eq!(rows[0].1[4], SqliteValue::from(vec![0x61, 0x62]));
-        assert_eq!(rows[0].1[5], SqliteValue::Text("fallback".into()));
+            let loaded = load_test_db(&db_path).await.unwrap();
+            let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+            let rows: Vec<_> = table.iter_rows().collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].0, 5);
+            assert_eq!(rows[0].1[0], SqliteValue::Integer(5));
+            assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
+            assert_eq!(rows[0].1[2], SqliteValue::Integer(1));
+            assert_eq!(rows[0].1[3], SqliteValue::Integer(0));
+            assert_eq!(rows[0].1[4], SqliteValue::from(vec![0x61, 0x62]));
+            assert_eq!(rows[0].1[5], SqliteValue::Text("fallback".into()));
+        });
     }
 
     #[test]
@@ -3940,29 +3958,30 @@ mod tests {
 
     #[test]
     fn test_load_sqlite3_created_file_with_nondefault_page_size_and_reserved_bytes() {
-        if Command::new("sqlite3").arg("--version").output().is_err() {
-            eprintln!("skipping: sqlite3 binary not found");
-            return;
-        }
+        asupersync::test_utils::run_test(|| async {
+            if Command::new("sqlite3").arg("--version").output().is_err() {
+                eprintln!("skipping: sqlite3 binary not found");
+                return;
+            }
 
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("from_c_reserved_bytes.db");
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("from_c_reserved_bytes.db");
 
-        let mut child = Command::new("sqlite3")
-            .arg(&db_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("sqlite3 process should start");
-        {
-            let mut stdin = child
-                .stdin
-                .take()
-                .expect("sqlite3 stdin should be available");
-            stdin
-                .write_all(
-                    br"PRAGMA journal_mode=DELETE;
+            let mut child = Command::new("sqlite3")
+                .arg(&db_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("sqlite3 process should start");
+            {
+                let mut stdin = child
+                    .stdin
+                    .take()
+                    .expect("sqlite3 stdin should be available");
+                stdin
+                    .write_all(
+                        br"PRAGMA journal_mode=DELETE;
 PRAGMA page_size=8192;
 VACUUM;
 .filectrl reserve_bytes 32
@@ -3972,49 +3991,50 @@ INSERT INTO items VALUES (10, 'alpha');
 INSERT INTO items VALUES (20, 'beta');
 PRAGMA integrity_check;
 ",
-                )
-                .expect("sqlite3 setup should accept the script");
-        }
-        let output = child
-            .wait_with_output()
-            .expect("sqlite3 process should finish");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.status.success()
-            && (stdout.contains("unknown")
-                || stdout.contains("Usage:")
-                || stderr.contains("unknown")
-                || stderr.contains("Usage:"))
-        {
-            eprintln!(
-                "skipping: sqlite3 shell does not support .filectrl reserve_bytes: stdout={stdout} stderr={stderr}"
+                    )
+                    .expect("sqlite3 setup should accept the script");
+            }
+            let output = child
+                .wait_with_output()
+                .expect("sqlite3 process should finish");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !output.status.success()
+                && (stdout.contains("unknown")
+                    || stdout.contains("Usage:")
+                    || stderr.contains("unknown")
+                    || stderr.contains("Usage:"))
+            {
+                eprintln!(
+                    "skipping: sqlite3 shell does not support .filectrl reserve_bytes: stdout={stdout} stderr={stderr}"
+                );
+                return;
+            }
+            assert!(
+                output.status.success(),
+                "sqlite3 reserved-byte setup failed: stdout={stdout} stderr={stderr}"
             );
-            return;
-        }
-        assert!(
-            output.status.success(),
-            "sqlite3 reserved-byte setup failed: stdout={stdout} stderr={stderr}"
-        );
-        assert!(
-            stdout.lines().any(|line| line.trim() == "ok"),
-            "sqlite3 should report integrity_check=ok for the reserved-byte database: stdout={stdout} stderr={stderr}"
-        );
+            assert!(
+                stdout.lines().any(|line| line.trim() == "ok"),
+                "sqlite3 should report integrity_check=ok for the reserved-byte database: stdout={stdout} stderr={stderr}"
+            );
 
-        let loaded = load_test_db(&db_path).unwrap_or_else(|error| {
+            let loaded = load_test_db(&db_path).await.unwrap_or_else(|error| {
             panic!(
                 "compat loader must read valid C SQLite files with non-default page sizes and reserved bytes: {error}"
             )
         });
-        assert_eq!(loaded.schema.len(), 1);
-        assert_eq!(loaded.schema[0].name, "items");
+            assert_eq!(loaded.schema.len(), 1);
+            assert_eq!(loaded.schema[0].name, "items");
 
-        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
-        let rows: Vec<_> = table.iter_rows().collect();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
-        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
-        assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
-        assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
+            let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+            let rows: Vec<_> = table.iter_rows().collect();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
+            assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
+            assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
+            assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
+        });
     }
 
     #[test]
@@ -4034,87 +4054,89 @@ PRAGMA integrity_check;
 
     #[test]
     fn test_multiple_tables_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("multi.db");
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("multi.db");
 
-        let mut db = MemDatabase::new();
-        let root_a = db.create_table(1);
-        db.tables
-            .get_mut(&root_a)
-            .unwrap()
-            .insert_row(1, vec![SqliteValue::Text("row_a".into())]);
+            let mut db = MemDatabase::new();
+            let root_a = db.create_table(1);
+            db.tables
+                .get_mut(&root_a)
+                .unwrap()
+                .insert_row(1, vec![SqliteValue::Text("row_a".into())]);
 
-        let root_b = db.create_table(1);
-        db.tables
-            .get_mut(&root_b)
-            .unwrap()
-            .insert_row(1, vec![SqliteValue::Integer(777)]);
+            let root_b = db.create_table(1);
+            db.tables
+                .get_mut(&root_b)
+                .unwrap()
+                .insert_row(1, vec![SqliteValue::Integer(777)]);
 
-        let schema = vec![
-            TableSchema {
-                name: "alpha".to_owned(),
-                root_page: root_a,
-                columns: vec![ColumnInfo {
-                    name: "val".to_owned(),
-                    affinity: 'C',
-                    is_ipk: false,
-                    type_name: None,
-                    notnull: false,
-                    unique: false,
-                    default_value: None,
-                    strict_type: None,
-                    generated_expr: None,
-                    generated_stored: None,
-                    collation: None,
-                    conflict_action: None,
-                }],
-                indexes: Vec::new(),
-                strict: false,
-                without_rowid: false,
-                primary_key_constraints: Vec::new(),
-                foreign_keys: Vec::new(),
-                check_constraints: Vec::new(),
-            },
-            TableSchema {
-                name: "beta".to_owned(),
-                root_page: root_b,
-                columns: vec![ColumnInfo {
-                    name: "num".to_owned(),
-                    affinity: 'd',
-                    is_ipk: false,
-                    type_name: None,
-                    notnull: false,
-                    unique: false,
-                    default_value: None,
-                    strict_type: None,
-                    generated_expr: None,
-                    generated_stored: None,
-                    collation: None,
-                    conflict_action: None,
-                }],
-                indexes: Vec::new(),
-                strict: false,
-                without_rowid: false,
-                primary_key_constraints: Vec::new(),
-                foreign_keys: Vec::new(),
-                check_constraints: Vec::new(),
-            },
-        ];
+            let schema = vec![
+                TableSchema {
+                    name: "alpha".to_owned(),
+                    root_page: root_a,
+                    columns: vec![ColumnInfo {
+                        name: "val".to_owned(),
+                        affinity: 'C',
+                        is_ipk: false,
+                        type_name: None,
+                        notnull: false,
+                        unique: false,
+                        default_value: None,
+                        strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
+                        collation: None,
+                        conflict_action: None,
+                    }],
+                    indexes: Vec::new(),
+                    strict: false,
+                    without_rowid: false,
+                    primary_key_constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    check_constraints: Vec::new(),
+                },
+                TableSchema {
+                    name: "beta".to_owned(),
+                    root_page: root_b,
+                    columns: vec![ColumnInfo {
+                        name: "num".to_owned(),
+                        affinity: 'd',
+                        is_ipk: false,
+                        type_name: None,
+                        notnull: false,
+                        unique: false,
+                        default_value: None,
+                        strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
+                        collation: None,
+                        conflict_action: None,
+                    }],
+                    indexes: Vec::new(),
+                    strict: false,
+                    without_rowid: false,
+                    primary_key_constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    check_constraints: Vec::new(),
+                },
+            ];
 
-        persist_test_db(&db_path, &schema, &db, 0, 0).unwrap();
-        let loaded = load_test_db(&db_path).unwrap();
+            persist_test_db(&db_path, &schema, &db, 0, 0).await.unwrap();
+            let loaded = load_test_db(&db_path).await.unwrap();
 
-        assert_eq!(loaded.schema.len(), 2);
-        assert_eq!(loaded.schema[0].name, "alpha");
-        assert_eq!(loaded.schema[1].name, "beta");
+            assert_eq!(loaded.schema.len(), 2);
+            assert_eq!(loaded.schema[0].name, "alpha");
+            assert_eq!(loaded.schema[1].name, "beta");
 
-        let tbl_a = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
-        let rows_a: Vec<_> = tbl_a.iter_rows().collect();
-        assert_eq!(rows_a[0].1[0], SqliteValue::Text("row_a".into()));
+            let tbl_a = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+            let rows_a: Vec<_> = tbl_a.iter_rows().collect();
+            assert_eq!(rows_a[0].1[0], SqliteValue::Text("row_a".into()));
 
-        let tbl_b = loaded.db.get_table(loaded.schema[1].root_page).unwrap();
-        let rows_b: Vec<_> = tbl_b.iter_rows().collect();
-        assert_eq!(rows_b[0].1[0], SqliteValue::Integer(777));
+            let tbl_b = loaded.db.get_table(loaded.schema[1].root_page).unwrap();
+            let rows_b: Vec<_> = tbl_b.iter_rows().collect();
+            assert_eq!(rows_b[0].1[0], SqliteValue::Integer(777));
+        });
     }
 
     #[test]
@@ -5190,24 +5212,25 @@ PRAGMA integrity_check;
 
     #[test]
     fn test_reserved_prefix_explicit_index_survives_without_original_table_ddl() {
-        const TABLE_SQL: &str = "CREATE TABLE link_table(\
+        asupersync::test_utils::run_test(|| async {
+            const TABLE_SQL: &str = "CREATE TABLE link_table(\
             a INTEGER NOT NULL,\
             b INTEGER NOT NULL,\
             PRIMARY KEY(a,b)\
         )";
-        const INDEX_NAME: &str = "sqlite_autoindex_link_table_v23_1";
-        const INDEX_SQL: &str = "CREATE UNIQUE INDEX \
+            const INDEX_NAME: &str = "sqlite_autoindex_link_table_v23_1";
+            const INDEX_SQL: &str = "CREATE UNIQUE INDEX \
             \"sqlite_autoindex_link_table_v23_1\" ON \"link_table\"(a,b)";
 
-        let dir = tempfile::tempdir().unwrap();
-        let source_path = dir.path().join("reserved-prefix-source.db");
-        let rebuilt_path = dir.path().join("reserved-prefix-rebuilt.db");
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("reserved-prefix-source.db");
+            let rebuilt_path = dir.path().join("reserved-prefix-rebuilt.db");
 
-        {
-            let sqlite = rusqlite::Connection::open(&source_path).unwrap();
-            sqlite
-                .execute_batch(&format!(
-                    r"
+            {
+                let sqlite = rusqlite::Connection::open(&source_path).unwrap();
+                sqlite
+                    .execute_batch(&format!(
+                        r"
                     {TABLE_SQL};
                     CREATE UNIQUE INDEX legacy_unique ON link_table(a,b);
                     INSERT INTO link_table VALUES (1,2), (3,4);
@@ -5217,97 +5240,99 @@ PRAGMA integrity_check;
                      WHERE type='index' AND name='legacy_unique';
                     PRAGMA schema_version=2;
                     "
-                ))
-                .unwrap();
-        }
+                    ))
+                    .unwrap();
+            }
 
-        {
-            let sqlite = rusqlite::Connection::open(&source_path).unwrap();
+            {
+                let sqlite = rusqlite::Connection::open(&source_path).unwrap();
+                let quick_check: String = sqlite
+                    .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+                    .unwrap();
+                let integrity_check: String = sqlite
+                    .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(quick_check, "ok");
+                assert_eq!(integrity_check, "ok");
+            }
+
+            let loaded = load_test_db(&source_path).await.unwrap();
+            let table = loaded
+                .schema
+                .iter()
+                .find(|table| table.name == "link_table")
+                .unwrap();
+            assert!(
+                table.indexes.iter().any(|index| index.name == INDEX_NAME),
+                "a non-NULL CREATE INDEX entry is explicit even with a reserved-prefix name"
+            );
+
+            let mut original_ddl = HashMap::new();
+            // Deliberately omit the table DDL so persistence must reconstruct it
+            // from TableSchema. The explicit reserved-prefix index DDL remains the
+            // provenance signal that prevents a phantom UNIQUE table constraint.
+            original_ddl.insert(INDEX_NAME.to_owned(), INDEX_SQL.to_owned());
+            let header = DatabaseHeader {
+                page_size: DEFAULT_PAGE_SIZE,
+                schema_cookie: loaded.schema_cookie,
+                change_counter: loaded.change_counter,
+                version_valid_for: loaded.change_counter,
+                ..DatabaseHeader::default()
+            };
+            persist_to_sqlite_with_header_and_master_entries(
+                &Cx::new(),
+                &rebuilt_path,
+                &loaded.schema,
+                &loaded.db,
+                &header,
+                &[],
+                &original_ddl,
+            )
+            .await
+            .unwrap();
+
+            let sqlite = rusqlite::Connection::open(&rebuilt_path).unwrap();
+            let stored_table_sql: String = sqlite
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='link_table';",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let stored_sql: String = sqlite
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1;",
+                    [INDEX_NAME],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let row_count: i64 = sqlite
+                .query_row("SELECT COUNT(*) FROM link_table;", [], |row| row.get(0))
+                .unwrap();
             let quick_check: String = sqlite
                 .query_row("PRAGMA quick_check;", [], |row| row.get(0))
                 .unwrap();
             let integrity_check: String = sqlite
                 .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
                 .unwrap();
+            assert!(
+                !stored_table_sql.to_ascii_uppercase().contains("UNIQUE"),
+                "reconstructed table DDL must not duplicate the explicit reserved-prefix index: {stored_table_sql}"
+            );
+            assert_eq!(stored_sql, INDEX_SQL);
+            assert_eq!(row_count, 2);
             assert_eq!(quick_check, "ok");
             assert_eq!(integrity_check, "ok");
-        }
+            drop(sqlite);
 
-        let loaded = load_test_db(&source_path).unwrap();
-        let table = loaded
-            .schema
-            .iter()
-            .find(|table| table.name == "link_table")
-            .unwrap();
-        assert!(
-            table.indexes.iter().any(|index| index.name == INDEX_NAME),
-            "a non-NULL CREATE INDEX entry is explicit even with a reserved-prefix name"
-        );
-
-        let mut original_ddl = HashMap::new();
-        // Deliberately omit the table DDL so persistence must reconstruct it
-        // from TableSchema. The explicit reserved-prefix index DDL remains the
-        // provenance signal that prevents a phantom UNIQUE table constraint.
-        original_ddl.insert(INDEX_NAME.to_owned(), INDEX_SQL.to_owned());
-        let header = DatabaseHeader {
-            page_size: DEFAULT_PAGE_SIZE,
-            schema_cookie: loaded.schema_cookie,
-            change_counter: loaded.change_counter,
-            version_valid_for: loaded.change_counter,
-            ..DatabaseHeader::default()
-        };
-        persist_to_sqlite_with_header_and_master_entries(
-            &Cx::new(),
-            &rebuilt_path,
-            &loaded.schema,
-            &loaded.db,
-            &header,
-            &[],
-            &original_ddl,
-        )
-        .unwrap();
-
-        let sqlite = rusqlite::Connection::open(&rebuilt_path).unwrap();
-        let stored_table_sql: String = sqlite
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='link_table';",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let stored_sql: String = sqlite
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1;",
-                [INDEX_NAME],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let row_count: i64 = sqlite
-            .query_row("SELECT COUNT(*) FROM link_table;", [], |row| row.get(0))
-            .unwrap();
-        let quick_check: String = sqlite
-            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
-            .unwrap();
-        let integrity_check: String = sqlite
-            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
-            .unwrap();
-        assert!(
-            !stored_table_sql.to_ascii_uppercase().contains("UNIQUE"),
-            "reconstructed table DDL must not duplicate the explicit reserved-prefix index: {stored_table_sql}"
-        );
-        assert_eq!(stored_sql, INDEX_SQL);
-        assert_eq!(row_count, 2);
-        assert_eq!(quick_check, "ok");
-        assert_eq!(integrity_check, "ok");
-        drop(sqlite);
-
-        let reopened = load_test_db(&rebuilt_path).unwrap();
-        let table = reopened
-            .schema
-            .iter()
-            .find(|table| table.name == "link_table")
-            .unwrap();
-        assert!(table.indexes.iter().any(|index| index.name == INDEX_NAME));
+            let reopened = load_test_db(&rebuilt_path).await.unwrap();
+            let table = reopened
+                .schema
+                .iter()
+                .find(|table| table.name == "link_table")
+                .unwrap();
+            assert!(table.indexes.iter().any(|index| index.name == INDEX_NAME));
+        });
     }
 
     #[test]
@@ -5334,371 +5359,396 @@ PRAGMA integrity_check;
 
     #[test]
     fn test_persist_to_sqlite_keeps_expression_index_btree_and_schema() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("expression-index-persist.db");
-        let cx = Cx::new();
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("expression-index-persist.db");
+            let cx = Cx::new();
 
-        let mut db = MemDatabase::new();
-        db.create_table_at(2, 3);
-        let table_data = db.get_table_mut(2).unwrap();
-        table_data.insert_row(
-            1,
-            vec![
-                SqliteValue::Integer(1),
-                SqliteValue::Text("Alpha".into()),
-                SqliteValue::Integer(1),
-            ],
-        );
-        table_data.insert_row(
-            2,
-            vec![
-                SqliteValue::Integer(2),
-                SqliteValue::Text("Dormant".into()),
-                SqliteValue::Integer(0),
-            ],
-        );
+            let mut db = MemDatabase::new();
+            db.create_table_at(2, 3);
+            let table_data = db.get_table_mut(2).unwrap();
+            table_data.insert_row(
+                1,
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("Alpha".into()),
+                    SqliteValue::Integer(1),
+                ],
+            );
+            table_data.insert_row(
+                2,
+                vec![
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("Dormant".into()),
+                    SqliteValue::Integer(0),
+                ],
+            );
 
-        let schema = vec![TableSchema {
-            name: "agents".to_owned(),
-            root_page: 2,
-            columns: vec![
-                ColumnInfo {
-                    name: "id".to_owned(),
-                    affinity: 'D',
-                    is_ipk: true,
-                    type_name: Some("INTEGER".to_owned()),
-                    notnull: false,
-                    unique: false,
-                    default_value: None,
-                    strict_type: None,
-                    generated_expr: None,
-                    generated_stored: None,
-                    collation: None,
+            let schema = vec![TableSchema {
+                name: "agents".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo {
+                        name: "id".to_owned(),
+                        affinity: 'D',
+                        is_ipk: true,
+                        type_name: Some("INTEGER".to_owned()),
+                        notnull: false,
+                        unique: false,
+                        default_value: None,
+                        strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
+                        collation: None,
+                        conflict_action: None,
+                    },
+                    ColumnInfo {
+                        name: "name".to_owned(),
+                        affinity: 'B',
+                        is_ipk: false,
+                        type_name: Some("TEXT".to_owned()),
+                        notnull: true,
+                        unique: false,
+                        default_value: None,
+                        strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
+                        collation: None,
+                        conflict_action: None,
+                    },
+                    ColumnInfo {
+                        name: "is_active".to_owned(),
+                        affinity: 'D',
+                        is_ipk: false,
+                        type_name: Some("INTEGER".to_owned()),
+                        notnull: true,
+                        unique: false,
+                        default_value: Some("1".to_owned()),
+                        strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
+                        collation: None,
+                        conflict_action: None,
+                    },
+                ],
+                indexes: vec![IndexSchema {
+                    name: "uq_agents_name_ci".to_owned(),
+                    root_page: 3,
+                    columns: Vec::new(),
+                    key_expressions: vec!["lower(name)".to_owned()],
+                    key_sort_directions: vec![SortDirection::Asc],
+                    where_clause: Some("is_active = 1".to_owned()),
+                    is_unique: true,
+                    key_collations: vec![None],
                     conflict_action: None,
-                },
-                ColumnInfo {
-                    name: "name".to_owned(),
-                    affinity: 'B',
-                    is_ipk: false,
-                    type_name: Some("TEXT".to_owned()),
-                    notnull: true,
-                    unique: false,
-                    default_value: None,
-                    strict_type: None,
-                    generated_expr: None,
-                    generated_stored: None,
-                    collation: None,
-                    conflict_action: None,
-                },
-                ColumnInfo {
-                    name: "is_active".to_owned(),
-                    affinity: 'D',
-                    is_ipk: false,
-                    type_name: Some("INTEGER".to_owned()),
-                    notnull: true,
-                    unique: false,
-                    default_value: Some("1".to_owned()),
-                    strict_type: None,
-                    generated_expr: None,
-                    generated_stored: None,
-                    collation: None,
-                    conflict_action: None,
-                },
-            ],
-            indexes: vec![IndexSchema {
-                name: "uq_agents_name_ci".to_owned(),
-                root_page: 3,
-                columns: Vec::new(),
-                key_expressions: vec!["lower(name)".to_owned()],
-                key_sort_directions: vec![SortDirection::Asc],
-                where_clause: Some("is_active = 1".to_owned()),
-                is_unique: true,
-                key_collations: vec![None],
-                conflict_action: None,
-            }],
-            strict: false,
-            without_rowid: false,
-            primary_key_constraints: vec![vec!["id".to_owned()]],
-            foreign_keys: Vec::new(),
-            check_constraints: Vec::new(),
-        }];
-        let header = DatabaseHeader {
-            page_size: DEFAULT_PAGE_SIZE,
-            schema_cookie: 1,
-            change_counter: 1,
-            version_valid_for: 1,
-            ..DatabaseHeader::default()
-        };
-        let mut original_ddl = HashMap::new();
-        original_ddl.insert(
+                }],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: vec![vec!["id".to_owned()]],
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            }];
+            let header = DatabaseHeader {
+                page_size: DEFAULT_PAGE_SIZE,
+                schema_cookie: 1,
+                change_counter: 1,
+                version_valid_for: 1,
+                ..DatabaseHeader::default()
+            };
+            let mut original_ddl = HashMap::new();
+            original_ddl.insert(
             "agents".to_owned(),
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 1)"
                 .to_owned(),
         );
-        original_ddl.insert(
-            "uq_agents_name_ci".to_owned(),
-            "CREATE UNIQUE INDEX uq_agents_name_ci ON agents(lower(name)) WHERE is_active = 1"
-                .to_owned(),
-        );
+            original_ddl.insert(
+                "uq_agents_name_ci".to_owned(),
+                "CREATE UNIQUE INDEX uq_agents_name_ci ON agents(lower(name)) WHERE is_active = 1"
+                    .to_owned(),
+            );
 
-        persist_to_sqlite_with_header_and_master_entries(
-            &cx,
-            &db_path,
-            &schema,
-            &db,
-            &header,
-            &[],
-            &original_ddl,
-        )
-        .unwrap();
-
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let integrity: String = conn
-            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            persist_to_sqlite_with_header_and_master_entries(
+                &cx,
+                &db_path,
+                &schema,
+                &db,
+                &header,
+                &[],
+                &original_ddl,
+            )
+            .await
             .unwrap();
-        assert_eq!(integrity, "ok");
-        let index_sql: String = conn
+
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let integrity: String = conn
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok");
+            let index_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_agents_name_ci';",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(
-            index_sql.to_ascii_lowercase().contains("lower(name)")
-                && index_sql
-                    .to_ascii_lowercase()
-                    .contains("where is_active = 1"),
-            "expression index SQL should be preserved: {index_sql}"
-        );
-        let duplicate = conn.execute(
-            "INSERT INTO agents(name, is_active) VALUES ('ALPHA', 1);",
-            [],
-        );
-        assert!(
-            duplicate.is_err(),
-            "persisted expression index should still enforce active-name uniqueness"
-        );
+            assert!(
+                index_sql.to_ascii_lowercase().contains("lower(name)")
+                    && index_sql
+                        .to_ascii_lowercase()
+                        .contains("where is_active = 1"),
+                "expression index SQL should be preserved: {index_sql}"
+            );
+            let duplicate = conn.execute(
+                "INSERT INTO agents(name, is_active) VALUES ('ALPHA', 1);",
+                [],
+            );
+            assert!(
+                duplicate.is_err(),
+                "persisted expression index should still enforce active-name uniqueness"
+            );
+        });
     }
 
     #[test]
     fn test_overwrite_existing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("overwrite.db");
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("overwrite.db");
 
-        // Write once.
-        let (schema, db) = make_test_schema_and_db();
-        persist_test_db(&db_path, &schema, &db, 0, 0).unwrap();
+            // Write once.
+            let (schema, db) = make_test_schema_and_db();
+            persist_test_db(&db_path, &schema, &db, 0, 0).await.unwrap();
 
-        // Overwrite with empty.
-        persist_test_db(&db_path, &[], &MemDatabase::new(), 0, 0).unwrap();
+            // Overwrite with empty.
+            persist_test_db(&db_path, &[], &MemDatabase::new(), 0, 0)
+                .await
+                .unwrap();
 
-        let loaded = load_test_db(&db_path).unwrap();
-        assert!(loaded.schema.is_empty());
+            let loaded = load_test_db(&db_path).await.unwrap();
+            assert!(loaded.schema.is_empty());
+        });
     }
 
     #[test]
     fn test_load_from_sqlite_keeps_materialized_virtual_tables_with_real_root_page() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("materialized_vtab_load.db");
-        let db_str = db_path.to_string_lossy().to_string();
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("materialized_vtab_load.db");
+            let db_str = db_path.to_string_lossy().to_string();
 
-        {
-            let conn = crate::connection::Connection::open(&db_str).unwrap();
-            conn.execute("CREATE VIRTUAL TABLE docs USING fts5(subject, body, tokenize='porter')")
+            {
+                let conn = crate::connection::Connection::open(&db_str).await.unwrap();
+                conn.execute(
+                    "CREATE VIRTUAL TABLE docs USING fts5(subject, body, tokenize='porter')",
+                )
+                .await
                 .unwrap();
-            conn.execute(
-                "INSERT INTO docs(rowid, subject, body) VALUES (1, 'Hello', 'Rust world')",
-            )
-            .unwrap();
-            conn.execute("INSERT INTO docs(rowid, subject, body) VALUES (2, 'Other', 'Nothing')")
+                conn.execute(
+                    "INSERT INTO docs(rowid, subject, body) VALUES (1, 'Hello', 'Rust world')",
+                )
+                .await
                 .unwrap();
-            conn.close().unwrap();
-        }
+                conn.execute(
+                    "INSERT INTO docs(rowid, subject, body) VALUES (2, 'Other', 'Nothing')",
+                )
+                .await
+                .unwrap();
+                conn.close().await.unwrap();
+            }
 
-        let loaded = load_test_db(&db_path).unwrap();
-        // FrankenSQLite-created FTS5 tables are now stock-compatible
-        // rootpage=0 virtual tables. The low-level compat loader deliberately
-        // skips rootpage=0 virtual-table catalog rows (they have no
-        // materialized root b-tree of their own; the live vtab is reconstructed
-        // at the higher connection-reload layer instead), so the `docs` row is
-        // NOT present here — but the durable document content it persisted DOES
-        // survive, in the positive-rootpage `docs_content` shadow table.
-        assert!(
-            loaded
+            let loaded = load_test_db(&db_path).await.unwrap();
+            // FrankenSQLite-created FTS5 tables are now stock-compatible
+            // rootpage=0 virtual tables. The low-level compat loader deliberately
+            // skips rootpage=0 virtual-table catalog rows (they have no
+            // materialized root b-tree of their own; the live vtab is reconstructed
+            // at the higher connection-reload layer instead), so the `docs` row is
+            // NOT present here — but the durable document content it persisted DOES
+            // survive, in the positive-rootpage `docs_content` shadow table.
+            assert!(
+                loaded
+                    .schema
+                    .iter()
+                    .all(|table| !table.name.eq_ignore_ascii_case("docs")),
+                "rootpage=0 FTS5 virtual-table catalog row must be skipped by the low-level loader"
+            );
+
+            // The persisted document content lives in the `docs_content` shadow
+            // table, laid out as (id INTEGER PRIMARY KEY, c0=subject, c1=body).
+            let content = loaded
                 .schema
                 .iter()
-                .all(|table| !table.name.eq_ignore_ascii_case("docs")),
-            "rootpage=0 FTS5 virtual-table catalog row must be skipped by the low-level loader"
-        );
-
-        // The persisted document content lives in the `docs_content` shadow
-        // table, laid out as (id INTEGER PRIMARY KEY, c0=subject, c1=body).
-        let content = loaded
-            .schema
-            .iter()
-            .find(|table| table.name.eq_ignore_ascii_case("docs_content"))
-            .expect("FTS5 content shadow table should survive direct load");
-        let content_columns: Vec<&str> = content
-            .columns
-            .iter()
-            .map(|column| column.name.as_str())
-            .collect();
-        assert_eq!(content_columns, vec!["id", "c0", "c1"]);
-        assert!(
-            content.root_page > 0,
-            "the _content shadow table is a real positive-rootpage b-tree"
-        );
-        let mem_table = loaded
-            .db
-            .get_table(content.root_page)
-            .expect("loaded content shadow table should exist in MemDatabase");
-        // The _content shadow b-tree stores the full record (id, c0, c1): the
-        // INTEGER PRIMARY KEY `id` is both the rowid and the first record value,
-        // followed by the document columns subject (c0) and body (c1).
-        let rows: Vec<_> = mem_table.iter_rows().collect();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0, 1);
-        assert_eq!(rows[0].1[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].1[1], SqliteValue::Text("Hello".into()));
-        assert_eq!(rows[0].1[2], SqliteValue::Text("Rust world".into()));
-        assert_eq!(rows[1].0, 2);
-        assert_eq!(rows[1].1[0], SqliteValue::Integer(2));
-        assert_eq!(rows[1].1[1], SqliteValue::Text("Other".into()));
-        assert_eq!(rows[1].1[2], SqliteValue::Text("Nothing".into()));
+                .find(|table| table.name.eq_ignore_ascii_case("docs_content"))
+                .expect("FTS5 content shadow table should survive direct load");
+            let content_columns: Vec<&str> = content
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect();
+            assert_eq!(content_columns, vec!["id", "c0", "c1"]);
+            assert!(
+                content.root_page > 0,
+                "the _content shadow table is a real positive-rootpage b-tree"
+            );
+            let mem_table = loaded
+                .db
+                .get_table(content.root_page)
+                .expect("loaded content shadow table should exist in MemDatabase");
+            // The _content shadow b-tree stores the full record (id, c0, c1): the
+            // INTEGER PRIMARY KEY `id` is both the rowid and the first record value,
+            // followed by the document columns subject (c0) and body (c1).
+            let rows: Vec<_> = mem_table.iter_rows().collect();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].0, 1);
+            assert_eq!(rows[0].1[0], SqliteValue::Integer(1));
+            assert_eq!(rows[0].1[1], SqliteValue::Text("Hello".into()));
+            assert_eq!(rows[0].1[2], SqliteValue::Text("Rust world".into()));
+            assert_eq!(rows[1].0, 2);
+            assert_eq!(rows[1].1[0], SqliteValue::Integer(2));
+            assert_eq!(rows[1].1[1], SqliteValue::Text("Other".into()));
+            assert_eq!(rows[1].1[2], SqliteValue::Text("Nothing".into()));
+        });
     }
 
     #[test]
     fn test_load_from_sqlite_rejects_non_virtual_table_with_rootpage_zero() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("compat_corrupt_rootpage_zero.db");
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("compat_corrupt_rootpage_zero.db");
 
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                r"
+            {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute_batch(
+                    r"
                 CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
                 INSERT INTO docs VALUES (1, 'hello');
                 PRAGMA writable_schema = ON;
                 UPDATE sqlite_master SET rootpage = 0 WHERE name = 'docs';
                 PRAGMA writable_schema = OFF;
                 ",
-            )
-            .unwrap();
-        }
+                )
+                .unwrap();
+            }
 
-        let err = match load_test_db(&db_path) {
-            Ok(_) => panic!("corrupt rootpage should fail load"),
-            Err(err) => err,
-        };
-        let message = err.to_string();
-        assert!(
-            message.contains("rootpage 0") || message.contains("root page"),
-            "unexpected load error: {message}"
-        );
+            let err = match load_test_db(&db_path).await {
+                Ok(_) => panic!("corrupt rootpage should fail load"),
+                Err(err) => err,
+            };
+            let message = err.to_string();
+            assert!(
+                message.contains("rootpage 0") || message.contains("root page"),
+                "unexpected load error: {message}"
+            );
+        });
     }
 
     #[test]
     fn test_load_from_sqlite_rejects_negative_rootpage() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("compat_corrupt_rootpage_negative.db");
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("compat_corrupt_rootpage_negative.db");
 
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                r"
+            {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute_batch(
+                    r"
                 CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
                 INSERT INTO docs VALUES (1, 'hello');
                 PRAGMA writable_schema = ON;
                 UPDATE sqlite_master SET rootpage = -7 WHERE name = 'docs';
                 PRAGMA writable_schema = OFF;
                 ",
-            )
-            .unwrap();
-        }
+                )
+                .unwrap();
+            }
 
-        let err = match load_test_db(&db_path) {
-            Ok(_) => panic!("negative rootpage should fail load"),
-            Err(err) => err,
-        };
-        let message = err.to_string();
-        assert!(
-            message.contains("rootpage -7") || message.contains("invalid rootpage"),
-            "unexpected load error: {message}"
-        );
+            let err = match load_test_db(&db_path).await {
+                Ok(_) => panic!("negative rootpage should fail load"),
+                Err(err) => err,
+            };
+            let message = err.to_string();
+            assert!(
+                message.contains("rootpage -7") || message.contains("invalid rootpage"),
+                "unexpected load error: {message}"
+            );
+        });
     }
 
     #[test]
     fn test_load_from_sqlite_rejects_rootpage_above_supported_range() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("compat_corrupt_rootpage_large.db");
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("compat_corrupt_rootpage_large.db");
 
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                r"
+            {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute_batch(
+                    r"
                 CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
                 INSERT INTO docs VALUES (1, 'hello');
                 PRAGMA writable_schema = ON;
                 UPDATE sqlite_master SET rootpage = 2147483648 WHERE name = 'docs';
                 PRAGMA writable_schema = OFF;
                 ",
-            )
-            .unwrap();
-        }
+                )
+                .unwrap();
+            }
 
-        let err = match load_test_db(&db_path) {
-            Ok(_) => panic!("oversized rootpage should fail load"),
-            Err(err) => err,
-        };
-        let message = err.to_string();
-        assert!(
-            message.contains("supported range")
-                || message.contains("out-of-range")
-                || message.contains("2147483648"),
-            "unexpected load error: {message}"
-        );
+            let err = match load_test_db(&db_path).await {
+                Ok(_) => panic!("oversized rootpage should fail load"),
+                Err(err) => err,
+            };
+            let message = err.to_string();
+            assert!(
+                message.contains("supported range")
+                    || message.contains("out-of-range")
+                    || message.contains("2147483648"),
+                "unexpected load error: {message}"
+            );
+        });
     }
 
     #[test]
     fn test_load_from_sqlite_rejects_index_rootpage_above_supported_range() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("compat_corrupt_index_rootpage_large.db");
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("compat_corrupt_index_rootpage_large.db");
 
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                r"
+            {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute_batch(
+                    r"
                 CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
                 CREATE INDEX docs_title_idx ON docs(title);
                 PRAGMA writable_schema = ON;
                 UPDATE sqlite_master SET rootpage = 2147483648 WHERE name = 'docs_title_idx';
                 PRAGMA writable_schema = OFF;
                 ",
-            )
-            .unwrap();
-        }
+                )
+                .unwrap();
+            }
 
-        let err = match load_test_db(&db_path) {
-            Ok(_) => panic!("oversized index rootpage should fail load"),
-            Err(err) => err,
-        };
-        let message = err.to_string();
-        assert!(
-            message.contains("docs_title_idx") && message.contains("2147483648"),
-            "unexpected load error: {message}"
-        );
+            let err = match load_test_db(&db_path).await {
+                Ok(_) => panic!("oversized index rootpage should fail load"),
+                Err(err) => err,
+            };
+            let message = err.to_string();
+            assert!(
+                message.contains("docs_title_idx") && message.contains("2147483648"),
+                "unexpected load error: {message}"
+            );
+        });
     }
 
     #[test]
     fn test_load_from_sqlite_rejects_invalid_utf8_in_sqlite_master_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("compat_corrupt_master_utf8.db");
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("compat_corrupt_master_utf8.db");
 
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                r"
+            {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute_batch(
+                    r"
                 CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
                 INSERT INTO docs VALUES (1, 'hello');
                 PRAGMA writable_schema = ON;
@@ -5707,43 +5757,50 @@ PRAGMA integrity_check;
                 WHERE name = 'docs';
                 PRAGMA writable_schema = OFF;
                 ",
-            )
-            .unwrap();
-        }
+                )
+                .unwrap();
+            }
 
-        let err = load_test_db(&db_path).expect_err("invalid sqlite_master text should fail");
-        let message = err.to_string();
-        assert!(
-            message.contains("sqlite_master row")
-                || message.contains("valid SQLite record")
-                || message.contains("payload"),
-            "unexpected load error: {message}"
-        );
+            let err = load_test_db(&db_path)
+                .await
+                .expect_err("invalid sqlite_master text should fail");
+            let message = err.to_string();
+            assert!(
+                message.contains("sqlite_master row")
+                    || message.contains("valid SQLite record")
+                    || message.contains("payload"),
+                "unexpected load error: {message}"
+            );
+        });
     }
 
     #[test]
     fn test_load_from_sqlite_rejects_invalid_utf8_in_table_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("compat_corrupt_table_utf8.db");
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("compat_corrupt_table_utf8.db");
 
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                r"
+            {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute_batch(
+                    r"
                 CREATE TABLE docs (title TEXT);
                 INSERT INTO docs VALUES (CAST(x'FF' AS TEXT));
                 ",
-            )
-            .unwrap();
-        }
+                )
+                .unwrap();
+            }
 
-        let err = load_test_db(&db_path).expect_err("invalid table text should fail");
-        let message = err.to_string();
-        assert!(
-            message.contains("table `docs`")
-                || message.contains("valid SQLite record")
-                || message.contains("payload"),
-            "unexpected load error: {message}"
-        );
+            let err = load_test_db(&db_path)
+                .await
+                .expect_err("invalid table text should fail");
+            let message = err.to_string();
+            assert!(
+                message.contains("table `docs`")
+                    || message.contains("valid SQLite record")
+                    || message.contains("payload"),
+                "unexpected load error: {message}"
+            );
+        });
     }
 }

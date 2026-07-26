@@ -47,9 +47,15 @@ asupersync.workspace = true
 parking_lot = { workspace = true }
 
 [dev-dependencies]
+# The storage stack is `async`, so inline tests must drive a runtime via
+# `asupersync::test_utils::run_test`, which lives behind `test-internals`.
+asupersync = { workspace = true, features = ["test-internals"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }
-fsqlite-mvcc = { path = "../fsqlite-mvcc", version = "0.1.19" }
+# Dev-only, and fsqlite-mvcc depends on fsqlite-pager — so pager must publish
+# FIRST. A `^0.1.19` pin cannot resolve at publish time (mvcc 0.1.19 is not on
+# crates.io yet). Keep this a permissive range so the dev-edge stays satisfiable.
+fsqlite-mvcc = { path = "../fsqlite-mvcc", version = ">=0.1.2, <0.2.0" }
 fsqlite-wal = { workspace = true }
 serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }

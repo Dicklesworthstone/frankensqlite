@@ -27,12 +27,14 @@ use fsqlite_types::value::SqliteValue;
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-fn open_mem() -> Connection {
-    Connection::open(":memory:").expect("in-memory connection")
+async fn open_mem() -> Connection {
+    Connection::open(":memory:")
+        .await
+        .expect("in-memory connection")
 }
 
-fn query_first_float(conn: &Connection, sql: &str) -> f64 {
-    match conn.query(sql).expect("query")[0].values()[0] {
+async fn query_first_float(conn: &Connection, sql: &str) -> f64 {
+    match conn.query(sql).await.expect("query")[0].values()[0] {
         SqliteValue::Float(v) => v,
         SqliteValue::Integer(v) => v as f64,
         ref other => panic!("expected float, got {other:?}"),
@@ -45,11 +47,11 @@ fn open_rusqlite() -> rusqlite::Connection {
 
 /// Compare a single SELECT expression between fsqlite and rusqlite.
 /// Returns (pass, fsqlite_result, rusqlite_result).
-fn compare_expr(sql: &str) -> (bool, String, String) {
-    let fs = open_mem();
+async fn compare_expr(sql: &str) -> (bool, String, String) {
+    let fs = open_mem().await;
     let rs = open_rusqlite();
 
-    let fs_val = match fs.query(sql) {
+    let fs_val = match fs.query(sql).await {
         Ok(rows) if !rows.is_empty() => format_sqlite_value(&rows[0].values()[0]),
         Ok(_) => "(empty)".to_string(),
         Err(e) => format!("ERR:{e}"),
@@ -65,12 +67,12 @@ fn compare_expr(sql: &str) -> (bool, String, String) {
 }
 
 /// Compare expressions using connections with pre-populated tables.
-fn compare_with_tables(
+async fn compare_with_tables(
     fs_conn: &Connection,
     rs_conn: &rusqlite::Connection,
     sql: &str,
 ) -> (bool, String, String) {
-    let fs_val = match fs_conn.query(sql) {
+    let fs_val = match fs_conn.query(sql).await {
         Ok(rows) if !rows.is_empty() => format_sqlite_value(&rows[0].values()[0]),
         Ok(_) => "(empty)".to_string(),
         Err(e) => format!("ERR:{e}"),
@@ -309,7 +311,9 @@ fn test_scalar_string_functions() {
         },
     ];
 
-    run_compat_suite("scalar_string", &tests);
+    asupersync::test_utils::run_test(|| async {
+        run_compat_suite("scalar_string", &tests).await;
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -425,7 +429,9 @@ fn test_scalar_numeric_functions() {
         },
     ];
 
-    run_compat_suite("scalar_numeric", &tests);
+    asupersync::test_utils::run_test(|| async {
+        run_compat_suite("scalar_numeric", &tests).await;
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -438,8 +444,6 @@ fn test_math_functions() {
     // Math functions require SQLITE_ENABLE_MATH_FUNCTIONS which rusqlite's
     // bundled SQLite doesn't include. Verify fsqlite output against known
     // mathematical values instead.
-    let conn = open_mem();
-
     struct MathCase {
         name: &'static str,
         sql: &'static str,
@@ -624,26 +628,30 @@ fn test_math_functions() {
         },
     ];
 
-    let mut passed = 0;
-    let mut failed = 0;
-    for mc in &cases {
-        let result = query_first_float(&conn, mc.sql);
-        if (result - mc.expected).abs() <= mc.tol {
-            passed += 1;
-        } else {
-            failed += 1;
-            println!(
-                "  FAIL {}: got={result} expected={} sql={}",
-                mc.name, mc.expected, mc.sql
-            );
+    asupersync::test_utils::run_test(|| async {
+        let conn = open_mem().await;
+
+        let mut passed = 0;
+        let mut failed = 0;
+        for mc in &cases {
+            let result = query_first_float(&conn, mc.sql).await;
+            if (result - mc.expected).abs() <= mc.tol {
+                passed += 1;
+            } else {
+                failed += 1;
+                println!(
+                    "  FAIL {}: got={result} expected={} sql={}",
+                    mc.name, mc.expected, mc.sql
+                );
+            }
         }
-    }
-    let total = passed + failed;
-    println!("[math] {passed}/{total} passed (verified against known mathematical values)");
-    assert_eq!(
-        failed, 0,
-        "[math] {failed}/{total} math function mismatches"
-    );
+        let total = passed + failed;
+        println!("[math] {passed}/{total} passed (verified against known mathematical values)");
+        assert_eq!(
+            failed, 0,
+            "[math] {failed}/{total} math function mismatches"
+        );
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -652,105 +660,107 @@ fn test_math_functions() {
 
 #[test]
 fn test_aggregate_functions() {
-    let fs = open_mem();
-    let rs = open_rusqlite();
+    asupersync::test_utils::run_test(|| async {
+        let fs = open_mem().await;
+        let rs = open_rusqlite();
 
-    // Create identical test tables in both
-    for sql in &[
-        "CREATE TABLE t (grp TEXT, val INTEGER, fval REAL)",
-        "INSERT INTO t VALUES ('a', 10, 1.5)",
-        "INSERT INTO t VALUES ('a', 20, 2.5)",
-        "INSERT INTO t VALUES ('a', 30, 3.5)",
-        "INSERT INTO t VALUES ('b', 100, 10.0)",
-        "INSERT INTO t VALUES ('b', 200, 20.0)",
-        "INSERT INTO t VALUES ('c', NULL, NULL)",
-    ] {
-        fs.execute(sql).unwrap();
-        rs.execute(sql, []).unwrap();
-    }
-
-    let tests = vec![
-        CompatTest {
-            name: "count_star",
-            sql: "SELECT count(*) FROM t",
-        },
-        CompatTest {
-            name: "count_col",
-            sql: "SELECT count(val) FROM t",
-        },
-        CompatTest {
-            name: "count_null",
-            sql: "SELECT count(val) FROM t WHERE grp = 'c'",
-        },
-        CompatTest {
-            name: "sum_all",
-            sql: "SELECT sum(val) FROM t",
-        },
-        CompatTest {
-            name: "sum_group",
-            sql: "SELECT sum(val) FROM t WHERE grp = 'a'",
-        },
-        CompatTest {
-            name: "sum_null",
-            sql: "SELECT sum(val) FROM t WHERE grp = 'c'",
-        },
-        CompatTest {
-            name: "total_all",
-            sql: "SELECT total(val) FROM t",
-        },
-        CompatTest {
-            name: "total_null",
-            sql: "SELECT total(val) FROM t WHERE grp = 'c'",
-        },
-        CompatTest {
-            name: "avg_all",
-            sql: "SELECT avg(val) FROM t WHERE grp = 'a'",
-        },
-        CompatTest {
-            name: "avg_float",
-            sql: "SELECT avg(fval) FROM t WHERE grp = 'a'",
-        },
-        CompatTest {
-            name: "max_agg",
-            sql: "SELECT max(val) FROM t",
-        },
-        CompatTest {
-            name: "min_agg",
-            sql: "SELECT min(val) FROM t",
-        },
-        CompatTest {
-            name: "max_null_group",
-            sql: "SELECT max(val) FROM t WHERE grp = 'c'",
-        },
-        CompatTest {
-            name: "group_concat_basic",
-            sql: "SELECT group_concat(grp) FROM t WHERE val IS NOT NULL",
-        },
-    ];
-
-    let mut passed = 0;
-    let mut failed = 0;
-    let mut failures = Vec::new();
-
-    for test in &tests {
-        let (ok, fs_val, rs_val) = compare_with_tables(&fs, &rs, test.sql);
-        if ok {
-            passed += 1;
-        } else {
-            failed += 1;
-            failures.push(format!(
-                "  FAIL {}: fsqlite={} rusqlite={} sql={}",
-                test.name, fs_val, rs_val, test.sql
-            ));
+        // Create identical test tables in both
+        for sql in &[
+            "CREATE TABLE t (grp TEXT, val INTEGER, fval REAL)",
+            "INSERT INTO t VALUES ('a', 10, 1.5)",
+            "INSERT INTO t VALUES ('a', 20, 2.5)",
+            "INSERT INTO t VALUES ('a', 30, 3.5)",
+            "INSERT INTO t VALUES ('b', 100, 10.0)",
+            "INSERT INTO t VALUES ('b', 200, 20.0)",
+            "INSERT INTO t VALUES ('c', NULL, NULL)",
+        ] {
+            fs.execute(sql).await.unwrap();
+            rs.execute(sql, []).unwrap();
         }
-    }
 
-    let total = passed + failed;
-    println!("[aggregate] {passed}/{total} passed");
-    for f in &failures {
-        println!("{f}");
-    }
-    assert_eq!(failed, 0, "aggregate function mismatches: {failed}/{total}");
+        let tests = vec![
+            CompatTest {
+                name: "count_star",
+                sql: "SELECT count(*) FROM t",
+            },
+            CompatTest {
+                name: "count_col",
+                sql: "SELECT count(val) FROM t",
+            },
+            CompatTest {
+                name: "count_null",
+                sql: "SELECT count(val) FROM t WHERE grp = 'c'",
+            },
+            CompatTest {
+                name: "sum_all",
+                sql: "SELECT sum(val) FROM t",
+            },
+            CompatTest {
+                name: "sum_group",
+                sql: "SELECT sum(val) FROM t WHERE grp = 'a'",
+            },
+            CompatTest {
+                name: "sum_null",
+                sql: "SELECT sum(val) FROM t WHERE grp = 'c'",
+            },
+            CompatTest {
+                name: "total_all",
+                sql: "SELECT total(val) FROM t",
+            },
+            CompatTest {
+                name: "total_null",
+                sql: "SELECT total(val) FROM t WHERE grp = 'c'",
+            },
+            CompatTest {
+                name: "avg_all",
+                sql: "SELECT avg(val) FROM t WHERE grp = 'a'",
+            },
+            CompatTest {
+                name: "avg_float",
+                sql: "SELECT avg(fval) FROM t WHERE grp = 'a'",
+            },
+            CompatTest {
+                name: "max_agg",
+                sql: "SELECT max(val) FROM t",
+            },
+            CompatTest {
+                name: "min_agg",
+                sql: "SELECT min(val) FROM t",
+            },
+            CompatTest {
+                name: "max_null_group",
+                sql: "SELECT max(val) FROM t WHERE grp = 'c'",
+            },
+            CompatTest {
+                name: "group_concat_basic",
+                sql: "SELECT group_concat(grp) FROM t WHERE val IS NOT NULL",
+            },
+        ];
+
+        let mut passed = 0;
+        let mut failed = 0;
+        let mut failures = Vec::new();
+
+        for test in &tests {
+            let (ok, fs_val, rs_val) = compare_with_tables(&fs, &rs, test.sql).await;
+            if ok {
+                passed += 1;
+            } else {
+                failed += 1;
+                failures.push(format!(
+                    "  FAIL {}: fsqlite={} rusqlite={} sql={}",
+                    test.name, fs_val, rs_val, test.sql
+                ));
+            }
+        }
+
+        let total = passed + failed;
+        println!("[aggregate] {passed}/{total} passed");
+        for f in &failures {
+            println!("{f}");
+        }
+        assert_eq!(failed, 0, "aggregate function mismatches: {failed}/{total}");
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -821,7 +831,9 @@ fn test_type_coercion() {
         },
     ];
 
-    run_compat_suite("type_coercion", &tests);
+    asupersync::test_utils::run_test(|| async {
+        run_compat_suite("type_coercion", &tests).await;
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -887,7 +899,9 @@ fn test_null_handling() {
         },
     ];
 
-    run_compat_suite("null_handling", &tests);
+    asupersync::test_utils::run_test(|| async {
+        run_compat_suite("null_handling", &tests).await;
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -952,7 +966,9 @@ fn test_edge_cases() {
         },
     ];
 
-    run_compat_suite("edge_cases", &tests);
+    asupersync::test_utils::run_test(|| async {
+        run_compat_suite("edge_cases", &tests).await;
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -1014,62 +1030,64 @@ fn test_conformance_summary() {
         ("null:abs", "SELECT abs(NULL)"),
     ];
 
-    let mut passed = 0;
-    let mut failed = 0;
-    let mut results = Vec::new();
+    asupersync::test_utils::run_test(|| async {
+        let mut passed = 0;
+        let mut failed = 0;
+        let mut results = Vec::new();
 
-    for (name, sql) in &all_tests {
-        let (ok, fs_val, rs_val) = compare_expr(sql);
-        if ok {
-            passed += 1;
-            results.push(format!(
-                "    {{ \"name\": \"{name}\", \"status\": \"PASS\" }}"
-            ));
-        } else {
-            failed += 1;
-            results.push(format!(
-                "    {{ \"name\": \"{name}\", \"status\": \"FAIL\", \"fsqlite\": \"{fs_val}\", \"sqlite\": \"{rs_val}\" }}"
-            ));
+        for (name, sql) in &all_tests {
+            let (ok, fs_val, rs_val) = compare_expr(sql).await;
+            if ok {
+                passed += 1;
+                results.push(format!(
+                    "    {{ \"name\": \"{name}\", \"status\": \"PASS\" }}"
+                ));
+            } else {
+                failed += 1;
+                results.push(format!(
+                    "    {{ \"name\": \"{name}\", \"status\": \"FAIL\", \"fsqlite\": \"{fs_val}\", \"sqlite\": \"{rs_val}\" }}"
+                ));
+            }
         }
-    }
 
-    let total = passed + failed;
-    println!("\n=== bd-2wt.4: Function Compatibility Conformance Summary ===");
-    println!("{{");
-    println!("  \"bead\": \"bd-2wt.4\",");
-    println!("  \"suite\": \"function_compat\",");
-    println!("  \"total\": {total},");
-    println!("  \"passed\": {passed},");
-    println!("  \"failed\": {failed},");
-    println!(
-        "  \"pass_rate\": \"{:.1}%\",",
-        passed as f64 / total as f64 * 100.0
-    );
-    println!("  \"cases\": [");
-    for (i, r) in results.iter().enumerate() {
-        let comma = if i + 1 < total { "," } else { "" };
-        println!("{r}{comma}");
-    }
-    println!("  ]");
-    println!("}}");
+        let total = passed + failed;
+        println!("\n=== bd-2wt.4: Function Compatibility Conformance Summary ===");
+        println!("{{");
+        println!("  \"bead\": \"bd-2wt.4\",");
+        println!("  \"suite\": \"function_compat\",");
+        println!("  \"total\": {total},");
+        println!("  \"passed\": {passed},");
+        println!("  \"failed\": {failed},");
+        println!(
+            "  \"pass_rate\": \"{:.1}%\",",
+            passed as f64 / total as f64 * 100.0
+        );
+        println!("  \"cases\": [");
+        for (i, r) in results.iter().enumerate() {
+            let comma = if i + 1 < total { "," } else { "" };
+            println!("{r}{comma}");
+        }
+        println!("  ]");
+        println!("}}");
 
-    assert_eq!(
-        failed, 0,
-        "{failed}/{total} function compatibility tests failed"
-    );
+        assert_eq!(
+            failed, 0,
+            "{failed}/{total} function compatibility tests failed"
+        );
 
-    println!("[PASS] all {total} function compatibility tests passed");
+        println!("[PASS] all {total} function compatibility tests passed");
+    });
 }
 
 // ── Runner ───────────────────────────────────────────────────────────────
 
-fn run_compat_suite(suite: &str, tests: &[CompatTest]) {
+async fn run_compat_suite(suite: &str, tests: &[CompatTest]) {
     let mut passed = 0;
     let mut failed = 0;
     let mut failures = Vec::new();
 
     for test in tests {
-        let (ok, fs_val, rs_val) = compare_expr(test.sql);
+        let (ok, fs_val, rs_val) = compare_expr(test.sql).await;
         if ok {
             passed += 1;
         } else {

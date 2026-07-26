@@ -24,8 +24,9 @@ fn render(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+async fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     conn.query(sql)
+        .await
         .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"))
         .iter()
         .map(|row| row.values().iter().map(render).collect())
@@ -57,8 +58,9 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
 }
 
 /// True if the plan opens an `OpenRead` whose P4 text equals `name`.
-fn opens(conn: &Connection, sql: &str, name: &str) -> bool {
+async fn opens(conn: &Connection, sql: &str, name: &str) -> bool {
     conn.query(&format!("EXPLAIN {sql}"))
+        .await
         .unwrap()
         .iter()
         .any(|row| {
@@ -70,32 +72,32 @@ fn opens(conn: &Connection, sql: &str, name: &str) -> bool {
         })
 }
 
-fn setup(ddl: &[&str]) -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").expect("frank");
+async fn setup(ddl: &[&str]) -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.expect("frank");
     let r = rusqlite::Connection::open_in_memory().expect("sqlite");
     for stmt in ddl {
-        f.execute(stmt).unwrap();
+        f.execute(stmt).await.unwrap();
         r.execute_batch(stmt).unwrap();
     }
     (f, r)
 }
 
-fn insert_both(f: &Connection, r: &rusqlite::Connection, sql: &str) {
-    f.execute(sql).unwrap();
+async fn insert_both(f: &Connection, r: &rusqlite::Connection, sql: &str) {
+    f.execute(sql).await.unwrap();
     r.execute_batch(sql).unwrap();
 }
 
-fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, label: &str) {
+async fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, label: &str) {
     assert_eq!(
-        frank_rows(f, sql),
+        frank_rows(f, sql).await,
         sqlite_rows(r, sql),
         "[{label}] diverged: `{sql}`"
     );
 }
 
 /// Big-table battery: INTEGER `a` and TEXT `c`, both with NULLs. Opcode-gated to the index walk.
-fn check_big(label: &str, ddl: &[&str]) {
-    let (f, r) = setup(ddl);
+async fn check_big(label: &str, ddl: &[&str]) {
+    let (f, r) = setup(ddl).await;
     for i in 1..=3000_i64 {
         let a = if i % 13 == 0 {
             "NULL".to_owned()
@@ -111,19 +113,20 @@ fn check_big(label: &str, ddl: &[&str]) {
             &f,
             &r,
             &format!("INSERT INTO t VALUES ({i}, {a}, {c}, {});", i % 100),
-        );
+        )
+        .await;
     }
     for (sql, idx) in [
         ("SELECT COUNT(DISTINCT a) FROM t", "idx_a"),
         ("SELECT COUNT(DISTINCT c) FROM t", "idx_c"),
     ] {
-        cmp(&f, &r, sql, label);
+        cmp(&f, &r, sql, label).await;
         assert!(
-            opens(&f, sql, idx),
+            opens(&f, sql, idx).await,
             "[{label}] COUNT(DISTINCT) must walk {idx}: `{sql}`"
         );
         assert!(
-            !opens(&f, sql, "t"),
+            !opens(&f, sql, "t").await,
             "[{label}] covering COUNT(DISTINCT) walk must not open the table: `{sql}`"
         );
     }
@@ -131,26 +134,30 @@ fn check_big(label: &str, ddl: &[&str]) {
 
 #[test]
 fn count_distinct_index_walk_matches_sqlite() {
-    // Single-column indexes: control.
-    check_big(
-        "single idx_a/idx_c",
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c TEXT, b INTEGER);",
-            "CREATE INDEX idx_a ON t(a);",
-            "CREATE INDEX idx_c ON t(c);",
-        ],
-    );
-    // Composite indexes declared FIRST, shadowing the single-column ones.
-    check_big(
-        "shadowed idx_a/idx_c",
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c TEXT, b INTEGER);",
-            "CREATE INDEX idx_ab ON t(a, b);",
-            "CREATE INDEX idx_a ON t(a);",
-            "CREATE INDEX idx_cb ON t(c, b);",
-            "CREATE INDEX idx_c ON t(c);",
-        ],
-    );
+    asupersync::test_utils::run_test(|| async {
+        // Single-column indexes: control.
+        check_big(
+            "single idx_a/idx_c",
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c TEXT, b INTEGER);",
+                "CREATE INDEX idx_a ON t(a);",
+                "CREATE INDEX idx_c ON t(c);",
+            ],
+        )
+        .await;
+        // Composite indexes declared FIRST, shadowing the single-column ones.
+        check_big(
+            "shadowed idx_a/idx_c",
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c TEXT, b INTEGER);",
+                "CREATE INDEX idx_ab ON t(a, b);",
+                "CREATE INDEX idx_a ON t(a);",
+                "CREATE INDEX idx_cb ON t(c, b);",
+                "CREATE INDEX idx_c ON t(c);",
+            ],
+        )
+        .await;
+    });
 }
 
 /// COUNT(DISTINCT col) walks a COMPOSITE index whose LEADING key term is `col` when NO single-column
@@ -159,115 +166,127 @@ fn count_distinct_index_walk_matches_sqlite() {
 /// walked. A trailing-DESC term must not disqualify — only the ASC BINARY leading term governs.
 #[test]
 fn count_distinct_index_walk_composite_leading_term_matches_sqlite() {
-    for (label, ddl, a_idx, c_idx) in [
-        (
-            "composite-only (a,b)/(c,b)",
-            vec![
-                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c TEXT, b INTEGER);",
-                "CREATE INDEX idx_ab ON t(a, b);",
-                "CREATE INDEX idx_cb ON t(c, b);",
-            ],
-            "idx_ab",
-            "idx_cb",
-        ),
-        (
-            "composite trailing-DESC (a ASC, b DESC)/(c ASC, b DESC)",
-            vec![
-                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c TEXT, b INTEGER);",
-                "CREATE INDEX idx_ad ON t(a ASC, b DESC);",
-                "CREATE INDEX idx_cd ON t(c ASC, b DESC);",
-            ],
-            "idx_ad",
-            "idx_cd",
-        ),
-    ] {
-        let (f, r) = setup(&ddl);
-        for i in 1..=3000_i64 {
-            let a = if i % 13 == 0 {
-                "NULL".to_owned()
-            } else {
-                format!("{}", (i * 7) % 40)
-            };
-            let c = if i % 17 == 0 {
-                "NULL".to_owned()
-            } else {
-                format!("'k{}'", i % 25)
-            };
-            insert_both(
-                &f,
-                &r,
-                &format!("INSERT INTO t VALUES ({i}, {a}, {c}, {});", i % 100),
-            );
-        }
-        for (sql, idx) in [
-            ("SELECT COUNT(DISTINCT a) FROM t", a_idx),
-            ("SELECT COUNT(DISTINCT c) FROM t", c_idx),
+    asupersync::test_utils::run_test(|| async {
+        for (label, ddl, a_idx, c_idx) in [
+            (
+                "composite-only (a,b)/(c,b)",
+                vec![
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c TEXT, b INTEGER);",
+                    "CREATE INDEX idx_ab ON t(a, b);",
+                    "CREATE INDEX idx_cb ON t(c, b);",
+                ],
+                "idx_ab",
+                "idx_cb",
+            ),
+            (
+                "composite trailing-DESC (a ASC, b DESC)/(c ASC, b DESC)",
+                vec![
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c TEXT, b INTEGER);",
+                    "CREATE INDEX idx_ad ON t(a ASC, b DESC);",
+                    "CREATE INDEX idx_cd ON t(c ASC, b DESC);",
+                ],
+                "idx_ad",
+                "idx_cd",
+            ),
         ] {
-            cmp(&f, &r, sql, label);
-            assert!(
-                opens(&f, sql, idx),
-                "[{label}] COUNT(DISTINCT) must walk composite {idx}: `{sql}`"
-            );
-            assert!(
-                !opens(&f, sql, "t"),
-                "[{label}] composite COUNT(DISTINCT) walk must not open the table: `{sql}`"
-            );
+            let (f, r) = setup(&ddl).await;
+            for i in 1..=3000_i64 {
+                let a = if i % 13 == 0 {
+                    "NULL".to_owned()
+                } else {
+                    format!("{}", (i * 7) % 40)
+                };
+                let c = if i % 17 == 0 {
+                    "NULL".to_owned()
+                } else {
+                    format!("'k{}'", i % 25)
+                };
+                insert_both(
+                    &f,
+                    &r,
+                    &format!("INSERT INTO t VALUES ({i}, {a}, {c}, {});", i % 100),
+                )
+                .await;
+            }
+            for (sql, idx) in [
+                ("SELECT COUNT(DISTINCT a) FROM t", a_idx),
+                ("SELECT COUNT(DISTINCT c) FROM t", c_idx),
+            ] {
+                cmp(&f, &r, sql, label).await;
+                assert!(
+                    opens(&f, sql, idx).await,
+                    "[{label}] COUNT(DISTINCT) must walk composite {idx}: `{sql}`"
+                );
+                assert!(
+                    !opens(&f, sql, "t").await,
+                    "[{label}] composite COUNT(DISTINCT) walk must not open the table: `{sql}`"
+                );
+            }
         }
-    }
+    });
 }
 
 #[test]
 fn count_distinct_index_walk_edge_cases() {
-    // Empty, all-NULL, all-same, all-distinct, single-row — the walk's boundary conditions.
-    let (f, r) = setup(&[
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER);",
-        "CREATE INDEX idx_a ON t(a);",
-    ]);
-    cmp(&f, &r, "SELECT COUNT(DISTINCT a) FROM t", "empty");
-    insert_both(
-        &f,
-        &r,
-        "INSERT INTO t VALUES (1, NULL), (2, NULL), (3, NULL);",
-    );
-    cmp(&f, &r, "SELECT COUNT(DISTINCT a) FROM t", "all-null");
-    insert_both(&f, &r, "DELETE FROM t;");
-    insert_both(
-        &f,
-        &r,
-        "INSERT INTO t VALUES (1, 5), (2, 5), (3, 5), (4, 5);",
-    );
-    cmp(&f, &r, "SELECT COUNT(DISTINCT a) FROM t", "all-same");
-    insert_both(&f, &r, "DELETE FROM t;");
-    insert_both(&f, &r, "INSERT INTO t VALUES (1, 7);");
-    cmp(&f, &r, "SELECT COUNT(DISTINCT a) FROM t", "single-row");
-    insert_both(&f, &r, "DELETE FROM t;");
-    for i in 1..=10_i64 {
-        insert_both(&f, &r, &format!("INSERT INTO t VALUES ({i}, {i});"));
-    }
-    // Mix in leading NULLs before the distinct run.
-    insert_both(&f, &r, "INSERT INTO t VALUES (100, NULL), (101, NULL);");
-    cmp(
-        &f,
-        &r,
-        "SELECT COUNT(DISTINCT a) FROM t",
-        "all-distinct-plus-nulls",
-    );
-    assert!(
-        opens(&f, "SELECT COUNT(DISTINCT a) FROM t", "idx_a"),
-        "edge: COUNT(DISTINCT) must walk idx_a"
-    );
+    asupersync::test_utils::run_test(|| async {
+        // Empty, all-NULL, all-same, all-distinct, single-row — the walk's boundary conditions.
+        let (f, r) = setup(&[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER);",
+            "CREATE INDEX idx_a ON t(a);",
+        ])
+        .await;
+        cmp(&f, &r, "SELECT COUNT(DISTINCT a) FROM t", "empty").await;
+        insert_both(
+            &f,
+            &r,
+            "INSERT INTO t VALUES (1, NULL), (2, NULL), (3, NULL);",
+        )
+        .await;
+        cmp(&f, &r, "SELECT COUNT(DISTINCT a) FROM t", "all-null").await;
+        insert_both(&f, &r, "DELETE FROM t;").await;
+        insert_both(
+            &f,
+            &r,
+            "INSERT INTO t VALUES (1, 5), (2, 5), (3, 5), (4, 5);",
+        )
+        .await;
+        cmp(&f, &r, "SELECT COUNT(DISTINCT a) FROM t", "all-same").await;
+        insert_both(&f, &r, "DELETE FROM t;").await;
+        insert_both(&f, &r, "INSERT INTO t VALUES (1, 7);").await;
+        cmp(&f, &r, "SELECT COUNT(DISTINCT a) FROM t", "single-row").await;
+        insert_both(&f, &r, "DELETE FROM t;").await;
+        for i in 1..=10_i64 {
+            insert_both(&f, &r, &format!("INSERT INTO t VALUES ({i}, {i});")).await;
+        }
+        // Mix in leading NULLs before the distinct run.
+        insert_both(&f, &r, "INSERT INTO t VALUES (100, NULL), (101, NULL);").await;
+        cmp(
+            &f,
+            &r,
+            "SELECT COUNT(DISTINCT a) FROM t",
+            "all-distinct-plus-nulls",
+        )
+        .await;
+        assert!(
+            opens(&f, "SELECT COUNT(DISTINCT a) FROM t", "idx_a").await,
+            "edge: COUNT(DISTINCT) must walk idx_a"
+        );
+    });
 }
 
 #[test]
 fn count_distinct_nocase_declines_but_matches() {
-    // A NOCASE column: the BINARY index-walk plan must DECLINE (index order != DISTINCT grouping); the
-    // full-scan path still produces the byte-exact case-folded distinct count.
-    let (f, r) = setup(&[
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, c TEXT COLLATE NOCASE);",
-        "CREATE INDEX idx_c ON t(c);",
-    ]);
-    for (i, v) in ["A", "a", "B", "b", "c", "C", "d"].iter().enumerate() {
-        insert_both(&f, &r, &format!("INSERT INTO t VALUES ({}, '{v}');", i + 1));
-    }
-    cmp(&f, &r, "SELECT COUNT(DISTINCT c) FROM t", "nocase");
+    asupersync::test_utils::run_test(|| async {
+        // A NOCASE column: the BINARY index-walk plan must DECLINE (index order != DISTINCT grouping); the
+        // full-scan path still produces the byte-exact case-folded distinct count.
+        let (f, r) = setup(&[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, c TEXT COLLATE NOCASE);",
+            "CREATE INDEX idx_c ON t(c);",
+        ])
+        .await;
+        for (i, v) in ["A", "a", "B", "b", "c", "C", "d"].iter().enumerate() {
+            insert_both(&f, &r, &format!("INSERT INTO t VALUES ({}, '{v}');", i + 1)).await;
+        }
+        cmp(&f, &r, "SELECT COUNT(DISTINCT c) FROM t", "nocase").await;
+    });
 }

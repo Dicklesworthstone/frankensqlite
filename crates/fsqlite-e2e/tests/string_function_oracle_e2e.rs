@@ -26,8 +26,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -59,12 +59,13 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn assert_parity(queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn assert_parity(queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        let frank = frank_rows(&f, q).await;
+        match (frank, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"));
@@ -88,116 +89,137 @@ fn assert_parity(queries: &[&str], label: &str) {
 
 #[test]
 fn str_upper_lower_ascii_only() {
-    assert_parity(
-        &[
-            "SELECT upper('hello'), lower('HELLO')",
-            "SELECT upper('abc123xyz'), lower('ABC123XYZ')",
-            // SQLite upper/lower only touch ASCII letters; non-ASCII bytes pass through.
-            "SELECT upper('café')", // 'CAFé' (é unchanged)
-            "SELECT lower('CAFÉ')", // 'cafÉ' (É unchanged)
-            "SELECT upper(NULL), lower(NULL)",
-        ],
-        "str_upper_lower_ascii_only",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_parity(
+            &[
+                "SELECT upper('hello'), lower('HELLO')",
+                "SELECT upper('abc123xyz'), lower('ABC123XYZ')",
+                // SQLite upper/lower only touch ASCII letters; non-ASCII bytes pass through.
+                "SELECT upper('café')", // 'CAFé' (é unchanged)
+                "SELECT lower('CAFÉ')", // 'cafÉ' (É unchanged)
+                "SELECT upper(NULL), lower(NULL)",
+            ],
+            "str_upper_lower_ascii_only",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn str_trim_variants_and_custom_set() {
-    assert_parity(
-        &[
-            "SELECT '[' || ltrim('  hi  ') || ']'", // '[hi  ]'
-            "SELECT '[' || rtrim('  hi  ') || ']'", // '[  hi]'
-            "SELECT '[' || trim('  hi  ') || ']'",  // '[hi]'
-            "SELECT ltrim('xxhello', 'x')",         // 'hello'
-            "SELECT rtrim('helloyy', 'y')",         // 'hello'
-            "SELECT trim('xyhelloxy', 'xy')",       // 'hello'
-            "SELECT trim('aaa', 'a')",              // '' (empty)
-        ],
-        "str_trim_variants_and_custom_set",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_parity(
+            &[
+                "SELECT '[' || ltrim('  hi  ') || ']'", // '[hi  ]'
+                "SELECT '[' || rtrim('  hi  ') || ']'", // '[  hi]'
+                "SELECT '[' || trim('  hi  ') || ']'",  // '[hi]'
+                "SELECT ltrim('xxhello', 'x')",         // 'hello'
+                "SELECT rtrim('helloyy', 'y')",         // 'hello'
+                "SELECT trim('xyhelloxy', 'xy')",       // 'hello'
+                "SELECT trim('aaa', 'a')",              // '' (empty)
+            ],
+            "str_trim_variants_and_custom_set",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn str_replace_edges() {
-    assert_parity(
-        &[
-            "SELECT replace('aaa', 'a', 'bb')",  // 'bbbbbb'
-            "SELECT replace('hello', 'l', '')",  // 'heo'
-            "SELECT replace('hello', 'z', 'Q')", // 'hello' (not found)
-            "SELECT replace('abc', '', 'X')",    // 'abc' (empty search -> unchanged)
-            "SELECT replace(NULL, 'a', 'b')",    // NULL
-        ],
-        "str_replace_edges",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_parity(
+            &[
+                "SELECT replace('aaa', 'a', 'bb')",  // 'bbbbbb'
+                "SELECT replace('hello', 'l', '')",  // 'heo'
+                "SELECT replace('hello', 'z', 'Q')", // 'hello' (not found)
+                "SELECT replace('abc', '', 'X')",    // 'abc' (empty search -> unchanged)
+                "SELECT replace(NULL, 'a', 'b')",    // NULL
+            ],
+            "str_replace_edges",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn str_concat_and_concat_ws() {
-    assert_parity(
-        &[
-            "SELECT concat('a', 'b', 'c')",          // 'abc'
-            "SELECT concat('a', NULL, 'c')",         // 'ac' (NULL -> empty)
-            "SELECT concat(1, 2.5, 'x')",            // '12.5x'
-            "SELECT concat_ws('-', 'a', 'b', 'c')",  // 'a-b-c'
-            "SELECT concat_ws('-', 'a', NULL, 'c')", // 'a-c' (NULL skipped, no '--')
-            "SELECT concat_ws(',', 1, 2, 3)",        // '1,2,3'
-        ],
-        "str_concat_and_concat_ws",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_parity(
+            &[
+                "SELECT concat('a', 'b', 'c')",          // 'abc'
+                "SELECT concat('a', NULL, 'c')",         // 'ac' (NULL -> empty)
+                "SELECT concat(1, 2.5, 'x')",            // '12.5x'
+                "SELECT concat_ws('-', 'a', 'b', 'c')",  // 'a-b-c'
+                "SELECT concat_ws('-', 'a', NULL, 'c')", // 'a-c' (NULL skipped, no '--')
+                "SELECT concat_ws(',', 1, 2, 3)",        // '1,2,3'
+            ],
+            "str_concat_and_concat_ws",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn str_unhex_and_octet_length() {
-    assert_parity(
-        &[
-            "SELECT unhex('48656C6C6F')",   // blob 'Hello' -> X'48656C6C6F'
-            "SELECT typeof(unhex('41'))",   // blob
-            "SELECT unhex('xyz')",          // NULL (invalid hex)
-            "SELECT octet_length('hello')", // 5
-            "SELECT octet_length('café')",  // 5 (UTF-8 bytes; é = 2)
-            "SELECT length('café')",        // 4 (characters)
-        ],
-        "str_unhex_and_octet_length",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_parity(
+            &[
+                "SELECT unhex('48656C6C6F')",   // blob 'Hello' -> X'48656C6C6F'
+                "SELECT typeof(unhex('41'))",   // blob
+                "SELECT unhex('xyz')",          // NULL (invalid hex)
+                "SELECT octet_length('hello')", // 5
+                "SELECT octet_length('café')",  // 5 (UTF-8 bytes; é = 2)
+                "SELECT length('café')",        // 4 (characters)
+            ],
+            "str_unhex_and_octet_length",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn str_format_alias() {
-    assert_parity(
-        &[
-            "SELECT format('%d-%s', 5, 'x')", // '5-x'
-            "SELECT format('%.2f', 3.14159)", // '3.14'
-            "SELECT format('%05d', 42)",      // '00042'
-        ],
-        "str_format_alias",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_parity(
+            &[
+                "SELECT format('%d-%s', 5, 'x')", // '5-x'
+                "SELECT format('%.2f', 3.14159)", // '3.14'
+                "SELECT format('%05d', 42)",      // '00042'
+            ],
+            "str_format_alias",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn str_string_agg_aggregate() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    for s in [
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, val TEXT)",
-        "INSERT INTO t VALUES (1,'a','x'),(2,'a','y'),(3,'b','z'),(4,'a',NULL)",
-    ] {
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
-    let mut mismatches = Vec::new();
-    for q in [
-        "SELECT string_agg(val, '|') FROM t WHERE grp='a'", // 'x|y' (NULL skipped)
-        "SELECT grp, string_agg(val, ',') FROM t GROUP BY grp ORDER BY grp",
-    ] {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
-            (Ok(a), Ok(b)) if a == b => {}
-            (a, b) => mismatches.push(format!("{q}\n  frank: {a:?}\n  csql:  {b:?}")),
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for s in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, val TEXT)",
+            "INSERT INTO t VALUES (1,'a','x'),(2,'a','y'),(3,'b','z'),(4,'a',NULL)",
+        ] {
+            f.execute(s).await.unwrap();
+            r.execute_batch(s).unwrap();
         }
-    }
-    assert!(
-        mismatches.is_empty(),
-        "str_string_agg_aggregate: {} mismatch(es)\n{}",
-        mismatches.len(),
-        mismatches.join("\n")
-    );
+        let mut mismatches = Vec::new();
+        for q in [
+            "SELECT string_agg(val, '|') FROM t WHERE grp='a'", // 'x|y' (NULL skipped)
+            "SELECT grp, string_agg(val, ',') FROM t GROUP BY grp ORDER BY grp",
+        ] {
+            let frank = frank_rows(&f, q).await;
+            match (frank, sqlite_rows(&r, q)) {
+                (Ok(a), Ok(b)) if a == b => {}
+                (a, b) => mismatches.push(format!("{q}\n  frank: {a:?}\n  csql:  {b:?}")),
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "str_string_agg_aggregate: {} mismatch(es)\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    });
 }

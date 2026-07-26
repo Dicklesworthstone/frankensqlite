@@ -191,7 +191,7 @@ impl PageEncryptor {
 
         let plaintext_len = page_len - reserved;
         let aad = build_aad(page_number, &self.database_id);
-        let xnonce = XNonce::from_slice(nonce);
+        let xnonce: &XNonce = nonce.into();
 
         let ciphertext = self
             .cipher
@@ -249,7 +249,7 @@ impl PageEncryptor {
         ct_with_tag.extend_from_slice(&tag);
 
         let aad = build_aad(page_number, &self.database_id);
-        let xnonce = XNonce::from_slice(&nonce);
+        let xnonce: &XNonce = (&nonce).into();
 
         let plaintext = self
             .cipher
@@ -328,7 +328,7 @@ impl KeyManager {
         nonce: &[u8; NONCE_SIZE],
     ) -> Result<Vec<u8>, EncryptError> {
         let cipher = XChaCha20Poly1305::new(kek.into());
-        let xnonce = XNonce::from_slice(nonce);
+        let xnonce: &XNonce = nonce.into();
         let ct = cipher
             .encrypt(xnonce, dek.as_slice())
             .map_err(|_| EncryptError::EncryptionFailed)?;
@@ -352,10 +352,11 @@ impl KeyManager {
         let nonce = &wrapped[..NONCE_SIZE];
         let ct = &wrapped[NONCE_SIZE..];
         let cipher = XChaCha20Poly1305::new(kek.into());
-        // chacha20poly1305 0.10 consumes a borrowed GenericArray nonce.
-        let xnonce = XNonce::from_slice(nonce);
+        // `nonce` is a runtime slice here, so this is a checked conversion; the
+        // length was already validated against NONCE_SIZE above.
+        let xnonce = XNonce::try_from(nonce).map_err(|_| EncryptError::DekUnwrapFailed)?;
         let plaintext = cipher
-            .decrypt(xnonce, ct)
+            .decrypt(&xnonce, ct)
             .map_err(|_| EncryptError::DekUnwrapFailed)?;
         if plaintext.len() != KEY_SIZE {
             return Err(EncryptError::DekUnwrapFailed);

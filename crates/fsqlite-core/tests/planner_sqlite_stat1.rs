@@ -10,7 +10,7 @@ use fsqlite_planner::stats::parse_stat1;
 
 /// Extract the row-count integer recorded for `table` by querying
 /// `sqlite_stat1` directly and parsing via the planner's format parser.
-fn stat1_n_rows(conn: &Connection, table: &str) -> Option<u64> {
+async fn stat1_n_rows(conn: &Connection, table: &str) -> Option<u64> {
     let rows = conn
         .query_with_params(
             "SELECT stat FROM sqlite_stat1 WHERE tbl = ?1 AND idx IS NULL",
@@ -18,6 +18,7 @@ fn stat1_n_rows(conn: &Connection, table: &str) -> Option<u64> {
                 table.to_owned().into(),
             )],
         )
+        .await
         .expect("sqlite_stat1 query");
     let mut out: Option<u64> = None;
     for row in &rows {
@@ -32,55 +33,72 @@ fn stat1_n_rows(conn: &Connection, table: &str) -> Option<u64> {
 
 #[test]
 fn analyze_populates_sqlite_stat1_and_planner_can_parse_it() {
-    let conn = Connection::open(":memory:").unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
-        .unwrap();
-    for i in 0..42 {
-        conn.execute_with_params(
-            "INSERT INTO t(v) VALUES (?1);",
-            &[fsqlite_types::value::SqliteValue::Integer(i)],
-        )
-        .unwrap();
-    }
-    conn.execute("ANALYZE;").unwrap();
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .await
+            .unwrap();
+        for i in 0..42 {
+            conn.execute_with_params(
+                "INSERT INTO t(v) VALUES (?1);",
+                &[fsqlite_types::value::SqliteValue::Integer(i)],
+            )
+            .await
+            .unwrap();
+        }
+        conn.execute("ANALYZE;").await.unwrap();
 
-    // The planner's parser should round-trip the row count that ANALYZE wrote.
-    // We query sqlite_stat1 directly, feed the stat string into parse_stat1,
-    // and expect the integer to equal the number of rows we inserted.
-    let n_rows = stat1_n_rows(&conn, "t")
-        .expect("ANALYZE must write a table-level row to sqlite_stat1 for 't'");
-    assert_eq!(
-        n_rows, 42,
-        "planner's parse_stat1 must recover the inserted row count"
-    );
+        // The planner's parser should round-trip the row count that ANALYZE wrote.
+        // We query sqlite_stat1 directly, feed the stat string into parse_stat1,
+        // and expect the integer to equal the number of rows we inserted.
+        let n_rows = stat1_n_rows(&conn, "t")
+            .await
+            .expect("ANALYZE must write a table-level row to sqlite_stat1 for 't'");
+        assert_eq!(
+            n_rows, 42,
+            "planner's parse_stat1 must recover the inserted row count"
+        );
+    });
 }
 
 #[test]
 fn sqlite_stat1_parse_matches_multi_row_counts() {
     // Two tables with different row counts: ensure each is reported separately
     // by sqlite_stat1, and the planner's parser sees the right n_rows per table.
-    let conn = Connection::open(":memory:").unwrap();
-    conn.execute("CREATE TABLE small (id INTEGER PRIMARY KEY);")
-        .unwrap();
-    conn.execute("CREATE TABLE big (id INTEGER PRIMARY KEY);")
-        .unwrap();
-    // Wrap bulk inserts in a single transaction so page-cache snapshot churn
-    // doesn't trip the concurrent-read-snapshot guard between statements.
-    conn.execute("BEGIN;").unwrap();
-    for _ in 0..3 {
-        conn.execute("INSERT INTO small DEFAULT VALUES;").unwrap();
-    }
-    for _ in 0..200 {
-        conn.execute("INSERT INTO big DEFAULT VALUES;").unwrap();
-    }
-    conn.execute("COMMIT;").unwrap();
-    conn.execute("ANALYZE;").unwrap();
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE TABLE small (id INTEGER PRIMARY KEY);")
+            .await
+            .unwrap();
+        conn.execute("CREATE TABLE big (id INTEGER PRIMARY KEY);")
+            .await
+            .unwrap();
+        // Wrap bulk inserts in a single transaction so page-cache snapshot churn
+        // doesn't trip the concurrent-read-snapshot guard between statements.
+        conn.execute("BEGIN;").await.unwrap();
+        for _ in 0..3 {
+            conn.execute("INSERT INTO small DEFAULT VALUES;")
+                .await
+                .unwrap();
+        }
+        for _ in 0..200 {
+            conn.execute("INSERT INTO big DEFAULT VALUES;")
+                .await
+                .unwrap();
+        }
+        conn.execute("COMMIT;").await.unwrap();
+        conn.execute("ANALYZE;").await.unwrap();
 
-    let small = stat1_n_rows(&conn, "small").expect("small must appear in sqlite_stat1");
-    let big = stat1_n_rows(&conn, "big").expect("big must appear in sqlite_stat1");
-    assert_eq!(small, 3);
-    assert_eq!(big, 200);
-    assert!(big > small, "planner must distinguish small from big table");
+        let small = stat1_n_rows(&conn, "small")
+            .await
+            .expect("small must appear in sqlite_stat1");
+        let big = stat1_n_rows(&conn, "big")
+            .await
+            .expect("big must appear in sqlite_stat1");
+        assert_eq!(small, 3);
+        assert_eq!(big, 200);
+        assert!(big > small, "planner must distinguish small from big table");
+    });
 }
 
 #[test]

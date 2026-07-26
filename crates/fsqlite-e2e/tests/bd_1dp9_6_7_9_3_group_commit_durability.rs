@@ -44,6 +44,7 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::similar_names)]
 #![allow(clippy::cast_precision_loss)]
+#![recursion_limit = "512"]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -181,8 +182,11 @@ fn verify_csqlite_ordering(path: &str, n_threads: usize, ops_per_thread: u64) {
 
 // ─── FrankenSQLite helpers ───────────────────────────────────────────
 
-fn fsqlite_extract_count(conn: &fsqlite::Connection) -> u64 {
-    let rows = conn.query("SELECT COUNT(*) FROM gc_bench").expect("count");
+async fn fsqlite_extract_count(conn: &fsqlite::Connection) -> u64 {
+    let rows = conn
+        .query("SELECT COUNT(*) FROM gc_bench")
+        .await
+        .expect("count");
     match &rows[0].values()[0] {
         fsqlite_types::value::SqliteValue::Integer(n) => *n as u64,
         other => panic!("unexpected count type: {other:?}"),
@@ -663,84 +667,88 @@ fn g5_group_commit_fairness_4t() {
 
 #[test]
 fn g6_group_commit_metrics_evidence() {
-    let scenario_id = "G6";
-    let n_threads = 4usize;
-    let ops = OPS_PER_THREAD;
+    asupersync::test_utils::run_test(|| async {
+        let scenario_id = "G6";
+        let n_threads = 4usize;
+        let ops = OPS_PER_THREAD;
 
-    emit_log(
-        scenario_id,
-        SEED_G6,
-        "start",
-        json!({"test": "metrics_evidence", "threads": n_threads}),
-    );
+        emit_log(
+            scenario_id,
+            SEED_G6,
+            "start",
+            json!({"test": "metrics_evidence", "threads": n_threads}),
+        );
 
-    GLOBAL_CONSOLIDATION_METRICS.reset();
+        GLOBAL_CONSOLIDATION_METRICS.reset();
 
-    let conn = fsqlite::Connection::open(":memory:").expect("open");
-    conn.execute(
-        "CREATE TABLE gc_bench (id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, batch_id INTEGER NOT NULL, val INTEGER NOT NULL)",
-    )
-    .expect("create");
+        let conn = fsqlite::Connection::open(":memory:").await.expect("open");
+        conn.execute(
+            "CREATE TABLE gc_bench (id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, batch_id INTEGER NOT NULL, val INTEGER NOT NULL)",
+        )
+        .await
+        .expect("create");
 
-    let batch_size = 25u64;
-    let batches_per_thread = ops / batch_size;
+        let batch_size = 25u64;
+        let batches_per_thread = ops / batch_size;
 
-    let wall_start = Instant::now();
-    for tid in 0..n_threads {
-        let base = (tid as u64) * RANGE_SIZE;
-        for batch_id in 0..batches_per_thread {
-            conn.execute("BEGIN").expect("begin");
-            for i in 0..batch_size {
-                let row_id = base + batch_id * batch_size + i;
-                conn.execute(&format!(
-                    "INSERT INTO gc_bench (id, thread_id, batch_id, val) VALUES ({row_id}, {tid}, {batch_id}, {})",
-                    row_id * 7 + 13
-                ))
-                .expect("insert");
+        let wall_start = Instant::now();
+        for tid in 0..n_threads {
+            let base = (tid as u64) * RANGE_SIZE;
+            for batch_id in 0..batches_per_thread {
+                conn.execute("BEGIN").await.expect("begin");
+                for i in 0..batch_size {
+                    let row_id = base + batch_id * batch_size + i;
+                    conn.execute(&format!(
+                        "INSERT INTO gc_bench (id, thread_id, batch_id, val) VALUES ({row_id}, {tid}, {batch_id}, {})",
+                        row_id * 7 + 13
+                    ))
+                    .await
+                    .expect("insert");
+                }
+                conn.execute("COMMIT").await.expect("commit");
             }
-            conn.execute("COMMIT").expect("commit");
         }
-    }
-    let total_wall_ns = wall_start.elapsed().as_nanos() as u64;
+        let total_wall_ns = wall_start.elapsed().as_nanos() as u64;
 
-    let count = fsqlite_extract_count(&conn);
-    assert_eq!(count, n_threads as u64 * ops, "[G6] row count mismatch");
+        let count = fsqlite_extract_count(&conn).await;
+        assert_eq!(count, n_threads as u64 * ops, "[G6] row count mismatch");
 
-    let snap = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+        let snap = GLOBAL_CONSOLIDATION_METRICS.snapshot();
 
-    emit_log(
-        scenario_id,
-        SEED_G6,
-        "result",
-        json!({
-            "groups_flushed": snap.groups_flushed,
-            "frames_consolidated": snap.frames_consolidated,
-            "transactions_batched": snap.transactions_batched,
-            "fsyncs_total": snap.fsyncs_total,
-            "fsync_reduction_ratio": snap.fsync_reduction_ratio(),
-            "max_group_size_observed": snap.max_group_size_observed,
-            "avg_group_size": snap.avg_group_size(),
-            "flusher_commits": snap.flusher_commits,
-            "waiter_commits": snap.waiter_commits,
-            "wall_ns": total_wall_ns,
-            "total_rows": count,
-        }),
-    );
+        emit_log(
+            scenario_id,
+            SEED_G6,
+            "result",
+            json!({
+                "groups_flushed": snap.groups_flushed,
+                "frames_consolidated": snap.frames_consolidated,
+                "transactions_batched": snap.transactions_batched,
+                "fsyncs_total": snap.fsyncs_total,
+                "fsync_reduction_ratio": snap.fsync_reduction_ratio(),
+                "max_group_size_observed": snap.max_group_size_observed,
+                "avg_group_size": snap.avg_group_size(),
+                "flusher_commits": snap.flusher_commits,
+                "waiter_commits": snap.waiter_commits,
+                "wall_ns": total_wall_ns,
+                "total_rows": count,
+            }),
+        );
 
-    // In-memory databases bypass the WAL path entirely, so group-commit
-    // metrics will be zero. The metrics snapshot is logged for evidence;
-    // the primary assertion is data correctness. When WAL is active
-    // (file-backed), transactions_batched and groups_flushed will be
-    // non-zero, proving consolidation occurred.
-    emit_log(
-        scenario_id,
-        SEED_G6,
-        "metrics_note",
-        json!({
-            "note": "in-memory mode bypasses WAL group-commit; metrics may be zero",
-            "wal_active": snap.groups_flushed > 0,
-        }),
-    );
+        // In-memory databases bypass the WAL path entirely, so group-commit
+        // metrics will be zero. The metrics snapshot is logged for evidence;
+        // the primary assertion is data correctness. When WAL is active
+        // (file-backed), transactions_batched and groups_flushed will be
+        // non-zero, proving consolidation occurred.
+        emit_log(
+            scenario_id,
+            SEED_G6,
+            "metrics_note",
+            json!({
+                "note": "in-memory mode bypasses WAL group-commit; metrics may be zero",
+                "wal_active": snap.groups_flushed > 0,
+            }),
+        );
+    });
 }
 
 // ─── G7: File-backed durability with group commit ────────────────────
@@ -845,68 +853,73 @@ fn g7_group_commit_file_durability() {
 
 #[test]
 fn fsqlite_group_commit_sequential_batching() {
-    let scenario_id = "FS_GC";
+    asupersync::test_utils::run_test(|| async {
+        let scenario_id = "FS_GC";
 
-    emit_log(
-        scenario_id,
-        SEED_G6,
-        "start",
-        json!({"test": "fsqlite_sequential_batching"}),
-    );
+        emit_log(
+            scenario_id,
+            SEED_G6,
+            "start",
+            json!({"test": "fsqlite_sequential_batching"}),
+        );
 
-    GLOBAL_CONSOLIDATION_METRICS.reset();
+        GLOBAL_CONSOLIDATION_METRICS.reset();
 
-    let conn = fsqlite::Connection::open(":memory:").expect("open");
-    conn.execute(
-        "CREATE TABLE gc_bench (id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, batch_id INTEGER NOT NULL, val INTEGER NOT NULL)",
-    )
-    .expect("create");
+        let conn = fsqlite::Connection::open(":memory:").await.expect("open");
+        conn.execute(
+            "CREATE TABLE gc_bench (id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, batch_id INTEGER NOT NULL, val INTEGER NOT NULL)",
+        )
+        .await
+        .expect("create");
 
-    let n_batches = 20u64;
-    let batch_size = 25u64;
+        let n_batches = 20u64;
+        let batch_size = 25u64;
 
-    for batch_id in 0..n_batches {
-        conn.execute("BEGIN").expect("begin");
-        for i in 0..batch_size {
-            let row_id = batch_id * batch_size + i;
-            conn.execute(&format!(
-                "INSERT INTO gc_bench (id, thread_id, batch_id, val) VALUES ({row_id}, 0, {batch_id}, {})",
-                row_id * 3
-            ))
-            .expect("insert");
+        for batch_id in 0..n_batches {
+            conn.execute("BEGIN").await.expect("begin");
+            for i in 0..batch_size {
+                let row_id = batch_id * batch_size + i;
+                conn.execute(&format!(
+                    "INSERT INTO gc_bench (id, thread_id, batch_id, val) VALUES ({row_id}, 0, {batch_id}, {})",
+                    row_id * 3
+                ))
+                .await
+                .expect("insert");
+            }
+            conn.execute("COMMIT").await.expect("commit");
         }
-        conn.execute("COMMIT").expect("commit");
-    }
 
-    let count = fsqlite_extract_count(&conn);
-    assert_eq!(count, n_batches * batch_size);
+        let count = fsqlite_extract_count(&conn).await;
+        assert_eq!(count, n_batches * batch_size);
 
-    let snap = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+        let snap = GLOBAL_CONSOLIDATION_METRICS.snapshot();
 
-    emit_log(
-        scenario_id,
-        SEED_G6,
-        "result",
-        json!({
-            "total_rows": count,
-            "batches_committed": n_batches,
-            "groups_flushed": snap.groups_flushed,
-            "transactions_batched": snap.transactions_batched,
-            "fsyncs_total": snap.fsyncs_total,
-            "flusher_commits": snap.flusher_commits,
-            "waiter_commits": snap.waiter_commits,
-        }),
-    );
+        emit_log(
+            scenario_id,
+            SEED_G6,
+            "result",
+            json!({
+                "total_rows": count,
+                "batches_committed": n_batches,
+                "groups_flushed": snap.groups_flushed,
+                "transactions_batched": snap.transactions_batched,
+                "fsyncs_total": snap.fsyncs_total,
+                "flusher_commits": snap.flusher_commits,
+                "waiter_commits": snap.waiter_commits,
+            }),
+        );
 
-    // Verify data integrity via SELECT
-    let rows = conn
-        .query("SELECT COUNT(DISTINCT batch_id) FROM gc_bench")
-        .expect("distinct batches");
-    let distinct_batches = match &rows[0].values()[0] {
-        fsqlite_types::value::SqliteValue::Integer(n) => *n as u64,
-        other => panic!("unexpected: {other:?}"),
-    };
-    assert_eq!(distinct_batches, n_batches, "batch_id integrity broken");
+        // Verify data integrity via SELECT
+        let rows = conn
+            .query("SELECT COUNT(DISTINCT batch_id) FROM gc_bench")
+            .await
+            .expect("distinct batches");
+        let distinct_batches = match &rows[0].values()[0] {
+            fsqlite_types::value::SqliteValue::Integer(n) => *n as u64,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(distinct_batches, n_batches, "batch_id integrity broken");
+    });
 }
 
 // ─── Jain's fairness index math tests ────────────────────────────────

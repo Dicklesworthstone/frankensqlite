@@ -21,13 +21,14 @@
 use fsqlite::Connection;
 use rusqlite::Connection as StockConnection;
 
-fn setup(conn: &Connection) {
+async fn setup(conn: &Connection) {
     conn.execute(
         "CREATE TABLE commands (\
             id INTEGER PRIMARY KEY AUTOINCREMENT,\
             command TEXT NOT NULL\
         )",
     )
+    .await
     .expect("create commands");
     conn.execute(
         "CREATE VIRTUAL TABLE commands_fts USING fts5(\
@@ -36,12 +37,14 @@ fn setup(conn: &Connection) {
             content_rowid='id'\
         )",
     )
+    .await
     .expect("create external-content fts5");
     conn.execute(
         "CREATE TRIGGER commands_fts_insert AFTER INSERT ON commands BEGIN \
             INSERT INTO commands_fts(rowid, command) VALUES (new.id, new.command); \
         END",
     )
+    .await
     .expect("create insert trigger");
     // The canonical FTS5 external-content AFTER UPDATE trigger: delete the old
     // terms from the FTS index, then re-insert the new terms.
@@ -52,13 +55,15 @@ fn setup(conn: &Connection) {
             INSERT INTO commands_fts(rowid, command) VALUES (new.id, new.command); \
         END",
     )
+    .await
     .expect("create update trigger");
 }
 
-fn match_rowids(conn: &Connection, term: &str) -> Vec<i64> {
+async fn match_rowids(conn: &Connection, term: &str) -> Vec<i64> {
     conn.query(&format!(
         "SELECT rowid FROM commands_fts WHERE commands_fts MATCH '{term}' ORDER BY rowid"
     ))
+    .await
     .expect("MATCH query")
     .iter()
     .map(|r| match &r.values()[0] {
@@ -71,22 +76,28 @@ fn match_rowids(conn: &Connection, term: &str) -> Vec<i64> {
 /// In-memory variant (the shadow tables live at rootpage=0 in MemDatabase).
 #[test]
 fn update_fts_indexed_table_in_memory() {
-    let conn = Connection::open(":memory:").expect("open");
-    setup(&conn);
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.expect("open");
+        setup(&conn).await;
 
-    conn.execute("INSERT INTO commands(command) VALUES ('first command')")
-        .expect("1st insert");
-    conn.execute("INSERT INTO commands(command) VALUES ('second command')")
-        .expect("2nd insert");
+        conn.execute("INSERT INTO commands(command) VALUES ('first command')")
+            .await
+            .expect("1st insert");
+        conn.execute("INSERT INTO commands(command) VALUES ('second command')")
+            .await
+            .expect("2nd insert");
 
-    let res = conn.execute("UPDATE commands SET command = 'updated command' WHERE id = 1");
-    assert!(
-        res.is_ok(),
-        "UPDATE on FTS5-indexed table must not abort as malformed: {res:?}"
-    );
+        let res = conn
+            .execute("UPDATE commands SET command = 'updated command' WHERE id = 1")
+            .await;
+        assert!(
+            res.is_ok(),
+            "UPDATE on FTS5-indexed table must not abort as malformed: {res:?}"
+        );
 
-    assert_eq!(match_rowids(&conn, "updated"), vec![1]);
-    assert!(match_rowids(&conn, "first").is_empty());
+        assert_eq!(match_rowids(&conn, "updated").await, vec![1]);
+        assert!(match_rowids(&conn, "first").await.is_empty());
+    });
 }
 
 /// On-disk variant: the `%_idx` shadow is persisted as a real index-structured
@@ -94,25 +105,31 @@ fn update_fts_indexed_table_in_memory() {
 /// This is the reporter's scenario for frankensqlite#121.
 #[test]
 fn update_fts_indexed_table_on_disk() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let path = tmp.path().to_str().unwrap().to_owned();
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_owned();
 
-    {
-        let conn = Connection::open(&path).expect("open on-disk");
-        setup(&conn);
-        conn.execute("INSERT INTO commands(command) VALUES ('first command')")
-            .expect("1st insert");
-        conn.execute("INSERT INTO commands(command) VALUES ('second command')")
-            .expect("2nd insert");
+        {
+            let conn = Connection::open(&path).await.expect("open on-disk");
+            setup(&conn).await;
+            conn.execute("INSERT INTO commands(command) VALUES ('first command')")
+                .await
+                .expect("1st insert");
+            conn.execute("INSERT INTO commands(command) VALUES ('second command')")
+                .await
+                .expect("2nd insert");
 
-        let res = conn.execute("UPDATE commands SET command = 'updated command' WHERE id = 1");
-        assert!(
-            res.is_ok(),
-            "UPDATE on FTS5-indexed table (same connection) must not abort as malformed: {res:?}"
-        );
-        assert_eq!(match_rowids(&conn, "updated"), vec![1]);
-        assert!(match_rowids(&conn, "first").is_empty());
-    }
+            let res = conn
+                .execute("UPDATE commands SET command = 'updated command' WHERE id = 1")
+                .await;
+            assert!(
+                res.is_ok(),
+                "UPDATE on FTS5-indexed table (same connection) must not abort as malformed: {res:?}"
+            );
+            assert_eq!(match_rowids(&conn, "updated").await, vec![1]);
+            assert!(match_rowids(&conn, "first").await.is_empty());
+        }
+    });
 }
 
 /// On-disk variant with a close/reopen cycle before the UPDATE: the `%_idx`
@@ -120,26 +137,32 @@ fn update_fts_indexed_table_on_disk() {
 /// purely off the persisted page type.
 #[test]
 fn update_fts_indexed_table_reopen_then_update() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let path = tmp.path().to_str().unwrap().to_owned();
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_owned();
 
-    {
-        let conn = Connection::open(&path).expect("open on-disk");
-        setup(&conn);
-        conn.execute("INSERT INTO commands(command) VALUES ('first command')")
-            .expect("1st insert");
-        conn.execute("INSERT INTO commands(command) VALUES ('second command')")
-            .expect("2nd insert");
-    }
+        {
+            let conn = Connection::open(&path).await.expect("open on-disk");
+            setup(&conn).await;
+            conn.execute("INSERT INTO commands(command) VALUES ('first command')")
+                .await
+                .expect("1st insert");
+            conn.execute("INSERT INTO commands(command) VALUES ('second command')")
+                .await
+                .expect("2nd insert");
+        }
 
-    let conn = Connection::open(&path).expect("reopen on-disk");
-    let res = conn.execute("UPDATE commands SET command = 'updated command' WHERE id = 1");
-    assert!(
-        res.is_ok(),
-        "UPDATE on FTS5-indexed table (after reopen) must not abort as malformed: {res:?}"
-    );
-    assert_eq!(match_rowids(&conn, "updated"), vec![1]);
-    assert!(match_rowids(&conn, "first").is_empty());
+        let conn = Connection::open(&path).await.expect("reopen on-disk");
+        let res = conn
+            .execute("UPDATE commands SET command = 'updated command' WHERE id = 1")
+            .await;
+        assert!(
+            res.is_ok(),
+            "UPDATE on FTS5-indexed table (after reopen) must not abort as malformed: {res:?}"
+        );
+        assert_eq!(match_rowids(&conn, "updated").await, vec![1]);
+        assert!(match_rowids(&conn, "first").await.is_empty());
+    });
 }
 
 /// The reporter's actual scenario (frankensqlite#121): the store is created by
@@ -150,14 +173,15 @@ fn update_fts_indexed_table_reopen_then_update() {
 /// cursor, not a table cursor.
 #[test]
 fn update_stock_created_fts_indexed_table_does_not_abort() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("commands.db");
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("commands.db");
 
-    // Build the store with stock SQLite (rusqlite bundled).
-    {
-        let conn = StockConnection::open(&db_path).expect("open stock");
-        conn.execute_batch(
-            "CREATE TABLE commands(\
+        // Build the store with stock SQLite (rusqlite bundled).
+        {
+            let conn = StockConnection::open(&db_path).expect("open stock");
+            conn.execute_batch(
+                "CREATE TABLE commands(\
                 id INTEGER PRIMARY KEY AUTOINCREMENT,\
                 command TEXT NOT NULL\
              );\
@@ -172,30 +196,35 @@ fn update_stock_created_fts_indexed_table_does_not_abort() {
                     VALUES('delete', old.id, old.command); \
                 INSERT INTO commands_fts(rowid, command) VALUES (new.id, new.command); \
              END;",
-        )
-        .expect("create stock schema");
-        conn.execute("INSERT INTO commands(command) VALUES ('first command')", [])
-            .expect("stock insert 1");
-        conn.execute(
-            "INSERT INTO commands(command) VALUES ('second command')",
-            [],
-        )
-        .expect("stock insert 2");
-        // Sanity: stock's own integrity_check passes.
-        let ok: String = conn
-            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-            .expect("integrity_check");
-        assert_eq!(ok, "ok", "stock store must be canonically valid");
-    }
+            )
+            .expect("create stock schema");
+            conn.execute("INSERT INTO commands(command) VALUES ('first command')", [])
+                .expect("stock insert 1");
+            conn.execute(
+                "INSERT INTO commands(command) VALUES ('second command')",
+                [],
+            )
+            .expect("stock insert 2");
+            // Sanity: stock's own integrity_check passes.
+            let ok: String = conn
+                .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+                .expect("integrity_check");
+            assert_eq!(ok, "ok", "stock store must be canonically valid");
+        }
 
-    // Now open with frankensqlite and UPDATE.
-    let conn = Connection::open(db_path.to_str().unwrap()).expect("frankensqlite open stock file");
-    let res = conn.execute("UPDATE commands SET command = 'updated command' WHERE id = 1");
-    assert!(
-        res.is_ok(),
-        "UPDATE on stock-created FTS5-indexed table must not abort as malformed: {res:?}"
-    );
+        // Now open with frankensqlite and UPDATE.
+        let conn = Connection::open(db_path.to_str().unwrap())
+            .await
+            .expect("frankensqlite open stock file");
+        let res = conn
+            .execute("UPDATE commands SET command = 'updated command' WHERE id = 1")
+            .await;
+        assert!(
+            res.is_ok(),
+            "UPDATE on stock-created FTS5-indexed table must not abort as malformed: {res:?}"
+        );
 
-    assert_eq!(match_rowids(&conn, "updated"), vec![1]);
-    assert!(match_rowids(&conn, "first").is_empty());
+        assert_eq!(match_rowids(&conn, "updated").await, vec![1]);
+        assert!(match_rowids(&conn, "first").await.is_empty());
+    });
 }

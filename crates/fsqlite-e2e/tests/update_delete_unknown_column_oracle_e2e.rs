@@ -9,14 +9,14 @@
 
 use fsqlite::Connection;
 
-fn ddl_case(setup: &[&str], test: &str) -> Option<String> {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn ddl_case(setup: &[&str], test: &str) -> Option<String> {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in setup {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
-    let fe = f.execute(test);
+    let fe = f.execute(test).await;
     let re = r.execute_batch(test);
     match (&fe, &re) {
         (Ok(_), Ok(())) | (Err(_), Err(_)) => None,
@@ -27,11 +27,13 @@ fn ddl_case(setup: &[&str], test: &str) -> Option<String> {
     }
 }
 
-fn check(cases: &[(&[&str], &str)], label: &str) {
-    let mismatches: Vec<String> = cases
-        .iter()
-        .filter_map(|(setup, test)| ddl_case(setup, test))
-        .collect();
+async fn check(cases: &[(&[&str], &str)], label: &str) {
+    let mut mismatches: Vec<String> = Vec::new();
+    for (setup, test) in cases {
+        if let Some(m) = ddl_case(setup, test).await {
+            mismatches.push(m);
+        }
+    }
     assert!(
         mismatches.is_empty(),
         "{label}: {} mismatch(es)\n{}",
@@ -47,29 +49,35 @@ const SETUP: &[&str] = &[
 
 #[test]
 fn update_delete_valid_ok() {
-    check(
-        &[
-            (SETUP, "UPDATE t SET a = a + 1"),
-            (SETUP, "UPDATE t SET b = 99 WHERE a = 1"),
-            (SETUP, "DELETE FROM t WHERE a = 2"),
-        ],
-        "update_delete_valid_ok",
-    );
+    asupersync::test_utils::run_test(|| async {
+        check(
+            &[
+                (SETUP, "UPDATE t SET a = a + 1"),
+                (SETUP, "UPDATE t SET b = 99 WHERE a = 1"),
+                (SETUP, "DELETE FROM t WHERE a = 2"),
+            ],
+            "update_delete_valid_ok",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn update_delete_unknown_column_rejected() {
-    check(
-        &[
-            // SET left-hand-side names a column that does not exist
-            (SETUP, "UPDATE t SET nope = 1"),
-            // WHERE references an unknown column
-            (SETUP, "UPDATE t SET a = 1 WHERE nope = 1"),
-            // SET expression references an unknown column
-            (SETUP, "UPDATE t SET a = nope + 1"),
-            // DELETE WHERE references unknown column
-            (SETUP, "DELETE FROM t WHERE nope = 1"),
-        ],
-        "update_delete_unknown_column_rejected",
-    );
+    asupersync::test_utils::run_test(|| async {
+        check(
+            &[
+                // SET left-hand-side names a column that does not exist
+                (SETUP, "UPDATE t SET nope = 1"),
+                // WHERE references an unknown column
+                (SETUP, "UPDATE t SET a = 1 WHERE nope = 1"),
+                // SET expression references an unknown column
+                (SETUP, "UPDATE t SET a = nope + 1"),
+                // DELETE WHERE references unknown column
+                (SETUP, "DELETE FROM t WHERE nope = 1"),
+            ],
+            "update_delete_unknown_column_rejected",
+        )
+        .await;
+    });
 }

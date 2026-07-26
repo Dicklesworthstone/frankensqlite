@@ -16,8 +16,8 @@
 //!   cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --filter insert
 
 use std::collections::BTreeMap;
-use std::io::Write as _;
-use std::sync::{Arc, Barrier, OnceLock, mpsc};
+use std::io::{Read as _, Write as _};
+use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeBuilder};
@@ -25,7 +25,17 @@ use fsqlite_core::connection::{
     HotPathProfileSnapshot, hot_path_profile_enabled, hot_path_profile_snapshot,
     reset_hot_path_profile, set_hot_path_profile_enabled,
 };
+#[cfg(feature = "bridge-experiment")]
+use rand::RngExt as _;
+#[cfg(feature = "bridge-experiment")]
+use rand::SeedableRng as _;
+#[cfg(feature = "bridge-experiment")]
+use rand::rngs::StdRng;
+#[cfg(feature = "bridge-experiment")]
+use rand::seq::SliceRandom as _;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use tracing_subscriber::prelude::*;
 
 // ─── Configuration ─────────────────────────────────────────────────────
 
@@ -40,12 +50,12 @@ const ROW_COUNTS_QUICK: &[usize] = &[100, 1_000, 10_000];
 const CONCURRENT_THREAD_COUNTS: &[usize] = &[2, 4, 8];
 const CONCURRENT_ROWS_PER_THREAD: usize = 1_000;
 const CONCURRENT_RANGE_SIZE: i64 = 1_000_000;
-const JSON_REPORT_SCHEMA_V3: &str = "fsqlite-e2e.comprehensive-bench-report.v3";
+const JSON_REPORT_SCHEMA_V4: &str = "fsqlite-e2e.comprehensive-bench-report.v4";
+const BENCHMARK_PROVENANCE_SCHEMA_V1: &str = "fsqlite-e2e.benchmark-provenance.v1";
 const CI_REGRESSION_GATE_SCHEMA_V2: &str = "fsqlite-e2e.comprehensive-bench-ci-regression-gate.v2";
 const CI_REGRESSION_GATE_BEAD_ID: &str = "bd-m4tju";
 const CI_REGRESSION_BASELINE_BEAD_ID: &str = "bd-0winn";
 const CI_REGRESSION_BASELINE_AVG_RATIO: f64 = 2.74;
-const CI_REGRESSION_GATE_STATUS_RICH_SCORECARD: &str = "rich_scorecard_schema_ready";
 const CI_REGRESSION_GATE_THRESHOLD_SOURCE: &str =
     "bd-d4m5k rich scorecard: primary gate is per_category_weighted.score";
 const CI_PRIMARY_SCORE_MAX_REGRESSION_PCT: f64 = 0.03;
@@ -55,6 +65,10 @@ const CI_P90_MAX_REGRESSION_PCT: f64 = 0.15;
 const CONCURRENT_WRITERS_SECTION_TITLE: &str =
     "Concurrent Writers — C SQLite WAL vs FrankenSQLite MVCC";
 const DEFAULT_BENCH_PAGE_SIZE_BYTES: u32 = 4096;
+#[cfg(feature = "bridge-experiment")]
+const BRIDGE_REPORT_SCHEMA_V1: &str = "fsqlite-e2e.bridge-experiment.v1";
+#[cfg(feature = "bridge-experiment")]
+const BRIDGE_INSERT_SQL: &str = "INSERT INTO bridge_probe(id, value) VALUES (?1, ?2)";
 
 // ─── Record size definitions ───────────────────────────────────────────
 
@@ -419,23 +433,28 @@ fn bench_env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Optional symmetric `synchronous` override for the concurrent-writer section.
+/// Matched durability for both engines in the concurrent-writer section.
 ///
-/// Returns `None` (env unset) for the default run, where BOTH engines' writer
-/// connections are already at NORMAL: C sets it explicitly (it would otherwise
-/// inherit the compiled FULL default — see the writer setup below) and
-/// FrankenSQLite gets it from `apply_pragmas_fsqlite`. When
-/// `FSQLITE_BENCH_CONCURRENT_SYNC` is set to `normal`/`full`, both are forced to
-/// that identical mode instead — `full` gives the durability-serious comparison
-/// (a real WAL fsync per commit on both sides) and was used to probe whether
-/// group-commit coalescing engages under per-commit fsync (it does not for this
-/// workload shape; see bd-6hgad). The comparison is matched either way; the
-/// override only chooses which durability level both engines are matched at.
-fn concurrent_sync_override() -> Option<&'static str> {
+/// NORMAL is the explicit default. FULL is available as a separate, labelled
+/// experiment. Silently allowing C SQLite to inherit FULL while FrankenSQLite
+/// receives NORMAL makes the comparison non-citable (bd-x5gzk).
+///
+/// Why this exists at all: `synchronous` is a PER-CONNECTION pragma, so the
+/// setup connection's NORMAL never reaches the writer connections. A C SQLite
+/// writer that never sets it inherits the compiled default
+/// SQLITE_DEFAULT_SYNCHRONOUS=2 (FULL) and pays a real WAL fsync per commit,
+/// while FrankenSQLite's NORMAL maps to WalCommitSyncPolicy::Deferred and pays
+/// none. FULL is also the durability-serious comparison, and was used to probe
+/// whether group-commit coalescing engages under a per-commit fsync: it does
+/// not for this workload shape, because each writer issues exactly one commit
+/// so commits never co-occur in the consolidator's FILLING window (bd-6hgad).
+fn concurrent_sync_mode() -> &'static str {
     match std::env::var("FSQLITE_BENCH_CONCURRENT_SYNC") {
-        Ok(value) if value.eq_ignore_ascii_case("normal") => Some("NORMAL"),
-        Ok(value) if value.eq_ignore_ascii_case("full") => Some("FULL"),
-        _ => None,
+        Ok(value) if value.eq_ignore_ascii_case("normal") => "NORMAL",
+        Ok(value) if value.eq_ignore_ascii_case("full") => "FULL",
+        Ok(value) => panic!("FSQLITE_BENCH_CONCURRENT_SYNC must be NORMAL or FULL, got `{value}`"),
+        Err(std::env::VarError::NotPresent) => "NORMAL",
+        Err(error) => panic!("could not read FSQLITE_BENCH_CONCURRENT_SYNC: {error}"),
     }
 }
 
@@ -453,6 +472,13 @@ fn collect_rusqlite_rows<P: rusqlite::Params>(
         Ok(values)
     })?
     .collect::<Result<Vec<_>, _>>()
+}
+
+fn fsqlite_integer(row: &fsqlite::Row, column: usize, context: &str) -> i64 {
+    match row.get(column) {
+        Some(fsqlite::SqliteValue::Integer(value)) => *value,
+        value => panic!("{context}: expected INTEGER at column {column}, got {value:?}"),
+    }
 }
 
 struct BenchTask<T> {
@@ -543,7 +569,7 @@ fn apply_pragmas_csqlite(conn: &rusqlite::Connection) {
          PRAGMA cache_size = -64000;",
         benchmark_page_size_bytes()
     ))
-    .ok();
+    .unwrap_or_else(|error| panic!("failed to configure C SQLite benchmark connection: {error}"));
 }
 
 const FSQLITE_BENCHMARK_PRAGMAS: &[&str] = &[
@@ -557,15 +583,14 @@ const FSQLITE_BENCHMARK_PRAGMAS: &[&str] = &[
 ];
 
 fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
-    // Every pragma here is best-effort: an unsupported one must not abort the
-    // run. `drop(block_on(..))` — not `let _ = ..` — because `execute` returns a
-    // future now, and `let _` would bind (and immediately drop) it unpolled,
-    // silently skipping the pragma with no diagnostic.
-    drop(fsqlite_e2e::block_on(conn.execute(
-        format!("PRAGMA page_size = {};", benchmark_page_size_bytes()).as_str(),
-    )));
+    let page_size = format!("PRAGMA page_size = {};", benchmark_page_size_bytes());
+    fsqlite_e2e::block_on(conn.execute(&page_size)).unwrap_or_else(|error| {
+        panic!("failed to configure FrankenSQLite with `{page_size}`: {error}")
+    });
     for pragma in FSQLITE_BENCHMARK_PRAGMAS {
-        drop(fsqlite_e2e::block_on(conn.execute(pragma)));
+        fsqlite_e2e::block_on(conn.execute(pragma)).unwrap_or_else(|error| {
+            panic!("failed to configure FrankenSQLite with `{pragma}`: {error}")
+        });
     }
     // Opt-in LAB_UNSAFE write-merge mode for A/B perf measurement of the
     // SSI e-process skip gate. The gate is safe to leave on: under the
@@ -575,14 +600,360 @@ fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
         .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {
-        drop(fsqlite_e2e::block_on(
-            conn.execute("PRAGMA fsqlite.write_merge = LAB_UNSAFE;"),
-        ));
+        fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.write_merge = LAB_UNSAFE;"))
+            .unwrap_or_else(|error| panic!("failed to enable LAB_UNSAFE write merge: {error}"));
         // Tight alpha so the gate opens reasonably fast on the short
         // benchmark runs. `alpha = 1e-3` matches the default.
-        drop(fsqlite_e2e::block_on(
-            conn.execute("PRAGMA fsqlite.ssi_e_process_alpha = 0.001;"),
+        fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.ssi_e_process_alpha = 0.001;"))
+            .unwrap_or_else(|error| panic!("failed to set SSI e-process alpha: {error}"));
+    }
+}
+
+fn normalize_csqlite_value(value: rusqlite::types::ValueRef<'_>) -> String {
+    match value {
+        rusqlite::types::ValueRef::Null => "null".to_owned(),
+        rusqlite::types::ValueRef::Integer(value) => value.to_string(),
+        rusqlite::types::ValueRef::Real(value) => value.to_string(),
+        rusqlite::types::ValueRef::Text(value) => {
+            String::from_utf8_lossy(value).to_ascii_lowercase()
+        }
+        rusqlite::types::ValueRef::Blob(value) => format!("blob:{}", value.len()),
+    }
+}
+
+fn normalize_fsqlite_value(value: &fsqlite::SqliteValue) -> String {
+    match value {
+        fsqlite::SqliteValue::Null => "null".to_owned(),
+        fsqlite::SqliteValue::Integer(value) => value.to_string(),
+        fsqlite::SqliteValue::Float(value) => value.to_string(),
+        fsqlite::SqliteValue::Text(value) => value.as_ref().to_ascii_lowercase(),
+        fsqlite::SqliteValue::Blob(value) => format!("blob:{}", value.len()),
+    }
+}
+
+fn query_effective_csqlite_pragmas(
+    conn: &rusqlite::Connection,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut values = BTreeMap::new();
+    for pragma in ["page_size", "journal_mode", "synchronous", "cache_size"] {
+        let sql = format!("PRAGMA {pragma};");
+        let value = conn
+            .query_row(&sql, [], |row| row.get_ref(0).map(normalize_csqlite_value))
+            .map_err(|error| format!("C SQLite `{sql}` failed: {error}"))?;
+        values.insert(pragma.to_owned(), value);
+    }
+    Ok(values)
+}
+
+fn query_effective_fsqlite_pragmas(
+    conn: &fsqlite::Connection,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut values = BTreeMap::new();
+    for pragma in ["page_size", "journal_mode", "synchronous", "cache_size"] {
+        let sql = format!("PRAGMA {pragma};");
+        let rows = fsqlite_e2e::block_on(conn.query(&sql))
+            .map_err(|error| format!("FrankenSQLite `{sql}` failed: {error}"))?;
+        let row = rows
+            .first()
+            .ok_or_else(|| format!("FrankenSQLite `{sql}` returned no row"))?;
+        let value = row
+            .get(0)
+            .ok_or_else(|| format!("FrankenSQLite `{sql}` returned no first column"))?;
+        values.insert(pragma.to_owned(), normalize_fsqlite_value(value));
+    }
+    Ok(values)
+}
+
+fn record_durability_profile(
+    profiles: &mut BTreeMap<String, BTreeMap<String, String>>,
+    errors: &mut Vec<String>,
+    name: &str,
+    result: Result<BTreeMap<String, String>, String>,
+) {
+    match result {
+        Ok(profile) => {
+            profiles.insert(name.to_owned(), profile);
+        }
+        Err(error) => errors.push(error),
+    }
+}
+
+fn capture_durability_identity() -> JsonDurabilityIdentity {
+    let mut effective_profiles = BTreeMap::new();
+    let mut validation_errors = Vec::new();
+
+    let csqlite_memory = rusqlite::Connection::open_in_memory()
+        .expect("durability certification must open C SQLite memory database");
+    apply_pragmas_csqlite(&csqlite_memory);
+    record_durability_profile(
+        &mut effective_profiles,
+        &mut validation_errors,
+        "memory.csqlite",
+        query_effective_csqlite_pragmas(&csqlite_memory),
+    );
+
+    let fsqlite_memory = open_fsqlite_memory_connection_for_benchmark();
+    apply_pragmas_fsqlite(&fsqlite_memory);
+    let memory_concurrent_mode_default = fsqlite_memory.is_concurrent_mode_default();
+    record_durability_profile(
+        &mut effective_profiles,
+        &mut validation_errors,
+        "memory.fsqlite",
+        query_effective_fsqlite_pragmas(&fsqlite_memory),
+    );
+
+    let directory =
+        tempfile::tempdir().expect("durability certification must create a temporary directory");
+    let csqlite_path = directory.path().join("csqlite.db");
+    let csqlite_file = rusqlite::Connection::open(&csqlite_path)
+        .expect("durability certification must open C SQLite file database");
+    apply_pragmas_csqlite(&csqlite_file);
+    record_durability_profile(
+        &mut effective_profiles,
+        &mut validation_errors,
+        "file.csqlite",
+        query_effective_csqlite_pragmas(&csqlite_file),
+    );
+
+    let fsqlite_path = directory.path().join("fsqlite.db");
+    let fsqlite_path = fsqlite_path
+        .to_str()
+        .expect("temporary benchmark path must be UTF-8");
+    let fsqlite_file = fsqlite_e2e::block_on(fsqlite::Connection::open_with_page_size(
+        fsqlite_path,
+        benchmark_page_size_bytes(),
+    ))
+    .expect("durability certification must open FrankenSQLite file database");
+    apply_pragmas_fsqlite(&fsqlite_file);
+    let file_concurrent_mode_default = fsqlite_file.is_concurrent_mode_default();
+    record_durability_profile(
+        &mut effective_profiles,
+        &mut validation_errors,
+        "file.fsqlite",
+        query_effective_fsqlite_pragmas(&fsqlite_file),
+    );
+
+    for kind in ["memory", "file"] {
+        let csqlite = effective_profiles.get(&format!("{kind}.csqlite"));
+        let fsqlite = effective_profiles.get(&format!("{kind}.fsqlite"));
+        if let (Some(csqlite), Some(fsqlite)) = (csqlite, fsqlite)
+            && csqlite != fsqlite
+        {
+            validation_errors.push(format!(
+                "{kind} effective PRAGMAs differ: C SQLite={csqlite:?}, FrankenSQLite={fsqlite:?}"
+            ));
+        }
+    }
+    let concurrent_mode_default = memory_concurrent_mode_default && file_concurrent_mode_default;
+    if !concurrent_mode_default {
+        validation_errors.push(format!(
+            "FrankenSQLite concurrent-writer mode is not default-on for every benchmark backend: \
+             memory={memory_concurrent_mode_default}, file={file_concurrent_mode_default}"
         ));
+    }
+
+    let verified = effective_profiles.len() == 4;
+    let matched = verified && validation_errors.is_empty();
+    JsonDurabilityIdentity {
+        page_size_bytes: benchmark_page_size_bytes(),
+        default_synchronous: "NORMAL".to_owned(),
+        concurrent_synchronous_modes: vec![concurrent_sync_mode().to_owned()],
+        csqlite_pragmas: vec![
+            format!("PRAGMA page_size = {};", benchmark_page_size_bytes()),
+            "PRAGMA journal_mode = WAL;".to_owned(),
+            "PRAGMA synchronous = NORMAL;".to_owned(),
+            "PRAGMA cache_size = -64000;".to_owned(),
+        ],
+        fsqlite_pragmas: std::iter::once(format!(
+            "PRAGMA page_size = {};",
+            benchmark_page_size_bytes()
+        ))
+        .chain(
+            FSQLITE_BENCHMARK_PRAGMAS
+                .iter()
+                .map(|pragma| (*pragma).to_owned()),
+        )
+        .collect(),
+        concurrent_mode_default,
+        verified,
+        matched,
+        validation_errors,
+        effective_profiles,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FallbackDecisionLayer(Arc<Mutex<BTreeMap<String, u64>>>);
+
+#[derive(Default)]
+struct FallbackDecisionVisitor {
+    decision_reason: Option<String>,
+}
+
+impl tracing::field::Visit for FallbackDecisionVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "decision_reason" {
+            self.decision_reason = Some(value.to_owned());
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "decision_reason" && self.decision_reason.is_none() {
+            self.decision_reason = Some(format!("{value:?}").trim_matches('"').to_owned());
+        }
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for FallbackDecisionLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() != "fsqlite.fallback_decision" {
+            return;
+        }
+        let mut visitor = FallbackDecisionVisitor::default();
+        event.record(&mut visitor);
+        let reason = visitor
+            .decision_reason
+            .unwrap_or_else(|| "<missing-decision-reason>".to_owned());
+        let mut counts = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *counts.entry(reason).or_insert(0) += 1;
+    }
+}
+
+fn environment_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn certify_execution_routing() -> JsonExecutionRouting {
+    let previous_profile_enabled = hot_path_profile_enabled();
+    set_hot_path_profile_enabled(true);
+    reset_hot_path_profile();
+
+    let conn = open_fsqlite_memory_connection_for_benchmark();
+    apply_pragmas_fsqlite(&conn);
+    fs_execute(
+        &conn,
+        "CREATE TABLE routing_probe(id INTEGER PRIMARY KEY, grp INTEGER, value TEXT)",
+    );
+    let insert = fs_prepare(
+        &conn,
+        "INSERT INTO routing_probe(id, grp, value) VALUES (?1, ?2, ?3)",
+    );
+    for id in 1_i64..=4 {
+        fs_stmt_execute_with_params(
+            &insert,
+            &[
+                fsqlite::SqliteValue::Integer(id),
+                fsqlite::SqliteValue::Integer(id % 2),
+                fsqlite::SqliteValue::Text(format!("value-{id}").into()),
+            ],
+        );
+    }
+    let update = fs_prepare(&conn, "UPDATE routing_probe SET value = ?2 WHERE id = ?1");
+    fs_stmt_execute_with_params(
+        &update,
+        &[
+            fsqlite::SqliteValue::Integer(1),
+            fsqlite::SqliteValue::Text("updated".into()),
+        ],
+    );
+    let delete = fs_prepare(&conn, "DELETE FROM routing_probe WHERE id = ?1");
+    fs_stmt_execute_with_params(&delete, &[fsqlite::SqliteValue::Integer(4)]);
+
+    let fallback_counts = Arc::new(Mutex::new(BTreeMap::new()));
+    let subscriber = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::filter::Targets::new()
+                .with_target("fsqlite.fallback_decision", tracing::Level::DEBUG),
+        )
+        .with(FallbackDecisionLayer(Arc::clone(&fallback_counts)));
+    {
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let rows = fsqlite_e2e::block_on(
+            conn.query("SELECT grp, GROUP_CONCAT(value) FROM routing_probe GROUP BY grp"),
+        )
+        .expect("routing certification GROUP BY query must succeed");
+        std::hint::black_box(rows);
+    }
+
+    let profile = hot_path_profile_snapshot();
+    set_hot_path_profile_enabled(previous_profile_enabled);
+    let select_fallback_decisions = fallback_counts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let timed_execution_instrumented = [
+        "FSQLITE_BENCH_PROFILE_INSERT",
+        "FSQLITE_BENCH_PROFILE_CONCURRENT",
+        "FSQLITE_BENCH_PROFILE_DML",
+        "FSQLITE_BENCH_PROFILE_IDX",
+    ]
+    .into_iter()
+    .any(environment_flag_enabled);
+    let mut certification_errors = Vec::new();
+    if select_fallback_decisions.is_empty() {
+        certification_errors.push(
+            "fallback-decision collector saw no event for the certification GROUP BY query"
+                .to_owned(),
+        );
+    }
+    if timed_execution_instrumented {
+        certification_errors.push(
+            "a FSQLITE_BENCH_PROFILE_* switch instruments timed FrankenSQLite execution".to_owned(),
+        );
+    }
+
+    JsonExecutionRouting {
+        capture_scope:
+            "untimed certification pass; counters reset before the probe and excluded from score rows"
+                .to_owned(),
+        timed_execution_instrumented,
+        parser_fast_path_executions: profile.parser.fast_path_executions,
+        parser_slow_path_executions: profile.parser.slow_path_executions,
+        prepared_insert_fast_lane_hits: profile.prepared_insert_fast_lane_hits,
+        prepared_insert_instrumented_lane_hits: profile.prepared_insert_instrumented_lane_hits,
+        prepared_update_delete_fast_lane_hits: profile.prepared_update_delete_fast_lane_hits,
+        prepared_update_delete_instrumented_lane_hits: profile
+            .prepared_update_delete_instrumented_lane_hits,
+        prepared_dml_fallbacks: BTreeMap::from([
+            (
+                "returning".to_owned(),
+                profile.prepared_update_delete_fallback_returning,
+            ),
+            (
+                "sqlite_sequence".to_owned(),
+                profile.prepared_update_delete_fallback_sqlite_sequence,
+            ),
+            (
+                "without_rowid".to_owned(),
+                profile.prepared_update_delete_fallback_without_rowid,
+            ),
+            (
+                "live_vtab".to_owned(),
+                profile.prepared_update_delete_fallback_live_vtab,
+            ),
+            (
+                "trigger".to_owned(),
+                profile.prepared_update_delete_fallback_trigger,
+            ),
+            (
+                "foreign_key".to_owned(),
+                profile.prepared_update_delete_fallback_foreign_key,
+            ),
+        ]),
+        select_fallback_decisions,
+        certification_errors,
     }
 }
 
@@ -616,6 +987,11 @@ struct CliOptions {
     json_out_path: Option<String>,
     json_stdout: bool,
     print_json_schema: bool,
+    allow_unverified_provenance: bool,
+    bridge_experiment: bool,
+    bridge_samples: usize,
+    bridge_operations: usize,
+    bridge_seed: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -695,6 +1071,257 @@ struct DetectedEnvironment {
     benchmark_binary_modified_unix_ts: Option<u64>,
     benchmark_binary_older_than_git_head: Option<bool>,
     build_profile: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonBuildIdentity {
+    workspace_root: String,
+    git_commit_sha: String,
+    git_branch: String,
+    git_dirty: Option<bool>,
+    input_tracking: String,
+    cargo_profile: String,
+    declared_profile: String,
+    opt_level: String,
+    debug: String,
+    target: String,
+    host: String,
+    panic_strategy: String,
+    package_features: Vec<String>,
+    encoded_rustflags_hex: String,
+    rustc_version: String,
+    cargo_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonRuntimeSourceIdentity {
+    verification_root: String,
+    git_commit_sha: Option<String>,
+    git_branch: Option<String>,
+    git_dirty: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonTracingIdentity {
+    rust_log: Option<String>,
+    statement_debug_enabled: bool,
+    statement_reuse_info_enabled: bool,
+    fallback_decision_debug_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonDurabilityIdentity {
+    page_size_bytes: u32,
+    default_synchronous: String,
+    concurrent_synchronous_modes: Vec<String>,
+    csqlite_pragmas: Vec<String>,
+    fsqlite_pragmas: Vec<String>,
+    concurrent_mode_default: bool,
+    verified: bool,
+    matched: bool,
+    validation_errors: Vec<String>,
+    effective_profiles: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonExecutionRouting {
+    capture_scope: String,
+    timed_execution_instrumented: bool,
+    parser_fast_path_executions: u64,
+    parser_slow_path_executions: u64,
+    prepared_insert_fast_lane_hits: u64,
+    prepared_insert_instrumented_lane_hits: u64,
+    prepared_update_delete_fast_lane_hits: u64,
+    prepared_update_delete_instrumented_lane_hits: u64,
+    prepared_dml_fallbacks: BTreeMap<String, u64>,
+    select_fallback_decisions: BTreeMap<String, u64>,
+    certification_errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonBenchmarkProvenance {
+    schema_version: String,
+    citable: bool,
+    status: String,
+    validation_errors: Vec<String>,
+    build: JsonBuildIdentity,
+    runtime_source: JsonRuntimeSourceIdentity,
+    working_directory: Option<String>,
+    binary_path: Option<String>,
+    binary_sha256: Option<String>,
+    binary_size_bytes: Option<u64>,
+    binary_modified_unix_ts: Option<u64>,
+    cargo_lock_sha256: Option<String>,
+    cargo_feature_graph_sha256: Option<String>,
+    cargo_feature_graph: Option<String>,
+    cargo_feature_graph_command: String,
+    command_line: Vec<String>,
+    benchmark_environment: BTreeMap<String, String>,
+    cpu_affinity: Option<String>,
+    runtime_bridge: String,
+    tracing: JsonTracingIdentity,
+    durability: JsonDurabilityIdentity,
+    execution_routing: JsonExecutionRouting,
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum BridgeArm {
+    PerOperationBlockOn,
+    #[serde(rename = "inside_existing_runtime")]
+    SingleRuntimeEntry,
+    WorkerSyncFacade,
+}
+
+#[cfg(feature = "bridge-experiment")]
+impl BridgeArm {
+    const ALL: [Self; 3] = [
+        Self::PerOperationBlockOn,
+        Self::SingleRuntimeEntry,
+        Self::WorkerSyncFacade,
+    ];
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::PerOperationBlockOn => "per_operation_block_on",
+            Self::SingleRuntimeEntry => "inside_existing_runtime",
+            Self::WorkerSyncFacade => "worker_sync_facade",
+        }
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum BridgeWorkload {
+    ReadyFuture,
+    PreparedInsert,
+    RawExecuteWithParams,
+}
+
+#[cfg(feature = "bridge-experiment")]
+impl BridgeWorkload {
+    const fn id(self) -> &'static str {
+        match self {
+            Self::ReadyFuture => "ready_future",
+            Self::PreparedInsert => "prepared_insert",
+            Self::RawExecuteWithParams => "raw_execute_with_params",
+        }
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonBridgeSample {
+    workload: BridgeWorkload,
+    operation_count: usize,
+    block_index: usize,
+    order_slot: usize,
+    arm: BridgeArm,
+    elapsed_ns: u64,
+    runtime_entries_total: usize,
+    runtime_entries_inside_timed_region: usize,
+    caller_future_completions_inside_timed_region: usize,
+    engine_dml_future_calls_inside_timed_region: usize,
+    worker_commands_total: usize,
+    worker_commands_inside_timed_region: usize,
+    worker_open_handshakes_total: usize,
+    oracle_kind: String,
+    checksum_count: i64,
+    checksum_sum: i64,
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonBridgeArmStats {
+    workload: BridgeWorkload,
+    operation_count: usize,
+    arm: BridgeArm,
+    samples: usize,
+    median_ns: f64,
+    mean_ns: f64,
+    p95_ns: f64,
+    stddev_ns: f64,
+    cv_pct: f64,
+    median_ns_per_operation: f64,
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonBridgePairedComparison {
+    workload: BridgeWorkload,
+    operation_count: usize,
+    numerator: BridgeArm,
+    denominator: BridgeArm,
+    paired_blocks: usize,
+    median_ratio: f64,
+    geomean_ratio: f64,
+    bootstrap_mean_ratio_ci95_low: f64,
+    bootstrap_mean_ratio_ci95_high: f64,
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonBridgeReadyRegression {
+    predictor: String,
+    response: String,
+    interpretation: String,
+    points: usize,
+    paired_blocks: usize,
+    bootstrap_clusters: usize,
+    intercept_ns: f64,
+    slope_ns_per_additional_runtime_entry: f64,
+    bootstrap_slope_ci95_low: f64,
+    bootstrap_slope_ci95_high: f64,
+    r_squared: f64,
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonBridgeConfig {
+    samples_per_arm: usize,
+    raw_insert_operations: usize,
+    ready_operation_counts: Vec<usize>,
+    order_seed: u64,
+    ordering_policy: String,
+    warmup_policy: String,
+    timed_region: String,
+    arm_contracts: BTreeMap<String, String>,
+    affinity_policy: String,
+    max_load_average_1m: Option<f64>,
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonBridgeHostState {
+    captured_at_utc: String,
+    load_average_1m: Option<f64>,
+    load_average_5m: Option<f64>,
+    load_average_15m: Option<f64>,
+    available_parallelism: Option<usize>,
+    cpu_affinity: Option<String>,
+    scaling_governors: Vec<String>,
+    energy_performance_preferences: Vec<String>,
+    boost_controls: BTreeMap<String, String>,
+    numa_nodes_online: Option<String>,
+    memory_available_gb: Option<f64>,
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonBridgeReport {
+    schema_version: String,
+    generated_at_utc: String,
+    provenance: JsonBenchmarkProvenance,
+    environment: DetectedEnvironment,
+    host_state_before: JsonBridgeHostState,
+    host_state_after: JsonBridgeHostState,
+    config: JsonBridgeConfig,
+    raw_samples: Vec<JsonBridgeSample>,
+    arm_statistics: Vec<JsonBridgeArmStats>,
+    paired_comparisons: Vec<JsonBridgePairedComparison>,
+    ready_runtime_entry_regression: JsonBridgeReadyRegression,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -779,6 +1406,7 @@ struct JsonBenchmarkReport {
     total_elapsed_ms: u64,
     config: JsonRunConfig,
     environment: DetectedEnvironment,
+    provenance: JsonBenchmarkProvenance,
     summary: ReportSummaryStats,
     ci_regression_gate: JsonCiRegressionGateDraft,
     sections: Vec<JsonSection>,
@@ -790,6 +1418,9 @@ struct JsonCiRegressionGateDraft {
     bead_id: String,
     depends_on_bead_id: String,
     status: String,
+    eligible: bool,
+    ineligibility_reasons: Vec<String>,
+    evaluation_result: String,
     thresholds: JsonCiRegressionThresholdsDraft,
     observed: JsonCiRegressionObservedMetrics,
 }
@@ -1050,13 +1681,21 @@ fn max_multithread_p95_ratio(report: &BenchReport) -> (Option<f64>, Option<Strin
 fn build_ci_regression_gate(
     report: &BenchReport,
     summary: &ReportSummaryStats,
+    provenance: &JsonBenchmarkProvenance,
 ) -> JsonCiRegressionGateDraft {
     let (max_mt_p95_ratio, max_mt_p95_scenario_id) = max_multithread_p95_ratio(report);
     JsonCiRegressionGateDraft {
         schema_version: CI_REGRESSION_GATE_SCHEMA_V2.to_owned(),
         bead_id: CI_REGRESSION_GATE_BEAD_ID.to_owned(),
         depends_on_bead_id: CI_REGRESSION_BASELINE_BEAD_ID.to_owned(),
-        status: CI_REGRESSION_GATE_STATUS_RICH_SCORECARD.to_owned(),
+        status: if provenance.citable {
+            "eligible_compatible_baseline_required".to_owned()
+        } else {
+            "ineligible".to_owned()
+        },
+        eligible: provenance.citable,
+        ineligibility_reasons: provenance.validation_errors.clone(),
+        evaluation_result: "not_evaluated".to_owned(),
         thresholds: JsonCiRegressionThresholdsDraft {
             avg_ratio_baseline: CI_REGRESSION_BASELINE_AVG_RATIO,
             avg_ratio_max: None,
@@ -1122,8 +1761,405 @@ impl JsonMeasurement {
     }
 }
 
+fn command_stdout_at(
+    current_dir: &std::path::Path,
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+) -> Option<String> {
+    std::process::Command::new(program)
+        .current_dir(current_dir)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|stdout| !stdout.is_empty())
+}
+
+fn git_stdout_at(current_dir: &std::path::Path, args: &[&str]) -> Option<String> {
+    command_stdout_at(current_dir, "git", args)
+}
+
+fn git_dirty_at(current_dir: &std::path::Path) -> Option<bool> {
+    std::process::Command::new("git")
+        .current_dir(current_dir)
+        .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| !output.stdout.is_empty())
+}
+
+fn parse_build_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    lowercase_hex(digest.as_ref())
+}
+
+fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    Ok(lowercase_hex(digest.as_ref()))
+}
+
+fn cpu_affinity() -> Option<String> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                line.strip_prefix("Cpus_allowed_list:")
+                    .map(str::trim)
+                    .filter(|cpus| !cpus.is_empty())
+                    .map(str::to_owned)
+            })
+        })
+}
+
+fn capture_cargo_feature_graph(
+    workspace_root: &std::path::Path,
+    target: &str,
+    package_features: &[String],
+) -> Option<String> {
+    let mut command = std::process::Command::new("cargo");
+    command.current_dir(workspace_root).args([
+        "tree",
+        "--locked",
+        "--offline",
+        "-p",
+        "fsqlite-e2e",
+        "-e",
+        "features,no-dev",
+        "--no-default-features",
+        "--target",
+        target,
+    ]);
+    if !package_features.is_empty() {
+        command.arg("--features").arg(package_features.join(","));
+    }
+    command
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|graph| !graph.is_empty())
+}
+
+impl JsonBenchmarkProvenance {
+    fn capture(command_line: Vec<String>, runtime_bridge: &str) -> Self {
+        let build_workspace_root = env!("FSQLITE_BENCH_BUILD_WORKSPACE_ROOT").to_owned();
+        let verification_root = std::env::var("FSQLITE_BENCH_SOURCE_ROOT")
+            .unwrap_or_else(|_| build_workspace_root.clone());
+        let verification_path = std::path::Path::new(&verification_root);
+        let package_features = env!("FSQLITE_BENCH_BUILD_FEATURES")
+            .split(',')
+            .filter(|feature| !feature.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let build_target = env!("FSQLITE_BENCH_BUILD_TARGET").to_owned();
+        let runtime_git_sha = git_stdout_at(verification_path, &["rev-parse", "--verify", "HEAD"]);
+        let runtime_git_branch = git_stdout_at(verification_path, &["branch", "--show-current"]);
+        let runtime_git_dirty = git_dirty_at(verification_path);
+        let binary_path = std::env::current_exe()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned());
+        let binary_metadata = binary_path
+            .as_deref()
+            .and_then(|path| std::fs::metadata(path).ok());
+        let binary_sha256 = binary_path
+            .as_deref()
+            .and_then(|path| sha256_file(std::path::Path::new(path)).ok());
+        let binary_size_bytes = binary_metadata.as_ref().map(std::fs::Metadata::len);
+        let binary_modified_unix_ts = binary_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| {
+                modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| duration.as_secs())
+            });
+        let cargo_lock_sha256 = sha256_file(&verification_path.join("Cargo.lock")).ok();
+        let cargo_feature_graph =
+            capture_cargo_feature_graph(verification_path, &build_target, &package_features);
+        let cargo_feature_graph_sha256 = cargo_feature_graph
+            .as_deref()
+            .map(str::as_bytes)
+            .map(sha256_bytes);
+        let cargo_feature_graph_command = format!(
+            "cargo tree --locked --offline -p fsqlite-e2e -e features,no-dev \
+             --no-default-features --target {}{}",
+            build_target,
+            if package_features.is_empty() {
+                String::new()
+            } else {
+                format!(" --features {}", package_features.join(","))
+            }
+        );
+        let benchmark_environment = [
+            "FSQLITE_BENCH_CONCURRENT_SYNC",
+            "FSQLITE_BENCH_EXPECTED_CPU_AFFINITY",
+            "FSQLITE_BENCH_LAB_UNSAFE",
+            "FSQLITE_BENCH_MAX_LOAD_1M",
+            "FSQLITE_BENCH_PAGE_SIZE",
+            "FSQLITE_BENCH_PROFILE_CONCURRENT",
+            "FSQLITE_BENCH_PROFILE_DML",
+            "FSQLITE_BENCH_PROFILE_IDX",
+            "FSQLITE_BENCH_PROFILE_IDX_ITERS",
+            "FSQLITE_BENCH_PROFILE_INSERT",
+            "FSQLITE_BENCH_SOURCE_ROOT",
+            "RUST_LOG",
+        ]
+        .into_iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| (name.to_owned(), value))
+        })
+        .collect();
+
+        let build = JsonBuildIdentity {
+            workspace_root: build_workspace_root,
+            git_commit_sha: env!("FSQLITE_BENCH_BUILD_GIT_SHA").to_owned(),
+            git_branch: env!("FSQLITE_BENCH_BUILD_GIT_BRANCH").to_owned(),
+            git_dirty: parse_build_bool(env!("FSQLITE_BENCH_BUILD_GIT_DIRTY")),
+            input_tracking: env!("FSQLITE_BENCH_BUILD_INPUT_TRACKING").to_owned(),
+            cargo_profile: env!("FSQLITE_BENCH_BUILD_PROFILE").to_owned(),
+            declared_profile: env!("FSQLITE_BENCH_BUILD_PROFILE_LABEL").to_owned(),
+            opt_level: env!("FSQLITE_BENCH_BUILD_OPT_LEVEL").to_owned(),
+            debug: env!("FSQLITE_BENCH_BUILD_DEBUG").to_owned(),
+            target: build_target,
+            host: env!("FSQLITE_BENCH_BUILD_HOST").to_owned(),
+            panic_strategy: env!("FSQLITE_BENCH_BUILD_PANIC").to_owned(),
+            package_features,
+            encoded_rustflags_hex: env!("FSQLITE_BENCH_BUILD_RUSTFLAGS_HEX").to_owned(),
+            rustc_version: env!("FSQLITE_BENCH_BUILD_RUSTC_VERSION").to_owned(),
+            cargo_version: env!("FSQLITE_BENCH_BUILD_CARGO_VERSION").to_owned(),
+        };
+        let runtime_source = JsonRuntimeSourceIdentity {
+            verification_root,
+            git_commit_sha: runtime_git_sha,
+            git_branch: runtime_git_branch,
+            git_dirty: runtime_git_dirty,
+        };
+        let tracing = JsonTracingIdentity {
+            rust_log: std::env::var("RUST_LOG").ok(),
+            statement_debug_enabled: tracing::enabled!(
+                target: "fsqlite.statement",
+                tracing::Level::DEBUG
+            ),
+            statement_reuse_info_enabled: tracing::enabled!(
+                target: "fsqlite.statement_reuse",
+                tracing::Level::INFO
+            ),
+            fallback_decision_debug_enabled: tracing::enabled!(
+                target: "fsqlite.fallback_decision",
+                tracing::Level::DEBUG
+            ),
+        };
+        let durability = capture_durability_identity();
+        let execution_routing = certify_execution_routing();
+
+        let mut validation_errors = Vec::new();
+        if build.git_commit_sha.len() != 40
+            || !build
+                .git_commit_sha
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            validation_errors.push("build Git SHA is absent or malformed".to_owned());
+        }
+        if build.git_dirty != Some(false) {
+            validation_errors
+                .push("benchmark binary was built from a dirty or unknown tree".to_owned());
+        }
+        if build.input_tracking != "complete" {
+            validation_errors
+                .push("build script could not watch every tracked workspace input".to_owned());
+        }
+        if build.declared_profile == "unspecified" {
+            validation_errors.push(
+                "build profile label missing; set FSQLITE_BENCH_PROFILE_NAME while building"
+                    .to_owned(),
+            );
+        }
+        if runtime_source.git_commit_sha.as_deref() != Some(build.git_commit_sha.as_str()) {
+            validation_errors
+                .push("verification checkout SHA does not match the binary build SHA".to_owned());
+        }
+        if runtime_source.git_dirty != Some(false) {
+            validation_errors.push("verification checkout is dirty or unavailable".to_owned());
+        }
+        if binary_sha256.is_none() {
+            validation_errors.push("benchmark binary SHA-256 could not be computed".to_owned());
+        }
+        if binary_size_bytes.is_none() || binary_modified_unix_ts.is_none() {
+            validation_errors.push("benchmark binary metadata is incomplete".to_owned());
+        }
+        if cargo_lock_sha256.is_none() {
+            validation_errors.push("Cargo.lock SHA-256 could not be computed".to_owned());
+        }
+        if cargo_feature_graph.is_none() {
+            validation_errors.push(
+                "exact Cargo feature graph could not be captured from the verification checkout"
+                    .to_owned(),
+            );
+        }
+        if build.rustc_version == "unknown" || build.cargo_version == "unknown" {
+            validation_errors.push("build toolchain identity is incomplete".to_owned());
+        }
+        match build.declared_profile.as_str() {
+            "release-perf" if build.opt_level != "3" => validation_errors.push(format!(
+                "declared release-perf profile has effective opt-level {}",
+                build.opt_level
+            )),
+            "release" if build.opt_level != "z" => validation_errors.push(format!(
+                "declared release profile has effective opt-level {}",
+                build.opt_level
+            )),
+            "release-perf" | "release" => {}
+            other if other != "unspecified" => {
+                validation_errors.push(format!("unsupported citable build profile label `{other}`"))
+            }
+            _ => {}
+        }
+        if build.target == "unknown" || build.host == "unknown" || build.panic_strategy == "unknown"
+        {
+            validation_errors
+                .push("effective build target/host/panic identity is incomplete".to_owned());
+        }
+        if tracing.statement_debug_enabled || tracing.statement_reuse_info_enabled {
+            validation_errors.push(
+                "statement tracing or statement-reuse tracing changes the selected execution lane"
+                    .to_owned(),
+            );
+        }
+        if environment_flag_enabled("FSQLITE_BENCH_LAB_UNSAFE") {
+            validation_errors.push(
+                "FSQLITE_BENCH_LAB_UNSAFE is diagnostic-only and cannot produce a citable artifact"
+                    .to_owned(),
+            );
+        }
+        if !durability.verified || !durability.matched {
+            validation_errors.extend(
+                durability
+                    .validation_errors
+                    .iter()
+                    .map(|error| format!("durability certification: {error}")),
+            );
+            if durability.validation_errors.is_empty() {
+                validation_errors.push(
+                    "effective durability settings were not fully verified and matched".to_owned(),
+                );
+            }
+        }
+        validation_errors.extend(
+            execution_routing
+                .certification_errors
+                .iter()
+                .map(|error| format!("execution-routing certification: {error}")),
+        );
+        let citable = validation_errors.is_empty();
+
+        Self {
+            schema_version: BENCHMARK_PROVENANCE_SCHEMA_V1.to_owned(),
+            citable,
+            status: if citable {
+                "verified_citable".to_owned()
+            } else {
+                "unverified".to_owned()
+            },
+            validation_errors,
+            build,
+            runtime_source,
+            working_directory: std::env::current_dir()
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned()),
+            binary_path,
+            binary_sha256,
+            binary_size_bytes,
+            binary_modified_unix_ts,
+            cargo_lock_sha256,
+            cargo_feature_graph_sha256,
+            cargo_feature_graph,
+            cargo_feature_graph_command,
+            command_line,
+            benchmark_environment,
+            cpu_affinity: cpu_affinity(),
+            runtime_bridge: runtime_bridge.to_owned(),
+            tracing,
+            durability,
+            execution_routing,
+        }
+    }
+
+    fn verify_runtime_source_unchanged(&mut self) {
+        let verification_path = std::path::Path::new(&self.runtime_source.verification_root);
+        let current_sha = git_stdout_at(verification_path, &["rev-parse", "--verify", "HEAD"]);
+        let current_dirty = git_dirty_at(verification_path);
+        if current_sha != self.runtime_source.git_commit_sha {
+            self.validation_errors.push(
+                "verification checkout SHA changed while the benchmark was running".to_owned(),
+            );
+        }
+        if current_dirty != self.runtime_source.git_dirty || current_dirty != Some(false) {
+            self.validation_errors
+                .push("verification checkout dirty state changed or is no longer clean".to_owned());
+        }
+        self.refresh_validation_status();
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    fn add_validation_error(&mut self, error: impl Into<String>) {
+        self.validation_errors.push(error.into());
+        self.refresh_validation_status();
+    }
+
+    fn refresh_validation_status(&mut self) {
+        self.validation_errors.sort();
+        self.validation_errors.dedup();
+        self.citable = self.validation_errors.is_empty();
+        self.status = if self.citable {
+            "verified_citable".to_owned()
+        } else {
+            "unverified".to_owned()
+        };
+    }
+
+    fn mark_explicit_override(&mut self) {
+        if !self.citable {
+            self.status = "unverified_explicit_override".to_owned();
+        }
+    }
+}
+
 impl DetectedEnvironment {
-    fn detect() -> Self {
+    fn detect(provenance: &JsonBenchmarkProvenance) -> Self {
         fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
             std::process::Command::new(program)
                 .args(args)
@@ -1191,16 +2227,14 @@ impl DetectedEnvironment {
             });
         let rust_version = command_stdout("rustc", &["--version"]);
         let cargo_version = command_stdout("cargo", &["--version"]);
-        let git_commit_sha = command_stdout("git", &["rev-parse", "HEAD"]);
-        let git_branch = command_stdout("git", &["branch", "--show-current"]);
-        let git_head_unix_ts = command_stdout("git", &["show", "-s", "--format=%ct", "HEAD"])
-            .and_then(|timestamp| timestamp.parse::<u64>().ok());
-        let git_dirty = std::process::Command::new("git")
-            .args(["status", "--porcelain"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| !output.stdout.is_empty());
+        let git_commit_sha = Some(provenance.build.git_commit_sha.clone());
+        let git_branch = Some(provenance.build.git_branch.clone());
+        let git_head_unix_ts = git_stdout_at(
+            std::path::Path::new(&provenance.runtime_source.verification_root),
+            &["show", "-s", "--format=%ct", "HEAD"],
+        )
+        .and_then(|timestamp| timestamp.parse::<u64>().ok());
+        let git_dirty = provenance.runtime_source.git_dirty;
         let benchmark_binary_modified_unix_ts = std::env::current_exe()
             .ok()
             .and_then(|exe| std::fs::metadata(exe).ok())
@@ -1230,7 +2264,7 @@ impl DetectedEnvironment {
             git_dirty,
             benchmark_binary_modified_unix_ts,
             benchmark_binary_older_than_git_head,
-            build_profile: "release-perf".to_owned(),
+            build_profile: provenance.build.declared_profile.clone(),
         }
     }
 
@@ -1287,7 +2321,7 @@ impl DetectedEnvironment {
         }
         emit_line(
             to_stdout,
-            format!("  Build: {} (opt-level 3, LTO)", self.build_profile),
+            format!("  Build profile: {}", self.build_profile),
         );
     }
 }
@@ -1297,6 +2331,7 @@ fn build_json_report(
     total_elapsed: Duration,
     config: JsonRunConfig,
     environment: DetectedEnvironment,
+    provenance: JsonBenchmarkProvenance,
 ) -> JsonBenchmarkReport {
     let summary = compute_report_summary(report);
     let sections = report
@@ -1329,12 +2364,13 @@ fn build_json_report(
         .collect();
 
     JsonBenchmarkReport {
-        schema_version: JSON_REPORT_SCHEMA_V3.to_owned(),
+        schema_version: JSON_REPORT_SCHEMA_V4.to_owned(),
         generated_at_utc: chrono_stamp(),
         total_elapsed_ms: u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX),
         config,
         environment,
-        ci_regression_gate: build_ci_regression_gate(report, &summary),
+        ci_regression_gate: build_ci_regression_gate(report, &summary, &provenance),
+        provenance,
         summary,
         sections,
     }
@@ -1344,7 +2380,7 @@ fn build_json_report(
 fn benchmark_json_schema() -> serde_json::Value {
     serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/comprehensive-bench-report.v3.json",
+        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/comprehensive-bench-report.v4.json",
         "title": "FrankenSQLite comprehensive benchmark JSON report",
         "type": "object",
         "additionalProperties": false,
@@ -1354,13 +2390,14 @@ fn benchmark_json_schema() -> serde_json::Value {
             "total_elapsed_ms",
             "config",
             "environment",
+            "provenance",
             "summary",
             "ci_regression_gate",
             "sections"
         ],
         "properties": {
             "schema_version": {
-                "const": JSON_REPORT_SCHEMA_V3
+                "const": JSON_REPORT_SCHEMA_V4
             },
             "generated_at_utc": {
                 "type": "string"
@@ -1371,13 +2408,253 @@ fn benchmark_json_schema() -> serde_json::Value {
             },
             "config": {
                 "type": "object",
-                "additionalProperties": true,
-                "required": ["quick", "warmup_iterations", "min_iterations", "max_iterations", "target_duration_secs", "row_counts"]
+                "additionalProperties": false,
+                "required": [
+                    "quick", "filter", "warmup_iterations", "min_iterations",
+                    "max_iterations", "target_duration_secs", "row_counts",
+                    "html_output_path", "json_output_path", "json_stdout"
+                ],
+                "properties": {
+                    "quick": {"type": "boolean"},
+                    "filter": {"type": ["string", "null"]},
+                    "warmup_iterations": {"type": "integer", "minimum": 0},
+                    "min_iterations": {"type": "integer", "minimum": 1},
+                    "max_iterations": {"type": "integer", "minimum": 1},
+                    "target_duration_secs": {"type": "integer", "minimum": 0},
+                    "row_counts": {
+                        "type": "array",
+                        "items": {"type": "integer", "minimum": 1}
+                    },
+                    "html_output_path": {"type": ["string", "null"]},
+                    "json_output_path": {"type": ["string", "null"]},
+                    "json_stdout": {"type": "boolean"}
+                }
             },
             "environment": {
                 "type": "object",
-                "additionalProperties": true,
-                "required": ["arch", "build_profile"]
+                "additionalProperties": false,
+                "required": [
+                    "os", "arch", "kernel_release", "cpu_model", "cpu_cores",
+                    "ram_gb", "active_toolchain", "rust_version", "cargo_version",
+                    "git_commit_sha", "git_branch", "git_head_unix_ts", "git_dirty",
+                    "benchmark_binary_modified_unix_ts",
+                    "benchmark_binary_older_than_git_head", "build_profile"
+                ],
+                "properties": {
+                    "os": {"type": ["string", "null"]},
+                    "arch": {"type": "string"},
+                    "kernel_release": {"type": ["string", "null"]},
+                    "cpu_model": {"type": ["string", "null"]},
+                    "cpu_cores": {"type": ["integer", "null"], "minimum": 1},
+                    "ram_gb": {"type": ["number", "null"]},
+                    "active_toolchain": {"type": ["string", "null"]},
+                    "rust_version": {"type": ["string", "null"]},
+                    "cargo_version": {"type": ["string", "null"]},
+                    "git_commit_sha": {"type": ["string", "null"]},
+                    "git_branch": {"type": ["string", "null"]},
+                    "git_head_unix_ts": {"type": ["integer", "null"]},
+                    "git_dirty": {"type": ["boolean", "null"]},
+                    "benchmark_binary_modified_unix_ts": {"type": ["integer", "null"]},
+                    "benchmark_binary_older_than_git_head": {"type": ["boolean", "null"]},
+                    "build_profile": {"type": "string"}
+                }
+            },
+            "provenance": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "schema_version",
+                    "citable",
+                    "status",
+                    "validation_errors",
+                    "build",
+                    "runtime_source",
+                    "working_directory",
+                    "binary_path",
+                    "binary_sha256",
+                    "binary_size_bytes",
+                    "binary_modified_unix_ts",
+                    "cargo_lock_sha256",
+                    "cargo_feature_graph_sha256",
+                    "cargo_feature_graph",
+                    "cargo_feature_graph_command",
+                    "command_line",
+                    "benchmark_environment",
+                    "cpu_affinity",
+                    "runtime_bridge",
+                    "tracing",
+                    "durability",
+                    "execution_routing"
+                ],
+                "properties": {
+                    "schema_version": {"const": BENCHMARK_PROVENANCE_SCHEMA_V1},
+                    "citable": {"type": "boolean"},
+                    "status": {
+                        "enum": [
+                            "verified_citable",
+                            "unverified",
+                            "unverified_explicit_override"
+                        ]
+                    },
+                    "validation_errors": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "build": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                            "workspace_root", "git_commit_sha", "git_branch", "git_dirty",
+                            "input_tracking", "cargo_profile", "declared_profile", "opt_level",
+                            "debug", "target", "host", "panic_strategy", "package_features",
+                            "encoded_rustflags_hex", "rustc_version", "cargo_version"
+                        ],
+                        "properties": {
+                            "workspace_root": {"type": "string"},
+                            "git_commit_sha": {"type": "string"},
+                            "git_branch": {"type": "string"},
+                            "git_dirty": {"type": ["boolean", "null"]},
+                            "input_tracking": {"type": "string"},
+                            "cargo_profile": {"type": "string"},
+                            "declared_profile": {"type": "string"},
+                            "opt_level": {"type": "string"},
+                            "debug": {"type": "string"},
+                            "target": {"type": "string"},
+                            "host": {"type": "string"},
+                            "panic_strategy": {"type": "string"},
+                            "package_features": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            },
+                            "encoded_rustflags_hex": {"type": "string"},
+                            "rustc_version": {"type": "string"},
+                            "cargo_version": {"type": "string"}
+                        }
+                    },
+                    "runtime_source": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                            "verification_root", "git_commit_sha", "git_branch", "git_dirty"
+                        ],
+                        "properties": {
+                            "verification_root": {"type": "string"},
+                            "git_commit_sha": {"type": ["string", "null"]},
+                            "git_branch": {"type": ["string", "null"]},
+                            "git_dirty": {"type": ["boolean", "null"]}
+                        }
+                    },
+                    "working_directory": {"type": ["string", "null"]},
+                    "binary_path": {"type": ["string", "null"]},
+                    "binary_sha256": {"type": ["string", "null"]},
+                    "binary_size_bytes": {"type": ["integer", "null"]},
+                    "binary_modified_unix_ts": {"type": ["integer", "null"]},
+                    "cargo_lock_sha256": {"type": ["string", "null"]},
+                    "cargo_feature_graph_sha256": {"type": ["string", "null"]},
+                    "cargo_feature_graph": {"type": ["string", "null"]},
+                    "cargo_feature_graph_command": {"type": "string"},
+                    "command_line": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "benchmark_environment": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"}
+                    },
+                    "cpu_affinity": {"type": ["string", "null"]},
+                    "runtime_bridge": {"type": "string"},
+                    "tracing": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                            "rust_log", "statement_debug_enabled",
+                            "statement_reuse_info_enabled",
+                            "fallback_decision_debug_enabled"
+                        ],
+                        "properties": {
+                            "rust_log": {"type": ["string", "null"]},
+                            "statement_debug_enabled": {"type": "boolean"},
+                            "statement_reuse_info_enabled": {"type": "boolean"},
+                            "fallback_decision_debug_enabled": {"type": "boolean"}
+                        }
+                    },
+                    "durability": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                            "page_size_bytes", "default_synchronous",
+                            "concurrent_synchronous_modes", "csqlite_pragmas",
+                            "fsqlite_pragmas", "concurrent_mode_default", "verified",
+                            "matched", "validation_errors", "effective_profiles"
+                        ],
+                        "properties": {
+                            "page_size_bytes": {"type": "integer", "minimum": 512},
+                            "default_synchronous": {"type": "string"},
+                            "concurrent_synchronous_modes": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            },
+                            "csqlite_pragmas": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            },
+                            "fsqlite_pragmas": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            },
+                            "concurrent_mode_default": {"const": true},
+                            "verified": {"type": "boolean"},
+                            "matched": {"type": "boolean"},
+                            "validation_errors": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            },
+                            "effective_profiles": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "object",
+                                    "additionalProperties": {"type": "string"}
+                                }
+                            }
+                        }
+                    },
+                    "execution_routing": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                            "capture_scope", "timed_execution_instrumented",
+                            "parser_fast_path_executions", "parser_slow_path_executions",
+                            "prepared_insert_fast_lane_hits",
+                            "prepared_insert_instrumented_lane_hits",
+                            "prepared_update_delete_fast_lane_hits",
+                            "prepared_update_delete_instrumented_lane_hits",
+                            "prepared_dml_fallbacks", "select_fallback_decisions",
+                            "certification_errors"
+                        ],
+                        "properties": {
+                            "capture_scope": {"type": "string"},
+                            "timed_execution_instrumented": {"type": "boolean"},
+                            "parser_fast_path_executions": {"type": "integer", "minimum": 0},
+                            "parser_slow_path_executions": {"type": "integer", "minimum": 0},
+                            "prepared_insert_fast_lane_hits": {"type": "integer", "minimum": 0},
+                            "prepared_insert_instrumented_lane_hits": {"type": "integer", "minimum": 0},
+                            "prepared_update_delete_fast_lane_hits": {"type": "integer", "minimum": 0},
+                            "prepared_update_delete_instrumented_lane_hits": {"type": "integer", "minimum": 0},
+                            "prepared_dml_fallbacks": {
+                                "type": "object",
+                                "additionalProperties": {"type": "integer", "minimum": 0}
+                            },
+                            "select_fallback_decisions": {
+                                "type": "object",
+                                "additionalProperties": {"type": "integer", "minimum": 0}
+                            },
+                            "certification_errors": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            }
+                        }
+                    }
+                }
             },
             "summary": {
                 "type": "object",
@@ -1434,12 +2711,24 @@ fn benchmark_json_schema() -> serde_json::Value {
             "ci_regression_gate": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["schema_version", "bead_id", "depends_on_bead_id", "status", "thresholds", "observed"],
+                "required": [
+                    "schema_version", "bead_id", "depends_on_bead_id", "status",
+                    "eligible", "ineligibility_reasons", "evaluation_result",
+                    "thresholds", "observed"
+                ],
                 "properties": {
                     "schema_version": {"const": CI_REGRESSION_GATE_SCHEMA_V2},
                     "bead_id": {"const": CI_REGRESSION_GATE_BEAD_ID},
                     "depends_on_bead_id": {"const": CI_REGRESSION_BASELINE_BEAD_ID},
-                    "status": {"const": CI_REGRESSION_GATE_STATUS_RICH_SCORECARD},
+                    "status": {
+                        "enum": ["eligible_compatible_baseline_required", "ineligible"]
+                    },
+                    "eligible": {"type": "boolean"},
+                    "ineligibility_reasons": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "evaluation_result": {"const": "not_evaluated"},
                     "thresholds": {
                         "type": "object",
                         "additionalProperties": false,
@@ -1603,11 +2892,269 @@ fn benchmark_json_schema() -> serde_json::Value {
     })
 }
 
+#[cfg(feature = "bridge-experiment")]
+#[allow(clippy::too_many_lines)]
+fn bridge_json_schema() -> serde_json::Value {
+    let comprehensive = benchmark_json_schema();
+    let provenance = comprehensive["properties"]["provenance"].clone();
+    let environment = comprehensive["properties"]["environment"].clone();
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/bridge-experiment.v1.json",
+        "title": "FrankenSQLite async bridge experiment report",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "schema_version", "generated_at_utc", "provenance", "environment",
+            "host_state_before", "host_state_after", "config", "raw_samples",
+            "arm_statistics", "paired_comparisons", "ready_runtime_entry_regression"
+        ],
+        "properties": {
+            "schema_version": {"const": BRIDGE_REPORT_SCHEMA_V1},
+            "generated_at_utc": {"type": "string"},
+            "provenance": provenance,
+            "environment": environment,
+            "host_state_before": {"$ref": "#/$defs/host_state"},
+            "host_state_after": {"$ref": "#/$defs/host_state"},
+            "config": {"$ref": "#/$defs/config"},
+            "raw_samples": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"$ref": "#/$defs/sample"}
+            },
+            "arm_statistics": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"$ref": "#/$defs/arm_statistics"}
+            },
+            "paired_comparisons": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"$ref": "#/$defs/paired_comparison"}
+            },
+            "ready_runtime_entry_regression": {"$ref": "#/$defs/ready_regression"}
+        },
+        "$defs": {
+            "arm": {
+                "enum": [
+                    "per_operation_block_on",
+                    "inside_existing_runtime",
+                    "worker_sync_facade"
+                ]
+            },
+            "workload": {
+                "enum": [
+                    "ready_future",
+                    "prepared_insert",
+                    "raw_execute_with_params"
+                ]
+            },
+            "host_state": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "captured_at_utc", "load_average_1m", "load_average_5m",
+                    "load_average_15m", "available_parallelism", "cpu_affinity",
+                    "scaling_governors", "energy_performance_preferences",
+                    "boost_controls", "numa_nodes_online", "memory_available_gb"
+                ],
+                "properties": {
+                    "captured_at_utc": {"type": "string"},
+                    "load_average_1m": {"type": ["number", "null"], "minimum": 0},
+                    "load_average_5m": {"type": ["number", "null"], "minimum": 0},
+                    "load_average_15m": {"type": ["number", "null"], "minimum": 0},
+                    "available_parallelism": {"type": ["integer", "null"], "minimum": 1},
+                    "cpu_affinity": {"type": ["string", "null"]},
+                    "scaling_governors": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "energy_performance_preferences": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "boost_controls": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"}
+                    },
+                    "numa_nodes_online": {"type": ["string", "null"]},
+                    "memory_available_gb": {"type": ["number", "null"], "minimum": 0}
+                }
+            },
+            "config": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "samples_per_arm", "raw_insert_operations",
+                    "ready_operation_counts", "order_seed", "ordering_policy",
+                    "warmup_policy", "timed_region", "arm_contracts",
+                    "affinity_policy", "max_load_average_1m"
+                ],
+                "properties": {
+                    "samples_per_arm": {"type": "integer", "minimum": 32},
+                    "raw_insert_operations": {"type": "integer", "minimum": 1},
+                    "ready_operation_counts": {
+                        "type": "array",
+                        "minItems": 2,
+                        "items": {"type": "integer", "minimum": 1}
+                    },
+                    "order_seed": {"type": "integer", "minimum": 0},
+                    "ordering_policy": {"type": "string"},
+                    "warmup_policy": {"type": "string"},
+                    "timed_region": {"type": "string"},
+                    "arm_contracts": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                            "per_operation_block_on",
+                            "inside_existing_runtime",
+                            "worker_sync_facade"
+                        ],
+                        "properties": {
+                            "per_operation_block_on": {"type": "string"},
+                            "inside_existing_runtime": {"type": "string"},
+                            "worker_sync_facade": {"type": "string"}
+                        }
+                    },
+                    "affinity_policy": {"type": "string"},
+                    "max_load_average_1m": {
+                        "type": ["number", "null"],
+                        "minimum": 0
+                    }
+                }
+            },
+            "sample": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "workload", "operation_count", "block_index", "order_slot",
+                    "arm", "elapsed_ns", "runtime_entries_total",
+                    "runtime_entries_inside_timed_region",
+                    "caller_future_completions_inside_timed_region",
+                    "engine_dml_future_calls_inside_timed_region",
+                    "worker_commands_total", "worker_commands_inside_timed_region",
+                    "worker_open_handshakes_total", "oracle_kind",
+                    "checksum_count", "checksum_sum"
+                ],
+                "properties": {
+                    "workload": {"$ref": "#/$defs/workload"},
+                    "operation_count": {"type": "integer", "minimum": 1},
+                    "block_index": {"type": "integer", "minimum": 0},
+                    "order_slot": {"type": "integer", "minimum": 0},
+                    "arm": {"$ref": "#/$defs/arm"},
+                    "elapsed_ns": {"type": "integer", "minimum": 0},
+                    "runtime_entries_total": {"type": "integer", "minimum": 0},
+                    "runtime_entries_inside_timed_region": {
+                        "type": "integer", "minimum": 0
+                    },
+                    "caller_future_completions_inside_timed_region": {
+                        "type": "integer", "minimum": 0
+                    },
+                    "engine_dml_future_calls_inside_timed_region": {
+                        "type": "integer", "minimum": 0
+                    },
+                    "worker_commands_total": {"type": "integer", "minimum": 0},
+                    "worker_commands_inside_timed_region": {
+                        "type": "integer", "minimum": 0
+                    },
+                    "worker_open_handshakes_total": {
+                        "type": "integer", "minimum": 0
+                    },
+                    "oracle_kind": {"type": "string"},
+                    "checksum_count": {"type": "integer"},
+                    "checksum_sum": {"type": "integer"}
+                }
+            },
+            "arm_statistics": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "workload", "operation_count", "arm", "samples",
+                    "median_ns", "mean_ns", "p95_ns", "stddev_ns", "cv_pct",
+                    "median_ns_per_operation"
+                ],
+                "properties": {
+                    "workload": {"$ref": "#/$defs/workload"},
+                    "operation_count": {"type": "integer", "minimum": 1},
+                    "arm": {"$ref": "#/$defs/arm"},
+                    "samples": {"type": "integer", "minimum": 1},
+                    "median_ns": {"type": "number", "minimum": 0},
+                    "mean_ns": {"type": "number", "minimum": 0},
+                    "p95_ns": {"type": "number", "minimum": 0},
+                    "stddev_ns": {"type": "number", "minimum": 0},
+                    "cv_pct": {"type": "number", "minimum": 0},
+                    "median_ns_per_operation": {"type": "number", "minimum": 0}
+                }
+            },
+            "paired_comparison": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "workload", "operation_count", "numerator", "denominator",
+                    "paired_blocks", "median_ratio", "geomean_ratio",
+                    "bootstrap_mean_ratio_ci95_low",
+                    "bootstrap_mean_ratio_ci95_high"
+                ],
+                "properties": {
+                    "workload": {"$ref": "#/$defs/workload"},
+                    "operation_count": {"type": "integer", "minimum": 1},
+                    "numerator": {"$ref": "#/$defs/arm"},
+                    "denominator": {"$ref": "#/$defs/arm"},
+                    "paired_blocks": {"type": "integer", "minimum": 1},
+                    "median_ratio": {"type": "number", "exclusiveMinimum": 0},
+                    "geomean_ratio": {"type": "number", "exclusiveMinimum": 0},
+                    "bootstrap_mean_ratio_ci95_low": {
+                        "type": "number", "exclusiveMinimum": 0
+                    },
+                    "bootstrap_mean_ratio_ci95_high": {
+                        "type": "number", "exclusiveMinimum": 0
+                    }
+                }
+            },
+            "ready_regression": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "predictor", "response", "interpretation", "points",
+                    "paired_blocks", "bootstrap_clusters", "intercept_ns",
+                    "slope_ns_per_additional_runtime_entry",
+                    "bootstrap_slope_ci95_low", "bootstrap_slope_ci95_high",
+                    "r_squared"
+                ],
+                "properties": {
+                    "predictor": {"type": "string"},
+                    "response": {"type": "string"},
+                    "interpretation": {"type": "string"},
+                    "points": {"type": "integer", "minimum": 2},
+                    "paired_blocks": {"type": "integer", "minimum": 2},
+                    "bootstrap_clusters": {"type": "integer", "minimum": 1},
+                    "intercept_ns": {"type": "number"},
+                    "slope_ns_per_additional_runtime_entry": {"type": "number"},
+                    "bootstrap_slope_ci95_low": {"type": "number"},
+                    "bootstrap_slope_ci95_high": {"type": "number"},
+                    "r_squared": {"type": "number"}
+                }
+            }
+        }
+    })
+}
+
 fn print_benchmark_json_schema() {
     match serde_json::to_string_pretty(&benchmark_json_schema()) {
         Ok(json) => println!("{json}"),
         Err(err) => {
             eprintln!("ERROR: Could not serialize benchmark JSON schema: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn print_bridge_json_schema() {
+    match serde_json::to_string_pretty(&bridge_json_schema()) {
+        Ok(json) => println!("{json}"),
+        Err(err) => {
+            eprintln!("ERROR: Could not serialize bridge JSON schema: {err}");
             std::process::exit(1);
         }
     }
@@ -1745,7 +3292,7 @@ impl BenchReport {
         println!();
     }
 
-    fn write_html(&self, path: &str) {
+    fn write_html(&self, path: &str, provenance: &JsonBenchmarkProvenance) -> Result<(), String> {
         let mut html = String::with_capacity(32 * 1024);
 
         // Collect JSON data for charts.
@@ -2114,19 +3661,26 @@ document.querySelectorAll('[id^="section-"]').forEach(el => observer.observe(el)
             summary.csqlite_faster,
         ));
 
-        if !ensure_report_parent_dir(path, "HTML") {
-            return;
-        }
+        let provenance_json = serde_json::to_string(provenance)
+            .map_err(|error| format!("could not serialize HTML provenance: {error}"))?
+            .replace('<', "\\u003c")
+            .replace('>', "\\u003e");
+        let provenance_element = format!(
+            r#"<script id="benchmark-provenance" type="application/json">{provenance_json}</script>
+"#
+        );
+        let body_end = html
+            .rfind("</body>")
+            .ok_or_else(|| "generated HTML has no closing body element".to_owned())?;
+        html.insert_str(body_end, &provenance_element);
 
-        let Ok(mut file) = std::fs::File::create(path) else {
-            eprintln!("ERROR: Could not create HTML file at {path}");
-            return;
-        };
-        if file.write_all(html.as_bytes()).is_ok() {
-            eprintln!("HTML report written to: {path}");
-        } else {
-            eprintln!("ERROR: Failed to write HTML file");
-        }
+        ensure_report_parent_dir(path, "HTML")?;
+        let mut file = std::fs::File::create(path)
+            .map_err(|error| format!("could not create HTML report at {path}: {error}"))?;
+        file.write_all(html.as_bytes())
+            .map_err(|error| format!("could not write HTML report at {path}: {error}"))?;
+        eprintln!("HTML report written to: {path}");
+        Ok(())
     }
 }
 
@@ -2272,6 +3826,7 @@ fn print_usage() {
   cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --json-out report.json --no-html
   cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --json-stdout --no-html
   cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --print-json-schema
+  FSQLITE_BENCH_EXPECTED_CPU_AFFINITY=2-3 FSQLITE_BENCH_MAX_LOAD_1M=4 FSQLITE_BENCH_PROFILE_NAME=release-perf taskset -c 2,3 cargo run --profile release-perf -p fsqlite-e2e --features bridge-experiment --bin comprehensive-bench -- --bridge-experiment --json-out bridge.json
 
 Flags:
   --quick              Run the reduced benchmark matrix.
@@ -2282,6 +3837,14 @@ Flags:
   --json-out <path>    Write the JSON report to an explicit path.
   --json-stdout        Emit only the structured JSON report to stdout.
   --print-json-schema  Emit the standardized benchmark JSON schema and exit.
+  --allow-unverified-provenance
+                       Emit explicitly non-citable artifacts when provenance validation fails.
+  --bridge-experiment  Run the standalone three-arm async bridge experiment.
+  --bridge-samples <n> Samples per bridge arm; multiple of 16 and at least 32
+                       (default: 64).
+  --bridge-operations <n>
+                       Timed insert operations per sample (default: 1000).
+  --bridge-seed <n>    Deterministic ABBA ordering/bootstrap seed.
   --help, -h           Show this help text."
     );
 }
@@ -2296,6 +3859,11 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
         json_out_path: None,
         json_stdout: false,
         print_json_schema: false,
+        allow_unverified_provenance: false,
+        bridge_experiment: false,
+        bridge_samples: 64,
+        bridge_operations: 1_000,
+        bridge_seed: 0x4653_514c_4954_4530,
     };
 
     let mut index = 1;
@@ -2343,9 +3911,60 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
                 options.print_json_schema = true;
                 index += 1;
             }
+            "--allow-unverified-provenance" => {
+                options.allow_unverified_provenance = true;
+                index += 1;
+            }
+            "--bridge-experiment" => {
+                options.bridge_experiment = true;
+                options.emit_html = false;
+                index += 1;
+            }
+            "--bridge-samples" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "expected a value after --bridge-samples".to_owned())?;
+                options.bridge_samples = value
+                    .parse()
+                    .map_err(|_| "--bridge-samples must be a positive integer".to_owned())?;
+                index += 2;
+            }
+            "--bridge-operations" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "expected a value after --bridge-operations".to_owned())?;
+                options.bridge_operations = value
+                    .parse()
+                    .map_err(|_| "--bridge-operations must be a positive integer".to_owned())?;
+                index += 2;
+            }
+            "--bridge-seed" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "expected a value after --bridge-seed".to_owned())?;
+                options.bridge_seed = value
+                    .parse()
+                    .map_err(|_| "--bridge-seed must be an unsigned integer".to_owned())?;
+                index += 2;
+            }
             unknown => {
                 return Err(format!("unrecognized argument `{unknown}`"));
             }
+        }
+    }
+
+    if options.bridge_experiment {
+        if options.bridge_samples < 32 || options.bridge_samples % 16 != 0 {
+            return Err("--bridge-samples must be a multiple of 16 and at least 32".to_owned());
+        }
+        if options.bridge_operations == 0 {
+            return Err("--bridge-operations must be greater than zero".to_owned());
+        }
+        if options.quick || options.filter.is_some() || options.html_path.is_some() {
+            return Err(
+                "--bridge-experiment cannot be combined with --quick, --filter, or --html"
+                    .to_owned(),
+            );
         }
     }
 
@@ -3489,13 +5108,11 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
             let path = tmp.path().to_str().unwrap().to_owned();
             {
                 let setup = rusqlite::Connection::open(&path).unwrap();
+                apply_pragmas_csqlite(&setup);
                 setup
                     .execute_batch(
-                        "PRAGMA page_size = 4096;\
-                         PRAGMA journal_mode = WAL;\
-                         PRAGMA synchronous = NORMAL;\
-                         PRAGMA cache_size = -64000;\
-                         CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER);",
+                        "CREATE TABLE bench \
+                         (id INTEGER PRIMARY KEY, name TEXT, score INTEGER);",
                     )
                     .unwrap();
             }
@@ -3510,23 +5127,17 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                         // worker error cannot strand the rest at the barrier.
                         bar.wait();
                         let conn = rusqlite::Connection::open(&p).unwrap();
-                        // `synchronous` is PER-CONNECTION: the setup connection's
-                        // NORMAL does not carry here. Without this pragma these
-                        // writers silently inherit the compiled default
-                        // (SQLITE_DEFAULT_SYNCHRONOUS=2, FULL) and race
-                        // FrankenSQLite's NORMAL at unmatched durability — C pays a
-                        // real WAL fsync per commit that F does not, which flatters
-                        // FrankenSQLite by an unquantified amount (bd-x5gzk). Match
-                        // `mt_mvcc_bench` and the FrankenSQLite arm below.
-                        conn.execute_batch(
-                            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; \
-                             PRAGMA busy_timeout=5000;",
-                        )
-                        .unwrap();
-                        if let Some(mode) = concurrent_sync_override() {
-                            conn.execute_batch(&format!("PRAGMA synchronous={mode};"))
-                                .unwrap();
-                        }
+                        // Both `cache_size` and `synchronous` are
+                        // connection-local: configuring only the setup
+                        // connection would silently give C SQLite a different
+                        // scored workload than FrankenSQLite, and would leave
+                        // these writers on the compiled FULL default while
+                        // FrankenSQLite runs NORMAL (bd-x5gzk).
+                        apply_pragmas_csqlite(&conn);
+                        conn.execute_batch("PRAGMA busy_timeout=5000;").unwrap();
+                        let mode = concurrent_sync_mode();
+                        conn.execute_batch(&format!("PRAGMA synchronous={mode};"))
+                            .unwrap();
 
                         conn.execute_batch("BEGIN").unwrap();
                         #[allow(clippy::cast_possible_wrap)]
@@ -3573,7 +5184,11 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
             let tmp = tempfile::NamedTempFile::new().unwrap();
             let path = tmp.path().to_str().unwrap().to_owned();
             {
-                let setup = fsqlite_e2e::block_on(fsqlite::Connection::open(&path)).unwrap();
+                let setup = fsqlite_e2e::block_on(fsqlite::Connection::open_with_page_size(
+                    &path,
+                    benchmark_page_size_bytes(),
+                ))
+                .unwrap();
                 apply_pragmas_fsqlite(&setup);
                 fs_execute(
                     &setup,
@@ -3592,24 +5207,21 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                         bar.wait();
                         let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(&p)).unwrap();
                         apply_pragmas_fsqlite(&conn);
-                        if let Some(mode) = concurrent_sync_override() {
-                            drop(fsqlite_e2e::block_on(
-                                conn.execute(&format!("PRAGMA synchronous={mode};")),
-                            ));
-                        }
-                        let concurrent_ok = fsqlite_e2e::block_on(
-                            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;"),
-                        )
-                        .is_ok();
-                        drop(fsqlite_e2e::block_on(
-                            conn.execute("PRAGMA busy_timeout=5000;"),
-                        ));
+                        let mode = concurrent_sync_mode();
+                        fsqlite_e2e::block_on(conn.execute(&format!("PRAGMA synchronous={mode};")))
+                            .unwrap_or_else(|error| {
+                                panic!("failed to set FrankenSQLite synchronous={mode}: {error}")
+                            });
+                        fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;"))
+                            .unwrap_or_else(|error| {
+                                panic!("failed to enable concurrent writer mode: {error}")
+                            });
+                        fsqlite_e2e::block_on(conn.execute("PRAGMA busy_timeout=5000;"))
+                            .unwrap_or_else(|error| {
+                                panic!("failed to set FrankenSQLite busy_timeout: {error}")
+                            });
 
-                        let begin_sql = if concurrent_ok {
-                            "BEGIN CONCURRENT"
-                        } else {
-                            "BEGIN"
-                        };
+                        let begin_sql = "BEGIN CONCURRENT";
 
                         // Mirror `mt_mvcc_bench`'s pattern: wrap the entire
                         // BEGIN + N*INSERT + COMMIT in a retry loop, because
@@ -3643,7 +5255,13 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                                 ])) {
                                     Ok(_) => {}
                                     Err(e) if e.is_transient() && retry_count < TXN_MAX_RETRIES => {
-                                        drop(fsqlite_e2e::block_on(conn.execute("ROLLBACK")));
+                                        fsqlite_e2e::block_on(conn.execute("ROLLBACK"))
+                                            .unwrap_or_else(|rollback_error| {
+                                                panic!(
+                                                    "fsqlite rollback after INSERT retry failed: \
+                                                     {rollback_error}"
+                                                )
+                                            });
                                         sleep_bench_busy_backoff(retry_count, jitter_salt);
                                         retry_count += 1;
                                         continue 'txn;
@@ -3657,7 +5275,14 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                             match fsqlite_e2e::block_on(conn.execute("COMMIT")) {
                                 Ok(_) => break 'txn,
                                 Err(e) if e.is_transient() && retry_count < TXN_MAX_RETRIES => {
-                                    drop(fsqlite_e2e::block_on(conn.execute("ROLLBACK")));
+                                    fsqlite_e2e::block_on(conn.execute("ROLLBACK")).unwrap_or_else(
+                                        |rollback_error| {
+                                            panic!(
+                                                "fsqlite rollback after COMMIT retry failed: \
+                                                 {rollback_error}"
+                                            )
+                                        },
+                                    );
                                     sleep_bench_busy_backoff(retry_count, jitter_salt);
                                     retry_count += 1;
                                 }
@@ -3822,6 +5447,84 @@ mod tests {
         report
     }
 
+    fn sample_provenance() -> JsonBenchmarkProvenance {
+        JsonBenchmarkProvenance {
+            schema_version: BENCHMARK_PROVENANCE_SCHEMA_V1.to_owned(),
+            citable: true,
+            status: "verified_citable".to_owned(),
+            validation_errors: Vec::new(),
+            build: JsonBuildIdentity {
+                workspace_root: "/test/frankensqlite".to_owned(),
+                git_commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                git_branch: "main".to_owned(),
+                git_dirty: Some(false),
+                input_tracking: "complete".to_owned(),
+                cargo_profile: "release".to_owned(),
+                declared_profile: "release-perf".to_owned(),
+                opt_level: "3".to_owned(),
+                debug: "false".to_owned(),
+                target: "x86_64-unknown-linux-gnu".to_owned(),
+                host: "x86_64-unknown-linux-gnu".to_owned(),
+                panic_strategy: "abort".to_owned(),
+                package_features: Vec::new(),
+                encoded_rustflags_hex: String::new(),
+                rustc_version: "rustc test".to_owned(),
+                cargo_version: "cargo test".to_owned(),
+            },
+            runtime_source: JsonRuntimeSourceIdentity {
+                verification_root: "/test/frankensqlite".to_owned(),
+                git_commit_sha: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+                git_branch: Some("main".to_owned()),
+                git_dirty: Some(false),
+            },
+            working_directory: Some("/test/frankensqlite".to_owned()),
+            binary_path: Some("/test/comprehensive-bench".to_owned()),
+            binary_sha256: Some("ab".repeat(32)),
+            binary_size_bytes: Some(1024),
+            binary_modified_unix_ts: Some(1_700_000_001),
+            cargo_lock_sha256: Some("cd".repeat(32)),
+            cargo_feature_graph_sha256: Some("ef".repeat(32)),
+            cargo_feature_graph: Some("fsqlite-e2e v0.1.19".to_owned()),
+            cargo_feature_graph_command: "cargo tree --locked --offline -p fsqlite-e2e -e features"
+                .to_owned(),
+            command_line: vec!["comprehensive-bench".to_owned(), "--quick".to_owned()],
+            benchmark_environment: BTreeMap::new(),
+            cpu_affinity: Some("0-7".to_owned()),
+            runtime_bridge: "per_operation_thread_local_block_on".to_owned(),
+            tracing: JsonTracingIdentity {
+                rust_log: None,
+                statement_debug_enabled: false,
+                statement_reuse_info_enabled: false,
+                fallback_decision_debug_enabled: false,
+            },
+            durability: JsonDurabilityIdentity {
+                page_size_bytes: 4096,
+                default_synchronous: "NORMAL".to_owned(),
+                concurrent_synchronous_modes: vec!["NORMAL".to_owned()],
+                csqlite_pragmas: vec!["PRAGMA synchronous = NORMAL;".to_owned()],
+                fsqlite_pragmas: vec!["PRAGMA synchronous = NORMAL;".to_owned()],
+                concurrent_mode_default: true,
+                verified: true,
+                matched: true,
+                validation_errors: Vec::new(),
+                effective_profiles: BTreeMap::new(),
+            },
+            execution_routing: JsonExecutionRouting {
+                capture_scope: "untimed test certification".to_owned(),
+                timed_execution_instrumented: false,
+                parser_fast_path_executions: 1,
+                parser_slow_path_executions: 1,
+                prepared_insert_fast_lane_hits: 1,
+                prepared_insert_instrumented_lane_hits: 0,
+                prepared_update_delete_fast_lane_hits: 2,
+                prepared_update_delete_instrumented_lane_hits: 0,
+                prepared_dml_fallbacks: BTreeMap::new(),
+                select_fallback_decisions: BTreeMap::from([("group_by_fallback".to_owned(), 1)]),
+                certification_errors: Vec::new(),
+            },
+        }
+    }
+
     #[test]
     fn benchmark_pragmas_disable_time_travel_capture() {
         assert!(
@@ -3939,6 +5642,11 @@ mod tests {
                 json_out_path: Some("bench.json".to_owned()),
                 json_stdout: true,
                 print_json_schema: false,
+                allow_unverified_provenance: false,
+                bridge_experiment: false,
+                bridge_samples: 64,
+                bridge_operations: 1_000,
+                bridge_seed: 0x4653_514c_4954_4530,
             }
         );
     }
@@ -4113,9 +5821,10 @@ mod tests {
                 benchmark_binary_older_than_git_head: Some(false),
                 build_profile: "release-perf".to_owned(),
             },
+            sample_provenance(),
         );
 
-        assert_eq!(json.schema_version, JSON_REPORT_SCHEMA_V3);
+        assert_eq!(json.schema_version, JSON_REPORT_SCHEMA_V4);
         assert_eq!(json.environment.git_head_unix_ts, Some(1_700_000_000));
         assert_eq!(json.environment.git_dirty, Some(false));
         assert_eq!(
@@ -4173,6 +5882,37 @@ mod tests {
                 .fsqlite_concurrent_profile
                 .is_none()
         );
+
+        let schema = benchmark_json_schema();
+        assert!(
+            jsonschema::draft202012::meta::is_valid(&schema),
+            "the published V4 schema must itself be valid Draft 2020-12 JSON Schema"
+        );
+        let instance = serde_json::to_value(&json).expect("report should serialize");
+        assert!(
+            jsonschema::draft202012::is_valid(&schema, &instance),
+            "a complete V4 report must validate against its published schema"
+        );
+
+        let mut missing_build = instance.clone();
+        missing_build["provenance"]
+            .as_object_mut()
+            .expect("provenance should be an object")
+            .remove("build");
+        assert!(
+            !jsonschema::draft202012::is_valid(&schema, &missing_build),
+            "the schema must reject missing provenance identity"
+        );
+
+        let mut unknown_field = instance;
+        unknown_field
+            .as_object_mut()
+            .expect("report should be an object")
+            .insert("unknown_gate0_field".to_owned(), serde_json::Value::Null);
+        assert!(
+            !jsonschema::draft202012::is_valid(&schema, &unknown_field),
+            "the schema must reject unknown top-level fields"
+        );
     }
 
     #[test]
@@ -4219,6 +5959,7 @@ mod tests {
                 benchmark_binary_older_than_git_head: None,
                 build_profile: "release-perf".to_owned(),
             },
+            sample_provenance(),
         );
 
         let profile = json.sections[0].rows[0]
@@ -4272,6 +6013,7 @@ mod tests {
                 benchmark_binary_older_than_git_head: None,
                 build_profile: "release-perf".to_owned(),
             },
+            sample_provenance(),
         );
         let temp = tempfile::tempdir().expect("temp directory should be created");
         let report_path = temp.path().join("nested").join("bench.json");
@@ -4279,12 +6021,84 @@ mod tests {
             .to_str()
             .expect("temp report path should be valid UTF-8");
 
-        write_json_report(&json, report_path);
+        write_json_report(&json, report_path).expect("JSON report should be written");
 
         let written = std::fs::read_to_string(report_path).expect("JSON report should be written");
         assert!(
-            written.contains(JSON_REPORT_SCHEMA_V3),
+            written.contains(JSON_REPORT_SCHEMA_V4),
             "written JSON should include the benchmark schema version"
+        );
+    }
+
+    #[test]
+    fn report_writers_propagate_filesystem_errors_and_html_embeds_provenance() {
+        let temp = tempfile::tempdir().expect("temp directory should be created");
+        let blocker = temp.path().join("not-a-directory");
+        std::fs::write(&blocker, b"file").expect("blocking file should be created");
+        let blocked_json = blocker.join("report.json");
+        let blocked_json = blocked_json
+            .to_str()
+            .expect("temp report path should be valid UTF-8");
+
+        let report = sample_report();
+        let provenance = sample_provenance();
+        let json = build_json_report(
+            &report,
+            Duration::from_secs(1),
+            JsonRunConfig {
+                quick: true,
+                filter: None,
+                warmup_iterations: WARMUP_ITERS,
+                min_iterations: MIN_ITERS,
+                max_iterations: MAX_ITERS,
+                target_duration_secs: TARGET_DURATION.as_secs(),
+                row_counts: vec![100],
+                html_output_path: None,
+                json_output_path: Some(blocked_json.to_owned()),
+                json_stdout: false,
+            },
+            DetectedEnvironment {
+                os: None,
+                arch: "x86_64".to_owned(),
+                kernel_release: None,
+                cpu_model: None,
+                cpu_cores: Some(8),
+                ram_gb: None,
+                active_toolchain: None,
+                rust_version: None,
+                cargo_version: None,
+                git_commit_sha: None,
+                git_branch: Some("main".to_owned()),
+                git_head_unix_ts: None,
+                git_dirty: Some(false),
+                benchmark_binary_modified_unix_ts: None,
+                benchmark_binary_older_than_git_head: None,
+                build_profile: "release-perf".to_owned(),
+            },
+            provenance.clone(),
+        );
+        assert!(
+            write_json_report(&json, blocked_json).is_err(),
+            "JSON output errors must propagate to the process boundary"
+        );
+
+        let html_path = temp.path().join("report.html");
+        let html_path = html_path
+            .to_str()
+            .expect("temp report path should be valid UTF-8");
+        report
+            .write_html(html_path, &provenance)
+            .expect("HTML report should be written");
+        let html = std::fs::read_to_string(html_path).expect("HTML report should be readable");
+        assert!(html.contains("benchmark-provenance"));
+        assert!(html.contains(BENCHMARK_PROVENANCE_SCHEMA_V1));
+    }
+
+    #[test]
+    fn sha256_fixture_is_stable() {
+        assert_eq!(
+            sha256_bytes(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
 
@@ -4336,6 +6150,7 @@ mod tests {
                 benchmark_binary_older_than_git_head: None,
                 build_profile: "release-perf".to_owned(),
             },
+            sample_provenance(),
         );
 
         assert_eq!(
@@ -4359,7 +6174,7 @@ mod tests {
 
         assert_eq!(
             schema["properties"]["schema_version"]["const"],
-            JSON_REPORT_SCHEMA_V3
+            JSON_REPORT_SCHEMA_V4
         );
         assert_eq!(
             schema["properties"]["ci_regression_gate"]["properties"]["bead_id"]["const"],
@@ -4399,6 +6214,285 @@ mod tests {
                 ["type"][0],
             "number"
         );
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    fn bridge_test_sample(
+        workload: BridgeWorkload,
+        operation_count: usize,
+        block_index: usize,
+        arm: BridgeArm,
+        elapsed_ns: u64,
+    ) -> JsonBridgeSample {
+        let checksum = bridge_expected_checksum(operation_count).expect("test checksum should fit");
+        JsonBridgeSample {
+            workload,
+            operation_count,
+            block_index,
+            order_slot: 0,
+            arm,
+            elapsed_ns,
+            runtime_entries_total: 0,
+            runtime_entries_inside_timed_region: 0,
+            caller_future_completions_inside_timed_region: 0,
+            engine_dml_future_calls_inside_timed_region: 0,
+            worker_commands_total: 0,
+            worker_commands_inside_timed_region: 0,
+            worker_open_handshakes_total: 0,
+            oracle_kind: "test_fixture".to_owned(),
+            checksum_count: checksum.0,
+            checksum_sum: checksum.1,
+        }
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
+    fn bridge_orders_are_mirrored_and_balanced() {
+        let mut rng = StdRng::seed_from_u64(7);
+        for _ in 0..100 {
+            let order = bridge_two_arm_order(&mut rng);
+            assert_eq!(order[0], order[3]);
+            assert_eq!(order[1], order[2]);
+            assert_ne!(order[0], order[1]);
+
+            let order = bridge_three_arm_order(&mut rng);
+            assert_eq!(order[0], order[5]);
+            assert_eq!(order[1], order[4]);
+            assert_eq!(order[2], order[3]);
+            for arm in BridgeArm::ALL {
+                assert_eq!(
+                    order.iter().filter(|candidate| **candidate == arm).count(),
+                    2
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
+    fn bridge_ready_count_orders_balance_position_and_predecessor() {
+        let operation_counts = [1_usize, 10, 100, 1_000];
+        let mut rng = StdRng::seed_from_u64(17);
+        let orders = bridge_balanced_ready_count_orders(&operation_counts, 16, &mut rng)
+            .expect("two complete Williams cycles should be valid");
+        assert_eq!(orders.len(), 16);
+
+        let mut position_counts = BTreeMap::new();
+        let mut predecessor_counts = BTreeMap::new();
+        for order in &orders {
+            assert_eq!(order.len(), operation_counts.len());
+            for (position, operation_count) in order.iter().copied().enumerate() {
+                *position_counts
+                    .entry((operation_count, position))
+                    .or_insert(0_usize) += 1;
+            }
+            for pair in order.windows(2) {
+                assert_ne!(pair[0], pair[1]);
+                *predecessor_counts
+                    .entry((pair[0], pair[1]))
+                    .or_insert(0_usize) += 1;
+            }
+        }
+
+        for operation_count in operation_counts {
+            for position in 0..operation_counts.len() {
+                assert_eq!(position_counts[&(operation_count, position)], 4);
+            }
+            for successor in operation_counts {
+                if successor != operation_count {
+                    assert_eq!(predecessor_counts[&(operation_count, successor)], 4);
+                }
+            }
+        }
+
+        assert!(
+            bridge_balanced_ready_count_orders(&operation_counts, 10, &mut rng).is_err(),
+            "an incomplete Williams cycle must fail instead of silently biasing positions"
+        );
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
+    fn bridge_affinity_parser_and_sample_policy_fail_closed() {
+        assert_eq!(bridge_cpu_affinity_cardinality("2").unwrap(), 1);
+        assert_eq!(bridge_cpu_affinity_cardinality("2-3").unwrap(), 2);
+        assert_eq!(bridge_cpu_affinity_cardinality("2,4").unwrap(), 2);
+        assert!(bridge_cpu_affinity_cardinality("").is_err());
+        assert!(bridge_cpu_affinity_cardinality("3-2").is_err());
+        assert!(bridge_cpu_affinity_cardinality("2-3,3-4").is_err());
+
+        let valid = vec![
+            "comprehensive-bench".to_owned(),
+            "--bridge-experiment".to_owned(),
+            "--bridge-samples".to_owned(),
+            "32".to_owned(),
+        ];
+        assert_eq!(parse_cli_args(&valid).unwrap().bridge_samples, 32);
+
+        for invalid in ["20", "40", "30"] {
+            let args = vec![
+                "comprehensive-bench".to_owned(),
+                "--bridge-experiment".to_owned(),
+                "--bridge-samples".to_owned(),
+                invalid.to_owned(),
+            ];
+            assert!(parse_cli_args(&args).is_err());
+        }
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
+    fn bridge_paired_comparison_uses_block_means() {
+        let mut samples = Vec::new();
+        for block_index in 0..10 {
+            samples.push(bridge_test_sample(
+                BridgeWorkload::RawExecuteWithParams,
+                100,
+                block_index,
+                BridgeArm::PerOperationBlockOn,
+                200,
+            ));
+            samples.push(bridge_test_sample(
+                BridgeWorkload::RawExecuteWithParams,
+                100,
+                block_index,
+                BridgeArm::PerOperationBlockOn,
+                220,
+            ));
+            samples.push(bridge_test_sample(
+                BridgeWorkload::RawExecuteWithParams,
+                100,
+                block_index,
+                BridgeArm::SingleRuntimeEntry,
+                100,
+            ));
+            samples.push(bridge_test_sample(
+                BridgeWorkload::RawExecuteWithParams,
+                100,
+                block_index,
+                BridgeArm::SingleRuntimeEntry,
+                110,
+            ));
+        }
+
+        let comparison = bridge_paired_comparison(
+            &samples,
+            BridgeWorkload::RawExecuteWithParams,
+            100,
+            BridgeArm::PerOperationBlockOn,
+            BridgeArm::SingleRuntimeEntry,
+            99,
+        )
+        .expect("balanced blocks should compare");
+        assert_eq!(comparison.paired_blocks, 10);
+        assert!((comparison.median_ratio - 2.0).abs() < f64::EPSILON);
+        assert!((comparison.geomean_ratio - 2.0).abs() < f64::EPSILON);
+        assert!((comparison.bootstrap_mean_ratio_ci95_low - 2.0).abs() < f64::EPSILON);
+        assert!((comparison.bootstrap_mean_ratio_ci95_high - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
+    fn bridge_ready_regression_recovers_runtime_entry_slope() {
+        let mut samples = Vec::new();
+        for block_index in 0..10 {
+            for operation_count in [1_usize, 10, 100, 1_000] {
+                let baseline = 100_u64;
+                let per_operation = baseline
+                    + 5 * u64::try_from(operation_count.saturating_sub(1))
+                        .expect("test count should fit");
+                for _ in 0..2 {
+                    samples.push(bridge_test_sample(
+                        BridgeWorkload::ReadyFuture,
+                        operation_count,
+                        block_index,
+                        BridgeArm::SingleRuntimeEntry,
+                        baseline,
+                    ));
+                    samples.push(bridge_test_sample(
+                        BridgeWorkload::ReadyFuture,
+                        operation_count,
+                        block_index,
+                        BridgeArm::PerOperationBlockOn,
+                        per_operation,
+                    ));
+                }
+            }
+        }
+
+        let regression = bridge_ready_regression(&samples, 123).expect("fixture should regress");
+        assert_eq!(regression.points, 40);
+        assert_eq!(regression.paired_blocks, 10);
+        assert_eq!(regression.bootstrap_clusters, 5);
+        assert!(regression.intercept_ns.abs() < 1.0e-9);
+        assert!((regression.slope_ns_per_additional_runtime_entry - 5.0).abs() < 1.0e-9);
+        assert!((regression.bootstrap_slope_ci95_low - 5.0).abs() < 1.0e-9);
+        assert!((regression.bootstrap_slope_ci95_high - 5.0).abs() < 1.0e-9);
+        assert!((regression.r_squared - 1.0).abs() < 1.0e-12);
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
+    fn bridge_ready_samples_count_exact_runtime_entries_and_future_calls() {
+        let per_operation =
+            bridge_sample_ready_per_operation(3, 0, 0).expect("ready sample should run");
+        assert_eq!(
+            per_operation.runtime_entries_total, 4,
+            "one untimed sentinel probe plus three timed entries"
+        );
+        assert_eq!(per_operation.runtime_entries_inside_timed_region, 3);
+        assert_eq!(
+            per_operation.caller_future_completions_inside_timed_region,
+            3
+        );
+        assert_eq!(per_operation.engine_dml_future_calls_inside_timed_region, 0);
+        assert_eq!(
+            (per_operation.checksum_count, per_operation.checksum_sum),
+            (3, 0)
+        );
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("test runtime should build");
+        let single_runtime =
+            bridge_sample_ready_single_runtime(&runtime, 3, 0, 1).expect("ready sample should run");
+        assert_eq!(single_runtime.runtime_entries_total, 1);
+        assert_eq!(single_runtime.runtime_entries_inside_timed_region, 0);
+        assert_eq!(
+            single_runtime.caller_future_completions_inside_timed_region,
+            3
+        );
+        assert_eq!(
+            single_runtime.engine_dml_future_calls_inside_timed_region,
+            0
+        );
+        assert_eq!(
+            (single_runtime.checksum_count, single_runtime.checksum_sum),
+            (3, 0)
+        );
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
+    fn bridge_worker_sample_accounts_for_every_command_and_checks_rows() {
+        let sample = bridge_sample_insert_worker(3, 7, 2).expect("worker sample should run");
+        assert_eq!(sample.workload, BridgeWorkload::RawExecuteWithParams);
+        assert_eq!(sample.arm, BridgeArm::WorkerSyncFacade);
+        assert_eq!(sample.operation_count, 3);
+        assert_eq!(sample.block_index, 7);
+        assert_eq!(sample.order_slot, 2);
+        assert_eq!(sample.runtime_entries_total, 0);
+        assert_eq!(sample.runtime_entries_inside_timed_region, 0);
+        assert_eq!(sample.caller_future_completions_inside_timed_region, 0);
+        assert_eq!(sample.engine_dml_future_calls_inside_timed_region, 3);
+        assert_eq!(sample.worker_commands_inside_timed_region, 3);
+        assert_eq!(sample.worker_open_handshakes_total, 1);
+        assert_eq!(sample.worker_commands_total, bridge_pragmas().len() + 7 + 3);
+        assert_eq!(
+            sample.oracle_kind,
+            "untimed_database_count_and_sum_query"
+        );
+        assert_eq!((sample.checksum_count, sample.checksum_sum), (3, 3));
     }
 }
 
@@ -5202,27 +7296,39 @@ fn bench_mixed_oltp(report: &mut BenchReport) {
             let roll = rng.next_usize(100);
             if roll < 40 {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                let _ = collect_rusqlite_rows(&mut select_pt, rusqlite::params![id]);
+                std::hint::black_box(
+                    collect_rusqlite_rows(&mut select_pt, rusqlite::params![id]).unwrap(),
+                );
             } else if roll < 60 {
                 let start = (rng.next_usize(seed_rows.saturating_sub(50)) + 1) as i64;
-                let _: i64 = select_range
+                let count: i64 = select_range
                     .query_row(rusqlite::params![start, start + 50], |r| r.get(0))
-                    .unwrap_or(0);
+                    .unwrap();
+                std::hint::black_box(count);
             } else if roll < 80 {
-                let _: (i64, i64) = select_agg
+                let aggregate: (i64, i64) = select_agg
                     .query_row([], |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())))
                     .unwrap();
+                std::hint::black_box(aggregate);
             } else if roll < 95 {
-                let _ = insert.execute(rusqlite::params![next_id]);
+                std::hint::black_box(insert.execute(rusqlite::params![next_id]).unwrap());
                 next_id += 1;
             } else if roll < 98 {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                let _ = update.execute(rusqlite::params![id, id * 99]);
+                std::hint::black_box(update.execute(rusqlite::params![id, id * 99]).unwrap());
             } else {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                let _ = delete.execute(rusqlite::params![id]);
+                std::hint::black_box(delete.execute(rusqlite::params![id]).unwrap());
             }
         }
+        let final_state: (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(score), 0) FROM bench",
+                [],
+                |row| Ok((row.get(0).unwrap(), row.get(1).unwrap())),
+            )
+            .unwrap();
+        std::hint::black_box(final_state);
     });
 
     eprintln!("C={}", format_duration(cs.median()));
@@ -5263,45 +7369,60 @@ fn bench_mixed_oltp(report: &mut BenchReport) {
         let update = fs_prepare(&conn, "UPDATE bench SET score = ?2 WHERE id = ?1");
         let delete = fs_prepare(&conn, "DELETE FROM bench WHERE id = ?1");
 
-        // Each op's result is deliberately discarded — the mix is what's being
-        // timed, not the rows. `drop(block_on(..))`, never `let _ = ..`: the
-        // latter would bind the future without polling it and time nothing.
         #[allow(clippy::cast_possible_wrap)]
         for _ in 0..ops {
             let roll = rng.next_usize(100);
             if roll < 40 {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                drop(fsqlite_e2e::block_on(
-                    select_pt.query_row_with_params(&[fsqlite::SqliteValue::Integer(id)]),
-                ));
+                std::hint::black_box(
+                    fsqlite_e2e::block_on(
+                        select_pt.query_with_params(&[fsqlite::SqliteValue::Integer(id)]),
+                    )
+                    .unwrap(),
+                );
             } else if roll < 60 {
                 let start = (rng.next_usize(seed_rows.saturating_sub(50)) + 1) as i64;
-                drop(fsqlite_e2e::block_on(select_range.query_row_with_params(
-                    &[
+                std::hint::black_box(
+                    fsqlite_e2e::block_on(select_range.query_row_with_params(&[
                         fsqlite::SqliteValue::Integer(start),
                         fsqlite::SqliteValue::Integer(start + 50),
-                    ],
-                )));
+                    ]))
+                    .unwrap(),
+                );
             } else if roll < 80 {
-                drop(fsqlite_e2e::block_on(select_agg.query_row()));
+                std::hint::black_box(fsqlite_e2e::block_on(select_agg.query_row()).unwrap());
             } else if roll < 95 {
-                drop(fsqlite_e2e::block_on(insert.execute_with_params(&[
-                    fsqlite::SqliteValue::Integer(next_id),
-                ])));
+                std::hint::black_box(
+                    fsqlite_e2e::block_on(
+                        insert.execute_with_params(&[fsqlite::SqliteValue::Integer(next_id)]),
+                    )
+                    .unwrap(),
+                );
                 next_id += 1;
             } else if roll < 98 {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                drop(fsqlite_e2e::block_on(update.execute_with_params(&[
-                    fsqlite::SqliteValue::Integer(id),
-                    fsqlite::SqliteValue::Integer(id * 99),
-                ])));
+                std::hint::black_box(
+                    fsqlite_e2e::block_on(update.execute_with_params(&[
+                        fsqlite::SqliteValue::Integer(id),
+                        fsqlite::SqliteValue::Integer(id * 99),
+                    ]))
+                    .unwrap(),
+                );
             } else {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                drop(fsqlite_e2e::block_on(
-                    delete.execute_with_params(&[fsqlite::SqliteValue::Integer(id)]),
-                ));
+                std::hint::black_box(
+                    fsqlite_e2e::block_on(
+                        delete.execute_with_params(&[fsqlite::SqliteValue::Integer(id)]),
+                    )
+                    .unwrap(),
+                );
             }
         }
+        let final_state = fsqlite_e2e::block_on(
+            fs_prepare(&conn, "SELECT COUNT(*), COALESCE(SUM(score), 0) FROM bench").query_row(),
+        )
+        .unwrap();
+        std::hint::black_box(final_state);
     });
 
     eprintln!("F={}", format_duration(fs.median()));
@@ -5415,7 +7536,7 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
             "SELECT c.name, o.amount FROM customers c INNER JOIN orders o ON o.customer_id = c.id",
         );
         let fs = measure(&format!("fs_inner_join_{count}"), count, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query()));
+            std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
         });
         eprintln!(
             "C={} F={}",
@@ -5437,7 +7558,7 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
             "SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON o.customer_id = c.id",
         );
         let fs = measure(&format!("fs_left_join_{count}"), count, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query()));
+            std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
         });
         eprintln!(
             "C={} F={}",
@@ -5459,7 +7580,7 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
             "SELECT c.name, COUNT(*), SUM(o.amount) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name",
         );
         let fs = measure(&format!("fs_join_agg_{count}"), customer_count, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query()));
+            std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
         });
         eprintln!(
             "C={} F={}",
@@ -5490,7 +7611,7 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
             );
             let stmt = fs_prepare(&fs_conn, &sql);
             measure(&format!("fs_join_having_{count}"), customer_count, || {
-                drop(fsqlite_e2e::block_on(stmt.query()));
+                std::hint::black_box(fsqlite_e2e::block_on(stmt.query()).unwrap());
             })
         };
         eprintln!(
@@ -5603,7 +7724,7 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
             "SELECT p.name, (SELECT c.name FROM categories c WHERE c.id = p.category_id) AS cat_name FROM products p LIMIT 100",
         );
         let fs = measure(&format!("fs_scalar_sub_{count}"), 100, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query()));
+            std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
         });
         eprintln!(
             "C={} F={}",
@@ -5616,25 +7737,54 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
             Some(fs),
         );
 
-        // EXISTS subquery.
-        eprint!("    EXISTS subquery... ");
-        let half = count / 2;
+        // Parameter-varying EXISTS subquery. Varying the bound prevents a
+        // one-entry exact-result cache from turning this into a warmed-result
+        // lookup while C SQLite still executes the query.
+        eprint!("    EXISTS subquery (parameter-varying)... ");
+        let exists_sql = "SELECT COUNT(*) FROM products p WHERE EXISTS \
+            (SELECT 1 FROM categories c \
+             WHERE c.id = p.category_id AND c.id <= ?1)";
+        #[allow(clippy::cast_possible_wrap)]
+        let cat_count_i64 = cat_count as i64;
+        let oracle_threshold = cat_count_i64.min(5);
+        let expected_exists: i64 = cs_conn
+            .query_row(exists_sql, rusqlite::params![oracle_threshold], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let exists_probe = fs_prepare(&fs_conn, exists_sql);
+        let actual_exists = fsqlite_e2e::block_on(
+            exists_probe.query_row_with_params(&[fsqlite::SqliteValue::Integer(oracle_threshold)]),
+        )
+        .unwrap();
+        assert_eq!(
+            fsqlite_integer(&actual_exists, 0, "EXISTS oracle"),
+            expected_exists,
+            "FrankenSQLite and C SQLite disagree on EXISTS benchmark oracle"
+        );
         let cs = {
-            let sql = format!(
-                "SELECT COUNT(*) FROM products p WHERE EXISTS (SELECT 1 FROM categories c WHERE c.id = p.category_id AND c.id <= {half})"
-            );
-            let mut stmt = cs_conn.prepare(&sql).unwrap();
+            let mut stmt = cs_conn.prepare(exists_sql).unwrap();
+            let mut iteration = 0_i64;
             measure(&format!("cs_exists_{count}"), 1, || {
-                let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+                let threshold = 1 + iteration % cat_count_i64;
+                iteration += 1;
+                let value: i64 = stmt
+                    .query_row(rusqlite::params![threshold], |row| row.get(0))
+                    .unwrap();
+                std::hint::black_box(value);
             })
         };
         let fs = {
-            let sql = format!(
-                "SELECT COUNT(*) FROM products p WHERE EXISTS (SELECT 1 FROM categories c WHERE c.id = p.category_id AND c.id <= {half})"
-            );
-            let stmt = fs_prepare(&fs_conn, &sql);
+            let stmt = fs_prepare(&fs_conn, exists_sql);
+            let mut iteration = 0_i64;
             measure(&format!("fs_exists_{count}"), 1, || {
-                drop(fsqlite_e2e::block_on(stmt.query_row()));
+                let threshold = 1 + iteration % cat_count_i64;
+                iteration += 1;
+                let row = fsqlite_e2e::block_on(
+                    stmt.query_row_with_params(&[fsqlite::SqliteValue::Integer(threshold)]),
+                )
+                .unwrap();
+                std::hint::black_box(fsqlite_integer(&row, 0, "EXISTS measurement"));
             })
         };
         eprintln!(
@@ -5643,33 +7793,66 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
             format_duration(fs.median())
         );
         section.add_row(
-            &format!("{count} rows / EXISTS subquery"),
+            &format!("{count} rows / EXISTS subquery (parameter-varying)"),
             Some(cs),
             Some(fs),
         );
 
-        // IN subquery.
-        eprint!("    IN subquery... ");
+        // Parameter-varying IN subquery. The previous constant `id <= 5`
+        // shape measured FrankenSQLite's warmed exact-result cache after the
+        // warmups, rather than general subquery execution (bd-czzlp).
+        eprint!("    IN subquery (parameter-varying)... ");
+        let in_sql = "SELECT COUNT(*) FROM products \
+            WHERE category_id IN \
+            (SELECT id FROM categories WHERE id <= ?1)";
+        let expected_in: i64 = cs_conn
+            .query_row(in_sql, rusqlite::params![oracle_threshold], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let in_probe = fs_prepare(&fs_conn, in_sql);
+        let actual_in = fsqlite_e2e::block_on(
+            in_probe.query_row_with_params(&[fsqlite::SqliteValue::Integer(oracle_threshold)]),
+        )
+        .unwrap();
+        assert_eq!(
+            fsqlite_integer(&actual_in, 0, "IN-subquery oracle"),
+            expected_in,
+            "FrankenSQLite and C SQLite disagree on IN-subquery benchmark oracle"
+        );
         let cs = {
-            let sql = "SELECT COUNT(*) FROM products WHERE category_id IN (SELECT id FROM categories WHERE id <= 5)";
-            let mut stmt = cs_conn.prepare(sql).unwrap();
+            let mut stmt = cs_conn.prepare(in_sql).unwrap();
+            let mut iteration = 0_i64;
             measure(&format!("cs_in_sub_{count}"), 1, || {
-                let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+                let threshold = 1 + iteration % cat_count_i64;
+                iteration += 1;
+                let value: i64 = stmt
+                    .query_row(rusqlite::params![threshold], |row| row.get(0))
+                    .unwrap();
+                std::hint::black_box(value);
             })
         };
-        let fs_stmt = fs_prepare(
-            &fs_conn,
-            "SELECT COUNT(*) FROM products WHERE category_id IN (SELECT id FROM categories WHERE id <= 5)",
-        );
+        let fs_stmt = fs_prepare(&fs_conn, in_sql);
+        let mut fs_iteration = 0_i64;
         let fs = measure(&format!("fs_in_sub_{count}"), 1, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query_row()));
+            let threshold = 1 + fs_iteration % cat_count_i64;
+            fs_iteration += 1;
+            let row = fsqlite_e2e::block_on(
+                fs_stmt.query_row_with_params(&[fsqlite::SqliteValue::Integer(threshold)]),
+            )
+            .unwrap();
+            std::hint::black_box(fsqlite_integer(&row, 0, "IN-subquery measurement"));
         });
         eprintln!(
             "C={} F={}",
             format_duration(cs.median()),
             format_duration(fs.median())
         );
-        section.add_row(&format!("{count} rows / IN subquery"), Some(cs), Some(fs));
+        section.add_row(
+            &format!("{count} rows / IN subquery (parameter-varying)"),
+            Some(cs),
+            Some(fs),
+        );
 
         // CTE (non-recursive).
         eprint!("    CTE (non-recursive)... ");
@@ -5688,7 +7871,7 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
              SELECT p.name, p.price FROM products p JOIN top_cats tc ON p.category_id = tc.category_id",
         );
         let fs = measure(&format!("fs_cte_{count}"), count, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query()));
+            std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
         });
         eprintln!(
             "C={} F={}",
@@ -5698,25 +7881,30 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
         section.add_row(&format!("{count} rows / CTE + JOIN"), Some(cs), Some(fs));
     }
 
-    // Recursive CTE.
-    eprint!("    Recursive CTE (generate_series 1..1000)... ");
+    // This exact SUM shape is intentionally specialized by FrankenSQLite.
+    // Keep it, but label it as such instead of presenting it as the general
+    // recursive-CTE executor.
+    const SPECIALIZED_RECURSIVE_CTE_SQL: &str = "WITH RECURSIVE cnt(x) AS \
+         (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 1000) \
+         SELECT SUM(x) FROM cnt";
+    eprint!("    Recursive CTE specialized integer-series SUM... ");
     let cs = {
         let cs_conn = rusqlite::Connection::open_in_memory().unwrap();
-        let mut stmt = cs_conn.prepare(
-            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 1000) SELECT SUM(x) FROM cnt"
-        ).unwrap();
+        let mut stmt = cs_conn.prepare(SPECIALIZED_RECURSIVE_CTE_SQL).unwrap();
         measure("cs_recursive_cte", 1000, || {
-            let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+            let value: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+            assert_eq!(value, 500_500);
+            std::hint::black_box(value);
         })
     };
     let fs = {
         let fs_conn = open_fsqlite_memory_connection_for_benchmark();
-        let stmt = fs_prepare(
-            &fs_conn,
-            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 1000) SELECT SUM(x) FROM cnt",
-        );
+        let stmt = fs_prepare(&fs_conn, SPECIALIZED_RECURSIVE_CTE_SQL);
         measure("fs_recursive_cte", 1000, || {
-            drop(fsqlite_e2e::block_on(stmt.query_row()));
+            let row = fsqlite_e2e::block_on(stmt.query_row()).unwrap();
+            let value = fsqlite_integer(&row, 0, "specialized recursive CTE");
+            assert_eq!(value, 500_500);
+            std::hint::black_box(value);
         })
     };
     eprintln!(
@@ -5724,7 +7912,43 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
         format_duration(cs.median()),
         format_duration(fs.median())
     );
-    section.add_row("Recursive CTE (1..1000 SUM)", Some(cs), Some(fs));
+    section.add_row(
+        "Recursive CTE specialized integer-series SUM (1..1000)",
+        Some(cs),
+        Some(fs),
+    );
+
+    // COUNT defeats the narrow SUM specialization and therefore measures the
+    // general recursive frontier executor.
+    const GENERAL_RECURSIVE_CTE_SQL: &str = "WITH RECURSIVE cnt(x) AS \
+         (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 1000) \
+         SELECT COUNT(*) FROM cnt";
+    eprint!("    Recursive CTE general COUNT... ");
+    let cs = {
+        let cs_conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut stmt = cs_conn.prepare(GENERAL_RECURSIVE_CTE_SQL).unwrap();
+        measure("cs_recursive_cte_general", 1000, || {
+            let value: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+            assert_eq!(value, 1_000);
+            std::hint::black_box(value);
+        })
+    };
+    let fs = {
+        let fs_conn = open_fsqlite_memory_connection_for_benchmark();
+        let stmt = fs_prepare(&fs_conn, GENERAL_RECURSIVE_CTE_SQL);
+        measure("fs_recursive_cte_general", 1000, || {
+            let row = fsqlite_e2e::block_on(stmt.query_row()).unwrap();
+            let value = fsqlite_integer(&row, 0, "general recursive CTE");
+            assert_eq!(value, 1_000);
+            std::hint::black_box(value);
+        })
+    };
+    eprintln!(
+        "C={} F={}",
+        format_duration(cs.median()),
+        format_duration(fs.median())
+    );
+    section.add_row("Recursive CTE general COUNT (1..1000)", Some(cs), Some(fs));
 }
 
 // ─── Section 10: String & LIKE performance ──────────────────────────────
@@ -5805,7 +8029,8 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 .prepare("SELECT COUNT(*) FROM docs WHERE title LIKE 'Document 1%'")
                 .unwrap();
             measure(&format!("cs_like_prefix_{count}"), 1, || {
-                let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+                let value: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+                std::hint::black_box(value);
             })
         };
         let fs_stmt = fs_prepare(
@@ -5813,7 +8038,8 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
             "SELECT COUNT(*) FROM docs WHERE title LIKE 'Document 1%'",
         );
         let fs = measure(&format!("fs_like_prefix_{count}"), 1, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query_row()));
+            let row = fsqlite_e2e::block_on(fs_stmt.query_row()).unwrap();
+            std::hint::black_box(fsqlite_integer(&row, 0, "LIKE prefix COUNT"));
         });
         eprintln!(
             "C={} F={}",
@@ -5833,7 +8059,8 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 .prepare("SELECT COUNT(*) FROM docs WHERE body LIKE '%benchmark%'")
                 .unwrap();
             measure(&format!("cs_like_wild_{count}"), 1, || {
-                let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+                let value: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+                std::hint::black_box(value);
             })
         };
         let fs_stmt = fs_prepare(
@@ -5841,7 +8068,8 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
             "SELECT COUNT(*) FROM docs WHERE body LIKE '%benchmark%'",
         );
         let fs = measure(&format!("fs_like_wild_{count}"), 1, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query_row()));
+            let row = fsqlite_e2e::block_on(fs_stmt.query_row()).unwrap();
+            std::hint::black_box(fsqlite_integer(&row, 0, "LIKE wildcard COUNT"));
         });
         eprintln!(
             "C={} F={}",
@@ -5861,7 +8089,8 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 .prepare("SELECT LENGTH(title), UPPER(tag), SUBSTR(body, 1, 50) FROM docs")
                 .unwrap();
             measure(&format!("cs_str_funcs_{count}"), count, || {
-                let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
+                let rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
+                std::hint::black_box(rows);
             })
         };
         let fs_stmt = fs_prepare(
@@ -5869,7 +8098,8 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
             "SELECT LENGTH(title), UPPER(tag), SUBSTR(body, 1, 50) FROM docs",
         );
         let fs = measure(&format!("fs_str_funcs_{count}"), count, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query()));
+            let rows = fsqlite_e2e::block_on(fs_stmt.query()).unwrap();
+            std::hint::black_box(rows);
         });
         eprintln!(
             "C={} F={}",
@@ -5889,7 +8119,8 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 .prepare("SELECT tag, GROUP_CONCAT(id, ',') FROM docs GROUP BY tag")
                 .unwrap();
             measure(&format!("cs_group_concat_{count}"), count, || {
-                let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
+                let rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
+                std::hint::black_box(rows);
             })
         };
         let fs_stmt = fs_prepare(
@@ -5897,7 +8128,8 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
             "SELECT tag, GROUP_CONCAT(id, ',') FROM docs GROUP BY tag",
         );
         let fs = measure(&format!("fs_group_concat_{count}"), count, || {
-            drop(fsqlite_e2e::block_on(fs_stmt.query()));
+            let rows = fsqlite_e2e::block_on(fs_stmt.query()).unwrap();
+            std::hint::black_box(rows);
         });
         eprintln!(
             "C={} F={}",
@@ -5908,46 +8140,1540 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
     }
 }
 
-// ─── Main ──────────────────────────────────────────────────────────────
+// ─── Async bridge experiment ──────────────────────────────────────────
 
-fn write_json_report(report: &JsonBenchmarkReport, path: &str) {
-    let Ok(json) = serde_json::to_string_pretty(report) else {
-        eprintln!("ERROR: Could not serialize JSON report");
-        return;
-    };
+#[cfg(feature = "bridge-experiment")]
+fn bridge_read_trimmed(path: impl AsRef<std::path::Path>) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
 
-    if !ensure_report_parent_dir(path, "JSON") {
-        return;
-    }
+#[cfg(feature = "bridge-experiment")]
+fn bridge_cpufreq_values(file_name: &str) -> Vec<String> {
+    let mut values = std::fs::read_dir("/sys/devices/system/cpu/cpufreq")
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("policy"))
+        .filter_map(|entry| bridge_read_trimmed(entry.path().join(file_name)))
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
 
-    match std::fs::write(path, format!("{json}\n")) {
-        Ok(()) => eprintln!("JSON report written to: {path}"),
-        Err(e) => eprintln!("ERROR: Could not write JSON report: {e}"),
+#[cfg(feature = "bridge-experiment")]
+fn capture_bridge_host_state() -> JsonBridgeHostState {
+    let load_average = bridge_read_trimmed("/proc/loadavg").and_then(|loadavg| {
+        let values = loadavg
+            .split_whitespace()
+            .take(3)
+            .map(str::parse::<f64>)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        (values.len() == 3).then(|| (values[0], values[1], values[2]))
+    });
+    let memory_available_gb = bridge_read_trimmed("/proc/meminfo").and_then(|meminfo| {
+        meminfo.lines().find_map(|line| {
+            line.strip_prefix("MemAvailable:").and_then(|value| {
+                value
+                    .split_whitespace()
+                    .next()
+                    .and_then(|kilobytes| kilobytes.parse::<u64>().ok())
+                    .map(|kilobytes| kilobytes as f64 / 1_048_576.0)
+            })
+        })
+    });
+    let boost_controls = [
+        ("cpufreq.boost", "/sys/devices/system/cpu/cpufreq/boost"),
+        (
+            "intel_pstate.no_turbo",
+            "/sys/devices/system/cpu/intel_pstate/no_turbo",
+        ),
+        (
+            "amd_pstate.status",
+            "/sys/devices/system/cpu/amd_pstate/status",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, path)| bridge_read_trimmed(path).map(|value| (name.to_owned(), value)))
+    .collect();
+
+    JsonBridgeHostState {
+        captured_at_utc: chrono_stamp(),
+        load_average_1m: load_average.map(|load| load.0),
+        load_average_5m: load_average.map(|load| load.1),
+        load_average_15m: load_average.map(|load| load.2),
+        available_parallelism: std::thread::available_parallelism()
+            .ok()
+            .map(std::num::NonZero::get),
+        cpu_affinity: cpu_affinity(),
+        scaling_governors: bridge_cpufreq_values("scaling_governor"),
+        energy_performance_preferences: bridge_cpufreq_values("energy_performance_preference"),
+        boost_controls,
+        numa_nodes_online: bridge_read_trimmed("/sys/devices/system/node/online"),
+        memory_available_gb,
     }
 }
 
-fn ensure_report_parent_dir(path: &str, report_kind: &str) -> bool {
+#[cfg(feature = "bridge-experiment")]
+fn bridge_cpu_affinity_cardinality(value: &str) -> Result<usize, String> {
+    let mut count = 0_usize;
+    let mut previous_end = None;
+    for segment in value.split(',') {
+        if segment.is_empty() {
+            return Err("CPU affinity contains an empty segment".to_owned());
+        }
+        let (start, end) = match segment.split_once('-') {
+            Some((start, end)) => (
+                start
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid CPU affinity start `{start}`"))?,
+                end.parse::<usize>()
+                    .map_err(|_| format!("invalid CPU affinity end `{end}`"))?,
+            ),
+            None => {
+                let cpu = segment
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid CPU affinity CPU `{segment}`"))?;
+                (cpu, cpu)
+            }
+        };
+        if start > end {
+            return Err(format!(
+                "CPU affinity range starts after it ends: `{segment}`"
+            ));
+        }
+        if previous_end.is_some_and(|previous| start <= previous) {
+            return Err("CPU affinity ranges overlap or are not increasing".to_owned());
+        }
+        count = count
+            .checked_add(end - start + 1)
+            .ok_or_else(|| "CPU affinity cardinality overflowed usize".to_owned())?;
+        previous_end = Some(end);
+    }
+    if count == 0 {
+        Err("CPU affinity selects no CPUs".to_owned())
+    } else {
+        Ok(count)
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_max_load_average_1m() -> Result<f64, String> {
+    let raw = std::env::var("FSQLITE_BENCH_MAX_LOAD_1M").map_err(|error| match error {
+        std::env::VarError::NotPresent => {
+            "citable bridge runs require FSQLITE_BENCH_MAX_LOAD_1M".to_owned()
+        }
+        other => format!("could not read FSQLITE_BENCH_MAX_LOAD_1M: {other}"),
+    })?;
+    let maximum = raw
+        .parse::<f64>()
+        .map_err(|_| format!("FSQLITE_BENCH_MAX_LOAD_1M must be a finite number, got `{raw}`"))?;
+    if maximum.is_finite() && maximum >= 0.0 {
+        Ok(maximum)
+    } else {
+        Err(format!(
+            "FSQLITE_BENCH_MAX_LOAD_1M must be finite and nonnegative, got `{raw}`"
+        ))
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_validate_host_state(
+    provenance: &mut JsonBenchmarkProvenance,
+    expected_affinity: Option<&str>,
+    max_load_average_1m: Option<f64>,
+    state: &JsonBridgeHostState,
+    phase: &str,
+) {
+    match (expected_affinity, state.cpu_affinity.as_deref()) {
+        (Some(expected), Some(observed)) if expected == observed => {
+            match bridge_cpu_affinity_cardinality(observed) {
+                Ok(1 | 2) => {}
+                Ok(count) => provenance.add_validation_error(format!(
+                    "{phase} bridge CPU affinity selects {count} CPUs; citable causal runs require exactly one or two"
+                )),
+                Err(error) => provenance
+                    .add_validation_error(format!("{phase} bridge CPU affinity is invalid: {error}")),
+            }
+        }
+        (Some(expected), observed) => provenance.add_validation_error(format!(
+            "{phase} bridge CPU affinity mismatch: expected `{expected}`, observed {observed:?}"
+        )),
+        (None, _) => provenance.add_validation_error(
+            "citable bridge runs require FSQLITE_BENCH_EXPECTED_CPU_AFFINITY".to_owned(),
+        ),
+    }
+    match (max_load_average_1m, state.load_average_1m) {
+        (Some(maximum), Some(observed)) if observed <= maximum => {}
+        (Some(maximum), Some(observed)) => provenance.add_validation_error(format!(
+            "{phase} host load average {observed:.3} exceeds declared maximum {maximum:.3}"
+        )),
+        (Some(_), None) => provenance
+            .add_validation_error(format!("{phase} host load average could not be captured")),
+        (None, _) => provenance
+            .add_validation_error("citable bridge runs require FSQLITE_BENCH_MAX_LOAD_1M"),
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_validate_host_stability(
+    provenance: &mut JsonBenchmarkProvenance,
+    before: &JsonBridgeHostState,
+    after: &JsonBridgeHostState,
+) {
+    for (name, changed) in [
+        ("CPU affinity", before.cpu_affinity != after.cpu_affinity),
+        (
+            "CPU scaling governors",
+            before.scaling_governors != after.scaling_governors,
+        ),
+        (
+            "energy performance preferences",
+            before.energy_performance_preferences != after.energy_performance_preferences,
+        ),
+        (
+            "CPU boost controls",
+            before.boost_controls != after.boost_controls,
+        ),
+        ("NUMA online set", before.numa_nodes_online != after.numa_nodes_online),
+    ] {
+        if changed {
+            provenance.add_validation_error(format!(
+                "bridge host state changed during measurement: {name}"
+            ));
+        }
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_result<T>(result: Result<T, fsqlite::FrankenError>, context: &str) -> Result<T, String> {
+    result.map_err(|error| format!("{context}: {error}"))
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_block_on<F>(runtime_entries: &mut usize, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    *runtime_entries += 1;
+    fsqlite_e2e::block_on(future)
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_elapsed_ns(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_expected_checksum(operation_count: usize) -> Result<(i64, i64), String> {
+    let count = i64::try_from(operation_count)
+        .map_err(|_| "bridge operation count exceeds i64::MAX".to_owned())?;
+    let sum = i128::from(count)
+        .checked_mul(i128::from(count.saturating_sub(1)))
+        .and_then(|value| value.checked_div(2))
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or_else(|| "bridge checksum would overflow i64".to_owned())?;
+    Ok((count, sum))
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_pragmas() -> Vec<String> {
+    std::iter::once(format!(
+        "PRAGMA page_size = {};",
+        benchmark_page_size_bytes()
+    ))
+    .chain(
+        FSQLITE_BENCHMARK_PRAGMAS
+            .iter()
+            .map(|pragma| (*pragma).to_owned()),
+    )
+    .chain(std::iter::once(
+        "PRAGMA fsqlite.concurrent_mode=ON;".to_owned(),
+    ))
+    .collect()
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_verify_affected_rows(affected: usize, context: &str) -> Result<(), String> {
+    if affected == 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{context}: expected one affected row, got {affected}"
+        ))
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_checksum_from_row(
+    row: &fsqlite::Row,
+    operation_count: usize,
+    context: &str,
+) -> Result<(i64, i64), String> {
+    let actual = (
+        fsqlite_integer(row, 0, context),
+        fsqlite_integer(row, 1, context),
+    );
+    let expected = bridge_expected_checksum(operation_count)?;
+    if actual == expected {
+        Ok(actual)
+    } else {
+        Err(format!(
+            "{context}: expected COUNT/SUM {expected:?}, got {actual:?}"
+        ))
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_sample_ready_per_operation(
+    operation_count: usize,
+    block_index: usize,
+    order_slot: usize,
+) -> Result<JsonBridgeSample, String> {
+    let mut runtime_entries = 0_usize;
+    let sentinel = bridge_block_on(&mut runtime_entries, std::future::ready(0x4653_514c_i64));
+    if sentinel != 0x4653_514c {
+        return Err(format!(
+            "per-operation ready control preflight returned {sentinel}"
+        ));
+    }
+    let entries_before_timing = runtime_entries;
+    let start = Instant::now();
+    for _ in 0..operation_count {
+        let future = std::hint::black_box(std::future::ready(()));
+        std::hint::black_box(bridge_block_on(&mut runtime_entries, future));
+    }
+    let elapsed = start.elapsed();
+    let timed_runtime_entries = runtime_entries.saturating_sub(entries_before_timing);
+    let completion_count = i64::try_from(operation_count)
+        .map_err(|_| "ready-future operation count exceeds i64::MAX".to_owned())?;
+
+    Ok(JsonBridgeSample {
+        workload: BridgeWorkload::ReadyFuture,
+        operation_count,
+        block_index,
+        order_slot,
+        arm: BridgeArm::PerOperationBlockOn,
+        elapsed_ns: bridge_elapsed_ns(elapsed),
+        runtime_entries_total: runtime_entries,
+        runtime_entries_inside_timed_region: timed_runtime_entries,
+        caller_future_completions_inside_timed_region: operation_count,
+        engine_dml_future_calls_inside_timed_region: 0,
+        worker_commands_total: 0,
+        worker_commands_inside_timed_region: 0,
+        worker_open_handshakes_total: 0,
+        oracle_kind: "untimed_ready_sentinel_plus_control_flow_completion_count".to_owned(),
+        checksum_count: completion_count,
+        checksum_sum: 0,
+    })
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_sample_ready_single_runtime(
+    runtime: &Runtime,
+    operation_count: usize,
+    block_index: usize,
+    order_slot: usize,
+) -> Result<JsonBridgeSample, String> {
+    let elapsed = runtime.block_on(async {
+        let sentinel = std::future::ready(0x4653_514c_i64).await;
+        if sentinel != 0x4653_514c {
+            return Err(format!(
+                "existing-runtime ready control preflight returned {sentinel}"
+            ));
+        }
+        let start = Instant::now();
+        for _ in 0..operation_count {
+            let future = std::hint::black_box(std::future::ready(()));
+            std::hint::black_box(future.await);
+        }
+        Ok::<_, String>(start.elapsed())
+    })?;
+    let completion_count = i64::try_from(operation_count)
+        .map_err(|_| "ready-future operation count exceeds i64::MAX".to_owned())?;
+
+    Ok(JsonBridgeSample {
+        workload: BridgeWorkload::ReadyFuture,
+        operation_count,
+        block_index,
+        order_slot,
+        arm: BridgeArm::SingleRuntimeEntry,
+        elapsed_ns: bridge_elapsed_ns(elapsed),
+        runtime_entries_total: 1,
+        runtime_entries_inside_timed_region: 0,
+        caller_future_completions_inside_timed_region: operation_count,
+        engine_dml_future_calls_inside_timed_region: 0,
+        worker_commands_total: 0,
+        worker_commands_inside_timed_region: 0,
+        worker_open_handshakes_total: 0,
+        oracle_kind: "untimed_ready_sentinel_plus_control_flow_completion_count".to_owned(),
+        checksum_count: completion_count,
+        checksum_sum: 0,
+    })
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_sample_insert_per_operation(
+    workload: BridgeWorkload,
+    operation_count: usize,
+    block_index: usize,
+    order_slot: usize,
+) -> Result<JsonBridgeSample, String> {
+    if workload == BridgeWorkload::ReadyFuture {
+        return Err("ready-future workload is not an insert workload".to_owned());
+    }
+    let mut runtime_entries = 0_usize;
+    let conn = bridge_result(
+        bridge_block_on(&mut runtime_entries, fsqlite::Connection::open(":memory:")),
+        "per-operation arm open",
+    )?;
+    for pragma in bridge_pragmas() {
+        bridge_result(
+            bridge_block_on(&mut runtime_entries, conn.execute(&pragma)),
+            &format!("per-operation arm configure `{pragma}`"),
+        )?;
+    }
+    bridge_result(
+        bridge_block_on(
+            &mut runtime_entries,
+            conn.execute(
+                "CREATE TABLE bridge_probe(\
+                 id INTEGER PRIMARY KEY, value INTEGER NOT NULL)",
+            ),
+        ),
+        "per-operation arm create schema",
+    )?;
+    bridge_result(
+        bridge_block_on(&mut runtime_entries, conn.execute("BEGIN")),
+        "per-operation arm begin",
+    )?;
+
+    let (elapsed, affected_total) = match workload {
+        BridgeWorkload::PreparedInsert => {
+            let statement = bridge_result(
+                bridge_block_on(&mut runtime_entries, conn.prepare(BRIDGE_INSERT_SQL)),
+                "per-operation arm prepare",
+            )?;
+            let warm_affected = bridge_result(
+                bridge_block_on(
+                    &mut runtime_entries,
+                    statement.execute_with_params(&[
+                        fsqlite::SqliteValue::Integer(-1),
+                        fsqlite::SqliteValue::Integer(-1),
+                    ]),
+                ),
+                "per-operation prepared warmup",
+            )?;
+            bridge_verify_affected_rows(warm_affected, "per-operation prepared warmup")?;
+            let deleted = bridge_result(
+                bridge_block_on(
+                    &mut runtime_entries,
+                    conn.execute("DELETE FROM bridge_probe WHERE id = -1"),
+                ),
+                "per-operation prepared warmup cleanup",
+            )?;
+            bridge_verify_affected_rows(deleted, "per-operation prepared warmup cleanup")?;
+
+            let start = Instant::now();
+            let mut affected_total = 0_usize;
+            for value in 0..operation_count {
+                let value = i64::try_from(value)
+                    .map_err(|_| "prepared-insert value exceeds i64::MAX".to_owned())?;
+                let affected = bridge_result(
+                    bridge_block_on(
+                        &mut runtime_entries,
+                        statement.execute_with_params(&[
+                            fsqlite::SqliteValue::Integer(value),
+                            fsqlite::SqliteValue::Integer(value),
+                        ]),
+                    ),
+                    "per-operation prepared timed insert",
+                )?;
+                affected_total = affected_total.saturating_add(affected);
+            }
+            let elapsed = start.elapsed();
+            drop(statement);
+            (elapsed, affected_total)
+        }
+        BridgeWorkload::RawExecuteWithParams => {
+            let warm_affected = bridge_result(
+                bridge_block_on(
+                    &mut runtime_entries,
+                    conn.execute_with_params(
+                        BRIDGE_INSERT_SQL,
+                        &[
+                            fsqlite::SqliteValue::Integer(-1),
+                            fsqlite::SqliteValue::Integer(-1),
+                        ],
+                    ),
+                ),
+                "per-operation raw warmup",
+            )?;
+            bridge_verify_affected_rows(warm_affected, "per-operation raw warmup")?;
+            let deleted = bridge_result(
+                bridge_block_on(
+                    &mut runtime_entries,
+                    conn.execute("DELETE FROM bridge_probe WHERE id = -1"),
+                ),
+                "per-operation raw warmup cleanup",
+            )?;
+            bridge_verify_affected_rows(deleted, "per-operation raw warmup cleanup")?;
+
+            let start = Instant::now();
+            let mut affected_total = 0_usize;
+            for value in 0..operation_count {
+                let value = i64::try_from(value)
+                    .map_err(|_| "raw-insert value exceeds i64::MAX".to_owned())?;
+                let affected = bridge_result(
+                    bridge_block_on(
+                        &mut runtime_entries,
+                        conn.execute_with_params(
+                            BRIDGE_INSERT_SQL,
+                            &[
+                                fsqlite::SqliteValue::Integer(value),
+                                fsqlite::SqliteValue::Integer(value),
+                            ],
+                        ),
+                    ),
+                    "per-operation raw timed insert",
+                )?;
+                affected_total = affected_total.saturating_add(affected);
+            }
+            (start.elapsed(), affected_total)
+        }
+        BridgeWorkload::ReadyFuture => unreachable!(),
+    };
+    if affected_total != operation_count {
+        return Err(format!(
+            "per-operation {} timed inserts affected {affected_total} rows, expected {operation_count}",
+            workload.id()
+        ));
+    }
+
+    bridge_result(
+        bridge_block_on(&mut runtime_entries, conn.execute("COMMIT")),
+        "per-operation arm commit",
+    )?;
+    let checksum_row = bridge_result(
+        bridge_block_on(
+            &mut runtime_entries,
+            conn.query_row("SELECT COUNT(*), COALESCE(SUM(value), 0) FROM bridge_probe"),
+        ),
+        "per-operation arm checksum query",
+    )?;
+    let checksum =
+        bridge_checksum_from_row(&checksum_row, operation_count, "per-operation arm checksum")?;
+    bridge_result(
+        bridge_block_on(&mut runtime_entries, conn.close()),
+        "per-operation arm close",
+    )?;
+
+    Ok(JsonBridgeSample {
+        workload,
+        operation_count,
+        block_index,
+        order_slot,
+        arm: BridgeArm::PerOperationBlockOn,
+        elapsed_ns: bridge_elapsed_ns(elapsed),
+        runtime_entries_total: runtime_entries,
+        runtime_entries_inside_timed_region: operation_count,
+        caller_future_completions_inside_timed_region: operation_count,
+        engine_dml_future_calls_inside_timed_region: operation_count,
+        worker_commands_total: 0,
+        worker_commands_inside_timed_region: 0,
+        worker_open_handshakes_total: 0,
+        oracle_kind: "untimed_database_count_and_sum_query".to_owned(),
+        checksum_count: checksum.0,
+        checksum_sum: checksum.1,
+    })
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_sample_insert_single_runtime(
+    runtime: &Runtime,
+    workload: BridgeWorkload,
+    operation_count: usize,
+    block_index: usize,
+    order_slot: usize,
+) -> Result<JsonBridgeSample, String> {
+    if workload == BridgeWorkload::ReadyFuture {
+        return Err("ready-future workload is not an insert workload".to_owned());
+    }
+    let (elapsed, checksum) = runtime.block_on(async {
+        let conn = bridge_result(
+            fsqlite::Connection::open(":memory:").await,
+            "single-runtime arm open",
+        )?;
+        for pragma in bridge_pragmas() {
+            bridge_result(
+                conn.execute(&pragma).await,
+                &format!("single-runtime arm configure `{pragma}`"),
+            )?;
+        }
+        bridge_result(
+            conn.execute(
+                "CREATE TABLE bridge_probe(\
+                 id INTEGER PRIMARY KEY, value INTEGER NOT NULL)",
+            )
+            .await,
+            "single-runtime arm create schema",
+        )?;
+        bridge_result(conn.execute("BEGIN").await, "single-runtime arm begin")?;
+
+        let (elapsed, affected_total) = match workload {
+            BridgeWorkload::PreparedInsert => {
+                let statement = bridge_result(
+                    conn.prepare(BRIDGE_INSERT_SQL).await,
+                    "single-runtime arm prepare",
+                )?;
+                let warm_affected = bridge_result(
+                    statement
+                        .execute_with_params(&[
+                            fsqlite::SqliteValue::Integer(-1),
+                            fsqlite::SqliteValue::Integer(-1),
+                        ])
+                        .await,
+                    "single-runtime prepared warmup",
+                )?;
+                bridge_verify_affected_rows(warm_affected, "single-runtime prepared warmup")?;
+                let deleted = bridge_result(
+                    conn.execute("DELETE FROM bridge_probe WHERE id = -1")
+                        .await,
+                    "single-runtime prepared warmup cleanup",
+                )?;
+                bridge_verify_affected_rows(deleted, "single-runtime prepared warmup cleanup")?;
+
+                let start = Instant::now();
+                let mut affected_total = 0_usize;
+                for value in 0..operation_count {
+                    let value = i64::try_from(value)
+                        .map_err(|_| "prepared-insert value exceeds i64::MAX".to_owned())?;
+                    let affected = bridge_result(
+                        statement
+                            .execute_with_params(&[
+                                fsqlite::SqliteValue::Integer(value),
+                                fsqlite::SqliteValue::Integer(value),
+                            ])
+                            .await,
+                        "single-runtime prepared timed insert",
+                    )?;
+                    affected_total = affected_total.saturating_add(affected);
+                }
+                let elapsed = start.elapsed();
+                drop(statement);
+                (elapsed, affected_total)
+            }
+            BridgeWorkload::RawExecuteWithParams => {
+                let warm_affected = bridge_result(
+                    conn.execute_with_params(
+                        BRIDGE_INSERT_SQL,
+                        &[
+                            fsqlite::SqliteValue::Integer(-1),
+                            fsqlite::SqliteValue::Integer(-1),
+                        ],
+                    )
+                    .await,
+                    "single-runtime raw warmup",
+                )?;
+                bridge_verify_affected_rows(warm_affected, "single-runtime raw warmup")?;
+                let deleted = bridge_result(
+                    conn.execute("DELETE FROM bridge_probe WHERE id = -1")
+                        .await,
+                    "single-runtime raw warmup cleanup",
+                )?;
+                bridge_verify_affected_rows(deleted, "single-runtime raw warmup cleanup")?;
+
+                let start = Instant::now();
+                let mut affected_total = 0_usize;
+                for value in 0..operation_count {
+                    let value = i64::try_from(value)
+                        .map_err(|_| "raw-insert value exceeds i64::MAX".to_owned())?;
+                    let affected = bridge_result(
+                        conn.execute_with_params(
+                            BRIDGE_INSERT_SQL,
+                            &[
+                                fsqlite::SqliteValue::Integer(value),
+                                fsqlite::SqliteValue::Integer(value),
+                            ],
+                        )
+                        .await,
+                        "single-runtime raw timed insert",
+                    )?;
+                    affected_total = affected_total.saturating_add(affected);
+                }
+                (start.elapsed(), affected_total)
+            }
+            BridgeWorkload::ReadyFuture => unreachable!(),
+        };
+        if affected_total != operation_count {
+            return Err(format!(
+                "single-runtime {} timed inserts affected {affected_total} rows, expected {operation_count}",
+                workload.id()
+            ));
+        }
+
+        bridge_result(conn.execute("COMMIT").await, "single-runtime arm commit")?;
+        let checksum_row = bridge_result(
+            conn.query_row("SELECT COUNT(*), COALESCE(SUM(value), 0) FROM bridge_probe")
+                .await,
+            "single-runtime arm checksum query",
+        )?;
+        let checksum =
+            bridge_checksum_from_row(&checksum_row, operation_count, "single-runtime checksum")?;
+        bridge_result(conn.close().await, "single-runtime arm close")?;
+        Ok::<_, String>((elapsed, checksum))
+    })?;
+
+    Ok(JsonBridgeSample {
+        workload,
+        operation_count,
+        block_index,
+        order_slot,
+        arm: BridgeArm::SingleRuntimeEntry,
+        elapsed_ns: bridge_elapsed_ns(elapsed),
+        runtime_entries_total: 1,
+        runtime_entries_inside_timed_region: 0,
+        caller_future_completions_inside_timed_region: operation_count,
+        engine_dml_future_calls_inside_timed_region: operation_count,
+        worker_commands_total: 0,
+        worker_commands_inside_timed_region: 0,
+        worker_open_handshakes_total: 0,
+        oracle_kind: "untimed_database_count_and_sum_query".to_owned(),
+        checksum_count: checksum.0,
+        checksum_sum: checksum.1,
+    })
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_worker_command<T>(
+    command_count: &mut usize,
+    result: Result<T, fsqlite::FrankenError>,
+    context: &str,
+) -> Result<T, String> {
+    *command_count += 1;
+    bridge_result(result, context)
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_sample_insert_worker(
+    operation_count: usize,
+    block_index: usize,
+    order_slot: usize,
+) -> Result<JsonBridgeSample, String> {
+    let mut conn = bridge_result(
+        fsqlite::AsyncConnection::open_sync(":memory:"),
+        "worker arm open",
+    )?;
+    let mut worker_commands = 0_usize;
+    for pragma in bridge_pragmas() {
+        let result = conn.execute_sync(&pragma);
+        bridge_worker_command(
+            &mut worker_commands,
+            result,
+            &format!("worker arm configure `{pragma}`"),
+        )?;
+    }
+    let result = conn.execute_sync(
+        "CREATE TABLE bridge_probe(\
+         id INTEGER PRIMARY KEY, value INTEGER NOT NULL)",
+    );
+    bridge_worker_command(&mut worker_commands, result, "worker arm create schema")?;
+    let result = conn.begin_transaction_sync();
+    bridge_worker_command(&mut worker_commands, result, "worker arm begin")?;
+
+    let result = conn.execute_with_params_sync(
+        BRIDGE_INSERT_SQL,
+        &[
+            fsqlite::SqliteValue::Integer(-1),
+            fsqlite::SqliteValue::Integer(-1),
+        ],
+    );
+    let warm_affected = bridge_worker_command(&mut worker_commands, result, "worker raw warmup")?;
+    bridge_verify_affected_rows(warm_affected, "worker raw warmup")?;
+    let result = conn.execute_sync("DELETE FROM bridge_probe WHERE id = -1");
+    let deleted = bridge_worker_command(&mut worker_commands, result, "worker raw warmup cleanup")?;
+    bridge_verify_affected_rows(deleted, "worker raw warmup cleanup")?;
+
+    let commands_before_timing = worker_commands;
+    let start = Instant::now();
+    let mut affected_total = 0_usize;
+    for value in 0..operation_count {
+        let value =
+            i64::try_from(value).map_err(|_| "worker-insert value exceeds i64::MAX".to_owned())?;
+        let result = conn.execute_with_params_sync(
+            BRIDGE_INSERT_SQL,
+            &[
+                fsqlite::SqliteValue::Integer(value),
+                fsqlite::SqliteValue::Integer(value),
+            ],
+        );
+        let affected =
+            bridge_worker_command(&mut worker_commands, result, "worker raw timed insert")?;
+        affected_total = affected_total.saturating_add(affected);
+    }
+    let elapsed = start.elapsed();
+    let timed_worker_commands = worker_commands.saturating_sub(commands_before_timing);
+    if affected_total != operation_count {
+        return Err(format!(
+            "worker raw timed inserts affected {affected_total} rows, expected {operation_count}"
+        ));
+    }
+
+    let result = conn.commit_transaction_sync();
+    bridge_worker_command(&mut worker_commands, result, "worker arm commit")?;
+    let result = conn.query_row_sync("SELECT COUNT(*), COALESCE(SUM(value), 0) FROM bridge_probe");
+    let checksum_row =
+        bridge_worker_command(&mut worker_commands, result, "worker arm checksum query")?;
+    let checksum = bridge_checksum_from_row(&checksum_row, operation_count, "worker checksum")?;
+    let result = conn.close_sync();
+    bridge_worker_command(&mut worker_commands, result, "worker arm close")?;
+
+    Ok(JsonBridgeSample {
+        workload: BridgeWorkload::RawExecuteWithParams,
+        operation_count,
+        block_index,
+        order_slot,
+        arm: BridgeArm::WorkerSyncFacade,
+        elapsed_ns: bridge_elapsed_ns(elapsed),
+        runtime_entries_total: 0,
+        runtime_entries_inside_timed_region: 0,
+        caller_future_completions_inside_timed_region: 0,
+        engine_dml_future_calls_inside_timed_region: operation_count,
+        worker_commands_total: worker_commands,
+        worker_commands_inside_timed_region: timed_worker_commands,
+        worker_open_handshakes_total: 1,
+        oracle_kind: "untimed_database_count_and_sum_query".to_owned(),
+        checksum_count: checksum.0,
+        checksum_sum: checksum.1,
+    })
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_percentile(sorted: &[f64], percentile: f64) -> f64 {
+    debug_assert!(!sorted.is_empty());
+    let index = ((percentile / 100.0) * (sorted.len() - 1) as f64).ceil() as usize;
+    sorted[index.min(sorted.len() - 1)]
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_arm_statistics(samples: &[JsonBridgeSample]) -> Vec<JsonBridgeArmStats> {
+    let mut grouped: BTreeMap<(BridgeWorkload, usize, BridgeArm), Vec<f64>> = BTreeMap::new();
+    for sample in samples {
+        grouped
+            .entry((sample.workload, sample.operation_count, sample.arm))
+            .or_default()
+            .push(sample.elapsed_ns as f64);
+    }
+
+    grouped
+        .into_iter()
+        .map(|((workload, operation_count, arm), mut values)| {
+            values.sort_by(f64::total_cmp);
+            let sample_count = values.len();
+            let mean = values.iter().sum::<f64>() / sample_count as f64;
+            let variance = values
+                .iter()
+                .map(|value| {
+                    let delta = *value - mean;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / sample_count as f64;
+            let stddev = variance.sqrt();
+            let median = bridge_percentile(&values, 50.0);
+            JsonBridgeArmStats {
+                workload,
+                operation_count,
+                arm,
+                samples: sample_count,
+                median_ns: median,
+                mean_ns: mean,
+                p95_ns: bridge_percentile(&values, 95.0),
+                stddev_ns: stddev,
+                cv_pct: if mean > 0.0 {
+                    stddev / mean * 100.0
+                } else {
+                    0.0
+                },
+                median_ns_per_operation: median / operation_count.max(1) as f64,
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_bootstrap_mean_ci95(values: &[f64], seed: u64) -> (f64, f64) {
+    debug_assert!(!values.is_empty());
+    const RESAMPLES: usize = 10_000;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut means = Vec::with_capacity(RESAMPLES);
+    for _ in 0..RESAMPLES {
+        let mut total = 0.0_f64;
+        for _ in 0..values.len() {
+            total += values[rng.random_range(0..values.len())];
+        }
+        means.push(total / values.len() as f64);
+    }
+    means.sort_by(f64::total_cmp);
+    (
+        bridge_percentile(&means, 2.5),
+        bridge_percentile(&means, 97.5),
+    )
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_paired_comparison(
+    samples: &[JsonBridgeSample],
+    workload: BridgeWorkload,
+    operation_count: usize,
+    numerator: BridgeArm,
+    denominator: BridgeArm,
+    seed: u64,
+) -> Result<JsonBridgePairedComparison, String> {
+    let mut blocks: BTreeMap<usize, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    for sample in samples
+        .iter()
+        .filter(|sample| sample.workload == workload && sample.operation_count == operation_count)
+    {
+        let block = blocks.entry(sample.block_index).or_default();
+        if sample.arm == numerator {
+            block.0.push(sample.elapsed_ns as f64);
+        } else if sample.arm == denominator {
+            block.1.push(sample.elapsed_ns as f64);
+        }
+    }
+
+    let mut ratios = Vec::with_capacity(blocks.len());
+    for (block_index, (numerator_values, denominator_values)) in blocks {
+        if numerator_values.len() != 2 || denominator_values.len() != 2 {
+            return Err(format!(
+                "{} operations={operation_count} block {block_index} has {} {} samples and {} {} samples; expected two per arm",
+                workload.id(),
+                numerator_values.len(),
+                numerator.id(),
+                denominator_values.len(),
+                denominator.id()
+            ));
+        }
+        let numerator_mean = numerator_values.iter().sum::<f64>() / 2.0;
+        let denominator_mean = denominator_values.iter().sum::<f64>() / 2.0;
+        if denominator_mean <= 0.0 {
+            return Err(format!(
+                "{} operations={operation_count} block {block_index} has a zero denominator",
+                workload.id()
+            ));
+        }
+        ratios.push(numerator_mean / denominator_mean);
+    }
+    if ratios.is_empty() {
+        return Err(format!(
+            "no paired blocks for {} operations={operation_count} {} / {}",
+            workload.id(),
+            numerator.id(),
+            denominator.id()
+        ));
+    }
+
+    let mut sorted = ratios.clone();
+    sorted.sort_by(f64::total_cmp);
+    let geomean_ratio =
+        (ratios.iter().map(|ratio| ratio.ln()).sum::<f64>() / ratios.len() as f64).exp();
+    let (ci_low, ci_high) = bridge_bootstrap_mean_ci95(&ratios, seed);
+    Ok(JsonBridgePairedComparison {
+        workload,
+        operation_count,
+        numerator,
+        denominator,
+        paired_blocks: ratios.len(),
+        median_ratio: bridge_percentile(&sorted, 50.0),
+        geomean_ratio,
+        bootstrap_mean_ratio_ci95_low: ci_low,
+        bootstrap_mean_ratio_ci95_high: ci_high,
+    })
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_linear_fit(points: &[(f64, f64)]) -> Result<(f64, f64, f64), String> {
+    if points.len() < 2 {
+        return Err("linear fit requires at least two points".to_owned());
+    }
+    let mean_x = points.iter().map(|point| point.0).sum::<f64>() / points.len() as f64;
+    let mean_y = points.iter().map(|point| point.1).sum::<f64>() / points.len() as f64;
+    let covariance = points
+        .iter()
+        .map(|point| (point.0 - mean_x) * (point.1 - mean_y))
+        .sum::<f64>();
+    let variance_x = points
+        .iter()
+        .map(|point| {
+            let delta = point.0 - mean_x;
+            delta * delta
+        })
+        .sum::<f64>();
+    if variance_x == 0.0 {
+        return Err("linear fit predictor has zero variance".to_owned());
+    }
+    let slope = covariance / variance_x;
+    let intercept = mean_y - slope * mean_x;
+    let residual_sum_squares = points
+        .iter()
+        .map(|point| {
+            let predicted = intercept + slope * point.0;
+            let residual = point.1 - predicted;
+            residual * residual
+        })
+        .sum::<f64>();
+    let total_sum_squares = points
+        .iter()
+        .map(|point| {
+            let delta = point.1 - mean_y;
+            delta * delta
+        })
+        .sum::<f64>();
+    let r_squared = if total_sum_squares > 0.0 {
+        1.0 - residual_sum_squares / total_sum_squares
+    } else if residual_sum_squares == 0.0 {
+        1.0
+    } else {
+        0.0
+    };
+    Ok((intercept, slope, r_squared))
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_ready_regression(
+    samples: &[JsonBridgeSample],
+    seed: u64,
+) -> Result<JsonBridgeReadyRegression, String> {
+    let mut grouped: BTreeMap<(usize, usize), (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    for sample in samples
+        .iter()
+        .filter(|sample| sample.workload == BridgeWorkload::ReadyFuture)
+    {
+        let pair = grouped
+            .entry((sample.block_index, sample.operation_count))
+            .or_default();
+        match sample.arm {
+            BridgeArm::PerOperationBlockOn => pair.0.push(sample.elapsed_ns as f64),
+            BridgeArm::SingleRuntimeEntry => pair.1.push(sample.elapsed_ns as f64),
+            BridgeArm::WorkerSyncFacade => {
+                return Err("ready-future control unexpectedly contains worker samples".to_owned());
+            }
+        }
+    }
+    if grouped.is_empty() {
+        return Err("ready-future regression has no paired samples".to_owned());
+    }
+
+    let mut points_by_block: BTreeMap<usize, Vec<(f64, f64)>> = BTreeMap::new();
+    for ((block_index, operation_count), (per_operation, existing_runtime)) in grouped {
+        if per_operation.len() != 2 || existing_runtime.len() != 2 {
+            return Err(format!(
+                "ready-future operations={operation_count} block {block_index} has {} per-operation and {} existing-runtime samples; expected two each",
+                per_operation.len(),
+                existing_runtime.len()
+            ));
+        }
+        let per_operation_mean = per_operation.iter().sum::<f64>() / 2.0;
+        let existing_runtime_mean = existing_runtime.iter().sum::<f64>() / 2.0;
+        points_by_block.entry(block_index).or_default().push((
+            operation_count.saturating_sub(1) as f64,
+            per_operation_mean - existing_runtime_mean,
+        ));
+    }
+    let expected_points_per_block = points_by_block.values().next().map_or(0, Vec::len);
+    if expected_points_per_block < 2
+        || points_by_block
+            .values()
+            .any(|points| points.len() != expected_points_per_block)
+    {
+        return Err(
+            "ready-future regression blocks do not contain the same operation-count matrix"
+                .to_owned(),
+        );
+    }
+
+    let points = points_by_block
+        .values()
+        .flat_map(|block| block.iter().copied())
+        .collect::<Vec<_>>();
+    let (intercept, slope, r_squared) = bridge_linear_fit(&points)?;
+
+    const RESAMPLES: usize = 10_000;
+    let blocks = points_by_block.values().collect::<Vec<_>>();
+    if blocks.len() % 2 != 0 {
+        return Err(
+            "ready-future regression requires adjacent forward/reverse block pairs".to_owned(),
+        );
+    }
+    let bootstrap_clusters = blocks.chunks_exact(2).collect::<Vec<_>>();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut bootstrap_slopes = Vec::with_capacity(RESAMPLES);
+    for _ in 0..RESAMPLES {
+        let mut resampled_points =
+            Vec::with_capacity(blocks.len().saturating_mul(expected_points_per_block));
+        for _ in 0..bootstrap_clusters.len() {
+            let cluster =
+                bootstrap_clusters[rng.random_range(0..bootstrap_clusters.len())];
+            for block in cluster {
+                resampled_points.extend_from_slice(block);
+            }
+        }
+        bootstrap_slopes.push(bridge_linear_fit(&resampled_points)?.1);
+    }
+    bootstrap_slopes.sort_by(f64::total_cmp);
+
+    Ok(JsonBridgeReadyRegression {
+        predictor: "additional per-operation Runtime::block_on entries (N - 1)".to_owned(),
+        response:
+            "paired block mean(per_operation_block_on) - mean(inside_existing_runtime) ns"
+                .to_owned(),
+        interpretation:
+            "slope estimates each block_on entry beyond the first; intercept estimates the first timed block_on entry plus fixed arm difference"
+                .to_owned(),
+        points: points.len(),
+        paired_blocks: blocks.len(),
+        bootstrap_clusters: bootstrap_clusters.len(),
+        intercept_ns: intercept,
+        slope_ns_per_additional_runtime_entry: slope,
+        bootstrap_slope_ci95_low: bridge_percentile(&bootstrap_slopes, 2.5),
+        bootstrap_slope_ci95_high: bridge_percentile(&bootstrap_slopes, 97.5),
+        r_squared,
+    })
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_two_arm_order(rng: &mut StdRng) -> [BridgeArm; 4] {
+    if rng.random::<bool>() {
+        [
+            BridgeArm::PerOperationBlockOn,
+            BridgeArm::SingleRuntimeEntry,
+            BridgeArm::SingleRuntimeEntry,
+            BridgeArm::PerOperationBlockOn,
+        ]
+    } else {
+        [
+            BridgeArm::SingleRuntimeEntry,
+            BridgeArm::PerOperationBlockOn,
+            BridgeArm::PerOperationBlockOn,
+            BridgeArm::SingleRuntimeEntry,
+        ]
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_three_arm_order(rng: &mut StdRng) -> [BridgeArm; 6] {
+    let mut first_half = BridgeArm::ALL;
+    first_half.shuffle(rng);
+    [
+        first_half[0],
+        first_half[1],
+        first_half[2],
+        first_half[2],
+        first_half[1],
+        first_half[0],
+    ]
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_balanced_ready_count_orders(
+    operation_counts: &[usize],
+    block_count: usize,
+    rng: &mut StdRng,
+) -> Result<Vec<Vec<usize>>, String> {
+    if operation_counts.is_empty() {
+        return Err("ready operation-count matrix must not be empty".to_owned());
+    }
+    let width = operation_counts.len();
+    let cycle_blocks = width.saturating_mul(2);
+    if block_count == 0 || block_count % cycle_blocks != 0 {
+        return Err(format!(
+            "ready count ordering requires a whole balanced Williams cycle: \
+             block_count={block_count}, required multiple={cycle_blocks}"
+        ));
+    }
+    let mut orders = Vec::with_capacity(block_count);
+    while orders.len() < block_count {
+        let mut labels = operation_counts.to_vec();
+        labels.shuffle(rng);
+        let base = (0..width)
+            .map(|position| {
+                if position == 0 {
+                    0
+                } else if position % 2 == 1 {
+                    position.div_ceil(2)
+                } else {
+                    width - position / 2
+                }
+            })
+            .collect::<Vec<_>>();
+        for rotation in 0..width {
+            let order = base
+                .iter()
+                .map(|index| labels[(index + rotation) % width])
+                .collect::<Vec<_>>();
+            orders.push(order.clone());
+            if orders.len() == block_count {
+                break;
+            }
+            orders.push(order.into_iter().rev().collect());
+            if orders.len() == block_count {
+                break;
+            }
+        }
+    }
+    Ok(orders)
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_collect_samples(
+    runtime: &Runtime,
+    options: &CliOptions,
+    ready_operation_counts: &[usize],
+) -> Result<Vec<JsonBridgeSample>, String> {
+    let mut rng = StdRng::seed_from_u64(options.bridge_seed);
+    let block_count = options.bridge_samples / 2;
+    let estimated = ready_operation_counts
+        .len()
+        .saturating_mul(options.bridge_samples)
+        .saturating_mul(2)
+        .saturating_add(options.bridge_samples.saturating_mul(5));
+    let mut samples = Vec::with_capacity(estimated);
+
+    eprintln!(
+        "bridge ready-future control: operations={ready_operation_counts:?}, samples/arm/count={}",
+        options.bridge_samples
+    );
+    let ready_count_orders =
+        bridge_balanced_ready_count_orders(ready_operation_counts, block_count, &mut rng)?;
+    for (block_index, ready_order) in ready_count_orders.iter().enumerate() {
+        for (count_slot, &operation_count) in ready_order.iter().enumerate() {
+            for (arm_slot, arm) in bridge_two_arm_order(&mut rng).into_iter().enumerate() {
+                let order_slot = count_slot.saturating_mul(4).saturating_add(arm_slot);
+                let sample = match arm {
+                    BridgeArm::PerOperationBlockOn => {
+                        bridge_sample_ready_per_operation(operation_count, block_index, order_slot)?
+                    }
+                    BridgeArm::SingleRuntimeEntry => bridge_sample_ready_single_runtime(
+                        runtime,
+                        operation_count,
+                        block_index,
+                        order_slot,
+                    )?,
+                    BridgeArm::WorkerSyncFacade => unreachable!(),
+                };
+                samples.push(sample);
+            }
+        }
+    }
+
+    eprintln!(
+        "bridge retained-prepared control: operations={}, samples/arm={}",
+        options.bridge_operations, options.bridge_samples
+    );
+    for block_index in 0..block_count {
+        for (order_slot, arm) in bridge_two_arm_order(&mut rng).into_iter().enumerate() {
+            let sample = match arm {
+                BridgeArm::PerOperationBlockOn => bridge_sample_insert_per_operation(
+                    BridgeWorkload::PreparedInsert,
+                    options.bridge_operations,
+                    block_index,
+                    order_slot,
+                )?,
+                BridgeArm::SingleRuntimeEntry => bridge_sample_insert_single_runtime(
+                    runtime,
+                    BridgeWorkload::PreparedInsert,
+                    options.bridge_operations,
+                    block_index,
+                    order_slot,
+                )?,
+                BridgeArm::WorkerSyncFacade => unreachable!(),
+            };
+            samples.push(sample);
+        }
+    }
+
+    eprintln!(
+        "bridge common raw-DML path: operations={}, samples/arm={}",
+        options.bridge_operations, options.bridge_samples
+    );
+    for block_index in 0..block_count {
+        for (order_slot, arm) in bridge_three_arm_order(&mut rng).into_iter().enumerate() {
+            let sample = match arm {
+                BridgeArm::PerOperationBlockOn => bridge_sample_insert_per_operation(
+                    BridgeWorkload::RawExecuteWithParams,
+                    options.bridge_operations,
+                    block_index,
+                    order_slot,
+                )?,
+                BridgeArm::SingleRuntimeEntry => bridge_sample_insert_single_runtime(
+                    runtime,
+                    BridgeWorkload::RawExecuteWithParams,
+                    options.bridge_operations,
+                    block_index,
+                    order_slot,
+                )?,
+                BridgeArm::WorkerSyncFacade => {
+                    bridge_sample_insert_worker(options.bridge_operations, block_index, order_slot)?
+                }
+            };
+            samples.push(sample);
+        }
+    }
+
+    Ok(samples)
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_build_comparisons(
+    samples: &[JsonBridgeSample],
+    ready_operation_counts: &[usize],
+    operation_count: usize,
+    seed: u64,
+) -> Result<Vec<JsonBridgePairedComparison>, String> {
+    let mut comparisons = Vec::new();
+    for (index, &ready_count) in ready_operation_counts.iter().enumerate() {
+        comparisons.push(bridge_paired_comparison(
+            samples,
+            BridgeWorkload::ReadyFuture,
+            ready_count,
+            BridgeArm::PerOperationBlockOn,
+            BridgeArm::SingleRuntimeEntry,
+            seed ^ 0x1000 ^ index as u64,
+        )?);
+    }
+    comparisons.push(bridge_paired_comparison(
+        samples,
+        BridgeWorkload::PreparedInsert,
+        operation_count,
+        BridgeArm::PerOperationBlockOn,
+        BridgeArm::SingleRuntimeEntry,
+        seed ^ 0x2000,
+    )?);
+    for (index, (numerator, denominator)) in [
+        (
+            BridgeArm::PerOperationBlockOn,
+            BridgeArm::SingleRuntimeEntry,
+        ),
+        (BridgeArm::WorkerSyncFacade, BridgeArm::SingleRuntimeEntry),
+        (BridgeArm::WorkerSyncFacade, BridgeArm::PerOperationBlockOn),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        comparisons.push(bridge_paired_comparison(
+            samples,
+            BridgeWorkload::RawExecuteWithParams,
+            operation_count,
+            numerator,
+            denominator,
+            seed ^ 0x3000 ^ index as u64,
+        )?);
+    }
+    Ok(comparisons)
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), String> {
+    if benchmark_page_size_bytes() != DEFAULT_BENCH_PAGE_SIZE_BYTES {
+        return Err(format!(
+            "bridge experiment currently requires the default {}-byte page size so every arm opens identically",
+            DEFAULT_BENCH_PAGE_SIZE_BYTES
+        ));
+    }
+    bridge_expected_checksum(options.bridge_operations)?;
+
+    // Warm the thread-local bridge once before any sample, then reuse one
+    // separately constructed runtime for every single-entry sample.
+    fsqlite_e2e::block_on(std::future::ready(()));
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|error| format!("could not build bridge experiment runtime: {error}"))?;
+
+    // Fixed width keeps every allowed sample count on complete Williams
+    // cycles, so count order and first-order carryover remain exactly
+    // balanced rather than changing with the DML operation count.
+    let ready_operation_counts = vec![1, 10, 100, 1_000];
+
+    let mut provenance = JsonBenchmarkProvenance::capture(
+        args.to_vec(),
+        "three_arm_per_operation_inside_existing_runtime_worker_sync_facade",
+    );
+    if !provenance
+        .build
+        .package_features
+        .iter()
+        .any(|feature| feature == "bridge-experiment")
+    {
+        provenance.add_validation_error(
+            "bridge artifact was not built with the fsqlite-e2e bridge-experiment feature",
+        );
+    }
+    let expected_affinity = std::env::var("FSQLITE_BENCH_EXPECTED_CPU_AFFINITY").ok();
+    let max_load_average_1m = match bridge_max_load_average_1m() {
+        Ok(maximum) => Some(maximum),
+        Err(error) => {
+            provenance.add_validation_error(error);
+            None
+        }
+    };
+    let environment = DetectedEnvironment::detect(&provenance);
+    let host_state_before = capture_bridge_host_state();
+    bridge_validate_host_state(
+        &mut provenance,
+        expected_affinity.as_deref(),
+        max_load_average_1m,
+        &host_state_before,
+        "pre-measurement",
+    );
+    if !provenance.citable {
+        if options.allow_unverified_provenance {
+            provenance.mark_explicit_override();
+        } else {
+            return Err(format!(
+                "refusing to run bridge experiment with invalid provenance:\n  - {}",
+                provenance.validation_errors.join("\n  - ")
+            ));
+        }
+    }
+
+    let samples = bridge_collect_samples(&runtime, options, &ready_operation_counts)?;
+    let host_state_after = capture_bridge_host_state();
+    bridge_validate_host_state(
+        &mut provenance,
+        expected_affinity.as_deref(),
+        max_load_average_1m,
+        &host_state_after,
+        "post-measurement",
+    );
+    bridge_validate_host_stability(&mut provenance, &host_state_before, &host_state_after);
+    let statistics = bridge_arm_statistics(&samples);
+    let comparisons = bridge_build_comparisons(
+        &samples,
+        &ready_operation_counts,
+        options.bridge_operations,
+        options.bridge_seed,
+    )?;
+    let ready_regression = bridge_ready_regression(&samples, options.bridge_seed ^ 0x4000)?;
+
+    provenance.verify_runtime_source_unchanged();
+    if !provenance.citable {
+        if options.allow_unverified_provenance {
+            provenance.mark_explicit_override();
+        } else {
+            return Err(format!(
+                "source provenance changed during bridge experiment; no artifact emitted:\n  - {}",
+                provenance.validation_errors.join("\n  - ")
+            ));
+        }
+    }
+
+    let report = JsonBridgeReport {
+        schema_version: BRIDGE_REPORT_SCHEMA_V1.to_owned(),
+        generated_at_utc: chrono_stamp(),
+        provenance,
+        environment,
+        host_state_before,
+        host_state_after,
+        config: JsonBridgeConfig {
+            samples_per_arm: options.bridge_samples,
+            raw_insert_operations: options.bridge_operations,
+            ready_operation_counts,
+            order_seed: options.bridge_seed,
+            ordering_policy:
+                "seeded balanced Latin/Williams order with reversed pairs for ready operation counts; random ABBA/BAAB within every two-arm block; random mirrored ABC-CBA for the three-arm workload"
+                    .to_owned(),
+            warmup_policy:
+                "thread-local runtime prewarmed once; every database sample warms its exact DML path before timing"
+                    .to_owned(),
+            timed_region:
+                "per-operation arm times N complete thread-local Runtime::block_on entries; existing-runtime arm times N awaits inside an already-entered runtime; worker arm times N complete public facade calls; open, PRAGMAs, schema, transaction begin/commit, checksum, and close excluded"
+                    .to_owned(),
+            arm_contracts: BTreeMap::from([
+                (
+                    BridgeArm::PerOperationBlockOn.id().to_owned(),
+                    "one reused thread-local asupersync Runtime::block_on entry/exit per timed operation"
+                        .to_owned(),
+                ),
+                (
+                    BridgeArm::SingleRuntimeEntry.id().to_owned(),
+                    "one Runtime::block_on surrounds the whole sample outside its timer; timed operations are ordinary awaits inside the existing runtime"
+                        .to_owned(),
+                ),
+                (
+                    BridgeArm::WorkerSyncFacade.id().to_owned(),
+                    "public AsyncConnection synchronous facade: each timed call clones SQL and parameters, allocates a response channel, crosses the worker channel, schedules the worker, and drives the engine future with futures-lite::block_on"
+                    .to_owned(),
+                ),
+            ]),
+            affinity_policy:
+                "expected affinity must exactly match /proc/self/status and select exactly one or two CPUs"
+                    .to_owned(),
+            max_load_average_1m,
+        },
+        raw_samples: samples,
+        arm_statistics: statistics,
+        paired_comparisons: comparisons,
+        ready_runtime_entry_regression: ready_regression,
+    };
+
+    let json_path = options
+        .json_out_path
+        .clone()
+        .or_else(|| {
+            options
+                .emit_timestamped_json
+                .then(|| timestamp_filename("bridge_report", "json"))
+        })
+        .or_else(|| (!options.json_stdout).then(|| timestamp_filename("bridge_report", "json")));
+    if let Some(path) = json_path.as_deref() {
+        write_json_report(&report, path)?;
+    }
+    if options.json_stdout {
+        print_json_report(&report);
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "bridge-experiment"))]
+fn run_bridge_experiment(_args: &[String], _options: &CliOptions) -> Result<(), String> {
+    Err("--bridge-experiment requires rebuilding with `--features bridge-experiment`".to_owned())
+}
+
+// ─── Main ──────────────────────────────────────────────────────────────
+
+fn write_json_report<T: Serialize>(report: &T, path: &str) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|error| format!("could not serialize JSON report: {error}"))?;
+    ensure_report_parent_dir(path, "JSON")?;
+    std::fs::write(path, format!("{json}\n"))
+        .map_err(|error| format!("could not write JSON report at {path}: {error}"))?;
+    eprintln!("JSON report written to: {path}");
+    Ok(())
+}
+
+fn ensure_report_parent_dir(path: &str, report_kind: &str) -> Result<(), String> {
     let path = std::path::Path::new(path);
     let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     else {
-        return true;
+        return Ok(());
     };
 
-    match std::fs::create_dir_all(parent) {
-        Ok(()) => true,
-        Err(err) => {
-            eprintln!(
-                "ERROR: Could not create {report_kind} report parent directory {}: {err}",
-                parent.display()
-            );
-            false
-        }
-    }
+    std::fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "could not create {report_kind} report parent directory {}: {error}",
+            parent.display()
+        )
+    })
 }
 
-fn print_json_report(report: &JsonBenchmarkReport) {
+fn print_json_report<T: Serialize>(report: &T) {
     match serde_json::to_string_pretty(report) {
         Ok(json) => println!("{json}"),
         Err(err) => {
@@ -5973,7 +9699,26 @@ fn main() {
         }
     };
     if options.print_json_schema {
-        print_benchmark_json_schema();
+        if options.bridge_experiment {
+            #[cfg(feature = "bridge-experiment")]
+            print_bridge_json_schema();
+            #[cfg(not(feature = "bridge-experiment"))]
+            {
+                eprintln!(
+                    "ERROR: bridge schema requires rebuilding with `--features bridge-experiment`"
+                );
+                std::process::exit(1);
+            }
+        } else {
+            print_benchmark_json_schema();
+        }
+        return;
+    }
+    if options.bridge_experiment {
+        if let Err(error) = run_bridge_experiment(&args, &options) {
+            eprintln!("ERROR: {error}");
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -5982,6 +9727,40 @@ fn main() {
     } else {
         ROW_COUNTS
     };
+    let html_file = if options.emit_html {
+        Some(
+            options
+                .html_path
+                .clone()
+                .unwrap_or_else(|| timestamp_filename("benchmark_report", "html")),
+        )
+    } else {
+        None
+    };
+    let json_file = if let Some(path) = options.json_out_path.clone() {
+        Some(path)
+    } else if options.emit_timestamped_json {
+        Some(timestamp_filename("benchmark_report", "json"))
+    } else {
+        None
+    };
+    let artifact_requested = html_file.is_some() || json_file.is_some() || options.json_stdout;
+    let mut provenance =
+        JsonBenchmarkProvenance::capture(args.clone(), "per_operation_thread_local_block_on");
+    if artifact_requested && !provenance.citable {
+        if options.allow_unverified_provenance {
+            provenance.mark_explicit_override();
+        } else {
+            eprintln!("ERROR: refusing to run a citable benchmark with invalid provenance:");
+            for error in &provenance.validation_errors {
+                eprintln!("  - {error}");
+            }
+            eprintln!(
+                "Use --allow-unverified-provenance only for an explicitly non-citable diagnostic run."
+            );
+            std::process::exit(2);
+        }
+    }
     let filter_lower = options.filter.as_ref().map(|filter| filter.to_lowercase());
 
     let should_run =
@@ -5990,7 +9769,7 @@ fn main() {
         |aliases: &[&str]| -> bool { section_filter_matches(filter_lower.as_deref(), aliases) };
 
     let bench_start = Instant::now();
-    let environment = DetectedEnvironment::detect();
+    let environment = DetectedEnvironment::detect(&provenance);
     print_run_banner(!options.json_stdout, &options, row_counts, &environment);
 
     let mut report = BenchReport::new();
@@ -6086,28 +9865,27 @@ fn main() {
     if !options.json_stdout {
         report.print(total_elapsed, &environment);
     }
-
-    let html_file = if options.emit_html {
-        Some(
-            options
-                .html_path
-                .clone()
-                .unwrap_or_else(|| timestamp_filename("benchmark_report", "html")),
-        )
-    } else {
-        None
-    };
-    if let Some(path) = html_file.as_deref() {
-        report.write_html(path);
+    provenance.verify_runtime_source_unchanged();
+    if artifact_requested && !provenance.citable {
+        if options.allow_unverified_provenance {
+            provenance.mark_explicit_override();
+        } else {
+            eprintln!(
+                "ERROR: source provenance changed during the benchmark; no artifact emitted:"
+            );
+            for error in &provenance.validation_errors {
+                eprintln!("  - {error}");
+            }
+            std::process::exit(2);
+        }
     }
 
-    let json_file = if let Some(path) = options.json_out_path.clone() {
-        Some(path)
-    } else if options.emit_timestamped_json {
-        Some(timestamp_filename("benchmark_report", "json"))
-    } else {
-        None
-    };
+    if let Some(path) = html_file.as_deref()
+        && let Err(error) = report.write_html(path, &provenance)
+    {
+        eprintln!("ERROR: {error}");
+        std::process::exit(1);
+    }
 
     if json_file.is_some() || options.json_stdout {
         let json_report = build_json_report(
@@ -6126,10 +9904,14 @@ fn main() {
                 json_stdout: options.json_stdout,
             },
             environment.clone(),
+            provenance,
         );
 
-        if let Some(path) = json_file.as_deref() {
-            write_json_report(&json_report, path);
+        if let Some(path) = json_file.as_deref()
+            && let Err(error) = write_json_report(&json_report, path)
+        {
+            eprintln!("ERROR: {error}");
+            std::process::exit(1);
         }
         if options.json_stdout {
             print_json_report(&json_report);

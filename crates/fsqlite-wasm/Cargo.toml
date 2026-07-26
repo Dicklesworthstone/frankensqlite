@@ -68,5 +68,11 @@ tracing-wasm = { version = "0.2", optional = true }
 getrandom = { version = "0.4.3", features = ["wasm_js"] }
 wasm-bindgen-test = "0.3.75"
 
+# The host-target inline test module (`#[cfg(all(test, not(target_arch =
+# "wasm32")))]`) drives the async core API, so it needs a runtime via
+# `asupersync::test_utils::run_test`, which lives behind `test-internals`.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+asupersync = { workspace = true, features = ["test-internals"] }
+
 [lints]
 workspace = true

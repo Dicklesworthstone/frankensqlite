@@ -23,8 +23,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -56,10 +56,10 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -81,14 +81,14 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
     );
 }
 
-fn data() -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").unwrap();
+async fn data() -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, s TEXT)",
         "INSERT INTO t VALUES (1,5,'5'),(2,10,'x')",
     ] {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
     (f, r)
@@ -96,49 +96,58 @@ fn data() -> (Connection, rusqlite::Connection) {
 
 #[test]
 fn nullif_same_type_and_numeric_controls() {
-    assert_scalar(
-        &[
-            "SELECT nullif(5, 5)",    // NULL
-            "SELECT nullif(5, 6)",    // 5
-            "SELECT nullif(5, 5.0)",  // NULL (numeric int vs real)
-            "SELECT nullif('a','a')", // NULL
-            "SELECT nullif(NULL, 1)", // NULL
-            "SELECT nullif('5', 5)",  // bare literals, no affinity -> not equal -> '5'
-        ],
-        "nullif_same_type_and_numeric_controls",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT nullif(5, 5)",    // NULL
+                "SELECT nullif(5, 6)",    // 5
+                "SELECT nullif(5, 5.0)",  // NULL (numeric int vs real)
+                "SELECT nullif('a','a')", // NULL
+                "SELECT nullif(NULL, 1)", // NULL
+                "SELECT nullif('5', 5)",  // bare literals, no affinity -> not equal -> '5'
+            ],
+            "nullif_same_type_and_numeric_controls",
+        )
+        .await;
+    });
 }
 
-fn assert_scalar(queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn assert_scalar(queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
-    check(&f, &r, queries, label);
+    check(&f, &r, queries, label).await;
 }
 
 #[test]
 fn nullif_integer_column_vs_text_numeric() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            // n has INTEGER affinity: nullif(5,'5') -> coerces '5'->5 -> equal -> NULL.
-            "SELECT id, nullif(n, '5') FROM t ORDER BY id", // (1,NULL),(2,10)
-        ],
-        "nullif_integer_column_vs_text_numeric",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                // n has INTEGER affinity: nullif(5,'5') -> coerces '5'->5 -> equal -> NULL.
+                "SELECT id, nullif(n, '5') FROM t ORDER BY id", // (1,NULL),(2,10)
+            ],
+            "nullif_integer_column_vs_text_numeric",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn nullif_text_column_vs_numeric() {
-    let (f, r) = data();
-    check(
-        &f,
-        &r,
-        &[
-            // s has TEXT affinity: nullif(s,5) -> coerces 5->'5' -> id1 (s='5') -> NULL.
-            "SELECT id, nullif(s, 5) FROM t ORDER BY id", // (1,NULL),(2,'x')
-        ],
-        "nullif_text_column_vs_numeric",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = data().await;
+        check(
+            &f,
+            &r,
+            &[
+                // s has TEXT affinity: nullif(s,5) -> coerces 5->'5' -> id1 (s='5') -> NULL.
+                "SELECT id, nullif(s, 5) FROM t ORDER BY id", // (1,NULL),(2,'x')
+            ],
+            "nullif_text_column_vs_numeric",
+        )
+        .await;
+    });
 }

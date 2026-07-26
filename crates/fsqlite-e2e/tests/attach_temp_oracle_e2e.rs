@@ -6,6 +6,7 @@
 //! and DETACH. Each scenario asserts per-statement success/failure agreement
 //! between FrankenSQLite and rusqlite (a rejected ATTACH/TEMP statement is
 //! itself a finding), then compares query results.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -23,8 +24,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -56,11 +57,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -70,7 +71,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -94,97 +95,112 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 
 #[test]
 fn temp_table_basic() {
-    scenario(
-        &[
-            "CREATE TEMP TABLE tt (id INTEGER PRIMARY KEY, v TEXT)",
-            "INSERT INTO tt VALUES (1,'a'),(2,'b')",
-            "CREATE TEMPORARY TABLE tt2 (x INTEGER)",
-            "INSERT INTO tt2 VALUES (10),(20),(30)",
-        ],
-        &[
-            "SELECT id, v FROM tt ORDER BY id",
-            "SELECT sum(x) FROM tt2",
-            "SELECT count(*) FROM temp.tt",
-        ],
-        "temp_table_basic",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TEMP TABLE tt (id INTEGER PRIMARY KEY, v TEXT)",
+                "INSERT INTO tt VALUES (1,'a'),(2,'b')",
+                "CREATE TEMPORARY TABLE tt2 (x INTEGER)",
+                "INSERT INTO tt2 VALUES (10),(20),(30)",
+            ],
+            &[
+                "SELECT id, v FROM tt ORDER BY id",
+                "SELECT sum(x) FROM tt2",
+                "SELECT count(*) FROM temp.tt",
+            ],
+            "temp_table_basic",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn temp_table_shadows_main() {
     // A TEMP table shadows a same-named table in main within the connection.
-    scenario(
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, src TEXT)",
-            "INSERT INTO t VALUES (1,'main'),(2,'main')",
-            "CREATE TEMP TABLE t (id INTEGER PRIMARY KEY, src TEXT)",
-            "INSERT INTO t VALUES (9,'temp')",
-        ],
-        &[
-            // Unqualified `t` resolves to the TEMP table.
-            "SELECT id, src FROM t ORDER BY id",
-            // Explicit main. reaches the shadowed base table.
-            "SELECT id, src FROM main.t ORDER BY id",
-        ],
-        "temp_table_shadows_main",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, src TEXT)",
+                "INSERT INTO t VALUES (1,'main'),(2,'main')",
+                "CREATE TEMP TABLE t (id INTEGER PRIMARY KEY, src TEXT)",
+                "INSERT INTO t VALUES (9,'temp')",
+            ],
+            &[
+                // Unqualified `t` resolves to the TEMP table.
+                "SELECT id, src FROM t ORDER BY id",
+                // Explicit main. reaches the shadowed base table.
+                "SELECT id, src FROM main.t ORDER BY id",
+            ],
+            "temp_table_shadows_main",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn attach_memory_db_and_query() {
-    scenario(
-        &[
-            "ATTACH DATABASE ':memory:' AS aux",
-            "CREATE TABLE aux.t (id INTEGER PRIMARY KEY, v INTEGER)",
-            "INSERT INTO aux.t VALUES (1,100),(2,200)",
-            "CREATE TABLE main.t (id INTEGER PRIMARY KEY, v INTEGER)",
-            "INSERT INTO main.t VALUES (1,1),(2,2),(3,3)",
-        ],
-        &[
-            "SELECT id, v FROM aux.t ORDER BY id",
-            "SELECT id, v FROM main.t ORDER BY id",
-            "SELECT sum(v) FROM aux.t",
-            // Unqualified resolves to main when only main has the table... both have `t`,
-            // so qualify to stay unambiguous:
-            "SELECT count(*) FROM aux.t",
-        ],
-        "attach_memory_db_and_query",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "ATTACH DATABASE ':memory:' AS aux",
+                "CREATE TABLE aux.t (id INTEGER PRIMARY KEY, v INTEGER)",
+                "INSERT INTO aux.t VALUES (1,100),(2,200)",
+                "CREATE TABLE main.t (id INTEGER PRIMARY KEY, v INTEGER)",
+                "INSERT INTO main.t VALUES (1,1),(2,2),(3,3)",
+            ],
+            &[
+                "SELECT id, v FROM aux.t ORDER BY id",
+                "SELECT id, v FROM main.t ORDER BY id",
+                "SELECT sum(v) FROM aux.t",
+                // Unqualified resolves to main when only main has the table... both have `t`,
+                // so qualify to stay unambiguous:
+                "SELECT count(*) FROM aux.t",
+            ],
+            "attach_memory_db_and_query",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn attach_cross_db_join() {
-    scenario(
-        &[
-            "ATTACH DATABASE ':memory:' AS aux",
-            "CREATE TABLE main.orders (id INTEGER PRIMARY KEY, cust INTEGER, amt INTEGER)",
-            "CREATE TABLE aux.customers (id INTEGER PRIMARY KEY, name TEXT)",
-            "INSERT INTO main.orders VALUES (1,10,100),(2,20,200),(3,10,50)",
-            "INSERT INTO aux.customers VALUES (10,'ann'),(20,'bob')",
-        ],
-        &[
-            // Join across the two attached databases.
-            "SELECT c.name, sum(o.amt) FROM main.orders o JOIN aux.customers c ON o.cust = c.id \
-             GROUP BY c.id ORDER BY c.name",
-            "SELECT o.id FROM main.orders o WHERE o.cust IN (SELECT id FROM aux.customers) ORDER BY o.id",
-        ],
-        "attach_cross_db_join",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "ATTACH DATABASE ':memory:' AS aux",
+                "CREATE TABLE main.orders (id INTEGER PRIMARY KEY, cust INTEGER, amt INTEGER)",
+                "CREATE TABLE aux.customers (id INTEGER PRIMARY KEY, name TEXT)",
+                "INSERT INTO main.orders VALUES (1,10,100),(2,20,200),(3,10,50)",
+                "INSERT INTO aux.customers VALUES (10,'ann'),(20,'bob')",
+            ],
+            &[
+                // Join across the two attached databases.
+                "SELECT c.name, sum(o.amt) FROM main.orders o JOIN aux.customers c ON o.cust = c.id \
+                 GROUP BY c.id ORDER BY c.name",
+                "SELECT o.id FROM main.orders o WHERE o.cust IN (SELECT id FROM aux.customers) ORDER BY o.id",
+            ],
+            "attach_cross_db_join",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn attach_detach() {
-    scenario(
-        &[
-            "ATTACH DATABASE ':memory:' AS aux",
-            "CREATE TABLE aux.t (x INTEGER)",
-            "INSERT INTO aux.t VALUES (1),(2)",
-            "DETACH DATABASE aux",
-        ],
-        &[
-            // After DETACH, aux.t is gone -> error on both.
-            "SELECT * FROM aux.t",
-        ],
-        "attach_detach",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "ATTACH DATABASE ':memory:' AS aux",
+                "CREATE TABLE aux.t (x INTEGER)",
+                "INSERT INTO aux.t VALUES (1),(2)",
+                "DETACH DATABASE aux",
+            ],
+            &[
+                // After DETACH, aux.t is gone -> error on both.
+                "SELECT * FROM aux.t",
+            ],
+            "attach_detach",
+        )
+        .await;
+    });
 }

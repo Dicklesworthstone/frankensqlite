@@ -45,6 +45,7 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::similar_names)]
 #![allow(clippy::cast_precision_loss)]
+#![recursion_limit = "512"]
 
 use std::fs;
 use std::path::Path;
@@ -145,11 +146,14 @@ fn wal_frame_count(wal_data: &[u8]) -> usize {
     payload / frame_size
 }
 
-fn _count_rows_fsqlite(path: &Path) -> i64 {
+async fn _count_rows_fsqlite(path: &Path) -> i64 {
     let p = path.to_str().expect("utf-8");
-    let conn = fsqlite::Connection::open(p).expect("open fsqlite");
-    conn.execute("PRAGMA journal_mode=WAL").ok();
-    let rows = conn.query("SELECT COUNT(*) FROM data").expect("count");
+    let conn = fsqlite::Connection::open(p).await.expect("open fsqlite");
+    conn.execute("PRAGMA journal_mode=WAL").await.ok();
+    let rows = conn
+        .query("SELECT COUNT(*) FROM data")
+        .await
+        .expect("count");
     match &rows[0].values()[0] {
         fsqlite_types::value::SqliteValue::Integer(n) => *n,
         other => panic!("expected Integer, got {other:?}"),
@@ -833,51 +837,58 @@ fn w8_wal_growth_then_truncate() {
 
 #[test]
 fn fsqlite_wal_write_and_read() {
-    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let scenario_id = "FW1";
+    asupersync::test_utils::run_test(|| async {
+        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let scenario_id = "FW1";
 
-    emit_log(
-        scenario_id,
-        SEED_W1,
-        "start",
-        json!({"test": "fsqlite_wal_write_and_read"}),
-    );
+        emit_log(
+            scenario_id,
+            SEED_W1,
+            "start",
+            json!({"test": "fsqlite_wal_write_and_read"}),
+        );
 
-    let temp = tempfile::tempdir().expect("tempdir");
-    let db_path = temp.path().join("fw1.db");
-    let db_str = db_path.to_str().expect("utf-8");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("fw1.db");
+        let db_str = db_path.to_str().expect("utf-8");
 
-    let conn = fsqlite::Connection::open(db_str).expect("open");
-    conn.execute("PRAGMA journal_mode=WAL").ok();
-    conn.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
-        .expect("create");
+        let conn = fsqlite::Connection::open(db_str).await.expect("open");
+        conn.execute("PRAGMA journal_mode=WAL").await.ok();
+        conn.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
+            .await
+            .expect("create");
 
-    let row_count = 50i64;
-    for i in 0..row_count {
-        conn.execute(&format!(
-            "INSERT INTO data (id, payload) VALUES ({i}, 'payload-{i}')"
-        ))
-        .expect("insert");
-    }
+        let row_count = 50i64;
+        for i in 0..row_count {
+            conn.execute(&format!(
+                "INSERT INTO data (id, payload) VALUES ({i}, 'payload-{i}')"
+            ))
+            .await
+            .expect("insert");
+        }
 
-    // Read back and verify
-    let rows = conn.query("SELECT COUNT(*) FROM data").expect("count");
-    let count = match &rows[0].values()[0] {
-        fsqlite_types::value::SqliteValue::Integer(n) => *n,
-        other => panic!("expected Integer, got {other:?}"),
-    };
+        // Read back and verify
+        let rows = conn
+            .query("SELECT COUNT(*) FROM data")
+            .await
+            .expect("count");
+        let count = match &rows[0].values()[0] {
+            fsqlite_types::value::SqliteValue::Integer(n) => *n,
+            other => panic!("expected Integer, got {other:?}"),
+        };
 
-    emit_log(
-        scenario_id,
-        SEED_W1,
-        "result",
-        json!({
-            "backend": "fsqlite",
-            "row_count": count,
-            "expected": row_count,
-            "wal_mode": true,
-        }),
-    );
+        emit_log(
+            scenario_id,
+            SEED_W1,
+            "result",
+            json!({
+                "backend": "fsqlite",
+                "row_count": count,
+                "expected": row_count,
+                "wal_mode": true,
+            }),
+        );
 
-    assert_eq!(count, row_count, "[FW1] fsqlite WAL row count mismatch");
+        assert_eq!(count, row_count, "[FW1] fsqlite WAL row count mismatch");
+    });
 }

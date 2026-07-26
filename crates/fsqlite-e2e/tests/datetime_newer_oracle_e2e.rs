@@ -12,6 +12,7 @@
 //!     day number or a Unix timestamp.
 //! All inputs are FIXED (no `'now'`/`'localtime'`) so results are deterministic;
 //! rusqlite is the oracle for the exact formatting.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -29,8 +30,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -62,12 +63,12 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn assert_scalar(queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn assert_scalar(queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -91,78 +92,96 @@ fn assert_scalar(queries: &[&str], label: &str) {
 
 #[test]
 fn timediff_function() {
-    assert_scalar(
-        &[
-            "SELECT timediff('2023-01-02 00:00:00', '2023-01-01 00:00:00')", // +1 day
-            "SELECT timediff('2023-01-01 12:30:00', '2023-01-01 00:00:00')", // +12:30
-            "SELECT timediff('2023-01-01 00:00:00', '2023-01-02 00:00:00')", // negative
-            "SELECT timediff('2024-03-01', '2024-02-01')",                   // leap-Feb month
-            "SELECT timediff('2023-06-15 00:00:00.500', '2023-06-15 00:00:00.000')", // subsec
-        ],
-        "timediff_function",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT timediff('2023-01-02 00:00:00', '2023-01-01 00:00:00')", // +1 day
+                "SELECT timediff('2023-01-01 12:30:00', '2023-01-01 00:00:00')", // +12:30
+                "SELECT timediff('2023-01-01 00:00:00', '2023-01-02 00:00:00')", // negative
+                "SELECT timediff('2024-03-01', '2024-02-01')",                   // leap-Feb month
+                "SELECT timediff('2023-06-15 00:00:00.500', '2023-06-15 00:00:00.000')", // subsec
+            ],
+            "timediff_function",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn subsec_modifier_datetime_and_time() {
-    assert_scalar(
-        &[
-            // With 'subsec' the fractional part survives; without it, truncated.
-            "SELECT datetime('2023-06-15 12:30:45.678', 'subsec')",
-            "SELECT datetime('2023-06-15 12:30:45.678')",
-            "SELECT time('2023-06-15 12:30:45.678', 'subsec')",
-            "SELECT time('2023-06-15 12:30:45.678')",
-            // %f always carries the fractional seconds.
-            "SELECT strftime('%f', '2023-06-15 12:30:45.678')",
-            // unixepoch without 'subsec' truncates to whole seconds (matches).
-            "SELECT unixepoch('2023-06-15 12:30:45')",
-        ],
-        "subsec_modifier_datetime_and_time",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                // With 'subsec' the fractional part survives; without it, truncated.
+                "SELECT datetime('2023-06-15 12:30:45.678', 'subsec')",
+                "SELECT datetime('2023-06-15 12:30:45.678')",
+                "SELECT time('2023-06-15 12:30:45.678', 'subsec')",
+                "SELECT time('2023-06-15 12:30:45.678')",
+                // %f always carries the fractional seconds.
+                "SELECT strftime('%f', '2023-06-15 12:30:45.678')",
+                // unixepoch without 'subsec' truncates to whole seconds (matches).
+                "SELECT unixepoch('2023-06-15 12:30:45')",
+            ],
+            "subsec_modifier_datetime_and_time",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn unixepoch_subsec_fractional() {
-    assert_scalar(
-        &[
-            "SELECT unixepoch('2023-06-15 12:30:45.500', 'subsec')", // SQLite 1686832245.5
-        ],
-        "unixepoch_subsec_fractional",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT unixepoch('2023-06-15 12:30:45.500', 'subsec')", // SQLite 1686832245.5
+            ],
+            "unixepoch_subsec_fractional",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn ceiling_floor_month_overflow() {
-    assert_scalar(
-        &[
-            "SELECT date('2023-01-31', '+1 month', 'ceiling')", // SQLite '2023-03-03'
-            "SELECT date('2023-01-31', '+1 month', 'floor')",   // SQLite '2023-02-28'
-            "SELECT date('2020-02-29', '+1 year', 'floor')",    // SQLite '2021-02-28'
-            "SELECT date('2020-02-29', '+1 year', 'ceiling')",  // SQLite '2021-03-01'
-        ],
-        "ceiling_floor_month_overflow",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT date('2023-01-31', '+1 month', 'ceiling')", // SQLite '2023-03-03'
+                "SELECT date('2023-01-31', '+1 month', 'floor')",   // SQLite '2023-02-28'
+                "SELECT date('2020-02-29', '+1 year', 'floor')",    // SQLite '2021-02-28'
+                "SELECT date('2020-02-29', '+1 year', 'ceiling')",  // SQLite '2021-03-01'
+            ],
+            "ceiling_floor_month_overflow",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn auto_modifier_detects_julian_vs_unix() {
-    // 'auto' classification works across the normal range.
-    assert_scalar(
-        &[
-            "SELECT datetime(1686836730, 'auto')", // large -> Unix seconds
-            "SELECT datetime(2460111.0, 'auto')",  // -> Julian day
-            "SELECT date(2460111, 'auto')",        // Julian day -> date
-        ],
-        "auto_modifier_detects_julian_vs_unix",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // 'auto' classification works across the normal range.
+        assert_scalar(
+            &[
+                "SELECT datetime(1686836730, 'auto')", // large -> Unix seconds
+                "SELECT datetime(2460111.0, 'auto')",  // -> Julian day
+                "SELECT date(2460111, 'auto')",        // Julian day -> date
+            ],
+            "auto_modifier_detects_julian_vs_unix",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn julian_day_zero_extreme_date() {
-    assert_scalar(
-        &[
-            "SELECT datetime(0, 'auto')", // SQLite '-4713-11-24 12:00:00'
-        ],
-        "julian_day_zero_extreme_date",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT datetime(0, 'auto')", // SQLite '-4713-11-24 12:00:00'
+            ],
+            "julian_day_zero_extreme_date",
+        )
+        .await;
+    });
 }

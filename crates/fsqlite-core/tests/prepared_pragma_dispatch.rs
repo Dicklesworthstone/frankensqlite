@@ -39,8 +39,9 @@ fn format_blob(bytes: &[u8]) -> String {
     )
 }
 
-fn fsqlite_prepared_rows(conn: &Connection, sql: &str) -> TestResult<Vec<Vec<String>>> {
-    Ok(format_fsqlite_rows(conn.prepare(sql)?.query()?))
+async fn fsqlite_prepared_rows(conn: &Connection, sql: &str) -> TestResult<Vec<Vec<String>>> {
+    let stmt = conn.prepare(sql).await?;
+    Ok(format_fsqlite_rows(stmt.query().await?))
 }
 
 fn rusqlite_rows(conn: &rusqlite::Connection, sql: &str) -> TestResult<Vec<Vec<String>>> {
@@ -61,24 +62,42 @@ fn rusqlite_rows(conn: &rusqlite::Connection, sql: &str) -> TestResult<Vec<Vec<S
 
 #[test]
 fn prepared_pragma_getters_and_setters_match_rusqlite() -> TestResult {
-    let fconn = Connection::open(":memory:")?;
-    let rconn = rusqlite::Connection::open_in_memory()?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let fconn = Connection::open(":memory:").await?;
+            let rconn = rusqlite::Connection::open_in_memory()?;
 
-    for sql in ["PRAGMA user_version = 37", "PRAGMA cache_size = -4000"] {
-        fconn.prepare(sql)?.execute()?;
-        rconn.execute_batch(sql)?;
-    }
+            for sql in ["PRAGMA user_version = 37", "PRAGMA cache_size = -4000"] {
+                fconn.prepare(sql).await?.execute().await?;
+                rconn.execute_batch(sql)?;
+            }
 
-    for sql in ["PRAGMA user_version", "PRAGMA cache_size"] {
-        assert_eq!(
-            fsqlite_prepared_rows(&fconn, sql)?,
-            rusqlite_rows(&rconn, sql)?
-        );
-    }
+            for sql in ["PRAGMA user_version", "PRAGMA cache_size"] {
+                assert_eq!(
+                    fsqlite_prepared_rows(&fconn, sql).await?,
+                    rusqlite_rows(&rconn, sql)?
+                );
+            }
 
-    let user_version_row = fconn.prepare("PRAGMA user_version")?.query_row()?;
-    assert_eq!(user_version_row.values(), &[SqliteValue::Integer(37)]);
-    assert_eq!(fconn.prepare("PRAGMA user_version")?.execute()?, 1);
+            let user_version_row = fconn
+                .prepare("PRAGMA user_version")
+                .await?
+                .query_row()
+                .await?;
+            assert_eq!(user_version_row.values(), &[SqliteValue::Integer(37)]);
+            assert_eq!(
+                fconn
+                    .prepare("PRAGMA user_version")
+                    .await?
+                    .execute()
+                    .await?,
+                1
+            );
 
-    Ok(())
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }

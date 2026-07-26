@@ -18,9 +18,10 @@ fn render(v: &SqliteValue) -> String {
         ),
     }
 }
-fn frank_rows(c: &Connection, sql: &str) -> Vec<Vec<String>> {
+async fn frank_rows(c: &Connection, sql: &str) -> Vec<Vec<String>> {
     let mut r: Vec<Vec<String>> = c
         .query(sql)
+        .await
         .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"))
         .iter()
         .map(|row| row.values().iter().map(render).collect())
@@ -54,31 +55,31 @@ fn sqlite_rows(c: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
     r.sort();
     r
 }
-fn has_seek(c: &Connection, sql: &str) -> bool {
-    c.query(&format!("EXPLAIN {sql}")).unwrap().iter().any(|row| matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.to_string().starts_with("Seek")))
+async fn has_seek(c: &Connection, sql: &str) -> bool {
+    c.query(&format!("EXPLAIN {sql}")).await.unwrap().iter().any(|row| matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.to_string().starts_with("Seek")))
 }
-fn setup(ddl: &[&str]) -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").unwrap();
+async fn setup(ddl: &[&str]) -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in ddl {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
     (f, r)
 }
-fn ins(f: &Connection, r: &rusqlite::Connection, s: &str) {
-    f.execute(s).unwrap();
+async fn ins(f: &Connection, r: &rusqlite::Connection, s: &str) {
+    f.execute(s).await.unwrap();
     r.execute_batch(s).unwrap();
 }
-fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, l: &str) {
+async fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, l: &str) {
     assert_eq!(
-        frank_rows(f, sql),
+        frank_rows(f, sql).await,
         sqlite_rows(r, sql),
         "[{l}] diverged: `{sql}`"
     );
 }
-fn check(label: &str, ddl: &[&str]) {
-    let (f, r) = setup(ddl);
+async fn check(label: &str, ddl: &[&str]) {
+    let (f, r) = setup(ddl).await;
     for i in 1..=600_i64 {
         let a = if i % 17 == 0 {
             "NULL".to_owned()
@@ -98,7 +99,8 @@ fn check(label: &str, ddl: &[&str]) {
                 i % 7,
                 i % 9
             ),
-        );
+        )
+        .await;
     }
     // Output includes a column (`c` / `s` / `*`) not in idx_a NOR the composite idx_ax used by the
     // shadowed schema, so it is non-covering on BOTH schemas and must seek.
@@ -113,9 +115,9 @@ fn check(label: &str, ddl: &[&str]) {
         "SELECT c, s FROM t WHERE a = 3 AND c BETWEEN 2 AND 8",
     ];
     for sql in seeks {
-        cmp(&f, &r, sql, label);
+        cmp(&f, &r, sql, label).await;
         assert!(
-            has_seek(&f, sql),
+            has_seek(&f, sql).await,
             "[{label}] non-covering eq+residual must seek: `{sql}`"
         );
     }
@@ -126,52 +128,63 @@ fn check(label: &str, ddl: &[&str]) {
         "SELECT a FROM t WHERE a = 5 AND c = 5",
         "SELECT x FROM t WHERE a = 5 AND c = 5",
     ] {
-        cmp(&f, &r, sql, label);
+        cmp(&f, &r, sql, label).await;
     }
-    cmp(&f, &r, "SELECT id FROM t WHERE a = 5", label);
+    cmp(&f, &r, "SELECT id FROM t WHERE a = 5", label).await;
 }
 #[test]
 fn nonagg_eq_residual_matches_sqlite() {
-    check(
-        "single idx_a",
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER, x TEXT, s TEXT);",
-            "CREATE INDEX idx_a ON t(a);",
-            "CREATE INDEX idx_c ON t(c);",
-        ],
-    );
-    check(
-        "shadowed idx_a",
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER, x TEXT, s TEXT);",
-            "CREATE INDEX idx_ax ON t(a, x);",
-            "CREATE INDEX idx_a ON t(a);",
-        ],
-    );
+    asupersync::test_utils::run_test(|| async {
+        check(
+            "single idx_a",
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER, x TEXT, s TEXT);",
+                "CREATE INDEX idx_a ON t(a);",
+                "CREATE INDEX idx_c ON t(c);",
+            ],
+        )
+        .await;
+        check(
+            "shadowed idx_a",
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER, x TEXT, s TEXT);",
+                "CREATE INDEX idx_ax ON t(a, x);",
+                "CREATE INDEX idx_a ON t(a);",
+            ],
+        )
+        .await;
+    });
 }
 #[test]
 fn nonagg_eq_residual_text_prefix() {
-    let (f, r) = setup(&[
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT, c INTEGER, x TEXT);",
-        "CREATE INDEX idx_s ON t(s);",
-    ]);
-    for i in 1..=300_i64 {
-        ins(
-            &f,
-            &r,
-            &format!(
-                "INSERT INTO t VALUES ({i}, 'k{}', {}, 'p{}');",
-                i % 8,
-                i % 10,
-                i % 4
-            ),
-        );
-    }
-    for sql in [
-        "SELECT c FROM t WHERE s = 'k3' AND c = 4",
-        "SELECT * FROM t WHERE s = 'k3' AND c > 5",
-    ] {
-        cmp(&f, &r, sql, "text-prefix");
-        assert!(has_seek(&f, sql), "text eq+residual must seek: `{sql}`");
-    }
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT, c INTEGER, x TEXT);",
+            "CREATE INDEX idx_s ON t(s);",
+        ])
+        .await;
+        for i in 1..=300_i64 {
+            ins(
+                &f,
+                &r,
+                &format!(
+                    "INSERT INTO t VALUES ({i}, 'k{}', {}, 'p{}');",
+                    i % 8,
+                    i % 10,
+                    i % 4
+                ),
+            )
+            .await;
+        }
+        for sql in [
+            "SELECT c FROM t WHERE s = 'k3' AND c = 4",
+            "SELECT * FROM t WHERE s = 'k3' AND c > 5",
+        ] {
+            cmp(&f, &r, sql, "text-prefix").await;
+            assert!(
+                has_seek(&f, sql).await,
+                "text eq+residual must seek: `{sql}`"
+            );
+        }
+    });
 }

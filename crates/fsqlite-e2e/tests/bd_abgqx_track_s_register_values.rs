@@ -1,4 +1,5 @@
 //! Track S register-value lifecycle and perf coverage for `bd-abgqx`.
+#![recursion_limit = "512"]
 
 use std::{
     path::Path,
@@ -29,12 +30,15 @@ struct TrackSMetricsSnapshot {
     vdbe: VdbeMetricsSnapshot,
 }
 
-fn capture_track_s_metrics<T>(f: impl FnOnce() -> T) -> (T, TrackSMetricsSnapshot) {
+async fn capture_track_s_metrics<T, Fut>(f: impl FnOnce() -> Fut) -> (T, TrackSMetricsSnapshot)
+where
+    Fut: std::future::Future<Output = T>,
+{
     set_hot_path_profile_enabled(true);
     reset_hot_path_profile();
     set_vdbe_metrics_enabled(true);
     reset_vdbe_metrics();
-    let result = f();
+    let result = f().await;
     let snapshot = TrackSMetricsSnapshot {
         hot_path: hot_path_profile_snapshot(),
         vdbe: vdbe_metrics_snapshot(),
@@ -46,10 +50,12 @@ fn capture_track_s_metrics<T>(f: impl FnOnce() -> T) -> (T, TrackSMetricsSnapsho
     (result, snapshot)
 }
 
-fn open_fsqlite(path: &Path) -> fsqlite::Connection {
+async fn open_fsqlite(path: &Path) -> fsqlite::Connection {
     let path = path.to_str().expect("utf-8 db path");
-    let conn = fsqlite::Connection::open(path).expect("open fsqlite connection");
-    conn.execute("PRAGMA journal_mode=WAL").ok();
+    let conn = fsqlite::Connection::open(path)
+        .await
+        .expect("open fsqlite connection");
+    conn.execute("PRAGMA journal_mode=WAL").await.ok();
     conn
 }
 
@@ -60,8 +66,9 @@ fn open_sqlite(path: &Path) -> rusqlite::Connection {
     conn
 }
 
-fn fetch_fsqlite_rows(conn: &fsqlite::Connection) -> Vec<(i64, String, i64)> {
+async fn fetch_fsqlite_rows(conn: &fsqlite::Connection) -> Vec<(i64, String, i64)> {
     conn.query("SELECT id, val, score FROM reg_track ORDER BY id")
+        .await
         .expect("query fsqlite rows")
         .into_iter()
         .map(|row| {
@@ -133,144 +140,152 @@ fn estimated_metric_bytes_for_row(values: &[SqliteValue]) -> u64 {
 fn bd_abgqx_track_s_prepared_insert_select_keeps_metrics_heap_light() {
     let _guard = TRACK_S_E2E_LOCK.lock().unwrap();
 
-    let temp = tempdir().expect("tempdir");
-    let fsqlite_db = temp.path().join("track_s_register_values_fsqlite.db");
-    let sqlite_db = temp.path().join("track_s_register_values_sqlite.db");
+    asupersync::test_utils::run_test(|| async {
+        let temp = tempdir().expect("tempdir");
+        let fsqlite_db = temp.path().join("track_s_register_values_fsqlite.db");
+        let sqlite_db = temp.path().join("track_s_register_values_sqlite.db");
 
-    let fconn = open_fsqlite(&fsqlite_db);
-    let sconn = open_sqlite(&sqlite_db);
+        let fconn = open_fsqlite(&fsqlite_db).await;
+        let sconn = open_sqlite(&sqlite_db);
 
-    assert!(
-        fconn.is_concurrent_mode_default(),
-        "Track S coverage must keep concurrent_mode_default enabled by default"
-    );
+        assert!(
+            fconn.is_concurrent_mode_default(),
+            "Track S coverage must keep concurrent_mode_default enabled by default"
+        );
 
-    fconn
-        .execute("CREATE TABLE reg_track (id INTEGER PRIMARY KEY, val TEXT NOT NULL, score INTEGER NOT NULL)")
-        .expect("create fsqlite table");
-    sconn
-        .execute_batch(
-            "CREATE TABLE reg_track (id INTEGER PRIMARY KEY, val TEXT NOT NULL, score INTEGER NOT NULL);",
-        )
-        .expect("create sqlite table");
+        fconn
+            .execute("CREATE TABLE reg_track (id INTEGER PRIMARY KEY, val TEXT NOT NULL, score INTEGER NOT NULL)")
+            .await
+            .expect("create fsqlite table");
+        sconn
+            .execute_batch(
+                "CREATE TABLE reg_track (id INTEGER PRIMARY KEY, val TEXT NOT NULL, score INTEGER NOT NULL);",
+            )
+            .expect("create sqlite table");
 
-    let insert_stmt = fconn
-        .prepare("INSERT INTO reg_track VALUES (?1, ?2, ?3)")
-        .expect("prepare fsqlite insert");
-    let lookup_stmt = fconn
-        .prepare("SELECT val, score FROM reg_track WHERE id = ?1")
-        .expect("prepare fsqlite lookup");
-    let mut sqlite_insert = sconn
-        .prepare("INSERT INTO reg_track VALUES (?1, ?2, ?3)")
-        .expect("prepare sqlite insert");
-    let mut sqlite_lookup = sconn
-        .prepare("SELECT val, score FROM reg_track WHERE id = ?1")
-        .expect("prepare sqlite lookup");
+        let insert_stmt = fconn
+            .prepare("INSERT INTO reg_track VALUES (?1, ?2, ?3)")
+            .await
+            .expect("prepare fsqlite insert");
+        let lookup_stmt = fconn
+            .prepare("SELECT val, score FROM reg_track WHERE id = ?1")
+            .await
+            .expect("prepare fsqlite lookup");
+        let mut sqlite_insert = sconn
+            .prepare("INSERT INTO reg_track VALUES (?1, ?2, ?3)")
+            .expect("prepare sqlite insert");
+        let mut sqlite_lookup = sconn
+            .prepare("SELECT val, score FROM reg_track WHERE id = ?1")
+            .expect("prepare sqlite lookup");
 
-    let probe_ids = [1_i64, 64, 128, 256, 512, 256, 128, 64, 1];
-    let (_result, metrics) = capture_track_s_metrics(|| {
+        let probe_ids = [1_i64, 64, 128, 256, 512, 256, 128, 64, 1];
+        let (_result, metrics) = capture_track_s_metrics(|| async {
+            for rowid in 1..=INSERT_ROWS_FAST {
+                let value = format!("v{rowid}");
+                let score = rowid * 10;
+                insert_stmt
+                    .execute_with_params(&[
+                        SqliteValue::Integer(rowid),
+                        SqliteValue::Text(value.as_str().into()),
+                        SqliteValue::Integer(score),
+                    ])
+                    .await
+                    .expect("fsqlite insert");
+            }
+
+            for rowid in probe_ids {
+                let row = lookup_stmt
+                    .query_row_with_params(&[SqliteValue::Integer(rowid)])
+                    .await
+                    .expect("fsqlite lookup");
+                assert_eq!(
+                    row.values().to_vec(),
+                    vec![
+                        SqliteValue::Text(format!("v{rowid}").into()),
+                        SqliteValue::Integer(rowid * 10),
+                    ],
+                    "prepared lookup should return the inserted row"
+                );
+            }
+        })
+        .await;
+
         for rowid in 1..=INSERT_ROWS_FAST {
             let value = format!("v{rowid}");
             let score = rowid * 10;
-            insert_stmt
-                .execute_with_params(&[
-                    SqliteValue::Integer(rowid),
-                    SqliteValue::Text(value.as_str().into()),
-                    SqliteValue::Integer(score),
-                ])
-                .expect("fsqlite insert");
+            sqlite_insert
+                .execute(rusqlite::params![rowid, value, score])
+                .expect("sqlite insert");
         }
 
         for rowid in probe_ids {
-            let row = lookup_stmt
-                .query_row_with_params(&[SqliteValue::Integer(rowid)])
-                .expect("fsqlite lookup");
-            assert_eq!(
-                row.values().to_vec(),
-                vec![
+            let (val, score): (String, i64) = sqlite_lookup
+                .query_row(rusqlite::params![rowid], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .expect("sqlite lookup");
+            assert_eq!(val, format!("v{rowid}"));
+            assert_eq!(score, rowid * 10);
+        }
+
+        let fsqlite_rows = fetch_fsqlite_rows(&fconn).await;
+        let sqlite_rows = fetch_sqlite_rows(&sconn);
+        let expected_probe_metric_bytes = probe_ids
+            .iter()
+            .map(|rowid| {
+                estimated_metric_bytes_for_row(&[
                     SqliteValue::Text(format!("v{rowid}").into()),
                     SqliteValue::Integer(rowid * 10),
-                ],
-                "prepared lookup should return the inserted row"
-            );
-        }
-    });
-
-    for rowid in 1..=INSERT_ROWS_FAST {
-        let value = format!("v{rowid}");
-        let score = rowid * 10;
-        sqlite_insert
-            .execute(rusqlite::params![rowid, value, score])
-            .expect("sqlite insert");
-    }
-
-    for rowid in probe_ids {
-        let (val, score): (String, i64) = sqlite_lookup
-            .query_row(rusqlite::params![rowid], |row| {
-                Ok((row.get(0)?, row.get(1)?))
+                ])
             })
-            .expect("sqlite lookup");
-        assert_eq!(val, format!("v{rowid}"));
-        assert_eq!(score, rowid * 10);
-    }
+            .sum::<u64>();
+        assert_eq!(
+            fsqlite_rows, sqlite_rows,
+            "prepared register rowset mismatch"
+        );
+        assert_eq!(
+            metrics.hot_path.prepared_insert_fast_lane_hits, INSERT_ROWS_FAST as u64,
+            "prepared Track S inserts should stay on the prepared fast lane"
+        );
+        assert_eq!(
+            metrics.hot_path.prepared_direct_insert_executions, INSERT_ROWS_FAST as u64,
+            "prepared Track S inserts should execute through the direct insert path"
+        );
+        assert_eq!(
+            metrics.vdbe.make_record_calls_total, 0,
+            "simple prepared Track S inserts should avoid the VDBE MakeRecord path entirely"
+        );
+        assert_eq!(
+            metrics.vdbe.result_rows_total,
+            probe_ids.len() as u64,
+            "prepared lookups should surface one result row per probe"
+        );
+        assert_eq!(
+            metrics.vdbe.result_value_heap_bytes_total, expected_probe_metric_bytes,
+            "result-row metrics should match the inline Track S probe footprint estimate: {metrics:?}"
+        );
+        assert_eq!(
+            metrics.vdbe.decoded_value_heap_bytes_total, expected_probe_metric_bytes,
+            "decoded-value metrics should match the inline Track S probe footprint estimate: {metrics:?}"
+        );
+        assert!(
+            metrics.vdbe.result_row_materialization_time_ns_total > 0,
+            "prepared lookups should record result-row materialization timing: {metrics:?}"
+        );
 
-    let fsqlite_rows = fetch_fsqlite_rows(&fconn);
-    let sqlite_rows = fetch_sqlite_rows(&sconn);
-    let expected_probe_metric_bytes = probe_ids
-        .iter()
-        .map(|rowid| {
-            estimated_metric_bytes_for_row(&[
-                SqliteValue::Text(format!("v{rowid}").into()),
-                SqliteValue::Integer(rowid * 10),
-            ])
-        })
-        .sum::<u64>();
-    assert_eq!(
-        fsqlite_rows, sqlite_rows,
-        "prepared register rowset mismatch"
-    );
-    assert_eq!(
-        metrics.hot_path.prepared_insert_fast_lane_hits, INSERT_ROWS_FAST as u64,
-        "prepared Track S inserts should stay on the prepared fast lane"
-    );
-    assert_eq!(
-        metrics.hot_path.prepared_direct_insert_executions, INSERT_ROWS_FAST as u64,
-        "prepared Track S inserts should execute through the direct insert path"
-    );
-    assert_eq!(
-        metrics.vdbe.make_record_calls_total, 0,
-        "simple prepared Track S inserts should avoid the VDBE MakeRecord path entirely"
-    );
-    assert_eq!(
-        metrics.vdbe.result_rows_total,
-        probe_ids.len() as u64,
-        "prepared lookups should surface one result row per probe"
-    );
-    assert_eq!(
-        metrics.vdbe.result_value_heap_bytes_total, expected_probe_metric_bytes,
-        "result-row metrics should match the inline Track S probe footprint estimate: {metrics:?}"
-    );
-    assert_eq!(
-        metrics.vdbe.decoded_value_heap_bytes_total, expected_probe_metric_bytes,
-        "decoded-value metrics should match the inline Track S probe footprint estimate: {metrics:?}"
-    );
-    assert!(
-        metrics.vdbe.result_row_materialization_time_ns_total > 0,
-        "prepared lookups should record result-row materialization timing: {metrics:?}"
-    );
-
-    eprintln!(
-        "INFO bead_id={BEAD_ID} scenario=prepared_insert_select rows={} probes={} prepared_insert_fast_lane_hits={} prepared_direct_insert_executions={} make_record_calls_total={} result_rows_total={} decoded_value_heap_bytes_total={} result_value_heap_bytes_total={} result_row_materialization_time_ns_total={} replay_command={REPLAY_COMMAND}",
-        INSERT_ROWS_FAST,
-        probe_ids.len(),
-        metrics.hot_path.prepared_insert_fast_lane_hits,
-        metrics.hot_path.prepared_direct_insert_executions,
-        metrics.vdbe.make_record_calls_total,
-        metrics.vdbe.result_rows_total,
-        metrics.vdbe.decoded_value_heap_bytes_total,
-        metrics.vdbe.result_value_heap_bytes_total,
-        metrics.vdbe.result_row_materialization_time_ns_total,
-    );
+        eprintln!(
+            "INFO bead_id={BEAD_ID} scenario=prepared_insert_select rows={} probes={} prepared_insert_fast_lane_hits={} prepared_direct_insert_executions={} make_record_calls_total={} result_rows_total={} decoded_value_heap_bytes_total={} result_value_heap_bytes_total={} result_row_materialization_time_ns_total={} replay_command={REPLAY_COMMAND}",
+            INSERT_ROWS_FAST,
+            probe_ids.len(),
+            metrics.hot_path.prepared_insert_fast_lane_hits,
+            metrics.hot_path.prepared_direct_insert_executions,
+            metrics.vdbe.make_record_calls_total,
+            metrics.vdbe.result_rows_total,
+            metrics.vdbe.decoded_value_heap_bytes_total,
+            metrics.vdbe.result_value_heap_bytes_total,
+            metrics.vdbe.result_row_materialization_time_ns_total,
+        );
+    });
 }
 
 #[test]
@@ -278,77 +293,83 @@ fn bd_abgqx_track_s_prepared_insert_select_keeps_metrics_heap_light() {
 fn bd_abgqx_track_s_prepared_insert_10k_perf_probe_emits_metrics() {
     let _guard = TRACK_S_E2E_LOCK.lock().unwrap();
 
-    let temp = tempdir().expect("tempdir");
-    let fsqlite_db = temp.path().join("track_s_perf_fsqlite.db");
-    let sqlite_db = temp.path().join("track_s_perf_sqlite.db");
+    asupersync::test_utils::run_test(|| async {
+        let temp = tempdir().expect("tempdir");
+        let fsqlite_db = temp.path().join("track_s_perf_fsqlite.db");
+        let sqlite_db = temp.path().join("track_s_perf_sqlite.db");
 
-    let fconn = open_fsqlite(&fsqlite_db);
-    let sconn = open_sqlite(&sqlite_db);
+        let fconn = open_fsqlite(&fsqlite_db).await;
+        let sconn = open_sqlite(&sqlite_db);
 
-    fconn
-        .execute("CREATE TABLE reg_track (id INTEGER PRIMARY KEY, val TEXT NOT NULL, score INTEGER NOT NULL)")
-        .expect("create fsqlite table");
-    sconn
-        .execute_batch(
-            "CREATE TABLE reg_track (id INTEGER PRIMARY KEY, val TEXT NOT NULL, score INTEGER NOT NULL);",
-        )
-        .expect("create sqlite table");
+        fconn
+            .execute("CREATE TABLE reg_track (id INTEGER PRIMARY KEY, val TEXT NOT NULL, score INTEGER NOT NULL)")
+            .await
+            .expect("create fsqlite table");
+        sconn
+            .execute_batch(
+                "CREATE TABLE reg_track (id INTEGER PRIMARY KEY, val TEXT NOT NULL, score INTEGER NOT NULL);",
+            )
+            .expect("create sqlite table");
 
-    let insert_stmt = fconn
-        .prepare("INSERT INTO reg_track VALUES (?1, ?2, ?3)")
-        .expect("prepare fsqlite insert");
-    let mut sqlite_insert = sconn
-        .prepare("INSERT INTO reg_track VALUES (?1, ?2, ?3)")
-        .expect("prepare sqlite insert");
+        let insert_stmt = fconn
+            .prepare("INSERT INTO reg_track VALUES (?1, ?2, ?3)")
+            .await
+            .expect("prepare fsqlite insert");
+        let mut sqlite_insert = sconn
+            .prepare("INSERT INTO reg_track VALUES (?1, ?2, ?3)")
+            .expect("prepare sqlite insert");
 
-    let fsqlite_start = Instant::now();
-    let (_result, metrics) = capture_track_s_metrics(|| {
+        let fsqlite_start = Instant::now();
+        let (_result, metrics) = capture_track_s_metrics(|| async {
+            for rowid in 1..=INSERT_ROWS_PERF {
+                let value = format!("v{rowid}");
+                insert_stmt
+                    .execute_with_params(&[
+                        SqliteValue::Integer(rowid),
+                        SqliteValue::Text(value.as_str().into()),
+                        SqliteValue::Integer(rowid * 10),
+                    ])
+                    .await
+                    .expect("fsqlite insert");
+            }
+        })
+        .await;
+        let fsqlite_elapsed = fsqlite_start.elapsed();
+
+        let sqlite_start = Instant::now();
         for rowid in 1..=INSERT_ROWS_PERF {
             let value = format!("v{rowid}");
-            insert_stmt
-                .execute_with_params(&[
-                    SqliteValue::Integer(rowid),
-                    SqliteValue::Text(value.as_str().into()),
-                    SqliteValue::Integer(rowid * 10),
-                ])
-                .expect("fsqlite insert");
+            sqlite_insert
+                .execute(rusqlite::params![rowid, value, rowid * 10])
+                .expect("sqlite insert");
         }
+        let sqlite_elapsed = sqlite_start.elapsed();
+
+        let fsqlite_rows = fetch_fsqlite_rows(&fconn).await;
+        let sqlite_rows = fetch_sqlite_rows(&sconn);
+        assert_eq!(fsqlite_rows, sqlite_rows, "10k prepared rowset mismatch");
+        assert_eq!(
+            metrics.hot_path.prepared_insert_fast_lane_hits, INSERT_ROWS_PERF as u64,
+            "prepared 10k Track S probe should stay on the prepared fast lane"
+        );
+        assert_eq!(
+            metrics.hot_path.prepared_direct_insert_executions, INSERT_ROWS_PERF as u64,
+            "prepared 10k Track S probe should execute through the direct insert path"
+        );
+        assert_eq!(
+            metrics.vdbe.make_record_calls_total, 0,
+            "simple prepared 10k Track S probe should avoid the VDBE MakeRecord path entirely"
+        );
+
+        eprintln!(
+            "INFO bead_id={BEAD_ID} scenario=prepared_insert_10k_perf_probe rows={} prepared_insert_fast_lane_hits={} prepared_direct_insert_executions={} make_record_calls_total={} make_record_blob_bytes_total={} fsqlite_rows_per_sec={:.1} sqlite_rows_per_sec={:.1} replay_command={REPLAY_COMMAND}",
+            INSERT_ROWS_PERF,
+            metrics.hot_path.prepared_insert_fast_lane_hits,
+            metrics.hot_path.prepared_direct_insert_executions,
+            metrics.vdbe.make_record_calls_total,
+            metrics.vdbe.make_record_blob_bytes_total,
+            rows_per_sec(INSERT_ROWS_PERF, fsqlite_elapsed),
+            rows_per_sec(INSERT_ROWS_PERF, sqlite_elapsed),
+        );
     });
-    let fsqlite_elapsed = fsqlite_start.elapsed();
-
-    let sqlite_start = Instant::now();
-    for rowid in 1..=INSERT_ROWS_PERF {
-        let value = format!("v{rowid}");
-        sqlite_insert
-            .execute(rusqlite::params![rowid, value, rowid * 10])
-            .expect("sqlite insert");
-    }
-    let sqlite_elapsed = sqlite_start.elapsed();
-
-    let fsqlite_rows = fetch_fsqlite_rows(&fconn);
-    let sqlite_rows = fetch_sqlite_rows(&sconn);
-    assert_eq!(fsqlite_rows, sqlite_rows, "10k prepared rowset mismatch");
-    assert_eq!(
-        metrics.hot_path.prepared_insert_fast_lane_hits, INSERT_ROWS_PERF as u64,
-        "prepared 10k Track S probe should stay on the prepared fast lane"
-    );
-    assert_eq!(
-        metrics.hot_path.prepared_direct_insert_executions, INSERT_ROWS_PERF as u64,
-        "prepared 10k Track S probe should execute through the direct insert path"
-    );
-    assert_eq!(
-        metrics.vdbe.make_record_calls_total, 0,
-        "simple prepared 10k Track S probe should avoid the VDBE MakeRecord path entirely"
-    );
-
-    eprintln!(
-        "INFO bead_id={BEAD_ID} scenario=prepared_insert_10k_perf_probe rows={} prepared_insert_fast_lane_hits={} prepared_direct_insert_executions={} make_record_calls_total={} make_record_blob_bytes_total={} fsqlite_rows_per_sec={:.1} sqlite_rows_per_sec={:.1} replay_command={REPLAY_COMMAND}",
-        INSERT_ROWS_PERF,
-        metrics.hot_path.prepared_insert_fast_lane_hits,
-        metrics.hot_path.prepared_direct_insert_executions,
-        metrics.vdbe.make_record_calls_total,
-        metrics.vdbe.make_record_blob_bytes_total,
-        rows_per_sec(INSERT_ROWS_PERF, fsqlite_elapsed),
-        rows_per_sec(INSERT_ROWS_PERF, sqlite_elapsed),
-    );
 }

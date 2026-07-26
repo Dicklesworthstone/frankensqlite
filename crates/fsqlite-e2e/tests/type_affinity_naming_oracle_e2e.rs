@@ -25,8 +25,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -58,10 +58,10 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -86,8 +86,8 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
 /// Build a table whose columns have the given declared types, insert one row of
 /// integer 42 and one of text '42', and compare typeof() of each column on each
 /// row. The (int-probe typeof, text-probe typeof) pair reveals the affinity.
-fn affinity_probe(types: &[&str], label: &str) {
-    let f = Connection::open(":memory:").unwrap();
+async fn affinity_probe(types: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     let cols: Vec<String> = types
         .iter()
@@ -106,78 +106,94 @@ fn affinity_probe(types: &[&str], label: &str) {
         &format!("INSERT INTO t VALUES (1, {int_vals})"),
         &format!("INSERT INTO t VALUES (2, {txt_vals})"),
     ] {
-        f.execute(s).unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
+        f.execute(s)
+            .await
+            .unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
         r.execute_batch(s)
             .unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
     }
     let typeofs: Vec<String> = names.iter().map(|n| format!("typeof({n})")).collect();
     let q = format!("SELECT rid, {} FROM t ORDER BY rid", typeofs.join(", "));
-    check(&f, &r, &[&q], label);
+    check(&f, &r, &[&q], label).await;
 }
 
 #[test]
 fn affinity_integer_class() {
-    // Anything containing "INT" -> INTEGER affinity.
-    affinity_probe(
-        &[
-            "INTEGER",
-            "INT",
-            "BIGINT",
-            "INT2",
-            "INT8",
-            "TINYINT",
-            "MEDIUMINT",
-            "UNSIGNED BIG INT",
-        ],
-        "affinity_integer_class",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // Anything containing "INT" -> INTEGER affinity.
+        affinity_probe(
+            &[
+                "INTEGER",
+                "INT",
+                "BIGINT",
+                "INT2",
+                "INT8",
+                "TINYINT",
+                "MEDIUMINT",
+                "UNSIGNED BIG INT",
+            ],
+            "affinity_integer_class",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn affinity_text_class() {
-    // Contains "CHAR"/"CLOB"/"TEXT" -> TEXT affinity.
-    affinity_probe(
-        &[
-            "TEXT",
-            "CLOB",
-            "CHARACTER(20)",
-            "VARCHAR(255)",
-            "NCHAR(10)",
-            "NVARCHAR(8)",
-            "VARYING CHARACTER(5)",
-        ],
-        "affinity_text_class",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // Contains "CHAR"/"CLOB"/"TEXT" -> TEXT affinity.
+        affinity_probe(
+            &[
+                "TEXT",
+                "CLOB",
+                "CHARACTER(20)",
+                "VARCHAR(255)",
+                "NCHAR(10)",
+                "NVARCHAR(8)",
+                "VARYING CHARACTER(5)",
+            ],
+            "affinity_text_class",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn affinity_real_class() {
-    // Contains "REAL"/"FLOA"/"DOUB" -> REAL affinity.
-    affinity_probe(
-        &["REAL", "DOUBLE", "DOUBLE PRECISION", "FLOAT"],
-        "affinity_real_class",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // Contains "REAL"/"FLOA"/"DOUB" -> REAL affinity.
+        affinity_probe(
+            &["REAL", "DOUBLE", "DOUBLE PRECISION", "FLOAT"],
+            "affinity_real_class",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn affinity_blob_class() {
-    // Contains "BLOB" or no declared type -> BLOB affinity (no coercion).
-    affinity_probe(&["BLOB", ""], "affinity_blob_class");
+    asupersync::test_utils::run_test(|| async {
+        // Contains "BLOB" or no declared type -> BLOB affinity (no coercion).
+        affinity_probe(&["BLOB", ""], "affinity_blob_class").await;
+    });
 }
 
 #[test]
 fn affinity_numeric_class() {
-    // The "otherwise" bucket -> NUMERIC. STRING/BOOLEAN/DATE/DATETIME are the
-    // ones most likely to be mismapped to TEXT/INTEGER.
-    affinity_probe(
-        &[
-            "NUMERIC",
-            "DECIMAL(10,5)",
-            "BOOLEAN",
-            "DATE",
-            "DATETIME",
-            "STRING",
-        ],
-        "affinity_numeric_class",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // The "otherwise" bucket -> NUMERIC. STRING/BOOLEAN/DATE/DATETIME are the
+        // ones most likely to be mismapped to TEXT/INTEGER.
+        affinity_probe(
+            &[
+                "NUMERIC",
+                "DECIMAL(10,5)",
+                "BOOLEAN",
+                "DATE",
+                "DATETIME",
+                "STRING",
+            ],
+            "affinity_numeric_class",
+        )
+        .await;
+    });
 }

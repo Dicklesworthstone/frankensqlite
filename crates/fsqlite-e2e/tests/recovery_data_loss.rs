@@ -55,9 +55,10 @@ fn helper_is_active() -> bool {
     env::var_os(HELPER_MODE_ENV).is_some()
 }
 
-fn row_count(conn: &Connection) -> i64 {
+async fn row_count(conn: &Connection) -> i64 {
     let row = conn
         .query_row("SELECT COUNT(*) FROM t;")
+        .await
         .expect("count query");
     match row.get(0) {
         Some(SqliteValue::Integer(count)) => *count,
@@ -65,8 +66,9 @@ fn row_count(conn: &Connection) -> i64 {
     }
 }
 
-fn ordered_ids(conn: &Connection) -> Vec<i64> {
+async fn ordered_ids(conn: &Connection) -> Vec<i64> {
     conn.query("SELECT id FROM t ORDER BY id;")
+        .await
         .expect("query ordered ids")
         .into_iter()
         .map(|row| match row.get(0) {
@@ -76,10 +78,12 @@ fn ordered_ids(conn: &Connection) -> Vec<i64> {
         .collect()
 }
 
-fn setup_table(conn: &Connection) {
+async fn setup_table(conn: &Connection) {
     conn.execute("PRAGMA journal_mode = WAL;")
+        .await
         .expect("enable WAL mode");
     conn.execute("CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY, payload TEXT);")
+        .await
         .expect("create table");
 }
 
@@ -132,68 +136,81 @@ fn wait_for_committed_batches(commit_log: &Path, min_batches: u32) -> bool {
 }
 
 fn yfdb6_producer_child(db_path: &Path, commit_log: &Path, stop_after: u32) -> ! {
-    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("producer: open db");
-    setup_table(&conn);
+    // The whole producer loop runs inside one runtime so the connection stays
+    // live (never dropped, never checkpointed) when the parent lands SIGKILL.
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(db_path.to_string_lossy().as_ref())
+            .await
+            .expect("producer: open db");
+        setup_table(&conn).await;
 
-    let mut commit_log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(commit_log)
-        .expect("producer: open commit log");
+        let mut commit_log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(commit_log)
+            .expect("producer: open commit log");
 
-    let mut next_id: i64 = 0;
-    let mut batches_committed: u32 = 0;
-    loop {
-        conn.execute("BEGIN IMMEDIATE;")
-            .expect("producer: begin txn");
-        let lo = next_id;
-        let hi = lo + BATCH_SIZE;
-        for id in lo..hi {
-            conn.execute_with_params(
-                "INSERT INTO t(id, payload) VALUES (?1, ?2);",
-                &[
-                    SqliteValue::Integer(id),
-                    SqliteValue::Text(format!("row-{id}").into()),
-                ],
-            )
-            .expect("producer: insert");
-        }
-        conn.execute("COMMIT;").expect("producer: commit");
+        let mut next_id: i64 = 0;
+        let mut batches_committed: u32 = 0;
+        loop {
+            conn.execute("BEGIN IMMEDIATE;")
+                .await
+                .expect("producer: begin txn");
+            let lo = next_id;
+            let hi = lo + BATCH_SIZE;
+            for id in lo..hi {
+                conn.execute_with_params(
+                    "INSERT INTO t(id, payload) VALUES (?1, ?2);",
+                    &[
+                        SqliteValue::Integer(id),
+                        SqliteValue::Text(format!("row-{id}").into()),
+                    ],
+                )
+                .await
+                .expect("producer: insert");
+            }
+            conn.execute("COMMIT;").await.expect("producer: commit");
 
-        // Record (inclusive lo, exclusive hi) into the side-car commit log.
-        writeln!(commit_log_file, "{lo},{hi}").expect("producer: append commit log");
-        commit_log_file
-            .sync_all()
-            .expect("producer: sync commit log");
+            // Record (inclusive lo, exclusive hi) into the side-car commit log.
+            writeln!(commit_log_file, "{lo},{hi}").expect("producer: append commit log");
+            commit_log_file
+                .sync_all()
+                .expect("producer: sync commit log");
 
-        next_id = hi;
-        batches_committed += 1;
+            next_id = hi;
+            batches_committed += 1;
 
-        if batches_committed >= stop_after {
-            // Busy-loop until the parent kills us. We deliberately keep
-            // starting a new transaction so the parent has a fighting chance
-            // of landing the SIGKILL mid-write (which is the whole point of
-            // this test).
-            loop {
-                conn.execute("BEGIN IMMEDIATE;")
-                    .expect("producer: begin tail txn");
-                for id in next_id..(next_id + BATCH_SIZE) {
-                    conn.execute_with_params(
-                        "INSERT INTO t(id, payload) VALUES (?1, ?2);",
-                        &[
-                            SqliteValue::Integer(id),
-                            SqliteValue::Text(format!("tail-{id}").into()),
-                        ],
-                    )
-                    .expect("producer: tail insert");
+            if batches_committed >= stop_after {
+                // Busy-loop until the parent kills us. We deliberately keep
+                // starting a new transaction so the parent has a fighting chance
+                // of landing the SIGKILL mid-write (which is the whole point of
+                // this test).
+                loop {
+                    conn.execute("BEGIN IMMEDIATE;")
+                        .await
+                        .expect("producer: begin tail txn");
+                    for id in next_id..(next_id + BATCH_SIZE) {
+                        conn.execute_with_params(
+                            "INSERT INTO t(id, payload) VALUES (?1, ?2);",
+                            &[
+                                SqliteValue::Integer(id),
+                                SqliteValue::Text(format!("tail-{id}").into()),
+                            ],
+                        )
+                        .await
+                        .expect("producer: tail insert");
+                    }
+                    // Deliberately leave the txn uncommitted and start another.
+                    conn.execute("ROLLBACK;")
+                        .await
+                        .expect("producer: tail rollback");
+                    next_id += BATCH_SIZE;
+                    std::thread::sleep(Duration::from_millis(1));
                 }
-                // Deliberately leave the txn uncommitted and start another.
-                conn.execute("ROLLBACK;").expect("producer: tail rollback");
-                next_id += BATCH_SIZE;
-                std::thread::sleep(Duration::from_millis(1));
             }
         }
-    }
+    });
+    unreachable!("yfdb6 producer child runs until SIGKILL");
 }
 
 fn spawn_producer(db_path: &Path, commit_log: &Path, stop_after: u32) -> std::process::Child {
@@ -210,7 +227,7 @@ fn spawn_producer(db_path: &Path, commit_log: &Path, stop_after: u32) -> std::pr
         .expect("spawn producer helper")
 }
 
-fn run_one_iteration(seed: u64, iteration: u32) {
+async fn run_one_iteration(seed: u64, iteration: u32) {
     let dir = tempdir().expect("tempdir");
     let db_path: PathBuf = dir.path().join(format!("yfdb6_iter_{iteration}.db"));
     let commit_log: PathBuf = dir.path().join(format!("yfdb6_iter_{iteration}.commits"));
@@ -248,14 +265,16 @@ fn run_one_iteration(seed: u64, iteration: u32) {
     let expected_rows = expected_rows_from_commit_log(&commit_entries);
 
     // Open a fresh connection: this runs the WAL recovery path.
-    let verifier = Connection::open(db_path.to_string_lossy().as_ref()).expect("verifier: open db");
+    let verifier = Connection::open(db_path.to_string_lossy().as_ref())
+        .await
+        .expect("verifier: open db");
     assert!(
         verifier.is_concurrent_mode_default(),
         "[{BEAD_ID}] recovered connection must keep concurrent mode enabled",
     );
 
-    let actual_count = row_count(&verifier);
-    let actual_rows = ordered_ids(&verifier);
+    let actual_count = row_count(&verifier).await;
+    let actual_rows = ordered_ids(&verifier).await;
 
     assert_eq!(
         actual_count,
@@ -292,21 +311,23 @@ fn two_process_sigkill_recovery_loses_no_committed_writes() {
         // handles the work; the top-level test body should never run.
         return;
     }
-    // Deterministic base seed bound to the bead id. Twenty iterations ×
-    // different per-iteration seeds covers enough kill points to surface
-    // the race reproducibly.
-    let base_seed: u64 = 0x0000_0000_0000_BD6F_u64;
-    let iterations: u32 = 20;
-    for i in 0..iterations {
-        let seed = base_seed
-            .wrapping_mul(1 + u64::from(i))
-            .wrapping_add(u64::from(i) * 7919);
-        run_one_iteration(seed, i);
-    }
-    eprintln!(
-        "[{BEAD_ID}] SIGKILL fault-injection test passed {iterations} iterations with \
-         no data loss.",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // Deterministic base seed bound to the bead id. Twenty iterations ×
+        // different per-iteration seeds covers enough kill points to surface
+        // the race reproducibly.
+        let base_seed: u64 = 0x0000_0000_0000_BD6F_u64;
+        let iterations: u32 = 20;
+        for i in 0..iterations {
+            let seed = base_seed
+                .wrapping_mul(1 + u64::from(i))
+                .wrapping_add(u64::from(i) * 7919);
+            run_one_iteration(seed, i).await;
+        }
+        eprintln!(
+            "[{BEAD_ID}] SIGKILL fault-injection test passed {iterations} iterations with \
+             no data loss.",
+        );
+    });
 }
 
 #[test]

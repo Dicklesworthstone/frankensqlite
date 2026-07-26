@@ -35,6 +35,7 @@
 //! ```sh
 //! cargo test -p fsqlite-e2e --test bd_3wop3_7_contention_elimination -- --nocapture
 //! ```
+#![recursion_limit = "512"]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -153,13 +154,14 @@ fn measure_csqlite_throughput(thread_count: usize, rows_per_thread: u64) -> Thro
 ///
 /// Keep this helper only so the historical ignored scaffolding compiles until
 /// the blocked governance and matrix work replaces it with a real gate.
-fn measure_fsqlite_placeholder_sequential_control(
+async fn measure_fsqlite_placeholder_sequential_control(
     thread_count: usize,
     rows_per_thread: u64,
 ) -> ThroughputResult {
-    let conn = fsqlite::Connection::open(":memory:").expect("open");
-    conn.execute("PRAGMA journal_mode = WAL").ok();
+    let conn = fsqlite::Connection::open(":memory:").await.expect("open");
+    conn.execute("PRAGMA journal_mode = WAL").await.ok();
     conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, val INTEGER)")
+        .await
         .expect("create");
 
     let total_ops = thread_count as u64 * rows_per_thread;
@@ -173,6 +175,7 @@ fn measure_fsqlite_placeholder_sequential_control(
                 fsqlite::SqliteValue::Integer((i * 7) as i64),
             ],
         )
+        .await
         .ok();
     }
 
@@ -182,19 +185,30 @@ fn measure_fsqlite_placeholder_sequential_control(
     ThroughputResult { ops_per_sec }
 }
 
-fn create_fsqlite_file_backed_db(filename: &str, schema_sql: &str) -> (tempfile::TempDir, String) {
+async fn create_fsqlite_file_backed_db(
+    filename: &str,
+    schema_sql: &str,
+) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join(filename).to_string_lossy().to_string();
-    let conn = fsqlite::Connection::open(path.as_str()).expect("open setup db");
-    conn.execute("PRAGMA journal_mode = WAL").ok();
-    conn.execute("PRAGMA fsqlite.concurrent_mode = ON").ok();
-    conn.execute(schema_sql).expect("create schema");
+    let conn = fsqlite::Connection::open(path.as_str())
+        .await
+        .expect("open setup db");
+    conn.execute("PRAGMA journal_mode = WAL").await.ok();
+    conn.execute("PRAGMA fsqlite.concurrent_mode = ON")
+        .await
+        .ok();
+    conn.execute(schema_sql).await.expect("create schema");
     (dir, path)
 }
 
-fn open_fsqlite_worker(path: &str) -> fsqlite::Connection {
-    let conn = fsqlite::Connection::open(path.to_owned()).expect("open worker db");
-    conn.execute("PRAGMA fsqlite.concurrent_mode = ON").ok();
+async fn open_fsqlite_worker(path: &str) -> fsqlite::Connection {
+    let conn = fsqlite::Connection::open(path.to_owned())
+        .await
+        .expect("open worker db");
+    conn.execute("PRAGMA fsqlite.concurrent_mode = ON")
+        .await
+        .ok();
     conn
 }
 
@@ -312,78 +326,86 @@ fn test_ebr_no_gc_pauses() {
 
     use std::sync::atomic::AtomicBool;
 
-    let (_dir, path) = create_fsqlite_file_backed_db(
-        "ebr_no_gc_pauses.db",
-        "CREATE TABLE bench (id INTEGER PRIMARY KEY, val TEXT)",
-    );
-    let path = Arc::new(path);
+    asupersync::test_utils::run_test(|| async {
+        let (_dir, path) = create_fsqlite_file_backed_db(
+            "ebr_no_gc_pauses.db",
+            "CREATE TABLE bench (id INTEGER PRIMARY KEY, val TEXT)",
+        )
+        .await;
+        let path = Arc::new(path);
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let latencies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let latencies = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-    let barrier = Arc::new(Barrier::new(4));
-    let handles: Vec<_> = (0..4)
-        .map(|tid| {
-            let p = Arc::clone(&path);
-            let s = Arc::clone(&stop);
-            let l = Arc::clone(&latencies);
-            let b = Arc::clone(&barrier);
+        let barrier = Arc::new(Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|tid| {
+                let p = Arc::clone(&path);
+                let s = Arc::clone(&stop);
+                let l = Arc::clone(&latencies);
+                let b = Arc::clone(&barrier);
 
-            thread::spawn(move || {
-                let c = open_fsqlite_worker(p.as_str());
-                b.wait();
-                let mut local_latencies = Vec::with_capacity(10_000);
-                let mut i = tid * 1_000_000;
+                thread::spawn(move || {
+                    asupersync::test_utils::run_test(|| async {
+                        let c = open_fsqlite_worker(p.as_str()).await;
+                        b.wait();
+                        let mut local_latencies = Vec::with_capacity(10_000);
+                        let mut i = tid * 1_000_000;
 
-                while !s.load(Ordering::Relaxed) {
-                    let op_start = Instant::now();
-                    let _ = c.execute_with_params(
-                        "INSERT OR REPLACE INTO bench VALUES (?1, ?2)",
-                        &[
-                            fsqlite::SqliteValue::Integer(i),
-                            fsqlite::SqliteValue::Text(format!("value_{i}").into()),
-                        ],
-                    );
-                    local_latencies.push(op_start.elapsed().as_micros() as u64);
-                    i += 1;
-                }
+                        while !s.load(Ordering::Relaxed) {
+                            let op_start = Instant::now();
+                            drop(
+                                c.execute_with_params(
+                                    "INSERT OR REPLACE INTO bench VALUES (?1, ?2)",
+                                    &[
+                                        fsqlite::SqliteValue::Integer(i),
+                                        fsqlite::SqliteValue::Text(format!("value_{i}").into()),
+                                    ],
+                                )
+                                .await,
+                            );
+                            local_latencies.push(op_start.elapsed().as_micros() as u64);
+                            i += 1;
+                        }
 
-                l.lock().unwrap().extend(local_latencies);
+                        l.lock().unwrap().extend(local_latencies);
+                    });
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    // Run for 2 seconds (reduced for test speed)
-    thread::sleep(Duration::from_secs(2));
-    stop.store(true, Ordering::Release);
+        // Run for 2 seconds (reduced for test speed)
+        thread::sleep(Duration::from_secs(2));
+        stop.store(true, Ordering::Release);
 
-    for h in handles {
-        h.join().expect("join");
-    }
+        for h in handles {
+            h.join().expect("join");
+        }
 
-    let mut all_latencies = latencies.lock().unwrap().clone();
-    all_latencies.sort_unstable();
+        let mut all_latencies = latencies.lock().unwrap().clone();
+        all_latencies.sort_unstable();
 
-    if all_latencies.is_empty() {
-        panic!("No operations completed");
-    }
+        if all_latencies.is_empty() {
+            panic!("No operations completed");
+        }
 
-    let p99_idx = (all_latencies.len() as f64 * 0.99) as usize;
-    let p99_us = all_latencies.get(p99_idx).copied().unwrap_or(0);
-    let p99_ms = p99_us as f64 / 1000.0;
+        let p99_idx = (all_latencies.len() as f64 * 0.99) as usize;
+        let p99_us = all_latencies.get(p99_idx).copied().unwrap_or(0);
+        let p99_ms = p99_us as f64 / 1000.0;
 
-    println!(
-        "[test_ebr_no_gc_pauses] {} ops, p99={:.2}ms, max={:.2}ms",
-        all_latencies.len(),
-        p99_ms,
-        all_latencies.last().copied().unwrap_or(0) as f64 / 1000.0
-    );
+        println!(
+            "[test_ebr_no_gc_pauses] {} ops, p99={:.2}ms, max={:.2}ms",
+            all_latencies.len(),
+            p99_ms,
+            all_latencies.last().copied().unwrap_or(0) as f64 / 1000.0
+        );
 
-    // Assert p99 < 10ms (generous threshold for GC-free operation)
-    assert!(
-        p99_ms < 10.0,
-        "bd-3wop3.7: EBR p99 latency {p99_ms:.2}ms exceeds 10ms threshold"
-    );
+        // Assert p99 < 10ms (generous threshold for GC-free operation)
+        assert!(
+            p99_ms < 10.0,
+            "bd-3wop3.7: EBR p99 latency {p99_ms:.2}ms exceeds 10ms threshold"
+        );
+    });
 }
 
 /// Test 6: Historical scaling-curve placeholder.
@@ -440,77 +462,86 @@ fn test_64_thread_no_deadlock() {
     // This stress test already exercises the current file-backed concurrent path.
     // It is separate from the historical placeholder throughput helper above.
 
-    let (_dir, path) = create_fsqlite_file_backed_db(
-        "64_thread_no_deadlock.db",
-        "CREATE TABLE stress (id INTEGER PRIMARY KEY, val INTEGER)",
-    );
-    let setup_conn = open_fsqlite_worker(&path);
+    asupersync::test_utils::run_test(|| async {
+        let (_dir, path) = create_fsqlite_file_backed_db(
+            "64_thread_no_deadlock.db",
+            "CREATE TABLE stress (id INTEGER PRIMARY KEY, val INTEGER)",
+        )
+        .await;
+        let setup_conn = open_fsqlite_worker(&path).await;
 
-    // Pre-populate some rows to enable updates
-    for i in 0..100 {
-        setup_conn
-            .execute_with_params(
-                "INSERT INTO stress VALUES (?1, ?2)",
-                &[
-                    fsqlite::SqliteValue::Integer(i),
-                    fsqlite::SqliteValue::Integer(0),
-                ],
-            )
-            .ok();
-    }
-    let path = Arc::new(path);
+        // Pre-populate some rows to enable updates
+        for i in 0..100 {
+            setup_conn
+                .execute_with_params(
+                    "INSERT INTO stress VALUES (?1, ?2)",
+                    &[
+                        fsqlite::SqliteValue::Integer(i),
+                        fsqlite::SqliteValue::Integer(0),
+                    ],
+                )
+                .await
+                .ok();
+        }
+        let path = Arc::new(path);
 
-    let barrier = Arc::new(Barrier::new(64));
-    let stop = Arc::new(AtomicBool::new(false));
-    let completed = Arc::new(AtomicU64::new(0));
+        let barrier = Arc::new(Barrier::new(64));
+        let stop = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicU64::new(0));
 
-    let handles: Vec<_> = (0..64)
-        .map(|tid| {
-            let p = Arc::clone(&path);
-            let b = Arc::clone(&barrier);
-            let s = Arc::clone(&stop);
-            let comp = Arc::clone(&completed);
+        let handles: Vec<_> = (0..64)
+            .map(|tid| {
+                let p = Arc::clone(&path);
+                let b = Arc::clone(&barrier);
+                let s = Arc::clone(&stop);
+                let comp = Arc::clone(&completed);
 
-            thread::spawn(move || {
-                let c = open_fsqlite_worker(p.as_str());
-                b.wait();
-                let mut ops = 0u64;
+                thread::spawn(move || {
+                    asupersync::test_utils::run_test(|| async {
+                        let c = open_fsqlite_worker(p.as_str()).await;
+                        b.wait();
+                        let mut ops = 0u64;
 
-                while !s.load(Ordering::Relaxed) && ops < 1000 {
-                    // Update a random-ish row to create contention
-                    let row_id = ((tid * 17 + ops as usize) % 100) as i64;
-                    let _ = c.execute_with_params(
-                        "UPDATE stress SET val = val + 1 WHERE id = ?1",
-                        &[fsqlite::SqliteValue::Integer(row_id)],
-                    );
-                    ops += 1;
-                }
+                        while !s.load(Ordering::Relaxed) && ops < 1000 {
+                            // Update a random-ish row to create contention
+                            let row_id = ((tid * 17 + ops as usize) % 100) as i64;
+                            drop(
+                                c.execute_with_params(
+                                    "UPDATE stress SET val = val + 1 WHERE id = ?1",
+                                    &[fsqlite::SqliteValue::Integer(row_id)],
+                                )
+                                .await,
+                            );
+                            ops += 1;
+                        }
 
-                comp.fetch_add(1, Ordering::Relaxed);
+                        comp.fetch_add(1, Ordering::Relaxed);
+                    });
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    // Give threads up to 30 seconds to complete
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline && completed.load(Ordering::Relaxed) < 64 {
-        thread::sleep(Duration::from_millis(100));
-    }
+        // Give threads up to 30 seconds to complete
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && completed.load(Ordering::Relaxed) < 64 {
+            thread::sleep(Duration::from_millis(100));
+        }
 
-    stop.store(true, Ordering::Release);
+        stop.store(true, Ordering::Release);
 
-    // Wait for all threads with timeout
-    for h in handles {
-        let _ = h.join();
-    }
+        // Wait for all threads with timeout
+        for h in handles {
+            let _ = h.join();
+        }
 
-    let final_completed = completed.load(Ordering::Relaxed);
-    println!("[test_64_thread_no_deadlock] {final_completed}/64 threads completed");
+        let final_completed = completed.load(Ordering::Relaxed);
+        println!("[test_64_thread_no_deadlock] {final_completed}/64 threads completed");
 
-    assert_eq!(
-        final_completed, 64,
-        "bd-3wop3.7: deadlock detected - only {final_completed}/64 threads completed"
-    );
+        assert_eq!(
+            final_completed, 64,
+            "bd-3wop3.7: deadlock detected - only {final_completed}/64 threads completed"
+        );
+    });
 }
 
 /// Stress test: High write + aggressive GC, no throughput collapse.
@@ -522,77 +553,85 @@ fn test_64_thread_no_deadlock() {
 fn test_contention_under_gc_pressure() {
     // This test exercises the EBR-based GC under write pressure.
 
-    let (_dir, path) = create_fsqlite_file_backed_db(
-        "contention_under_gc_pressure.db",
-        "CREATE TABLE gc_stress (id INTEGER PRIMARY KEY, data BLOB)",
-    );
-    let path = Arc::new(path);
+    asupersync::test_utils::run_test(|| async {
+        let (_dir, path) = create_fsqlite_file_backed_db(
+            "contention_under_gc_pressure.db",
+            "CREATE TABLE gc_stress (id INTEGER PRIMARY KEY, data BLOB)",
+        )
+        .await;
+        let path = Arc::new(path);
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let total_ops = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let total_ops = Arc::new(AtomicU64::new(0));
 
-    let barrier = Arc::new(Barrier::new(4));
-    let handles: Vec<_> = (0..4)
-        .map(|tid| {
-            let p = Arc::clone(&path);
-            let b = Arc::clone(&barrier);
-            let s = Arc::clone(&stop);
-            let ops = Arc::clone(&total_ops);
+        let barrier = Arc::new(Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|tid| {
+                let p = Arc::clone(&path);
+                let b = Arc::clone(&barrier);
+                let s = Arc::clone(&stop);
+                let ops = Arc::clone(&total_ops);
 
-            thread::spawn(move || {
-                let c = open_fsqlite_worker(p.as_str());
-                b.wait();
-                let mut local_ops = 0u64;
-                let mut i = tid * 10_000_000;
+                thread::spawn(move || {
+                    asupersync::test_utils::run_test(|| async {
+                        let c = open_fsqlite_worker(p.as_str()).await;
+                        b.wait();
+                        let mut local_ops = 0u64;
+                        let mut i = tid * 10_000_000;
 
-                // Create a blob that will stress memory allocation
-                let blob = vec![0xABu8; 1024];
+                        // Create a blob that will stress memory allocation
+                        let blob = vec![0xABu8; 1024];
 
-                while !s.load(Ordering::Relaxed) {
-                    // INSERT OR REPLACE to create version churn (GC pressure)
-                    let row_id = (i % 1000) as i64; // Reuse 1000 row IDs
-                    let _ = c.execute_with_params(
-                        "INSERT OR REPLACE INTO gc_stress VALUES (?1, ?2)",
-                        &[
-                            fsqlite::SqliteValue::Integer(row_id),
-                            fsqlite::SqliteValue::Blob(blob.clone().into()),
-                        ],
-                    );
-                    local_ops += 1;
-                    i += 1;
-                }
+                        while !s.load(Ordering::Relaxed) {
+                            // INSERT OR REPLACE to create version churn (GC pressure)
+                            let row_id = (i % 1000) as i64; // Reuse 1000 row IDs
+                            drop(
+                                c.execute_with_params(
+                                    "INSERT OR REPLACE INTO gc_stress VALUES (?1, ?2)",
+                                    &[
+                                        fsqlite::SqliteValue::Integer(row_id),
+                                        fsqlite::SqliteValue::Blob(blob.clone().into()),
+                                    ],
+                                )
+                                .await,
+                            );
+                            local_ops += 1;
+                            i += 1;
+                        }
 
-                ops.fetch_add(local_ops, Ordering::Relaxed);
+                        ops.fetch_add(local_ops, Ordering::Relaxed);
+                    });
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    // Run for 3 seconds
-    let start = Instant::now();
-    thread::sleep(Duration::from_secs(3));
-    stop.store(true, Ordering::Release);
+        // Run for 3 seconds
+        let start = Instant::now();
+        thread::sleep(Duration::from_secs(3));
+        stop.store(true, Ordering::Release);
 
-    for h in handles {
-        h.join().expect("join");
-    }
+        for h in handles {
+            h.join().expect("join");
+        }
 
-    let elapsed = start.elapsed();
-    let total = total_ops.load(Ordering::Relaxed);
-    let ops_per_sec = total as f64 / elapsed.as_secs_f64();
+        let elapsed = start.elapsed();
+        let total = total_ops.load(Ordering::Relaxed);
+        let ops_per_sec = total as f64 / elapsed.as_secs_f64();
 
-    println!(
-        "[test_contention_under_gc_pressure] {} ops in {:.2}s = {:.0} ops/s",
-        total,
-        elapsed.as_secs_f64(),
-        ops_per_sec
-    );
+        println!(
+            "[test_contention_under_gc_pressure] {} ops in {:.2}s = {:.0} ops/s",
+            total,
+            elapsed.as_secs_f64(),
+            ops_per_sec
+        );
 
-    // Assert minimum throughput (very conservative floor)
-    // With GC pressure, we should still achieve at least 1000 ops/s
-    assert!(
-        ops_per_sec > 1000.0,
-        "bd-3wop3.7: GC pressure caused throughput collapse ({ops_per_sec:.0} ops/s < 1000)"
-    );
+        // Assert minimum throughput (very conservative floor)
+        // With GC pressure, we should still achieve at least 1000 ops/s
+        assert!(
+            ops_per_sec > 1000.0,
+            "bd-3wop3.7: GC pressure caused throughput collapse ({ops_per_sec:.0} ops/s < 1000)"
+        );
+    });
 }
 
 // ===========================================================================
@@ -613,81 +652,87 @@ fn test_split_lock_commit_no_deadlock() {
     // Test that multiple concurrent writers don't deadlock with the split-lock
     // protocol. With the old monolithic lock, this would cause severe contention.
 
-    let (_dir, path) = create_fsqlite_file_backed_db(
-        "split_lock_commit_no_deadlock.db",
-        "CREATE TABLE split_lock_test (id INTEGER PRIMARY KEY, val INTEGER)",
-    );
-    let path = Arc::new(path);
+    asupersync::test_utils::run_test(|| async {
+        let (_dir, path) = create_fsqlite_file_backed_db(
+            "split_lock_commit_no_deadlock.db",
+            "CREATE TABLE split_lock_test (id INTEGER PRIMARY KEY, val INTEGER)",
+        )
+        .await;
+        let path = Arc::new(path);
 
-    let barrier = Arc::new(Barrier::new(8));
-    let completed = Arc::new(AtomicU64::new(0));
-    let total_ops = Arc::new(AtomicU64::new(0));
+        let barrier = Arc::new(Barrier::new(8));
+        let completed = Arc::new(AtomicU64::new(0));
+        let total_ops = Arc::new(AtomicU64::new(0));
 
-    let handles: Vec<_> = (0..8)
-        .map(|tid| {
-            let p = Arc::clone(&path);
-            let b = Arc::clone(&barrier);
-            let comp = Arc::clone(&completed);
-            let ops = Arc::clone(&total_ops);
-            let base = (tid as i64) * 10_000;
+        let handles: Vec<_> = (0..8)
+            .map(|tid| {
+                let p = Arc::clone(&path);
+                let b = Arc::clone(&barrier);
+                let comp = Arc::clone(&completed);
+                let ops = Arc::clone(&total_ops);
+                let base = (tid as i64) * 10_000;
 
-            thread::spawn(move || {
-                let c = open_fsqlite_worker(p.as_str());
-                b.wait();
-                let mut local_ops = 0u64;
+                thread::spawn(move || {
+                    asupersync::test_utils::run_test(|| async {
+                        let c = open_fsqlite_worker(p.as_str()).await;
+                        b.wait();
+                        let mut local_ops = 0u64;
 
-                // Each thread inserts 500 rows, each as its own transaction
-                // This maximizes commit contention
-                for i in 0..500 {
-                    if c.execute_with_params(
-                        "INSERT INTO split_lock_test VALUES (?1, ?2)",
-                        &[
-                            fsqlite::SqliteValue::Integer(base + i),
-                            fsqlite::SqliteValue::Integer(i * 7),
-                        ],
-                    )
-                    .is_ok()
-                    {
-                        local_ops += 1;
-                    }
-                }
+                        // Each thread inserts 500 rows, each as its own transaction
+                        // This maximizes commit contention
+                        for i in 0..500 {
+                            if c.execute_with_params(
+                                "INSERT INTO split_lock_test VALUES (?1, ?2)",
+                                &[
+                                    fsqlite::SqliteValue::Integer(base + i),
+                                    fsqlite::SqliteValue::Integer(i * 7),
+                                ],
+                            )
+                            .await
+                            .is_ok()
+                            {
+                                local_ops += 1;
+                            }
+                        }
 
-                ops.fetch_add(local_ops, Ordering::Relaxed);
-                comp.fetch_add(1, Ordering::Relaxed);
+                        ops.fetch_add(local_ops, Ordering::Relaxed);
+                        comp.fetch_add(1, Ordering::Relaxed);
+                    });
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    // Give threads up to 30 seconds to complete (generous timeout)
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline && completed.load(Ordering::Relaxed) < 8 {
-        thread::sleep(Duration::from_millis(100));
-    }
+        // Give threads up to 30 seconds to complete (generous timeout)
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && completed.load(Ordering::Relaxed) < 8 {
+            thread::sleep(Duration::from_millis(100));
+        }
 
-    for h in handles {
-        h.join().expect("join");
-    }
+        for h in handles {
+            h.join().expect("join");
+        }
 
-    let final_completed = completed.load(Ordering::Relaxed);
-    let final_ops = total_ops.load(Ordering::Relaxed);
+        let final_completed = completed.load(Ordering::Relaxed);
+        let final_ops = total_ops.load(Ordering::Relaxed);
 
-    println!(
-        "[test_split_lock_commit_no_deadlock] {}/8 threads completed, {} total ops",
-        final_completed, final_ops
-    );
+        println!(
+            "[test_split_lock_commit_no_deadlock] {}/8 threads completed, {} total ops",
+            final_completed, final_ops
+        );
 
-    assert_eq!(
-        final_completed, 8,
-        "bd-3wop3.8: split-lock deadlock - only {}/8 threads completed",
-        final_completed
-    );
+        assert_eq!(
+            final_completed, 8,
+            "bd-3wop3.8: split-lock deadlock - only {}/8 threads completed",
+            final_completed
+        );
 
-    // All 8 threads × 500 ops = 4000 expected
-    assert!(
-        final_ops >= 3800,
-        "bd-3wop3.8: too few operations completed ({} < 3800)",
-        final_ops
-    );
+        // All 8 threads × 500 ops = 4000 expected
+        assert!(
+            final_ops >= 3800,
+            "bd-3wop3.8: too few operations completed ({} < 3800)",
+            final_ops
+        );
+    });
 }
 
 /// Test 8: Verify split-lock commit throughput scales better than monolithic lock.
@@ -699,13 +744,14 @@ fn test_split_lock_commit_no_deadlock() {
 fn test_split_lock_commit_scaling() {
     // Measure throughput at 1, 2, 4, 8 threads and verify scaling isn't pathological.
 
-    let results: Vec<(usize, f64)> = [1, 2, 4, 8]
-        .iter()
-        .map(|&thread_count| {
+    asupersync::test_utils::run_test(|| async {
+        let mut results: Vec<(usize, f64)> = Vec::new();
+        for &thread_count in &[1, 2, 4, 8] {
             let (_dir, path) = create_fsqlite_file_backed_db(
                 &format!("split_lock_commit_scaling_{thread_count}.db"),
                 "CREATE TABLE scaling_test (id INTEGER PRIMARY KEY, val INTEGER)",
-            );
+            )
+            .await;
             let path = Arc::new(path);
 
             let barrier = Arc::new(Barrier::new(thread_count));
@@ -722,25 +768,28 @@ fn test_split_lock_commit_scaling() {
                     let base = (tid as i64) * (ops_per_thread as i64) * 2;
 
                     thread::spawn(move || {
-                        let c = open_fsqlite_worker(p.as_str());
-                        b.wait();
-                        let mut local_ops = 0u64;
+                        asupersync::test_utils::run_test(|| async {
+                            let c = open_fsqlite_worker(p.as_str()).await;
+                            b.wait();
+                            let mut local_ops = 0u64;
 
-                        for i in 0..ops_per_thread {
-                            if c.execute_with_params(
-                                "INSERT INTO scaling_test VALUES (?1, ?2)",
-                                &[
-                                    fsqlite::SqliteValue::Integer(base + i as i64),
-                                    fsqlite::SqliteValue::Integer(i as i64),
-                                ],
-                            )
-                            .is_ok()
-                            {
-                                local_ops += 1;
+                            for i in 0..ops_per_thread {
+                                if c.execute_with_params(
+                                    "INSERT INTO scaling_test VALUES (?1, ?2)",
+                                    &[
+                                        fsqlite::SqliteValue::Integer(base + i as i64),
+                                        fsqlite::SqliteValue::Integer(i as i64),
+                                    ],
+                                )
+                                .await
+                                .is_ok()
+                                {
+                                    local_ops += 1;
+                                }
                             }
-                        }
 
-                        ops.fetch_add(local_ops, Ordering::Relaxed);
+                            ops.fetch_add(local_ops, Ordering::Relaxed);
+                        });
                     })
                 })
                 .collect();
@@ -753,36 +802,36 @@ fn test_split_lock_commit_scaling() {
             let total = total_ops.load(Ordering::Relaxed);
             let ops_per_sec = total as f64 / elapsed.as_secs_f64();
 
-            (thread_count, ops_per_sec)
-        })
-        .collect();
+            results.push((thread_count, ops_per_sec));
+        }
 
-    println!("\n[test_split_lock_commit_scaling] Results:");
-    for (threads, ops) in &results {
-        println!("  {}t: {:.0} ops/s", threads, ops);
-    }
+        println!("\n[test_split_lock_commit_scaling] Results:");
+        for (threads, ops) in &results {
+            println!("  {}t: {:.0} ops/s", threads, ops);
+        }
 
-    // Verify basic sanity: throughput at 4+ threads shouldn't collapse below 1-thread
-    let single_thread_ops = results[0].1;
-    let four_thread_ops = results[2].1;
-    let eight_thread_ops = results[3].1;
+        // Verify basic sanity: throughput at 4+ threads shouldn't collapse below 1-thread
+        let single_thread_ops = results[0].1;
+        let four_thread_ops = results[2].1;
+        let eight_thread_ops = results[3].1;
 
-    // With split-lock, 4t should be at least 50% of 1t (allowing for contention)
-    // This is a conservative check - the goal is to catch pathological regression
-    assert!(
-        four_thread_ops > single_thread_ops * 0.5,
-        "bd-3wop3.8: 4t throughput collapsed ({:.0} < {:.0} * 0.5)",
-        four_thread_ops,
-        single_thread_ops
-    );
+        // With split-lock, 4t should be at least 50% of 1t (allowing for contention)
+        // This is a conservative check - the goal is to catch pathological regression
+        assert!(
+            four_thread_ops > single_thread_ops * 0.5,
+            "bd-3wop3.8: 4t throughput collapsed ({:.0} < {:.0} * 0.5)",
+            four_thread_ops,
+            single_thread_ops
+        );
 
-    // 8t should still be at least 30% of 1t (more contention expected)
-    assert!(
-        eight_thread_ops > single_thread_ops * 0.3,
-        "bd-3wop3.8: 8t throughput collapsed ({:.0} < {:.0} * 0.3)",
-        eight_thread_ops,
-        single_thread_ops
-    );
+        // 8t should still be at least 30% of 1t (more contention expected)
+        assert!(
+            eight_thread_ops > single_thread_ops * 0.3,
+            "bd-3wop3.8: 8t throughput collapsed ({:.0} < {:.0} * 0.3)",
+            eight_thread_ops,
+            single_thread_ops
+        );
+    });
 }
 
 /// Test 9: Verify WAL I/O phase doesn't block prepare phase.
@@ -795,82 +844,88 @@ fn test_split_lock_wal_io_does_not_block_prepare() {
     // This test verifies the core property of split-lock: that WAL I/O in one
     // thread doesn't block prepare in another thread.
 
-    let (_dir, path) = create_fsqlite_file_backed_db(
-        "split_lock_wal_io_does_not_block_prepare.db",
-        "CREATE TABLE wal_io_test (id INTEGER PRIMARY KEY, data BLOB)",
-    );
-    let path = Arc::new(path);
+    asupersync::test_utils::run_test(|| async {
+        let (_dir, path) = create_fsqlite_file_backed_db(
+            "split_lock_wal_io_does_not_block_prepare.db",
+            "CREATE TABLE wal_io_test (id INTEGER PRIMARY KEY, data BLOB)",
+        )
+        .await;
+        let path = Arc::new(path);
 
-    let barrier = Arc::new(Barrier::new(4));
-    let completed = Arc::new(AtomicU64::new(0));
-    let total_ops = Arc::new(AtomicU64::new(0));
+        let barrier = Arc::new(Barrier::new(4));
+        let completed = Arc::new(AtomicU64::new(0));
+        let total_ops = Arc::new(AtomicU64::new(0));
 
-    let handles: Vec<_> = (0..4)
-        .map(|tid| {
-            let p = Arc::clone(&path);
-            let b = Arc::clone(&barrier);
-            let comp = Arc::clone(&completed);
-            let ops = Arc::clone(&total_ops);
+        let handles: Vec<_> = (0..4)
+            .map(|tid| {
+                let p = Arc::clone(&path);
+                let b = Arc::clone(&barrier);
+                let comp = Arc::clone(&completed);
+                let ops = Arc::clone(&total_ops);
 
-            thread::spawn(move || {
-                let c = open_fsqlite_worker(p.as_str());
-                b.wait();
-                let mut local_ops = 0u64;
+                thread::spawn(move || {
+                    asupersync::test_utils::run_test(|| async {
+                        let c = open_fsqlite_worker(p.as_str()).await;
+                        b.wait();
+                        let mut local_ops = 0u64;
 
-                // Write larger blobs to make WAL I/O more significant
-                let blob = vec![0xABu8; 4096]; // 4KB per row
+                        // Write larger blobs to make WAL I/O more significant
+                        let blob = vec![0xABu8; 4096]; // 4KB per row
 
-                for i in 0..100 {
-                    let row_id = (tid * 1000 + i) as i64;
-                    if c.execute_with_params(
-                        "INSERT INTO wal_io_test VALUES (?1, ?2)",
-                        &[
-                            fsqlite::SqliteValue::Integer(row_id),
-                            fsqlite::SqliteValue::Blob(blob.clone().into()),
-                        ],
-                    )
-                    .is_ok()
-                    {
-                        local_ops += 1;
-                    }
-                }
+                        for i in 0..100 {
+                            let row_id = (tid * 1000 + i) as i64;
+                            if c.execute_with_params(
+                                "INSERT INTO wal_io_test VALUES (?1, ?2)",
+                                &[
+                                    fsqlite::SqliteValue::Integer(row_id),
+                                    fsqlite::SqliteValue::Blob(blob.clone().into()),
+                                ],
+                            )
+                            .await
+                            .is_ok()
+                            {
+                                local_ops += 1;
+                            }
+                        }
 
-                ops.fetch_add(local_ops, Ordering::Relaxed);
-                comp.fetch_add(1, Ordering::Relaxed);
+                        ops.fetch_add(local_ops, Ordering::Relaxed);
+                        comp.fetch_add(1, Ordering::Relaxed);
+                    });
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    // All threads should complete within 10 seconds
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && completed.load(Ordering::Relaxed) < 4 {
-        thread::sleep(Duration::from_millis(50));
-    }
+        // All threads should complete within 10 seconds
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && completed.load(Ordering::Relaxed) < 4 {
+            thread::sleep(Duration::from_millis(50));
+        }
 
-    for h in handles {
-        h.join().expect("join");
-    }
+        for h in handles {
+            h.join().expect("join");
+        }
 
-    let final_completed = completed.load(Ordering::Relaxed);
-    let final_ops = total_ops.load(Ordering::Relaxed);
+        let final_completed = completed.load(Ordering::Relaxed);
+        let final_ops = total_ops.load(Ordering::Relaxed);
 
-    println!(
-        "[test_split_lock_wal_io_does_not_block_prepare] {}/4 threads, {} ops",
-        final_completed, final_ops
-    );
+        println!(
+            "[test_split_lock_wal_io_does_not_block_prepare] {}/4 threads, {} ops",
+            final_completed, final_ops
+        );
 
-    assert_eq!(
-        final_completed, 4,
-        "bd-3wop3.8: WAL I/O blocked prepare - only {}/4 threads completed",
-        final_completed
-    );
+        assert_eq!(
+            final_completed, 4,
+            "bd-3wop3.8: WAL I/O blocked prepare - only {}/4 threads completed",
+            final_completed
+        );
 
-    // 4 threads × 100 ops = 400 expected
-    assert!(
-        final_ops >= 380,
-        "bd-3wop3.8: too few ops with large WAL I/O ({} < 380)",
-        final_ops
-    );
+        // 4 threads × 100 ops = 400 expected
+        assert!(
+            final_ops >= 380,
+            "bd-3wop3.8: too few ops with large WAL I/O ({} < 380)",
+            final_ops
+        );
+    });
 }
 
 // ===========================================================================
@@ -884,22 +939,25 @@ fn test_split_lock_wal_io_does_not_block_prepare() {
 #[test]
 #[ignore = "manual benchmark - run with --ignored"]
 fn scaling_report() {
-    println!("\n=== D-TEST Scaling Report (bd-3wop3.7) ===\n");
-    println!("Thread | C SQLite ops/s | FS placeholder ops/s | Historical placeholder ratio");
-    println!("-------|----------------|----------------------|----------------------------");
+    asupersync::test_utils::run_test(|| async {
+        println!("\n=== D-TEST Scaling Report (bd-3wop3.7) ===\n");
+        println!("Thread | C SQLite ops/s | FS placeholder ops/s | Historical placeholder ratio");
+        println!("-------|----------------|----------------------|----------------------------");
 
-    for &threads in SCALING_THREAD_COUNTS {
-        let csqlite = measure_csqlite_throughput(threads, ROWS_PER_THREAD / 10);
-        let fsqlite = measure_fsqlite_placeholder_sequential_control(threads, ROWS_PER_THREAD / 10);
-        let speedup = fsqlite.ops_per_sec / csqlite.ops_per_sec;
+        for &threads in SCALING_THREAD_COUNTS {
+            let csqlite = measure_csqlite_throughput(threads, ROWS_PER_THREAD / 10);
+            let fsqlite =
+                measure_fsqlite_placeholder_sequential_control(threads, ROWS_PER_THREAD / 10).await;
+            let speedup = fsqlite.ops_per_sec / csqlite.ops_per_sec;
+
+            println!(
+                "{:>6} | {:>14.0} | {:>19.0} | {:>6.2}x",
+                threads, csqlite.ops_per_sec, fsqlite.ops_per_sec, speedup
+            );
+        }
 
         println!(
-            "{:>6} | {:>14.0} | {:>19.0} | {:>6.2}x",
-            threads, csqlite.ops_per_sec, fsqlite.ops_per_sec, speedup
+            "\nNote: FrankenSQLite numbers here come from a historical sequential placeholder control, not the authoritative c1 or persistent 8t/16t scorecard surfaces. Use scripts/capture_c1_evidence_pack.sh and scripts/capture_persistent_phase_pack.sh for current truth."
         );
-    }
-
-    println!(
-        "\nNote: FrankenSQLite numbers here come from a historical sequential placeholder control, not the authoritative c1 or persistent 8t/16t scorecard surfaces. Use scripts/capture_c1_evidence_pack.sh and scripts/capture_persistent_phase_pack.sh for current truth."
-    );
+    });
 }

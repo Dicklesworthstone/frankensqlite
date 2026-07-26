@@ -6,6 +6,7 @@
 //! the usual text->number prefix parse (so `X'3132'` = "12" -> 12, `X'6162'` =
 //! "ab" -> 0). NUMERIC and NULL/typeof variants are included. Compared against
 //! rusqlite; only printable-ASCII byte sequences are used so rendering is stable.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -23,8 +24,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -56,12 +57,12 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn assert_scalar(queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn assert_scalar(queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -85,43 +86,52 @@ fn assert_scalar(queries: &[&str], label: &str) {
 
 #[test]
 fn cast_blob_to_text() {
-    assert_scalar(
-        &[
-            "SELECT CAST(X'48656C6C6F' AS TEXT)",         // 'Hello'
-            "SELECT CAST(X'31' AS TEXT)",                 // '1'
-            "SELECT CAST(X'' AS TEXT)",                   // '' (empty)
-            "SELECT typeof(CAST(X'41' AS TEXT))",         // text
-            "SELECT length(CAST(X'48656C6C6F' AS TEXT))", // 5
-        ],
-        "cast_blob_to_text",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT CAST(X'48656C6C6F' AS TEXT)",         // 'Hello'
+                "SELECT CAST(X'31' AS TEXT)",                 // '1'
+                "SELECT CAST(X'' AS TEXT)",                   // '' (empty)
+                "SELECT typeof(CAST(X'41' AS TEXT))",         // text
+                "SELECT length(CAST(X'48656C6C6F' AS TEXT))", // 5
+            ],
+            "cast_blob_to_text",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn cast_blob_to_integer() {
-    assert_scalar(
-        &[
-            "SELECT CAST(X'31' AS INTEGER)",         // '1' -> 1
-            "SELECT CAST(X'313233' AS INTEGER)",     // '123' -> 123
-            "SELECT CAST(X'2D3432' AS INTEGER)",     // '-42' -> -42
-            "SELECT CAST(X'3132616263' AS INTEGER)", // '12abc' -> 12 (prefix)
-            "SELECT CAST(X'6162' AS INTEGER)",       // 'ab' -> 0
-            "SELECT CAST(X'' AS INTEGER)",           // empty -> 0
-        ],
-        "cast_blob_to_integer",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT CAST(X'31' AS INTEGER)",         // '1' -> 1
+                "SELECT CAST(X'313233' AS INTEGER)",     // '123' -> 123
+                "SELECT CAST(X'2D3432' AS INTEGER)",     // '-42' -> -42
+                "SELECT CAST(X'3132616263' AS INTEGER)", // '12abc' -> 12 (prefix)
+                "SELECT CAST(X'6162' AS INTEGER)",       // 'ab' -> 0
+                "SELECT CAST(X'' AS INTEGER)",           // empty -> 0
+            ],
+            "cast_blob_to_integer",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn cast_blob_to_real_and_numeric() {
-    assert_scalar(
-        &[
-            "SELECT CAST(X'332E3134' AS REAL)",     // '3.14' -> 3.14
-            "SELECT CAST(X'3235' AS REAL)",         // '25' -> 25.0
-            "SELECT CAST(X'332E30' AS NUMERIC)",    // '3.0' -> 3 (numeric reduces)
-            "SELECT CAST(X'332E35' AS NUMERIC)",    // '3.5' -> 3.5
-            "SELECT typeof(CAST(X'3235' AS REAL))", // real
-        ],
-        "cast_blob_to_real_and_numeric",
-    );
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT CAST(X'332E3134' AS REAL)",     // '3.14' -> 3.14
+                "SELECT CAST(X'3235' AS REAL)",         // '25' -> 25.0
+                "SELECT CAST(X'332E30' AS NUMERIC)",    // '3.0' -> 3 (numeric reduces)
+                "SELECT CAST(X'332E35' AS NUMERIC)",    // '3.5' -> 3.5
+                "SELECT typeof(CAST(X'3235' AS REAL))", // real
+            ],
+            "cast_blob_to_real_and_numeric",
+        )
+        .await;
+    });
 }

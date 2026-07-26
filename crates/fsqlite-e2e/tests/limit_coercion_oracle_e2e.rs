@@ -8,6 +8,7 @@
 //! (`'abc'`), and NULL are NOT and make SQLite raise "datatype mismatch". frank is
 //! currently more lenient on the non-integer cases (bd-1zc9p). Fixed 5-row table;
 //! compared against rusqlite.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -25,8 +26,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -58,23 +59,23 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn setup() -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn setup() -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY)",
         "INSERT INTO t VALUES (1),(2),(3),(4),(5)",
     ] {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
     (f, r)
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -98,37 +99,43 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
 
 #[test]
 fn limit_offset_lossless_integer_values() {
-    // Values that convert losslessly to an integer are accepted by both engines:
-    // integer-valued text, an arithmetic expression, and a scalar subquery.
-    let (f, r) = setup();
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT id FROM t ORDER BY id LIMIT '3'", // 1,2,3 (text -> 3)
-            "SELECT id FROM t ORDER BY id LIMIT 1 + 1", // 1,2 (expression)
-            "SELECT id FROM t ORDER BY id LIMIT (SELECT 2)", // 1,2 (scalar subquery)
-            "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET '1'", // 2,3 (text offset)
-            "SELECT id FROM t ORDER BY id LIMIT 10 OFFSET (SELECT 2)", // 3,4,5
-        ],
-        "limit_offset_lossless_integer_values",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // Values that convert losslessly to an integer are accepted by both engines:
+        // integer-valued text, an arithmetic expression, and a scalar subquery.
+        let (f, r) = setup().await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT id FROM t ORDER BY id LIMIT '3'", // 1,2,3 (text -> 3)
+                "SELECT id FROM t ORDER BY id LIMIT 1 + 1", // 1,2 (expression)
+                "SELECT id FROM t ORDER BY id LIMIT (SELECT 2)", // 1,2 (scalar subquery)
+                "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET '1'", // 2,3 (text offset)
+                "SELECT id FROM t ORDER BY id LIMIT 10 OFFSET (SELECT 2)", // 3,4,5
+            ],
+            "limit_offset_lossless_integer_values",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn limit_offset_noninteger_rejected() {
-    // SQLite requires a LOSSLESS integer conversion; these all raise
-    // "datatype mismatch". frank coerces them (truncate / parse-to-0 / NULL->0).
-    let (f, r) = setup();
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT id FROM t ORDER BY id LIMIT 2.9", // real with fraction
-            "SELECT id FROM t ORDER BY id LIMIT 'abc'", // non-numeric text
-            "SELECT id FROM t ORDER BY id LIMIT NULL", // NULL
-            "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1.5", // real offset
-        ],
-        "limit_offset_noninteger_rejected",
-    );
+    asupersync::test_utils::run_test(|| async {
+        // SQLite requires a LOSSLESS integer conversion; these all raise
+        // "datatype mismatch". frank coerces them (truncate / parse-to-0 / NULL->0).
+        let (f, r) = setup().await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT id FROM t ORDER BY id LIMIT 2.9", // real with fraction
+                "SELECT id FROM t ORDER BY id LIMIT 'abc'", // non-numeric text
+                "SELECT id FROM t ORDER BY id LIMIT NULL", // NULL
+                "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1.5", // real offset
+            ],
+            "limit_offset_noninteger_rejected",
+        )
+        .await;
+    });
 }

@@ -55,13 +55,13 @@ fn rusqlite_rows(conn: &rusqlite::Connection, sql: &str) -> TestResult<Vec<Vec<S
     Ok(rows)
 }
 
-fn assert_query_matches_rusqlite(
+async fn assert_query_matches_rusqlite(
     fconn: &Connection,
     rconn: &rusqlite::Connection,
     sql: &str,
 ) -> TestResult {
     assert_eq!(
-        format_fsqlite_rows(fconn.query(sql)?),
+        format_fsqlite_rows(fconn.query(sql).await?),
         rusqlite_rows(rconn, sql)?,
         "{sql}"
     );
@@ -70,7 +70,10 @@ fn assert_query_matches_rusqlite(
 
 #[test]
 fn insert_select_returning_matches_rusqlite() -> TestResult {
-    let fconn = Connection::open(":memory:")?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+    let fconn = Connection::open(":memory:").await?;
     let rconn = rusqlite::Connection::open_in_memory()?;
 
     for sql in [
@@ -79,7 +82,7 @@ fn insert_select_returning_matches_rusqlite() -> TestResult {
         "INSERT INTO src VALUES (1, 'alpha', 3), (2, 'beta', NULL), (3, 'gamma', 7);",
         "INSERT INTO dst(id, label, qty) VALUES (100, 'alpha', 11);",
     ] {
-        fconn.execute(sql)?;
+        fconn.execute(sql).await?;
         rconn.execute_batch(sql)?;
     }
 
@@ -106,10 +109,15 @@ fn insert_select_returning_matches_rusqlite() -> TestResult {
          WHERE 0
          RETURNING *",
     ] {
-        assert_query_matches_rusqlite(&fconn, &rconn, sql)?;
+        assert_query_matches_rusqlite(&fconn, &rconn, sql).await?;
     }
 
-    assert_query_matches_rusqlite(&fconn, &rconn, "SELECT id, label, qty FROM dst ORDER BY id")?;
+    assert_query_matches_rusqlite(&fconn, &rconn, "SELECT id, label, qty FROM dst ORDER BY id")
+        .await?;
 
     Ok(())
+        }
+        .await;
+    });
+    outcome
 }

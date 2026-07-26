@@ -14,8 +14,9 @@ fn render(v: &SqliteValue) -> String {
         SqliteValue::Blob(_) => "blob".into(),
     }
 }
-fn fr(c: &Connection, s: &str) -> Vec<Vec<String>> {
+async fn fr(c: &Connection, s: &str) -> Vec<Vec<String>> {
     c.query(s)
+        .await
         .unwrap_or_else(|e| panic!("frank `{s}`: {e}"))
         .iter()
         .map(|r| r.values().iter().map(render).collect())
@@ -43,50 +44,51 @@ fn sq(c: &rusqlite::Connection, s: &str) -> Vec<Vec<String>> {
 }
 #[test]
 fn eq_seek_nonagg_exact_matches_sqlite() {
-    let f = Connection::open(":memory:").unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    for s in [
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c TEXT);",
-        "CREATE INDEX idx_a ON t(a);",
-        "CREATE INDEX idx_c ON t(c);",
-    ] {
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
-    for i in 1..=500_i64 {
-        let a = if i <= 5 {
-            "NULL".to_owned()
-        } else {
-            format!("{}", i % 50)
-        };
-        let s = format!("INSERT INTO t VALUES ({i}, {a}, 'k{}');", i % 20);
-        f.execute(&s).unwrap();
-        r.execute_batch(&s).unwrap();
-    }
-    for (id, val) in [(9001, "7.5"), (9002, "'abc'")] {
-        let s = format!("INSERT INTO t VALUES ({id}, {val}, 'z');");
-        f.execute(&s).unwrap();
-        r.execute_batch(&s).unwrap();
-    }
-    let cmp = |s: &str| assert_eq!(fr(&f, s), sq(&r, s), "diverged: `{s}`");
-    for s in [
-        // ABSENT keys -> exact seek, empty result (the lever).
-        "SELECT id FROM t WHERE a = 999999",
-        "SELECT 1 FROM t WHERE a = 999999 LIMIT 1",
-        "SELECT EXISTS(SELECT 1 FROM t WHERE a = 999999)",
-        "SELECT EXISTS(SELECT 1 FROM t WHERE a = -1)",
-        // EXISTING keys (seek+match path, unchanged) -> EXISTS + deterministic ORDER BY.
-        "SELECT EXISTS(SELECT 1 FROM t WHERE a = 7)",
-        "SELECT id FROM t WHERE a = 7 ORDER BY id",
-        "SELECT id FROM t WHERE a = 7 ORDER BY id LIMIT 1",
-        "SELECT EXISTS(SELECT 1 FROM t WHERE a = 0)",
-        // Non-exact: TEXT column (keeps fallback).
-        "SELECT EXISTS(SELECT 1 FROM t WHERE c = 'nope')",
-        "SELECT EXISTS(SELECT 1 FROM t WHERE c = 'k3')",
-        // Non-exact: real literal on the INTEGER column (keeps fallback) — 7.5 exists.
-        "SELECT EXISTS(SELECT 1 FROM t WHERE a = 7.5)",
-        "SELECT id FROM t WHERE a = 7.5 ORDER BY id",
-    ] {
-        cmp(s);
-    }
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for s in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c TEXT);",
+            "CREATE INDEX idx_a ON t(a);",
+            "CREATE INDEX idx_c ON t(c);",
+        ] {
+            f.execute(s).await.unwrap();
+            r.execute_batch(s).unwrap();
+        }
+        for i in 1..=500_i64 {
+            let a = if i <= 5 {
+                "NULL".to_owned()
+            } else {
+                format!("{}", i % 50)
+            };
+            let s = format!("INSERT INTO t VALUES ({i}, {a}, 'k{}');", i % 20);
+            f.execute(&s).await.unwrap();
+            r.execute_batch(&s).unwrap();
+        }
+        for (id, val) in [(9001, "7.5"), (9002, "'abc'")] {
+            let s = format!("INSERT INTO t VALUES ({id}, {val}, 'z');");
+            f.execute(&s).await.unwrap();
+            r.execute_batch(&s).unwrap();
+        }
+        for s in [
+            // ABSENT keys -> exact seek, empty result (the lever).
+            "SELECT id FROM t WHERE a = 999999",
+            "SELECT 1 FROM t WHERE a = 999999 LIMIT 1",
+            "SELECT EXISTS(SELECT 1 FROM t WHERE a = 999999)",
+            "SELECT EXISTS(SELECT 1 FROM t WHERE a = -1)",
+            // EXISTING keys (seek+match path, unchanged) -> EXISTS + deterministic ORDER BY.
+            "SELECT EXISTS(SELECT 1 FROM t WHERE a = 7)",
+            "SELECT id FROM t WHERE a = 7 ORDER BY id",
+            "SELECT id FROM t WHERE a = 7 ORDER BY id LIMIT 1",
+            "SELECT EXISTS(SELECT 1 FROM t WHERE a = 0)",
+            // Non-exact: TEXT column (keeps fallback).
+            "SELECT EXISTS(SELECT 1 FROM t WHERE c = 'nope')",
+            "SELECT EXISTS(SELECT 1 FROM t WHERE c = 'k3')",
+            // Non-exact: real literal on the INTEGER column (keeps fallback) — 7.5 exists.
+            "SELECT EXISTS(SELECT 1 FROM t WHERE a = 7.5)",
+            "SELECT id FROM t WHERE a = 7.5 ORDER BY id",
+        ] {
+            assert_eq!(fr(&f, s).await, sq(&r, s), "diverged: `{s}`");
+        }
+    });
 }

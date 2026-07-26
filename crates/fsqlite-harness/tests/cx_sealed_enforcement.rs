@@ -4,7 +4,6 @@ use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use asupersync::runtime::RuntimeBuilder;
 use fsqlite_btree::{BtreeCursorOps, MockBtreeCursor, SeekResult};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::{
@@ -23,13 +22,6 @@ use fsqlite_vfs::{MemoryVfs, ShmRegion, Vfs, VfsFile};
 use serde_json::json;
 
 const BEAD_ID: &str = "bd-ggxs";
-
-fn run_io<F: std::future::Future>(future: F) -> F::Output {
-    RuntimeBuilder::current_thread()
-        .build()
-        .expect("build async VFS test runtime")
-        .block_on(future)
-}
 
 fn workspace_root() -> &'static Path {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -120,115 +112,122 @@ fn test_cx_param_audit_vfs_traits() {
 
 #[test]
 fn test_cx_param_audit_mvcc_pager_trait() {
-    fn _begin<P: MvccPager>(pager: &P, cx: &Cx) -> Result<P::Txn> {
-        pager.begin(cx, TransactionMode::Deferred)
+    async fn _begin<P: MvccPager>(pager: &P, cx: &Cx) -> Result<P::Txn> {
+        pager.begin(cx, TransactionMode::Deferred).await
     }
-    fn _get_page<T: TransactionHandle>(txn: &T, cx: &Cx) -> Result<PageData> {
+    async fn _get_page<T: TransactionHandle>(txn: &T, cx: &Cx) -> Result<PageData> {
         txn.get_page(cx, PageNumber::new(1).expect("non-zero page number"))
+            .await
     }
-    fn _write_page<T: TransactionHandle>(txn: &mut T, cx: &Cx) -> Result<()> {
+    async fn _write_page<T: TransactionHandle>(txn: &mut T, cx: &Cx) -> Result<()> {
         txn.write_page(
             cx,
             PageNumber::new(1).expect("non-zero page number"),
             &[0_u8; 64],
         )
+        .await
     }
-    fn _allocate_page<T: TransactionHandle>(txn: &mut T, cx: &Cx) -> Result<PageNumber> {
-        txn.allocate_page(cx)
+    async fn _allocate_page<T: TransactionHandle>(txn: &mut T, cx: &Cx) -> Result<PageNumber> {
+        txn.allocate_page(cx).await
     }
-    fn _free_page<T: TransactionHandle>(txn: &mut T, cx: &Cx) -> Result<()> {
+    async fn _free_page<T: TransactionHandle>(txn: &mut T, cx: &Cx) -> Result<()> {
         txn.free_page(cx, PageNumber::new(2).expect("non-zero page number"))
+            .await
     }
-    fn _commit<T: TransactionHandle>(txn: &mut T, cx: &Cx) -> Result<()> {
-        txn.commit(cx)
+    async fn _commit<T: TransactionHandle>(txn: &mut T, cx: &Cx) -> Result<()> {
+        txn.commit(cx).await
     }
-    fn _rollback<T: TransactionHandle>(txn: &mut T, cx: &Cx) -> Result<()> {
-        txn.rollback(cx)
+    async fn _rollback<T: TransactionHandle>(txn: &mut T, cx: &Cx) -> Result<()> {
+        txn.rollback(cx).await
     }
 
-    let _ = _begin::<MockMvccPager> as fn(&MockMvccPager, &Cx) -> Result<MockTransaction>;
-    let _ = _get_page::<MockTransaction> as fn(&MockTransaction, &Cx) -> Result<PageData>;
-    let _ = _write_page::<MockTransaction> as fn(&mut MockTransaction, &Cx) -> Result<()>;
-    let _ =
-        _allocate_page::<MockTransaction> as fn(&mut MockTransaction, &Cx) -> Result<PageNumber>;
-    let _ = _free_page::<MockTransaction> as fn(&mut MockTransaction, &Cx) -> Result<()>;
-    let _ = _commit::<MockTransaction> as fn(&mut MockTransaction, &Cx) -> Result<()>;
-    let _ = _rollback::<MockTransaction> as fn(&mut MockTransaction, &Cx) -> Result<()>;
+    // These are now `async fn`, so their return type is an anonymous future and
+    // cannot be spelled in an `as fn(..) -> ..` cast; referencing the function
+    // item still forces the full signature (including `&Cx`) to type-check.
+    let _ = _begin::<MockMvccPager>;
+    let _ = _get_page::<MockTransaction>;
+    let _ = _write_page::<MockTransaction>;
+    let _ = _allocate_page::<MockTransaction>;
+    let _ = _free_page::<MockTransaction>;
+    let _ = _commit::<MockTransaction>;
+    let _ = _rollback::<MockTransaction>;
 }
 
 #[test]
 fn test_cx_param_audit_btree_cursor_ops_trait() {
-    fn _index_move_to<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<SeekResult> {
-        c.index_move_to(cx, b"alpha")
+    async fn _index_move_to<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<SeekResult> {
+        c.index_move_to(cx, b"alpha").await
     }
-    fn _table_move_to<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<SeekResult> {
-        c.table_move_to(cx, 1)
+    async fn _table_move_to<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<SeekResult> {
+        c.table_move_to(cx, 1).await
     }
-    fn _first<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<bool> {
-        c.first(cx)
+    async fn _first<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<bool> {
+        c.first(cx).await
     }
-    fn _last<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<bool> {
-        c.last(cx)
+    async fn _last<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<bool> {
+        c.last(cx).await
     }
-    fn _next<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<bool> {
-        c.next(cx)
+    async fn _next<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<bool> {
+        c.next(cx).await
     }
-    fn _prev<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<bool> {
-        c.prev(cx)
+    async fn _prev<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<bool> {
+        c.prev(cx).await
     }
-    fn _index_insert<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<()> {
-        c.index_insert(cx, b"beta")
+    async fn _index_insert<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<()> {
+        c.index_insert(cx, b"beta").await
     }
-    fn _table_insert<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<()> {
-        c.table_insert(cx, 2, b"payload")
+    async fn _table_insert<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<()> {
+        c.table_insert(cx, 2, b"payload").await
     }
-    fn _delete<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<()> {
-        c.delete(cx)
+    async fn _delete<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<()> {
+        c.delete(cx).await
     }
-    fn _payload<C: BtreeCursorOps>(c: &C, cx: &Cx) -> Result<Vec<u8>> {
-        c.payload(cx)
+    async fn _payload<C: BtreeCursorOps>(c: &C, cx: &Cx) -> Result<Vec<u8>> {
+        c.payload(cx).await
     }
-    fn _rowid<C: BtreeCursorOps>(c: &C, cx: &Cx) -> Result<i64> {
-        c.rowid(cx)
+    async fn _rowid<C: BtreeCursorOps>(c: &C, cx: &Cx) -> Result<i64> {
+        c.rowid(cx).await
     }
 
-    let _ =
-        _index_move_to::<MockBtreeCursor> as fn(&mut MockBtreeCursor, &Cx) -> Result<SeekResult>;
-    let _ =
-        _table_move_to::<MockBtreeCursor> as fn(&mut MockBtreeCursor, &Cx) -> Result<SeekResult>;
-    let _ = _first::<MockBtreeCursor> as fn(&mut MockBtreeCursor, &Cx) -> Result<bool>;
-    let _ = _last::<MockBtreeCursor> as fn(&mut MockBtreeCursor, &Cx) -> Result<bool>;
-    let _ = _next::<MockBtreeCursor> as fn(&mut MockBtreeCursor, &Cx) -> Result<bool>;
-    let _ = _prev::<MockBtreeCursor> as fn(&mut MockBtreeCursor, &Cx) -> Result<bool>;
-    let _ = _index_insert::<MockBtreeCursor> as fn(&mut MockBtreeCursor, &Cx) -> Result<()>;
-    let _ = _table_insert::<MockBtreeCursor> as fn(&mut MockBtreeCursor, &Cx) -> Result<()>;
-    let _ = _delete::<MockBtreeCursor> as fn(&mut MockBtreeCursor, &Cx) -> Result<()>;
-    let _ = _payload::<MockBtreeCursor> as fn(&MockBtreeCursor, &Cx) -> Result<Vec<u8>>;
-    let _ = _rowid::<MockBtreeCursor> as fn(&MockBtreeCursor, &Cx) -> Result<i64>;
+    // `async fn` return types are anonymous futures, so the `as fn(..) -> ..`
+    // casts are no longer expressible; referencing the function items still
+    // forces every `&Cx` parameter position to type-check.
+    let _ = _index_move_to::<MockBtreeCursor>;
+    let _ = _table_move_to::<MockBtreeCursor>;
+    let _ = _first::<MockBtreeCursor>;
+    let _ = _last::<MockBtreeCursor>;
+    let _ = _next::<MockBtreeCursor>;
+    let _ = _prev::<MockBtreeCursor>;
+    let _ = _index_insert::<MockBtreeCursor>;
+    let _ = _table_insert::<MockBtreeCursor>;
+    let _ = _delete::<MockBtreeCursor>;
+    let _ = _payload::<MockBtreeCursor>;
+    let _ = _rowid::<MockBtreeCursor>;
 }
 
 #[test]
 fn test_cx_param_audit_checkpoint_page_writer_trait() {
-    fn _write_page<W: CheckpointPageWriter>(w: &mut W, cx: &Cx) -> Result<()> {
+    async fn _write_page<W: CheckpointPageWriter>(w: &mut W, cx: &Cx) -> Result<()> {
         w.write_page(
             cx,
             PageNumber::new(1).expect("non-zero page number"),
             &[0_u8; 64],
         )
+        .await
     }
-    fn _truncate<W: CheckpointPageWriter>(w: &mut W, cx: &Cx) -> Result<()> {
-        w.truncate(cx, 4)
+    async fn _truncate<W: CheckpointPageWriter>(w: &mut W, cx: &Cx) -> Result<()> {
+        w.truncate(cx, 4).await
     }
-    fn _sync<W: CheckpointPageWriter>(w: &mut W, cx: &Cx) -> Result<()> {
-        w.sync(cx)
+    async fn _sync<W: CheckpointPageWriter>(w: &mut W, cx: &Cx) -> Result<()> {
+        w.sync(cx).await
     }
 
-    let _ = _write_page::<MockCheckpointPageWriter>
-        as fn(&mut MockCheckpointPageWriter, &Cx) -> Result<()>;
-    let _ = _truncate::<MockCheckpointPageWriter>
-        as fn(&mut MockCheckpointPageWriter, &Cx) -> Result<()>;
-    let _ =
-        _sync::<MockCheckpointPageWriter> as fn(&mut MockCheckpointPageWriter, &Cx) -> Result<()>;
+    // `async fn` return types are anonymous futures, so the `as fn(..) -> ..`
+    // casts are no longer expressible; referencing the function items still
+    // forces every `&Cx` parameter position to type-check.
+    let _ = _write_page::<MockCheckpointPageWriter>;
+    let _ = _truncate::<MockCheckpointPageWriter>;
+    let _ = _sync::<MockCheckpointPageWriter>;
 }
 
 // ---------------------------------------------------------------------------
@@ -487,43 +486,55 @@ fn test_open_traits_external_impl_compiles() {
 
 #[test]
 fn test_mock_exports_available() {
-    let cx = Cx::new();
+    asupersync::test_utils::run_test(|| async {
+        let cx = Cx::new();
 
-    let pager = MockMvccPager;
-    let mut txn = pager
-        .begin(&cx, TransactionMode::Deferred)
-        .expect("mock pager begin must succeed");
-    let _ = txn
-        .get_page(&cx, PageNumber::new(1).expect("non-zero page number"))
-        .expect("mock get_page must succeed");
-    txn.rollback(&cx).expect("mock rollback must succeed");
+        let pager = MockMvccPager;
+        let mut txn = pager
+            .begin(&cx, TransactionMode::Deferred)
+            .await
+            .expect("mock pager begin must succeed");
+        drop(
+            txn.get_page(&cx, PageNumber::new(1).expect("non-zero page number"))
+                .await
+                .expect("mock get_page must succeed"),
+        );
+        txn.rollback(&cx).await.expect("mock rollback must succeed");
 
-    let mut writer = MockCheckpointPageWriter;
-    writer
-        .sync(&cx)
-        .expect("mock checkpoint writer sync must succeed");
+        let mut writer = MockCheckpointPageWriter;
+        writer
+            .sync(&cx)
+            .await
+            .expect("mock checkpoint writer sync must succeed");
 
-    let mut cursor = MockBtreeCursor::new(vec![(1, b"a".to_vec())]);
-    assert!(cursor.first(&cx).expect("mock first must succeed"));
+        let mut cursor = MockBtreeCursor::new(vec![(1, b"a".to_vec())]);
+        assert!(cursor.first(&cx).await.expect("mock first must succeed"));
+    });
 }
 
 #[test]
 fn test_cx_cancellation_propagates_on_real_vfs_io_path() {
-    let open_cx = Cx::new();
-    let vfs = MemoryVfs::new();
-    let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-    let (mut file, _) = vfs
-        .open(&open_cx, Some(Path::new("cancel-smoke.db")), flags)
-        .expect("open should succeed before cancellation");
-    run_io(file.write(&open_cx, b"x", 0)).expect("initial write should succeed");
+    asupersync::test_utils::run_test(|| async {
+        let open_cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (file, _) = vfs
+            .open(&open_cx, Some(Path::new("cancel-smoke.db")), flags)
+            .expect("open should succeed before cancellation");
+        file.write(&open_cx, b"x", 0)
+            .await
+            .expect("initial write should succeed");
 
-    let cancelled_cx = Cx::new();
-    cancelled_cx.cancel();
+        let cancelled_cx = Cx::new();
+        cancelled_cx.cancel();
 
-    let mut buf = [0_u8; 1];
-    let err = run_io(file.read(&cancelled_cx, &mut buf, 0))
-        .expect_err("read should fail once Cx is cancelled");
-    assert!(matches!(err, FrankenError::Abort));
+        let mut buf = [0_u8; 1];
+        let err = file
+            .read(&cancelled_cx, &mut buf, 0)
+            .await
+            .expect_err("read should fail once Cx is cancelled");
+        assert!(matches!(err, FrankenError::Abort));
+    });
 }
 
 #[test]
@@ -786,24 +797,28 @@ impl VfsFile for RecordingFile {
 
 #[test]
 fn test_pager_owns_vfs_file_with_static_dispatch() {
-    let cx = Cx::new();
-    let vfs = RecordingVfs::new(false);
-    let (file, _) = vfs
-        .open(
-            &cx,
-            Some(Path::new("pager-owns-vfs-file.db")),
-            VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
-        )
-        .expect("open should succeed");
+    asupersync::test_utils::run_test(|| async {
+        let cx = Cx::new();
+        let vfs = RecordingVfs::new(false);
+        let (file, _) = vfs
+            .open(
+                &cx,
+                Some(Path::new("pager-owns-vfs-file.db")),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+            )
+            .expect("open should succeed");
 
-    let mut file = file;
-    run_io(file.write(&cx, b"abc", 0)).expect("statically dispatched file write should succeed");
-    file.sync(&cx, SyncFlags::NORMAL)
-        .expect("sync should succeed");
+        let mut file = file;
+        file.write(&cx, b"abc", 0)
+            .await
+            .expect("statically dispatched file write should succeed");
+        file.sync(&cx, SyncFlags::NORMAL)
+            .expect("sync should succeed");
 
-    let log = vfs.log.snapshot();
-    assert!(log.iter().any(|entry| entry.starts_with("open:")));
-    assert!(log.iter().any(|entry| entry.starts_with("write:")));
+        let log = vfs.log.snapshot();
+        assert!(log.iter().any(|entry| entry.starts_with("open:")));
+        assert!(log.iter().any(|entry| entry.starts_with("write:")));
+    });
 }
 
 #[test]
@@ -827,76 +842,95 @@ fn test_pager_opens_via_vfs() {
 
 #[test]
 fn test_mvcc_pager_page_resolution_chain() {
-    let cx = Cx::new();
-    let pager = MockMvccPager;
-    let txn = pager
-        .begin(&cx, TransactionMode::Deferred)
-        .expect("mock begin should succeed");
+    asupersync::test_utils::run_test(|| async {
+        let cx = Cx::new();
+        let pager = MockMvccPager;
+        let txn = pager
+            .begin(&cx, TransactionMode::Deferred)
+            .await
+            .expect("mock begin should succeed");
 
-    let page = txn
-        .get_page(&cx, PageNumber::new(7).expect("non-zero page number"))
-        .expect("mock get_page should succeed");
-    let stamp = u32::from_le_bytes(page.as_bytes()[..4].try_into().expect("stamp bytes"));
+        let page = txn
+            .get_page(&cx, PageNumber::new(7).expect("non-zero page number"))
+            .await
+            .expect("mock get_page should succeed");
+        let stamp = u32::from_le_bytes(page.as_bytes()[..4].try_into().expect("stamp bytes"));
 
-    assert_eq!(
-        stamp, 7,
-        "bead_id={COMPOSITION_BEAD_ID} mock pager must stamp requested page number"
-    );
+        assert_eq!(
+            stamp, 7,
+            "bead_id={COMPOSITION_BEAD_ID} mock pager must stamp requested page number"
+        );
+    });
 }
 
 #[test]
 fn test_mvcc_pager_wraps_pager_and_wal() {
-    let cx = Cx::new();
-    let pager = MockMvccPager;
-    let mut writer = MockCheckpointPageWriter;
+    asupersync::test_utils::run_test(|| async {
+        let cx = Cx::new();
+        let pager = MockMvccPager;
+        let mut writer = MockCheckpointPageWriter;
 
-    let mut txn = pager
-        .begin(&cx, TransactionMode::Deferred)
-        .expect("mock begin should succeed");
-    let allocated = txn.allocate_page(&cx).expect("allocate should succeed");
-    txn.commit(&cx).expect("commit should succeed");
+        let mut txn = pager
+            .begin(&cx, TransactionMode::Deferred)
+            .await
+            .expect("mock begin should succeed");
+        let allocated = txn
+            .allocate_page(&cx)
+            .await
+            .expect("allocate should succeed");
+        txn.commit(&cx).await.expect("commit should succeed");
 
-    writer
-        .truncate(&cx, allocated.get())
-        .expect("truncate should succeed");
-    writer.sync(&cx).expect("sync should succeed");
+        writer
+            .truncate(&cx, allocated.get())
+            .await
+            .expect("truncate should succeed");
+        writer.sync(&cx).await.expect("sync should succeed");
+    });
 }
 
 #[test]
 fn test_btcursor_calls_pager_get_page() {
-    let cx = Cx::new();
-    let pager = MockMvccPager;
-    let txn = pager
-        .begin(&cx, TransactionMode::Deferred)
-        .expect("begin should succeed");
-    let _ = txn
-        .get_page(&cx, PageNumber::new(3).expect("non-zero page number"))
-        .expect("get_page should succeed");
+    asupersync::test_utils::run_test(|| async {
+        let cx = Cx::new();
+        let pager = MockMvccPager;
+        let txn = pager
+            .begin(&cx, TransactionMode::Deferred)
+            .await
+            .expect("begin should succeed");
+        drop(
+            txn.get_page(&cx, PageNumber::new(3).expect("non-zero page number"))
+                .await
+                .expect("get_page should succeed"),
+        );
 
-    let mut cursor = MockBtreeCursor::new(vec![(3, b"three".to_vec())]);
-    assert!(
-        cursor
-            .table_move_to(&cx, 3)
-            .expect("seek should succeed")
-            .is_found()
-    );
-    assert_eq!(cursor.rowid(&cx).expect("rowid should succeed"), 3);
+        let mut cursor = MockBtreeCursor::new(vec![(3, b"three".to_vec())]);
+        assert!(
+            cursor
+                .table_move_to(&cx, 3)
+                .await
+                .expect("seek should succeed")
+                .is_found()
+        );
+        assert_eq!(cursor.rowid(&cx).await.expect("rowid should succeed"), 3);
+    });
 }
 
 #[test]
 fn test_vdbe_cursor_wraps_btcursor() {
-    let cx = Cx::new();
-    let mut cursor = MockBtreeCursor::new(vec![(1, b"alpha".to_vec()), (2, b"beta".to_vec())]);
-    assert!(cursor.first(&cx).expect("first should succeed"));
-    assert_eq!(
-        cursor.payload(&cx).expect("payload should succeed"),
-        b"alpha"
-    );
-    assert!(cursor.next(&cx).expect("next should succeed"));
-    assert_eq!(
-        cursor.payload(&cx).expect("payload should succeed"),
-        b"beta"
-    );
+    asupersync::test_utils::run_test(|| async {
+        let cx = Cx::new();
+        let mut cursor = MockBtreeCursor::new(vec![(1, b"alpha".to_vec()), (2, b"beta".to_vec())]);
+        assert!(cursor.first(&cx).await.expect("first should succeed"));
+        assert_eq!(
+            cursor.payload(&cx).await.expect("payload should succeed"),
+            b"alpha"
+        );
+        assert!(cursor.next(&cx).await.expect("next should succeed"));
+        assert_eq!(
+            cursor.payload(&cx).await.expect("payload should succeed"),
+            b"beta"
+        );
+    });
 }
 
 #[test]
@@ -937,50 +971,63 @@ fn test_mock_vfs_records_calls() {
 
 #[test]
 fn test_mock_vfs_configurable_errors() {
-    let cx = Cx::new();
-    let vfs = RecordingVfs::new(true);
-    let (mut file, _) = vfs
-        .open(
-            &cx,
-            Some(Path::new("inject-error.db")),
-            VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
-        )
-        .expect("open should succeed");
+    asupersync::test_utils::run_test(|| async {
+        let cx = Cx::new();
+        let vfs = RecordingVfs::new(true);
+        let (file, _) = vfs
+            .open(
+                &cx,
+                Some(Path::new("inject-error.db")),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+            )
+            .expect("open should succeed");
 
-    let err =
-        run_io(file.write(&cx, b"fail-me", 0)).expect_err("write should fail when configured");
-    assert!(matches!(err, FrankenError::Unsupported));
+        let err = file
+            .write(&cx, b"fail-me", 0)
+            .await
+            .expect_err("write should fail when configured");
+        assert!(matches!(err, FrankenError::Unsupported));
+    });
 }
 
 #[test]
 fn test_mock_mvcc_pager_preconfigured_pages() {
-    let cx = Cx::new();
-    let pager = MockMvccPager;
-    let txn = pager
-        .begin(&cx, TransactionMode::Deferred)
-        .expect("begin should succeed");
+    asupersync::test_utils::run_test(|| async {
+        let cx = Cx::new();
+        let pager = MockMvccPager;
+        let txn = pager
+            .begin(&cx, TransactionMode::Deferred)
+            .await
+            .expect("begin should succeed");
 
-    let first = txn
-        .get_page(&cx, PageNumber::new(11).expect("non-zero page number"))
-        .expect("get_page should succeed");
-    let second = txn
-        .get_page(&cx, PageNumber::new(12).expect("non-zero page number"))
-        .expect("get_page should succeed");
+        let first = txn
+            .get_page(&cx, PageNumber::new(11).expect("non-zero page number"))
+            .await
+            .expect("get_page should succeed");
+        let second = txn
+            .get_page(&cx, PageNumber::new(12).expect("non-zero page number"))
+            .await
+            .expect("get_page should succeed");
 
-    let first_stamp = u32::from_le_bytes(first.as_bytes()[..4].try_into().expect("stamp bytes"));
-    let second_stamp = u32::from_le_bytes(second.as_bytes()[..4].try_into().expect("stamp bytes"));
-    assert_eq!(first_stamp, 11);
-    assert_eq!(second_stamp, 12);
+        let first_stamp =
+            u32::from_le_bytes(first.as_bytes()[..4].try_into().expect("stamp bytes"));
+        let second_stamp =
+            u32::from_le_bytes(second.as_bytes()[..4].try_into().expect("stamp bytes"));
+        assert_eq!(first_stamp, 11);
+        assert_eq!(second_stamp, 12);
+    });
 }
 
 #[test]
 fn test_mock_btree_cursor_preconfigured_rows() {
-    let cx = Cx::new();
-    let mut cursor = MockBtreeCursor::new(vec![(1, b"a".to_vec()), (2, b"b".to_vec())]);
-    assert!(cursor.first(&cx).expect("first should succeed"));
-    assert_eq!(cursor.rowid(&cx).expect("rowid should succeed"), 1);
-    assert!(cursor.next(&cx).expect("next should succeed"));
-    assert_eq!(cursor.rowid(&cx).expect("rowid should succeed"), 2);
+    asupersync::test_utils::run_test(|| async {
+        let cx = Cx::new();
+        let mut cursor = MockBtreeCursor::new(vec![(1, b"a".to_vec()), (2, b"b".to_vec())]);
+        assert!(cursor.first(&cx).await.expect("first should succeed"));
+        assert_eq!(cursor.rowid(&cx).await.expect("rowid should succeed"), 1);
+        assert!(cursor.next(&cx).await.expect("next should succeed"));
+        assert_eq!(cursor.rowid(&cx).await.expect("rowid should succeed"), 2);
+    });
 }
 
 #[derive(Debug)]
@@ -1017,11 +1064,18 @@ fn test_mock_scalar_function_fixed_value() {
 
 #[test]
 fn test_sealed_trait_mock_in_defining_crate() {
-    let pager = MockMvccPager;
-    let _: &dyn MvccPager<Txn = MockTransaction> = &pager;
+    // `MvccPager` and `BtreeCursorOps` gained `-> impl Future` methods, so they
+    // are no longer dyn-compatible; assert the sealed-impl relationship
+    // statically instead. `CheckpointPageWriter` boxes its futures and is still
+    // usable as a trait object.
+    fn _assert_mvcc_pager<P: MvccPager<Txn = MockTransaction>>(_pager: &P) {}
+    fn _assert_btree_cursor_ops<C: BtreeCursorOps>(_cursor: &C) {}
 
-    let mut cursor = MockBtreeCursor::new(vec![(1, b"x".to_vec())]);
-    let _: &mut dyn BtreeCursorOps = &mut cursor;
+    let pager = MockMvccPager;
+    _assert_mvcc_pager(&pager);
+
+    let cursor = MockBtreeCursor::new(vec![(1, b"x".to_vec())]);
+    _assert_btree_cursor_ops(&cursor);
 
     let mut writer = MockCheckpointPageWriter;
     let _: &mut dyn CheckpointPageWriter = &mut writer;
@@ -1029,99 +1083,120 @@ fn test_sealed_trait_mock_in_defining_crate() {
 
 #[test]
 fn test_layer_isolation_btree_without_real_pager() {
-    let cx = Cx::new();
-    let pager = MockMvccPager;
-    let txn = pager
-        .begin(&cx, TransactionMode::Deferred)
-        .expect("begin should succeed");
+    asupersync::test_utils::run_test(|| async {
+        let cx = Cx::new();
+        let pager = MockMvccPager;
+        let txn = pager
+            .begin(&cx, TransactionMode::Deferred)
+            .await
+            .expect("begin should succeed");
 
-    let page = txn
-        .get_page(&cx, PageNumber::new(99).expect("non-zero page number"))
-        .expect("get_page should succeed");
-    assert_eq!(
-        u32::from_le_bytes(page.as_bytes()[..4].try_into().expect("stamp bytes")),
-        99
-    );
+        let page = txn
+            .get_page(&cx, PageNumber::new(99).expect("non-zero page number"))
+            .await
+            .expect("get_page should succeed");
+        assert_eq!(
+            u32::from_le_bytes(page.as_bytes()[..4].try_into().expect("stamp bytes")),
+            99
+        );
+    });
 }
 
 #[test]
 fn test_layer_isolation_vdbe_without_real_btree() {
-    let cx = Cx::new();
-    let mut cursor = MockBtreeCursor::new(vec![(10, b"row".to_vec())]);
-    assert!(cursor.first(&cx).expect("first should succeed"));
-    assert_eq!(cursor.payload(&cx).expect("payload should succeed"), b"row");
+    asupersync::test_utils::run_test(|| async {
+        let cx = Cx::new();
+        let mut cursor = MockBtreeCursor::new(vec![(10, b"row".to_vec())]);
+        assert!(cursor.first(&cx).await.expect("first should succeed"));
+        assert_eq!(
+            cursor.payload(&cx).await.expect("payload should succeed"),
+            b"row"
+        );
+    });
 }
 
 #[test]
 fn test_e2e_full_layer_stack() {
-    let cx = Cx::new();
+    asupersync::test_utils::run_test(|| async {
+        let cx = Cx::new();
 
-    let vfs = RecordingVfs::new(false);
-    let (mut file, _) = vfs
-        .open(
-            &cx,
-            Some(Path::new("full-layer-stack.db")),
-            VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
-        )
-        .expect("open should succeed");
-    run_io(file.write(&cx, b"stack", 0)).expect("write should succeed");
+        let vfs = RecordingVfs::new(false);
+        let (file, _) = vfs
+            .open(
+                &cx,
+                Some(Path::new("full-layer-stack.db")),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+            )
+            .expect("open should succeed");
+        file.write(&cx, b"stack", 0)
+            .await
+            .expect("write should succeed");
 
-    let pager = MockMvccPager;
-    let txn = pager
-        .begin(&cx, TransactionMode::Deferred)
-        .expect("begin should succeed");
-    let page = txn
-        .get_page(&cx, PageNumber::new(5).expect("non-zero page number"))
-        .expect("get_page should succeed");
-    assert_eq!(
-        u32::from_le_bytes(page.as_bytes()[..4].try_into().expect("stamp bytes")),
-        5
-    );
+        let pager = MockMvccPager;
+        let txn = pager
+            .begin(&cx, TransactionMode::Deferred)
+            .await
+            .expect("begin should succeed");
+        let page = txn
+            .get_page(&cx, PageNumber::new(5).expect("non-zero page number"))
+            .await
+            .expect("get_page should succeed");
+        assert_eq!(
+            u32::from_le_bytes(page.as_bytes()[..4].try_into().expect("stamp bytes")),
+            5
+        );
 
-    let mut cursor = MockBtreeCursor::new(vec![(1, b"payload".to_vec())]);
-    assert!(cursor.first(&cx).expect("first should succeed"));
-    assert_eq!(
-        cursor.payload(&cx).expect("payload should succeed"),
-        b"payload"
-    );
+        let mut cursor = MockBtreeCursor::new(vec![(1, b"payload".to_vec())]);
+        assert!(cursor.first(&cx).await.expect("first should succeed"));
+        assert_eq!(
+            cursor.payload(&cx).await.expect("payload should succeed"),
+            b"payload"
+        );
 
-    let mut registry = FunctionRegistry::new();
-    registry.register_scalar(FixedScalar {
-        name: "stack_fn",
-        value: SqliteValue::Integer(7),
+        let mut registry = FunctionRegistry::new();
+        registry.register_scalar(FixedScalar {
+            name: "stack_fn",
+            value: SqliteValue::Integer(7),
+        });
+        let function = registry
+            .find_scalar("stack_fn", -1)
+            .expect("function should be found");
+        assert_eq!(
+            function.invoke(&[]).expect("invoke should succeed"),
+            SqliteValue::Integer(7)
+        );
+
+        eprintln!(
+            "bead_id={COMPOSITION_BEAD_ID} level=DEBUG from_layer=vfs to_layer=pager operation=open_write"
+        );
+        eprintln!(
+            "bead_id={COMPOSITION_BEAD_ID} level=DEBUG from_layer=mvcc to_layer=btree operation=get_page_traverse"
+        );
+        eprintln!(
+            "bead_id={COMPOSITION_BEAD_ID} level=INFO operation=e2e_full_layer_stack status=ok"
+        );
     });
-    let function = registry
-        .find_scalar("stack_fn", -1)
-        .expect("function should be found");
-    assert_eq!(
-        function.invoke(&[]).expect("invoke should succeed"),
-        SqliteValue::Integer(7)
-    );
-
-    eprintln!(
-        "bead_id={COMPOSITION_BEAD_ID} level=DEBUG from_layer=vfs to_layer=pager operation=open_write"
-    );
-    eprintln!(
-        "bead_id={COMPOSITION_BEAD_ID} level=DEBUG from_layer=mvcc to_layer=btree operation=get_page_traverse"
-    );
-    eprintln!("bead_id={COMPOSITION_BEAD_ID} level=INFO operation=e2e_full_layer_stack status=ok");
 }
 
 #[test]
 fn test_e2e_mock_vfs_error_propagation() {
-    let cx = Cx::new();
-    let vfs = RecordingVfs::new(true);
-    let (mut file, _) = vfs
-        .open(
-            &cx,
-            Some(Path::new("error-propagation.db")),
-            VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
-        )
-        .expect("open should succeed");
+    asupersync::test_utils::run_test(|| async {
+        let cx = Cx::new();
+        let vfs = RecordingVfs::new(true);
+        let (file, _) = vfs
+            .open(
+                &cx,
+                Some(Path::new("error-propagation.db")),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+            )
+            .expect("open should succeed");
 
-    let err =
-        run_io(file.write(&cx, b"boom", 0)).expect_err("configured write failure should propagate");
-    assert!(matches!(err, FrankenError::Unsupported));
+        let err = file
+            .write(&cx, b"boom", 0)
+            .await
+            .expect_err("configured write failure should propagate");
+        assert!(matches!(err, FrankenError::Unsupported));
+    });
 }
 
 #[test]

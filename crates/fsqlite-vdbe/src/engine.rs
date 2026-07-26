@@ -18750,16 +18750,14 @@ mod tests {
             .storage_cursors
             .get_mut(&0)
             .expect("storage cursor should exist");
-        run_async(
-            sc.cursor.index_insert(
-                &sc.cx,
-                &encode_record(&[
-                    SqliteValue::Integer(7),
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("extra".into()),
-                ]),
-            ),
-        )
+        run_async(sc.cursor.index_insert(
+            &sc.cx,
+            &encode_record(&[
+                SqliteValue::Integer(7),
+                SqliteValue::Integer(1),
+                SqliteValue::Text("extra".into()),
+            ]),
+        ))
         .expect("malformed index fixture should insert for corruption regression");
 
         let probe_key = encode_record(&[SqliteValue::Integer(7), SqliteValue::Integer(42)]);
@@ -18796,10 +18794,8 @@ mod tests {
             .get_mut(&0)
             .expect("NOCASE storage cursor should exist");
         run_async(
-            sc.cursor.index_insert(
-                &sc.cx,
-                &encode_record(&[SqliteValue::Text("alpha".into())]),
-            ),
+            sc.cursor
+                .index_insert(&sc.cx, &encode_record(&[SqliteValue::Text("alpha".into())])),
         )
         .expect("malformed NOCASE index fixture should insert for corruption regression");
 
@@ -18844,16 +18840,14 @@ mod tests {
             .storage_cursors
             .get_mut(&0)
             .expect("NOCASE storage cursor should exist");
-        run_async(
-            sc.cursor.index_insert(
-                &sc.cx,
-                &encode_record(&[
-                    SqliteValue::Text("alpha".into()),
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("extra".into()),
-                ]),
-            ),
-        )
+        run_async(sc.cursor.index_insert(
+            &sc.cx,
+            &encode_record(&[
+                SqliteValue::Text("alpha".into()),
+                SqliteValue::Integer(1),
+                SqliteValue::Text("extra".into()),
+            ]),
+        ))
         .expect("malformed NOCASE index fixture should insert for corruption regression");
 
         let probe_key =
@@ -19087,7 +19081,7 @@ mod tests {
                     .cursor
                     .index_insert(&index_cursor.cx, &existing_key),
             )
-                .expect("existing unique index key should insert");
+            .expect("existing unique index key should insert");
         }
 
         let provisional_payload = encode_record(&[SqliteValue::Integer(99)]);
@@ -19101,7 +19095,7 @@ mod tests {
                     .cursor
                     .table_insert(&table_cursor.cx, 2, &provisional_payload),
             )
-                .expect("provisional table row should insert");
+            .expect("provisional table row should insert");
         }
         engine.changes = 1;
         engine.set_pending_insert_rollback(Some(PendingInsertRollback {
@@ -19188,7 +19182,7 @@ mod tests {
                     .cursor
                     .index_insert(&index_cursor.cx, &existing_key),
             )
-                .expect("existing unique index key should insert");
+            .expect("existing unique index key should insert");
         }
 
         let mut builder = ProgramBuilder::new();
@@ -19432,8 +19426,7 @@ mod tests {
             "new engines should keep the preallocated result-row buffer"
         );
 
-        let outcome =
-            run_async(engine.execute(&program)).expect("execution should succeed");
+        let outcome = run_async(engine.execute(&program)).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
         let rows = engine.take_results();
         assert_eq!(rows.len(), 1);
@@ -19458,8 +19451,8 @@ mod tests {
 
         let mut engine = VdbeEngine::new(one_row_program.register_count());
         let initial_capacity = engine.result_buffer_capacity();
-        let outcome = run_async(engine.execute(&one_row_program))
-            .expect("one-row execution should succeed");
+        let outcome =
+            run_async(engine.execute(&one_row_program)).expect("one-row execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
         assert_eq!(
             engine.take_exactly_one_result_row(),
@@ -19514,8 +19507,7 @@ mod tests {
 
         let mut engine = VdbeEngine::new(program.register_count());
         engine.set_collect_result_rows(false);
-        let outcome =
-            run_async(engine.execute(&program)).expect("execution should succeed");
+        let outcome = run_async(engine.execute(&program)).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
         assert!(
             engine.results().is_empty(),
@@ -19560,8 +19552,7 @@ mod tests {
 
         let mut engine = VdbeEngine::new(program.register_count());
         engine.set_max_collected_result_rows(Some(2));
-        let outcome =
-            run_async(engine.execute(&program)).expect("execution should succeed");
+        let outcome = run_async(engine.execute(&program)).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
         assert_eq!(
             engine
@@ -19652,8 +19643,8 @@ mod tests {
         );
         assert!(engine.table_index_meta.is_empty());
 
-        let first_outcome = run_async(engine.execute(&first_program))
-            .expect("first execution should succeed");
+        let first_outcome =
+            run_async(engine.execute(&first_program)).expect("first execution should succeed");
         assert_eq!(first_outcome, ExecOutcome::Done);
         assert!(Arc::ptr_eq(
             &engine.table_index_meta,
@@ -19667,8 +19658,8 @@ mod tests {
         assert_eq!(first_meta[0].cursor_id, 8);
         assert_eq!(first_meta[0].column_indices, vec![0, 2]);
 
-        let second_outcome = run_async(engine.execute(&second_program))
-            .expect("second execution should succeed");
+        let second_outcome =
+            run_async(engine.execute(&second_program)).expect("second execution should succeed");
         assert_eq!(second_outcome, ExecOutcome::Done);
         assert!(Arc::ptr_eq(
             &engine.table_index_meta,
@@ -19970,8 +19961,7 @@ mod tests {
         let mut engine = VdbeEngine::new(program.register_count());
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
-        let outcome =
-            run_async(engine.execute(&program)).expect("execution should succeed");
+        let outcome = run_async(engine.execute(&program)).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
         let results = engine
             .take_results()
@@ -20343,12 +20333,9 @@ mod tests {
         engine.set_bindings_slice(&[SqliteValue::Integer(7)]);
 
         let outcome = run_async(
-            engine.execute_with_borrowed_bindings(
-                &program,
-                Some(&[SqliteValue::Integer(11)]),
-            ),
+            engine.execute_with_borrowed_bindings(&program, Some(&[SqliteValue::Integer(11)])),
         )
-            .expect("execution should succeed");
+        .expect("execution should succeed");
 
         assert_eq!(outcome, ExecOutcome::Done);
         assert_eq!(
@@ -20433,10 +20420,10 @@ mod tests {
         }
 
         let before = vdbe_metrics_snapshot();
-        let first = run_async(engine.cursor_column(0, 0))
-            .expect("first text decode should succeed");
-        let second = run_async(engine.cursor_column(0, 0))
-            .expect("pinned-row cache hit should succeed");
+        let first =
+            run_async(engine.cursor_column(0, 0)).expect("first text decode should succeed");
+        let second =
+            run_async(engine.cursor_column(0, 0)).expect("pinned-row cache hit should succeed");
         let after = vdbe_metrics_snapshot();
         let sc = engine
             .storage_cursors
@@ -20829,8 +20816,7 @@ mod tests {
 
         let before = vdbe_metrics_snapshot();
         assert_eq!(
-            run_async(engine.cursor_column(0, 0))
-                .expect("first text decode should succeed"),
+            run_async(engine.cursor_column(0, 0)).expect("first text decode should succeed"),
             SqliteValue::Text("alpha-track-s".into())
         );
         {
@@ -20841,8 +20827,7 @@ mod tests {
             assert!(run_async(sc.cursor.next(&sc.cx)).expect("cursor should advance"));
         }
         assert_eq!(
-            run_async(engine.cursor_column(0, 0))
-                .expect("post-move text decode should succeed"),
+            run_async(engine.cursor_column(0, 0)).expect("post-move text decode should succeed"),
             SqliteValue::Text("beta-track-s".into())
         );
         let after = vdbe_metrics_snapshot();
@@ -20915,8 +20900,7 @@ mod tests {
 
         let before = vdbe_metrics_snapshot();
         assert_eq!(
-            run_async(engine.cursor_column(0, 0))
-                .expect("first text decode should succeed"),
+            run_async(engine.cursor_column(0, 0)).expect("first text decode should succeed"),
             SqliteValue::Text("alpha-track-j".into())
         );
         {
@@ -21439,12 +21423,8 @@ mod tests {
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
 
-        assert!(run_async(
-            engine.open_storage_cursor(0, table_root, true)
-        ));
-        assert!(run_async(
-            engine.open_storage_cursor(1, index_root, true)
-        ));
+        assert!(run_async(engine.open_storage_cursor(0, table_root, true)));
+        assert!(run_async(engine.open_storage_cursor(1, index_root, true)));
 
         let payload = encode_record(&[SqliteValue::Integer(99)]);
         {
@@ -21454,13 +21434,9 @@ mod tests {
                     .cursor
                     .table_insert(&table_cursor.cx, 2, &payload),
             )
-                .expect("provisional table row should insert");
+            .expect("provisional table row should insert");
             assert!(
-                run_async(
-                    table_cursor
-                        .cursor
-                        .table_move_to(&table_cursor.cx, 2),
-                )
+                run_async(table_cursor.cursor.table_move_to(&table_cursor.cx, 2),)
                     .expect("table seek should succeed")
                     .is_found()
             );
@@ -21474,15 +21450,15 @@ mod tests {
                     .cursor
                     .index_insert(&index_cursor.cx, &index_key),
             )
-                .expect("index entry should insert");
+            .expect("index entry should insert");
             assert!(
                 run_async(
                     index_cursor
                         .cursor
                         .index_move_to(&index_cursor.cx, &index_key),
                 )
-                    .expect("index seek should succeed")
-                    .is_found()
+                .expect("index seek should succeed")
+                .is_found()
             );
         }
 
@@ -21501,11 +21477,7 @@ mod tests {
 
         let table_cursor = engine.storage_cursors.get_mut(&0).unwrap();
         assert!(
-            !run_async(
-                table_cursor
-                    .cursor
-                    .table_move_to(&table_cursor.cx, 2),
-            )
+            !run_async(table_cursor.cursor.table_move_to(&table_cursor.cx, 2),)
                 .expect("post-rollback table seek should succeed")
                 .is_found()
         );
@@ -21517,8 +21489,8 @@ mod tests {
                     .cursor
                     .index_move_to(&index_cursor.cx, &index_key),
             )
-                .expect("post-rollback index seek should succeed")
-                .is_found()
+            .expect("post-rollback index seek should succeed")
+            .is_found()
         );
         assert_eq!(engine.changes(), 0);
     }
@@ -26360,15 +26332,17 @@ mod tests {
                 .storage_cursors
                 .get_mut(&0)
                 .expect("storage cursor should exist");
-            run_async(
-                sc.cursor
-                    .table_insert(&sc.cx, 1, &encode_record(&[SqliteValue::Integer(10)])),
-            )
+            run_async(sc.cursor.table_insert(
+                &sc.cx,
+                1,
+                &encode_record(&[SqliteValue::Integer(10)]),
+            ))
             .unwrap();
-            run_async(
-                sc.cursor
-                    .table_insert(&sc.cx, 2, &encode_record(&[SqliteValue::Integer(20)])),
-            )
+            run_async(sc.cursor.table_insert(
+                &sc.cx,
+                2,
+                &encode_record(&[SqliteValue::Integer(20)]),
+            ))
             .unwrap();
             sc.writable = false;
         }
@@ -27915,12 +27889,8 @@ mod tests {
             .into_boxed_slice(),
         )]));
 
-        assert!(run_async(
-            engine.open_storage_cursor(0, table_root, true)
-        ));
-        assert!(run_async(
-            engine.open_storage_cursor(1, index_root, true)
-        ));
+        assert!(run_async(engine.open_storage_cursor(0, table_root, true)));
+        assert!(run_async(engine.open_storage_cursor(1, index_root, true)));
         engine.cursor_root_pages.insert(0, table_root);
         engine.cursor_root_pages.insert(1, index_root);
 
@@ -27941,42 +27911,17 @@ mod tests {
                 .storage_cursors
                 .get_mut(&0)
                 .expect("table storage cursor should exist");
-            run_async(
-                table_cursor
-                    .cursor
-                    .table_insert(&table_cursor.cx, 1, &row1),
-            )
-            .unwrap();
-            run_async(
-                table_cursor
-                    .cursor
-                    .table_insert(&table_cursor.cx, 2, &row2),
-            )
-            .unwrap();
-            run_async(
-                table_cursor
-                    .cursor
-                    .table_insert(&table_cursor.cx, 3, &row3),
-            )
-            .unwrap();
+            run_async(table_cursor.cursor.table_insert(&table_cursor.cx, 1, &row1)).unwrap();
+            run_async(table_cursor.cursor.table_insert(&table_cursor.cx, 2, &row2)).unwrap();
+            run_async(table_cursor.cursor.table_insert(&table_cursor.cx, 3, &row3)).unwrap();
         }
         {
             let index_cursor = engine
                 .storage_cursors
                 .get_mut(&1)
                 .expect("index storage cursor should exist");
-            run_async(
-                index_cursor
-                    .cursor
-                    .index_insert(&index_cursor.cx, &idx1),
-            )
-            .unwrap();
-            run_async(
-                index_cursor
-                    .cursor
-                    .index_insert(&index_cursor.cx, &idx2),
-            )
-            .unwrap();
+            run_async(index_cursor.cursor.index_insert(&index_cursor.cx, &idx1)).unwrap();
+            run_async(index_cursor.cursor.index_insert(&index_cursor.cx, &idx2)).unwrap();
         }
 
         run_async(engine.native_replace_row(0, 1)).unwrap();
@@ -28004,21 +27949,13 @@ mod tests {
             .get_mut(&1)
             .expect("index storage cursor should still exist");
         assert!(
-            !run_async(
-                index_cursor
-                    .cursor
-                    .index_move_to(&index_cursor.cx, &idx1)
-            )
+            !run_async(index_cursor.cursor.index_move_to(&index_cursor.cx, &idx1))
                 .unwrap()
                 .is_found(),
             "conflicting unique index entry should be removed from storage"
         );
         assert!(
-            run_async(
-                index_cursor
-                    .cursor
-                    .index_move_to(&index_cursor.cx, &idx2)
-            )
+            run_async(index_cursor.cursor.index_move_to(&index_cursor.cx, &idx2))
                 .unwrap()
                 .is_found(),
             "non-conflicting index entries must remain intact"
@@ -28048,12 +27985,8 @@ mod tests {
             .into_boxed_slice(),
         )]));
 
-        assert!(run_async(
-            engine.open_storage_cursor(0, table_root, true)
-        ));
-        assert!(run_async(
-            engine.open_storage_cursor(1, index_root, true)
-        ));
+        assert!(run_async(engine.open_storage_cursor(0, table_root, true)));
+        assert!(run_async(engine.open_storage_cursor(1, index_root, true)));
         engine.cursor_root_pages.insert(0, table_root);
         engine.cursor_root_pages.insert(1, index_root);
 
@@ -28105,8 +28038,8 @@ mod tests {
                     .cursor
                     .index_move_to(&index_cursor.cx, &victim_index)
             )
-                .unwrap()
-                .is_found(),
+            .unwrap()
+            .is_found(),
             "expression-index cleanup must remove the victim's rowid-suffixed key"
         );
         assert!(
@@ -28115,8 +28048,8 @@ mod tests {
                     .cursor
                     .index_move_to(&index_cursor.cx, &keep_index)
             )
-                .unwrap()
-                .is_found(),
+            .unwrap()
+            .is_found(),
             "rowid-suffix scanning must preserve other expression-index entries"
         );
     }
@@ -28146,12 +28079,8 @@ mod tests {
             .into_boxed_slice(),
         )]));
 
-        assert!(run_async(
-            engine.open_storage_cursor(0, table_root, true)
-        ));
-        assert!(run_async(
-            engine.open_storage_cursor(1, index_root, true)
-        ));
+        assert!(run_async(engine.open_storage_cursor(0, table_root, true)));
+        assert!(run_async(engine.open_storage_cursor(1, index_root, true)));
         engine.cursor_root_pages.insert(0, table_root);
         engine.cursor_root_pages.insert(1, index_root);
 
@@ -28165,36 +28094,16 @@ mod tests {
                 .storage_cursors
                 .get_mut(&0)
                 .expect("table storage cursor should exist");
-            run_async(
-                table_cursor
-                    .cursor
-                    .table_insert(&table_cursor.cx, 1, &row1),
-            )
-            .unwrap();
-            run_async(
-                table_cursor
-                    .cursor
-                    .table_insert(&table_cursor.cx, 2, &row2),
-            )
-            .unwrap();
+            run_async(table_cursor.cursor.table_insert(&table_cursor.cx, 1, &row1)).unwrap();
+            run_async(table_cursor.cursor.table_insert(&table_cursor.cx, 2, &row2)).unwrap();
         }
         {
             let index_cursor = engine
                 .storage_cursors
                 .get_mut(&1)
                 .expect("index storage cursor should exist");
-            run_async(
-                index_cursor
-                    .cursor
-                    .index_insert(&index_cursor.cx, &idx1),
-            )
-            .unwrap();
-            run_async(
-                index_cursor
-                    .cursor
-                    .index_insert(&index_cursor.cx, &idx2),
-            )
-            .unwrap();
+            run_async(index_cursor.cursor.index_insert(&index_cursor.cx, &idx1)).unwrap();
+            run_async(index_cursor.cursor.index_insert(&index_cursor.cx, &idx2)).unwrap();
         }
 
         run_async(engine.native_replace_row(0, 1)).unwrap();
@@ -28204,21 +28113,13 @@ mod tests {
             .get_mut(&1)
             .expect("index storage cursor should still exist");
         assert!(
-            !run_async(
-                index_cursor
-                    .cursor
-                    .index_move_to(&index_cursor.cx, &idx1)
-            )
+            !run_async(index_cursor.cursor.index_move_to(&index_cursor.cx, &idx1))
                 .unwrap()
                 .is_found(),
             "REPLACE cleanup must use the logical rowid alias, not the raw NULL payload slot"
         );
         assert!(
-            run_async(
-                index_cursor
-                    .cursor
-                    .index_move_to(&index_cursor.cx, &idx2)
-            )
+            run_async(index_cursor.cursor.index_move_to(&index_cursor.cx, &idx2))
                 .unwrap()
                 .is_found(),
             "non-conflicting rowid-alias index entries must remain intact"
@@ -28251,12 +28152,8 @@ mod tests {
             .into_boxed_slice(),
         )]));
 
-        assert!(run_async(
-            engine.open_storage_cursor(0, table_root, true)
-        ));
-        assert!(run_async(
-            engine.open_storage_cursor(1, index_root, true)
-        ));
+        assert!(run_async(engine.open_storage_cursor(0, table_root, true)));
+        assert!(run_async(engine.open_storage_cursor(1, index_root, true)));
         engine.cursor_root_pages.insert(0, table_root);
         engine.cursor_root_pages.insert(1, index_root);
 
@@ -28270,36 +28167,16 @@ mod tests {
                 .storage_cursors
                 .get_mut(&0)
                 .expect("table storage cursor should exist");
-            run_async(
-                table_cursor
-                    .cursor
-                    .table_insert(&table_cursor.cx, 1, &row1),
-            )
-            .unwrap();
-            run_async(
-                table_cursor
-                    .cursor
-                    .table_insert(&table_cursor.cx, 2, &row2),
-            )
-            .unwrap();
+            run_async(table_cursor.cursor.table_insert(&table_cursor.cx, 1, &row1)).unwrap();
+            run_async(table_cursor.cursor.table_insert(&table_cursor.cx, 2, &row2)).unwrap();
         }
         {
             let index_cursor = engine
                 .storage_cursors
                 .get_mut(&1)
                 .expect("index storage cursor should exist");
-            run_async(
-                index_cursor
-                    .cursor
-                    .index_insert(&index_cursor.cx, &idx1),
-            )
-            .unwrap();
-            run_async(
-                index_cursor
-                    .cursor
-                    .index_insert(&index_cursor.cx, &idx2),
-            )
-            .unwrap();
+            run_async(index_cursor.cursor.index_insert(&index_cursor.cx, &idx1)).unwrap();
+            run_async(index_cursor.cursor.index_insert(&index_cursor.cx, &idx2)).unwrap();
         }
 
         run_async(engine.native_replace_row(0, 1)).unwrap();
@@ -28309,21 +28186,13 @@ mod tests {
             .get_mut(&1)
             .expect("index storage cursor should still exist");
         assert!(
-            !run_async(
-                index_cursor
-                    .cursor
-                    .index_move_to(&index_cursor.cx, &idx1)
-            )
+            !run_async(index_cursor.cursor.index_move_to(&index_cursor.cx, &idx1))
                 .unwrap()
                 .is_found(),
             "REPLACE cleanup must not shift columns left when an old row keeps the NULL IPK placeholder"
         );
         assert!(
-            run_async(
-                index_cursor
-                    .cursor
-                    .index_move_to(&index_cursor.cx, &idx2)
-            )
+            run_async(index_cursor.cursor.index_move_to(&index_cursor.cx, &idx2))
                 .unwrap()
                 .is_found(),
             "non-conflicting short rowid-alias payload index entries must remain intact"
@@ -28355,12 +28224,8 @@ mod tests {
             .into_boxed_slice(),
         )]));
 
-        assert!(run_async(
-            engine.open_storage_cursor(0, table_root, true)
-        ));
-        assert!(run_async(
-            engine.open_storage_cursor(1, index_root, true)
-        ));
+        assert!(run_async(engine.open_storage_cursor(0, table_root, true)));
+        assert!(run_async(engine.open_storage_cursor(1, index_root, true)));
         engine.cursor_root_pages.insert(0, table_root);
         engine.cursor_root_pages.insert(1, index_root);
 
@@ -28382,11 +28247,7 @@ mod tests {
             .get_mut(&0)
             .expect("table storage cursor should still exist");
         assert!(
-            run_async(
-                table_cursor
-                    .cursor
-                    .table_move_to(&table_cursor.cx, 1)
-            )
+            run_async(table_cursor.cursor.table_move_to(&table_cursor.cx, 1))
                 .unwrap()
                 .is_found(),
             "UPDATE conflict rollback should restore the original table row"
@@ -28402,8 +28263,8 @@ mod tests {
                     .cursor
                     .index_move_to(&index_cursor.cx, &logical_idx)
             )
-                .unwrap()
-                .is_found(),
+            .unwrap()
+            .is_found(),
             "UPDATE conflict restore must use the logical rowid alias in index keys"
         );
         assert!(
@@ -28412,8 +28273,8 @@ mod tests {
                     .cursor
                     .index_move_to(&index_cursor.cx, &raw_payload_idx)
             )
-                .unwrap()
-                .is_found(),
+            .unwrap()
+            .is_found(),
             "UPDATE conflict restore must not index the raw NULL rowid-alias payload slot"
         );
     }
@@ -29130,26 +28991,31 @@ mod tests {
 
         let legacy_conflict = legacy_storage_cursor_no_conflict_prefix_match(cursor, &conflict_key)
             .expect("legacy conflict probe should succeed");
-        let scratch_conflict =
-            run_async(storage_cursor_no_conflict_prefix_match(0, cursor, &conflict_key))
-                .expect("scratch conflict probe should succeed");
+        let scratch_conflict = run_async(storage_cursor_no_conflict_prefix_match(
+            0,
+            cursor,
+            &conflict_key,
+        ))
+        .expect("scratch conflict probe should succeed");
         assert_eq!(scratch_conflict, legacy_conflict);
         assert!(scratch_conflict, "duplicate prefix should conflict");
 
         let legacy_miss = legacy_storage_cursor_no_conflict_prefix_match(cursor, &miss_key)
             .expect("legacy miss probe should succeed");
-        let scratch_miss =
-            run_async(storage_cursor_no_conflict_prefix_match(0, cursor, &miss_key))
-                .expect("scratch miss probe should succeed");
+        let scratch_miss = run_async(storage_cursor_no_conflict_prefix_match(
+            0, cursor, &miss_key,
+        ))
+        .expect("scratch miss probe should succeed");
         assert_eq!(scratch_miss, legacy_miss);
         assert!(!scratch_miss, "distinct prefix should not conflict");
 
         let malformed = vec![0x80];
         let legacy_malformed = legacy_storage_cursor_no_conflict_prefix_match(cursor, &malformed)
             .expect("legacy malformed probe should not raise");
-        let scratch_malformed =
-            run_async(storage_cursor_no_conflict_prefix_match(0, cursor, &malformed))
-                .expect("scratch malformed probe should not raise");
+        let scratch_malformed = run_async(storage_cursor_no_conflict_prefix_match(
+            0, cursor, &malformed,
+        ))
+        .expect("scratch malformed probe should not raise");
         assert_eq!(scratch_malformed, legacy_malformed);
         assert!(
             !scratch_malformed,
@@ -29247,7 +29113,7 @@ mod tests {
                     cursor,
                     &conflict_key,
                 ))
-                    .expect("scratch probe should succeed")
+                .expect("scratch probe should succeed")
                 {
                     matches += 1;
                 }
@@ -30081,9 +29947,7 @@ mod tests {
         let key = encode_record(&[SqliteValue::Float(7.0), SqliteValue::Integer(1)]);
         run_async(cursor.cursor.index_insert(&cursor.cx, &key))
             .expect("float-key index entry should insert");
-        assert!(
-            run_async(cursor.cursor.first(&cursor.cx)).expect("cursor first should succeed")
-        );
+        assert!(run_async(cursor.cursor.first(&cursor.cx)).expect("cursor first should succeed"));
 
         let matches = run_async(storage_cursor_current_first_index_key_equals(
             cursor,
@@ -30555,8 +30419,7 @@ mod tests {
         let vfs = MemoryVfs::new();
         let path = PathBuf::from("/vdbe_write_read_failure_no_mem_fallback.db");
         let cx = Cx::new();
-        let pager =
-            run_async(SimplePager::open_with_cx(&cx, vfs, &path, PageSize::MIN)).unwrap();
+        let pager = run_async(SimplePager::open_with_cx(&cx, vfs, &path, PageSize::MIN)).unwrap();
         let txn = run_async(pager.begin(&cx, TransactionMode::Immediate)).unwrap();
 
         let mut db = MemDatabase::new();
@@ -34896,8 +34759,7 @@ mod tests {
         let vfs = MemoryVfs::new();
         let path = PathBuf::from("/shared_txn_page_io_try_mutate_staged_page_data.db");
         let cx = Cx::new();
-        let pager =
-            run_async(SimplePager::open_with_cx(&cx, vfs, &path, PageSize::MIN)).unwrap();
+        let pager = run_async(SimplePager::open_with_cx(&cx, vfs, &path, PageSize::MIN)).unwrap();
         let txn = run_async(pager.begin(&cx, TransactionMode::Concurrent)).unwrap();
 
         let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
@@ -35232,8 +35094,7 @@ mod tests {
         let vfs = MemoryVfs::new();
         let path = PathBuf::from("/leased_growth_write_skips_page_one_pretracking.db");
         let cx = Cx::new();
-        let pager =
-            run_async(SimplePager::open_with_cx(&cx, vfs, &path, PageSize::MIN)).unwrap();
+        let pager = run_async(SimplePager::open_with_cx(&cx, vfs, &path, PageSize::MIN)).unwrap();
 
         let txn = run_async(pager.begin(&cx, TransactionMode::Concurrent)).unwrap();
         let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
@@ -35282,13 +35143,9 @@ mod tests {
             0,
         );
 
-        let page_no = run_async(page_io.allocate_page(&cx))
-            .expect("allocate_page should not need page one");
-        run_async(page_io.write_page(
-            &cx,
-            page_no,
-            &vec![0x5A; PageSize::MIN.as_usize()],
-        ))
+        let page_no =
+            run_async(page_io.allocate_page(&cx)).expect("allocate_page should not need page one");
+        run_async(page_io.write_page(&cx, page_no, &vec![0x5A; PageSize::MIN.as_usize()]))
             .expect("leased growth write should not block on unrelated page-one tracking");
 
         let guard = handle.lock();
@@ -35358,11 +35215,7 @@ mod tests {
             0,
         );
 
-        run_async(page_io.write_page(
-            &cx,
-            target_page,
-            &vec![0x7B; PageSize::DEFAULT.as_usize()],
-        ))
+        run_async(page_io.write_page(&cx, target_page, &vec![0x7B; PageSize::DEFAULT.as_usize()]))
             .expect("ordinary high-page concurrent writes must not probe page-one tracking");
 
         let guard = handle.lock();
@@ -35387,8 +35240,7 @@ mod tests {
         let vfs = MemoryVfs::new();
         let path = PathBuf::from("/late_pending_commit_freelist_trunk.db");
         let cx = Cx::new();
-        let pager =
-            run_async(SimplePager::open_with_cx(&cx, vfs, &path, PageSize::MIN)).unwrap();
+        let pager = run_async(SimplePager::open_with_cx(&cx, vfs, &path, PageSize::MIN)).unwrap();
         let ps = PageSize::MIN.as_usize();
 
         let (p2, p3) = {
@@ -35553,7 +35405,7 @@ mod tests {
             &cx,
             PageNumber::new(2).expect("page number must be non-zero"),
         ))
-            .expect("free_page should succeed while pending commit pages stay empty");
+        .expect("free_page should succeed while pending commit pages stay empty");
 
         let guard = handle.lock();
         assert!(

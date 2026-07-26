@@ -8,6 +8,7 @@
 //! result that still creates the columns, and the no-constraint property
 //! (duplicate "id" values are allowed in the CTAS result). Each scenario asserts
 //! per-statement agreement with rusqlite, then compares the resulting rows.
+#![recursion_limit = "512"]
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -25,8 +26,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -58,11 +59,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in stmts {
-        let fe = f.execute(s);
+        let fe = f.execute(s).await;
         let re = r.execute_batch(s);
         match (&fe, &re) {
             (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
@@ -72,7 +73,7 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
     }
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(&f, q), sqlite_rows(&r, q)) {
+        match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -101,88 +102,106 @@ const SRC: [&str; 2] = [
 
 #[test]
 fn ctas_basic_copy() {
-    scenario(
-        &[
-            SRC[0],
-            SRC[1],
-            "CREATE TABLE dst AS SELECT id, g, v FROM src",
-        ],
-        &[
-            "SELECT id, g, v FROM dst ORDER BY id", // same 3 rows
-            "SELECT count(*) FROM dst",             // 3
-        ],
-        "ctas_basic_copy",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                SRC[0],
+                SRC[1],
+                "CREATE TABLE dst AS SELECT id, g, v FROM src",
+            ],
+            &[
+                "SELECT id, g, v FROM dst ORDER BY id", // same 3 rows
+                "SELECT count(*) FROM dst",             // 3
+            ],
+            "ctas_basic_copy",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn ctas_alias_and_expression_columns() {
-    scenario(
-        &[
-            SRC[0],
-            SRC[1],
-            "CREATE TABLE calc AS SELECT id, v * 2 AS doubled, g || '!' AS tag FROM src",
-        ],
-        &["SELECT id, doubled, tag FROM calc ORDER BY id"], // (1,20,'a!'),(2,40,'a!'),(3,60,'b!')
-        "ctas_alias_and_expression_columns",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                SRC[0],
+                SRC[1],
+                "CREATE TABLE calc AS SELECT id, v * 2 AS doubled, g || '!' AS tag FROM src",
+            ],
+            &["SELECT id, doubled, tag FROM calc ORDER BY id"], // (1,20,'a!'),(2,40,'a!'),(3,60,'b!')
+            "ctas_alias_and_expression_columns",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn ctas_from_aggregate() {
-    scenario(
-        &[
-            SRC[0],
-            SRC[1],
-            "CREATE TABLE summary AS SELECT g, sum(v) AS total, count(*) AS cnt FROM src GROUP BY g",
-        ],
-        &["SELECT g, total, cnt FROM summary ORDER BY g"], // ('a',30,2),('b',30,1)
-        "ctas_from_aggregate",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                SRC[0],
+                SRC[1],
+                "CREATE TABLE summary AS SELECT g, sum(v) AS total, count(*) AS cnt FROM src GROUP BY g",
+            ],
+            &["SELECT g, total, cnt FROM summary ORDER BY g"], // ('a',30,2),('b',30,1)
+            "ctas_from_aggregate",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn ctas_with_where_orderby_limit() {
-    scenario(
-        &[
-            SRC[0],
-            SRC[1],
-            "CREATE TABLE top AS SELECT id, v FROM src WHERE v >= 20 ORDER BY v DESC LIMIT 2",
-        ],
-        &["SELECT id, v FROM top ORDER BY v DESC"], // (3,30),(2,20)
-        "ctas_with_where_orderby_limit",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                SRC[0],
+                SRC[1],
+                "CREATE TABLE top AS SELECT id, v FROM src WHERE v >= 20 ORDER BY v DESC LIMIT 2",
+            ],
+            &["SELECT id, v FROM top ORDER BY v DESC"], // (3,30),(2,20)
+            "ctas_with_where_orderby_limit",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn ctas_empty_result_keeps_columns() {
-    scenario(
-        &[
-            SRC[0],
-            SRC[1],
-            "CREATE TABLE empty_t AS SELECT id, v FROM src WHERE v > 1000",
-            // The table exists with the two columns; a fresh insert works.
-            "INSERT INTO empty_t (id, v) VALUES (1, 5)",
-        ],
-        &["SELECT id, v FROM empty_t ORDER BY id"], // just (1,5)
-        "ctas_empty_result_keeps_columns",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                SRC[0],
+                SRC[1],
+                "CREATE TABLE empty_t AS SELECT id, v FROM src WHERE v > 1000",
+                // The table exists with the two columns; a fresh insert works.
+                "INSERT INTO empty_t (id, v) VALUES (1, 5)",
+            ],
+            &["SELECT id, v FROM empty_t ORDER BY id"], // just (1,5)
+            "ctas_empty_result_keeps_columns",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn ctas_carries_no_primary_key_constraint() {
-    scenario(
-        &[
-            SRC[0],
-            SRC[1],
-            // The CTAS result has NO primary key, so a duplicate id is allowed.
-            "CREATE TABLE nodup AS SELECT id FROM src",
-            "INSERT INTO nodup VALUES (1)", // duplicate of existing id=1 -> allowed
-        ],
-        &[
-            "SELECT id FROM nodup ORDER BY id", // 1,1,2,3
-            "SELECT count(*) FROM nodup",       // 4
-        ],
-        "ctas_carries_no_primary_key_constraint",
-    );
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                SRC[0],
+                SRC[1],
+                // The CTAS result has NO primary key, so a duplicate id is allowed.
+                "CREATE TABLE nodup AS SELECT id FROM src",
+                "INSERT INTO nodup VALUES (1)", // duplicate of existing id=1 -> allowed
+            ],
+            &[
+                "SELECT id FROM nodup ORDER BY id", // 1,1,2,3
+                "SELECT count(*) FROM nodup",       // 4
+            ],
+            "ctas_carries_no_primary_key_constraint",
+        )
+        .await;
+    });
 }

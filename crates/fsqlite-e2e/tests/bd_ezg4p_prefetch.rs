@@ -1,4 +1,5 @@
 //! Prefetch effectiveness and safety proofs for `bd-ezg4p`.
+#![recursion_limit = "512"]
 
 use fsqlite_btree::{BtCursor, BtreeCursorOps, MemPageStore, PageReader, PageWriter};
 use fsqlite_e2e::bench_summary::percentile_u64;
@@ -73,36 +74,44 @@ impl SharedPrefetchStore {
     }
 }
 
+#[allow(clippy::manual_async_fn)]
 impl PageReader for SharedPrefetchStore {
     #[allow(clippy::useless_let_if_seq)]
-    fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-        let prefetched = {
-            let mut stats = self.stats.borrow_mut();
-            let mut counted_prefetch_hit = false;
-            let mut hinted = false;
-            let mut remove_pending = false;
-            if let Some(pending) = stats.pending_hints.get_mut(&page_no.get())
-                && *pending > 0
-            {
-                *pending -= 1;
-                counted_prefetch_hit = true;
-                hinted = true;
-                remove_pending = *pending == 0;
-            }
-            if counted_prefetch_hit {
-                stats.prefetch_hit_count = stats.prefetch_hit_count.saturating_add(1);
-            }
-            if remove_pending {
-                stats.pending_hints.remove(&page_no.get());
-            }
-            hinted
-        };
+    fn read_page<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
+        async move {
+            let prefetched = {
+                let mut stats = self.stats.borrow_mut();
+                let mut counted_prefetch_hit = false;
+                let mut hinted = false;
+                let mut remove_pending = false;
+                if let Some(pending) = stats.pending_hints.get_mut(&page_no.get())
+                    && *pending > 0
+                {
+                    *pending -= 1;
+                    counted_prefetch_hit = true;
+                    hinted = true;
+                    remove_pending = *pending == 0;
+                }
+                if counted_prefetch_hit {
+                    stats.prefetch_hit_count = stats.prefetch_hit_count.saturating_add(1);
+                }
+                if remove_pending {
+                    stats.pending_hints.remove(&page_no.get());
+                }
+                hinted
+            };
 
-        if self.simulate_cold_reads && !prefetched {
-            cold_read_penalty();
+            if self.simulate_cold_reads && !prefetched {
+                cold_read_penalty();
+            }
+
+            let inner = self.inner.borrow();
+            inner.read_page(cx, page_no).await
         }
-
-        self.inner.borrow().read_page(cx, page_no)
     }
 
     fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
@@ -119,17 +128,39 @@ impl PageReader for SharedPrefetchStore {
     }
 }
 
+#[allow(clippy::manual_async_fn)]
 impl PageWriter for SharedPrefetchStore {
-    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-        self.inner.borrow_mut().write_page(cx, page_no, data)
+    fn write_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            let mut inner = self.inner.borrow_mut();
+            inner.write_page(cx, page_no, data).await
+        }
     }
 
-    fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
-        self.inner.borrow_mut().allocate_page(cx)
+    fn allocate_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> impl Future<Output = Result<PageNumber>> + 'a {
+        async move {
+            let mut inner = self.inner.borrow_mut();
+            inner.allocate_page(cx).await
+        }
     }
 
-    fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-        self.inner.borrow_mut().free_page(cx, page_no)
+    fn free_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            let mut inner = self.inner.borrow_mut();
+            inner.free_page(cx, page_no).await
+        }
     }
 
     fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
@@ -183,7 +214,7 @@ fn payload_for_rowid(rowid: i64) -> Vec<u8> {
     payload
 }
 
-fn build_seed_table_store(total_rows: i64) -> Rc<RefCell<MemPageStore>> {
+async fn build_seed_table_store(total_rows: i64) -> Rc<RefCell<MemPageStore>> {
     let cx = Cx::new();
     let root = pn(ROOT_PAGE);
     let store = Rc::new(RefCell::new(MemPageStore::with_empty_table(root, USABLE)));
@@ -197,13 +228,14 @@ fn build_seed_table_store(total_rows: i64) -> Rc<RefCell<MemPageStore>> {
         );
         cursor
             .table_insert(&cx, rowid, payload_for_rowid(rowid).as_slice())
+            .await
             .expect("seed insert should succeed");
     }
 
     store
 }
 
-fn extract_btree_rows(store: Rc<RefCell<MemPageStore>>) -> Vec<(i64, Vec<u8>)> {
+async fn extract_btree_rows(store: Rc<RefCell<MemPageStore>>) -> Vec<(i64, Vec<u8>)> {
     let cx = Cx::new();
     let mut cursor = BtCursor::new(
         SharedPrefetchStore::new(store, true, false),
@@ -212,16 +244,16 @@ fn extract_btree_rows(store: Rc<RefCell<MemPageStore>>) -> Vec<(i64, Vec<u8>)> {
         true,
     );
     let mut rows = Vec::new();
-    if !cursor.first(&cx).expect("btree first should succeed") {
+    if !cursor.first(&cx).await.expect("btree first should succeed") {
         return rows;
     }
 
     loop {
         rows.push((
-            cursor.rowid(&cx).expect("rowid should exist"),
-            cursor.payload(&cx).expect("payload should exist"),
+            cursor.rowid(&cx).await.expect("rowid should exist"),
+            cursor.payload(&cx).await.expect("payload should exist"),
         ));
-        if !cursor.next(&cx).expect("btree next should succeed") {
+        if !cursor.next(&cx).await.expect("btree next should succeed") {
             break;
         }
     }
@@ -240,7 +272,7 @@ fn extract_sqlite_rows(conn: &rusqlite::Connection) -> Vec<(i64, Vec<u8>)> {
     .collect()
 }
 
-fn measure_lookup_latencies(
+async fn measure_lookup_latencies(
     store: SharedPrefetchStore,
     workload: &[i64],
 ) -> (Vec<u64>, PrefetchStatsSnapshot) {
@@ -253,13 +285,14 @@ fn measure_lookup_latencies(
         let started = Instant::now();
         let seek = cursor
             .table_move_to(&cx, *rowid)
+            .await
             .expect("lookup should succeed");
         let elapsed = started.elapsed();
         assert!(
             seek.is_found(),
             "rowid {rowid} should exist in the seed tree"
         );
-        black_box(cursor.payload(&cx).expect("payload should exist"));
+        black_box(cursor.payload(&cx).await.expect("payload should exist"));
         latencies.push(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
     }
 
@@ -269,134 +302,139 @@ fn measure_lookup_latencies(
 #[test]
 fn bd_ezg4p_prefetch_insert_10k_correctness_matches_sqlite() {
     let _guard = PREFETCH_E2E_LOCK.lock().unwrap();
-    let cx = Cx::new();
-    let root = pn(ROOT_PAGE);
-    let backing = Rc::new(RefCell::new(MemPageStore::with_empty_table(root, USABLE)));
-    let probe_store = SharedPrefetchStore::new(Rc::clone(&backing), true, false);
-    let sqlite = rusqlite::Connection::open_in_memory().expect("open sqlite");
-    sqlite
-        .execute_batch(
-            "CREATE TABLE prefetched_rows (id INTEGER PRIMARY KEY, payload BLOB NOT NULL);",
-        )
-        .expect("create sqlite table");
-
-    let mut insertion_order: Vec<i64> = (1_i64..=10_000_i64).collect();
-    deterministic_shuffle(&mut insertion_order, 0xE2A4_0001);
-
-    probe_store.clear_stats();
-    for rowid in &insertion_order {
-        let payload = payload_for_rowid(*rowid);
-        let mut cursor = BtCursor::new(probe_store.clone(), root, USABLE, true);
-        cursor
-            .table_insert(&cx, *rowid, payload.as_slice())
-            .expect("btree insert should succeed");
+    asupersync::test_utils::run_test(|| async {
+        let cx = Cx::new();
+        let root = pn(ROOT_PAGE);
+        let backing = Rc::new(RefCell::new(MemPageStore::with_empty_table(root, USABLE)));
+        let probe_store = SharedPrefetchStore::new(Rc::clone(&backing), true, false);
+        let sqlite = rusqlite::Connection::open_in_memory().expect("open sqlite");
         sqlite
-            .execute(
-                "INSERT INTO prefetched_rows (id, payload) VALUES (?1, ?2)",
-                params![rowid, payload],
+            .execute_batch(
+                "CREATE TABLE prefetched_rows (id INTEGER PRIMARY KEY, payload BLOB NOT NULL);",
             )
-            .expect("sqlite insert should succeed");
-    }
+            .expect("create sqlite table");
 
-    let btree_rows = extract_btree_rows(Rc::clone(&backing));
-    let sqlite_rows = extract_sqlite_rows(&sqlite);
-    let stats = probe_store.snapshot();
+        let mut insertion_order: Vec<i64> = (1_i64..=10_000_i64).collect();
+        deterministic_shuffle(&mut insertion_order, 0xE2A4_0001);
 
-    assert_eq!(
-        btree_rows, sqlite_rows,
-        "prefetched B-tree rows diverged from sqlite"
-    );
-    assert!(
-        stats.prefetch_issued_count > 0,
-        "10K random inserts should issue at least one child prefetch"
-    );
-    assert!(
-        stats.prefetch_hit_count > 0,
-        "10K random inserts should consume at least one prefetched child page"
-    );
-    assert_eq!(
-        stats.missing_page_count, 0,
-        "prefetch should never target missing pages"
-    );
+        probe_store.clear_stats();
+        for rowid in &insertion_order {
+            let payload = payload_for_rowid(*rowid);
+            let mut cursor = BtCursor::new(probe_store.clone(), root, USABLE, true);
+            cursor
+                .table_insert(&cx, *rowid, payload.as_slice())
+                .await
+                .expect("btree insert should succeed");
+            sqlite
+                .execute(
+                    "INSERT INTO prefetched_rows (id, payload) VALUES (?1, ?2)",
+                    params![rowid, payload],
+                )
+                .expect("sqlite insert should succeed");
+        }
 
-    eprintln!(
-        "PREFETCH_E2E:{}",
-        json!({
-            "bead_id": BEAD_ID,
-            "scenario_id": "TRACK-P-INSERT-10K-CORRECTNESS",
-            "rows": btree_rows.len(),
-            "prefetch_issued_count": stats.prefetch_issued_count,
-            "prefetch_hit_count": stats.prefetch_hit_count,
-            "missing_page_count": stats.missing_page_count
-        })
-    );
+        let btree_rows = extract_btree_rows(Rc::clone(&backing)).await;
+        let sqlite_rows = extract_sqlite_rows(&sqlite);
+        let stats = probe_store.snapshot();
+
+        assert_eq!(
+            btree_rows, sqlite_rows,
+            "prefetched B-tree rows diverged from sqlite"
+        );
+        assert!(
+            stats.prefetch_issued_count > 0,
+            "10K random inserts should issue at least one child prefetch"
+        );
+        assert!(
+            stats.prefetch_hit_count > 0,
+            "10K random inserts should consume at least one prefetched child page"
+        );
+        assert_eq!(
+            stats.missing_page_count, 0,
+            "prefetch should never target missing pages"
+        );
+
+        eprintln!(
+            "PREFETCH_E2E:{}",
+            json!({
+                "bead_id": BEAD_ID,
+                "scenario_id": "TRACK-P-INSERT-10K-CORRECTNESS",
+                "rows": btree_rows.len(),
+                "prefetch_issued_count": stats.prefetch_issued_count,
+                "prefetch_hit_count": stats.prefetch_hit_count,
+                "missing_page_count": stats.missing_page_count
+            })
+        );
+    });
 }
 
 #[test]
 fn bd_ezg4p_prefetch_latency_improvement() {
     let _guard = PREFETCH_E2E_LOCK.lock().unwrap();
-    let seed_store = build_seed_table_store(10_000);
+    asupersync::test_utils::run_test(|| async {
+        let seed_store = build_seed_table_store(10_000).await;
 
-    let prefetch_enabled = SharedPrefetchStore::new(Rc::clone(&seed_store), true, true);
-    let prefetch_disabled = SharedPrefetchStore::new(Rc::clone(&seed_store), false, true);
+        let prefetch_enabled = SharedPrefetchStore::new(Rc::clone(&seed_store), true, true);
+        let prefetch_disabled = SharedPrefetchStore::new(Rc::clone(&seed_store), false, true);
 
-    let mut workload: Vec<i64> = (1_i64..=10_000_i64).collect();
-    deterministic_shuffle(&mut workload, 0xE2A4_0002);
-    workload.truncate(2_048);
+        let mut workload: Vec<i64> = (1_i64..=10_000_i64).collect();
+        deterministic_shuffle(&mut workload, 0xE2A4_0002);
+        workload.truncate(2_048);
 
-    let (baseline_latencies, baseline_stats) =
-        measure_lookup_latencies(prefetch_disabled, &workload);
-    let (prefetch_latencies, prefetch_stats) =
-        measure_lookup_latencies(prefetch_enabled, &workload);
+        let (baseline_latencies, baseline_stats) =
+            measure_lookup_latencies(prefetch_disabled, &workload).await;
+        let (prefetch_latencies, prefetch_stats) =
+            measure_lookup_latencies(prefetch_enabled, &workload).await;
 
-    let baseline_p50 = percentile_u64(&baseline_latencies, 50);
-    let baseline_p95 = percentile_u64(&baseline_latencies, 95);
-    let prefetch_p50 = percentile_u64(&prefetch_latencies, 50);
-    let prefetch_p95 = percentile_u64(&prefetch_latencies, 95);
+        let baseline_p50 = percentile_u64(&baseline_latencies, 50);
+        let baseline_p95 = percentile_u64(&baseline_latencies, 95);
+        let prefetch_p50 = percentile_u64(&prefetch_latencies, 50);
+        let prefetch_p95 = percentile_u64(&prefetch_latencies, 95);
 
-    assert!(
-        prefetch_p50 < baseline_p50,
-        "prefetch should reduce median descent latency under the cold-read harness: baseline_p50_ns={baseline_p50} prefetch_p50_ns={prefetch_p50}"
-    );
-    assert!(
-        prefetch_p95 < baseline_p95,
-        "prefetch should reduce p95 descent latency under the cold-read harness: baseline_p95_ns={baseline_p95} prefetch_p95_ns={prefetch_p95}"
-    );
-    assert_eq!(
-        prefetch_stats.missing_page_count, 0,
-        "lookup prefetch should never target missing pages"
-    );
-    assert_eq!(
-        prefetch_stats.prefetch_hit_count, prefetch_stats.prefetch_issued_count,
-        "lookup descent should consume every prefetched child page in the deterministic harness"
-    );
-    assert_eq!(
-        baseline_stats.prefetch_issued_count, 0,
-        "disabled harness should suppress prefetch issuance"
-    );
+        assert!(
+            prefetch_p50 < baseline_p50,
+            "prefetch should reduce median descent latency under the cold-read harness: baseline_p50_ns={baseline_p50} prefetch_p50_ns={prefetch_p50}"
+        );
+        assert!(
+            prefetch_p95 < baseline_p95,
+            "prefetch should reduce p95 descent latency under the cold-read harness: baseline_p95_ns={baseline_p95} prefetch_p95_ns={prefetch_p95}"
+        );
+        assert_eq!(
+            prefetch_stats.missing_page_count, 0,
+            "lookup prefetch should never target missing pages"
+        );
+        assert_eq!(
+            prefetch_stats.prefetch_hit_count, prefetch_stats.prefetch_issued_count,
+            "lookup descent should consume every prefetched child page in the deterministic harness"
+        );
+        assert_eq!(
+            baseline_stats.prefetch_issued_count, 0,
+            "disabled harness should suppress prefetch issuance"
+        );
 
-    eprintln!(
-        "PREFETCH_E2E:{}",
-        json!({
-            "bead_id": BEAD_ID,
-            "scenario_id": "TRACK-P-LATENCY-LOOKUP",
-            "workload_rows": workload.len(),
-            "baseline": {
-                "prefetch_issued_count": baseline_stats.prefetch_issued_count,
-                "prefetch_hit_count": baseline_stats.prefetch_hit_count,
-                "descent_latency_ns": {
-                    "p50": baseline_p50,
-                    "p95": baseline_p95
+        eprintln!(
+            "PREFETCH_E2E:{}",
+            json!({
+                "bead_id": BEAD_ID,
+                "scenario_id": "TRACK-P-LATENCY-LOOKUP",
+                "workload_rows": workload.len(),
+                "baseline": {
+                    "prefetch_issued_count": baseline_stats.prefetch_issued_count,
+                    "prefetch_hit_count": baseline_stats.prefetch_hit_count,
+                    "descent_latency_ns": {
+                        "p50": baseline_p50,
+                        "p95": baseline_p95
+                    }
+                },
+                "prefetch_enabled": {
+                    "prefetch_issued_count": prefetch_stats.prefetch_issued_count,
+                    "prefetch_hit_count": prefetch_stats.prefetch_hit_count,
+                    "descent_latency_ns": {
+                        "p50": prefetch_p50,
+                        "p95": prefetch_p95
+                    }
                 }
-            },
-            "prefetch_enabled": {
-                "prefetch_issued_count": prefetch_stats.prefetch_issued_count,
-                "prefetch_hit_count": prefetch_stats.prefetch_hit_count,
-                "descent_latency_ns": {
-                    "p50": prefetch_p50,
-                    "p95": prefetch_p95
-                }
-            }
-        })
-    );
+            })
+        );
+    });
 }

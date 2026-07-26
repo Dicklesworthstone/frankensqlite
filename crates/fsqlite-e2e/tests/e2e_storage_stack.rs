@@ -21,6 +21,7 @@
 //! 6. **Integrity** - Final integrity check
 //!
 //! Note: Stage 6 (MVCC concurrent writers) is tested separately in 5E tests.
+#![recursion_limit = "512"]
 
 use fsqlite_types::SqliteValue;
 use std::time::Instant;
@@ -81,30 +82,33 @@ impl StageReport {
 
 // ─── Diagnostic Dump ────────────────────────────────────────────────────────
 
-fn dump_diagnostics(conn: &fsqlite::Connection, path: &str) {
+async fn dump_diagnostics(conn: &fsqlite::Connection, path: &str) {
     eprintln!("[DIAG] Database path: {path}");
 
     // Query various PRAGMA values for diagnostics
-    if let Ok(rows) = conn.query("PRAGMA page_size") {
+    if let Ok(rows) = conn.query("PRAGMA page_size").await {
         if let Some(row) = rows.first() {
             eprintln!("[DIAG] Page size: {:?}", row.get(0));
         }
     }
 
-    if let Ok(rows) = conn.query("PRAGMA page_count") {
+    if let Ok(rows) = conn.query("PRAGMA page_count").await {
         if let Some(row) = rows.first() {
             eprintln!("[DIAG] Page count: {:?}", row.get(0));
         }
     }
 
-    if let Ok(rows) = conn.query("PRAGMA journal_mode") {
+    if let Ok(rows) = conn.query("PRAGMA journal_mode").await {
         if let Some(row) = rows.first() {
             eprintln!("[DIAG] Journal mode: {:?}", row.get(0));
         }
     }
 
     // Dump sqlite_master
-    if let Ok(rows) = conn.query("SELECT type, name, tbl_name, rootpage FROM sqlite_master") {
+    if let Ok(rows) = conn
+        .query("SELECT type, name, tbl_name, rootpage FROM sqlite_master")
+        .await
+    {
         for row in rows {
             eprintln!("[DIAG] sqlite_master: {:?}", row.values());
         }
@@ -113,7 +117,7 @@ fn dump_diagnostics(conn: &fsqlite::Connection, path: &str) {
 
 // ─── Stage 1: DDL (Database Creation and Schema) ────────────────────────────
 
-fn stage_1_ddl(conn: &fsqlite::Connection, _path: &str) -> StageReport {
+async fn stage_1_ddl(conn: &fsqlite::Connection, _path: &str) -> StageReport {
     let stage = "1_ddl";
     let start = Instant::now();
 
@@ -125,8 +129,9 @@ fn stage_1_ddl(conn: &fsqlite::Connection, _path: &str) -> StageReport {
         "create_table",
         "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)"
     );
-    if let Err(e) =
-        conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)")
+    if let Err(e) = conn
+        .execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)")
+        .await
     {
         return StageReport::failure(
             stage,
@@ -141,7 +146,10 @@ fn stage_1_ddl(conn: &fsqlite::Connection, _path: &str) -> StageReport {
         "verify_sqlite_master",
         "Checking sqlite_master entries"
     );
-    match conn.query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'") {
+    match conn
+        .query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'")
+        .await
+    {
         Ok(rows) => {
             if let Some(row) = rows.first() {
                 e2e_log_kv!(
@@ -169,7 +177,7 @@ fn stage_1_ddl(conn: &fsqlite::Connection, _path: &str) -> StageReport {
         "create_index",
         "CREATE INDEX idx_email ON users(email)"
     );
-    if let Err(e) = conn.execute("CREATE INDEX idx_email ON users(email)") {
+    if let Err(e) = conn.execute("CREATE INDEX idx_email ON users(email)").await {
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -178,7 +186,10 @@ fn stage_1_ddl(conn: &fsqlite::Connection, _path: &str) -> StageReport {
     }
 
     // Verify index in sqlite_master (optional - may not be fully queryable yet, see bd-3ly4)
-    match conn.query("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_email'") {
+    match conn
+        .query("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_email'")
+        .await
+    {
         Ok(rows) => {
             if let Some(row) = rows.first() {
                 e2e_log_kv!(stage, "index_check", "index entry", count = row.get(0));
@@ -208,7 +219,7 @@ fn stage_1_ddl(conn: &fsqlite::Connection, _path: &str) -> StageReport {
 
 // ─── Stage 2: Write Operations ──────────────────────────────────────────────
 
-fn stage_2_write(conn: &fsqlite::Connection) -> StageReport {
+async fn stage_2_write(conn: &fsqlite::Connection) -> StageReport {
     let stage = "2_write";
     let start = Instant::now();
 
@@ -229,7 +240,7 @@ fn stage_2_write(conn: &fsqlite::Connection) -> StageReport {
             "INSERT INTO users VALUES ({}, 'user{}', 'user{}@test.com')",
             i, i, i
         );
-        if let Err(e) = conn.execute(&sql) {
+        if let Err(e) = conn.execute(&sql).await {
             return StageReport::failure(
                 stage,
                 start.elapsed().as_millis(),
@@ -266,7 +277,10 @@ fn stage_2_write(conn: &fsqlite::Connection) -> StageReport {
 
     // Update some rows
     e2e_log!(stage, "update_batch", "Updating 50 rows");
-    if let Err(e) = conn.execute("UPDATE users SET name = name || '_updated' WHERE id <= 50") {
+    if let Err(e) = conn
+        .execute("UPDATE users SET name = name || '_updated' WHERE id <= 50")
+        .await
+    {
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -276,7 +290,7 @@ fn stage_2_write(conn: &fsqlite::Connection) -> StageReport {
 
     // Delete some rows
     e2e_log!(stage, "delete_batch", "Deleting 10 rows");
-    if let Err(e) = conn.execute("DELETE FROM users WHERE id > 90") {
+    if let Err(e) = conn.execute("DELETE FROM users WHERE id > 90").await {
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -285,7 +299,7 @@ fn stage_2_write(conn: &fsqlite::Connection) -> StageReport {
     }
 
     // Verify final count
-    match conn.query("SELECT COUNT(*) FROM users") {
+    match conn.query("SELECT COUNT(*) FROM users").await {
         Ok(rows) => {
             if let Some(row) = rows.first() {
                 let count = row.get(0);
@@ -324,7 +338,7 @@ fn stage_2_write(conn: &fsqlite::Connection) -> StageReport {
 
 // ─── Stage 3: Read Operations ───────────────────────────────────────────────
 
-fn stage_3_read(conn: &fsqlite::Connection) -> StageReport {
+async fn stage_3_read(conn: &fsqlite::Connection) -> StageReport {
     let stage = "3_read";
     let start = Instant::now();
 
@@ -333,7 +347,7 @@ fn stage_3_read(conn: &fsqlite::Connection) -> StageReport {
     // Full table scan
     e2e_log!(stage, "full_scan", "SELECT * FROM users ORDER BY id");
     let scan_start = Instant::now();
-    match conn.query("SELECT * FROM users ORDER BY id") {
+    match conn.query("SELECT * FROM users ORDER BY id").await {
         Ok(rows) => {
             e2e_log_kv!(
                 stage,
@@ -359,7 +373,10 @@ fn stage_3_read(conn: &fsqlite::Connection) -> StageReport {
         "SELECT * FROM users WHERE email = 'user50@test.com'"
     );
     let seek_start = Instant::now();
-    match conn.query("SELECT * FROM users WHERE email = 'user50@test.com'") {
+    match conn
+        .query("SELECT * FROM users WHERE email = 'user50@test.com'")
+        .await
+    {
         Ok(rows) => {
             e2e_log_kv!(
                 stage,
@@ -380,7 +397,7 @@ fn stage_3_read(conn: &fsqlite::Connection) -> StageReport {
 
     // Aggregate query
     e2e_log!(stage, "aggregate", "SELECT COUNT(*), SUM(id) FROM users");
-    match conn.query("SELECT COUNT(*), SUM(id) FROM users") {
+    match conn.query("SELECT COUNT(*), SUM(id) FROM users").await {
         Ok(rows) => {
             if let Some(row) = rows.first() {
                 e2e_log_kv!(
@@ -407,7 +424,10 @@ fn stage_3_read(conn: &fsqlite::Connection) -> StageReport {
         "subquery",
         "SELECT name FROM users WHERE id IN (SELECT id FROM users WHERE id < 10)"
     );
-    match conn.query("SELECT name FROM users WHERE id IN (SELECT id FROM users WHERE id < 10)") {
+    match conn
+        .query("SELECT name FROM users WHERE id IN (SELECT id FROM users WHERE id < 10)")
+        .await
+    {
         Ok(rows) => {
             e2e_log_kv!(
                 stage,
@@ -442,7 +462,7 @@ fn stage_3_read(conn: &fsqlite::Connection) -> StageReport {
 
 // ─── Stage 4: Transaction Lifecycle ─────────────────────────────────────────
 
-fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
+async fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
     let stage = "4_txn";
     let start = Instant::now();
 
@@ -450,7 +470,7 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
 
     // Test ROLLBACK
     e2e_log!(stage, "begin", "BEGIN");
-    if let Err(e) = conn.execute("BEGIN") {
+    if let Err(e) = conn.execute("BEGIN").await {
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -463,8 +483,11 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
         "insert",
         "INSERT INTO users VALUES (10001, 'txn_user', 'txn@test.com')"
     );
-    if let Err(e) = conn.execute("INSERT INTO users VALUES (10001, 'txn_user', 'txn@test.com')") {
-        let _ = conn.execute("ROLLBACK");
+    if let Err(e) = conn
+        .execute("INSERT INTO users VALUES (10001, 'txn_user', 'txn@test.com')")
+        .await
+    {
+        drop(conn.execute("ROLLBACK").await);
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -473,7 +496,7 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
     }
 
     e2e_log!(stage, "rollback", "ROLLBACK");
-    if let Err(e) = conn.execute("ROLLBACK") {
+    if let Err(e) = conn.execute("ROLLBACK").await {
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -482,7 +505,10 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
     }
 
     // Verify rollback
-    match conn.query("SELECT COUNT(*) FROM users WHERE id = 10001") {
+    match conn
+        .query("SELECT COUNT(*) FROM users WHERE id = 10001")
+        .await
+    {
         Ok(rows) => {
             if let Some(row) = rows.first() {
                 e2e_log_kv!(
@@ -504,7 +530,7 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
 
     // Test COMMIT
     e2e_log!(stage, "begin", "BEGIN (for commit test)");
-    if let Err(e) = conn.execute("BEGIN") {
+    if let Err(e) = conn.execute("BEGIN").await {
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -517,10 +543,11 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
         "insert",
         "INSERT INTO users VALUES (10001, 'commit_user', 'commit@test.com')"
     );
-    if let Err(e) =
-        conn.execute("INSERT INTO users VALUES (10001, 'commit_user', 'commit@test.com')")
+    if let Err(e) = conn
+        .execute("INSERT INTO users VALUES (10001, 'commit_user', 'commit@test.com')")
+        .await
     {
-        let _ = conn.execute("ROLLBACK");
+        drop(conn.execute("ROLLBACK").await);
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -529,7 +556,7 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
     }
 
     e2e_log!(stage, "commit", "COMMIT");
-    if let Err(e) = conn.execute("COMMIT") {
+    if let Err(e) = conn.execute("COMMIT").await {
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -538,7 +565,10 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
     }
 
     // Verify commit
-    match conn.query("SELECT COUNT(*) FROM users WHERE id = 10001") {
+    match conn
+        .query("SELECT COUNT(*) FROM users WHERE id = 10001")
+        .await
+    {
         Ok(rows) => {
             if let Some(row) = rows.first() {
                 e2e_log_kv!(
@@ -560,7 +590,7 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
 
     // Test SAVEPOINT
     e2e_log!(stage, "begin", "BEGIN (for savepoint test)");
-    if let Err(e) = conn.execute("BEGIN") {
+    if let Err(e) = conn.execute("BEGIN").await {
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -573,9 +603,11 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
         "insert",
         "INSERT INTO users VALUES (10002, 'sp_base', 'sp_base@test.com')"
     );
-    if let Err(e) = conn.execute("INSERT INTO users VALUES (10002, 'sp_base', 'sp_base@test.com')")
+    if let Err(e) = conn
+        .execute("INSERT INTO users VALUES (10002, 'sp_base', 'sp_base@test.com')")
+        .await
     {
-        let _ = conn.execute("ROLLBACK");
+        drop(conn.execute("ROLLBACK").await);
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -584,8 +616,8 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
     }
 
     e2e_log!(stage, "savepoint", "SAVEPOINT sp1");
-    if let Err(e) = conn.execute("SAVEPOINT sp1") {
-        let _ = conn.execute("ROLLBACK");
+    if let Err(e) = conn.execute("SAVEPOINT sp1").await {
+        drop(conn.execute("ROLLBACK").await);
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -598,10 +630,11 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
         "insert",
         "INSERT INTO users VALUES (10003, 'sp_after', 'sp_after@test.com')"
     );
-    if let Err(e) =
-        conn.execute("INSERT INTO users VALUES (10003, 'sp_after', 'sp_after@test.com')")
+    if let Err(e) = conn
+        .execute("INSERT INTO users VALUES (10003, 'sp_after', 'sp_after@test.com')")
+        .await
     {
-        let _ = conn.execute("ROLLBACK");
+        drop(conn.execute("ROLLBACK").await);
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -610,8 +643,8 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
     }
 
     e2e_log!(stage, "rollback_to", "ROLLBACK TO sp1");
-    if let Err(e) = conn.execute("ROLLBACK TO sp1") {
-        let _ = conn.execute("ROLLBACK");
+    if let Err(e) = conn.execute("ROLLBACK TO sp1").await {
+        drop(conn.execute("ROLLBACK").await);
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -620,7 +653,7 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
     }
 
     e2e_log!(stage, "commit", "COMMIT");
-    if let Err(e) = conn.execute("COMMIT") {
+    if let Err(e) = conn.execute("COMMIT").await {
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -629,7 +662,10 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
     }
 
     // Verify savepoint semantics: 10002 should exist, 10003 should not
-    match conn.query("SELECT COUNT(*) FROM users WHERE id IN (10002, 10003)") {
+    match conn
+        .query("SELECT COUNT(*) FROM users WHERE id IN (10002, 10003)")
+        .await
+    {
         Ok(rows) => {
             if let Some(row) = rows.first() {
                 e2e_log_kv!(
@@ -666,7 +702,7 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
 
 // ─── Stage 5: Persistence and Reopen ────────────────────────────────────────
 
-fn stage_5_persist(path: &str) -> StageReport {
+async fn stage_5_persist(path: &str) -> StageReport {
     let stage = "5_persist";
     let start = Instant::now();
 
@@ -674,7 +710,7 @@ fn stage_5_persist(path: &str) -> StageReport {
 
     // Open connection
     e2e_log_kv!(stage, "open", "Opening database", path = path);
-    let conn = match fsqlite::Connection::open(path) {
+    let conn = match fsqlite::Connection::open(path).await {
         Ok(c) => c,
         Err(e) => {
             return StageReport::failure(
@@ -687,7 +723,7 @@ fn stage_5_persist(path: &str) -> StageReport {
 
     // Get row count before close
     let count_before: i64;
-    match conn.query("SELECT COUNT(*) FROM users") {
+    match conn.query("SELECT COUNT(*) FROM users").await {
         Ok(rows) => {
             if let Some(row) = rows.first() {
                 if let Some(SqliteValue::Integer(n)) = row.get(0) {
@@ -724,7 +760,7 @@ fn stage_5_persist(path: &str) -> StageReport {
 
     // Close connection (triggers checkpoint)
     e2e_log!(stage, "close", "Connection::close()");
-    if let Err(e) = conn.close() {
+    if let Err(e) = conn.close().await {
         return StageReport::failure(
             stage,
             start.elapsed().as_millis(),
@@ -734,7 +770,7 @@ fn stage_5_persist(path: &str) -> StageReport {
 
     // Reopen
     e2e_log_kv!(stage, "reopen", "Reopening database", path = path);
-    let conn = match fsqlite::Connection::open(path) {
+    let conn = match fsqlite::Connection::open(path).await {
         Ok(c) => c,
         Err(e) => {
             return StageReport::failure(
@@ -746,7 +782,7 @@ fn stage_5_persist(path: &str) -> StageReport {
     };
 
     // Verify data persisted
-    match conn.query("SELECT COUNT(*) FROM users") {
+    match conn.query("SELECT COUNT(*) FROM users").await {
         Ok(rows) => {
             if let Some(row) = rows.first() {
                 if let Some(SqliteValue::Integer(count_after)) = row.get(0) {
@@ -782,7 +818,10 @@ fn stage_5_persist(path: &str) -> StageReport {
 
     // Spot check a few rows
     e2e_log!(stage, "spot_check", "Spot-checking data integrity");
-    match conn.query("SELECT id, name FROM users WHERE id IN (1, 50, 90) ORDER BY id") {
+    match conn
+        .query("SELECT id, name FROM users WHERE id IN (1, 50, 90) ORDER BY id")
+        .await
+    {
         Ok(rows) => {
             e2e_log_kv!(
                 stage,
@@ -817,14 +856,14 @@ fn stage_5_persist(path: &str) -> StageReport {
 
 // ─── Stage 6: Final Integrity Check ─────────────────────────────────────────
 
-fn stage_6_integrity(path: &str) -> StageReport {
+async fn stage_6_integrity(path: &str) -> StageReport {
     let stage = "6_integrity";
     let start = Instant::now();
 
     e2e_log!(stage, "start", "Beginning integrity check stage");
 
     // Open connection for final checks
-    let conn = match fsqlite::Connection::open(path) {
+    let conn = match fsqlite::Connection::open(path).await {
         Ok(c) => c,
         Err(e) => {
             return StageReport::failure(
@@ -837,7 +876,7 @@ fn stage_6_integrity(path: &str) -> StageReport {
 
     // Run integrity check (if available)
     e2e_log!(stage, "pragma", "PRAGMA integrity_check");
-    match conn.query("PRAGMA integrity_check") {
+    match conn.query("PRAGMA integrity_check").await {
         Ok(rows) => {
             if let Some(row) = rows.first() {
                 e2e_log_kv!(
@@ -861,7 +900,7 @@ fn stage_6_integrity(path: &str) -> StageReport {
 
     // Get page count
     e2e_log!(stage, "page_count", "Checking page count");
-    match conn.query("PRAGMA page_count") {
+    match conn.query("PRAGMA page_count").await {
         Ok(rows) => {
             if let Some(row) = rows.first() {
                 e2e_log_kv!(
@@ -893,193 +932,220 @@ fn stage_6_integrity(path: &str) -> StageReport {
 
 #[test]
 fn test_e2e_storage_stack_full() {
-    let total_start = Instant::now();
+    asupersync::test_utils::run_test(|| async {
+        let total_start = Instant::now();
 
-    eprintln!("\n╔════════════════════════════════════════════════════════════╗");
-    eprintln!("║  E2E Storage Stack Integration Test (bd-jd39 / 5F.2)       ║");
-    eprintln!("╚════════════════════════════════════════════════════════════╝\n");
-
-    // Create temporary directory for test database
-    let tmp_dir = tempdir().expect("Failed to create temp directory");
-    let db_path = tmp_dir.path().join("e2e_test.db");
-    let path_str = db_path.to_str().expect("Invalid path");
-
-    e2e_log!("setup", "create_dir", "Test database: {}", path_str);
-
-    // Open initial connection
-    let conn = fsqlite::Connection::open(path_str).expect("Failed to open database");
-
-    let mut reports: Vec<StageReport> = Vec::new();
-    let mut all_passed = true;
-
-    // Stage 1: DDL
-    let report = stage_1_ddl(&conn, path_str);
-    if !report.passed {
-        dump_diagnostics(&conn, path_str);
-        all_passed = false;
-    }
-    reports.push(report);
-
-    // Stage 2: Write
-    let report = stage_2_write(&conn);
-    if !report.passed {
-        dump_diagnostics(&conn, path_str);
-        all_passed = false;
-    }
-    reports.push(report);
-
-    // Stage 3: Read
-    let report = stage_3_read(&conn);
-    if !report.passed {
-        dump_diagnostics(&conn, path_str);
-        all_passed = false;
-    }
-    reports.push(report);
-
-    // Stage 4: Transaction
-    let report = stage_4_txn(&conn);
-    if !report.passed {
-        dump_diagnostics(&conn, path_str);
-        all_passed = false;
-    }
-    reports.push(report);
-
-    // Close for persistence test
-    drop(conn);
-
-    // Stage 5: Persistence
-    let report = stage_5_persist(path_str);
-    if !report.passed {
-        if let Ok(conn) = fsqlite::Connection::open(path_str) {
-            dump_diagnostics(&conn, path_str);
-        }
-        all_passed = false;
-    }
-    reports.push(report);
-
-    // Stage 6: Integrity
-    let report = stage_6_integrity(path_str);
-    if !report.passed {
-        if let Ok(conn) = fsqlite::Connection::open(path_str) {
-            dump_diagnostics(&conn, path_str);
-        }
-        all_passed = false;
-    }
-    reports.push(report);
-
-    // Final summary
-    let total_elapsed = total_start.elapsed().as_millis();
-
-    eprintln!("\n╔════════════════════════════════════════════════════════════╗");
-    eprintln!("║  E2E Test Summary                                          ║");
-    eprintln!("╠════════════════════════════════════════════════════════════╣");
-
-    for report in &reports {
-        let status = if report.passed { "✓" } else { "✗" };
-        eprintln!(
-            "║  {} {:12} {:8}ms - {}",
-            status, report.stage_name, report.elapsed_ms, report.details
-        );
-    }
-
-    eprintln!("╠════════════════════════════════════════════════════════════╣");
-
-    let passed_count = reports.iter().filter(|r| r.passed).count();
-    let total_count = reports.len();
-
-    if all_passed {
-        eprintln!(
-            "║  ALL {} STAGES PASSED | total_elapsed_ms={}",
-            total_count, total_elapsed
-        );
+        eprintln!("\n╔════════════════════════════════════════════════════════════╗");
+        eprintln!("║  E2E Storage Stack Integration Test (bd-jd39 / 5F.2)       ║");
         eprintln!("╚════════════════════════════════════════════════════════════╝\n");
-    } else {
-        eprintln!(
-            "║  FAILED: {}/{} stages passed | total_elapsed_ms={}",
-            passed_count, total_count, total_elapsed
-        );
-        eprintln!("╚════════════════════════════════════════════════════════════╝\n");
-        panic!("E2E test failed - see above for details");
-    }
+
+        // Create temporary directory for test database
+        let tmp_dir = tempdir().expect("Failed to create temp directory");
+        let db_path = tmp_dir.path().join("e2e_test.db");
+        let path_str = db_path.to_str().expect("Invalid path");
+
+        e2e_log!("setup", "create_dir", "Test database: {}", path_str);
+
+        // Open initial connection
+        let conn = fsqlite::Connection::open(path_str)
+            .await
+            .expect("Failed to open database");
+
+        let mut reports: Vec<StageReport> = Vec::new();
+        let mut all_passed = true;
+
+        // Stage 1: DDL
+        let report = stage_1_ddl(&conn, path_str).await;
+        if !report.passed {
+            dump_diagnostics(&conn, path_str).await;
+            all_passed = false;
+        }
+        reports.push(report);
+
+        // Stage 2: Write
+        let report = stage_2_write(&conn).await;
+        if !report.passed {
+            dump_diagnostics(&conn, path_str).await;
+            all_passed = false;
+        }
+        reports.push(report);
+
+        // Stage 3: Read
+        let report = stage_3_read(&conn).await;
+        if !report.passed {
+            dump_diagnostics(&conn, path_str).await;
+            all_passed = false;
+        }
+        reports.push(report);
+
+        // Stage 4: Transaction
+        let report = stage_4_txn(&conn).await;
+        if !report.passed {
+            dump_diagnostics(&conn, path_str).await;
+            all_passed = false;
+        }
+        reports.push(report);
+
+        // Close for persistence test
+        drop(conn);
+
+        // Stage 5: Persistence
+        let report = stage_5_persist(path_str).await;
+        if !report.passed {
+            if let Ok(conn) = fsqlite::Connection::open(path_str).await {
+                dump_diagnostics(&conn, path_str).await;
+            }
+            all_passed = false;
+        }
+        reports.push(report);
+
+        // Stage 6: Integrity
+        let report = stage_6_integrity(path_str).await;
+        if !report.passed {
+            if let Ok(conn) = fsqlite::Connection::open(path_str).await {
+                dump_diagnostics(&conn, path_str).await;
+            }
+            all_passed = false;
+        }
+        reports.push(report);
+
+        // Final summary
+        let total_elapsed = total_start.elapsed().as_millis();
+
+        eprintln!("\n╔════════════════════════════════════════════════════════════╗");
+        eprintln!("║  E2E Test Summary                                          ║");
+        eprintln!("╠════════════════════════════════════════════════════════════╣");
+
+        for report in &reports {
+            let status = if report.passed { "✓" } else { "✗" };
+            eprintln!(
+                "║  {} {:12} {:8}ms - {}",
+                status, report.stage_name, report.elapsed_ms, report.details
+            );
+        }
+
+        eprintln!("╠════════════════════════════════════════════════════════════╣");
+
+        let passed_count = reports.iter().filter(|r| r.passed).count();
+        let total_count = reports.len();
+
+        if all_passed {
+            eprintln!(
+                "║  ALL {} STAGES PASSED | total_elapsed_ms={}",
+                total_count, total_elapsed
+            );
+            eprintln!("╚════════════════════════════════════════════════════════════╝\n");
+        } else {
+            eprintln!(
+                "║  FAILED: {}/{} stages passed | total_elapsed_ms={}",
+                passed_count, total_count, total_elapsed
+            );
+            eprintln!("╚════════════════════════════════════════════════════════════╝\n");
+            panic!("E2E test failed - see above for details");
+        }
+    });
 }
 
 // ─── Individual Stage Tests ─────────────────────────────────────────────────
 
 #[test]
 fn test_e2e_stage_1_ddl() {
-    let tmp_dir = tempdir().expect("Failed to create temp directory");
-    let db_path = tmp_dir.path().join("stage1_test.db");
-    let path_str = db_path.to_str().expect("Invalid path");
+    asupersync::test_utils::run_test(|| async {
+        let tmp_dir = tempdir().expect("Failed to create temp directory");
+        let db_path = tmp_dir.path().join("stage1_test.db");
+        let path_str = db_path.to_str().expect("Invalid path");
 
-    let conn = fsqlite::Connection::open(path_str).expect("Failed to open database");
-    let report = stage_1_ddl(&conn, path_str);
+        let conn = fsqlite::Connection::open(path_str)
+            .await
+            .expect("Failed to open database");
+        let report = stage_1_ddl(&conn, path_str).await;
 
-    assert!(report.passed, "Stage 1 (DDL) failed: {}", report.details);
+        assert!(report.passed, "Stage 1 (DDL) failed: {}", report.details);
+    });
 }
 
 #[test]
 fn test_e2e_stage_2_write() {
-    let tmp_dir = tempdir().expect("Failed to create temp directory");
-    let db_path = tmp_dir.path().join("stage2_test.db");
-    let path_str = db_path.to_str().expect("Invalid path");
+    asupersync::test_utils::run_test(|| async {
+        let tmp_dir = tempdir().expect("Failed to create temp directory");
+        let db_path = tmp_dir.path().join("stage2_test.db");
+        let path_str = db_path.to_str().expect("Invalid path");
 
-    let conn = fsqlite::Connection::open(path_str).expect("Failed to open database");
-    // Need DDL first
-    conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)")
-        .expect("DDL failed");
+        let conn = fsqlite::Connection::open(path_str)
+            .await
+            .expect("Failed to open database");
+        // Need DDL first
+        conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)")
+            .await
+            .expect("DDL failed");
 
-    let report = stage_2_write(&conn);
+        let report = stage_2_write(&conn).await;
 
-    assert!(report.passed, "Stage 2 (Write) failed: {}", report.details);
+        assert!(report.passed, "Stage 2 (Write) failed: {}", report.details);
+    });
 }
 
 #[test]
 fn test_e2e_stage_3_read() {
-    let tmp_dir = tempdir().expect("Failed to create temp directory");
-    let db_path = tmp_dir.path().join("stage3_test.db");
-    let path_str = db_path.to_str().expect("Invalid path");
+    asupersync::test_utils::run_test(|| async {
+        let tmp_dir = tempdir().expect("Failed to create temp directory");
+        let db_path = tmp_dir.path().join("stage3_test.db");
+        let path_str = db_path.to_str().expect("Invalid path");
 
-    let conn = fsqlite::Connection::open(path_str).expect("Failed to open database");
-    // Need DDL and some data
-    conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)")
-        .expect("DDL failed");
-    conn.execute("CREATE INDEX idx_email ON users(email)")
-        .expect("INDEX failed");
+        let conn = fsqlite::Connection::open(path_str)
+            .await
+            .expect("Failed to open database");
+        // Need DDL and some data
+        conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)")
+            .await
+            .expect("DDL failed");
+        conn.execute("CREATE INDEX idx_email ON users(email)")
+            .await
+            .expect("INDEX failed");
 
-    for i in 1..=100 {
-        conn.execute(&format!(
-            "INSERT INTO users VALUES ({}, 'user{}', 'user{}@test.com')",
-            i, i, i
-        ))
-        .expect("INSERT failed");
-    }
-    // Simulate update/delete from stage 2
-    conn.execute("UPDATE users SET name = name || '_updated' WHERE id <= 50")
-        .expect("UPDATE failed");
-    conn.execute("DELETE FROM users WHERE id > 90")
-        .expect("DELETE failed");
+        for i in 1..=100 {
+            conn.execute(&format!(
+                "INSERT INTO users VALUES ({}, 'user{}', 'user{}@test.com')",
+                i, i, i
+            ))
+            .await
+            .expect("INSERT failed");
+        }
+        // Simulate update/delete from stage 2
+        conn.execute("UPDATE users SET name = name || '_updated' WHERE id <= 50")
+            .await
+            .expect("UPDATE failed");
+        conn.execute("DELETE FROM users WHERE id > 90")
+            .await
+            .expect("DELETE failed");
 
-    let report = stage_3_read(&conn);
+        let report = stage_3_read(&conn).await;
 
-    assert!(report.passed, "Stage 3 (Read) failed: {}", report.details);
+        assert!(report.passed, "Stage 3 (Read) failed: {}", report.details);
+    });
 }
 
 #[test]
 fn test_e2e_stage_4_txn() {
-    let tmp_dir = tempdir().expect("Failed to create temp directory");
-    let db_path = tmp_dir.path().join("stage4_test.db");
-    let path_str = db_path.to_str().expect("Invalid path");
+    asupersync::test_utils::run_test(|| async {
+        let tmp_dir = tempdir().expect("Failed to create temp directory");
+        let db_path = tmp_dir.path().join("stage4_test.db");
+        let path_str = db_path.to_str().expect("Invalid path");
 
-    let conn = fsqlite::Connection::open(path_str).expect("Failed to open database");
-    // Need DDL
-    conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)")
-        .expect("DDL failed");
+        let conn = fsqlite::Connection::open(path_str)
+            .await
+            .expect("Failed to open database");
+        // Need DDL
+        conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)")
+            .await
+            .expect("DDL failed");
 
-    let report = stage_4_txn(&conn);
+        let report = stage_4_txn(&conn).await;
 
-    assert!(
-        report.passed,
-        "Stage 4 (Transaction) failed: {}",
-        report.details
-    );
+        assert!(
+            report.passed,
+            "Stage 4 (Transaction) failed: {}",
+            report.details
+        );
+    });
 }

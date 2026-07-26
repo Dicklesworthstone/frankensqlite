@@ -21,9 +21,10 @@ fn render(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+async fn frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     let mut rows: Vec<Vec<String>> = conn
         .query(sql)
+        .await
         .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"))
         .iter()
         .map(|row| row.values().iter().map(render).collect())
@@ -62,8 +63,9 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
 }
 
 /// True if the plan opens an `OpenRead` whose P4 text equals `name`.
-fn opens(conn: &Connection, sql: &str, name: &str) -> bool {
+async fn opens(conn: &Connection, sql: &str, name: &str) -> bool {
     conn.query(&format!("EXPLAIN {sql}"))
+        .await
         .unwrap()
         .iter()
         .any(|row| {
@@ -75,31 +77,31 @@ fn opens(conn: &Connection, sql: &str, name: &str) -> bool {
         })
 }
 
-fn setup(ddl: &[&str]) -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").expect("frank");
+async fn setup(ddl: &[&str]) -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.expect("frank");
     let r = rusqlite::Connection::open_in_memory().expect("sqlite");
     for stmt in ddl {
-        f.execute(stmt).unwrap();
+        f.execute(stmt).await.unwrap();
         r.execute_batch(stmt).unwrap();
     }
     (f, r)
 }
 
-fn insert_both(f: &Connection, r: &rusqlite::Connection, sql: &str) {
-    f.execute(sql).unwrap();
+async fn insert_both(f: &Connection, r: &rusqlite::Connection, sql: &str) {
+    f.execute(sql).await.unwrap();
     r.execute_batch(sql).unwrap();
 }
 
-fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, label: &str) {
+async fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, label: &str) {
     assert_eq!(
-        frank_rows(f, sql),
+        frank_rows(f, sql).await,
         sqlite_rows(r, sql),
         "[{label}] diverged: `{sql}`"
     );
 }
 
-fn check(label: &str, ddl: &[&str]) {
-    let (f, r) = setup(ddl);
+async fn check(label: &str, ddl: &[&str]) {
+    let (f, r) = setup(ddl).await;
     for i in 1..=400_i64 {
         // a: 0..39, with a NULL every 13th row; x is not indexed.
         let a = if i % 13 == 0 {
@@ -111,7 +113,8 @@ fn check(label: &str, ddl: &[&str]) {
             &f,
             &r,
             &format!("INSERT INTO t VALUES ({i}, {a}, {});", i * 3),
-        );
+        )
+        .await;
     }
     // Covering ranges (output = rowid / indexed column): must seek idx_a, never open table t.
     let covering = [
@@ -125,13 +128,13 @@ fn check(label: &str, ddl: &[&str]) {
         "SELECT id FROM t WHERE a < 999", // non-selective: still covering, still <= full scan
     ];
     for sql in covering {
-        cmp(&f, &r, sql, label);
+        cmp(&f, &r, sql, label).await;
         assert!(
-            opens(&f, sql, "idx_a"),
+            opens(&f, sql, "idx_a").await,
             "[{label}] covering range must seek idx_a: `{sql}`"
         );
         assert!(
-            !opens(&f, sql, "t"),
+            !opens(&f, sql, "t").await,
             "[{label}] covering range must not open table t: `{sql}`"
         );
     }
@@ -141,55 +144,64 @@ fn check(label: &str, ddl: &[&str]) {
         "SELECT x FROM t WHERE a < 5",
         "SELECT id, x FROM t WHERE a BETWEEN 10 AND 12",
     ] {
-        cmp(&f, &r, sql, label);
+        cmp(&f, &r, sql, label).await;
     }
 }
 
 #[test]
 fn covering_range_before_directive_matches_sqlite() {
-    check(
-        "single idx_a",
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, x INTEGER);",
-            "CREATE INDEX idx_a ON t(a);",
-        ],
-    );
-    // Composite (a,b) declared FIRST must not shadow the single-column idx_a.
-    check(
-        "shadowed idx_a",
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, x INTEGER);",
-            "CREATE INDEX idx_ax ON t(a, x);",
-            "CREATE INDEX idx_a ON t(a);",
-        ],
-    );
+    asupersync::test_utils::run_test(|| async {
+        check(
+            "single idx_a",
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, x INTEGER);",
+                "CREATE INDEX idx_a ON t(a);",
+            ],
+        )
+        .await;
+        // Composite (a,b) declared FIRST must not shadow the single-column idx_a.
+        check(
+            "shadowed idx_a",
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, x INTEGER);",
+                "CREATE INDEX idx_ax ON t(a, x);",
+                "CREATE INDEX idx_a ON t(a);",
+            ],
+        )
+        .await;
+    });
 }
 
 #[test]
 fn covering_range_edge_cases() {
-    let (f, r) = setup(&[
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER);",
-        "CREATE INDEX idx_a ON t(a);",
-    ]);
-    let q = "SELECT id FROM t WHERE a < 5";
-    cmp(&f, &r, q, "empty");
-    insert_both(&f, &r, "INSERT INTO t VALUES (1, NULL), (2, NULL);");
-    cmp(&f, &r, q, "all-null-excluded"); // NULL < 5 is not true → 0 rows
-    insert_both(
-        &f,
-        &r,
-        "INSERT INTO t VALUES (3, 1), (4, 4), (5, 5), (6, 9);",
-    );
-    cmp(&f, &r, q, "mixed");
-    cmp(&f, &r, "SELECT id FROM t WHERE a >= 5", "ge-with-nulls");
-    cmp(
-        &f,
-        &r,
-        "SELECT id FROM t WHERE a BETWEEN 1 AND 4",
-        "between",
-    );
-    assert!(
-        opens(&f, q, "idx_a") && !opens(&f, q, "t"),
-        "edge: covering seek gate"
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER);",
+            "CREATE INDEX idx_a ON t(a);",
+        ])
+        .await;
+        let q = "SELECT id FROM t WHERE a < 5";
+        cmp(&f, &r, q, "empty").await;
+        insert_both(&f, &r, "INSERT INTO t VALUES (1, NULL), (2, NULL);").await;
+        cmp(&f, &r, q, "all-null-excluded").await; // NULL < 5 is not true → 0 rows
+        insert_both(
+            &f,
+            &r,
+            "INSERT INTO t VALUES (3, 1), (4, 4), (5, 5), (6, 9);",
+        )
+        .await;
+        cmp(&f, &r, q, "mixed").await;
+        cmp(&f, &r, "SELECT id FROM t WHERE a >= 5", "ge-with-nulls").await;
+        cmp(
+            &f,
+            &r,
+            "SELECT id FROM t WHERE a BETWEEN 1 AND 4",
+            "between",
+        )
+        .await;
+        assert!(
+            opens(&f, q, "idx_a").await && !opens(&f, q, "t").await,
+            "edge: covering seek gate"
+        );
+    });
 }

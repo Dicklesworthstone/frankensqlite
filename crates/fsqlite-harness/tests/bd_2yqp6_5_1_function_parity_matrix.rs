@@ -27,8 +27,10 @@ use fsqlite_types::value::SqliteValue;
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-fn open_mem() -> Connection {
-    Connection::open(":memory:").expect("in-memory connection")
+async fn open_mem() -> Connection {
+    Connection::open(":memory:")
+        .await
+        .expect("in-memory connection")
 }
 
 fn open_rusqlite() -> rusqlite::Connection {
@@ -36,11 +38,11 @@ fn open_rusqlite() -> rusqlite::Connection {
 }
 
 /// Compare a single SELECT expression between fsqlite and rusqlite.
-fn compare_expr(sql: &str) -> (bool, String, String) {
-    let fs = open_mem();
+async fn compare_expr(sql: &str) -> (bool, String, String) {
+    let fs = open_mem().await;
     let rs = open_rusqlite();
 
-    let fs_val = match fs.query(sql) {
+    let fs_val = match fs.query(sql).await {
         Ok(rows) if !rows.is_empty() => format_sqlite_value(&rows[0].values()[0]),
         Ok(_) => "(empty)".to_string(),
         Err(e) => format!("ERR:{e}"),
@@ -56,12 +58,12 @@ fn compare_expr(sql: &str) -> (bool, String, String) {
 }
 
 /// Compare expressions using connections with pre-populated tables.
-fn compare_with_tables(
+async fn compare_with_tables(
     fs_conn: &Connection,
     rs_conn: &rusqlite::Connection,
     sql: &str,
 ) -> (bool, String, String) {
-    let fs_val = match fs_conn.query(sql) {
+    let fs_val = match fs_conn.query(sql).await {
         Ok(rows) if !rows.is_empty() => format_sqlite_value(&rows[0].values()[0]),
         Ok(_) => "(empty)".to_string(),
         Err(e) => format!("ERR:{e}"),
@@ -77,12 +79,12 @@ fn compare_with_tables(
 }
 
 /// Compare full rowsets for multi-column / multi-row queries.
-fn compare_query_rows(
+async fn compare_query_rows(
     fs_conn: &Connection,
     rs_conn: &rusqlite::Connection,
     sql: &str,
 ) -> (bool, Vec<Vec<String>>, Vec<Vec<String>>) {
-    let fs_rows = match fs_conn.query(sql) {
+    let fs_rows = match fs_conn.query(sql).await {
         Ok(rows) => rows
             .iter()
             .map(|row| row.values().iter().map(format_sqlite_value).collect())
@@ -219,14 +221,14 @@ const KNOWN_RUSQLITE_BINDING_DIFFS: &[&str] = &[
     "null_char",
 ];
 
-fn run_compat_suite(suite: &str, tests: &[CompatTest]) -> (usize, usize) {
+async fn run_compat_suite(suite: &str, tests: &[CompatTest]) -> (usize, usize) {
     let mut passed = 0;
     let mut failed = 0;
     let mut skipped = 0;
     let mut failures = Vec::new();
 
     for test in tests {
-        let (ok, fs_val, rs_val) = compare_expr(test.sql);
+        let (ok, fs_val, rs_val) = compare_expr(test.sql).await;
         if ok {
             passed += 1;
         } else if KNOWN_RUSQLITE_BINDING_DIFFS.contains(&test.name) {
@@ -435,7 +437,9 @@ fn test_datetime_functions() {
         },
     ];
 
-    run_compat_suite("datetime", &tests);
+    asupersync::test_utils::run_test(|| async {
+        run_compat_suite("datetime", &tests).await;
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -563,7 +567,9 @@ fn test_format_printf_functions() {
         },
     ];
 
-    run_compat_suite("format_printf", &tests);
+    asupersync::test_utils::run_test(|| async {
+        run_compat_suite("format_printf", &tests).await;
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -623,7 +629,9 @@ fn test_hex_unhex_parity() {
         },
     ];
 
-    run_compat_suite("hex_unhex", &tests);
+    asupersync::test_utils::run_test(|| async {
+        run_compat_suite("hex_unhex", &tests).await;
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -701,7 +709,9 @@ fn test_like_glob_parity() {
         },
     ];
 
-    run_compat_suite("like_glob", &tests);
+    asupersync::test_utils::run_test(|| async {
+        run_compat_suite("like_glob", &tests).await;
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -765,7 +775,9 @@ fn test_null_propagation_extended() {
         },
     ];
 
-    run_compat_suite("null_extended", &tests);
+    asupersync::test_utils::run_test(|| async {
+        run_compat_suite("null_extended", &tests).await;
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -825,7 +837,9 @@ fn test_cast_edge_cases() {
         },
     ];
 
-    run_compat_suite("cast_edge", &tests);
+    asupersync::test_utils::run_test(|| async {
+        run_compat_suite("cast_edge", &tests).await;
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -924,7 +938,9 @@ fn test_string_edge_cases() {
         },
     ];
 
-    run_compat_suite("string_edge", &tests);
+    asupersync::test_utils::run_test(|| async {
+        run_compat_suite("string_edge", &tests).await;
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -984,7 +1000,9 @@ fn test_numeric_edge_cases() {
         },
     ];
 
-    run_compat_suite("numeric_edge", &tests);
+    asupersync::test_utils::run_test(|| async {
+        run_compat_suite("numeric_edge", &tests).await;
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -993,87 +1011,89 @@ fn test_numeric_edge_cases() {
 
 #[test]
 fn test_aggregate_extended() {
-    let fs = open_mem();
-    let rs = open_rusqlite();
+    asupersync::test_utils::run_test(|| async {
+        let fs = open_mem().await;
+        let rs = open_rusqlite();
 
-    for sql in &[
-        "CREATE TABLE t (grp TEXT, val INTEGER, txt TEXT)",
-        "INSERT INTO t VALUES ('a', 10, 'foo')",
-        "INSERT INTO t VALUES ('a', 20, 'bar')",
-        "INSERT INTO t VALUES ('a', 30, 'baz')",
-        "INSERT INTO t VALUES ('b', 100, 'one')",
-        "INSERT INTO t VALUES ('b', 200, 'two')",
-        "INSERT INTO t VALUES ('c', NULL, NULL)",
-    ] {
-        fs.execute(sql).unwrap();
-        rs.execute(sql, []).unwrap();
-    }
-
-    let tests = vec![
-        CompatTest {
-            name: "group_concat_sep",
-            sql: "SELECT group_concat(txt, '; ') FROM t WHERE grp = 'a'",
-        },
-        CompatTest {
-            name: "group_concat_null_skip",
-            sql: "SELECT group_concat(txt) FROM t WHERE grp = 'c'",
-        },
-        CompatTest {
-            name: "sum_empty",
-            sql: "SELECT sum(val) FROM t WHERE 0",
-        },
-        CompatTest {
-            name: "total_empty",
-            sql: "SELECT total(val) FROM t WHERE 0",
-        },
-        CompatTest {
-            name: "count_star_empty",
-            sql: "SELECT count(*) FROM t WHERE 0",
-        },
-        CompatTest {
-            name: "avg_single",
-            sql: "SELECT avg(val) FROM t WHERE grp = 'c'",
-        },
-        CompatTest {
-            name: "avg_null_only",
-            sql: "SELECT avg(val) FROM t WHERE grp = 'c'",
-        },
-        CompatTest {
-            name: "max_empty",
-            sql: "SELECT max(val) FROM t WHERE 0",
-        },
-        CompatTest {
-            name: "min_empty",
-            sql: "SELECT min(val) FROM t WHERE 0",
-        },
-    ];
-
-    let mut passed = 0;
-    let mut failed = 0;
-    let mut failures = Vec::new();
-
-    for test in &tests {
-        let (ok, fs_val, rs_val) = compare_with_tables(&fs, &rs, test.sql);
-        if ok {
-            passed += 1;
-        } else {
-            failed += 1;
-            failures.push(format!(
-                "  FAIL {}: fsqlite={} rusqlite={} sql={}",
-                test.name, fs_val, rs_val, test.sql
-            ));
+        for sql in &[
+            "CREATE TABLE t (grp TEXT, val INTEGER, txt TEXT)",
+            "INSERT INTO t VALUES ('a', 10, 'foo')",
+            "INSERT INTO t VALUES ('a', 20, 'bar')",
+            "INSERT INTO t VALUES ('a', 30, 'baz')",
+            "INSERT INTO t VALUES ('b', 100, 'one')",
+            "INSERT INTO t VALUES ('b', 200, 'two')",
+            "INSERT INTO t VALUES ('c', NULL, NULL)",
+        ] {
+            fs.execute(sql).await.unwrap();
+            rs.execute(sql, []).unwrap();
         }
-    }
 
-    let total = passed + failed;
-    println!("[aggregate_extended] {passed}/{total} passed");
-    for f in &failures {
-        println!("{f}");
-    }
-    assert_eq!(
-        failed, 0,
-        "[aggregate_extended] {failed}/{total} mismatches"
-    );
+        let tests = vec![
+            CompatTest {
+                name: "group_concat_sep",
+                sql: "SELECT group_concat(txt, '; ') FROM t WHERE grp = 'a'",
+            },
+            CompatTest {
+                name: "group_concat_null_skip",
+                sql: "SELECT group_concat(txt) FROM t WHERE grp = 'c'",
+            },
+            CompatTest {
+                name: "sum_empty",
+                sql: "SELECT sum(val) FROM t WHERE 0",
+            },
+            CompatTest {
+                name: "total_empty",
+                sql: "SELECT total(val) FROM t WHERE 0",
+            },
+            CompatTest {
+                name: "count_star_empty",
+                sql: "SELECT count(*) FROM t WHERE 0",
+            },
+            CompatTest {
+                name: "avg_single",
+                sql: "SELECT avg(val) FROM t WHERE grp = 'c'",
+            },
+            CompatTest {
+                name: "avg_null_only",
+                sql: "SELECT avg(val) FROM t WHERE grp = 'c'",
+            },
+            CompatTest {
+                name: "max_empty",
+                sql: "SELECT max(val) FROM t WHERE 0",
+            },
+            CompatTest {
+                name: "min_empty",
+                sql: "SELECT min(val) FROM t WHERE 0",
+            },
+        ];
+
+        let mut passed = 0;
+        let mut failed = 0;
+        let mut failures = Vec::new();
+
+        for test in &tests {
+            let (ok, fs_val, rs_val) = compare_with_tables(&fs, &rs, test.sql).await;
+            if ok {
+                passed += 1;
+            } else {
+                failed += 1;
+                failures.push(format!(
+                    "  FAIL {}: fsqlite={} rusqlite={} sql={}",
+                    test.name, fs_val, rs_val, test.sql
+                ));
+            }
+        }
+
+        let total = passed + failed;
+        println!("[aggregate_extended] {passed}/{total} passed");
+        for f in &failures {
+            println!("{f}");
+        }
+        assert_eq!(
+            failed, 0,
+            "[aggregate_extended] {failed}/{total} mismatches"
+        );
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -1164,7 +1184,9 @@ fn test_expression_edge_cases() {
         },
     ];
 
-    run_compat_suite("expression_edge", &tests);
+    asupersync::test_utils::run_test(|| async {
+        run_compat_suite("expression_edge", &tests).await;
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -1204,7 +1226,9 @@ fn test_probability_hint_and_random_contracts() {
         },
     ];
 
-    run_compat_suite("planner_hint_random", &tests);
+    asupersync::test_utils::run_test(|| async {
+        run_compat_suite("planner_hint_random", &tests).await;
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -1213,57 +1237,59 @@ fn test_probability_hint_and_random_contracts() {
 
 #[test]
 fn test_stateful_meta_function_parity() {
-    let fs = open_mem();
-    let rs = open_rusqlite();
+    asupersync::test_utils::run_test(|| async {
+        let fs = open_mem().await;
+        let rs = open_rusqlite();
 
-    for sql in &[
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)",
-        "INSERT INTO t (data) VALUES ('alpha')",
-        "INSERT INTO t (data) VALUES ('beta')",
-        "UPDATE t SET data = 'beta2' WHERE id = 2",
-    ] {
-        fs.execute(sql).unwrap();
-        rs.execute(sql, []).unwrap();
-    }
-
-    let tests = vec![
-        CompatTest {
-            name: "last_insert_rowid_after_update",
-            sql: "SELECT last_insert_rowid()",
-        },
-        CompatTest {
-            name: "changes_after_update",
-            sql: "SELECT changes()",
-        },
-        CompatTest {
-            name: "total_changes_after_update",
-            sql: "SELECT total_changes()",
-        },
-    ];
-
-    let mut passed = 0;
-    let mut failed = 0;
-    let mut failures = Vec::new();
-
-    for test in &tests {
-        let (ok, fs_val, rs_val) = compare_with_tables(&fs, &rs, test.sql);
-        if ok {
-            passed += 1;
-        } else {
-            failed += 1;
-            failures.push(format!(
-                "  FAIL {}: fsqlite={} rusqlite={} sql={}",
-                test.name, fs_val, rs_val, test.sql
-            ));
+        for sql in &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)",
+            "INSERT INTO t (data) VALUES ('alpha')",
+            "INSERT INTO t (data) VALUES ('beta')",
+            "UPDATE t SET data = 'beta2' WHERE id = 2",
+        ] {
+            fs.execute(sql).await.unwrap();
+            rs.execute(sql, []).unwrap();
         }
-    }
 
-    let total = passed + failed;
-    println!("[stateful_meta] {passed}/{total} passed");
-    for failure in &failures {
-        println!("{failure}");
-    }
-    assert_eq!(failed, 0, "stateful meta mismatches: {failed}/{total}");
+        let tests = vec![
+            CompatTest {
+                name: "last_insert_rowid_after_update",
+                sql: "SELECT last_insert_rowid()",
+            },
+            CompatTest {
+                name: "changes_after_update",
+                sql: "SELECT changes()",
+            },
+            CompatTest {
+                name: "total_changes_after_update",
+                sql: "SELECT total_changes()",
+            },
+        ];
+
+        let mut passed = 0;
+        let mut failed = 0;
+        let mut failures = Vec::new();
+
+        for test in &tests {
+            let (ok, fs_val, rs_val) = compare_with_tables(&fs, &rs, test.sql).await;
+            if ok {
+                passed += 1;
+            } else {
+                failed += 1;
+                failures.push(format!(
+                    "  FAIL {}: fsqlite={} rusqlite={} sql={}",
+                    test.name, fs_val, rs_val, test.sql
+                ));
+            }
+        }
+
+        let total = passed + failed;
+        println!("[stateful_meta] {passed}/{total} passed");
+        for failure in &failures {
+            println!("{failure}");
+        }
+        assert_eq!(failed, 0, "stateful meta mismatches: {failed}/{total}");
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -1272,22 +1298,6 @@ fn test_stateful_meta_function_parity() {
 
 #[test]
 fn test_window_function_parity() {
-    let fs = open_mem();
-    let rs = open_rusqlite();
-
-    for sql in &[
-        "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER)",
-        "INSERT INTO emp VALUES (1, 'Alice', 'eng', 120)",
-        "INSERT INTO emp VALUES (2, 'Bob', 'eng', 100)",
-        "INSERT INTO emp VALUES (3, 'Carol', 'sales', 100)",
-        "INSERT INTO emp VALUES (4, 'Dave', 'sales', 80)",
-        "INSERT INTO emp VALUES (5, 'Eve', 'hr', 110)",
-        "INSERT INTO emp VALUES (6, 'Frank', 'hr', 95)",
-    ] {
-        fs.execute(sql).unwrap();
-        rs.execute(sql, []).unwrap();
-    }
-
     let tests = [
         (
             "row_number_global",
@@ -1339,35 +1349,53 @@ fn test_window_function_parity() {
         ),
     ];
 
-    let mut passed = 0;
-    let mut failed = 0;
-    let mut failures = Vec::new();
-    let mut observed_failure_names = BTreeSet::new();
+    asupersync::test_utils::run_test(|| async {
+        let fs = open_mem().await;
+        let rs = open_rusqlite();
 
-    for (name, sql) in tests {
-        let (ok, fs_rows, rs_rows) = compare_query_rows(&fs, &rs, sql);
-        if ok {
-            passed += 1;
-        } else {
-            failed += 1;
-            observed_failure_names.insert(name);
-            failures.push(format!(
-                "  FAIL {name}: fsqlite={fs_rows:?} rusqlite={rs_rows:?} sql={sql}"
-            ));
+        for sql in &[
+            "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER)",
+            "INSERT INTO emp VALUES (1, 'Alice', 'eng', 120)",
+            "INSERT INTO emp VALUES (2, 'Bob', 'eng', 100)",
+            "INSERT INTO emp VALUES (3, 'Carol', 'sales', 100)",
+            "INSERT INTO emp VALUES (4, 'Dave', 'sales', 80)",
+            "INSERT INTO emp VALUES (5, 'Eve', 'hr', 110)",
+            "INSERT INTO emp VALUES (6, 'Frank', 'hr', 95)",
+        ] {
+            fs.execute(sql).await.unwrap();
+            rs.execute(sql, []).unwrap();
         }
-    }
 
-    let expected_failure_names: BTreeSet<&str> = BTreeSet::new();
-    let total = passed + failed;
-    println!("[window_parity] {passed}/{total} passed");
-    for failure in &failures {
-        println!("{failure}");
-    }
-    assert_eq!(
-        observed_failure_names, expected_failure_names,
-        "window parity gaps changed unexpectedly"
-    );
-    assert_eq!(failed, expected_failure_names.len());
+        let mut passed = 0;
+        let mut failed = 0;
+        let mut failures = Vec::new();
+        let mut observed_failure_names = BTreeSet::new();
+
+        for (name, sql) in tests {
+            let (ok, fs_rows, rs_rows) = compare_query_rows(&fs, &rs, sql).await;
+            if ok {
+                passed += 1;
+            } else {
+                failed += 1;
+                observed_failure_names.insert(name);
+                failures.push(format!(
+                    "  FAIL {name}: fsqlite={fs_rows:?} rusqlite={rs_rows:?} sql={sql}"
+                ));
+            }
+        }
+
+        let expected_failure_names: BTreeSet<&str> = BTreeSet::new();
+        let total = passed + failed;
+        println!("[window_parity] {passed}/{total} passed");
+        for failure in &failures {
+            println!("{failure}");
+        }
+        assert_eq!(
+            observed_failure_names, expected_failure_names,
+            "window parity gaps changed unexpectedly"
+        );
+        assert_eq!(failed, expected_failure_names.len());
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -1376,22 +1404,6 @@ fn test_window_function_parity() {
 
 #[test]
 fn test_window_function_extended_parity() {
-    let fs = open_mem();
-    let rs = open_rusqlite();
-
-    for sql in &[
-        "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER)",
-        "INSERT INTO emp VALUES (1, 'Alice', 'eng', 120)",
-        "INSERT INTO emp VALUES (2, 'Bob', 'eng', 100)",
-        "INSERT INTO emp VALUES (3, 'Carol', 'sales', 100)",
-        "INSERT INTO emp VALUES (4, 'Dave', 'sales', 80)",
-        "INSERT INTO emp VALUES (5, 'Eve', 'hr', 110)",
-        "INSERT INTO emp VALUES (6, 'Frank', 'hr', 95)",
-    ] {
-        fs.execute(sql).unwrap();
-        rs.execute(sql, []).unwrap();
-    }
-
     let tests = [
         // Partitioned row_number/rank/dense_rank
         (
@@ -1458,35 +1470,53 @@ fn test_window_function_extended_parity() {
         ),
     ];
 
-    let mut passed = 0;
-    let mut failed = 0;
-    let mut failures = Vec::new();
-    let mut observed_failure_names = BTreeSet::new();
+    asupersync::test_utils::run_test(|| async {
+        let fs = open_mem().await;
+        let rs = open_rusqlite();
 
-    for (name, sql) in tests {
-        let (ok, fs_rows, rs_rows) = compare_query_rows(&fs, &rs, sql);
-        if ok {
-            passed += 1;
-        } else {
-            failed += 1;
-            observed_failure_names.insert(name);
-            failures.push(format!(
-                "  FAIL {name}: fsqlite={fs_rows:?} rusqlite={rs_rows:?} sql={sql}"
-            ));
+        for sql in &[
+            "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER)",
+            "INSERT INTO emp VALUES (1, 'Alice', 'eng', 120)",
+            "INSERT INTO emp VALUES (2, 'Bob', 'eng', 100)",
+            "INSERT INTO emp VALUES (3, 'Carol', 'sales', 100)",
+            "INSERT INTO emp VALUES (4, 'Dave', 'sales', 80)",
+            "INSERT INTO emp VALUES (5, 'Eve', 'hr', 110)",
+            "INSERT INTO emp VALUES (6, 'Frank', 'hr', 95)",
+        ] {
+            fs.execute(sql).await.unwrap();
+            rs.execute(sql, []).unwrap();
         }
-    }
 
-    let expected_failure_names: BTreeSet<&str> = BTreeSet::new();
-    let total = passed + failed;
-    println!("[window_extended] {passed}/{total} passed");
-    for failure in &failures {
-        println!("{failure}");
-    }
-    assert_eq!(
-        observed_failure_names, expected_failure_names,
-        "extended window parity gaps changed unexpectedly"
-    );
-    assert_eq!(failed, expected_failure_names.len());
+        let mut passed = 0;
+        let mut failed = 0;
+        let mut failures = Vec::new();
+        let mut observed_failure_names = BTreeSet::new();
+
+        for (name, sql) in tests {
+            let (ok, fs_rows, rs_rows) = compare_query_rows(&fs, &rs, sql).await;
+            if ok {
+                passed += 1;
+            } else {
+                failed += 1;
+                observed_failure_names.insert(name);
+                failures.push(format!(
+                    "  FAIL {name}: fsqlite={fs_rows:?} rusqlite={rs_rows:?} sql={sql}"
+                ));
+            }
+        }
+
+        let expected_failure_names: BTreeSet<&str> = BTreeSet::new();
+        let total = passed + failed;
+        println!("[window_extended] {passed}/{total} passed");
+        for failure in &failures {
+            println!("{failure}");
+        }
+        assert_eq!(
+            observed_failure_names, expected_failure_names,
+            "extended window parity gaps changed unexpectedly"
+        );
+        assert_eq!(failed, expected_failure_names.len());
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -1495,21 +1525,6 @@ fn test_window_function_extended_parity() {
 
 #[test]
 fn test_window_function_edge_cases() {
-    let fs = open_mem();
-    let rs = open_rusqlite();
-
-    for sql in &[
-        "CREATE TABLE nums (id INTEGER PRIMARY KEY, val INTEGER, grp TEXT)",
-        "INSERT INTO nums VALUES (1, NULL, 'a')",
-        "INSERT INTO nums VALUES (2, 10, 'a')",
-        "INSERT INTO nums VALUES (3, 20, 'b')",
-        "INSERT INTO nums VALUES (4, NULL, 'b')",
-        "INSERT INTO nums VALUES (5, 10, 'a')",
-    ] {
-        fs.execute(sql).unwrap();
-        rs.execute(sql, []).unwrap();
-    }
-
     let tests = [
         // NULL values in aggregations
         (
@@ -1556,35 +1571,52 @@ fn test_window_function_edge_cases() {
         ),
     ];
 
-    let mut passed = 0;
-    let mut failed = 0;
-    let mut failures = Vec::new();
-    let mut observed_failure_names = BTreeSet::new();
+    asupersync::test_utils::run_test(|| async {
+        let fs = open_mem().await;
+        let rs = open_rusqlite();
 
-    for (name, sql) in tests {
-        let (ok, fs_rows, rs_rows) = compare_query_rows(&fs, &rs, sql);
-        if ok {
-            passed += 1;
-        } else {
-            failed += 1;
-            observed_failure_names.insert(name);
-            failures.push(format!(
-                "  FAIL {name}: fsqlite={fs_rows:?} rusqlite={rs_rows:?} sql={sql}"
-            ));
+        for sql in &[
+            "CREATE TABLE nums (id INTEGER PRIMARY KEY, val INTEGER, grp TEXT)",
+            "INSERT INTO nums VALUES (1, NULL, 'a')",
+            "INSERT INTO nums VALUES (2, 10, 'a')",
+            "INSERT INTO nums VALUES (3, 20, 'b')",
+            "INSERT INTO nums VALUES (4, NULL, 'b')",
+            "INSERT INTO nums VALUES (5, 10, 'a')",
+        ] {
+            fs.execute(sql).await.unwrap();
+            rs.execute(sql, []).unwrap();
         }
-    }
 
-    let expected_failure_names: BTreeSet<&str> = BTreeSet::new();
-    let total = passed + failed;
-    println!("[window_edge_cases] {passed}/{total} passed");
-    for failure in &failures {
-        println!("{failure}");
-    }
-    assert_eq!(
-        observed_failure_names, expected_failure_names,
-        "window edge case gaps changed unexpectedly"
-    );
-    assert_eq!(failed, expected_failure_names.len());
+        let mut passed = 0;
+        let mut failed = 0;
+        let mut failures = Vec::new();
+        let mut observed_failure_names = BTreeSet::new();
+
+        for (name, sql) in tests {
+            let (ok, fs_rows, rs_rows) = compare_query_rows(&fs, &rs, sql).await;
+            if ok {
+                passed += 1;
+            } else {
+                failed += 1;
+                observed_failure_names.insert(name);
+                failures.push(format!(
+                    "  FAIL {name}: fsqlite={fs_rows:?} rusqlite={rs_rows:?} sql={sql}"
+                ));
+            }
+        }
+
+        let expected_failure_names: BTreeSet<&str> = BTreeSet::new();
+        let total = passed + failed;
+        println!("[window_edge_cases] {passed}/{total} passed");
+        for failure in &failures {
+            println!("{failure}");
+        }
+        assert_eq!(
+            observed_failure_names, expected_failure_names,
+            "window edge case gaps changed unexpectedly"
+        );
+        assert_eq!(failed, expected_failure_names.len());
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -1593,69 +1625,73 @@ fn test_window_function_edge_cases() {
 
 #[test]
 fn test_sqlite_meta_functions() {
-    // These return known values; not compared against rusqlite since they
-    // deliberately differ (fsqlite returns its own version info).
-    let conn = open_mem();
+    asupersync::test_utils::run_test(|| async {
+        // These return known values; not compared against rusqlite since they
+        // deliberately differ (fsqlite returns its own version info).
+        let conn = open_mem().await;
 
-    // sqlite_version() should return a version string
-    let rows = conn.query("SELECT sqlite_version()").unwrap();
-    let version = match &rows[0].values()[0] {
-        SqliteValue::Text(s) => s.to_string(),
-        other => panic!("expected text, got {other:?}"),
-    };
-    assert!(
-        version.starts_with("3."),
-        "sqlite_version should start with '3.', got: {version}"
-    );
-
-    // typeof() basic sanity
-    let rows = conn.query("SELECT typeof(sqlite_version())").unwrap();
-    assert_eq!(
-        rows[0].values()[0],
-        SqliteValue::Text("text".to_string().into())
-    );
-
-    // sqlite_compileoption_used should expose the configured feature surface
-    let rows = conn
-        .query(
-            "SELECT \
-             sqlite_compileoption_used('THREADSAFE'), \
-             sqlite_compileoption_used('SQLITE_ENABLE_ICU'), \
-             sqlite_compileoption_used('ENABLE_FTS3')",
-        )
-        .unwrap();
-    assert_eq!(
-        rows[0].values(),
-        &[
-            SqliteValue::Integer(1),
-            SqliteValue::Integer(1),
-            SqliteValue::Integer(0),
-        ]
-    );
-
-    let pragma_rows = conn.query("PRAGMA compile_options").unwrap();
-    let pragma_options: Vec<String> = pragma_rows
-        .iter()
-        .map(|row| match &row.values()[0] {
+        // sqlite_version() should return a version string
+        let rows = conn.query("SELECT sqlite_version()").await.unwrap();
+        let version = match &rows[0].values()[0] {
             SqliteValue::Text(s) => s.to_string(),
             other => panic!("expected text, got {other:?}"),
-        })
-        .collect();
+        };
+        assert!(
+            version.starts_with("3."),
+            "sqlite_version should start with '3.', got: {version}"
+        );
 
-    let mut get_options = Vec::new();
-    for index in 0_i64.. {
+        // typeof() basic sanity
+        let rows = conn.query("SELECT typeof(sqlite_version())").await.unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text("text".to_string().into())
+        );
+
+        // sqlite_compileoption_used should expose the configured feature surface
         let rows = conn
-            .query(&format!("SELECT sqlite_compileoption_get({index})"))
+            .query(
+                "SELECT \
+                 sqlite_compileoption_used('THREADSAFE'), \
+                 sqlite_compileoption_used('SQLITE_ENABLE_ICU'), \
+                 sqlite_compileoption_used('ENABLE_FTS3')",
+            )
+            .await
             .unwrap();
-        match &rows[0].values()[0] {
-            SqliteValue::Text(option) => get_options.push(option.to_string()),
-            SqliteValue::Null => break,
-            other => panic!("expected text or null, got {other:?}"),
-        }
-    }
-    assert_eq!(pragma_options, get_options);
+        assert_eq!(
+            rows[0].values(),
+            &[
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(0),
+            ]
+        );
 
-    println!("[meta_functions] all assertions passed");
+        let pragma_rows = conn.query("PRAGMA compile_options").await.unwrap();
+        let pragma_options: Vec<String> = pragma_rows
+            .iter()
+            .map(|row| match &row.values()[0] {
+                SqliteValue::Text(s) => s.to_string(),
+                other => panic!("expected text, got {other:?}"),
+            })
+            .collect();
+
+        let mut get_options = Vec::new();
+        for index in 0_i64.. {
+            let rows = conn
+                .query(&format!("SELECT sqlite_compileoption_get({index})"))
+                .await
+                .unwrap();
+            match &rows[0].values()[0] {
+                SqliteValue::Text(option) => get_options.push(option.to_string()),
+                SqliteValue::Null => break,
+                other => panic!("expected text or null, got {other:?}"),
+            }
+        }
+        assert_eq!(pragma_options, get_options);
+
+        println!("[meta_functions] all assertions passed");
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════

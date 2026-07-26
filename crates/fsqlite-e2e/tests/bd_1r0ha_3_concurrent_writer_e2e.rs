@@ -1,6 +1,7 @@
 //! Deterministic concurrent-writer e2e matrix with fairness/latency evidence.
 //!
 //! Bead: bd-1r0ha.3
+#![recursion_limit = "512"]
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,7 +16,7 @@ use fsqlite_e2e::oplog::{
 use fsqlite_e2e::perf_runner::{FsqliteHotPathProfileConfig, profile_fsqlite_hot_path_oplog};
 use fsqlite_e2e::report::EngineRunReport;
 use fsqlite_e2e::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
-use fsqlite_e2e::{E2eResult, HarnessSettings};
+use fsqlite_e2e::{E2eResult, HarnessSettings, block_on};
 use fsqlite_types::SqliteValue;
 use serde_json::json;
 use tempfile::tempdir;
@@ -206,33 +207,38 @@ fn writer_progress_fsqlite(db_path: &Path, writer_count: u16) -> WriterProgress 
     let Some(path) = db_path.to_str() else {
         return WriterProgress::default();
     };
-    let conn = match fsqlite::Connection::open(path) {
-        Ok(conn) => conn,
-        Err(_) => return WriterProgress::default(),
-    };
-    let mut commits = Vec::new();
-    for writer_id in 0..writer_count {
-        let table = writer_progress_table_name(writer_id);
-        let sql = format!("SELECT COUNT(*) FROM {table};");
-        let rows = match conn.query(&sql) {
-            Ok(rows) => rows,
-            Err(_) => {
-                commits.push(0);
-                continue;
-            }
+    // The surrounding harness entry points (`run_oplog_fsqlite`, `run_benchmark`)
+    // are synchronous and drive the engine on the harness-owned runtime, so this
+    // probe uses the same bridge instead of building a nested runtime.
+    block_on(async {
+        let conn = match fsqlite::Connection::open(path).await {
+            Ok(conn) => conn,
+            Err(_) => return WriterProgress::default(),
         };
-        let count = rows
-            .first()
-            .and_then(|row| row.get(0))
-            .and_then(|value| match value {
-                SqliteValue::Integer(v) => u64::try_from(*v).ok(),
-                _ => None,
-            })
-            .unwrap_or(0);
-        commits.push(count);
-    }
+        let mut commits = Vec::new();
+        for writer_id in 0..writer_count {
+            let table = writer_progress_table_name(writer_id);
+            let sql = format!("SELECT COUNT(*) FROM {table};");
+            let rows = match conn.query(&sql).await {
+                Ok(rows) => rows,
+                Err(_) => {
+                    commits.push(0);
+                    continue;
+                }
+            };
+            let count = rows
+                .first()
+                .and_then(|row| row.get(0))
+                .and_then(|value| match value {
+                    SqliteValue::Integer(v) => u64::try_from(*v).ok(),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            commits.push(count);
+        }
 
-    summarize_progress(&commits)
+        summarize_progress(&commits)
+    })
 }
 
 fn push_worker_progress_table_setup(

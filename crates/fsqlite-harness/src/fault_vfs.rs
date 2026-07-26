@@ -1737,7 +1737,7 @@ mod tests {
 
         let cx = test_cx();
         let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
-        let (mut file, _) = vfs.open(&cx, Some(Path::new("fault.db")), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(Path::new("fault.db")), flags).unwrap();
 
         let err =
             run_io(file.write(&cx, b"1234", 0)).expect_err("disk-full fault should fail write");

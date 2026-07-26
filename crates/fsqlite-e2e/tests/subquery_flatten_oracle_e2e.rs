@@ -24,8 +24,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -57,10 +57,11 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        let frank = frank_rows(f, q).await;
+        match (frank, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -82,11 +83,13 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
     );
 }
 
-fn setup(stmts: &[&str]) -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").unwrap();
+async fn setup(stmts: &[&str]) -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     for s in stmts {
-        f.execute(s).unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
+        f.execute(s)
+            .await
+            .unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
         r.execute_batch(s)
             .unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
     }
@@ -95,93 +98,113 @@ fn setup(stmts: &[&str]) -> (Connection, rusqlite::Connection) {
 
 #[test]
 fn outer_where_after_inner_limit() {
-    let (f, r) = setup(&[
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)",
-        "INSERT INTO t VALUES (1,10),(2,20),(3,5),(4,30),(5,15),(6,25)",
-    ]);
-    check(
-        &f,
-        &r,
-        &[
-            // Inner picks the 3 smallest x (5,10,15); outer filters x>12 -> [15].
-            // A wrong WHERE-pushdown would pick 15,20,25 then keep all -> [15,20,25].
-            "SELECT x FROM (SELECT x FROM t ORDER BY x LIMIT 3) WHERE x > 12 ORDER BY x",
-            // Inner top-3 by x DESC (30,25,20); outer x<28 -> [20,25].
-            "SELECT x FROM (SELECT x FROM t ORDER BY x DESC LIMIT 3) WHERE x < 28 ORDER BY x",
-            "SELECT count(*) FROM (SELECT x FROM t ORDER BY x LIMIT 4)", // 4
-        ],
-        "outer_where_after_inner_limit",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)",
+            "INSERT INTO t VALUES (1,10),(2,20),(3,5),(4,30),(5,15),(6,25)",
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &[
+                // Inner picks the 3 smallest x (5,10,15); outer filters x>12 -> [15].
+                // A wrong WHERE-pushdown would pick 15,20,25 then keep all -> [15,20,25].
+                "SELECT x FROM (SELECT x FROM t ORDER BY x LIMIT 3) WHERE x > 12 ORDER BY x",
+                // Inner top-3 by x DESC (30,25,20); outer x<28 -> [20,25].
+                "SELECT x FROM (SELECT x FROM t ORDER BY x DESC LIMIT 3) WHERE x < 28 ORDER BY x",
+                "SELECT count(*) FROM (SELECT x FROM t ORDER BY x LIMIT 4)", // 4
+            ],
+            "outer_where_after_inner_limit",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn outer_query_after_inner_limit_offset() {
-    let (f, r) = setup(&[
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)",
-        "INSERT INTO t VALUES (1,10),(2,20),(3,5),(4,30),(5,15),(6,25)",
-    ]);
-    check(
-        &f,
-        &r,
-        &[
-            // x DESC LIMIT 2 OFFSET 1 -> 25,20 ; outer ORDER BY x -> [20,25].
-            "SELECT x FROM (SELECT x FROM t ORDER BY x DESC LIMIT 2 OFFSET 1) ORDER BY x",
-            // x ASC LIMIT 2 OFFSET 2 -> 15,20.
-            "SELECT x FROM (SELECT x FROM t ORDER BY x LIMIT 2 OFFSET 2) ORDER BY x",
-        ],
-        "outer_query_after_inner_limit_offset",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)",
+            "INSERT INTO t VALUES (1,10),(2,20),(3,5),(4,30),(5,15),(6,25)",
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &[
+                // x DESC LIMIT 2 OFFSET 1 -> 25,20 ; outer ORDER BY x -> [20,25].
+                "SELECT x FROM (SELECT x FROM t ORDER BY x DESC LIMIT 2 OFFSET 1) ORDER BY x",
+                // x ASC LIMIT 2 OFFSET 2 -> 15,20.
+                "SELECT x FROM (SELECT x FROM t ORDER BY x LIMIT 2 OFFSET 2) ORDER BY x",
+            ],
+            "outer_query_after_inner_limit_offset",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn flatten_aggregate_subquery_outer_filter() {
-    let (f, r) = setup(&[
-        "CREATE TABLE s (g TEXT, v INTEGER)",
-        "INSERT INTO s VALUES ('a',10),('a',20),('b',5),('c',30),('c',5)",
-    ]);
-    check(
-        &f,
-        &r,
-        &[
-            // Per-group sums: a=30,b=5,c=35; outer keeps s>25 -> a,c.
-            "SELECT g, s FROM (SELECT g, sum(v) AS s FROM s GROUP BY g) WHERE s > 25 ORDER BY g",
-        ],
-        "flatten_aggregate_subquery_outer_filter",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE s (g TEXT, v INTEGER)",
+            "INSERT INTO s VALUES ('a',10),('a',20),('b',5),('c',30),('c',5)",
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &[
+                // Per-group sums: a=30,b=5,c=35; outer keeps s>25 -> a,c.
+                "SELECT g, s FROM (SELECT g, sum(v) AS s FROM s GROUP BY g) WHERE s > 25 ORDER BY g",
+            ],
+            "flatten_aggregate_subquery_outer_filter",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn flatten_distinct_subquery_outer_filter() {
-    let (f, r) = setup(&[
-        "CREATE TABLE d (a INTEGER)",
-        "INSERT INTO d VALUES (1),(1),(2),(3),(3),(3),(5)",
-    ]);
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT a FROM (SELECT DISTINCT a FROM d) WHERE a >= 2 ORDER BY a", // 2,3,5
-            "SELECT count(*) FROM (SELECT DISTINCT a FROM d)",                  // 4
-        ],
-        "flatten_distinct_subquery_outer_filter",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE d (a INTEGER)",
+            "INSERT INTO d VALUES (1),(1),(2),(3),(3),(3),(5)",
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT a FROM (SELECT DISTINCT a FROM d) WHERE a >= 2 ORDER BY a", // 2,3,5
+                "SELECT count(*) FROM (SELECT DISTINCT a FROM d)",                  // 4
+            ],
+            "flatten_distinct_subquery_outer_filter",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn flatten_union_subquery_outer_filter() {
-    let (f, r) = setup(&[
-        "CREATE TABLE t1 (a INTEGER)",
-        "CREATE TABLE t2 (b INTEGER)",
-        "INSERT INTO t1 VALUES (5),(10),(15)",
-        "INSERT INTO t2 VALUES (10),(20),(25)",
-    ]);
-    check(
-        &f,
-        &r,
-        &[
-            // UNION dedups (10 appears in both); outer keeps v>10.
-            "SELECT v FROM (SELECT a AS v FROM t1 UNION SELECT b FROM t2) WHERE v > 10 ORDER BY v", // 15,20,25
-        ],
-        "flatten_union_subquery_outer_filter",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE t1 (a INTEGER)",
+            "CREATE TABLE t2 (b INTEGER)",
+            "INSERT INTO t1 VALUES (5),(10),(15)",
+            "INSERT INTO t2 VALUES (10),(20),(25)",
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &[
+                // UNION dedups (10 appears in both); outer keeps v>10.
+                "SELECT v FROM (SELECT a AS v FROM t1 UNION SELECT b FROM t2) WHERE v > 10 ORDER BY v", // 15,20,25
+            ],
+            "flatten_union_subquery_outer_filter",
+        )
+        .await;
+    });
 }

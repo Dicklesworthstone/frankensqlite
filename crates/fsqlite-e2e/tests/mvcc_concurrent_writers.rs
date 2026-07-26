@@ -22,6 +22,7 @@
 //! ```sh
 //! cargo test -p fsqlite-e2e --test mvcc_concurrent_writers -- --nocapture
 //! ```
+#![recursion_limit = "512"]
 
 use std::fmt::Write as FmtWrite;
 use std::time::{Duration, Instant};
@@ -165,8 +166,8 @@ fn sqlite_mvcc_scaling_config() -> SqliteExecConfig {
 }
 
 /// Run a single oplog against FrankenSQLite (sequential baseline).
-fn run_fsqlite_sequential(oplog: &OpLog) -> EngineRunReport {
-    let conn = fsqlite::Connection::open(":memory:").unwrap();
+async fn run_fsqlite_sequential(oplog: &OpLog) -> EngineRunReport {
+    let conn = fsqlite::Connection::open(":memory:").await.unwrap();
     let started = Instant::now();
     let mut ops_ok: u64 = 0;
     let mut error: Option<String> = None;
@@ -198,7 +199,7 @@ fn run_fsqlite_sequential(oplog: &OpLog) -> EngineRunReport {
             fsqlite_e2e::oplog::OpKind::Commit => "COMMIT".to_owned(),
             fsqlite_e2e::oplog::OpKind::Rollback => "ROLLBACK".to_owned(),
         };
-        match conn.execute(&sql) {
+        match conn.execute(&sql).await {
             Ok(_) => ops_ok += 1,
             Err(e) => {
                 if error.is_none() {
@@ -447,98 +448,105 @@ fn mvcc_scaling_report_hot_page_contention() {
 
 #[test]
 fn mvcc_fsqlite_baseline_disjoint() {
-    // Run the same disjoint workload on FrankenSQLite (sequential) as a baseline.
-    let oplog = preset_commutative_inserts_disjoint_keys(
-        "mvcc-baseline-disjoint",
-        SEED,
-        4,
-        DISJOINT_ROWS_PER_WORKER,
-    );
-    let report = run_fsqlite_sequential(&oplog);
-    assert!(report.error.is_none(), "fsqlite error: {:?}", report.error);
-    assert!(report.ops_total > 0, "should have executed operations");
-    println!(
-        "FrankenSQLite baseline (4w sequential): {} ops, {:.1} ops/s, {}ms",
-        report.ops_total, report.ops_per_sec, report.wall_time_ms
-    );
+    asupersync::test_utils::run_test(|| async {
+        // Run the same disjoint workload on FrankenSQLite (sequential) as a baseline.
+        let oplog = preset_commutative_inserts_disjoint_keys(
+            "mvcc-baseline-disjoint",
+            SEED,
+            4,
+            DISJOINT_ROWS_PER_WORKER,
+        );
+        let report = run_fsqlite_sequential(&oplog).await;
+        assert!(report.error.is_none(), "fsqlite error: {:?}", report.error);
+        assert!(report.ops_total > 0, "should have executed operations");
+        println!(
+            "FrankenSQLite baseline (4w sequential): {} ops, {:.1} ops/s, {}ms",
+            report.ops_total, report.ops_per_sec, report.wall_time_ms
+        );
+    });
 }
 
 #[test]
 fn mvcc_fsqlite_baseline_contention() {
-    let oplog = preset_hot_page_contention("mvcc-baseline-contention", SEED, 4, CONTENTION_ROUNDS);
-    let report = run_fsqlite_sequential(&oplog);
-    // Sequential execution has no contention, so should succeed.
-    assert!(report.error.is_none(), "fsqlite error: {:?}", report.error);
-    assert!(report.ops_total > 0, "should have executed operations");
-    println!(
-        "FrankenSQLite baseline (4w contention, sequential): {} ops, {:.1} ops/s, {}ms",
-        report.ops_total, report.ops_per_sec, report.wall_time_ms
-    );
+    asupersync::test_utils::run_test(|| async {
+        let oplog =
+            preset_hot_page_contention("mvcc-baseline-contention", SEED, 4, CONTENTION_ROUNDS);
+        let report = run_fsqlite_sequential(&oplog).await;
+        // Sequential execution has no contention, so should succeed.
+        assert!(report.error.is_none(), "fsqlite error: {:?}", report.error);
+        assert!(report.ops_total > 0, "should have executed operations");
+        println!(
+            "FrankenSQLite baseline (4w contention, sequential): {} ops, {:.1} ops/s, {}ms",
+            report.ops_total, report.ops_per_sec, report.wall_time_ms
+        );
+    });
 }
 
 // ── Combined scaling comparison ──────────────────────────────────────────
 
 #[test]
 fn mvcc_combined_scaling_comparison() {
-    let mut report = String::new();
-    let _ = writeln!(report, "\n{}", "#".repeat(72));
-    let _ = writeln!(report, "  MVCC Concurrent Writers — Full Scaling Report");
-    let _ = writeln!(report, "  Bead: bd-1w6k.4.3");
-    let _ = writeln!(report, "{}", "#".repeat(72));
+    asupersync::test_utils::run_test(|| async {
+        let mut report = String::new();
+        let _ = writeln!(report, "\n{}", "#".repeat(72));
+        let _ = writeln!(report, "  MVCC Concurrent Writers — Full Scaling Report");
+        let _ = writeln!(report, "  Bead: bd-1w6k.4.3");
+        let _ = writeln!(report, "{}", "#".repeat(72));
 
-    // ── Disjoint partition mode ──
-    let disjoint: Vec<RunMetrics> = CONCURRENCY_LEVELS
-        .iter()
-        .map(|&w| run_disjoint_scaling(w))
-        .collect();
-    let base_disjoint = disjoint.first().map_or(0.0, RunMetrics::p50_ops_per_sec);
-    let _ = writeln!(
-        report,
-        "{}",
-        format_scaling_table("Disjoint Partitions", &disjoint, base_disjoint)
-    );
-
-    // ── Contention mode ──
-    let contention: Vec<RunMetrics> = CONCURRENCY_LEVELS
-        .iter()
-        .map(|&w| run_contention_scaling(w))
-        .collect();
-    let base_contention = contention.first().map_or(0.0, RunMetrics::p50_ops_per_sec);
-    let _ = writeln!(
-        report,
-        "{}",
-        format_scaling_table("Hot-Page Contention", &contention, base_contention)
-    );
-
-    // ── FrankenSQLite baseline ──
-    let _ = writeln!(report, "  FrankenSQLite Sequential Baselines:");
-    let _ = writeln!(report, "  {:-<72}", "");
-
-    let fs_disjoint = {
-        let oplog = preset_commutative_inserts_disjoint_keys(
-            "baseline-d",
-            SEED,
-            4,
-            DISJOINT_ROWS_PER_WORKER,
+        // ── Disjoint partition mode ──
+        let disjoint: Vec<RunMetrics> = CONCURRENCY_LEVELS
+            .iter()
+            .map(|&w| run_disjoint_scaling(w))
+            .collect();
+        let base_disjoint = disjoint.first().map_or(0.0, RunMetrics::p50_ops_per_sec);
+        let _ = writeln!(
+            report,
+            "{}",
+            format_scaling_table("Disjoint Partitions", &disjoint, base_disjoint)
         );
-        run_fsqlite_sequential(&oplog)
-    };
-    let _ = writeln!(
-        report,
-        "  Disjoint (4w seq):   {:>8} ops  {:>10.1} ops/s  {:>6}ms",
-        fs_disjoint.ops_total, fs_disjoint.ops_per_sec, fs_disjoint.wall_time_ms
-    );
 
-    let fs_contention = {
-        let oplog = preset_hot_page_contention("baseline-c", SEED, 4, CONTENTION_ROUNDS);
-        run_fsqlite_sequential(&oplog)
-    };
-    let _ = writeln!(
-        report,
-        "  Contention (4w seq): {:>8} ops  {:>10.1} ops/s  {:>6}ms",
-        fs_contention.ops_total, fs_contention.ops_per_sec, fs_contention.wall_time_ms
-    );
+        // ── Contention mode ──
+        let contention: Vec<RunMetrics> = CONCURRENCY_LEVELS
+            .iter()
+            .map(|&w| run_contention_scaling(w))
+            .collect();
+        let base_contention = contention.first().map_or(0.0, RunMetrics::p50_ops_per_sec);
+        let _ = writeln!(
+            report,
+            "{}",
+            format_scaling_table("Hot-Page Contention", &contention, base_contention)
+        );
 
-    let _ = writeln!(report, "\n{}", "#".repeat(72));
-    println!("{report}");
+        // ── FrankenSQLite baseline ──
+        let _ = writeln!(report, "  FrankenSQLite Sequential Baselines:");
+        let _ = writeln!(report, "  {:-<72}", "");
+
+        let fs_disjoint = {
+            let oplog = preset_commutative_inserts_disjoint_keys(
+                "baseline-d",
+                SEED,
+                4,
+                DISJOINT_ROWS_PER_WORKER,
+            );
+            run_fsqlite_sequential(&oplog).await
+        };
+        let _ = writeln!(
+            report,
+            "  Disjoint (4w seq):   {:>8} ops  {:>10.1} ops/s  {:>6}ms",
+            fs_disjoint.ops_total, fs_disjoint.ops_per_sec, fs_disjoint.wall_time_ms
+        );
+
+        let fs_contention = {
+            let oplog = preset_hot_page_contention("baseline-c", SEED, 4, CONTENTION_ROUNDS);
+            run_fsqlite_sequential(&oplog).await
+        };
+        let _ = writeln!(
+            report,
+            "  Contention (4w seq): {:>8} ops  {:>10.1} ops/s  {:>6}ms",
+            fs_contention.ops_total, fs_contention.ops_per_sec, fs_contention.wall_time_ms
+        );
+
+        let _ = writeln!(report, "\n{}", "#".repeat(72));
+        println!("{report}");
+    });
 }

@@ -1,9 +1,14 @@
 //! Transaction wrapper analogous to `rusqlite::Transaction`.
 //!
-//! Scoped transactions that must be finalized by awaiting `commit()` or
-//! `rollback()`. Unlike `rusqlite`, dropping does NOT roll back: `Drop::drop`
-//! cannot await and this crate never builds its own runtime (see [`Drop`] on
-//! [`Transaction`]).
+//! Scoped transactions that should be finalized by awaiting `commit()` or
+//! `rollback()`. As in `rusqlite`, an abandoned transaction does not become
+//! visible: dropping without an awaited finalizer records a rollback
+//! obligation on the connection, which the next SQL entry point discharges
+//! before it executes anything else (see [`Drop`] on [`Transaction`]).
+//!
+//! The rollback is therefore *guaranteed* but *deferred* -- it completes at
+//! the next statement rather than inside `Drop`, because `Drop::drop` cannot
+//! await and this crate never builds its own runtime.
 
 use std::future::Future;
 
@@ -14,8 +19,9 @@ use crate::{Connection, Row};
 
 use super::params::ParamValue;
 
-/// Scoped transaction wrapper. Must be finalized by awaiting `commit()` or
-/// `rollback()` — dropping it leaves the transaction open (see [`Drop`]).
+/// Scoped transaction wrapper. Finalize by awaiting `commit()` or
+/// `rollback()`; dropping without either rolls back (deferred to the next
+/// statement — see [`Drop`]).
 ///
 /// # Examples
 ///
@@ -24,7 +30,7 @@ use super::params::ParamValue;
 ///
 /// let mut tx = conn.transaction().await?;
 /// tx.execute("INSERT INTO users (name) VALUES ('alice')").await?;
-/// tx.commit().await?; // Required: dropping `tx` does NOT roll back.
+/// tx.commit().await?; // Without this, the INSERT is rolled back.
 /// ```
 pub struct Transaction<'a> {
     conn: &'a Connection,
@@ -191,20 +197,23 @@ impl<'a> Transaction<'a> {
 
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
-        // `rollback_transaction` is `async` in the asupersync storage stack and
-        // `Drop::drop` cannot await. This crate never builds its own runtime
-        // (the `Cx` flows down from the consumer), so we cannot block here to
-        // finish the rollback.
+        // `rollback_transaction` is `async` and `Drop::drop` cannot await. This
+        // crate never builds its own runtime (the `Cx` flows down from the
+        // consumer), so the rollback cannot be *finished* here.
         //
-        // Consequence: dropping a `Transaction` without an awaited
-        // `commit()`/`rollback()` leaves the transaction open on the connection
-        // rather than rolling it back. Callers MUST await one of them.
+        // It can still be *guaranteed*. We record the obligation on the
+        // connection; the next SQL entry point discharges it by rolling back
+        // before it runs anything else. That preserves the observable
+        // rusqlite contract -- an abandoned transaction's writes are never
+        // visible to a later statement -- without blocking in `Drop` and
+        // without owning a runtime.
         if !self.finalized {
-            tracing::warn!(
+            self.conn.mark_transaction_cleanup_required();
+            tracing::debug!(
                 target: "fsqlite::compat",
                 event = "transaction_drop_without_finalize",
                 msg = "Transaction dropped without an awaited commit()/rollback(); \
-                       the transaction is left open on the connection"
+                       it will be rolled back before the next statement runs"
             );
         }
     }

@@ -161,7 +161,7 @@ fn open_wal_file(
         })
 }
 
-fn read_wal_bytes(vfs: &MemoryVfs, cx: &Cx, wal_path: &Path) -> Result<Vec<u8>, String> {
+async fn read_wal_bytes(vfs: &MemoryVfs, cx: &Cx, wal_path: &Path) -> Result<Vec<u8>, String> {
     let wal_file = open_wal_file(vfs, cx, wal_path)?;
     let file_size = wal_file
         .file_size(cx)
@@ -173,6 +173,7 @@ fn read_wal_bytes(vfs: &MemoryVfs, cx: &Cx, wal_path: &Path) -> Result<Vec<u8>, 
     ];
     wal_file
         .read(cx, &mut bytes, 0)
+        .await
         .map_err(|error| format!("read_wal_bytes_failed error={error}"))?;
     Ok(bytes)
 }
@@ -338,161 +339,199 @@ fn test_wal_first_frame_checksum() -> Result<(), String> {
 
 #[test]
 fn test_wal_chain_three_frames() -> Result<(), String> {
-    let cx = test_cx();
-    let vfs = MemoryVfs::new();
-    let wal_path = PathBuf::from("/bd_2fas_chain_three_frames.db-wal");
-    let page_size = PageSize::DEFAULT.as_usize();
-    let page_size_u32 =
-        u32::try_from(page_size).map_err(|error| format!("page_size_u32_failed error={error}"))?;
+    let mut outcome: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let wal_path = PathBuf::from("/bd_2fas_chain_three_frames.db-wal");
+            let page_size = PageSize::DEFAULT.as_usize();
+            let page_size_u32 = u32::try_from(page_size)
+                .map_err(|error| format!("page_size_u32_failed error={error}"))?;
 
-    {
-        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
-        let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
-            .map_err(|error| format!("create_wal_failed error={error}"))?;
-        for (idx, seed) in [0x21_u8, 0x22, 0x23].iter().copied().enumerate() {
-            let frame_no = u32::try_from(idx + 1)
-                .map_err(|error| format!("frame_no_u32_failed error={error}"))?;
-            wal.append_frame(&cx, frame_no, &sample_page(seed, page_size), frame_no)
-                .map_err(|error| {
-                    format!("append_frame_failed frame_no={frame_no} error={error}")
-                })?;
+            {
+                let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+                let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
+                    .await
+                    .map_err(|error| format!("create_wal_failed error={error}"))?;
+                for (idx, seed) in [0x21_u8, 0x22, 0x23].iter().copied().enumerate() {
+                    let frame_no = u32::try_from(idx + 1)
+                        .map_err(|error| format!("frame_no_u32_failed error={error}"))?;
+                    wal.append_frame(&cx, frame_no, &sample_page(seed, page_size), frame_no)
+                        .await
+                        .map_err(|error| {
+                            format!("append_frame_failed frame_no={frame_no} error={error}")
+                        })?;
+                }
+                wal.close(&cx)
+                    .map_err(|error| format!("close_wal_failed error={error}"))?;
+            }
+
+            let wal_bytes = read_wal_bytes(&vfs, &cx, &wal_path).await?;
+            let validation = validate_wal_chain(&wal_bytes, page_size, false)
+                .map_err(|error| format!("validate_wal_chain_failed error={error}"))?;
+            if !validation.valid || validation.valid_frame_count != 3 {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_chain_three_frames_invalid validation={validation:?}"
+                ));
+            }
+            Ok(())
         }
-        wal.close(&cx)
-            .map_err(|error| format!("close_wal_failed error={error}"))?;
-    }
-
-    let wal_bytes = read_wal_bytes(&vfs, &cx, &wal_path)?;
-    let validation = validate_wal_chain(&wal_bytes, page_size, false)
-        .map_err(|error| format!("validate_wal_chain_failed error={error}"))?;
-    if !validation.valid || validation.valid_frame_count != 3 {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_chain_three_frames_invalid validation={validation:?}"
-        ));
-    }
-    Ok(())
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn test_wal_frame_salt_validation() -> Result<(), String> {
-    let cx = test_cx();
-    let vfs = MemoryVfs::new();
-    let wal_path = PathBuf::from("/bd_2fas_salt_validation.db-wal");
-    let page_size = PageSize::DEFAULT.as_usize();
-    let page_size_u32 =
-        u32::try_from(page_size).map_err(|error| format!("page_size_u32_failed error={error}"))?;
-    let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+    let mut outcome: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let wal_path = PathBuf::from("/bd_2fas_salt_validation.db-wal");
+            let page_size = PageSize::DEFAULT.as_usize();
+            let page_size_u32 = u32::try_from(page_size)
+                .map_err(|error| format!("page_size_u32_failed error={error}"))?;
+            let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
 
-    {
-        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
-        let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
-            .map_err(|error| format!("create_wal_failed error={error}"))?;
-        wal.append_frame(&cx, 1, &sample_page(0x31, page_size), 1)
-            .map_err(|error| format!("append_frame_1_failed error={error}"))?;
-        wal.append_frame(&cx, 2, &sample_page(0x32, page_size), 2)
-            .map_err(|error| format!("append_frame_2_failed error={error}"))?;
-        wal.close(&cx)
-            .map_err(|error| format!("close_wal_failed error={error}"))?;
-    }
+            {
+                let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+                let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
+                    .await
+                    .map_err(|error| format!("create_wal_failed error={error}"))?;
+                wal.append_frame(&cx, 1, &sample_page(0x31, page_size), 1)
+                    .await
+                    .map_err(|error| format!("append_frame_1_failed error={error}"))?;
+                wal.append_frame(&cx, 2, &sample_page(0x32, page_size), 2)
+                    .await
+                    .map_err(|error| format!("append_frame_2_failed error={error}"))?;
+                wal.close(&cx)
+                    .map_err(|error| format!("close_wal_failed error={error}"))?;
+            }
 
-    let mut wal_bytes = read_wal_bytes(&vfs, &cx, &wal_path)?;
-    let second_header_start = WAL_HEADER_SIZE + frame_size;
-    let second_header_end = second_header_start + WAL_FRAME_HEADER_SIZE;
-    write_wal_frame_salts(
-        &mut wal_bytes[second_header_start..second_header_end],
-        WalSalts {
-            salt1: 0xDEAD_BEEF,
-            salt2: 0xF00D_CAFE,
-        },
-    )
-    .map_err(|error| format!("rewrite_frame_salts_failed error={error}"))?;
-    let validation = validate_wal_chain(&wal_bytes, page_size, false)
-        .map_err(|error| format!("validate_wal_chain_failed error={error}"))?;
-    if validation.reason != Some(WalChainInvalidReason::SaltMismatch) {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_frame_salt_validation_reason_mismatch reason={:?}",
-            validation.reason
-        ));
-    }
-    Ok(())
+            let mut wal_bytes = read_wal_bytes(&vfs, &cx, &wal_path).await?;
+            let second_header_start = WAL_HEADER_SIZE + frame_size;
+            let second_header_end = second_header_start + WAL_FRAME_HEADER_SIZE;
+            write_wal_frame_salts(
+                &mut wal_bytes[second_header_start..second_header_end],
+                WalSalts {
+                    salt1: 0xDEAD_BEEF,
+                    salt2: 0xF00D_CAFE,
+                },
+            )
+            .map_err(|error| format!("rewrite_frame_salts_failed error={error}"))?;
+            let validation = validate_wal_chain(&wal_bytes, page_size, false)
+                .map_err(|error| format!("validate_wal_chain_failed error={error}"))?;
+            if validation.reason != Some(WalChainInvalidReason::SaltMismatch) {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_frame_salt_validation_reason_mismatch reason={:?}",
+                    validation.reason
+                ));
+            }
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn test_wal_recovery_valid_prefix() -> Result<(), String> {
-    let cx = test_cx();
-    let vfs = MemoryVfs::new();
-    let wal_path = PathBuf::from("/bd_2fas_valid_prefix.db-wal");
-    let page_size = PageSize::DEFAULT.as_usize();
-    let page_size_u32 =
-        u32::try_from(page_size).map_err(|error| format!("page_size_u32_failed error={error}"))?;
-    let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+    let mut outcome: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let wal_path = PathBuf::from("/bd_2fas_valid_prefix.db-wal");
+            let page_size = PageSize::DEFAULT.as_usize();
+            let page_size_u32 = u32::try_from(page_size)
+                .map_err(|error| format!("page_size_u32_failed error={error}"))?;
+            let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
 
-    {
-        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
-        let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
-            .map_err(|error| format!("create_wal_failed error={error}"))?;
-        for (idx, seed) in [0x41_u8, 0x42, 0x43, 0x44, 0x45, 0x46]
-            .iter()
-            .copied()
-            .enumerate()
-        {
-            let frame_no = u32::try_from(idx + 1)
-                .map_err(|error| format!("frame_no_u32_failed error={error}"))?;
-            wal.append_frame(&cx, frame_no, &sample_page(seed, page_size), frame_no)
-                .map_err(|error| {
-                    format!("append_frame_failed frame_no={frame_no} error={error}")
-                })?;
+            {
+                let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+                let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
+                    .await
+                    .map_err(|error| format!("create_wal_failed error={error}"))?;
+                for (idx, seed) in [0x41_u8, 0x42, 0x43, 0x44, 0x45, 0x46]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                {
+                    let frame_no = u32::try_from(idx + 1)
+                        .map_err(|error| format!("frame_no_u32_failed error={error}"))?;
+                    wal.append_frame(&cx, frame_no, &sample_page(seed, page_size), frame_no)
+                        .await
+                        .map_err(|error| {
+                            format!("append_frame_failed frame_no={frame_no} error={error}")
+                        })?;
+                }
+                wal.close(&cx)
+                    .map_err(|error| format!("close_wal_failed error={error}"))?;
+            }
+
+            let mut wal_bytes = read_wal_bytes(&vfs, &cx, &wal_path).await?;
+            let invalid_frame_index = 5_usize;
+            let corrupt_offset =
+                WAL_HEADER_SIZE + frame_size * invalid_frame_index + WAL_FRAME_HEADER_SIZE + 19;
+            wal_bytes[corrupt_offset] ^= 0x40;
+            let validation = validate_wal_chain(&wal_bytes, page_size, false)
+                .map_err(|error| format!("validate_wal_chain_failed error={error}"))?;
+            if validation.valid_frame_count != 5 || validation.first_invalid_frame != Some(5) {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_recovery_valid_prefix_mismatch validation={validation:?}"
+                ));
+            }
+            Ok(())
         }
-        wal.close(&cx)
-            .map_err(|error| format!("close_wal_failed error={error}"))?;
-    }
-
-    let mut wal_bytes = read_wal_bytes(&vfs, &cx, &wal_path)?;
-    let invalid_frame_index = 5_usize;
-    let corrupt_offset =
-        WAL_HEADER_SIZE + frame_size * invalid_frame_index + WAL_FRAME_HEADER_SIZE + 19;
-    wal_bytes[corrupt_offset] ^= 0x40;
-    let validation = validate_wal_chain(&wal_bytes, page_size, false)
-        .map_err(|error| format!("validate_wal_chain_failed error={error}"))?;
-    if validation.valid_frame_count != 5 || validation.first_invalid_frame != Some(5) {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_recovery_valid_prefix_mismatch validation={validation:?}"
-        ));
-    }
-    Ok(())
+        .await;
+    });
+    outcome
 }
 
 #[test]
 fn test_wal_recovery_first_frame_corrupt() -> Result<(), String> {
-    let cx = test_cx();
-    let vfs = MemoryVfs::new();
-    let wal_path = PathBuf::from("/bd_2fas_first_frame_corrupt.db-wal");
-    let page_size = PageSize::DEFAULT.as_usize();
-    let page_size_u32 =
-        u32::try_from(page_size).map_err(|error| format!("page_size_u32_failed error={error}"))?;
+    let mut outcome: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let wal_path = PathBuf::from("/bd_2fas_first_frame_corrupt.db-wal");
+            let page_size = PageSize::DEFAULT.as_usize();
+            let page_size_u32 = u32::try_from(page_size)
+                .map_err(|error| format!("page_size_u32_failed error={error}"))?;
 
-    {
-        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
-        let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
-            .map_err(|error| format!("create_wal_failed error={error}"))?;
-        wal.append_frame(&cx, 1, &sample_page(0x51, page_size), 1)
-            .map_err(|error| format!("append_frame_1_failed error={error}"))?;
-        wal.append_frame(&cx, 2, &sample_page(0x52, page_size), 2)
-            .map_err(|error| format!("append_frame_2_failed error={error}"))?;
-        wal.close(&cx)
-            .map_err(|error| format!("close_wal_failed error={error}"))?;
-    }
+            {
+                let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+                let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
+                    .await
+                    .map_err(|error| format!("create_wal_failed error={error}"))?;
+                wal.append_frame(&cx, 1, &sample_page(0x51, page_size), 1)
+                    .await
+                    .map_err(|error| format!("append_frame_1_failed error={error}"))?;
+                wal.append_frame(&cx, 2, &sample_page(0x52, page_size), 2)
+                    .await
+                    .map_err(|error| format!("append_frame_2_failed error={error}"))?;
+                wal.close(&cx)
+                    .map_err(|error| format!("close_wal_failed error={error}"))?;
+            }
 
-    let mut wal_bytes = read_wal_bytes(&vfs, &cx, &wal_path)?;
-    let corrupt_offset = WAL_HEADER_SIZE + WAL_FRAME_HEADER_SIZE + 7;
-    wal_bytes[corrupt_offset] ^= 0x22;
-    let validation = validate_wal_chain(&wal_bytes, page_size, false)
-        .map_err(|error| format!("validate_wal_chain_failed error={error}"))?;
-    if validation.valid_frame_count != 0 || validation.first_invalid_frame != Some(0) {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=wal_recovery_first_frame_corrupt_mismatch validation={validation:?}"
-        ));
-    }
-    Ok(())
+            let mut wal_bytes = read_wal_bytes(&vfs, &cx, &wal_path).await?;
+            let corrupt_offset = WAL_HEADER_SIZE + WAL_FRAME_HEADER_SIZE + 7;
+            wal_bytes[corrupt_offset] ^= 0x22;
+            let validation = validate_wal_chain(&wal_bytes, page_size, false)
+                .map_err(|error| format!("validate_wal_chain_failed error={error}"))?;
+            if validation.valid_frame_count != 0 || validation.first_invalid_frame != Some(0) {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=wal_recovery_first_frame_corrupt_mismatch validation={validation:?}"
+                ));
+            }
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }
 
 #[test]

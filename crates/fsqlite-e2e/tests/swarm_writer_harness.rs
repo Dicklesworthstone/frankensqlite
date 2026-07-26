@@ -43,6 +43,7 @@
 //! covers (`beads_rust#252`, `frankensqlite#56`, etc). DO NOT silence
 //! a failing assertion — file an engineering bead under #70 instead.
 
+#![recursion_limit = "512"]
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::similar_names)]
 
@@ -242,52 +243,54 @@ fn swarm_writer_harness() {
         return;
     }
 
-    let backends = match env::var("FSQLITE_SWARM_BACKEND").ok().as_deref() {
-        Some("fsqlite") => vec![Backend::Fsqlite],
-        Some("stock") => vec![Backend::Stock],
-        _ => vec![Backend::Fsqlite, Backend::Stock],
-    };
+    asupersync::test_utils::run_test(|| async {
+        let backends = match env::var("FSQLITE_SWARM_BACKEND").ok().as_deref() {
+            Some("fsqlite") => vec![Backend::Fsqlite],
+            Some("stock") => vec![Backend::Stock],
+            _ => vec![Backend::Fsqlite, Backend::Stock],
+        };
 
-    let mut total_failures = 0_usize;
-    for backend in backends {
-        let cfg = cfg_from_env(backend);
-        let run_root = parent_test_root().join(backend.as_str());
-        fs::create_dir_all(&run_root).expect("create run root");
-        eprintln!(
-            "[swarm-harness] backend={} workers={} seconds={} keyspace=0..{} \
-             busy_timeout_ms={} seed={:#x} run_dir={}",
-            backend.as_str(),
-            cfg.workers,
-            cfg.seconds,
-            cfg.keyspace,
-            cfg.busy_timeout_ms,
-            cfg.seed,
-            run_root.display()
-        );
-        let report = run_parent(&cfg, &run_root);
-        for c in &report.criteria {
+        let mut total_failures = 0_usize;
+        for backend in backends {
+            let cfg = cfg_from_env(backend);
+            let run_root = parent_test_root().join(backend.as_str());
+            fs::create_dir_all(&run_root).expect("create run root");
             eprintln!(
-                "[swarm-harness][{}] {} {}",
+                "[swarm-harness] backend={} workers={} seconds={} keyspace=0..{} \
+                 busy_timeout_ms={} seed={:#x} run_dir={}",
                 backend.as_str(),
-                if c.pass { "PASS" } else { "FAIL" },
-                c.name
+                cfg.workers,
+                cfg.seconds,
+                cfg.keyspace,
+                cfg.busy_timeout_ms,
+                cfg.seed,
+                run_root.display()
             );
-            if !c.pass {
-                total_failures += 1;
-                eprintln!("    detail: {}", c.detail);
+            let report = run_parent(&cfg, &run_root).await;
+            for c in &report.criteria {
+                eprintln!(
+                    "[swarm-harness][{}] {} {}",
+                    backend.as_str(),
+                    if c.pass { "PASS" } else { "FAIL" },
+                    c.name
+                );
+                if !c.pass {
+                    total_failures += 1;
+                    eprintln!("    detail: {}", c.detail);
+                }
             }
         }
-    }
 
-    // The harness is a regression net for #70 — known-failing assertions
-    // are EXPECTED today. We surface failures as the test failure so
-    // future fixes accrete to a real net.
-    assert!(
-        total_failures == 0,
-        "swarm_writer_harness saw {total_failures} failed criteria — see stderr above. \
-         Each failure corresponds to a #70 surface. DO NOT silence; \
-         file an engineering bead instead."
-    );
+        // The harness is a regression net for #70 — known-failing assertions
+        // are EXPECTED today. We surface failures as the test failure so
+        // future fixes accrete to a real net.
+        assert!(
+            total_failures == 0,
+            "swarm_writer_harness saw {total_failures} failed criteria — see stderr above. \
+             Each failure corresponds to a #70 surface. DO NOT silence; \
+             file an engineering bead instead."
+        );
+    });
 }
 
 // =====================================================================
@@ -306,16 +309,16 @@ struct ParentReport {
     criteria: Vec<CriterionReport>,
 }
 
-fn run_parent(cfg: &RunConfig, run_dir: &Path) -> ParentReport {
+async fn run_parent(cfg: &RunConfig, run_dir: &Path) -> ParentReport {
     let db_path = run_dir.join("swarm.db");
     let audit_dir = run_dir.join("audit");
     fs::create_dir_all(&audit_dir).expect("audit dir");
 
-    initialize_database(cfg, &db_path);
+    initialize_database(cfg, &db_path).await;
 
     // Run sequential opens to verify Connection::open semantics across
     // many short-lived processes (assertion #6). Spawn N opens.
-    let open_check = run_sequential_open_check(cfg, run_dir);
+    let open_check = run_sequential_open_check(cfg, run_dir).await;
 
     // Spawn the swarm.
     let mut criteria: Vec<CriterionReport> = Vec::new();
@@ -340,18 +343,22 @@ fn run_parent(cfg: &RunConfig, run_dir: &Path) -> ParentReport {
     ParentReport { criteria }
 }
 
-fn initialize_database(cfg: &RunConfig, db_path: &Path) {
+async fn initialize_database(cfg: &RunConfig, db_path: &Path) {
     match cfg.backend {
         Backend::Fsqlite => {
             let conn = Connection::open(db_path.to_string_lossy().to_string())
+                .await
                 .expect("fsqlite open for init");
-            let _ = conn.execute(&format!("PRAGMA busy_timeout={};", cfg.busy_timeout_ms));
-            let _ = conn.execute("PRAGMA journal_mode=WAL;");
-            let _ = conn.execute("PRAGMA synchronous=NORMAL;");
+            drop(
+                conn.execute(&format!("PRAGMA busy_timeout={};", cfg.busy_timeout_ms))
+                    .await,
+            );
+            drop(conn.execute("PRAGMA journal_mode=WAL;").await);
+            drop(conn.execute("PRAGMA synchronous=NORMAL;").await);
             // Best-effort: enable concurrent mode on fsqlite — it's a
             // no-op on stock and may not be wired on every fsqlite
             // build, hence best-effort.
-            let _ = conn.execute("PRAGMA fsqlite.concurrent_mode=ON;");
+            drop(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").await);
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS swarm_kv (
                     k INTEGER PRIMARY KEY,
@@ -360,8 +367,9 @@ fn initialize_database(cfg: &RunConfig, db_path: &Path) {
                     rev INTEGER NOT NULL
                 );",
             )
+            .await
             .expect("create schema");
-            let _ = conn.close();
+            drop(conn.close().await);
         }
         Backend::Stock => {
             let conn = rusqlite::Connection::open(db_path).expect("stock open for init");
@@ -384,7 +392,7 @@ fn initialize_database(cfg: &RunConfig, db_path: &Path) {
     }
 }
 
-fn run_sequential_open_check(cfg: &RunConfig, run_dir: &Path) -> CriterionReport {
+async fn run_sequential_open_check(cfg: &RunConfig, run_dir: &Path) -> CriterionReport {
     // Acceptance assertion #6: Connection::open succeeds for the Nth
     // process with consistent semantics; no carry-over freelist state.
     // We do this in-process serially; the multi-process variant is
@@ -395,49 +403,58 @@ fn run_sequential_open_check(cfg: &RunConfig, run_dir: &Path) -> CriterionReport
     }
     let mut last_err: Option<String> = None;
     for i in 0..cfg.workers {
-        let result: Result<(), String> = (|| match cfg.backend {
-            Backend::Fsqlite => {
-                let conn = Connection::open(path.to_string_lossy().to_string())
-                    .map_err(|e| format!("open#{i}: {e}"))?;
-                let _ = conn.execute(&format!("PRAGMA busy_timeout={};", cfg.busy_timeout_ms));
-                let _ = conn.execute("PRAGMA journal_mode=WAL;");
-                if i == 0 {
+        let result: Result<(), String> = async {
+            match cfg.backend {
+                Backend::Fsqlite => {
+                    let conn = Connection::open(path.to_string_lossy().to_string())
+                        .await
+                        .map_err(|e| format!("open#{i}: {e}"))?;
+                    drop(
+                        conn.execute(&format!("PRAGMA busy_timeout={};", cfg.busy_timeout_ms))
+                            .await,
+                    );
+                    drop(conn.execute("PRAGMA journal_mode=WAL;").await);
+                    if i == 0 {
+                        conn.execute(
+                            "CREATE TABLE IF NOT EXISTS open_check (k INTEGER PRIMARY KEY, v TEXT)",
+                        )
+                        .await
+                        .map_err(|e| format!("create#{i}: {e}"))?;
+                    }
+                    conn.execute_with_params(
+                        "INSERT INTO open_check (k, v) VALUES (?1, ?2)",
+                        &[
+                            SqliteValue::Integer(i as i64),
+                            SqliteValue::Text(format!("seq-{i}").into()),
+                        ],
+                    )
+                    .await
+                    .map_err(|e| format!("insert#{i}: {e}"))?;
+                    conn.close().await.map_err(|e| format!("close#{i}: {e}"))
+                }
+                Backend::Stock => {
+                    let conn =
+                        rusqlite::Connection::open(&path).map_err(|e| format!("open#{i}: {e}"))?;
+                    conn.busy_timeout(Duration::from_millis(cfg.busy_timeout_ms))
+                        .map_err(|e| format!("busy_timeout#{i}: {e}"))?;
+                    conn.pragma_update(None, "journal_mode", "WAL")
+                        .map_err(|e| format!("journal_mode#{i}: {e}"))?;
+                    if i == 0 {
+                        conn.execute_batch(
+                            "CREATE TABLE IF NOT EXISTS open_check (k INTEGER PRIMARY KEY, v TEXT)",
+                        )
+                        .map_err(|e| format!("create#{i}: {e}"))?;
+                    }
                     conn.execute(
-                        "CREATE TABLE IF NOT EXISTS open_check (k INTEGER PRIMARY KEY, v TEXT)",
+                        "INSERT INTO open_check (k, v) VALUES (?1, ?2)",
+                        rusqlite::params![i as i64, format!("seq-{i}")],
                     )
-                    .map_err(|e| format!("create#{i}: {e}"))?;
+                    .map_err(|e| format!("insert#{i}: {e}"))?;
+                    Ok(())
                 }
-                conn.execute_with_params(
-                    "INSERT INTO open_check (k, v) VALUES (?1, ?2)",
-                    &[
-                        SqliteValue::Integer(i as i64),
-                        SqliteValue::Text(format!("seq-{i}").into()),
-                    ],
-                )
-                .map_err(|e| format!("insert#{i}: {e}"))?;
-                conn.close().map_err(|e| format!("close#{i}: {e}"))
             }
-            Backend::Stock => {
-                let conn =
-                    rusqlite::Connection::open(&path).map_err(|e| format!("open#{i}: {e}"))?;
-                conn.busy_timeout(Duration::from_millis(cfg.busy_timeout_ms))
-                    .map_err(|e| format!("busy_timeout#{i}: {e}"))?;
-                conn.pragma_update(None, "journal_mode", "WAL")
-                    .map_err(|e| format!("journal_mode#{i}: {e}"))?;
-                if i == 0 {
-                    conn.execute_batch(
-                        "CREATE TABLE IF NOT EXISTS open_check (k INTEGER PRIMARY KEY, v TEXT)",
-                    )
-                    .map_err(|e| format!("create#{i}: {e}"))?;
-                }
-                conn.execute(
-                    "INSERT INTO open_check (k, v) VALUES (?1, ?2)",
-                    rusqlite::params![i as i64, format!("seq-{i}")],
-                )
-                .map_err(|e| format!("insert#{i}: {e}"))?;
-                Ok(())
-            }
-        })();
+        }
+        .await;
         if let Err(e) = result {
             last_err = Some(e);
             break;
@@ -1080,7 +1097,15 @@ fn assert_no_indefinite_hangs(records: &[AuditRecord]) -> CriterionReport {
 fn run_as_child(backend: Backend) {
     // Children must NOT panic the test framework (cargo treats panics
     // as failures). We catch any failure and exit cleanly with code 1.
-    let res = std::panic::catch_unwind(|| child_main(backend));
+    // The async child body gets its own runtime *inside* the
+    // `catch_unwind` boundary so panics still surface as exit code 2.
+    let res = std::panic::catch_unwind(|| {
+        let mut outcome: Result<(), String> = Ok(());
+        asupersync::test_utils::run_test(|| async {
+            outcome = child_main(backend).await;
+        });
+        outcome
+    });
     match res {
         Ok(Ok(())) => std::process::exit(0),
         Ok(Err(e)) => {
@@ -1099,7 +1124,7 @@ fn run_as_child(backend: Backend) {
     }
 }
 
-fn child_main(backend: Backend) -> Result<(), String> {
+async fn child_main(backend: Backend) -> Result<(), String> {
     let db_path = env::var("FSQLITE_SWARM_DB_PATH").map_err(|e| format!("DB_PATH: {e}"))?;
     let audit_path =
         env::var("FSQLITE_SWARM_AUDIT_PATH").map_err(|e| format!("AUDIT_PATH: {e}"))?;
@@ -1146,17 +1171,20 @@ fn child_main(backend: Backend) -> Result<(), String> {
     let pid = std::process::id();
 
     match backend {
-        Backend::Fsqlite => child_run_fsqlite(
-            &db_path,
-            &mut audit,
-            pid,
-            worker_id,
-            keyspace,
-            busy_timeout_ms,
-            ops_count,
-            deadline,
-            &mut rng,
-        ),
+        Backend::Fsqlite => {
+            child_run_fsqlite(
+                &db_path,
+                &mut audit,
+                pid,
+                worker_id,
+                keyspace,
+                busy_timeout_ms,
+                ops_count,
+                deadline,
+                &mut rng,
+            )
+            .await
+        }
         Backend::Stock => child_run_stock(
             &db_path,
             &mut audit,
@@ -1181,7 +1209,7 @@ fn pick_op(rng: &mut StdRng) -> Op {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn child_run_fsqlite(
+async fn child_run_fsqlite(
     db_path: &str,
     audit: &mut File,
     pid: u32,
@@ -1192,7 +1220,7 @@ fn child_run_fsqlite(
     deadline: Instant,
     rng: &mut StdRng,
 ) -> Result<(), String> {
-    let conn = match Connection::open(db_path.to_string()) {
+    let conn = match Connection::open(db_path.to_string()).await {
         Ok(c) => c,
         Err(e) => {
             audit
@@ -1214,10 +1242,13 @@ fn child_run_fsqlite(
             return Err(format!("open: {e}"));
         }
     };
-    let _ = conn.execute(&format!("PRAGMA busy_timeout={busy_timeout_ms};"));
-    let _ = conn.execute("PRAGMA journal_mode=WAL;");
-    let _ = conn.execute("PRAGMA synchronous=NORMAL;");
-    let _ = conn.execute("PRAGMA fsqlite.concurrent_mode=ON;");
+    drop(
+        conn.execute(&format!("PRAGMA busy_timeout={busy_timeout_ms};"))
+            .await,
+    );
+    drop(conn.execute("PRAGMA journal_mode=WAL;").await);
+    drop(conn.execute("PRAGMA synchronous=NORMAL;").await);
+    drop(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").await);
 
     let busy_budget = Duration::from_millis(busy_timeout_ms.saturating_mul(2) + 2_000);
 
@@ -1228,41 +1259,46 @@ fn child_run_fsqlite(
         let value = format!("w{worker_id}-pid{pid}-rev{completed}");
         let started = Instant::now();
         let res: Result<String, FrankenError> = match op {
-            Op::Insert | Op::Update => retry_busy_fsqlite(busy_budget, || {
-                conn.begin_transaction()?;
-                let r = (|| -> Result<(), FrankenError> {
-                    conn.execute_with_params(
-                        "INSERT INTO swarm_kv (k, v, last_writer, rev) \
-                         VALUES (?1, ?2, ?3, 1) \
-                         ON CONFLICT(k) DO UPDATE SET \
-                            v=excluded.v, \
-                            last_writer=excluded.last_writer, \
-                            rev=swarm_kv.rev+1",
-                        &[
-                            SqliteValue::Integer(key),
-                            SqliteValue::Text(value.clone().into()),
-                            SqliteValue::Integer(worker_id as i64),
-                        ],
-                    )?;
-                    Ok(())
-                })();
-                match r {
-                    Ok(()) => {
-                        conn.commit_transaction()?;
-                        Ok("commit".to_owned())
+            Op::Insert | Op::Update => {
+                retry_busy_fsqlite(busy_budget, async || {
+                    conn.begin_transaction().await?;
+                    let r: Result<(), FrankenError> = async {
+                        conn.execute_with_params(
+                            "INSERT INTO swarm_kv (k, v, last_writer, rev) \
+                             VALUES (?1, ?2, ?3, 1) \
+                             ON CONFLICT(k) DO UPDATE SET \
+                                v=excluded.v, \
+                                last_writer=excluded.last_writer, \
+                                rev=swarm_kv.rev+1",
+                            &[
+                                SqliteValue::Integer(key),
+                                SqliteValue::Text(value.clone().into()),
+                                SqliteValue::Integer(worker_id as i64),
+                            ],
+                        )
+                        .await?;
+                        Ok(())
                     }
-                    Err(e) => {
-                        let _ = conn.rollback_transaction();
-                        Err(e)
+                    .await;
+                    match r {
+                        Ok(()) => {
+                            conn.commit_transaction().await?;
+                            Ok("commit".to_owned())
+                        }
+                        Err(e) => {
+                            drop(conn.rollback_transaction().await);
+                            Err(e)
+                        }
                     }
-                }
-            }),
+                })
+                .await
+            }
             Op::SelectByPk => {
                 // Read-your-own-writes / cross-process visibility check.
                 // We commit a known marker first, then immediately
                 // SELECT it back. Mismatch is assertion #5/#3.
-                let r = retry_busy_fsqlite(busy_budget, || {
-                    conn.begin_transaction()?;
+                let r = retry_busy_fsqlite(busy_budget, async || {
+                    conn.begin_transaction().await?;
                     conn.execute_with_params(
                         "INSERT INTO swarm_kv (k, v, last_writer, rev) \
                          VALUES (?1, ?2, ?3, 1) \
@@ -1275,13 +1311,15 @@ fn child_run_fsqlite(
                             SqliteValue::Text(value.clone().into()),
                             SqliteValue::Integer(worker_id as i64),
                         ],
-                    )?;
-                    conn.commit_transaction()?;
+                    )
+                    .await?;
+                    conn.commit_transaction().await?;
                     let row = conn
                         .query_row_with_params(
                             "SELECT v FROM swarm_kv WHERE k = ?1",
                             &[SqliteValue::Integer(key)],
                         )
+                        .await
                         .map(|row| match row.values().first() {
                             Some(SqliteValue::Text(s)) => s.to_string(),
                             _ => String::from("<non-text>"),
@@ -1329,18 +1367,24 @@ fn child_run_fsqlite(
                             Err(e)
                         }
                     }
-                });
+                })
+                .await;
                 r
             }
-            Op::SelectRange => retry_busy_fsqlite(busy_budget, || {
-                let lo = rng.random_range(0..keyspace);
-                let hi = (lo + rng.random_range(1..32)).min(keyspace);
-                let _rows = conn.query_with_params(
-                    "SELECT k, v FROM swarm_kv WHERE k BETWEEN ?1 AND ?2",
-                    &[SqliteValue::Integer(lo), SqliteValue::Integer(hi)],
-                )?;
-                Ok("select_range".to_owned())
-            }),
+            Op::SelectRange => {
+                retry_busy_fsqlite(busy_budget, async || {
+                    let lo = rng.random_range(0..keyspace);
+                    let hi = (lo + rng.random_range(1..32)).min(keyspace);
+                    let _rows = conn
+                        .query_with_params(
+                            "SELECT k, v FROM swarm_kv WHERE k BETWEEN ?1 AND ?2",
+                            &[SqliteValue::Integer(lo), SqliteValue::Integer(hi)],
+                        )
+                        .await?;
+                    Ok("select_range".to_owned())
+                })
+                .await
+            }
         };
         let latency = started.elapsed().as_micros();
         match res {
@@ -1385,18 +1429,18 @@ fn child_run_fsqlite(
         completed = completed.saturating_add(1);
     }
 
-    let _ = conn.close();
+    drop(conn.close().await);
     Ok(())
 }
 
-fn retry_busy_fsqlite<T>(
+async fn retry_busy_fsqlite<T>(
     budget: Duration,
-    mut op: impl FnMut() -> Result<T, FrankenError>,
+    mut op: impl AsyncFnMut() -> Result<T, FrankenError>,
 ) -> Result<T, FrankenError> {
     let started = Instant::now();
     let mut attempt = 0_u32;
     loop {
-        match op() {
+        match op().await {
             Ok(v) => return Ok(v),
             Err(e) => {
                 let transient = matches!(

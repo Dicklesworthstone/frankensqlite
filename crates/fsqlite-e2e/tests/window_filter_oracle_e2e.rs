@@ -25,8 +25,8 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
-fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
-    let rows = conn.query(sql).map_err(|e| e.to_string())?;
+async fn frank_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(sql).await.map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
         .map(|row| row.values().iter().map(render_frank).collect())
@@ -58,23 +58,23 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>
     .map_err(|e| e.to_string())
 }
 
-fn setup() -> (Connection, rusqlite::Connection) {
-    let f = Connection::open(":memory:").expect("open frank");
+async fn setup() -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").await.expect("open frank");
     let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
     for s in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, x INTEGER)",
         "INSERT INTO t VALUES (1,'a',10),(2,'a',-5),(3,'a',20),(4,'b',3),(5,'b',-1),(6,'b',8)",
     ] {
-        f.execute(s).unwrap();
+        f.execute(s).await.unwrap();
         r.execute_batch(s).unwrap();
     }
     (f, r)
 }
 
-fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
+async fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str) {
     let mut mismatches = Vec::new();
     for q in queries {
-        match (frank_rows(f, q), sqlite_rows(r, q)) {
+        match (frank_rows(f, q).await, sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
                 mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
@@ -98,69 +98,81 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
 
 #[test]
 fn filter_on_running_window_sum() {
-    let (f, r) = setup();
-    // Cumulative sum of only the positive x, over the default frame.
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT id, sum(x) FILTER (WHERE x > 0) OVER (ORDER BY id) FROM t ORDER BY id",
-            // (1,10),(2,10),(3,30),(4,33),(5,33),(6,41)
-        ],
-        "filter_on_running_window_sum",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup().await;
+        // Cumulative sum of only the positive x, over the default frame.
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT id, sum(x) FILTER (WHERE x > 0) OVER (ORDER BY id) FROM t ORDER BY id",
+                // (1,10),(2,10),(3,30),(4,33),(5,33),(6,41)
+            ],
+            "filter_on_running_window_sum",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn filter_on_partitioned_window_count() {
-    let (f, r) = setup();
-    // Per-group running count of positive x.
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT id, count(*) FILTER (WHERE x > 0) OVER (PARTITION BY g ORDER BY id) \
-             FROM t ORDER BY id",
-            // a: 1,1,2  b: 1,1,2  -> (1,1),(2,1),(3,2),(4,1),(5,1),(6,2)
-        ],
-        "filter_on_partitioned_window_count",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup().await;
+        // Per-group running count of positive x.
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT id, count(*) FILTER (WHERE x > 0) OVER (PARTITION BY g ORDER BY id) \
+                 FROM t ORDER BY id",
+                // a: 1,1,2  b: 1,1,2  -> (1,1),(2,1),(3,2),(4,1),(5,1),(6,2)
+            ],
+            "filter_on_partitioned_window_count",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn filter_matches_nothing_in_frame() {
-    let (f, r) = setup();
-    // No row satisfies the predicate: windowed sum is NULL, count is 0, everywhere.
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT id, \
-                sum(x)   FILTER (WHERE x > 1000) OVER (ORDER BY id), \
-                count(*) FILTER (WHERE x > 1000) OVER (ORDER BY id) \
-             FROM t ORDER BY id",
-            // (id, NULL, 0) for every row
-        ],
-        "filter_matches_nothing_in_frame",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup().await;
+        // No row satisfies the predicate: windowed sum is NULL, count is 0, everywhere.
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT id, \
+                    sum(x)   FILTER (WHERE x > 1000) OVER (ORDER BY id), \
+                    count(*) FILTER (WHERE x > 1000) OVER (ORDER BY id) \
+                 FROM t ORDER BY id",
+                // (id, NULL, 0) for every row
+            ],
+            "filter_matches_nothing_in_frame",
+        )
+        .await;
+    });
 }
 
 #[test]
 fn filter_with_sliding_rows_frame() {
-    let (f, r) = setup();
-    // 2-row sliding frame (previous + current), positives only.
-    check(
-        &f,
-        &r,
-        &[
-            "SELECT id, \
-                avg(x)   FILTER (WHERE x > 0) OVER w, \
-                total(x) FILTER (WHERE x > 0) OVER w \
-             FROM t \
-             WINDOW w AS (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
-             ORDER BY id",
-            // (1,10,10),(2,10,10),(3,20,20),(4,11.5,23),(5,3,3),(6,8,8)
-        ],
-        "filter_with_sliding_rows_frame",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup().await;
+        // 2-row sliding frame (previous + current), positives only.
+        check(
+            &f,
+            &r,
+            &[
+                "SELECT id, \
+                    avg(x)   FILTER (WHERE x > 0) OVER w, \
+                    total(x) FILTER (WHERE x > 0) OVER w \
+                 FROM t \
+                 WINDOW w AS (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+                 ORDER BY id",
+                // (1,10,10),(2,10,10),(3,20,20),(4,11.5,23),(5,3,3),(6,8,8)
+            ],
+            "filter_with_sliding_rows_frame",
+        )
+        .await;
+    });
 }

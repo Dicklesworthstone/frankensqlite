@@ -30,10 +30,11 @@ use fsqlite::{Connection, SqliteValue};
 
 const CREATE_SQL: &str = "CREATE VIRTUAL TABLE idx USING fts5(body, content='', tokenize='porter')";
 
-fn match_rowids(conn: &Connection, term: &str) -> Vec<i64> {
+async fn match_rowids(conn: &Connection, term: &str) -> Vec<i64> {
     conn.query(&format!(
         "SELECT rowid FROM idx WHERE idx MATCH '{term}' ORDER BY rowid"
     ))
+    .await
     .expect("MATCH query")
     .iter()
     .map(|r| match &r.values()[0] {
@@ -43,17 +44,19 @@ fn match_rowids(conn: &Connection, term: &str) -> Vec<i64> {
     .collect()
 }
 
-fn insert_doc(conn: &Connection, rowid: i64, body: &str) {
+async fn insert_doc(conn: &Connection, rowid: i64, body: &str) {
     conn.execute_with_params(
         "INSERT INTO idx(rowid, body) VALUES (?1, ?2)",
         &[SqliteValue::Integer(rowid), SqliteValue::Text(body.into())],
     )
+    .await
     .expect("insert contentless fts row");
 }
 
-fn data_row_count(conn: &Connection) -> i64 {
+async fn data_row_count(conn: &Connection) -> i64 {
     match &conn
         .query("SELECT count(*) FROM idx_data")
+        .await
         .expect("count _data rows")
         .first()
         .expect("one count row")
@@ -66,81 +69,87 @@ fn data_row_count(conn: &Connection) -> i64 {
 
 #[test]
 fn contentless_fts_inserts_append_incremental_segments() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let path = tmp.path().to_str().unwrap().to_owned();
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_owned();
 
-    const N: i64 = 24;
+        const N: i64 = 24;
 
-    // --- Phase 1: N inserts, each its own autocommit INSERT statement. ---
-    {
-        let conn = Connection::open(&path).unwrap();
-        conn.execute("PRAGMA journal_mode = WAL;").unwrap();
-        conn.execute(CREATE_SQL).expect("create contentless fts5");
+        // --- Phase 1: N inserts, each its own autocommit INSERT statement. ---
+        {
+            let conn = Connection::open(&path).await.unwrap();
+            conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+            conn.execute(CREATE_SQL)
+                .await
+                .expect("create contentless fts5");
 
-        for rowid in 1..=N {
-            // Each doc has a unique token `docK` plus the shared token `common`.
-            insert_doc(&conn, rowid, &format!("doc{rowid} common alpha beta gamma"));
-        }
+            for rowid in 1..=N {
+                // Each doc has a unique token `docK` plus the shared token `common`.
+                insert_doc(&conn, rowid, &format!("doc{rowid} common alpha beta gamma")).await;
+            }
 
-        // Correctness: every unique token is findable, and the shared token
-        // returns every row.
-        for rowid in 1..=N {
+            // Correctness: every unique token is findable, and the shared token
+            // returns every row.
+            for rowid in 1..=N {
+                assert_eq!(
+                    match_rowids(&conn, &format!("doc{rowid}")).await,
+                    vec![rowid],
+                    "unique token doc{rowid} not searchable"
+                );
+            }
             assert_eq!(
-                match_rowids(&conn, &format!("doc{rowid}")),
-                vec![rowid],
-                "unique token doc{rowid} not searchable"
+                match_rowids(&conn, "common").await,
+                (1..=N).collect::<Vec<_>>(),
+                "shared token did not return every inserted row"
             );
-        }
-        assert_eq!(
-            match_rowids(&conn, "common"),
-            (1..=N).collect::<Vec<_>>(),
-            "shared token did not return every inserted row"
-        );
 
-        // Incremental gate: `_data` must have grown well past the constant ~3
-        // rows the old full-re-encode path produced. One leaf per insert means
-        // at least N leaves plus averages + structure.
-        let data_rows = data_row_count(&conn);
-        assert!(
-            data_rows >= N,
-            "expected incremental segment growth (>= {N} _data rows), got {data_rows}; \
+            // Incremental gate: `_data` must have grown well past the constant ~3
+            // rows the old full-re-encode path produced. One leaf per insert means
+            // at least N leaves plus averages + structure.
+            let data_rows = data_row_count(&conn).await;
+            assert!(
+                data_rows >= N,
+                "expected incremental segment growth (>= {N} _data rows), got {data_rows}; \
              the old full-re-encode path holds a constant ~3 rows"
-        );
-    }
-
-    // --- Phase 2: reopen — multi-segment hydration must reconstruct all rows. ---
-    {
-        let conn = Connection::open(&path).expect("reopen contentless fts5 db");
-        for rowid in 1..=N {
-            assert_eq!(
-                match_rowids(&conn, &format!("doc{rowid}")),
-                vec![rowid],
-                "doc{rowid} lost after reopen across {N} appended segments"
             );
         }
-        assert_eq!(
-            match_rowids(&conn, "common"),
-            (1..=N).collect::<Vec<_>>(),
-            "shared token lost rows after reopen"
-        );
 
-        // --- Phase 3: incremental catch-up insert into the reopened table. ---
-        insert_doc(&conn, N + 1, "doc999 common catchup");
-        assert_eq!(match_rowids(&conn, "doc999"), vec![N + 1]);
-        assert_eq!(
-            match_rowids(&conn, "common"),
-            (1..=N + 1).collect::<Vec<_>>(),
-            "catch-up insert dropped previously persisted rows"
-        );
-    }
+        // --- Phase 2: reopen — multi-segment hydration must reconstruct all rows. ---
+        {
+            let conn = Connection::open(&path)
+                .await
+                .expect("reopen contentless fts5 db");
+            for rowid in 1..=N {
+                assert_eq!(
+                    match_rowids(&conn, &format!("doc{rowid}")).await,
+                    vec![rowid],
+                    "doc{rowid} lost after reopen across {N} appended segments"
+                );
+            }
+            assert_eq!(
+                match_rowids(&conn, "common").await,
+                (1..=N).collect::<Vec<_>>(),
+                "shared token lost rows after reopen"
+            );
 
-    // --- Phase 4: final reopen — everything persisted. ---
-    {
-        let conn = Connection::open(&path).expect("second reopen");
-        assert_eq!(match_rowids(&conn, "doc999"), vec![N + 1]);
-        assert_eq!(
-            match_rowids(&conn, "common"),
-            (1..=N + 1).collect::<Vec<_>>(),
-        );
-    }
+            // --- Phase 3: incremental catch-up insert into the reopened table. ---
+            insert_doc(&conn, N + 1, "doc999 common catchup").await;
+            assert_eq!(match_rowids(&conn, "doc999").await, vec![N + 1]);
+            assert_eq!(
+                match_rowids(&conn, "common").await,
+                (1..=N + 1).collect::<Vec<_>>(),
+                "catch-up insert dropped previously persisted rows"
+            );
+        }
+
+        // --- Phase 4: final reopen — everything persisted. ---
+        {
+            let conn = Connection::open(&path).await.expect("second reopen");
+            assert_eq!(match_rowids(&conn, "doc999").await, vec![N + 1]);
+            assert_eq!(
+                match_rowids(&conn, "common").await,
+                (1..=N + 1).collect::<Vec<_>>(),
+            );
+        }
+    });
 }

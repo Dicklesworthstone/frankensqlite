@@ -6,6 +6,7 @@
 //! - No account goes negative.
 //! - A conflict graph derived from committed transactions is acyclic.
 //! - Abort rate and throughput stay within target bounds for CI scale.
+#![recursion_limit = "512"]
 
 use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;
@@ -80,129 +81,138 @@ struct WorkerResult {
 
 #[test]
 fn ssi_serialization_correctness_ci_scale() {
-    let summary = run_ssi_workload(
-        configured_ci_writers(),
-        configured_ci_txns_per_writer(),
-        TEST_SEED,
-        "ci-scale",
-    );
+    asupersync::test_utils::run_test(|| async {
+        let summary = run_ssi_workload(
+            configured_ci_writers(),
+            configured_ci_txns_per_writer(),
+            TEST_SEED,
+            "ci-scale",
+        )
+        .await;
 
-    let attempted = summary.committed + summary.aborted;
-    assert!(attempted > 0, "expected at least one attempted transaction");
+        let attempted = summary.committed + summary.aborted;
+        assert!(attempted > 0, "expected at least one attempted transaction");
 
-    #[allow(clippy::cast_precision_loss)]
-    let abort_rate = summary.aborted as f64 / attempted as f64;
-    #[allow(clippy::cast_precision_loss)]
-    let throughput = summary.committed as f64 / summary.elapsed_seconds;
-    let min_ci_throughput = configured_ci_min_throughput();
-    let max_ci_elapsed = configured_ci_max_elapsed_seconds();
+        #[allow(clippy::cast_precision_loss)]
+        let abort_rate = summary.aborted as f64 / attempted as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let throughput = summary.committed as f64 / summary.elapsed_seconds;
+        let min_ci_throughput = configured_ci_min_throughput();
+        let max_ci_elapsed = configured_ci_max_elapsed_seconds();
 
-    assert!(
-        abort_rate < MAX_ABORT_RATE,
-        "abort rate too high: {:.3} (max {:.3}); committed={} aborted={} retry_conflicts={}",
-        abort_rate,
-        MAX_ABORT_RATE,
-        summary.committed,
-        summary.aborted,
-        summary.retry_conflicts
-    );
-    assert!(
-        throughput > min_ci_throughput,
-        "throughput too low: {:.1} txn/s (min {:.1} txn/s); committed={} elapsed={:.3}s",
-        throughput,
-        min_ci_throughput,
-        summary.committed,
-        summary.elapsed_seconds
-    );
-    assert!(
-        summary.elapsed_seconds <= max_ci_elapsed,
-        "ci-scale workload exceeded elapsed-time budget: elapsed={:.3}s max={:.3}s",
-        summary.elapsed_seconds,
-        max_ci_elapsed
-    );
+        assert!(
+            abort_rate < MAX_ABORT_RATE,
+            "abort rate too high: {:.3} (max {:.3}); committed={} aborted={} retry_conflicts={}",
+            abort_rate,
+            MAX_ABORT_RATE,
+            summary.committed,
+            summary.aborted,
+            summary.retry_conflicts
+        );
+        assert!(
+            throughput > min_ci_throughput,
+            "throughput too low: {:.1} txn/s (min {:.1} txn/s); committed={} elapsed={:.3}s",
+            throughput,
+            min_ci_throughput,
+            summary.committed,
+            summary.elapsed_seconds
+        );
+        assert!(
+            summary.elapsed_seconds <= max_ci_elapsed,
+            "ci-scale workload exceeded elapsed-time budget: elapsed={:.3}s max={:.3}s",
+            summary.elapsed_seconds,
+            max_ci_elapsed
+        );
 
-    emit_scenario_outcome(
-        "ci-scale",
-        TEST_SEED,
-        &summary,
-        json!({
-            "abort_rate": abort_rate,
-            "throughput_txn_per_sec": throughput,
-            "max_abort_rate": MAX_ABORT_RATE,
-            "min_throughput_txn_per_sec": min_ci_throughput,
-            "max_elapsed_seconds": max_ci_elapsed,
-        }),
-    );
+        emit_scenario_outcome(
+            "ci-scale",
+            TEST_SEED,
+            &summary,
+            json!({
+                "abort_rate": abort_rate,
+                "throughput_txn_per_sec": throughput,
+                "max_abort_rate": MAX_ABORT_RATE,
+                "min_throughput_txn_per_sec": min_ci_throughput,
+                "max_elapsed_seconds": max_ci_elapsed,
+            }),
+        );
+    });
 }
 
 #[test]
 fn ssi_serialization_correctness_single_writer_smoke() {
-    let summary = run_ssi_workload(
-        1,
-        configured_single_writer_txns(),
-        TEST_SEED,
-        "single-writer",
-    );
-    let attempted = summary.committed + summary.aborted;
-    assert!(
-        attempted > 0,
-        "expected at least one attempted single-writer transaction"
-    );
-    assert_eq!(
-        summary.aborted, 0,
-        "single-writer run should not abort under page-level FCW"
-    );
-    let max_single_elapsed = configured_single_writer_max_elapsed_seconds();
-    assert!(
-        summary.elapsed_seconds <= max_single_elapsed,
-        "single-writer workload exceeded elapsed-time budget: elapsed={:.3}s max={:.3}s",
-        summary.elapsed_seconds,
-        max_single_elapsed
-    );
+    asupersync::test_utils::run_test(|| async {
+        let summary = run_ssi_workload(
+            1,
+            configured_single_writer_txns(),
+            TEST_SEED,
+            "single-writer",
+        )
+        .await;
+        let attempted = summary.committed + summary.aborted;
+        assert!(
+            attempted > 0,
+            "expected at least one attempted single-writer transaction"
+        );
+        assert_eq!(
+            summary.aborted, 0,
+            "single-writer run should not abort under page-level FCW"
+        );
+        let max_single_elapsed = configured_single_writer_max_elapsed_seconds();
+        assert!(
+            summary.elapsed_seconds <= max_single_elapsed,
+            "single-writer workload exceeded elapsed-time budget: elapsed={:.3}s max={:.3}s",
+            summary.elapsed_seconds,
+            max_single_elapsed
+        );
 
-    #[allow(clippy::cast_precision_loss)]
-    let throughput = summary.committed as f64 / summary.elapsed_seconds;
-    emit_scenario_outcome(
-        "single-writer",
-        TEST_SEED,
-        &summary,
-        json!({
-            "abort_rate": 0.0,
-            "throughput_txn_per_sec": throughput,
-            "max_elapsed_seconds": max_single_elapsed,
-        }),
-    );
+        #[allow(clippy::cast_precision_loss)]
+        let throughput = summary.committed as f64 / summary.elapsed_seconds;
+        emit_scenario_outcome(
+            "single-writer",
+            TEST_SEED,
+            &summary,
+            json!({
+                "abort_rate": 0.0,
+                "throughput_txn_per_sec": throughput,
+                "max_elapsed_seconds": max_single_elapsed,
+            }),
+        );
+    });
 }
 
 #[test]
 #[ignore = "long-running stress profile for bd-3plop.5 acceptance envelope"]
 fn ssi_serialization_correctness_stress_profile() {
-    let summary = run_ssi_workload(STRESS_WRITERS, STRESS_TXNS_PER_WRITER, TEST_SEED, "stress");
-    let attempted = summary.committed + summary.aborted;
-    assert!(attempted > 0, "stress run produced zero attempts");
+    asupersync::test_utils::run_test(|| async {
+        let summary =
+            run_ssi_workload(STRESS_WRITERS, STRESS_TXNS_PER_WRITER, TEST_SEED, "stress").await;
+        let attempted = summary.committed + summary.aborted;
+        assert!(attempted > 0, "stress run produced zero attempts");
 
-    #[allow(clippy::cast_precision_loss)]
-    let abort_rate = summary.aborted as f64 / attempted as f64;
-    assert!(
-        abort_rate < MAX_ABORT_RATE,
-        "stress abort rate too high: {:.3} (max {:.3}); retry_conflicts={}",
-        abort_rate,
-        MAX_ABORT_RATE,
-        summary.retry_conflicts
-    );
+        #[allow(clippy::cast_precision_loss)]
+        let abort_rate = summary.aborted as f64 / attempted as f64;
+        assert!(
+            abort_rate < MAX_ABORT_RATE,
+            "stress abort rate too high: {:.3} (max {:.3}); retry_conflicts={}",
+            abort_rate,
+            MAX_ABORT_RATE,
+            summary.retry_conflicts
+        );
 
-    #[allow(clippy::cast_precision_loss)]
-    let throughput = summary.committed as f64 / summary.elapsed_seconds;
-    emit_scenario_outcome(
-        "stress",
-        TEST_SEED,
-        &summary,
-        json!({
-            "abort_rate": abort_rate,
-            "throughput_txn_per_sec": throughput,
-            "max_abort_rate": MAX_ABORT_RATE,
-        }),
-    );
+        #[allow(clippy::cast_precision_loss)]
+        let throughput = summary.committed as f64 / summary.elapsed_seconds;
+        emit_scenario_outcome(
+            "stress",
+            TEST_SEED,
+            &summary,
+            json!({
+                "abort_rate": abort_rate,
+                "throughput_txn_per_sec": throughput,
+                "max_abort_rate": MAX_ABORT_RATE,
+            }),
+        );
+    });
 }
 
 #[derive(Debug)]
@@ -358,7 +368,7 @@ fn env_i64(var: &str) -> Option<i64> {
         .filter(|v| *v > 0)
 }
 
-fn run_ssi_workload(
+async fn run_ssi_workload(
     writers: usize,
     txns_per_writer: usize,
     seed: u64,
@@ -367,7 +377,7 @@ fn run_ssi_workload(
     let db_dir = tempfile::tempdir().expect("create temp directory for workload");
     let db_path = db_dir.path().join("ssi_serialization.db");
     let account_count = configured_account_count();
-    initialize_db(&db_path, account_count);
+    initialize_db(&db_path, account_count).await;
 
     let started = Instant::now();
     let mut handles = Vec::with_capacity(writers);
@@ -377,13 +387,20 @@ fn run_ssi_workload(
             u16::try_from(worker_id).expect("worker count must fit into u16 for seed derivation");
         let worker_seed = derive_worker_seed(seed, worker_id_u16);
         handles.push(thread::spawn(move || {
-            run_worker(
-                &path,
-                worker_id,
-                txns_per_writer,
-                worker_seed,
-                account_count,
-            )
+            let mut outcome = None;
+            asupersync::test_utils::run_test(|| async {
+                outcome = Some(
+                    run_worker(
+                        &path,
+                        worker_id,
+                        txns_per_writer,
+                        worker_seed,
+                        account_count,
+                    )
+                    .await,
+                );
+            });
+            outcome.expect("worker thread must produce a result")
         }));
     }
 
@@ -412,7 +429,7 @@ fn run_ssi_workload(
         hard_failures.join(" | ")
     );
 
-    let (final_sum, min_balance) = read_account_invariants(&db_path);
+    let (final_sum, min_balance) = read_account_invariants(&db_path).await;
     let initial_sum = account_count * INITIAL_BALANCE;
     let expected_sum = initial_sum + sum_delta;
 
@@ -443,14 +460,18 @@ fn run_ssi_workload(
     }
 }
 
-fn initialize_db(path: &Path, account_count: i64) {
+async fn initialize_db(path: &Path, account_count: i64) {
     let conn = fsqlite::Connection::open(path.to_string_lossy().as_ref())
+        .await
         .expect("open db for initialization");
     conn.execute("PRAGMA journal_mode=WAL;")
+        .await
         .expect("set WAL mode");
     conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"))
+        .await
         .expect("set busy timeout");
     conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")
+        .await
         .expect("enable concurrent mode");
     conn.execute(
         "CREATE TABLE accounts (
@@ -458,17 +479,19 @@ fn initialize_db(path: &Path, account_count: i64) {
             balance INTEGER NOT NULL
         );",
     )
+    .await
     .expect("create accounts table");
 
     for id in 1..=account_count {
         conn.execute(&format!(
             "INSERT INTO accounts (id, balance) VALUES ({id}, {INITIAL_BALANCE});"
         ))
+        .await
         .expect("seed account row");
     }
 }
 
-fn run_worker(
+async fn run_worker(
     db_path: &Path,
     worker_id: usize,
     txns_per_worker: usize,
@@ -480,7 +503,7 @@ fn run_worker(
     // Keep retries adaptive instead of hot-looping under page-level contention.
     let mut retry_controller =
         RetryController::with_candidates(RetryCostParams::default(), vec![1, 2, 5, 10, 20], 8);
-    let mut conn = match open_worker_connection(db_path) {
+    let mut conn = match open_worker_connection(db_path).await {
         Ok(conn) => conn,
         Err(err) => {
             result.hard_failures.push(format!(
@@ -501,7 +524,7 @@ fn run_worker(
             let kind = choose_txn_kind(&mut rng);
 
             let execute_result: Result<_, FrankenError> =
-                execute_single_txn(&conn, &mut rng, kind, account_count);
+                execute_single_txn(&conn, &mut rng, kind, account_count).await;
             match execute_result {
                 Ok((start_order, commit_order, read_set, write_set, delta_sum)) => {
                     if let Some(wait_ms) = last_wait_ms.take() {
@@ -525,7 +548,7 @@ fn run_worker(
                     }
 
                     result.retry_conflicts += 1;
-                    if let Err(rollback_err) = rollback_required(&conn) {
+                    if let Err(rollback_err) = rollback_required(&conn).await {
                         retry_controller.clear_conflict(logical_txn_id);
                         result.aborted += 1;
                         result.hard_failures.push(format!(
@@ -563,7 +586,7 @@ fn run_worker(
                         }
                     };
                     thread::sleep(Duration::from_millis(retry_sleep_ms));
-                    conn = match open_worker_connection(db_path) {
+                    conn = match open_worker_connection(db_path).await {
                         Ok(conn) => conn,
                         Err(open_err) => {
                             retry_controller.clear_conflict(logical_txn_id);
@@ -580,7 +603,7 @@ fn run_worker(
                         retry_controller.observe(wait_ms, false);
                     }
                     result.aborted += 1;
-                    if let Err(rollback_err) = rollback_required(&conn) {
+                    if let Err(rollback_err) = rollback_required(&conn).await {
                         result.hard_failures.push(format!(
                             "worker={worker_id} txn_index={txn_index} rollback failed after non-transient error ({err}): {rollback_err}"
                         ));
@@ -599,13 +622,13 @@ fn run_worker(
 }
 
 #[allow(clippy::type_complexity)]
-fn execute_single_txn(
+async fn execute_single_txn(
     conn: &fsqlite::Connection,
     rng: &mut StdRng,
     kind: TxnKind,
     account_count: i64,
 ) -> Result<(u64, u64, BTreeSet<i64>, BTreeSet<i64>, i64), FrankenError> {
-    conn.execute("BEGIN CONCURRENT;")?;
+    conn.execute("BEGIN CONCURRENT;").await?;
     let start_order = conn.current_concurrent_snapshot_seq().ok_or_else(|| {
         FrankenError::Internal(
             "missing concurrent snapshot sequence after BEGIN CONCURRENT".to_owned(),
@@ -625,7 +648,7 @@ fn execute_single_txn(
             }
             let amount = i64::from(rng.random_range(1_u8..=5_u8));
 
-            let from_balance = read_balance(conn, from)?;
+            let from_balance = read_balance(conn, from).await?;
             read_set.insert(from);
 
             if from_balance >= amount {
@@ -637,7 +660,8 @@ fn execute_single_txn(
                          ELSE balance \
                      END \
                      WHERE id IN ({from}, {to});"
-                ))?;
+                ))
+                .await?;
                 write_set.insert(from);
                 write_set.insert(to);
             }
@@ -648,16 +672,17 @@ fn execute_single_txn(
 
             conn.execute(&format!(
                 "UPDATE accounts SET balance = balance + {amount} WHERE id = {account};"
-            ))?;
+            ))
+            .await?;
             write_set.insert(account);
             delta_sum += amount;
         }
         TxnKind::BalanceCheck => {
-            let _ = read_sum(conn)?;
+            let _ = read_sum(conn).await?;
         }
     }
 
-    conn.execute("COMMIT;")?;
+    conn.execute("COMMIT;").await?;
     let commit_order = conn.last_local_commit_seq().ok_or_else(|| {
         FrankenError::Internal("missing commit sequence after successful COMMIT".to_owned())
     })?;
@@ -683,26 +708,29 @@ fn random_account(rng: &mut StdRng, account_count: i64) -> i64 {
     rng.random_range(1_i64..=account_count)
 }
 
-fn open_worker_connection(db_path: &Path) -> Result<fsqlite::Connection, FrankenError> {
-    let conn = fsqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
-    conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"))?;
-    conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")?;
+async fn open_worker_connection(db_path: &Path) -> Result<fsqlite::Connection, FrankenError> {
+    let conn = fsqlite::Connection::open(db_path.to_string_lossy().as_ref()).await?;
+    conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"))
+        .await?;
+    conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").await?;
     Ok(conn)
 }
 
-fn rollback_required(conn: &fsqlite::Connection) -> Result<(), FrankenError> {
-    conn.execute("ROLLBACK;").map(|_| ())
+async fn rollback_required(conn: &fsqlite::Connection) -> Result<(), FrankenError> {
+    conn.execute("ROLLBACK;").await.map(|_| ())
 }
 
-fn read_balance(conn: &fsqlite::Connection, account_id: i64) -> Result<i64, FrankenError> {
-    let row = conn.query_row(&format!(
-        "SELECT balance FROM accounts WHERE id = {account_id};"
-    ))?;
+async fn read_balance(conn: &fsqlite::Connection, account_id: i64) -> Result<i64, FrankenError> {
+    let row = conn
+        .query_row(&format!(
+            "SELECT balance FROM accounts WHERE id = {account_id};"
+        ))
+        .await?;
     extract_int(&row, 0)
 }
 
-fn read_sum(conn: &fsqlite::Connection) -> Result<i64, FrankenError> {
-    let row = conn.query_row("SELECT SUM(balance) FROM accounts;")?;
+async fn read_sum(conn: &fsqlite::Connection) -> Result<i64, FrankenError> {
+    let row = conn.query_row("SELECT SUM(balance) FROM accounts;").await?;
     extract_int(&row, 0)
 }
 
@@ -718,17 +746,20 @@ fn extract_int(row: &fsqlite::Row, index: usize) -> Result<i64, FrankenError> {
     }
 }
 
-fn read_account_invariants(path: &Path) -> (i64, i64) {
+async fn read_account_invariants(path: &Path) -> (i64, i64) {
     let conn = fsqlite::Connection::open(path.to_string_lossy().as_ref())
+        .await
         .expect("open verifier connection");
 
     let sum_row = conn
         .query_row("SELECT SUM(balance) FROM accounts;")
+        .await
         .expect("query sum");
     let final_sum = extract_int(&sum_row, 0).expect("extract sum");
 
     let min_row = conn
         .query_row("SELECT MIN(balance) FROM accounts;")
+        .await
         .expect("query min balance");
     let min_balance = extract_int(&min_row, 0).expect("extract min balance");
 

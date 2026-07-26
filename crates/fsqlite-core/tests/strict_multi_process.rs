@@ -35,10 +35,14 @@ fn connection_env_strict_multi_process_round_trips() {
 
 #[test]
 fn open_strict_multi_process_constructor_opens_a_usable_connection() {
-    let conn = Connection::open_strict_multi_process(":memory:")
-        .expect("strict multi-process constructor should open an in-memory database");
-    conn.execute("CREATE TABLE strict_smoke (id INTEGER PRIMARY KEY)")
-        .expect("strict multi-process connection should execute ordinary DDL");
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open_strict_multi_process(":memory:")
+            .await
+            .expect("strict multi-process constructor should open an in-memory database");
+        conn.execute("CREATE TABLE strict_smoke (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("strict multi-process connection should execute ordinary DDL");
+    });
 }
 
 #[test]
@@ -64,29 +68,42 @@ fn multi_process_contract_violation_carries_detail() {
 
 #[test]
 fn strict_multi_process_refuses_expired_transaction_lock_admission() {
-    let dir = tempfile::tempdir().expect("create temp directory");
-    let path = dir.path().join("strict-lock-admission.db");
-    let path = path.to_string_lossy().into_owned();
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("create temp directory");
+        let path = dir.path().join("strict-lock-admission.db");
+        let path = path.to_string_lossy().into_owned();
 
-    let holder = Connection::open(path.clone()).expect("open lock holder");
-    holder
-        .execute("CREATE TABLE guarded(value INTEGER NOT NULL);")
-        .expect("initialize test database");
-    let waiter = Connection::open_strict_multi_process(path).expect("open strict waiter");
+        let holder = Connection::open(path.clone())
+            .await
+            .expect("open lock holder");
+        holder
+            .execute("CREATE TABLE guarded(value INTEGER NOT NULL);")
+            .await
+            .expect("initialize test database");
+        let waiter = Connection::open_strict_multi_process(path)
+            .await
+            .expect("open strict waiter");
 
-    holder
-        .execute("BEGIN EXCLUSIVE;")
-        .expect("holder acquires exclusive transaction lock");
-    waiter
-        .execute("PRAGMA busy_timeout = 0;")
-        .expect("disable retries for deterministic refusal");
-    let error = waiter
-        .execute("BEGIN IMMEDIATE;")
-        .expect_err("strict waiter must classify exhausted lock admission");
+        holder
+            .execute("BEGIN EXCLUSIVE;")
+            .await
+            .expect("holder acquires exclusive transaction lock");
+        waiter
+            .execute("PRAGMA busy_timeout = 0;")
+            .await
+            .expect("disable retries for deterministic refusal");
+        let error = waiter
+            .execute("BEGIN IMMEDIATE;")
+            .await
+            .expect_err("strict waiter must classify exhausted lock admission");
 
-    assert!(
-        matches!(error, FrankenError::MultiProcessContractViolation { .. }),
-        "strict mode must surface a typed contract violation, got {error:?}"
-    );
-    holder.execute("ROLLBACK;").expect("release holder lock");
+        assert!(
+            matches!(error, FrankenError::MultiProcessContractViolation { .. }),
+            "strict mode must surface a typed contract violation, got {error:?}"
+        );
+        holder
+            .execute("ROLLBACK;")
+            .await
+            .expect("release holder lock");
+    });
 }
