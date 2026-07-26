@@ -1036,6 +1036,7 @@ dependencies = [
  "fsqlite-vfs",
  "rand 0.10.1",
  "rusqlite",
+ "sha2 0.11.0",
  "tempfile",
  "tracing",
 ]
@@ -1126,6 +1127,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "smallvec",
  "tempfile",
  "tracing",

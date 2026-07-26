@@ -50,7 +50,13 @@ fsqlite-func = { workspace = true }
 fsqlite-pager = { workspace = true }
 rand = { workspace = true }
 rusqlite = { workspace = true, features = ["functions"] }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
+
+[[bench]]
+name = "minmax_prefix_contract_bench"
+path = "tests/minmax_prefix_profile.rs"
+harness = false
 
 [lints]
 workspace = true
