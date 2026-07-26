@@ -107,41 +107,41 @@ async fn run_no_fk_insert(n: i64) -> f64 {
 #[test]
 fn fk_explicit_rowid_insert_scales_flat() {
     asupersync::test_utils::run_test(|| async {
-    let sizes = [1000_i64, 2000, 4000, 8000];
-    let mut fk = Vec::new();
-    let mut nofk = Vec::new();
-    for &n in &sizes {
-        let (us, refreshes) = run_fk_insert(n).await;
-        // Distinct from #110: this shape must not trigger memdb reloads.
-        assert_eq!(
-            refreshes, 0,
-            "FK explicit-rowid insert at N={n} triggered {refreshes} memdb refreshes (expected 0; this would be the #110 bug, not #111)"
-        );
-        let control = run_no_fk_insert(n).await;
-        eprintln!(
-            "N={n:>5}  FK-on={us:8.3} us/insert   no-FK={control:8.3} us/insert   ratio={:.2}x",
-            us / control
-        );
-        fk.push(us);
-        nofk.push(control);
-    }
+        let sizes = [1000_i64, 2000, 4000, 8000];
+        let mut fk = Vec::new();
+        let mut nofk = Vec::new();
+        for &n in &sizes {
+            let (us, refreshes) = run_fk_insert(n).await;
+            // Distinct from #110: this shape must not trigger memdb reloads.
+            assert_eq!(
+                refreshes, 0,
+                "FK explicit-rowid insert at N={n} triggered {refreshes} memdb refreshes (expected 0; this would be the #110 bug, not #111)"
+            );
+            let control = run_no_fk_insert(n).await;
+            eprintln!(
+                "N={n:>5}  FK-on={us:8.3} us/insert   no-FK={control:8.3} us/insert   ratio={:.2}x",
+                us / control
+            );
+            fk.push(us);
+            nofk.push(control);
+        }
 
-    // Scaling check: the per-insert cost at N=8000 must not blow up versus
-    // N=1000. The bug showed ~6x growth (108 -> 635 us). Flat/linear-per-row
-    // should keep the ratio low. Allow generous slack for CI noise but catch
-    // the super-linear regression.
-    let growth = fk[fk.len() - 1] / fk[0];
-    eprintln!(
-        "FK per-insert growth N=1k->8k: {:.2}x ({:.3} -> {:.3} us)",
-        growth,
-        fk[0],
-        fk[fk.len() - 1]
-    );
-    assert!(
-        growth < 2.5,
-        "FK explicit-rowid insert grew {growth:.2}x from N=1k to N=8k (per-insert {:.3} -> {:.3} us); expected near-flat scaling. Super-linear regression (#111).",
-        fk[0],
-        fk[fk.len() - 1]
-    );
+        // Scaling check: the per-insert cost at N=8000 must not blow up versus
+        // N=1000. The bug showed ~6x growth (108 -> 635 us). Flat/linear-per-row
+        // should keep the ratio low. Allow generous slack for CI noise but catch
+        // the super-linear regression.
+        let growth = fk[fk.len() - 1] / fk[0];
+        eprintln!(
+            "FK per-insert growth N=1k->8k: {:.2}x ({:.3} -> {:.3} us)",
+            growth,
+            fk[0],
+            fk[fk.len() - 1]
+        );
+        assert!(
+            growth < 2.5,
+            "FK explicit-rowid insert grew {growth:.2}x from N=1k to N=8k (per-insert {:.3} -> {:.3} us); expected near-flat scaling. Super-linear regression (#111).",
+            fk[0],
+            fk[fk.len() - 1]
+        );
     });
 }

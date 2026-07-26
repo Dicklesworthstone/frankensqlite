@@ -150,22 +150,22 @@ const SELECT_CHILD: &str = "SELECT id, parent_id FROM child ORDER BY id;";
 #[test]
 fn fk_explicit_rowid_plain_valid_and_bad() {
     asupersync::test_utils::run_test(|| async {
-    assert_parity(
-        CHILD_FK,
-        &[
-            "INSERT INTO parent VALUES (1);",
-            "INSERT INTO parent VALUES (2);",
-        ],
-        &[
-            "INSERT INTO child VALUES (10, 1);",  // valid -> Ok(1)
-            "INSERT INTO child VALUES (11, 99);", // bad FK -> FkViolation, row not persisted
-            "INSERT INTO child VALUES (12, 2);",  // valid -> Ok(1)
-        ],
-        SELECT_CHILD,
-        2,
-        "explicit_plain",
-    )
-    .await;
+        assert_parity(
+            CHILD_FK,
+            &[
+                "INSERT INTO parent VALUES (1);",
+                "INSERT INTO parent VALUES (2);",
+            ],
+            &[
+                "INSERT INTO child VALUES (10, 1);",  // valid -> Ok(1)
+                "INSERT INTO child VALUES (11, 99);", // bad FK -> FkViolation, row not persisted
+                "INSERT INTO child VALUES (12, 2);",  // valid -> Ok(1)
+            ],
+            SELECT_CHILD,
+            2,
+            "explicit_plain",
+        )
+        .await;
     });
 }
 
@@ -174,18 +174,18 @@ fn fk_explicit_rowid_dup_pk_plain_pk_wins_over_fk() {
     // Plain INSERT with a dup PK AND a bad FK must raise PK/UNIQUE (PK first),
     // never FK.
     asupersync::test_utils::run_test(|| async {
-    assert_parity(
-        CHILD_FK,
-        &[
-            "INSERT INTO parent VALUES (1);",
-            "INSERT INTO child VALUES (5, 1);",
-        ],
-        &["INSERT INTO child VALUES (5, 99);"], // dup PK + bad FK -> PkOrUnique
-        SELECT_CHILD,
-        2,
-        "explicit_dup_pk_plain",
-    )
-    .await;
+        assert_parity(
+            CHILD_FK,
+            &[
+                "INSERT INTO parent VALUES (1);",
+                "INSERT INTO child VALUES (5, 1);",
+            ],
+            &["INSERT INTO child VALUES (5, 99);"], // dup PK + bad FK -> PkOrUnique
+            SELECT_CHILD,
+            2,
+            "explicit_dup_pk_plain",
+        )
+        .await;
     });
 }
 
@@ -194,18 +194,18 @@ fn fk_or_ignore_dup_pk_drops_no_fk() {
     // OR IGNORE on a dup PK drops the row (0 changed), and must NOT raise FK
     // even though the dropped row had a bad FK value.
     asupersync::test_utils::run_test(|| async {
-    assert_parity(
-        CHILD_FK,
-        &[
-            "INSERT INTO parent VALUES (1);",
-            "INSERT INTO child VALUES (5, 1);",
-        ],
-        &["INSERT OR IGNORE INTO child VALUES (5, 99);"], // dup PK -> Ok(0), ignored
-        SELECT_CHILD,
-        2,
-        "or_ignore_dup_pk",
-    )
-    .await;
+        assert_parity(
+            CHILD_FK,
+            &[
+                "INSERT INTO parent VALUES (1);",
+                "INSERT INTO child VALUES (5, 1);",
+            ],
+            &["INSERT OR IGNORE INTO child VALUES (5, 99);"], // dup PK -> Ok(0), ignored
+            SELECT_CHILD,
+            2,
+            "or_ignore_dup_pk",
+        )
+        .await;
     });
 }
 
@@ -214,15 +214,15 @@ fn fk_or_ignore_new_pk_bad_fk_still_raises() {
     // OR IGNORE does NOT suppress an immediate FK violation when there is no
     // PK conflict.
     asupersync::test_utils::run_test(|| async {
-    assert_parity(
-        CHILD_FK,
-        &["INSERT INTO parent VALUES (1);"],
-        &["INSERT OR IGNORE INTO child VALUES (6, 99);"], // new PK + bad FK -> FkViolation
-        SELECT_CHILD,
-        2,
-        "or_ignore_new_pk_bad_fk",
-    )
-    .await;
+        assert_parity(
+            CHILD_FK,
+            &["INSERT INTO parent VALUES (1);"],
+            &["INSERT OR IGNORE INTO child VALUES (6, 99);"], // new PK + bad FK -> FkViolation
+            SELECT_CHILD,
+            2,
+            "or_ignore_new_pk_bad_fk",
+        )
+        .await;
     });
 }
 
@@ -231,182 +231,182 @@ fn fk_or_replace_dup_pk_bad_fk_raises_fk() {
     // OR REPLACE replaces the conflicting row, but the replacement row's FK is
     // still enforced -> FK violation.
     asupersync::test_utils::run_test(|| async {
-    assert_parity(
-        CHILD_FK,
-        &[
-            "INSERT INTO parent VALUES (1);",
-            "INSERT INTO child VALUES (5, 1);",
-        ],
-        &["INSERT OR REPLACE INTO child VALUES (5, 99);"], // dup PK + bad FK -> FkViolation
-        SELECT_CHILD,
-        2,
-        "or_replace_dup_pk_bad_fk",
-    )
-    .await;
-    });
-}
-
-#[test]
-fn fk_or_replace_dup_pk_valid_fk_replaces() {
-    asupersync::test_utils::run_test(|| async {
-    assert_parity(
-        CHILD_FK,
-        &[
-            "INSERT INTO parent VALUES (1);",
-            "INSERT INTO parent VALUES (2);",
-            "INSERT INTO child VALUES (5, 1);",
-        ],
-        &["INSERT OR REPLACE INTO child VALUES (5, 2);"], // dup PK + valid FK -> Ok(1), replaced
-        SELECT_CHILD,
-        2,
-        "or_replace_dup_pk_valid",
-    )
-    .await;
-    });
-}
-
-#[test]
-fn fk_or_abort_fail_dup_pk_pk_wins() {
-    asupersync::test_utils::run_test(|| async {
-    for clause in ["OR ABORT", "OR FAIL"] {
-        let case = format!("INSERT {clause} INTO child VALUES (5, 99);");
         assert_parity(
             CHILD_FK,
             &[
                 "INSERT INTO parent VALUES (1);",
                 "INSERT INTO child VALUES (5, 1);",
             ],
-            &[&case],
+            &["INSERT OR REPLACE INTO child VALUES (5, 99);"], // dup PK + bad FK -> FkViolation
             SELECT_CHILD,
             2,
-            "or_abort_fail_dup_pk",
+            "or_replace_dup_pk_bad_fk",
         )
         .await;
-    }
+    });
+}
+
+#[test]
+fn fk_or_replace_dup_pk_valid_fk_replaces() {
+    asupersync::test_utils::run_test(|| async {
+        assert_parity(
+            CHILD_FK,
+            &[
+                "INSERT INTO parent VALUES (1);",
+                "INSERT INTO parent VALUES (2);",
+                "INSERT INTO child VALUES (5, 1);",
+            ],
+            &["INSERT OR REPLACE INTO child VALUES (5, 2);"], // dup PK + valid FK -> Ok(1), replaced
+            SELECT_CHILD,
+            2,
+            "or_replace_dup_pk_valid",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn fk_or_abort_fail_dup_pk_pk_wins() {
+    asupersync::test_utils::run_test(|| async {
+        for clause in ["OR ABORT", "OR FAIL"] {
+            let case = format!("INSERT {clause} INTO child VALUES (5, 99);");
+            assert_parity(
+                CHILD_FK,
+                &[
+                    "INSERT INTO parent VALUES (1);",
+                    "INSERT INTO child VALUES (5, 1);",
+                ],
+                &[&case],
+                SELECT_CHILD,
+                2,
+                "or_abort_fail_dup_pk",
+            )
+            .await;
+        }
     });
 }
 
 #[test]
 fn fk_implicit_rowid_regression() {
     asupersync::test_utils::run_test(|| async {
-    // Implicit-rowid child (id is NOT the IPK alias used for the FK). FK is on
-    // parent_id. Auto-assigned rowid never conflicts. Guards the pre-existing
-    // implicit-rowid behavior.
-    let child = "CREATE TABLE child (parent_id INTEGER REFERENCES parent(id), note TEXT);";
-    let select = "SELECT parent_id, note FROM child ORDER BY rowid;";
-    assert_parity(
-        child,
-        &["INSERT INTO parent VALUES (1);"],
-        &[
-            "INSERT INTO child (parent_id, note) VALUES (1, 'a');", // Ok(1)
-            "INSERT INTO child (parent_id, note) VALUES (99, 'b');", // bad FK -> FkViolation
-            "INSERT OR IGNORE INTO child (parent_id, note) VALUES (99, 'c');", // OR IGNORE new row bad FK -> FkViolation
-        ],
-        select,
-        2,
-        "implicit_rowid",
-    )
-    .await;
+        // Implicit-rowid child (id is NOT the IPK alias used for the FK). FK is on
+        // parent_id. Auto-assigned rowid never conflicts. Guards the pre-existing
+        // implicit-rowid behavior.
+        let child = "CREATE TABLE child (parent_id INTEGER REFERENCES parent(id), note TEXT);";
+        let select = "SELECT parent_id, note FROM child ORDER BY rowid;";
+        assert_parity(
+            child,
+            &["INSERT INTO parent VALUES (1);"],
+            &[
+                "INSERT INTO child (parent_id, note) VALUES (1, 'a');", // Ok(1)
+                "INSERT INTO child (parent_id, note) VALUES (99, 'b');", // bad FK -> FkViolation
+                "INSERT OR IGNORE INTO child (parent_id, note) VALUES (99, 'c');", // OR IGNORE new row bad FK -> FkViolation
+            ],
+            select,
+            2,
+            "implicit_rowid",
+        )
+        .await;
     });
 }
 
 #[test]
 fn fk_self_reference_explicit_rowid() {
     asupersync::test_utils::run_test(|| async {
-    // Self-referential FK: child.parent_id REFERENCES child.id. Post-insert FK
-    // must see the just-inserted (and earlier in-flight) rows.
-    let child =
-        "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES child(id));";
-    let (f, r) = setup_pair(child).await; // parent table unused but harmless
-    f.execute("BEGIN;").await.unwrap();
-    r.execute("BEGIN;", []).unwrap();
-    let cases: &[&str] = &[
-        "INSERT INTO child VALUES (1, NULL);", // root, Ok(1)
-        "INSERT INTO child VALUES (2, 1);",    // references in-flight id=1 -> Ok(1)
-        "INSERT INTO child VALUES (3, 3);",    // references itself -> Ok(1)
-        "INSERT INTO child VALUES (4, 99);",   // references missing id -> FkViolation
-    ];
-    for (i, sql) in cases.iter().enumerate() {
-        let fo = classify_franken(f.execute(sql).await);
-        let ro = classify_rusqlite(r.execute(sql, []));
-        assert_eq!(fo, ro, "[self_ref] case #{i} `{sql}`: {fo:?} vs {ro:?}");
-    }
-    let fd = franken_table_dump(&f, "SELECT id, parent_id FROM child ORDER BY id;").await;
-    let rd = rusqlite_table_dump(&r, "SELECT id, parent_id FROM child ORDER BY id;", 2);
-    assert_eq!(
-        fd, rd,
-        "[self_ref] final contents diverged: {fd:?} vs {rd:?}"
-    );
+        // Self-referential FK: child.parent_id REFERENCES child.id. Post-insert FK
+        // must see the just-inserted (and earlier in-flight) rows.
+        let child =
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES child(id));";
+        let (f, r) = setup_pair(child).await; // parent table unused but harmless
+        f.execute("BEGIN;").await.unwrap();
+        r.execute("BEGIN;", []).unwrap();
+        let cases: &[&str] = &[
+            "INSERT INTO child VALUES (1, NULL);", // root, Ok(1)
+            "INSERT INTO child VALUES (2, 1);",    // references in-flight id=1 -> Ok(1)
+            "INSERT INTO child VALUES (3, 3);",    // references itself -> Ok(1)
+            "INSERT INTO child VALUES (4, 99);",   // references missing id -> FkViolation
+        ];
+        for (i, sql) in cases.iter().enumerate() {
+            let fo = classify_franken(f.execute(sql).await);
+            let ro = classify_rusqlite(r.execute(sql, []));
+            assert_eq!(fo, ro, "[self_ref] case #{i} `{sql}`: {fo:?} vs {ro:?}");
+        }
+        let fd = franken_table_dump(&f, "SELECT id, parent_id FROM child ORDER BY id;").await;
+        let rd = rusqlite_table_dump(&r, "SELECT id, parent_id FROM child ORDER BY id;", 2);
+        assert_eq!(
+            fd, rd,
+            "[self_ref] final contents diverged: {fd:?} vs {rd:?}"
+        );
     });
 }
 
 #[test]
 fn fk_null_fk_column_satisfied() {
     asupersync::test_utils::run_test(|| async {
-    assert_parity(
-        CHILD_FK,
-        &["INSERT INTO parent VALUES (1);"],
-        &["INSERT INTO child VALUES (7, NULL);"], // NULL FK col -> satisfied -> Ok(1)
-        SELECT_CHILD,
-        2,
-        "null_fk",
-    )
-    .await;
+        assert_parity(
+            CHILD_FK,
+            &["INSERT INTO parent VALUES (1);"],
+            &["INSERT INTO child VALUES (7, NULL);"], // NULL FK col -> satisfied -> Ok(1)
+            SELECT_CHILD,
+            2,
+            "null_fk",
+        )
+        .await;
     });
 }
 
 #[test]
 fn fk_multi_fk_one_bad() {
     asupersync::test_utils::run_test(|| async {
-    let child = "CREATE TABLE child (id INTEGER PRIMARY KEY, p1 INTEGER REFERENCES parent(id), p2 INTEGER REFERENCES parent(id));";
-    let select = "SELECT id, p1, p2 FROM child ORDER BY id;";
-    assert_parity(
-        child,
-        &[
-            "INSERT INTO parent VALUES (1);",
-            "INSERT INTO parent VALUES (2);",
-        ],
-        &[
-            "INSERT INTO child VALUES (10, 1, 2);",  // both valid -> Ok(1)
-            "INSERT INTO child VALUES (11, 1, 99);", // one bad -> FkViolation
-        ],
-        select,
-        3,
-        "multi_fk",
-    )
-    .await;
+        let child = "CREATE TABLE child (id INTEGER PRIMARY KEY, p1 INTEGER REFERENCES parent(id), p2 INTEGER REFERENCES parent(id));";
+        let select = "SELECT id, p1, p2 FROM child ORDER BY id;";
+        assert_parity(
+            child,
+            &[
+                "INSERT INTO parent VALUES (1);",
+                "INSERT INTO parent VALUES (2);",
+            ],
+            &[
+                "INSERT INTO child VALUES (10, 1, 2);",  // both valid -> Ok(1)
+                "INSERT INTO child VALUES (11, 1, 99);", // one bad -> FkViolation
+            ],
+            select,
+            3,
+            "multi_fk",
+        )
+        .await;
     });
 }
 
 #[test]
 fn fk_autocommit_single_inserts() {
     asupersync::test_utils::run_test(|| async {
-    // Same matrix but in autocommit (no explicit BEGIN). Each statement is its
-    // own transaction; a failed FK insert rolls back its own statement.
-    let f = Connection::open(":memory:").await.unwrap();
-    let r = rusqlite::Connection::open_in_memory().unwrap();
-    f.execute("PRAGMA foreign_keys=ON;").await.unwrap();
-    r.execute("PRAGMA foreign_keys=ON;", []).unwrap();
-    for ddl in [
-        "CREATE TABLE parent (id INTEGER PRIMARY KEY);",
-        CHILD_FK,
-        "INSERT INTO parent VALUES (1);",
-    ] {
-        f.execute(ddl).await.unwrap();
-        r.execute(ddl, []).unwrap();
-    }
-    for sql in [
-        "INSERT INTO child VALUES (1, 1);",            // Ok
-        "INSERT INTO child VALUES (2, 99);",           // bad FK
-        "INSERT OR IGNORE INTO child VALUES (1, 99);", // dup PK -> ignored
-        "INSERT INTO child VALUES (3, 1);",            // Ok
-    ] {
-        let fo = classify_franken(f.execute(sql).await);
-        let ro = classify_rusqlite(r.execute(sql, []));
-        assert_eq!(fo, ro, "[autocommit] `{sql}`: {fo:?} vs {ro:?}");
-    }
-    let fd = franken_table_dump(&f, SELECT_CHILD).await;
-    let rd = rusqlite_table_dump(&r, SELECT_CHILD, 2);
-    assert_eq!(fd, rd, "[autocommit] final contents: {fd:?} vs {rd:?}");
+        // Same matrix but in autocommit (no explicit BEGIN). Each statement is its
+        // own transaction; a failed FK insert rolls back its own statement.
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        f.execute("PRAGMA foreign_keys=ON;").await.unwrap();
+        r.execute("PRAGMA foreign_keys=ON;", []).unwrap();
+        for ddl in [
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY);",
+            CHILD_FK,
+            "INSERT INTO parent VALUES (1);",
+        ] {
+            f.execute(ddl).await.unwrap();
+            r.execute(ddl, []).unwrap();
+        }
+        for sql in [
+            "INSERT INTO child VALUES (1, 1);",            // Ok
+            "INSERT INTO child VALUES (2, 99);",           // bad FK
+            "INSERT OR IGNORE INTO child VALUES (1, 99);", // dup PK -> ignored
+            "INSERT INTO child VALUES (3, 1);",            // Ok
+        ] {
+            let fo = classify_franken(f.execute(sql).await);
+            let ro = classify_rusqlite(r.execute(sql, []));
+            assert_eq!(fo, ro, "[autocommit] `{sql}`: {fo:?} vs {ro:?}");
+        }
+        let fd = franken_table_dump(&f, SELECT_CHILD).await;
+        let rd = rusqlite_table_dump(&r, SELECT_CHILD, 2);
+        assert_eq!(fd, rd, "[autocommit] final contents: {fd:?} vs {rd:?}");
     });
 }

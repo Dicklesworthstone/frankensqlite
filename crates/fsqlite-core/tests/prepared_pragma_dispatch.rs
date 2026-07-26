@@ -80,10 +80,18 @@ fn prepared_pragma_getters_and_setters_match_rusqlite() -> TestResult {
                 );
             }
 
-            let user_version_row = fconn.prepare("PRAGMA user_version").await?.query_row().await?;
+            let user_version_row = fconn
+                .prepare("PRAGMA user_version")
+                .await?
+                .query_row()
+                .await?;
             assert_eq!(user_version_row.values(), &[SqliteValue::Integer(37)]);
             assert_eq!(
-                fconn.prepare("PRAGMA user_version").await?.execute().await?,
+                fconn
+                    .prepare("PRAGMA user_version")
+                    .await?
+                    .execute()
+                    .await?,
                 1
             );
 

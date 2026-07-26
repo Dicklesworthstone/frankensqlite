@@ -23702,6 +23702,21 @@ impl Connection {
         self.clear_compilation_reuse_caches();
     }
 
+    // DO NOT DELETE AS DEAD CODE -- this is a lost call site, not vestigial.
+    //
+    // `bypass_compiled_cache` is still *consumed* by `compile_with_cache`,
+    // which skips the compiled-program cache and recompiles when it is set.
+    // This helper is the only thing that can set it, and it currently has zero
+    // callers, so the bypass branch is unreachable in practice and the compiled
+    // cache is always consulted.
+    //
+    // That matters because CTE and view materialization allocate temp tables in
+    // `MemDatabase` with *dynamic* root pages. A cached program compiled against
+    // an earlier root will keep using it, which is the shape of
+    // GH #255 / bd-gh-cte-compiled-cache-stale-root ("cte-compiled-cache-stale-root").
+    // Reconnecting this to the CTE/view materialization path is the suspected
+    // fix; it needs its own change with a regression test, not a lint cleanup.
+    #[allow(dead_code)]
     fn with_compiled_cache_bypass<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let previous = self.bypass_compiled_cache.replace(true);
         let result = f();
@@ -23709,6 +23724,10 @@ impl Connection {
         result
     }
 
+    // Same category as `with_compiled_cache_bypass` above: the
+    // `skip_statement_memdb_refresh` flag is still read elsewhere, but nothing
+    // sets it. Kept so the disconnected pair stays visible.
+    #[allow(dead_code)]
     fn with_statement_memdb_refresh_bypass<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let previous = self.skip_statement_memdb_refresh.replace(true);
         let result = f();
@@ -92020,6 +92039,15 @@ fn build_streaming_hash_join_index(
     right_index
 }
 
+// Reachable only from itself (the two call sites below are its own recursion),
+// so it is dead from outside. Unlike `with_compiled_cache_bypass` above, it is
+// NOT yet established whether this is a lost call site or genuinely abandoned:
+// a hash-join dispatch predicate (`prefer_memdb_hash_join_dispatch`) does exist
+// and routes such shapes to the interpreted join path, but that path does not
+// use this streaming helper. Left in place rather than deleted until someone
+// determines which, because deleting the analogous "dead" bypass helper would
+// have destroyed the evidence for GH #255. Tracked by bd-7y8ff.
+#[allow(dead_code)]
 fn stream_hash_join_rows<F>(
     current_row: &mut Vec<SqliteValue>,
     join_idx: usize,

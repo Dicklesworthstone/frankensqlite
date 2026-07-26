@@ -135,51 +135,48 @@ impl CensusCounters {
 #[test]
 fn test_census_single_prepared_insert_autocommit() {
     asupersync::test_utils::run_test(|| async {
-    let _profile_guard = CensusProfileGuard::new();
+        let _profile_guard = CensusProfileGuard::new();
 
-    let conn = Connection::open(":memory:").await.unwrap();
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
-        .await
-        .unwrap();
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .unwrap();
 
-    let stmt = conn
-        .prepare("INSERT INTO t VALUES(?1, ?2)")
-        .await
-        .unwrap();
+        let stmt = conn.prepare("INSERT INTO t VALUES(?1, ?2)").await.unwrap();
 
-    // Steady-state: execute 10 identical prepared INSERTs.
-    let before = census_snapshot();
-    for i in 0..10 {
-        stmt.execute_with_params(&[
-            fsqlite_types::SqliteValue::Integer(i),
-            fsqlite_types::SqliteValue::Text(format!("v{i}").into()),
-        ])
-        .await
-        .unwrap();
-    }
-    let after = census_snapshot();
-    let delta = after.delta(&before);
+        // Steady-state: execute 10 identical prepared INSERTs.
+        let before = census_snapshot();
+        for i in 0..10 {
+            stmt.execute_with_params(&[
+                fsqlite_types::SqliteValue::Integer(i),
+                fsqlite_types::SqliteValue::Text(format!("v{i}").into()),
+            ])
+            .await
+            .unwrap();
+        }
+        let after = census_snapshot();
+        let delta = after.delta(&before);
 
-    eprintln!("=== C1: Single prepared INSERT ×10, :memory: autocommit ===");
-    delta.print("per-10-stmts");
+        eprintln!("=== C1: Single prepared INSERT ×10, :memory: autocommit ===");
+        delta.print("per-10-stmts");
 
-    // The direct prepared INSERT fast lane should be taken for all 10. The
-    // broader parser fast-path counter also includes internal helper work.
-    assert_eq!(
-        delta.prepared_insert_fast_lane_hits, 10,
-        "all 10 INSERTs should use the prepared INSERT fast lane"
-    );
-    assert_eq!(
-        delta.slow_path, 0,
-        "prepared INSERT should avoid slow fallback"
-    );
+        // The direct prepared INSERT fast lane should be taken for all 10. The
+        // broader parser fast-path counter also includes internal helper work.
+        assert_eq!(
+            delta.prepared_insert_fast_lane_hits, 10,
+            "all 10 INSERTs should use the prepared INSERT fast lane"
+        );
+        assert_eq!(
+            delta.slow_path, 0,
+            "prepared INSERT should avoid slow fallback"
+        );
 
-    // :memory: autocommit should NOT trigger begin_refresh (uses fast path).
-    // begin_refresh only fires for file-backed databases.
-    assert_eq!(
-        delta.begin_refresh, 0,
-        ":memory: should not trigger begin_refresh (uses memory fast path)"
-    );
+        // :memory: autocommit should NOT trigger begin_refresh (uses fast path).
+        // begin_refresh only fires for file-backed databases.
+        assert_eq!(
+            delta.begin_refresh, 0,
+            ":memory: should not trigger begin_refresh (uses memory fast path)"
+        );
     });
 }
 
@@ -187,72 +184,69 @@ fn test_census_single_prepared_insert_autocommit() {
 #[test]
 fn test_census_file_backed_prepared_insert() {
     asupersync::test_utils::run_test(|| async {
-    let _profile_guard = CensusProfileGuard::new();
+        let _profile_guard = CensusProfileGuard::new();
 
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let path = tmp.path().to_str().unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
 
-    let conn = Connection::open(path).await.unwrap();
-    conn.execute("PRAGMA journal_mode = WAL").await.unwrap();
-    conn.execute("PRAGMA synchronous = NORMAL").await.unwrap();
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
-        .await
-        .unwrap();
+        let conn = Connection::open(path).await.unwrap();
+        conn.execute("PRAGMA journal_mode = WAL").await.unwrap();
+        conn.execute("PRAGMA synchronous = NORMAL").await.unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .unwrap();
 
-    let stmt = conn
-        .prepare("INSERT INTO t VALUES(?1, ?2)")
-        .await
-        .unwrap();
+        let stmt = conn.prepare("INSERT INTO t VALUES(?1, ?2)").await.unwrap();
 
-    // Warm: one execution to establish baseline.
-    stmt.execute_with_params(&[
-        fsqlite_types::SqliteValue::Integer(0),
-        fsqlite_types::SqliteValue::Text("warm".into()),
-    ])
-    .await
-    .unwrap();
-
-    // Census: 10 steady-state prepared INSERTs.
-    let before = census_snapshot();
-    for i in 1..=10 {
+        // Warm: one execution to establish baseline.
         stmt.execute_with_params(&[
-            fsqlite_types::SqliteValue::Integer(i),
-            fsqlite_types::SqliteValue::Text(format!("v{i}").into()),
+            fsqlite_types::SqliteValue::Integer(0),
+            fsqlite_types::SqliteValue::Text("warm".into()),
         ])
         .await
         .unwrap();
-    }
-    let after = census_snapshot();
-    let delta = after.delta(&before);
 
-    eprintln!("=== C2: File-backed prepared INSERT ×10, WAL autocommit ===");
-    delta.print("per-10-stmts");
+        // Census: 10 steady-state prepared INSERTs.
+        let before = census_snapshot();
+        for i in 1..=10 {
+            stmt.execute_with_params(&[
+                fsqlite_types::SqliteValue::Integer(i),
+                fsqlite_types::SqliteValue::Text(format!("v{i}").into()),
+            ])
+            .await
+            .unwrap();
+        }
+        let after = census_snapshot();
+        let delta = after.delta(&before);
 
-    // All 10 should take the direct prepared INSERT fast lane. The broader
-    // parser fast-path counter also includes internal helper statements.
-    assert_eq!(
-        delta.prepared_insert_fast_lane_hits, 10,
-        "all 10 INSERTs should use the prepared INSERT fast lane"
-    );
-    assert_eq!(
-        delta.slow_path, 0,
-        "prepared INSERT should avoid slow fallback"
-    );
-    assert_eq!(
-        delta.memdb_refresh, 0,
-        "file-backed WAL path should not pay memdb refresh work in this census"
-    );
+        eprintln!("=== C2: File-backed prepared INSERT ×10, WAL autocommit ===");
+        delta.print("per-10-stmts");
 
-    // Key census output: how many begin + commit refreshes per 10 statements?
-    eprintln!(
-        "  DUPLICATION RATIO: begin_refresh/stmt = {:.1}, commit_refresh/stmt = {:.1}",
-        delta.begin_refresh as f64 / 10.0,
-        delta.commit_refresh as f64 / 10.0,
-    );
-    eprintln!(
-        "  publication_bind/stmt = {:.1}",
-        delta.publication_bind as f64 / 10.0
-    );
+        // All 10 should take the direct prepared INSERT fast lane. The broader
+        // parser fast-path counter also includes internal helper statements.
+        assert_eq!(
+            delta.prepared_insert_fast_lane_hits, 10,
+            "all 10 INSERTs should use the prepared INSERT fast lane"
+        );
+        assert_eq!(
+            delta.slow_path, 0,
+            "prepared INSERT should avoid slow fallback"
+        );
+        assert_eq!(
+            delta.memdb_refresh, 0,
+            "file-backed WAL path should not pay memdb refresh work in this census"
+        );
+
+        // Key census output: how many begin + commit refreshes per 10 statements?
+        eprintln!(
+            "  DUPLICATION RATIO: begin_refresh/stmt = {:.1}, commit_refresh/stmt = {:.1}",
+            delta.begin_refresh as f64 / 10.0,
+            delta.commit_refresh as f64 / 10.0,
+        );
+        eprintln!(
+            "  publication_bind/stmt = {:.1}",
+            delta.publication_bind as f64 / 10.0
+        );
     });
 }
 
@@ -260,63 +254,60 @@ fn test_census_file_backed_prepared_insert() {
 #[test]
 fn test_census_explicit_transaction_prepared_insert() {
     asupersync::test_utils::run_test(|| async {
-    let _profile_guard = CensusProfileGuard::new();
+        let _profile_guard = CensusProfileGuard::new();
 
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let path = tmp.path().to_str().unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
 
-    let conn = Connection::open(path).await.unwrap();
-    conn.execute("PRAGMA journal_mode = WAL").await.unwrap();
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
-        .await
-        .unwrap();
+        let conn = Connection::open(path).await.unwrap();
+        conn.execute("PRAGMA journal_mode = WAL").await.unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .unwrap();
 
-    let stmt = conn
-        .prepare("INSERT INTO t VALUES(?1, ?2)")
-        .await
-        .unwrap();
+        let stmt = conn.prepare("INSERT INTO t VALUES(?1, ?2)").await.unwrap();
 
-    // Explicit transaction wrapping 10 INSERTs.
-    conn.execute("BEGIN").await.unwrap();
-    let before = census_snapshot();
-    for i in 0..10 {
-        stmt.execute_with_params(&[
-            fsqlite_types::SqliteValue::Integer(i),
-            fsqlite_types::SqliteValue::Text(format!("v{i}").into()),
-        ])
-        .await
-        .unwrap();
-    }
-    let after = census_snapshot();
-    conn.execute("COMMIT").await.unwrap();
-    let delta = after.delta(&before);
+        // Explicit transaction wrapping 10 INSERTs.
+        conn.execute("BEGIN").await.unwrap();
+        let before = census_snapshot();
+        for i in 0..10 {
+            stmt.execute_with_params(&[
+                fsqlite_types::SqliteValue::Integer(i),
+                fsqlite_types::SqliteValue::Text(format!("v{i}").into()),
+            ])
+            .await
+            .unwrap();
+        }
+        let after = census_snapshot();
+        conn.execute("COMMIT").await.unwrap();
+        let delta = after.delta(&before);
 
-    eprintln!("=== C3: Explicit txn, file-backed INSERT ×10 ===");
-    delta.print("per-10-stmts");
+        eprintln!("=== C3: Explicit txn, file-backed INSERT ×10 ===");
+        delta.print("per-10-stmts");
 
-    // The direct prepared INSERT fast lane should still handle every user
-    // statement. Global parser fast-path counters include internal helper
-    // traffic and are not one-to-one with user statements anymore.
-    assert_eq!(
-        delta.prepared_insert_fast_lane_hits, 10,
-        "explicit txn should still use the prepared INSERT fast lane"
-    );
-    assert_eq!(
-        delta.slow_path, 0,
-        "explicit txn should avoid slow fallback"
-    );
+        // The direct prepared INSERT fast lane should still handle every user
+        // statement. Global parser fast-path counters include internal helper
+        // traffic and are not one-to-one with user statements anymore.
+        assert_eq!(
+            delta.prepared_insert_fast_lane_hits, 10,
+            "explicit txn should still use the prepared INSERT fast lane"
+        );
+        assert_eq!(
+            delta.slow_path, 0,
+            "explicit txn should avoid slow fallback"
+        );
 
-    // Explicit transactions should materially reduce begin/commit refresh work
-    // versus per-statement autocommit, even if some internal helper activity
-    // still contributes to the global counters.
-    assert!(
-        delta.begin_refresh < 10,
-        "explicit txn begin_refresh should be below one-per-statement duplication: {delta:?}"
-    );
-    assert!(
-        delta.commit_refresh < 10,
-        "explicit txn commit_refresh should be below one-per-statement duplication: {delta:?}"
-    );
+        // Explicit transactions should materially reduce begin/commit refresh work
+        // versus per-statement autocommit, even if some internal helper activity
+        // still contributes to the global counters.
+        assert!(
+            delta.begin_refresh < 10,
+            "explicit txn begin_refresh should be below one-per-statement duplication: {delta:?}"
+        );
+        assert!(
+            delta.commit_refresh < 10,
+            "explicit txn commit_refresh should be below one-per-statement duplication: {delta:?}"
+        );
     });
 }
 
@@ -324,53 +315,50 @@ fn test_census_explicit_transaction_prepared_insert() {
 #[test]
 fn test_census_schema_invalidation_spike() {
     asupersync::test_utils::run_test(|| async {
-    let _profile_guard = CensusProfileGuard::new();
+        let _profile_guard = CensusProfileGuard::new();
 
-    let conn = Connection::open(":memory:").await.unwrap();
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
-        .await
-        .unwrap();
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .unwrap();
 
-    let stmt = conn
-        .prepare("INSERT INTO t VALUES(?1, ?2)")
-        .await
-        .unwrap();
+        let stmt = conn.prepare("INSERT INTO t VALUES(?1, ?2)").await.unwrap();
 
-    // 5 steady-state executions.
-    let before = census_snapshot();
-    for i in 0..5 {
-        stmt.execute_with_params(&[
-            fsqlite_types::SqliteValue::Integer(i),
-            fsqlite_types::SqliteValue::Text("pre".into()),
-        ])
-        .await
-        .unwrap();
-    }
-    let mid = census_snapshot();
-    let delta_pre = mid.delta(&before);
+        // 5 steady-state executions.
+        let before = census_snapshot();
+        for i in 0..5 {
+            stmt.execute_with_params(&[
+                fsqlite_types::SqliteValue::Integer(i),
+                fsqlite_types::SqliteValue::Text("pre".into()),
+            ])
+            .await
+            .unwrap();
+        }
+        let mid = census_snapshot();
+        let delta_pre = mid.delta(&before);
 
-    // DDL — invalidates caches.
-    conn.execute("CREATE TABLE t2(x INTEGER)").await.unwrap();
+        // DDL — invalidates caches.
+        conn.execute("CREATE TABLE t2(x INTEGER)").await.unwrap();
 
-    // The old prepared stmt will get SchemaChanged.
-    let result = stmt
-        .execute_with_params(&[
-            fsqlite_types::SqliteValue::Integer(99),
-            fsqlite_types::SqliteValue::Text("post-ddl".into()),
-        ])
-        .await;
-    let after = census_snapshot();
-    let delta_post = after.delta(&mid);
+        // The old prepared stmt will get SchemaChanged.
+        let result = stmt
+            .execute_with_params(&[
+                fsqlite_types::SqliteValue::Integer(99),
+                fsqlite_types::SqliteValue::Text("post-ddl".into()),
+            ])
+            .await;
+        let after = census_snapshot();
+        let delta_post = after.delta(&mid);
 
-    eprintln!("=== C4: Schema invalidation spike ===");
-    eprintln!("Pre-DDL (5 stmts):");
-    delta_pre.print("pre");
-    eprintln!("Post-DDL (1 stmt attempt):");
-    delta_post.print("post");
-    eprintln!(
-        "  stmt_result: {:?}",
-        result.as_ref().map(|_| "ok").unwrap_or("err")
-    );
+        eprintln!("=== C4: Schema invalidation spike ===");
+        eprintln!("Pre-DDL (5 stmts):");
+        delta_pre.print("pre");
+        eprintln!("Post-DDL (1 stmt attempt):");
+        delta_post.print("post");
+        eprintln!(
+            "  stmt_result: {:?}",
+            result.as_ref().map(|_| "ok").unwrap_or("err")
+        );
     });
 }
 
@@ -378,94 +366,96 @@ fn test_census_schema_invalidation_spike() {
 #[test]
 fn test_census_full_scorecard() {
     asupersync::test_utils::run_test(|| async {
-    let _profile_guard = CensusProfileGuard::new();
+        let _profile_guard = CensusProfileGuard::new();
 
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let path = tmp.path().to_str().unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
 
-    let conn = Connection::open(path).await.unwrap();
-    conn.execute("PRAGMA journal_mode = WAL").await.unwrap();
-    conn.execute("PRAGMA synchronous = NORMAL").await.unwrap();
-    conn.execute("CREATE TABLE bench(id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
-        .await
-        .unwrap();
+        let conn = Connection::open(path).await.unwrap();
+        conn.execute("PRAGMA journal_mode = WAL").await.unwrap();
+        conn.execute("PRAGMA synchronous = NORMAL").await.unwrap();
+        conn.execute("CREATE TABLE bench(id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
+            .await
+            .unwrap();
 
-    let ins = conn
-        .prepare("INSERT INTO bench VALUES(?1, ?2, ?3)")
-        .await
-        .unwrap();
+        let ins = conn
+            .prepare("INSERT INTO bench VALUES(?1, ?2, ?3)")
+            .await
+            .unwrap();
 
-    // Warm.
-    ins.execute_with_params(&[
-        fsqlite_types::SqliteValue::Integer(0),
-        fsqlite_types::SqliteValue::Text("warm".into()),
-        fsqlite_types::SqliteValue::Integer(0),
-    ])
-    .await
-    .unwrap();
-
-    // Census: 100 iterations.
-    reset_hot_path_profile();
-    for i in 1..=100 {
+        // Warm.
         ins.execute_with_params(&[
-            fsqlite_types::SqliteValue::Integer(i),
-            fsqlite_types::SqliteValue::Text(format!("r{i}").into()),
-            fsqlite_types::SqliteValue::Integer(i * 7),
+            fsqlite_types::SqliteValue::Integer(0),
+            fsqlite_types::SqliteValue::Text("warm".into()),
+            fsqlite_types::SqliteValue::Integer(0),
         ])
         .await
         .unwrap();
-    }
-    let snap = census_snapshot();
 
-    eprintln!("=== bd-db300.5.2.2.1 Full Census Scorecard (100 file-backed prepared INSERTs) ===");
-    eprintln!(
-        "  schema_refresh:     {:>4}  ({:.2}/stmt)",
-        snap.schema_refresh,
-        snap.schema_refresh as f64 / 100.0
-    );
-    eprintln!(
-        "  publication_bind:   {:>4}  ({:.2}/stmt)",
-        snap.publication_bind,
-        snap.publication_bind as f64 / 100.0
-    );
-    eprintln!(
-        "  begin_refresh:      {:>4}  ({:.2}/stmt)",
-        snap.begin_refresh,
-        snap.begin_refresh as f64 / 100.0
-    );
-    eprintln!(
-        "  commit_refresh:     {:>4}  ({:.2}/stmt)",
-        snap.commit_refresh,
-        snap.commit_refresh as f64 / 100.0
-    );
-    eprintln!(
-        "  memdb_refresh:      {:>4}  ({:.2}/stmt)",
-        snap.memdb_refresh,
-        snap.memdb_refresh as f64 / 100.0
-    );
-    eprintln!(
-        "  fast_path:          {:>4}  ({:.2}/stmt)",
-        snap.fast_path,
-        snap.fast_path as f64 / 100.0
-    );
-    eprintln!(
-        "  slow_path:          {:>4}  ({:.2}/stmt)",
-        snap.slow_path,
-        snap.slow_path as f64 / 100.0
-    );
-    eprintln!(
-        "  bg_status:          {:>4}  ({:.2}/stmt)",
-        snap.bg_status,
-        snap.bg_status as f64 / 100.0
-    );
-    eprintln!("=== END SCORECARD ===");
+        // Census: 100 iterations.
+        reset_hot_path_profile();
+        for i in 1..=100 {
+            ins.execute_with_params(&[
+                fsqlite_types::SqliteValue::Integer(i),
+                fsqlite_types::SqliteValue::Text(format!("r{i}").into()),
+                fsqlite_types::SqliteValue::Integer(i * 7),
+            ])
+            .await
+            .unwrap();
+        }
+        let snap = census_snapshot();
 
-    // Assertion: fast path should dominate.
-    assert!(
-        snap.fast_path >= 100,
-        "all 100 prepared INSERTs should use fast path: fast={}, slow={}",
-        snap.fast_path,
-        snap.slow_path
-    );
+        eprintln!(
+            "=== bd-db300.5.2.2.1 Full Census Scorecard (100 file-backed prepared INSERTs) ==="
+        );
+        eprintln!(
+            "  schema_refresh:     {:>4}  ({:.2}/stmt)",
+            snap.schema_refresh,
+            snap.schema_refresh as f64 / 100.0
+        );
+        eprintln!(
+            "  publication_bind:   {:>4}  ({:.2}/stmt)",
+            snap.publication_bind,
+            snap.publication_bind as f64 / 100.0
+        );
+        eprintln!(
+            "  begin_refresh:      {:>4}  ({:.2}/stmt)",
+            snap.begin_refresh,
+            snap.begin_refresh as f64 / 100.0
+        );
+        eprintln!(
+            "  commit_refresh:     {:>4}  ({:.2}/stmt)",
+            snap.commit_refresh,
+            snap.commit_refresh as f64 / 100.0
+        );
+        eprintln!(
+            "  memdb_refresh:      {:>4}  ({:.2}/stmt)",
+            snap.memdb_refresh,
+            snap.memdb_refresh as f64 / 100.0
+        );
+        eprintln!(
+            "  fast_path:          {:>4}  ({:.2}/stmt)",
+            snap.fast_path,
+            snap.fast_path as f64 / 100.0
+        );
+        eprintln!(
+            "  slow_path:          {:>4}  ({:.2}/stmt)",
+            snap.slow_path,
+            snap.slow_path as f64 / 100.0
+        );
+        eprintln!(
+            "  bg_status:          {:>4}  ({:.2}/stmt)",
+            snap.bg_status,
+            snap.bg_status as f64 / 100.0
+        );
+        eprintln!("=== END SCORECARD ===");
+
+        // Assertion: fast path should dominate.
+        assert!(
+            snap.fast_path >= 100,
+            "all 100 prepared INSERTs should use fast path: fast={}, slow={}",
+            snap.fast_path,
+            snap.slow_path
+        );
     });
 }

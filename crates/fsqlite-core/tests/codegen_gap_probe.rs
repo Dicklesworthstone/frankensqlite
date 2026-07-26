@@ -78,193 +78,193 @@ async fn classify(label: &str, setup: &[&str], sql: &str, is_query: bool) {
 #[ignore = "diagnostic triage harness; run with --ignored --nocapture"]
 fn codegen_gap_probe() {
     asupersync::test_utils::run_test(|| async {
-    let t = &[
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT)",
-        "INSERT INTO t VALUES (1,10,100,'x'),(2,20,200,'y'),(3,30,300,'z')",
-    ][..];
-    let ts = &[
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
-        "CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER, w INTEGER)",
-        "INSERT INTO t VALUES (1,0),(2,0),(3,0)",
-        "INSERT INTO src VALUES (1,11,111),(2,22,222),(3,33,333)",
-    ][..];
+        let t = &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT)",
+            "INSERT INTO t VALUES (1,10,100,'x'),(2,20,200,'y'),(3,30,300,'z')",
+        ][..];
+        let ts = &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+            "CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER, w INTEGER)",
+            "INSERT INTO t VALUES (1,0),(2,0),(3,0)",
+            "INSERT INTO src VALUES (1,11,111),(2,22,222),(3,33,333)",
+        ][..];
 
-    // ---- multi-column SET (UPDATE) — SQLite 3.15+ ----
-    classify(
-        "update_multicol_set_literals",
-        t,
-        "UPDATE t SET (a, b) = (99, 999) WHERE id = 1",
-        false,
-    )
-    .await;
-    classify(
-        "update_multicol_set_subquery",
-        ts,
-        "UPDATE t SET (v) = (SELECT max(v) FROM src) WHERE id = 1",
-        false,
-    )
-    .await;
-    classify(
-        "update_multicol_set_rowvalue_subquery",
-        ts,
-        "UPDATE t SET (v) = (SELECT v FROM src WHERE src.id = t.id) WHERE id = 2",
-        false,
-    )
-    .await;
+        // ---- multi-column SET (UPDATE) — SQLite 3.15+ ----
+        classify(
+            "update_multicol_set_literals",
+            t,
+            "UPDATE t SET (a, b) = (99, 999) WHERE id = 1",
+            false,
+        )
+        .await;
+        classify(
+            "update_multicol_set_subquery",
+            ts,
+            "UPDATE t SET (v) = (SELECT max(v) FROM src) WHERE id = 1",
+            false,
+        )
+        .await;
+        classify(
+            "update_multicol_set_rowvalue_subquery",
+            ts,
+            "UPDATE t SET (v) = (SELECT v FROM src WHERE src.id = t.id) WHERE id = 2",
+            false,
+        )
+        .await;
 
-    // ---- UPDATE ... FROM — SQLite 3.33+ ----
-    classify(
-        "update_from_subquery",
-        ts,
-        "UPDATE t SET v = s.v FROM (SELECT id, v FROM src) s WHERE t.id = s.id",
-        false,
-    )
-    .await;
-    classify(
-        "update_from_join",
-        ts,
-        "UPDATE t SET v = src.w FROM src JOIN (SELECT 1 AS k) k ON 1=1 WHERE t.id = src.id",
-        false,
-    )
-    .await;
+        // ---- UPDATE ... FROM — SQLite 3.33+ ----
+        classify(
+            "update_from_subquery",
+            ts,
+            "UPDATE t SET v = s.v FROM (SELECT id, v FROM src) s WHERE t.id = s.id",
+            false,
+        )
+        .await;
+        classify(
+            "update_from_join",
+            ts,
+            "UPDATE t SET v = src.w FROM src JOIN (SELECT 1 AS k) k ON 1=1 WHERE t.id = src.id",
+            false,
+        )
+        .await;
 
-    // ---- UPDATE / DELETE with ORDER BY / LIMIT ----
-    // (Whether rusqlite accepts depends on SQLITE_ENABLE_UPDATE_DELETE_LIMIT;
-    //  the differential classifies it correctly either way.)
-    classify(
-        "delete_limit",
-        t,
-        "DELETE FROM t WHERE a > 0 LIMIT 1",
-        false,
-    )
-    .await;
-    classify(
-        "delete_order_by_limit",
-        t,
-        "DELETE FROM t ORDER BY id LIMIT 1",
-        false,
-    )
-    .await;
-    classify(
-        "update_limit",
-        t,
-        "UPDATE t SET a = a + 1 WHERE b > 0 LIMIT 1",
-        false,
-    )
-    .await;
-    classify(
-        "update_order_by_limit",
-        t,
-        "UPDATE t SET a = a + 1 ORDER BY id LIMIT 1",
-        false,
-    )
-    .await;
+        // ---- UPDATE / DELETE with ORDER BY / LIMIT ----
+        // (Whether rusqlite accepts depends on SQLITE_ENABLE_UPDATE_DELETE_LIMIT;
+        //  the differential classifies it correctly either way.)
+        classify(
+            "delete_limit",
+            t,
+            "DELETE FROM t WHERE a > 0 LIMIT 1",
+            false,
+        )
+        .await;
+        classify(
+            "delete_order_by_limit",
+            t,
+            "DELETE FROM t ORDER BY id LIMIT 1",
+            false,
+        )
+        .await;
+        classify(
+            "update_limit",
+            t,
+            "UPDATE t SET a = a + 1 WHERE b > 0 LIMIT 1",
+            false,
+        )
+        .await;
+        classify(
+            "update_order_by_limit",
+            t,
+            "UPDATE t SET a = a + 1 ORDER BY id LIMIT 1",
+            false,
+        )
+        .await;
 
-    // ---- CREATE TABLE complex DEFAULT expressions ----
-    classify(
-        "create_default_fncall",
-        &[],
-        "CREATE TABLE x (a INTEGER DEFAULT (abs(-5)))",
-        false,
-    )
-    .await;
-    classify(
-        "create_default_arith",
-        &[],
-        "CREATE TABLE x (a INTEGER DEFAULT (2 + 3 * 4))",
-        false,
-    )
-    .await;
+        // ---- CREATE TABLE complex DEFAULT expressions ----
+        classify(
+            "create_default_fncall",
+            &[],
+            "CREATE TABLE x (a INTEGER DEFAULT (abs(-5)))",
+            false,
+        )
+        .await;
+        classify(
+            "create_default_arith",
+            &[],
+            "CREATE TABLE x (a INTEGER DEFAULT (2 + 3 * 4))",
+            false,
+        )
+        .await;
 
-    // ---- assorted constructs that may or may not fall back ----
-    classify(
-        "insert_default_values",
-        &["CREATE TABLE x (a INTEGER DEFAULT 7, b TEXT DEFAULT 'q')"],
-        "INSERT INTO x DEFAULT VALUES",
-        false,
-    )
-    .await;
-    classify(
-        "update_set_from_self_join",
-        ts,
-        "UPDATE t SET v = (SELECT w FROM src WHERE src.id = t.id)",
-        false,
-    )
-    .await;
-    classify(
-        "delete_using_subselect_limit",
-        t,
-        "DELETE FROM t WHERE id IN (SELECT id FROM t ORDER BY a DESC LIMIT 1)",
-        false,
-    )
-    .await;
+        // ---- assorted constructs that may or may not fall back ----
+        classify(
+            "insert_default_values",
+            &["CREATE TABLE x (a INTEGER DEFAULT 7, b TEXT DEFAULT 'q')"],
+            "INSERT INTO x DEFAULT VALUES",
+            false,
+        )
+        .await;
+        classify(
+            "update_set_from_self_join",
+            ts,
+            "UPDATE t SET v = (SELECT w FROM src WHERE src.id = t.id)",
+            false,
+        )
+        .await;
+        classify(
+            "delete_using_subselect_limit",
+            t,
+            "DELETE FROM t WHERE id IN (SELECT id FROM t ORDER BY a DESC LIMIT 1)",
+            false,
+        )
+        .await;
 
-    // ---- second batch: more UPDATE / INSERT variants ----
-    // aliased UPDATE target (SQLite 3.33+)
-    classify(
-        "update_aliased_target",
-        t,
-        "UPDATE t AS x SET a = 1 WHERE x.id = 1",
-        false,
-    )
-    .await;
-    // UPDATE ... FROM with table alias
-    classify(
-        "update_from_table_alias",
-        ts,
-        "UPDATE t SET v = s.v FROM src AS s WHERE t.id = s.id",
-        false,
-    )
-    .await;
-    // UPDATE ... FROM comma-joined multiple tables
-    classify(
-        "update_from_comma_tables",
-        ts,
-        "UPDATE t SET v = src.v FROM src, (SELECT 1) WHERE t.id = src.id",
-        false,
-    )
-    .await;
-    // multi-target (2-col) row-value SET from correlated subquery
-    classify(
-        "update_multicol2_subquery",
-        &[
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
-            "CREATE TABLE src (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
-            "INSERT INTO t VALUES (1,0,0),(2,0,0)",
-            "INSERT INTO src VALUES (1,7,8),(2,9,10)",
-        ],
-        "UPDATE t SET (a, b) = (SELECT a, b FROM src WHERE src.id = t.id)",
-        false,
-    )
-    .await;
-    // INSERT ... SELECT with ORDER BY / LIMIT
-    classify(
-        "insert_select_order_limit",
-        &[
-            "CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER)",
-            "CREATE TABLE dst (id INTEGER, v INTEGER)",
-            "INSERT INTO src VALUES (1,30),(2,10),(3,20)",
-        ],
-        "INSERT INTO dst SELECT id, v FROM src ORDER BY v DESC LIMIT 2",
-        false,
-    )
-    .await;
-    // INSERT ... SELECT compound (UNION)
-    classify(
-        "insert_select_union",
-        &[
-            "CREATE TABLE a (x INTEGER)",
-            "CREATE TABLE b (x INTEGER)",
-            "CREATE TABLE dst (x INTEGER)",
-            "INSERT INTO a VALUES (1),(2)",
-            "INSERT INTO b VALUES (3),(4)",
-        ],
-        "INSERT INTO dst SELECT x FROM a UNION SELECT x FROM b",
-        false,
-    )
-    .await;
-    // UPSERT targeting a non-PK unique index with DO UPDATE
-    classify(
+        // ---- second batch: more UPDATE / INSERT variants ----
+        // aliased UPDATE target (SQLite 3.33+)
+        classify(
+            "update_aliased_target",
+            t,
+            "UPDATE t AS x SET a = 1 WHERE x.id = 1",
+            false,
+        )
+        .await;
+        // UPDATE ... FROM with table alias
+        classify(
+            "update_from_table_alias",
+            ts,
+            "UPDATE t SET v = s.v FROM src AS s WHERE t.id = s.id",
+            false,
+        )
+        .await;
+        // UPDATE ... FROM comma-joined multiple tables
+        classify(
+            "update_from_comma_tables",
+            ts,
+            "UPDATE t SET v = src.v FROM src, (SELECT 1) WHERE t.id = src.id",
+            false,
+        )
+        .await;
+        // multi-target (2-col) row-value SET from correlated subquery
+        classify(
+            "update_multicol2_subquery",
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+                "CREATE TABLE src (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+                "INSERT INTO t VALUES (1,0,0),(2,0,0)",
+                "INSERT INTO src VALUES (1,7,8),(2,9,10)",
+            ],
+            "UPDATE t SET (a, b) = (SELECT a, b FROM src WHERE src.id = t.id)",
+            false,
+        )
+        .await;
+        // INSERT ... SELECT with ORDER BY / LIMIT
+        classify(
+            "insert_select_order_limit",
+            &[
+                "CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER)",
+                "CREATE TABLE dst (id INTEGER, v INTEGER)",
+                "INSERT INTO src VALUES (1,30),(2,10),(3,20)",
+            ],
+            "INSERT INTO dst SELECT id, v FROM src ORDER BY v DESC LIMIT 2",
+            false,
+        )
+        .await;
+        // INSERT ... SELECT compound (UNION)
+        classify(
+            "insert_select_union",
+            &[
+                "CREATE TABLE a (x INTEGER)",
+                "CREATE TABLE b (x INTEGER)",
+                "CREATE TABLE dst (x INTEGER)",
+                "INSERT INTO a VALUES (1),(2)",
+                "INSERT INTO b VALUES (3),(4)",
+            ],
+            "INSERT INTO dst SELECT x FROM a UNION SELECT x FROM b",
+            false,
+        )
+        .await;
+        // UPSERT targeting a non-PK unique index with DO UPDATE
+        classify(
         "upsert_do_update_unique",
         &[
             "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE, n INTEGER)",
@@ -274,22 +274,22 @@ fn codegen_gap_probe() {
         false,
     )
     .await;
-    // RETURNING on UPDATE (SQLite 3.35+)
-    classify(
-        "update_returning",
-        t,
-        "UPDATE t SET a = a + 1 WHERE id = 1 RETURNING id, a",
-        true,
-    )
-    .await;
-    // RETURNING on DELETE
-    classify(
-        "delete_returning",
-        t,
-        "DELETE FROM t WHERE id = 1 RETURNING id, a",
-        true,
-    )
-    .await;
+        // RETURNING on UPDATE (SQLite 3.35+)
+        classify(
+            "update_returning",
+            t,
+            "UPDATE t SET a = a + 1 WHERE id = 1 RETURNING id, a",
+            true,
+        )
+        .await;
+        // RETURNING on DELETE
+        classify(
+            "delete_returning",
+            t,
+            "DELETE FROM t WHERE id = 1 RETURNING id, a",
+            true,
+        )
+        .await;
     });
 }
 
@@ -301,101 +301,101 @@ fn codegen_gap_probe() {
 #[ignore = "diagnostic triage harness; run with --ignored --nocapture"]
 fn codegen_gap_probe_select_window_aggregate() {
     asupersync::test_utils::run_test(|| async {
-    let t = &[
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
-        "INSERT INTO t VALUES (1,1,10),(2,1,20),(3,2,30),(4,2,40),(5,2,50)",
-    ][..];
+        let t = &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
+            "INSERT INTO t VALUES (1,1,10),(2,1,20),(3,2,30),(4,2,40),(5,2,50)",
+        ][..];
 
-    // ---- aggregate FILTER clause (SQLite 3.30+) ----
-    classify(
-        "agg_filter_clause",
-        t,
-        "SELECT g, count(*) FILTER (WHERE v > 20) AS c FROM t GROUP BY g ORDER BY g",
-        true,
-    )
-    .await;
-    classify(
-        "agg_filter_sum",
-        t,
-        "SELECT sum(v) FILTER (WHERE v < 40) AS s FROM t",
-        true,
-    )
-    .await;
+        // ---- aggregate FILTER clause (SQLite 3.30+) ----
+        classify(
+            "agg_filter_clause",
+            t,
+            "SELECT g, count(*) FILTER (WHERE v > 20) AS c FROM t GROUP BY g ORDER BY g",
+            true,
+        )
+        .await;
+        classify(
+            "agg_filter_sum",
+            t,
+            "SELECT sum(v) FILTER (WHERE v < 40) AS s FROM t",
+            true,
+        )
+        .await;
 
-    // ---- window frame variants ----
-    classify(
+        // ---- window frame variants ----
+        classify(
         "window_range_frame",
         t,
         "SELECT v, sum(v) OVER (ORDER BY v RANGE BETWEEN 15 PRECEDING AND 15 FOLLOWING) FROM t ORDER BY v",
         true,
     )
     .await;
-    classify(
+        classify(
         "window_groups_frame",
         t,
         "SELECT v, sum(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY v",
         true,
     )
     .await;
-    classify(
+        classify(
         "window_exclude_current",
         t,
         "SELECT v, sum(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM t ORDER BY v",
         true,
     )
     .await;
-    classify(
-        "window_named_window_clause",
-        t,
-        "SELECT v, row_number() OVER w FROM t WINDOW w AS (ORDER BY v) ORDER BY v",
-        true,
-    )
-    .await;
-    classify(
-        "window_filter_on_window_agg",
-        t,
-        "SELECT v, sum(v) FILTER (WHERE v > 15) OVER (ORDER BY v) FROM t ORDER BY v",
-        true,
-    )
-    .await;
+        classify(
+            "window_named_window_clause",
+            t,
+            "SELECT v, row_number() OVER w FROM t WINDOW w AS (ORDER BY v) ORDER BY v",
+            true,
+        )
+        .await;
+        classify(
+            "window_filter_on_window_agg",
+            t,
+            "SELECT v, sum(v) FILTER (WHERE v > 15) OVER (ORDER BY v) FROM t ORDER BY v",
+            true,
+        )
+        .await;
 
-    // ---- VALUES as a relation / top-level ----
-    classify("values_top_level", &[], "VALUES (1, 2), (3, 4)", true).await;
-    classify(
-        "select_from_values",
-        &[],
-        "SELECT column1, column2 FROM (VALUES (1, 'a'), (2, 'b')) ORDER BY column1",
-        true,
-    )
-    .await;
+        // ---- VALUES as a relation / top-level ----
+        classify("values_top_level", &[], "VALUES (1, 2), (3, 4)", true).await;
+        classify(
+            "select_from_values",
+            &[],
+            "SELECT column1, column2 FROM (VALUES (1, 'a'), (2, 'b')) ORDER BY column1",
+            true,
+        )
+        .await;
 
-    // ---- compound SELECT edges ----
-    classify(
-        "compound_order_by_ordinal",
-        t,
-        "SELECT v FROM t UNION SELECT v + 1000 FROM t ORDER BY 1 DESC LIMIT 3",
-        true,
-    )
-    .await;
-    classify(
-        "compound_limit_on_values",
-        &[],
-        "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT 2",
-        true,
-    )
-    .await;
+        // ---- compound SELECT edges ----
+        classify(
+            "compound_order_by_ordinal",
+            t,
+            "SELECT v FROM t UNION SELECT v + 1000 FROM t ORDER BY 1 DESC LIMIT 3",
+            true,
+        )
+        .await;
+        classify(
+            "compound_limit_on_values",
+            &[],
+            "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT 2",
+            true,
+        )
+        .await;
 
-    // ---- correlated scalar subquery in projection ----
-    classify(
-        "correlated_scalar_in_select",
-        t,
-        "SELECT id, (SELECT count(*) FROM t t2 WHERE t2.g = t.g) AS gc FROM t ORDER BY id",
-        true,
-    )
-    .await;
+        // ---- correlated scalar subquery in projection ----
+        classify(
+            "correlated_scalar_in_select",
+            t,
+            "SELECT id, (SELECT count(*) FROM t t2 WHERE t2.g = t.g) AS gc FROM t ORDER BY id",
+            true,
+        )
+        .await;
 
-    // ---- DISTINCT aggregate + GROUP BY HAVING ----
-    classify(
+        // ---- DISTINCT aggregate + GROUP BY HAVING ----
+        classify(
         "group_by_having_count_distinct",
         t,
         "SELECT g, count(DISTINCT v) AS d FROM t GROUP BY g HAVING count(DISTINCT v) > 1 ORDER BY g",
@@ -403,22 +403,22 @@ fn codegen_gap_probe_select_window_aggregate() {
     )
     .await;
 
-    // ---- json table-valued + scalar ----
-    classify(
-        "json_each_table_valued",
-        &[],
-        "SELECT value FROM json_each('[10,20,30]') ORDER BY value",
-        true,
-    )
-    .await;
+        // ---- json table-valued + scalar ----
+        classify(
+            "json_each_table_valued",
+            &[],
+            "SELECT value FROM json_each('[10,20,30]') ORDER BY value",
+            true,
+        )
+        .await;
 
-    // ---- SELECT with LIMIT and OFFSET expression ----
-    classify(
-        "select_limit_offset_expr",
-        t,
-        "SELECT v FROM t ORDER BY v LIMIT 2 + 1 OFFSET 1",
-        true,
-    )
-    .await;
+        // ---- SELECT with LIMIT and OFFSET expression ----
+        classify(
+            "select_limit_offset_expr",
+            t,
+            "SELECT v FROM t ORDER BY v LIMIT 2 + 1 OFFSET 1",
+            true,
+        )
+        .await;
     });
 }

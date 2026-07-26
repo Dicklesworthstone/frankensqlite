@@ -86,33 +86,33 @@ fn test_issue_122_check_isnull_eq_isnull_in_memory() {
 #[test]
 fn test_issue_122_check_survives_schema_round_trip_through_file() {
     asupersync::test_utils::run_test(|| async {
-    let tmp = tempfile::NamedTempFile::new().expect("temp file");
-    let path = tmp.path().to_str().expect("utf-8 temp path");
+        let tmp = tempfile::NamedTempFile::new().expect("temp file");
+        let path = tmp.path().to_str().expect("utf-8 temp path");
 
-    {
-        let conn = Connection::open(path).await.expect("open file db");
-        conn.execute(CREATE_RUNS).await.expect("create table");
-        assert_check_semantics(&conn, 1).await;
-    }
+        {
+            let conn = Connection::open(path).await.expect("open file db");
+            conn.execute(CREATE_RUNS).await.expect("create table");
+            assert_check_semantics(&conn, 1).await;
+        }
 
-    // Reopen: the schema is re-parsed from the stored (normalized) text.
-    let conn = Connection::open(path).await.expect("reopen file db");
+        // Reopen: the schema is re-parsed from the stored (normalized) text.
+        let conn = Connection::open(path).await.expect("reopen file db");
 
-    let rows = conn
-        .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'runs'")
-        .await
-        .expect("read stored schema text");
-    assert_eq!(rows.len(), 1, "expected exactly one schema row");
-    let stored_sql = match &rows[0].values()[0] {
-        SqliteValue::Text(s) => s.clone(),
-        other => panic!("expected TEXT schema sql, got {other:?}"),
-    };
-    assert!(
-        stored_sql.contains("(t_end IS NULL) = (outcome IS NULL)"),
-        "stored schema text must keep the grouping parentheses, got: {stored_sql}"
-    );
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'runs'")
+            .await
+            .expect("read stored schema text");
+        assert_eq!(rows.len(), 1, "expected exactly one schema row");
+        let stored_sql = match &rows[0].values()[0] {
+            SqliteValue::Text(s) => s.clone(),
+            other => panic!("expected TEXT schema sql, got {other:?}"),
+        };
+        assert!(
+            stored_sql.contains("(t_end IS NULL) = (outcome IS NULL)"),
+            "stored schema text must keep the grouping parentheses, got: {stored_sql}"
+        );
 
-    assert_check_semantics(&conn, 11).await;
+        assert_check_semantics(&conn, 11).await;
     });
 }
 
@@ -122,39 +122,39 @@ fn test_issue_122_check_survives_schema_round_trip_through_file() {
 #[test]
 fn test_issue_122_null_test_precedence_matches_c_sqlite() {
     asupersync::test_utils::run_test(|| async {
-    // (sql, expected result from the sqlite3 CLI)
-    let cases: &[(&str, i64)] = &[
-        // Explicit grouping: (0) = (0) -> 1.
-        ("SELECT (200 IS NULL) = ('ok' IS NULL)", 1),
-        // Unparenthesized: ((200 IS NULL) = 'ok') IS NULL -> 0.
-        ("SELECT 200 IS NULL = 'ok' IS NULL", 0),
-        // ((300 IS NULL) = NULL) IS NULL -> 1 (NOT (0 = 1) -> 0).
-        ("SELECT 300 IS NULL = NULL IS NULL", 1),
-        // Single-token postfix form groups the same way.
-        ("SELECT 200 ISNULL = 'ok' ISNULL", 0),
-        // Tighter operator after NULL attaches to NULL: 1 IS (NULL < 2) -> 0.
-        ("SELECT 1 IS NULL < 2", 0),
-        ("SELECT 1 IS NULL + 1", 0),
-        // Parenthesized NULL still folds to a null-test.
-        ("SELECT 0 IS (NULL)", 0),
-    ];
+        // (sql, expected result from the sqlite3 CLI)
+        let cases: &[(&str, i64)] = &[
+            // Explicit grouping: (0) = (0) -> 1.
+            ("SELECT (200 IS NULL) = ('ok' IS NULL)", 1),
+            // Unparenthesized: ((200 IS NULL) = 'ok') IS NULL -> 0.
+            ("SELECT 200 IS NULL = 'ok' IS NULL", 0),
+            // ((300 IS NULL) = NULL) IS NULL -> 1 (NOT (0 = 1) -> 0).
+            ("SELECT 300 IS NULL = NULL IS NULL", 1),
+            // Single-token postfix form groups the same way.
+            ("SELECT 200 ISNULL = 'ok' ISNULL", 0),
+            // Tighter operator after NULL attaches to NULL: 1 IS (NULL < 2) -> 0.
+            ("SELECT 1 IS NULL < 2", 0),
+            ("SELECT 1 IS NULL + 1", 0),
+            // Parenthesized NULL still folds to a null-test.
+            ("SELECT 0 IS (NULL)", 0),
+        ];
 
-    let fconn = Connection::open(":memory:").await.expect("open fsqlite");
-    let rconn = rusqlite::Connection::open_in_memory().expect("open rusqlite");
+        let fconn = Connection::open(":memory:").await.expect("open fsqlite");
+        let rconn = rusqlite::Connection::open_in_memory().expect("open rusqlite");
 
-    for (sql, expected) in cases {
-        let rows = fconn.query(sql).await.expect("fsqlite query");
-        assert_eq!(rows.len(), 1, "{sql}: expected one row");
-        let got = match rows[0].values()[0] {
-            SqliteValue::Integer(n) => n,
-            ref other => panic!("{sql}: expected INTEGER, got {other:?}"),
-        };
-        assert_eq!(got, *expected, "fsqlite disagrees with sqlite3 CLI: {sql}");
+        for (sql, expected) in cases {
+            let rows = fconn.query(sql).await.expect("fsqlite query");
+            assert_eq!(rows.len(), 1, "{sql}: expected one row");
+            let got = match rows[0].values()[0] {
+                SqliteValue::Integer(n) => n,
+                ref other => panic!("{sql}: expected INTEGER, got {other:?}"),
+            };
+            assert_eq!(got, *expected, "fsqlite disagrees with sqlite3 CLI: {sql}");
 
-        let oracle: i64 = rconn
-            .query_row(sql, [], |row| row.get(0))
-            .expect("rusqlite query");
-        assert_eq!(got, oracle, "fsqlite disagrees with rusqlite oracle: {sql}");
-    }
+            let oracle: i64 = rconn
+                .query_row(sql, [], |row| row.get(0))
+                .expect("rusqlite query");
+            assert_eq!(got, oracle, "fsqlite disagrees with rusqlite oracle: {sql}");
+        }
     });
 }

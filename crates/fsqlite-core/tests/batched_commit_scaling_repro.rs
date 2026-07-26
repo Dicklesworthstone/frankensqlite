@@ -71,37 +71,37 @@ async fn run_batched_inserts() -> Vec<Duration> {
 #[test]
 fn batched_insert_per_txn_is_approximately_constant() {
     asupersync::test_utils::run_test(|| async {
-    let per_batch = run_batched_inserts().await;
+        let per_batch = run_batched_inserts().await;
 
-    // Pick a few representative points.
-    let first = per_batch[0];
-    let mid = per_batch[NUM_BATCHES / 2];
-    let last = per_batch[NUM_BATCHES - 1];
+        // Pick a few representative points.
+        let first = per_batch[0];
+        let mid = per_batch[NUM_BATCHES / 2];
+        let last = per_batch[NUM_BATCHES - 1];
 
-    // Sum of the first 5 batches (ignoring the very first which can include
-    // one-time codegen / compile-cache warmup noise) gives a stable baseline.
-    let warm_baseline: Duration = per_batch[1..6].iter().sum::<Duration>() / 5;
-    let tail_mean: Duration = per_batch[NUM_BATCHES - 5..NUM_BATCHES]
-        .iter()
-        .sum::<Duration>()
-        / 5;
+        // Sum of the first 5 batches (ignoring the very first which can include
+        // one-time codegen / compile-cache warmup noise) gives a stable baseline.
+        let warm_baseline: Duration = per_batch[1..6].iter().sum::<Duration>() / 5;
+        let tail_mean: Duration = per_batch[NUM_BATCHES - 5..NUM_BATCHES]
+            .iter()
+            .sum::<Duration>()
+            / 5;
 
-    eprintln!(
-        "batched_insert_per_txn ({NUM_BATCHES} batches x {BATCH_SIZE}/txn): \
+        eprintln!(
+            "batched_insert_per_txn ({NUM_BATCHES} batches x {BATCH_SIZE}/txn): \
          1st={first:?} 50th={mid:?} 99th={last:?} \
          warm_baseline(2..6)={warm_baseline:?} tail_mean(95..99)={tail_mean:?}"
-    );
+        );
 
-    // If the commit path is O(existing_rows), the 99th batch is ~100x slower
-    // than the 1st. We want linear scaling of commit cost — so the tail
-    // should be within a modest constant factor of the warm baseline.
-    //
-    // Allow up to 4x to accommodate CI noise and cache effects. In a healthy
-    // implementation this ratio is ~1.0-1.5.
-    let ratio = tail_mean.as_secs_f64() / warm_baseline.as_secs_f64().max(1e-9);
-    assert!(
-        ratio < 4.0,
-        "tail batch ({tail_mean:?}) is {ratio:.1}x slower than warm baseline ({warm_baseline:?}) — batched-commit cliff regressed. Per-batch timings: {per_batch:?}",
-    );
+        // If the commit path is O(existing_rows), the 99th batch is ~100x slower
+        // than the 1st. We want linear scaling of commit cost — so the tail
+        // should be within a modest constant factor of the warm baseline.
+        //
+        // Allow up to 4x to accommodate CI noise and cache effects. In a healthy
+        // implementation this ratio is ~1.0-1.5.
+        let ratio = tail_mean.as_secs_f64() / warm_baseline.as_secs_f64().max(1e-9);
+        assert!(
+            ratio < 4.0,
+            "tail batch ({tail_mean:?}) is {ratio:.1}x slower than warm baseline ({warm_baseline:?}) — batched-commit cliff regressed. Per-batch timings: {per_batch:?}",
+        );
     });
 }

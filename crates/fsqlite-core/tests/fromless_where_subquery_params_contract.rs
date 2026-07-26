@@ -32,28 +32,28 @@ async fn seeded() -> Connection {
 #[test]
 fn fromless_select_binds_params_inside_where_exists_subquery() {
     asupersync::test_utils::run_test(|| async {
-    let conn = seeded().await;
-    let rows = conn
-        .query_with_params(
-            "SELECT ?1, ?2 WHERE EXISTS(SELECT 1 FROM edges WHERE artifact = ?1 AND op = ?2 \
+        let conn = seeded().await;
+        let rows = conn
+            .query_with_params(
+                "SELECT ?1, ?2 WHERE EXISTS(SELECT 1 FROM edges WHERE artifact = ?1 AND op = ?2 \
              LIMIT 1);",
-            &[
-                SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
-                SqliteValue::Integer(1),
-            ],
-        )
-        .await
-        .expect("query");
-    assert_eq!(
-        rows.len(),
-        1,
-        "sqlite3 returns one row: the EXISTS guard is satisfied by the seeded edge"
-    );
-    assert_eq!(
-        rows[0].values()[0],
-        SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32]))
-    );
-    assert_eq!(rows[0].values()[1], SqliteValue::Integer(1));
+                &[
+                    SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
+                    SqliteValue::Integer(1),
+                ],
+            )
+            .await
+            .expect("query");
+        assert_eq!(
+            rows.len(),
+            1,
+            "sqlite3 returns one row: the EXISTS guard is satisfied by the seeded edge"
+        );
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32]))
+        );
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(1));
     });
 }
 
@@ -62,26 +62,26 @@ fn fromless_select_binds_params_inside_where_exists_subquery() {
 #[test]
 fn guarded_fromless_insert_select_binds_guard_params() {
     asupersync::test_utils::run_test(|| async {
-    let conn = seeded().await;
-    let inserted = conn
-        .execute_with_params(
-            "INSERT INTO seals SELECT ?1, ?2 WHERE EXISTS(SELECT 1 FROM edges WHERE artifact = \
+        let conn = seeded().await;
+        let inserted = conn
+            .execute_with_params(
+                "INSERT INTO seals SELECT ?1, ?2 WHERE EXISTS(SELECT 1 FROM edges WHERE artifact = \
              ?3 AND op = ?4 LIMIT 1);",
-            &[
-                SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
-                SqliteValue::Integer(1),
-                SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
-                SqliteValue::Integer(1),
-            ],
-        )
-        .await
-        .expect("guarded insert");
-    assert_eq!(inserted, 1, "the guard is satisfied; the row must insert");
-    let rows = conn
-        .query("SELECT COUNT(*) FROM seals;")
-        .await
-        .expect("count");
-    assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+                &[
+                    SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
+                    SqliteValue::Integer(1),
+                ],
+            )
+            .await
+            .expect("guarded insert");
+        assert_eq!(inserted, 1, "the guard is satisfied; the row must insert");
+        let rows = conn
+            .query("SELECT COUNT(*) FROM seals;")
+            .await
+            .expect("count");
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
     });
 }
 
@@ -90,21 +90,21 @@ fn guarded_fromless_insert_select_binds_guard_params() {
 #[test]
 fn guarded_fromless_insert_select_still_refuses_unmatched_guards() {
     asupersync::test_utils::run_test(|| async {
-    let conn = seeded().await;
-    let inserted = conn
-        .execute_with_params(
-            "INSERT INTO seals SELECT ?1, ?2 WHERE EXISTS(SELECT 1 FROM edges WHERE artifact = \
+        let conn = seeded().await;
+        let inserted = conn
+            .execute_with_params(
+                "INSERT INTO seals SELECT ?1, ?2 WHERE EXISTS(SELECT 1 FROM edges WHERE artifact = \
              ?3 AND op = ?4 LIMIT 1);",
-            &[
-                SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
-                SqliteValue::Integer(1),
-                SqliteValue::Blob(std::sync::Arc::from(vec![0xBB_u8; 32])), // no such artifact
-                SqliteValue::Integer(1),
-            ],
-        )
-        .await
-        .expect("guarded insert");
-    assert_eq!(inserted, 0, "an unsatisfied guard inserts nothing");
+                &[
+                    SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Blob(std::sync::Arc::from(vec![0xBB_u8; 32])), // no such artifact
+                    SqliteValue::Integer(1),
+                ],
+            )
+            .await
+            .expect("guarded insert");
+        assert_eq!(inserted, 0, "an unsatisfied guard inserts nothing");
     });
 }
 
@@ -113,18 +113,18 @@ fn guarded_fromless_insert_select_still_refuses_unmatched_guards() {
 #[test]
 fn projection_exists_params_keep_working() {
     asupersync::test_utils::run_test(|| async {
-    let conn = seeded().await;
-    let projected = conn
-        .query_with_params(
-            "SELECT EXISTS(SELECT 1 FROM edges WHERE artifact = ?1 AND op = ?2 LIMIT 1);",
-            &[
-                SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
-                SqliteValue::Integer(1),
-            ],
-        )
-        .await
-        .expect("projection form");
-    assert_eq!(projected[0].values()[0], SqliteValue::Integer(1));
+        let conn = seeded().await;
+        let projected = conn
+            .query_with_params(
+                "SELECT EXISTS(SELECT 1 FROM edges WHERE artifact = ?1 AND op = ?2 LIMIT 1);",
+                &[
+                    SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
+                    SqliteValue::Integer(1),
+                ],
+            )
+            .await
+            .expect("projection form");
+        assert_eq!(projected[0].values()[0], SqliteValue::Integer(1));
     });
 }
 
@@ -142,27 +142,27 @@ fn projection_exists_params_keep_working() {
 #[test]
 fn fromful_where_subquery_params_bind() {
     asupersync::test_utils::run_test(|| async {
-    let conn = seeded().await;
-    let fromful = conn
-        .query_with_params(
-            "SELECT role FROM edges WHERE EXISTS(SELECT 1 FROM edges e2 WHERE e2.artifact = ?1 \
+        let conn = seeded().await;
+        let fromful = conn
+            .query_with_params(
+                "SELECT role FROM edges WHERE EXISTS(SELECT 1 FROM edges e2 WHERE e2.artifact = ?1 \
              AND e2.op = ?2);",
-            &[
-                SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
-                SqliteValue::Integer(1),
-            ],
-        )
-        .await
-        .expect("FROM-ful form");
-    assert_eq!(fromful.len(), 1);
-    let scalar = conn
+                &[
+                    SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
+                    SqliteValue::Integer(1),
+                ],
+            )
+            .await
+            .expect("FROM-ful form");
+        assert_eq!(fromful.len(), 1);
+        let scalar = conn
         .query_with_params(
             "SELECT role FROM edges WHERE (SELECT COUNT(*) FROM edges e2 WHERE e2.op = ?1) > 0;",
             &[SqliteValue::Integer(1)],
         )
         .await
         .expect("scalar-count form");
-    assert_eq!(scalar.len(), 1);
+        assert_eq!(scalar.len(), 1);
     });
 }
 
@@ -173,46 +173,46 @@ fn fromful_where_subquery_params_bind() {
 #[test]
 fn prepared_fromful_subquery_rebinds_per_execution() {
     asupersync::test_utils::run_test(|| async {
-    let conn = seeded().await;
-    let prepared = conn
-        .prepare(
-            "SELECT role FROM edges WHERE EXISTS(SELECT 1 FROM edges e2 WHERE e2.artifact = ?1 \
+        let conn = seeded().await;
+        let prepared = conn
+            .prepare(
+                "SELECT role FROM edges WHERE EXISTS(SELECT 1 FROM edges e2 WHERE e2.artifact = ?1 \
              AND e2.op = ?2);",
-        )
-        .await
-        .expect("prepare");
-    let matching = prepared
-        .query_with_params(&[
-            SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
-            SqliteValue::Integer(1),
-        ])
-        .await
-        .expect("matching execution");
-    assert_eq!(
-        matching.len(),
-        1,
-        "matching bindings must satisfy the guard"
-    );
-    let unmatched = prepared
-        .query_with_params(&[
-            SqliteValue::Blob(std::sync::Arc::from(vec![0xBB_u8; 32])),
-            SqliteValue::Integer(1),
-        ])
-        .await
-        .expect("unmatched execution");
-    assert_eq!(
-        unmatched.len(),
-        0,
-        "the SAME prepared statement with unmatched bindings must refuse"
-    );
-    let matching_again = prepared
-        .query_with_params(&[
-            SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
-            SqliteValue::Integer(1),
-        ])
-        .await
-        .expect("matching re-execution");
-    assert_eq!(matching_again.len(), 1, "rebinding must not be sticky");
+            )
+            .await
+            .expect("prepare");
+        let matching = prepared
+            .query_with_params(&[
+                SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
+                SqliteValue::Integer(1),
+            ])
+            .await
+            .expect("matching execution");
+        assert_eq!(
+            matching.len(),
+            1,
+            "matching bindings must satisfy the guard"
+        );
+        let unmatched = prepared
+            .query_with_params(&[
+                SqliteValue::Blob(std::sync::Arc::from(vec![0xBB_u8; 32])),
+                SqliteValue::Integer(1),
+            ])
+            .await
+            .expect("unmatched execution");
+        assert_eq!(
+            unmatched.len(),
+            0,
+            "the SAME prepared statement with unmatched bindings must refuse"
+        );
+        let matching_again = prepared
+            .query_with_params(&[
+                SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
+                SqliteValue::Integer(1),
+            ])
+            .await
+            .expect("matching re-execution");
+        assert_eq!(matching_again.len(), 1, "rebinding must not be sticky");
     });
 }
 
@@ -222,33 +222,33 @@ fn prepared_fromful_subquery_rebinds_per_execution() {
 #[test]
 fn prepared_guarded_insert_select_rebinds_per_execution() {
     asupersync::test_utils::run_test(|| async {
-    let conn = seeded().await;
-    let prepared = conn
-        .prepare(
-            "INSERT INTO seals SELECT ?1, ?2 WHERE EXISTS(SELECT 1 FROM edges WHERE artifact = \
+        let conn = seeded().await;
+        let prepared = conn
+            .prepare(
+                "INSERT INTO seals SELECT ?1, ?2 WHERE EXISTS(SELECT 1 FROM edges WHERE artifact = \
              ?3 AND op = ?4 LIMIT 1);",
-        )
-        .await
-        .expect("prepare guarded insert");
-    let refused = prepared
-        .execute_with_params(&[
-            SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
-            SqliteValue::Integer(1),
-            SqliteValue::Blob(std::sync::Arc::from(vec![0xBB_u8; 32])), // no such artifact
-            SqliteValue::Integer(1),
-        ])
-        .await
-        .expect("unsatisfied guard executes");
-    assert_eq!(refused, 0, "unsatisfied guard must insert nothing");
-    let inserted = prepared
-        .execute_with_params(&[
-            SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
-            SqliteValue::Integer(1),
-            SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
-            SqliteValue::Integer(1),
-        ])
-        .await
-        .expect("satisfied guard executes");
-    assert_eq!(inserted, 1, "satisfied guard must insert exactly one row");
+            )
+            .await
+            .expect("prepare guarded insert");
+        let refused = prepared
+            .execute_with_params(&[
+                SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
+                SqliteValue::Integer(1),
+                SqliteValue::Blob(std::sync::Arc::from(vec![0xBB_u8; 32])), // no such artifact
+                SqliteValue::Integer(1),
+            ])
+            .await
+            .expect("unsatisfied guard executes");
+        assert_eq!(refused, 0, "unsatisfied guard must insert nothing");
+        let inserted = prepared
+            .execute_with_params(&[
+                SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
+                SqliteValue::Integer(1),
+                SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
+                SqliteValue::Integer(1),
+            ])
+            .await
+            .expect("satisfied guard executes");
+        assert_eq!(inserted, 1, "satisfied guard must insert exactly one row");
     });
 }

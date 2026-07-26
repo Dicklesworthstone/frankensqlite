@@ -82,14 +82,6 @@ mod test_support {
         {
             block_on(self).expect_err(message)
         }
-
-        fn is_ok(self) -> bool {
-            block_on(self).is_ok()
-        }
-
-        fn is_err(self) -> bool {
-            block_on(self).is_err()
-        }
     }
 
     impl<F, T, E> FutureResultTestExt<T, E> for F where
