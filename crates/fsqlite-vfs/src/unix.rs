@@ -1968,28 +1968,21 @@ impl VfsFile for UnixFile {
         Ok(Some(self.inode_key))
     }
 
-    fn read<'a>(
-        &'a self,
-        cx: &'a Cx,
-        buf: &'a mut [u8],
-        offset: u64,
-    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
-        async move {
-            checkpoint_or_abort(cx)?;
-            checked_io_range(offset, buf.len(), "read")?;
-            let file = Arc::clone(
-                self.file
-                    .as_ref()
-                    .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
-            );
-            let requested = buf.len();
-            let (data, total) = spawn_blocking_io(move || read_owned_at(file, requested, offset))
-                .await
-                .map_err(FrankenError::Io)?;
-            checkpoint_or_abort(cx)?;
-            buf.copy_from_slice(&data);
-            Ok(total)
-        }
+    async fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        checkpoint_or_abort(cx)?;
+        checked_io_range(offset, buf.len(), "read")?;
+        let file = Arc::clone(
+            self.file
+                .as_ref()
+                .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
+        );
+        let requested = buf.len();
+        let (data, total) = spawn_blocking_io(move || read_owned_at(file, requested, offset))
+            .await
+            .map_err(FrankenError::Io)?;
+        checkpoint_or_abort(cx)?;
+        buf.copy_from_slice(&data);
+        Ok(total)
     }
 
     fn write<'a>(
@@ -2001,37 +1994,33 @@ impl VfsFile for UnixFile {
         self.write_tracked(cx, buf, offset, VfsWriteCompletion::new())
     }
 
-    fn write_tracked<'a>(
-        &'a self,
-        cx: &'a Cx,
-        buf: &'a [u8],
+    async fn write_tracked(
+        &self,
+        cx: &Cx,
+        buf: &[u8],
         offset: u64,
         completion: VfsWriteCompletion,
-    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        async move {
-            let file = match (|| {
-                checkpoint_or_abort(cx)?;
-                checked_io_range(offset, buf.len(), "write")?;
-                self.file
-                    .as_ref()
-                    .map(Arc::clone)
-                    .ok_or_else(|| FrankenError::internal("unix file is closed"))
-            })() {
-                Ok(file) => file,
-                Err(error) => {
-                    completion.complete_error();
-                    return Err(error);
-                }
-            };
-            let data = buf.to_vec();
-            let source_completion = VfsWriteCompletionSource::new(completion.clone());
-            spawn_blocking_io(move || {
-                write_owned_at_tracked(file, data, offset, source_completion)
-            })
+    ) -> Result<()> {
+        let file = match (|| {
+            checkpoint_or_abort(cx)?;
+            checked_io_range(offset, buf.len(), "write")?;
+            self.file
+                .as_ref()
+                .map(Arc::clone)
+                .ok_or_else(|| FrankenError::internal("unix file is closed"))
+        })() {
+            Ok(file) => file,
+            Err(error) => {
+                completion.complete_error();
+                return Err(error);
+            }
+        };
+        let data = buf.to_vec();
+        let source_completion = VfsWriteCompletionSource::new(completion.clone());
+        spawn_blocking_io(move || write_owned_at_tracked(file, data, offset, source_completion))
             .await
             .map_err(FrankenError::Io)?;
-            checkpoint_or_abort(cx)
-        }
+        checkpoint_or_abort(cx)
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {

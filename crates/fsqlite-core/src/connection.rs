@@ -381,7 +381,7 @@ where
 /// below the observed 2 MiB test-thread stack boundary: compiler changes can
 /// grow these frames, and the limit must fire before the process aborts. The
 /// regression test exercises this boundary on an explicit 1 MiB stack.
-const MAX_TRIGGER_DEPTH: usize = 4000; // TEMP-MEASUREMENT (bd-wymdl): restore after measuring
+const MAX_TRIGGER_DEPTH: usize = 8;
 
 /// Maximum depth for FK CASCADE propagation.
 ///
@@ -440,7 +440,7 @@ thread_local! {
     // trigger frame. Successive deltas are the *measured* per-level native
     // stack cost of trigger recursion. Only recorded while a probe is armed,
     // so ordinary tests pay a single `Cell` read per frame push.
-    static TRIGGER_STACK_PROBE: RefCell<Option<Vec<usize>>> = const { RefCell::new(None) };
+    static TRIGGER_STACK_PROBE: RefCell<Option<Vec<(u8, usize)>>> = const { RefCell::new(None) };
 
     // bd-wymdl (defect 4a) diagnostic: override `MAX_TRIGGER_DEPTH` on the
     // current thread so the depth sweep can locate the largest limit that
@@ -475,10 +475,34 @@ fn arm_trigger_stack_probe() {
     TRIGGER_STACK_PROBE.with(|probe| *probe.borrow_mut() = Some(Vec::new()));
 }
 
-/// Disarm the probe and return the recorded stack addresses (test-only).
+/// Disarm the probe and return the recorded `(site, stack address)` samples
+/// (test-only).
 #[cfg(test)]
-fn take_trigger_stack_probe() -> Vec<usize> {
+fn take_trigger_stack_probe() -> Vec<(u8, usize)> {
     TRIGGER_STACK_PROBE.with(|probe| probe.borrow_mut().take().unwrap_or_default())
+}
+
+/// Probe site identifiers, ordered along one trigger recursion cycle.
+#[cfg(test)]
+mod trigger_probe_site {
+    pub(super) const EXECUTE_STATEMENT: u8 = 1;
+    pub(super) const AFTER_BACKGROUND_STATUS: u8 = 2;
+    pub(super) const DISPATCH_IMPL: u8 = 3;
+    pub(super) const FIRE_TRIGGERS: u8 = 4;
+    pub(super) const FRAME_PUSH: u8 = 5;
+    pub(super) const TRIGGER_REENTRY: u8 = 6;
+
+    pub(super) const fn name(site: u8) -> &'static str {
+        match site {
+            EXECUTE_STATEMENT => "execute_statement",
+            AFTER_BACKGROUND_STATUS => "execute_statement_after_background_status",
+            DISPATCH_IMPL => "execute_statement_impl_after_background_status",
+            FIRE_TRIGGERS => "fire_{before,after}_triggers",
+            FRAME_PUSH => "push_trigger_frame",
+            TRIGGER_REENTRY => "execute_bound_trigger_statement",
+            _ => "unknown",
+        }
+    }
 }
 
 /// Record the current native stack depth, if the probe is armed (test-only).
@@ -488,12 +512,12 @@ fn take_trigger_stack_probe() -> Vec<usize> {
 /// exactly the per-level stack cost.
 #[cfg(test)]
 #[inline(never)]
-fn record_trigger_stack_probe() {
+fn record_trigger_stack_probe(site: u8) {
     let marker: usize = 0;
     let addr = std::ptr::from_ref(&marker) as usize;
     TRIGGER_STACK_PROBE.with(|probe| {
         if let Some(samples) = probe.borrow_mut().as_mut() {
-            samples.push(addr);
+            samples.push((site, addr));
         }
     });
 }
@@ -1132,15 +1156,13 @@ pub fn set_hot_path_profile_enabled(enabled: bool) {
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub fn set_prepared_direct_update_fixed_real_for_bench(enabled: bool) {
-    FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_FOR_BENCH
-        .store(enabled, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_FOR_BENCH.store(enabled, AtomicOrdering::Relaxed);
 }
 
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub fn reset_prepared_direct_update_fixed_real_hits_for_bench() {
-    FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_HITS_FOR_BENCH
-        .store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_HITS_FOR_BENCH.store(0, AtomicOrdering::Relaxed);
 }
 
 #[cfg(feature = "bench-internals")]
@@ -1153,15 +1175,13 @@ pub fn prepared_direct_update_fixed_real_hits_for_bench() -> u64 {
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub fn set_prepared_direct_update_lazy_scratch_for_bench(enabled: bool) {
-    FSQLITE_PREPARED_DIRECT_UPDATE_LAZY_SCRATCH_FOR_BENCH
-        .store(enabled, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_UPDATE_LAZY_SCRATCH_FOR_BENCH.store(enabled, AtomicOrdering::Relaxed);
 }
 
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub fn reset_prepared_direct_update_lazy_scratch_hits_for_bench() {
-    FSQLITE_PREPARED_DIRECT_UPDATE_LAZY_SCRATCH_HITS_FOR_BENCH
-        .store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_DIRECT_UPDATE_LAZY_SCRATCH_HITS_FOR_BENCH.store(0, AtomicOrdering::Relaxed);
 }
 
 #[cfg(feature = "bench-internals")]
@@ -24920,6 +24940,8 @@ impl Connection {
         params: Option<&'a [SqliteValue]>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Row>>> + 'a>> {
         Box::pin(async move {
+            #[cfg(test)]
+            record_trigger_stack_probe(trigger_probe_site::EXECUTE_STATEMENT);
             if hot_path_profile_enabled() {
                 FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES.fetch_add(1, AtomicOrdering::Relaxed);
             }
@@ -24935,6 +24957,8 @@ impl Connection {
         params: Option<&'a [SqliteValue]>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Row>>> + 'a>> {
         Box::pin(async move {
+            #[cfg(test)]
+            record_trigger_stack_probe(trigger_probe_site::AFTER_BACKGROUND_STATUS);
             self.execute_statement_impl_after_background_status(statement, params, None)
                 .await
         })
@@ -24951,6 +24975,8 @@ impl Connection {
         precompiled: Option<&'a VdbeProgram>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Row>>> + 'a>> {
         Box::pin(async move {
+            #[cfg(test)]
+            record_trigger_stack_probe(trigger_probe_site::DISPATCH_IMPL);
             let _record_profile_scope =
                 enter_record_profile_scope(RecordProfileScope::CoreConnection);
             self.clear_table_program_error_state();
@@ -45317,7 +45343,7 @@ impl Connection {
 
     fn push_trigger_frame(&self, frame: TriggerFrame) -> TriggerFrameGuard<'_> {
         #[cfg(test)]
-        record_trigger_stack_probe();
+        record_trigger_stack_probe(trigger_probe_site::FRAME_PUSH);
         self.trigger_frame_stack.borrow_mut().push(frame);
         TriggerFrameGuard {
             stack: &self.trigger_frame_stack,
@@ -46287,6 +46313,27 @@ impl Connection {
                     .to_owned(),
             });
         }
+        // bd-wymdl (defect 4a): this is the trigger recursion re-entry point --
+        // statement execution re-enters `fire_{before,after}_triggers`, which
+        // re-enters here.
+        //
+        // An extra `Box::pin` was tried here and REMOVED as a measured
+        // negative result. `execute_statement` already returns
+        // `Pin<Box<dyn Future>>`, so wrapping it only added a layer: the
+        // stored state moves to the heap, but polling still descends the
+        // native stack level by level.
+        //
+        // `diag_trigger_stack_bytes_per_level` measured it both ways (debug
+        // profile, so these are upper bounds -- an optimized build spills far
+        // less): 186,608 bytes/level with the box, 185,408 without. The box
+        // COST 1,200 bytes/level and an allocation per trigger body statement
+        // while buying no depth at all. The two dominant frames were identical
+        // in both runs (127,760 and 52,768 bytes), confirming it never touched
+        // the real cost. Depth is bounded by `trigger_depth_limit()` instead;
+        // reaching SQLite's 1000 needs an iterative/trampolined rewrite, not
+        // more boxing.
+        #[cfg(test)]
+        record_trigger_stack_probe(trigger_probe_site::TRIGGER_REENTRY);
         self.execute_statement(&statement, None).await?;
         Ok(TriggerStatementOutcome::Continue)
     }
@@ -46378,6 +46425,8 @@ impl Connection {
         new_values: Option<&[SqliteValue]>,
     ) -> Result<()> {
         // F-PGM.11: Enforce trigger recursion depth limit (see fire_before_triggers).
+        #[cfg(test)]
+        record_trigger_stack_probe(trigger_probe_site::FIRE_TRIGGERS);
         if self.trigger_frame_stack.borrow().len() >= trigger_depth_limit() {
             return Err(FrankenError::Internal(
                 "too many levels of trigger recursion".to_owned(),
@@ -66639,12 +66688,27 @@ impl Drop for Connection {
         //   * `close_in_place()` / `close_without_checkpoint_in_place()`
         //   * `close_best_effort_in_place()`
         if !*self.closed.get_mut() {
+            // Cancellation is SYNCHRONOUS and therefore legal here, even though
+            // draining is not. Without it, every task spawned into this
+            // connection's region outlives the connection with a live `Cx`: a
+            // task looping on `cx.checkpoint()` never observes cancellation and
+            // spins for the lifetime of the process, burning a core. On the
+            // last connection this also cancels the database root region —
+            // covering the shared write-coordinator service task, which does
+            // NOT live under any per-connection region — and unpublishes the
+            // shared state so future opens start a fresh generation. Tasks
+            // exit at their next checkpoint under their own power; nothing
+            // here waits for them.
+            self._shared_mvcc_state
+                .release_connection_on_drop(self.runtime_region);
+
             tracing::warn!(
                 target: "fsqlite::runtime",
                 event = "drop_close",
                 db_path = %self.path,
-                msg = "Connection dropped without an awaited close(); \
-                       open transactions are not rolled back and no checkpoint runs"
+                msg = "Connection dropped without an awaited close(); region tasks were \
+                       cancelled but open transactions are not rolled back and no \
+                       checkpoint runs"
             );
         }
     }
@@ -73788,6 +73852,65 @@ impl SharedMvccState {
         Err(FrankenError::internal(
             "write coordinator tasks require an active asupersync runtime",
         ))
+    }
+
+    /// Drop-path analog of [`Self::release_connection`]: request cancellation
+    /// everywhere that teardown would drain, without ever blocking.
+    ///
+    /// `RegionTree::begin_close` cancels a region's `Cx` and propagates to
+    /// descendant regions, but explicitly does not wait for quiescence.
+    /// `release_connection` (which calls `close_and_drain`) spin-waits and
+    /// therefore must not run on the drop path.
+    ///
+    /// Without this, a `Connection` dropped without an awaited `close()` leaks
+    /// every task spawned into its region: nothing ever cancels their `Cx`, so
+    /// a task looping on `cx.checkpoint()` spins for the lifetime of the
+    /// process. Cancelling only the per-connection region is not enough: the
+    /// shared write-coordinator service task lives under the database *root*
+    /// region, so dropping the last connection must also cancel the root.
+    ///
+    /// Mirrors the bookkeeping of `release_connection`: decrements the
+    /// open-connection count, and on the last connection clears the
+    /// write-coordinator service state (dropping the shutdown sender wakes the
+    /// service's shutdown listener), cancels the database root region, and
+    /// removes the shared-state map entry so a future `open` builds a fresh
+    /// generation instead of trying to join a closing region tree.
+    fn release_connection_on_drop(&self, connection_region: Region) {
+        let mut state = lock_unpoisoned(&self.runtime_state);
+        if let Err(err) = state.regions.begin_close(connection_region) {
+            tracing::debug!(
+                target: "fsqlite::runtime",
+                event = "region_cancel_request_failed",
+                region_id = connection_region.get(),
+                error = %err,
+                "could not request region cancellation during drop"
+            );
+        }
+        if state.open_connections > 0 {
+            state.open_connections -= 1;
+            self.open_connection_count
+                .fetch_sub(1, AtomicOrdering::Release);
+        }
+        if state.open_connections == 0 {
+            state.write_coordinator_service_starting = false;
+            state.write_coordinator_service_running = false;
+            let _ = state.write_coordinator_shutdown.take();
+            let db_root_region = state.db_root_region;
+            if let Err(err) = state.regions.begin_close(db_root_region) {
+                tracing::debug!(
+                    target: "fsqlite::runtime",
+                    event = "region_cancel_request_failed",
+                    region_id = db_root_region.get(),
+                    error = %err,
+                    "could not request database-root region cancellation during drop"
+                );
+            }
+            if state.key.path_key != ":memory:" {
+                if let Some(state_map) = SHARED_MVCC_STATE_BY_PATH.get() {
+                    lock_unpoisoned(state_map).remove(&state.key);
+                }
+            }
+        }
     }
 
     fn release_connection(&self, connection_region: Region, best_effort: bool) -> Result<()> {
@@ -117756,23 +117879,36 @@ mod tests {
             .name("trigger-stack-probe".to_owned())
             .stack_size(512 * 1024 * 1024)
             .spawn(move || {
+                // The override is thread-local and this probe runs on its own
+                // thread, so it must be set here rather than by the caller.
+                // Without it the chain trips the production cap long before
+                // PROBE_DEPTH and no gradient can be sampled. The 512 MiB stack
+                // above is what makes sampling this deep safe.
+                set_trigger_depth_limit_override(Some(PROBE_DEPTH + 1));
                 let base_marker: usize = 0;
                 let thread_base = std::ptr::from_ref(&base_marker) as usize;
-                arm_trigger_stack_probe();
                 block_on_probe(quiet, || async {
                     let conn = build_bounded_trigger_chain(PROBE_DEPTH).await;
+                    // Arm only around the recursive statement so the schema
+                    // setup does not pollute the sample sequence.
+                    arm_trigger_stack_probe();
                     conn.execute("UPDATE a SET n = 1;").await.unwrap();
                 });
                 (thread_base, take_trigger_stack_probe())
             })
             .expect("spawn trigger stack probe thread");
         let (thread_base, samples) = handle.join().expect("probe thread panicked");
+        let frames: Vec<usize> = samples
+            .iter()
+            .filter(|(site, _)| *site == super::trigger_probe_site::FRAME_PUSH)
+            .map(|(_, addr)| *addr)
+            .collect();
         assert!(
-            samples.len() >= 8,
+            frames.len() >= 8,
             "probe recorded too few trigger levels: {}",
-            samples.len()
+            frames.len()
         );
-        let deltas: Vec<usize> = samples
+        let deltas: Vec<usize> = frames
             .windows(2)
             .map(|w| w[0].saturating_sub(w[1]))
             .collect();
@@ -117784,22 +117920,44 @@ mod tests {
         let mean = total / steady.len();
         let min = *steady.iter().min().unwrap();
         let max = *steady.iter().max().unwrap();
+        let base = thread_base.saturating_sub(frames[0]);
         println!("=== bd-wymdl trigger recursion stack measurement (raw Connection API) ===");
         println!("tracing subscriber installed: {}", !quiet);
-        println!("levels sampled: {}", samples.len());
-        println!(
-            "base stack consumed before first trigger frame: {} bytes",
-            thread_base.saturating_sub(samples[0])
-        );
-        println!("per-level deltas (bytes): {deltas:?}");
+        println!("levels sampled: {}", frames.len());
+        println!("base stack consumed before first trigger frame: {base} bytes");
         println!("steady-state per level: mean={mean} min={min} max={max}");
-        for stack_mib in [1_usize, 2, 4, 8, 16] {
+        for stack_mib in [1_usize, 2, 4, 8, 16, 32] {
             let budget = stack_mib * 1024 * 1024;
-            let base = thread_base.saturating_sub(samples[0]);
             let usable = budget.saturating_sub(base);
             println!(
                 "  {stack_mib:>2} MiB stack -> predicted max depth ~= {} levels",
                 usable / mean.max(1)
+            );
+        }
+
+        // Per-site attribution over one steady-state cycle: how many bytes each
+        // frame in the mutual-recursion chain contributes to a single level.
+        println!("--- per-site attribution (one steady-state recursion cycle) ---");
+        let cycle_start = samples
+            .iter()
+            .position(|(site, addr)| {
+                *site == super::trigger_probe_site::FRAME_PUSH && *addr == frames[4]
+            })
+            .expect("locate steady-state cycle start");
+        let cycle_end = samples
+            .iter()
+            .position(|(site, addr)| {
+                *site == super::trigger_probe_site::FRAME_PUSH && *addr == frames[5]
+            })
+            .expect("locate next cycle start");
+        for window in samples[cycle_start..=cycle_end].windows(2) {
+            let (site, addr) = window[0];
+            let (next_site, next_addr) = window[1];
+            println!(
+                "  {:>46} -> {:<46} {:>8} bytes",
+                super::trigger_probe_site::name(site),
+                super::trigger_probe_site::name(next_site),
+                addr.saturating_sub(next_addr),
             );
         }
     }

@@ -1,0 +1,13 @@
+Script started on 2026-07-25 22:49:44-04:00 [COMMAND="ssh vmi1227854 "rustc -vV; cargo -V; uname -a"" TERM="xterm-256color" TTY="/dev/pts/52" COLUMNS="80" LINES="24"]
+Warning: Permanently added '109.123.245.77' (ED25519) to the list of known hosts.
+rustc 1.99.0-nightly (3d50c25bc 2026-07-16)
+binary: rustc
+commit-hash: 3d50c25bc66853bf0ad205529d0f305a1d841b5e
+commit-date: 2026-07-16
+host: x86_64-unknown-linux-gnu
+release: 1.99.0-nightly
+LLVM version: 22.1.8
+cargo 1.99.0-nightly (59800466c 2026-07-07)
+Linux vmi1227854 6.17.0-35-generic #35-Ubuntu SMP PREEMPT_DYNAMIC Tue May 26 13:10:28 UTC 2026 x86_64 GNU/Linux
+
+Script done on 2026-07-25 22:49:46-04:00 [COMMAND_EXIT_CODE="0"]

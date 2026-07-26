@@ -1248,13 +1248,31 @@ struct ParallelWalCombinerState {
 
 static NEXT_PARALLEL_WAL_COMBINER_ID: AtomicU64 = AtomicU64::new(0);
 
+fn atomic_checked_increment(
+    counter: &AtomicU64,
+    set_order: Ordering,
+    fetch_order: Ordering,
+) -> Result<u64, u64> {
+    let mut current = counter.load(fetch_order);
+    loop {
+        let Some(next) = current.checked_add(1) else {
+            return Err(current);
+        };
+        match counter.compare_exchange_weak(current, next, set_order, fetch_order) {
+            Ok(previous) => return Ok(previous),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 fn next_parallel_wal_combiner_id() -> u64 {
-    NEXT_PARALLEL_WAL_COMBINER_ID
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
-        })
-        .map(|previous| previous + 1)
-        .expect("parallel WAL combiner identity space exhausted")
+    atomic_checked_increment(
+        &NEXT_PARALLEL_WAL_COMBINER_ID,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    )
+    .map(|previous| previous + 1)
+    .expect("parallel WAL combiner identity space exhausted")
 }
 
 /// Tiny serialized residue joining already-parallel lane staging to durable,
@@ -1512,12 +1530,13 @@ impl ParallelWalDurabilityCombiner {
     }
 
     fn next_pending_publication_id(&self) -> Result<u64, ParallelWalCombinerError> {
-        self.next_pending_publication_id
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
-            .map(|previous| previous + 1)
-            .map_err(|_| ParallelWalCombinerError::PendingPublicationIdOverflow)
+        atomic_checked_increment(
+            &self.next_pending_publication_id,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map(|previous| previous + 1)
+        .map_err(|_| ParallelWalCombinerError::PendingPublicationIdOverflow)
     }
 
     fn prepare_pending_publication_from_claim<S>(
@@ -3626,6 +3645,23 @@ mod tests {
 
     fn test_cx() -> Cx {
         Cx::default()
+    }
+
+    #[test]
+    fn checked_atomic_increment_reports_previous_value_and_overflow() {
+        let counter = AtomicU64::new(41);
+        assert_eq!(
+            atomic_checked_increment(&counter, Ordering::AcqRel, Ordering::Acquire),
+            Ok(41)
+        );
+        assert_eq!(counter.load(Ordering::Acquire), 42);
+
+        let exhausted = AtomicU64::new(u64::MAX);
+        assert_eq!(
+            atomic_checked_increment(&exhausted, Ordering::Relaxed, Ordering::Relaxed),
+            Err(u64::MAX)
+        );
+        assert_eq!(exhausted.load(Ordering::Relaxed), u64::MAX);
     }
 
     fn sample_batch(txn_id: u64, commit_seq: u64) -> ParallelWalBatch {

@@ -1193,6 +1193,11 @@ pub trait VfsFile: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    // Test doubles implement the async `VfsFile` surface with synchronous
+    // bodies; the futures must stay lazy to honor the trait contract, so the
+    // `async` is deliberate even though no body awaits.
+    #![allow(clippy::unused_async_trait_impl)]
+
     use super::*;
 
     fn poll_ready<F: std::future::Future>(future: F) -> F::Output {

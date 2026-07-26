@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
-use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeBuilder};
@@ -50,8 +50,8 @@ const ROW_COUNTS_QUICK: &[usize] = &[100, 1_000, 10_000];
 const CONCURRENT_THREAD_COUNTS: &[usize] = &[2, 4, 8];
 const CONCURRENT_ROWS_PER_THREAD: usize = 1_000;
 const CONCURRENT_RANGE_SIZE: i64 = 1_000_000;
-const JSON_REPORT_SCHEMA_V4: &str = "fsqlite-e2e.comprehensive-bench-report.v4";
-const BENCHMARK_PROVENANCE_SCHEMA_V1: &str = "fsqlite-e2e.benchmark-provenance.v1";
+const JSON_REPORT_SCHEMA_V6: &str = "fsqlite-e2e.comprehensive-bench-report.v6";
+const BENCHMARK_PROVENANCE_SCHEMA_V3: &str = "fsqlite-e2e.benchmark-provenance.v3";
 const CI_REGRESSION_GATE_SCHEMA_V2: &str = "fsqlite-e2e.comprehensive-bench-ci-regression-gate.v2";
 const CI_REGRESSION_GATE_BEAD_ID: &str = "bd-m4tju";
 const CI_REGRESSION_BASELINE_BEAD_ID: &str = "bd-0winn";
@@ -66,9 +66,19 @@ const CONCURRENT_WRITERS_SECTION_TITLE: &str =
     "Concurrent Writers — C SQLite WAL vs FrankenSQLite MVCC";
 const DEFAULT_BENCH_PAGE_SIZE_BYTES: u32 = 4096;
 #[cfg(feature = "bridge-experiment")]
-const BRIDGE_REPORT_SCHEMA_V1: &str = "fsqlite-e2e.bridge-experiment.v1";
+const BRIDGE_REPORT_SCHEMA_V2: &str = "fsqlite-e2e.bridge-experiment.v2";
 #[cfg(feature = "bridge-experiment")]
 const BRIDGE_INSERT_SQL: &str = "INSERT INTO bridge_probe(id, value) VALUES (?1, ?2)";
+#[cfg(feature = "bridge-experiment")]
+const BRIDGE_EXACT_ORACLE_SQL: &str = "SELECT COUNT(*), COALESCE(SUM(value), 0), \
+     COALESCE(SUM(CASE WHEN id = value AND id >= 0 AND id < ?1 THEN 1 ELSE 0 END), 0) \
+     FROM bridge_probe";
+#[cfg(feature = "bridge-experiment")]
+const BRIDGE_ABSOLUTE_MAX_LOAD_1M: f64 = 1.0;
+#[cfg(feature = "bridge-experiment")]
+const BRIDGE_MAX_CPU_PRESSURE_SOME_AVG10: f64 = 1.0;
+#[cfg(feature = "bridge-experiment")]
+const BRIDGE_MAX_IO_PRESSURE_SOME_AVG60: f64 = 0.10;
 
 // ─── Record size definitions ───────────────────────────────────────────
 
@@ -274,7 +284,7 @@ fn measure<F: FnMut()>(label: &str, row_count: usize, mut f: F) -> Measurement {
         durations.push(elapsed);
         total_elapsed += elapsed;
 
-        if iter >= MIN_ITERS && total_elapsed >= TARGET_DURATION {
+        if durations.len() >= MIN_ITERS && total_elapsed >= TARGET_DURATION {
             break;
         }
     }
@@ -320,7 +330,7 @@ where
         durations.push(elapsed);
         total_elapsed += elapsed;
 
-        if iter >= MIN_ITERS && total_elapsed >= TARGET_DURATION {
+        if durations.len() >= MIN_ITERS && total_elapsed >= TARGET_DURATION {
             break;
         }
     }
@@ -331,6 +341,58 @@ where
         durations,
         row_count,
     }
+}
+
+struct ConcurrentSample {
+    elapsed: Duration,
+    readiness: JsonConcurrentSampleReadiness,
+}
+
+fn measure_concurrent<F>(
+    label: &str,
+    row_count: usize,
+    mut sample: F,
+) -> (Measurement, Vec<JsonConcurrentSampleReadiness>)
+where
+    F: FnMut(&str, usize) -> Result<ConcurrentSample, String>,
+{
+    let mut readiness = Vec::new();
+    for warmup_index in 0..WARMUP_ITERS {
+        eprint!(
+            "\r    [{label}] warmup {}/{WARMUP_ITERS}...",
+            warmup_index + 1
+        );
+        let outcome = sample("warmup", warmup_index)
+            .unwrap_or_else(|error| panic!("{label} warmup {warmup_index} failed: {error}"));
+        readiness.push(outcome.readiness);
+    }
+
+    let mut durations = Vec::new();
+    let mut total_elapsed = Duration::ZERO;
+    for iteration in 0..MAX_ITERS {
+        eprint!(
+            "\r    [{label}] iter {}/{MAX_ITERS} (total: {:.1}s)    ",
+            iteration + 1,
+            total_elapsed.as_secs_f64()
+        );
+        let outcome = sample("measured", iteration)
+            .unwrap_or_else(|error| panic!("{label} iteration {iteration} failed: {error}"));
+        total_elapsed += outcome.elapsed;
+        durations.push(outcome.elapsed);
+        readiness.push(outcome.readiness);
+        if durations.len() >= MIN_ITERS && total_elapsed >= TARGET_DURATION {
+            break;
+        }
+    }
+    eprint!("\r{:80}\r", "");
+    (
+        Measurement {
+            label: label.to_owned(),
+            durations,
+            row_count,
+        },
+        readiness,
+    )
 }
 
 // ─── BusySnapshot / Busy retry helpers ─────────────────────────────────
@@ -487,13 +549,20 @@ struct BenchTask<T> {
 }
 
 impl<T> BenchTask<T> {
-    fn wait(self) -> T {
+    fn try_wait(self) -> Result<T, String> {
         self.handle.wait();
         match self.result_rx.recv() {
-            Ok(Ok(value)) => value,
-            Ok(Err(message)) => panic!("{message}"),
-            Err(err) => panic!("benchmark worker exited without reporting a result: {err}"),
+            Ok(result) => result,
+            Err(error) => Err(format!(
+                "benchmark worker exited without reporting a result: {error}"
+            )),
         }
+    }
+
+    #[cfg(test)]
+    fn wait(self) -> T {
+        self.try_wait()
+            .unwrap_or_else(|message| panic!("{message}"))
     }
 }
 
@@ -631,6 +700,13 @@ fn normalize_fsqlite_value(value: &fsqlite::SqliteValue) -> String {
     }
 }
 
+fn normalize_effective_pragma_value(pragma: &str, value: String) -> Result<String, String> {
+    if !pragma.eq_ignore_ascii_case("synchronous") {
+        return Ok(value);
+    }
+    normalized_synchronous(&value)
+}
+
 fn query_effective_csqlite_pragmas(
     conn: &rusqlite::Connection,
 ) -> Result<BTreeMap<String, String>, String> {
@@ -640,6 +716,8 @@ fn query_effective_csqlite_pragmas(
         let value = conn
             .query_row(&sql, [], |row| row.get_ref(0).map(normalize_csqlite_value))
             .map_err(|error| format!("C SQLite `{sql}` failed: {error}"))?;
+        let value = normalize_effective_pragma_value(pragma, value)
+            .map_err(|error| format!("C SQLite `{sql}` returned invalid value: {error}"))?;
         values.insert(pragma.to_owned(), value);
     }
     Ok(values)
@@ -659,7 +737,9 @@ fn query_effective_fsqlite_pragmas(
         let value = row
             .get(0)
             .ok_or_else(|| format!("FrankenSQLite `{sql}` returned no first column"))?;
-        values.insert(pragma.to_owned(), normalize_fsqlite_value(value));
+        let value = normalize_effective_pragma_value(pragma, normalize_fsqlite_value(value))
+            .map_err(|error| format!("FrankenSQLite `{sql}` returned invalid value: {error}"))?;
+        values.insert(pragma.to_owned(), value);
     }
     Ok(values)
 }
@@ -835,7 +915,7 @@ fn environment_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn certify_execution_routing() -> JsonExecutionRouting {
+fn probe_execution_routing() -> JsonExecutionRouting {
     let previous_profile_enabled = hot_path_profile_enabled();
     set_hot_path_profile_enabled(true);
     reset_hot_path_profile();
@@ -871,13 +951,13 @@ fn certify_execution_routing() -> JsonExecutionRouting {
     let delete = fs_prepare(&conn, "DELETE FROM routing_probe WHERE id = ?1");
     fs_stmt_execute_with_params(&delete, &[fsqlite::SqliteValue::Integer(4)]);
 
-    let fallback_counts = Arc::new(Mutex::new(BTreeMap::new()));
+    let routing_decision_counts = Arc::new(Mutex::new(BTreeMap::new()));
     let subscriber = tracing_subscriber::registry()
         .with(
             tracing_subscriber::filter::Targets::new()
                 .with_target("fsqlite.fallback_decision", tracing::Level::DEBUG),
         )
-        .with(FallbackDecisionLayer(Arc::clone(&fallback_counts)));
+        .with(FallbackDecisionLayer(Arc::clone(&routing_decision_counts)));
     {
         let _subscriber_guard = tracing::subscriber::set_default(subscriber);
         let rows = fsqlite_e2e::block_on(
@@ -889,7 +969,7 @@ fn certify_execution_routing() -> JsonExecutionRouting {
 
     let profile = hot_path_profile_snapshot();
     set_hot_path_profile_enabled(previous_profile_enabled);
-    let select_fallback_decisions = fallback_counts
+    let select_routing_decisions = routing_decision_counts
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
@@ -901,59 +981,133 @@ fn certify_execution_routing() -> JsonExecutionRouting {
     ]
     .into_iter()
     .any(environment_flag_enabled);
-    let mut certification_errors = Vec::new();
-    if select_fallback_decisions.is_empty() {
-        certification_errors.push(
-            "fallback-decision collector saw no event for the certification GROUP BY query"
-                .to_owned(),
-        );
+    let prepared_dml_fallbacks = BTreeMap::from([
+        (
+            "returning".to_owned(),
+            profile.prepared_update_delete_fallback_returning,
+        ),
+        (
+            "sqlite_sequence".to_owned(),
+            profile.prepared_update_delete_fallback_sqlite_sequence,
+        ),
+        (
+            "without_rowid".to_owned(),
+            profile.prepared_update_delete_fallback_without_rowid,
+        ),
+        (
+            "live_vtab".to_owned(),
+            profile.prepared_update_delete_fallback_live_vtab,
+        ),
+        (
+            "trigger".to_owned(),
+            profile.prepared_update_delete_fallback_trigger,
+        ),
+        (
+            "foreign_key".to_owned(),
+            profile.prepared_update_delete_fallback_foreign_key,
+        ),
+    ]);
+    let mut probe_errors = Vec::new();
+    if profile.prepared_insert_fast_lane_hits != 4 {
+        probe_errors.push(format!(
+            "routing probe expected 4 prepared INSERT fast-lane hits, observed {}",
+            profile.prepared_insert_fast_lane_hits
+        ));
+    }
+    if profile.prepared_insert_instrumented_lane_hits != 0 {
+        probe_errors.push(format!(
+            "routing probe observed {} instrumented prepared INSERT hits",
+            profile.prepared_insert_instrumented_lane_hits
+        ));
+    }
+    if profile.prepared_direct_insert_executions != 4 {
+        probe_errors.push(format!(
+            "routing probe expected 4 prepared direct INSERT executions, observed {}",
+            profile.prepared_direct_insert_executions
+        ));
+    }
+    if profile.prepared_update_delete_fast_lane_hits != 0 {
+        probe_errors.push(format!(
+            "routing probe observed {} prepared UPDATE/DELETE fused-lane hits; direct autocommit DML must return before that lane",
+            profile.prepared_update_delete_fast_lane_hits
+        ));
+    }
+    if profile.prepared_update_delete_instrumented_lane_hits != 0 {
+        probe_errors.push(format!(
+            "routing probe observed {} instrumented prepared UPDATE/DELETE hits",
+            profile.prepared_update_delete_instrumented_lane_hits
+        ));
+    }
+    if profile.prepared_direct_update_executions != 1 {
+        probe_errors.push(format!(
+            "routing probe expected 1 prepared direct UPDATE execution, observed {}",
+            profile.prepared_direct_update_executions
+        ));
+    }
+    if profile.prepared_direct_delete_executions != 1 {
+        probe_errors.push(format!(
+            "routing probe expected 1 prepared direct DELETE execution, observed {}",
+            profile.prepared_direct_delete_executions
+        ));
+    }
+    if profile.prepared_update_delete_dml_direct_handoff_runs != 0 {
+        probe_errors.push(format!(
+            "routing probe observed {} prepared UPDATE/DELETE VDBE direct-handoff runs",
+            profile.prepared_update_delete_dml_direct_handoff_runs
+        ));
+    }
+    if profile.prepared_table_dml_affected_only_runs != 0 {
+        probe_errors.push(format!(
+            "routing probe observed {} generic prepared affected-only DML runs",
+            profile.prepared_table_dml_affected_only_runs
+        ));
+    }
+    if prepared_dml_fallbacks.values().any(|count| *count != 0) {
+        probe_errors.push(format!(
+            "routing probe observed prepared DML fallbacks: {prepared_dml_fallbacks:?}"
+        ));
+    }
+    let expected_routing_decisions = BTreeMap::from([
+        ("group_by_fallback".to_owned(), 1_u64),
+        ("valid_btree_page".to_owned(), 1_u64),
+    ]);
+    if select_routing_decisions != expected_routing_decisions {
+        probe_errors.push(format!(
+            "routing probe expected decisions {expected_routing_decisions:?}, observed {select_routing_decisions:?}"
+        ));
     }
     if timed_execution_instrumented {
-        certification_errors.push(
+        probe_errors.push(
             "a FSQLITE_BENCH_PROFILE_* switch instruments timed FrankenSQLite execution".to_owned(),
         );
     }
 
     JsonExecutionRouting {
-        capture_scope:
-            "untimed certification pass; counters reset before the probe and excluded from score rows"
+        probe_scope:
+            "untimed surrogate INSERT/UPDATE/DELETE/GROUP BY probe; counters reset before the probe and excluded from score rows"
                 .to_owned(),
+        timed_routes_verified: false,
+        limitations: vec![
+            "probe health does not attest any scored statement, schema, prepared object, or dynamic dispatch decision"
+                .to_owned(),
+        ],
         timed_execution_instrumented,
         parser_fast_path_executions: profile.parser.fast_path_executions,
         parser_slow_path_executions: profile.parser.slow_path_executions,
         prepared_insert_fast_lane_hits: profile.prepared_insert_fast_lane_hits,
         prepared_insert_instrumented_lane_hits: profile.prepared_insert_instrumented_lane_hits,
+        prepared_direct_insert_executions: profile.prepared_direct_insert_executions,
         prepared_update_delete_fast_lane_hits: profile.prepared_update_delete_fast_lane_hits,
         prepared_update_delete_instrumented_lane_hits: profile
             .prepared_update_delete_instrumented_lane_hits,
-        prepared_dml_fallbacks: BTreeMap::from([
-            (
-                "returning".to_owned(),
-                profile.prepared_update_delete_fallback_returning,
-            ),
-            (
-                "sqlite_sequence".to_owned(),
-                profile.prepared_update_delete_fallback_sqlite_sequence,
-            ),
-            (
-                "without_rowid".to_owned(),
-                profile.prepared_update_delete_fallback_without_rowid,
-            ),
-            (
-                "live_vtab".to_owned(),
-                profile.prepared_update_delete_fallback_live_vtab,
-            ),
-            (
-                "trigger".to_owned(),
-                profile.prepared_update_delete_fallback_trigger,
-            ),
-            (
-                "foreign_key".to_owned(),
-                profile.prepared_update_delete_fallback_foreign_key,
-            ),
-        ]),
-        select_fallback_decisions,
-        certification_errors,
+        prepared_direct_update_executions: profile.prepared_direct_update_executions,
+        prepared_direct_delete_executions: profile.prepared_direct_delete_executions,
+        prepared_update_delete_dml_direct_handoff_runs: profile
+            .prepared_update_delete_dml_direct_handoff_runs,
+        prepared_table_dml_affected_only_runs: profile.prepared_table_dml_affected_only_runs,
+        prepared_dml_fallbacks,
+        select_routing_decisions,
+        probe_errors,
     }
 }
 
@@ -974,6 +1128,7 @@ struct ReportRow {
     csqlite: Option<Measurement>,
     fsqlite: Option<Measurement>,
     fsqlite_concurrent_profile: Option<JsonFsqliteConcurrentProfile>,
+    concurrent_readiness: Option<JsonConcurrentReadiness>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1074,21 +1229,36 @@ struct DetectedEnvironment {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+// These booleans are independent, serialized provenance receipts. Combining
+// them into a state enum would make the evidence schema less precise.
+#[allow(clippy::struct_excessive_bools)]
 struct JsonBuildIdentity {
     workspace_root: String,
     git_commit_sha: String,
     git_branch: String,
     git_dirty: Option<bool>,
-    input_tracking: String,
-    cargo_profile: String,
+    tracked_workspace_inputs_watched: String,
+    cargo_profile_family: String,
+    selected_profile: String,
     declared_profile: String,
+    build_nonce: String,
     opt_level: String,
-    debug: String,
+    debuginfo: String,
+    debug_assertions: bool,
     target: String,
     host: String,
     panic_strategy: String,
+    panic_abort: bool,
     package_features: Vec<String>,
     encoded_rustflags_hex: String,
+    encoded_rustflags_present: bool,
+    profile_override_environment_hex: String,
+    native_override_environment_hex: String,
+    verbose_build_log_path: Option<String>,
+    verbose_build_log_sha256: Option<String>,
+    verbose_build_log_size_bytes: Option<u64>,
+    verbose_build_log_verified: bool,
+    profile_proof_scope: String,
     rustc_version: String,
     cargo_version: String,
 }
@@ -1125,17 +1295,24 @@ struct JsonDurabilityIdentity {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct JsonExecutionRouting {
-    capture_scope: String,
+    probe_scope: String,
+    timed_routes_verified: bool,
+    limitations: Vec<String>,
     timed_execution_instrumented: bool,
     parser_fast_path_executions: u64,
     parser_slow_path_executions: u64,
     prepared_insert_fast_lane_hits: u64,
     prepared_insert_instrumented_lane_hits: u64,
+    prepared_direct_insert_executions: u64,
     prepared_update_delete_fast_lane_hits: u64,
     prepared_update_delete_instrumented_lane_hits: u64,
+    prepared_direct_update_executions: u64,
+    prepared_direct_delete_executions: u64,
+    prepared_update_delete_dml_direct_handoff_runs: u64,
+    prepared_table_dml_affected_only_runs: u64,
     prepared_dml_fallbacks: BTreeMap<String, u64>,
-    select_fallback_decisions: BTreeMap<String, u64>,
-    certification_errors: Vec<String>,
+    select_routing_decisions: BTreeMap<String, u64>,
+    probe_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1151,6 +1328,8 @@ struct JsonBenchmarkProvenance {
     binary_sha256: Option<String>,
     binary_size_bytes: Option<u64>,
     binary_modified_unix_ts: Option<u64>,
+    binary_device_id: Option<u64>,
+    binary_inode: Option<u64>,
     cargo_lock_sha256: Option<String>,
     cargo_feature_graph_sha256: Option<String>,
     cargo_feature_graph: Option<String>,
@@ -1227,9 +1406,11 @@ struct JsonBridgeSample {
     worker_commands_total: usize,
     worker_commands_inside_timed_region: usize,
     worker_open_handshakes_total: usize,
+    effective_settings: BTreeMap<String, String>,
     oracle_kind: String,
     checksum_count: i64,
     checksum_sum: i64,
+    checksum_exact_rows: i64,
 }
 
 #[cfg(feature = "bridge-experiment")]
@@ -1255,7 +1436,9 @@ struct JsonBridgePairedComparison {
     numerator: BridgeArm,
     denominator: BridgeArm,
     paired_blocks: usize,
+    bootstrap_clusters: usize,
     median_ratio: f64,
+    mean_ratio: f64,
     geomean_ratio: f64,
     bootstrap_mean_ratio_ci95_low: f64,
     bootstrap_mean_ratio_ci95_high: f64,
@@ -1278,7 +1461,7 @@ struct JsonBridgeReadyRegression {
 }
 
 #[cfg(feature = "bridge-experiment")]
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 struct JsonBridgeConfig {
     samples_per_arm: usize,
     raw_insert_operations: usize,
@@ -1301,11 +1484,16 @@ struct JsonBridgeHostState {
     load_average_15m: Option<f64>,
     available_parallelism: Option<usize>,
     cpu_affinity: Option<String>,
+    selected_cpu_topology: BTreeMap<String, String>,
     scaling_governors: Vec<String>,
     energy_performance_preferences: Vec<String>,
     boost_controls: BTreeMap<String, String>,
     numa_nodes_online: Option<String>,
     memory_available_gb: Option<f64>,
+    cpu_pressure_some_avg10: Option<f64>,
+    io_pressure_some_avg60: Option<f64>,
+    competing_processes: Vec<String>,
+    competing_process_scan_error: Option<String>,
 }
 
 #[cfg(feature = "bridge-experiment")]
@@ -1316,6 +1504,7 @@ struct JsonBridgeReport {
     provenance: JsonBenchmarkProvenance,
     environment: DetectedEnvironment,
     host_state_before: JsonBridgeHostState,
+    host_state_checkpoints: Vec<JsonBridgeHostState>,
     host_state_after: JsonBridgeHostState,
     config: JsonBridgeConfig,
     raw_samples: Vec<JsonBridgeSample>,
@@ -1360,6 +1549,52 @@ struct JsonFsqliteConcurrentProfile {
     counters: BTreeMap<String, u64>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonConcurrentWorkerSettings {
+    page_size_bytes: u32,
+    journal_mode: String,
+    synchronous: String,
+    cache_size: i64,
+    busy_timeout_ms: u64,
+    concurrent_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonConcurrentWorkerReceipt {
+    worker_index: usize,
+    setup_thread_id: String,
+    postflight_thread_id: String,
+    setup_cpu_affinity: String,
+    postflight_cpu_affinity: String,
+    completed_rows: usize,
+    settings: JsonConcurrentWorkerSettings,
+    settings_verified: bool,
+    thread_identity_verified: bool,
+    thread_affinity_verified: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonConcurrentSampleReadiness {
+    phase: String,
+    sample_index: usize,
+    engine: String,
+    expected_cpu_affinity: String,
+    expected_workers: usize,
+    expected_rows: usize,
+    completed_rows: usize,
+    database_rows: usize,
+    expected_id_sum: i64,
+    database_id_sum: i64,
+    timed_scope: String,
+    workers: Vec<JsonConcurrentWorkerReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonConcurrentReadiness {
+    csqlite_samples: Vec<JsonConcurrentSampleReadiness>,
+    fsqlite_samples: Vec<JsonConcurrentSampleReadiness>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 struct JsonRow {
     scenario_id: String,
@@ -1370,6 +1605,8 @@ struct JsonRow {
     ratio_fsqlite_over_csqlite: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fsqlite_concurrent_profile: Option<JsonFsqliteConcurrentProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    concurrent_readiness: Option<JsonConcurrentReadiness>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -1816,7 +2053,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
@@ -1826,6 +2063,335 @@ fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
     }
     let digest = hasher.finalize();
     Ok(lowercase_hex(digest.as_ref()))
+}
+
+#[derive(Debug)]
+struct BuildLogReceipt {
+    path: Option<String>,
+    sha256: Option<String>,
+    size_bytes: Option<u64>,
+    verified: bool,
+}
+
+fn split_posix_shell_words(command: &str) -> Option<Vec<String>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut word_started = false;
+    let mut quote = Quote::None;
+    let mut chars = command.chars();
+    while let Some(ch) = chars.next() {
+        match quote {
+            Quote::None => match ch {
+                '\'' => {
+                    quote = Quote::Single;
+                    word_started = true;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    word_started = true;
+                }
+                '\\' => {
+                    word.push(chars.next()?);
+                    word_started = true;
+                }
+                ch if ch.is_whitespace() => {
+                    if word_started {
+                        words.push(std::mem::take(&mut word));
+                        word_started = false;
+                    }
+                }
+                _ => {
+                    word.push(ch);
+                    word_started = true;
+                }
+            },
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::None;
+                } else {
+                    word.push(ch);
+                }
+            }
+            Quote::Double => match ch {
+                '"' => quote = Quote::None,
+                '\\' => {
+                    word.push(chars.next()?);
+                    word_started = true;
+                }
+                _ => word.push(ch),
+            },
+        }
+    }
+    if quote != Quote::None {
+        return None;
+    }
+    if word_started {
+        words.push(word);
+    }
+    Some(words)
+}
+
+fn rustc_command_tokens(line: &str) -> Option<Vec<String>> {
+    let command = line.trim().strip_prefix("Running `")?.strip_suffix('`')?;
+    let tokens = split_posix_shell_words(command)?;
+    tokens
+        .windows(2)
+        .any(|pair| pair[0] == "--crate-name")
+        .then_some(tokens)
+}
+
+fn rustc_crate_name(tokens: &[String]) -> Option<&str> {
+    tokens
+        .windows(2)
+        .find(|pair| pair[0] == "--crate-name")
+        .map(|pair| pair[1].as_str())
+}
+
+fn rustc_target(tokens: &[String]) -> Option<&str> {
+    tokens
+        .windows(2)
+        .find(|pair| pair[0] == "--target")
+        .map(|pair| pair[1].as_str())
+}
+
+fn rustc_log_line_for_crate<'a>(contents: &'a str, crate_name: &str) -> Option<&'a str> {
+    let mut matches = contents.lines().filter(|line| {
+        rustc_command_tokens(line)
+            .as_deref()
+            .and_then(rustc_crate_name)
+            == Some(crate_name)
+    });
+    let only = matches.next()?;
+    matches.next().is_none().then_some(only)
+}
+
+fn rustc_codegen_options(tokens: &[String]) -> Vec<&str> {
+    let mut options = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index] == "-C" {
+            if let Some(value) = tokens.get(index + 1) {
+                options.push(value.as_str());
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = tokens[index].strip_prefix("-C")
+            && !value.is_empty()
+        {
+            options.push(value);
+        }
+        index += 1;
+    }
+    options
+}
+
+fn rustc_codegen_values<'a>(tokens: &'a [String], key: &str) -> Vec<Option<&'a str>> {
+    rustc_codegen_options(tokens)
+        .into_iter()
+        .filter_map(|option| match option.split_once('=') {
+            Some((observed_key, value)) if observed_key == key => Some(Some(value)),
+            None if option == key => Some(None),
+            _ => None,
+        })
+        .collect()
+}
+
+fn rustc_codegen_is_exact(tokens: &[String], key: &str, expected: Option<&str>) -> bool {
+    rustc_codegen_values(tokens, key).as_slice() == [expected]
+}
+
+fn rustc_codegen_is_disabled_or_omitted(tokens: &[String], key: &str) -> bool {
+    matches!(
+        rustc_codegen_values(tokens, key).as_slice(),
+        [] | [Some("off" | "no")]
+    )
+}
+
+fn rustc_codegen_options_are_canonical_surface(tokens: &[String]) -> bool {
+    const ALLOWED_KEYS: &[&str] = &[
+        "codegen-units",
+        "debuginfo",
+        "debug-assertions",
+        "embed-bitcode",
+        "extra-filename",
+        "linker-plugin-lto",
+        "lto",
+        "metadata",
+        "opt-level",
+        "overflow-checks",
+        "panic",
+        "rpath",
+        "strip",
+    ];
+    rustc_codegen_options(tokens).into_iter().all(|option| {
+        let key = option
+            .split_once('=')
+            .map_or(option, |(observed_key, _)| observed_key);
+        ALLOWED_KEYS.contains(&key)
+    })
+}
+
+fn rustc_has_no_unstable_overrides(tokens: &[String]) -> bool {
+    !tokens.iter().any(|token| token.starts_with("-Z"))
+}
+
+fn rustc_invocation_is_direct(tokens: &[String]) -> bool {
+    let Some(executable) = tokens
+        .iter()
+        .find(|token| !token.contains('=') && !token.starts_with("env"))
+    else {
+        return false;
+    };
+    std::path::Path::new(executable)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        == Some("rustc")
+}
+
+fn rustc_target_invocation_is_canonical(
+    tokens: &[String],
+    profile: &str,
+    final_binary: bool,
+) -> bool {
+    let expected_opt_level = match profile {
+        "release-perf" => "3",
+        "release" => "z",
+        _ => return false,
+    };
+    if !rustc_invocation_is_direct(tokens)
+        || !rustc_codegen_options_are_canonical_surface(tokens)
+        || !rustc_has_no_unstable_overrides(tokens)
+        || !rustc_codegen_is_exact(tokens, "opt-level", Some(expected_opt_level))
+        || !rustc_codegen_is_exact(tokens, "codegen-units", Some("1"))
+        || !rustc_codegen_is_disabled_or_omitted(tokens, "debug-assertions")
+        || !rustc_codegen_is_disabled_or_omitted(tokens, "overflow-checks")
+    {
+        return false;
+    }
+    if final_binary {
+        rustc_codegen_is_exact(tokens, "lto", None)
+            && rustc_codegen_values(tokens, "linker-plugin-lto").is_empty()
+            && rustc_codegen_is_exact(tokens, "panic", Some("abort"))
+            && rustc_codegen_is_exact(tokens, "strip", Some("symbols"))
+    } else {
+        rustc_codegen_is_exact(tokens, "linker-plugin-lto", None)
+            && rustc_codegen_values(tokens, "lto").is_empty()
+    }
+}
+
+fn build_log_proves_profile(
+    contents: &str,
+    build_nonce: &str,
+    profile: &str,
+    target: &str,
+) -> bool {
+    let required_crates = [
+        "asupersync",
+        "fsqlite_error",
+        "fsqlite_types",
+        "fsqlite_observability",
+        "fsqlite_ast",
+        "fsqlite_parser",
+        "fsqlite_planner",
+        "fsqlite_func",
+        "fsqlite_vfs",
+        "fsqlite_wal",
+        "fsqlite_pager",
+        "fsqlite_mvcc",
+        "fsqlite_btree",
+        "fsqlite_vdbe",
+        "fsqlite_ext_json",
+        "fsqlite_ext_fts5",
+        "fsqlite_ext_rtree",
+        "fsqlite_core",
+        "fsqlite",
+        "fsqlite_e2e",
+        "comprehensive_bench",
+    ];
+    let required_invocations_are_canonical = required_crates.iter().all(|crate_name| {
+        rustc_log_line_for_crate(contents, crate_name)
+            .and_then(rustc_command_tokens)
+            .is_some_and(|tokens| {
+                rustc_target(&tokens) == Some(target)
+                    && rustc_target_invocation_is_canonical(
+                        &tokens,
+                        profile,
+                        *crate_name == "comprehensive_bench",
+                    )
+            })
+    });
+    let target_invocations_are_canonical = contents
+        .lines()
+        .filter_map(rustc_command_tokens)
+        .filter(|tokens| rustc_target(tokens) == Some(target))
+        .all(|tokens| {
+            rustc_target_invocation_is_canonical(
+                &tokens,
+                profile,
+                rustc_crate_name(&tokens) == Some("comprehensive_bench"),
+            )
+        });
+    let expected_nonce = format!("FSQLITE_BENCH_BUILD_NONCE={build_nonce}");
+    let final_binary_is_nonce_bound = rustc_log_line_for_crate(contents, "comprehensive_bench")
+        .and_then(rustc_command_tokens)
+        .is_some_and(|tokens| tokens.iter().any(|token| token == &expected_nonce));
+    let finished_profile = contents.contains(&format!("Finished `{profile}` profile"))
+        || contents.contains(&format!("Finished '{profile}' profile"));
+    required_invocations_are_canonical
+        && target_invocations_are_canonical
+        && final_binary_is_nonce_bound
+        && finished_profile
+}
+
+fn capture_build_log_receipt(build_nonce: &str, profile: &str, target: &str) -> BuildLogReceipt {
+    let Some(configured_path) = std::env::var_os("FSQLITE_BENCH_BUILD_LOG_PATH") else {
+        return BuildLogReceipt {
+            path: None,
+            sha256: None,
+            size_bytes: None,
+            verified: false,
+        };
+    };
+    let Ok(path) = std::fs::canonicalize(configured_path) else {
+        return BuildLogReceipt {
+            path: None,
+            sha256: None,
+            size_bytes: None,
+            verified: false,
+        };
+    };
+    let path_text = path.to_string_lossy().into_owned();
+    let sha256 = sha256_file(&path).ok();
+    let size_bytes = std::fs::metadata(&path).ok().map(|metadata| metadata.len());
+    let verified = std::fs::read_to_string(&path)
+        .is_ok_and(|contents| build_log_proves_profile(&contents, build_nonce, profile, target));
+    BuildLogReceipt {
+        path: Some(path_text),
+        sha256,
+        size_bytes,
+        verified,
+    }
+}
+
+fn binary_file_identity(metadata: &std::fs::Metadata) -> (Option<u64>, Option<u64>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        (Some(metadata.dev()), Some(metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        (None, None)
+    }
 }
 
 fn cpu_affinity() -> Option<String> {
@@ -1870,6 +2436,273 @@ fn capture_cargo_feature_graph(
         .filter(|graph| !graph.is_empty())
 }
 
+fn decode_lower_hex(encoded: &str, field: &str) -> Result<Vec<u8>, String> {
+    if encoded.len() % 2 != 0
+        || encoded
+            .bytes()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{field} is not even-length lowercase hexadecimal"));
+    }
+    let decoded = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let digit = |byte: u8| -> u8 {
+                match byte {
+                    b'0'..=b'9' => byte - b'0',
+                    b'a'..=b'f' => byte - b'a' + 10,
+                    _ => unreachable!("hex alphabet checked above"),
+                }
+            };
+            (digit(pair[0]) << 4) | digit(pair[1])
+        })
+        .collect();
+    Ok(decoded)
+}
+
+fn decode_build_environment(encoded_hex: &str) -> Result<BTreeMap<String, String>, String> {
+    let decoded = decode_lower_hex(encoded_hex, "build override environment")?;
+    let decoded = String::from_utf8(decoded)
+        .map_err(|_| "build override environment is not valid UTF-8".to_owned())?;
+    if decoded.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut environment = BTreeMap::new();
+    for assignment in decoded.split('\0') {
+        let (name, value) = assignment.split_once('=').ok_or_else(|| {
+            format!("build override environment entry has no `=` separator: `{assignment}`")
+        })?;
+        if name.is_empty() {
+            return Err("build override environment contains an empty variable name".to_owned());
+        }
+        if environment
+            .insert(name.to_owned(), value.to_owned())
+            .is_some()
+        {
+            return Err(format!(
+                "build override environment contains duplicate variable `{name}`"
+            ));
+        }
+    }
+    Ok(environment)
+}
+
+#[cfg(test)]
+fn encode_build_environment(environment: &BTreeMap<String, String>) -> String {
+    let assignments = environment
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("\0");
+    lowercase_hex(assignments.as_bytes())
+}
+
+fn canonical_profile_environment(
+    selected_profile: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    let (prefix, opt_level) = match selected_profile {
+        "release-perf" => ("CARGO_PROFILE_RELEASE_PERF", "3"),
+        "release" => ("CARGO_PROFILE_RELEASE", "z"),
+        other => {
+            return Err(format!(
+                "unsupported citable Cargo output profile `{other}`"
+            ));
+        }
+    };
+    Ok(BTreeMap::from([
+        (
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER".to_owned(),
+            String::new(),
+        ),
+        ("CARGO_BUILD_RUSTC_WRAPPER".to_owned(), String::new()),
+        ("CARGO_BUILD_RUSTFLAGS".to_owned(), String::new()),
+        ("RUSTC_WORKSPACE_WRAPPER".to_owned(), String::new()),
+        ("RUSTC_WRAPPER".to_owned(), String::new()),
+        (format!("{prefix}_CODEGEN_UNITS"), "1".to_owned()),
+        (format!("{prefix}_DEBUG"), "false".to_owned()),
+        (format!("{prefix}_DEBUG_ASSERTIONS"), "false".to_owned()),
+        (format!("{prefix}_INCREMENTAL"), "false".to_owned()),
+        (format!("{prefix}_LTO"), "true".to_owned()),
+        (format!("{prefix}_OPT_LEVEL"), opt_level.to_owned()),
+        (format!("{prefix}_OVERFLOW_CHECKS"), "false".to_owned()),
+        (format!("{prefix}_PANIC"), "abort".to_owned()),
+        (format!("{prefix}_RPATH"), "false".to_owned()),
+        (format!("{prefix}_SPLIT_DEBUGINFO"), "off".to_owned()),
+        (format!("{prefix}_STRIP"), "true".to_owned()),
+    ]))
+}
+
+const fn compiled_panic_strategy() -> &'static str {
+    if cfg!(panic = "abort") {
+        "abort"
+    } else {
+        "unwind"
+    }
+}
+
+fn canonical_native_environment() -> BTreeMap<String, String> {
+    BTreeMap::from([(
+        "LIBSQLITE3_FLAGS".to_owned(),
+        "-DSQLITE_ENABLE_MATH_FUNCTIONS".to_owned(),
+    )])
+}
+
+fn validate_build_identity(build: &JsonBuildIdentity) -> Vec<String> {
+    let mut errors = Vec::new();
+    if build.git_commit_sha.len() != 40
+        || !build
+            .git_commit_sha
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        errors.push("build Git SHA is absent or malformed".to_owned());
+    }
+    if build.git_dirty != Some(false) {
+        errors.push("benchmark binary was built from a dirty or unknown tree".to_owned());
+    }
+    if build.tracked_workspace_inputs_watched != "complete" {
+        errors.push("build script could not watch every tracked workspace input".to_owned());
+    }
+    if build.declared_profile == "unspecified" {
+        errors.push(
+            "build profile label missing; set FSQLITE_BENCH_PROFILE_NAME while building".to_owned(),
+        );
+    }
+    if build.selected_profile != build.declared_profile {
+        errors.push(format!(
+            "declared profile `{}` does not match Cargo output profile `{}`",
+            build.declared_profile, build.selected_profile
+        ));
+    }
+    if build.cargo_profile_family != "release" {
+        errors.push(format!(
+            "citable benchmark profile must inherit Cargo release, got family `{}`",
+            build.cargo_profile_family
+        ));
+    }
+    match build.selected_profile.as_str() {
+        "release-perf" if build.opt_level != "3" => errors.push(format!(
+            "selected release-perf profile has effective opt-level {}",
+            build.opt_level
+        )),
+        "release" if build.opt_level != "z" => errors.push(format!(
+            "selected release profile has effective opt-level {}",
+            build.opt_level
+        )),
+        "release-perf" | "release" => {}
+        other => errors.push(format!(
+            "unsupported citable Cargo output profile `{other}`"
+        )),
+    }
+    if build.debuginfo != "false" {
+        errors.push(format!(
+            "citable profile must disable debuginfo, got `{}`",
+            build.debuginfo
+        ));
+    }
+    if build.debug_assertions {
+        errors.push("citable profile compiled with debug assertions".to_owned());
+    }
+    if build.panic_strategy != "abort" || !build.panic_abort {
+        errors.push(format!(
+            "citable profile must compile panic=abort, got build `{}` and binary cfg panic_abort={}",
+            build.panic_strategy, build.panic_abort
+        ));
+    }
+    match decode_lower_hex(&build.encoded_rustflags_hex, "encoded rustflags") {
+        Ok(flags) if flags.is_empty() => {}
+        Ok(flags) => errors.push(format!(
+            "citable builds require empty encoded rustflags, got `{}`",
+            String::from_utf8_lossy(&flags).replace('\u{1f}', " ")
+        )),
+        Err(error) => errors.push(error),
+    }
+    if !build.encoded_rustflags_present {
+        errors.push(
+            "citable builds require explicitly present, empty CARGO_ENCODED_RUSTFLAGS to override Cargo-config rustflags"
+                .to_owned(),
+        );
+    }
+    match decode_build_environment(
+        &build.profile_override_environment_hex,
+    ) {
+        Ok(actual) => match canonical_profile_environment(&build.selected_profile) {
+            Ok(expected) if actual == expected => {}
+            Ok(expected) => errors.push(format!(
+                "build environment does not exactly force the canonical `{}` profile: expected {expected:?}, observed {actual:?}",
+                build.selected_profile
+            )),
+            Err(error) => errors.push(error),
+        },
+        Err(error) => errors.push(error),
+    }
+    match decode_build_environment(&build.native_override_environment_hex) {
+        Ok(environment) if environment == canonical_native_environment() => {}
+        Ok(environment) => errors.push(format!(
+            "citable builds require exactly the repository's canonical native build environment {:?}, got {environment:?}",
+            canonical_native_environment()
+        )),
+        Err(error) => errors.push(error),
+    }
+    if build.build_nonce.len() != 64
+        || !build
+            .build_nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        errors.push(format!(
+            "citable builds require a 64-character lowercase hexadecimal build nonce, got `{}`",
+            build.build_nonce
+        ));
+    }
+    match (
+        build.verbose_build_log_path.as_deref(),
+        build.verbose_build_log_sha256.as_deref(),
+        build.verbose_build_log_size_bytes,
+        build.verbose_build_log_verified,
+    ) {
+        (Some(path), Some(sha256), Some(size), true)
+            if std::path::Path::new(path).is_absolute()
+                && size > 0
+                && sha256.len() == 64
+                && sha256.bytes().all(|byte| {
+                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                }) => {}
+        receipt => errors.push(format!(
+            "citable builds require an absolute, nonempty, SHA-bound cargo -vv log whose explicit-target rustc invocations prove the nonce plus the required opt-level, codegen-units, debug-assertions, overflow-checks, LTO partition, and final panic/strip settings for the required Rust hot-path crate set and final benchmark binary; compiler identity and all other rustc flags remain outside this receipt's proof scope; observed {receipt:?}"
+        )),
+    }
+    if build.target == "unknown" || build.host == "unknown" {
+        errors.push("effective build target/host identity is incomplete".to_owned());
+    }
+    if build.rustc_version == "unknown" || build.cargo_version == "unknown" {
+        errors.push("build toolchain identity is incomplete".to_owned());
+    }
+    errors
+}
+
+fn measurement_design_validation_errors(runtime_bridge: &str) -> Vec<String> {
+    match runtime_bridge {
+        "per_operation_thread_local_block_on" => vec![
+            "generic comprehensive measurements are diagnostic-only: engines run in unpaired C-first/FrankenSQLite-second adaptive blocks, scored rows lack complete work oracles, and host/topology state is not release-gated"
+                .to_owned(),
+            "generic C-reference measurements do not receipt-bind sqlite_source_id(), compile_options, the SQLite amalgamation/library hash, or the resolved native C compiler path/version/hash"
+                .to_owned(),
+        ],
+        "three_arm_per_operation_inside_existing_runtime_worker_sync_facade" => vec![
+            "the three-arm bridge is diagnostic-only until citable runs prove an isolated cgroup-v2 cpuset partition covering selected CPUs and online SMT siblings, full-dynticks coverage, disjoint effective IRQ affinities, per-thread affinity, and stable selected-policy frequency controls"
+                .to_owned(),
+            "the three-arm bridge has no fail-bounded watchdog around a wedged engine future or worker-facade call"
+                .to_owned(),
+        ],
+        other => vec![format!(
+            "unknown measurement design `{other}` cannot produce citable evidence"
+        )],
+    }
+}
+
 impl JsonBenchmarkProvenance {
     fn capture(command_line: Vec<String>, runtime_bridge: &str) -> Self {
         let build_workspace_root = env!("FSQLITE_BENCH_BUILD_WORKSPACE_ROOT").to_owned();
@@ -1904,6 +2737,10 @@ impl JsonBenchmarkProvenance {
                     .ok()
                     .map(|duration| duration.as_secs())
             });
+        let (binary_device_id, binary_inode) = binary_metadata
+            .as_ref()
+            .map(binary_file_identity)
+            .unwrap_or((None, None));
         let cargo_lock_sha256 = sha256_file(&verification_path.join("Cargo.lock")).ok();
         let cargo_feature_graph =
             capture_cargo_feature_graph(verification_path, &build_target, &package_features);
@@ -1923,6 +2760,7 @@ impl JsonBenchmarkProvenance {
         );
         let benchmark_environment = [
             "FSQLITE_BENCH_CONCURRENT_SYNC",
+            "FSQLITE_BENCH_BUILD_LOG_PATH",
             "FSQLITE_BENCH_EXPECTED_CPU_AFFINITY",
             "FSQLITE_BENCH_LAB_UNSAFE",
             "FSQLITE_BENCH_MAX_LOAD_1M",
@@ -1943,21 +2781,51 @@ impl JsonBenchmarkProvenance {
         })
         .collect();
 
+        let selected_profile = env!("FSQLITE_BENCH_BUILD_SELECTED_PROFILE").to_owned();
+        let build_nonce = env!("FSQLITE_BENCH_BUILD_NONCE").to_owned();
+        let build_log = capture_build_log_receipt(&build_nonce, &selected_profile, &build_target);
         let build = JsonBuildIdentity {
             workspace_root: build_workspace_root,
             git_commit_sha: env!("FSQLITE_BENCH_BUILD_GIT_SHA").to_owned(),
             git_branch: env!("FSQLITE_BENCH_BUILD_GIT_BRANCH").to_owned(),
             git_dirty: parse_build_bool(env!("FSQLITE_BENCH_BUILD_GIT_DIRTY")),
-            input_tracking: env!("FSQLITE_BENCH_BUILD_INPUT_TRACKING").to_owned(),
-            cargo_profile: env!("FSQLITE_BENCH_BUILD_PROFILE").to_owned(),
+            tracked_workspace_inputs_watched: env!("FSQLITE_BENCH_BUILD_INPUT_TRACKING")
+                .to_owned(),
+            cargo_profile_family: env!("FSQLITE_BENCH_BUILD_PROFILE").to_owned(),
+            selected_profile,
             declared_profile: env!("FSQLITE_BENCH_BUILD_PROFILE_LABEL").to_owned(),
+            build_nonce,
             opt_level: env!("FSQLITE_BENCH_BUILD_OPT_LEVEL").to_owned(),
-            debug: env!("FSQLITE_BENCH_BUILD_DEBUG").to_owned(),
+            debuginfo: env!("FSQLITE_BENCH_BUILD_DEBUG").to_owned(),
+            debug_assertions: cfg!(debug_assertions),
             target: build_target,
             host: env!("FSQLITE_BENCH_BUILD_HOST").to_owned(),
-            panic_strategy: env!("FSQLITE_BENCH_BUILD_PANIC").to_owned(),
+            // Cargo build scripts are host executables and compile with unwind
+            // even when the benchmark target uses panic=abort. Only the target
+            // crate's cfg can attest the binary's effective panic strategy.
+            panic_strategy: compiled_panic_strategy().to_owned(),
+            panic_abort: cfg!(panic = "abort"),
             package_features,
             encoded_rustflags_hex: env!("FSQLITE_BENCH_BUILD_RUSTFLAGS_HEX").to_owned(),
+            encoded_rustflags_present: parse_build_bool(env!(
+                "FSQLITE_BENCH_BUILD_ENCODED_RUSTFLAGS_PRESENT"
+            ))
+            .unwrap_or(false),
+            profile_override_environment_hex: env!(
+                "FSQLITE_BENCH_BUILD_PROFILE_OVERRIDES_HEX"
+            )
+            .to_owned(),
+            native_override_environment_hex: env!(
+                "FSQLITE_BENCH_BUILD_NATIVE_OVERRIDES_HEX"
+            )
+            .to_owned(),
+            verbose_build_log_path: build_log.path,
+            verbose_build_log_sha256: build_log.sha256,
+            verbose_build_log_size_bytes: build_log.size_bytes,
+            verbose_build_log_verified: build_log.verified,
+            profile_proof_scope:
+                "selected profile bound from Cargo OUT_DIR; release fields forced through exact Cargo profile environment values; effective opt/debuginfo/panic cross-checked; explicitly present empty encoded rustflags and empty Cargo wrapper overrides required; the native override environment is constrained but the native compiler/source identity is not yet proven; tracked workspace inputs watched; a unique lowercase-hex build nonce binds the benchmark to a path- and SHA-bound cargo -vv log whose direct explicit-target rustc invocations prove only the required opt-level, codegen-units, debug-assertions, overflow-checks, LTO partition, and final panic/strip settings for the required Rust hot-path crate set and final benchmark binary, not compiler identity, other rustc flags, or every Cargo unit"
+                    .to_owned(),
             rustc_version: env!("FSQLITE_BENCH_BUILD_RUSTC_VERSION").to_owned(),
             cargo_version: env!("FSQLITE_BENCH_BUILD_CARGO_VERSION").to_owned(),
         };
@@ -1983,31 +2851,10 @@ impl JsonBenchmarkProvenance {
             ),
         };
         let durability = capture_durability_identity();
-        let execution_routing = certify_execution_routing();
+        let execution_routing = probe_execution_routing();
 
-        let mut validation_errors = Vec::new();
-        if build.git_commit_sha.len() != 40
-            || !build
-                .git_commit_sha
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            validation_errors.push("build Git SHA is absent or malformed".to_owned());
-        }
-        if build.git_dirty != Some(false) {
-            validation_errors
-                .push("benchmark binary was built from a dirty or unknown tree".to_owned());
-        }
-        if build.input_tracking != "complete" {
-            validation_errors
-                .push("build script could not watch every tracked workspace input".to_owned());
-        }
-        if build.declared_profile == "unspecified" {
-            validation_errors.push(
-                "build profile label missing; set FSQLITE_BENCH_PROFILE_NAME while building"
-                    .to_owned(),
-            );
-        }
+        let mut validation_errors = validate_build_identity(&build);
+        validation_errors.extend(measurement_design_validation_errors(runtime_bridge));
         if runtime_source.git_commit_sha.as_deref() != Some(build.git_commit_sha.as_str()) {
             validation_errors
                 .push("verification checkout SHA does not match the binary build SHA".to_owned());
@@ -2021,41 +2868,31 @@ impl JsonBenchmarkProvenance {
         if binary_size_bytes.is_none() || binary_modified_unix_ts.is_none() {
             validation_errors.push("benchmark binary metadata is incomplete".to_owned());
         }
+        if cfg!(unix) && (binary_device_id.is_none() || binary_inode.is_none()) {
+            validation_errors
+                .push("benchmark binary device/inode identity is incomplete".to_owned());
+        }
+        if !cfg!(unix) {
+            validation_errors.push(
+                "citable benchmark artifacts currently require Unix device/inode identity"
+                    .to_owned(),
+            );
+        }
         if cargo_lock_sha256.is_none() {
             validation_errors.push("Cargo.lock SHA-256 could not be computed".to_owned());
         }
         if cargo_feature_graph.is_none() {
             validation_errors.push(
-                "exact Cargo feature graph could not be captured from the verification checkout"
+                "runtime-resolved dependency graph could not be reconstructed from the verification checkout"
                     .to_owned(),
             );
         }
-        if build.rustc_version == "unknown" || build.cargo_version == "unknown" {
-            validation_errors.push("build toolchain identity is incomplete".to_owned());
-        }
-        match build.declared_profile.as_str() {
-            "release-perf" if build.opt_level != "3" => validation_errors.push(format!(
-                "declared release-perf profile has effective opt-level {}",
-                build.opt_level
-            )),
-            "release" if build.opt_level != "z" => validation_errors.push(format!(
-                "declared release profile has effective opt-level {}",
-                build.opt_level
-            )),
-            "release-perf" | "release" => {}
-            other if other != "unspecified" => {
-                validation_errors.push(format!("unsupported citable build profile label `{other}`"))
-            }
-            _ => {}
-        }
-        if build.target == "unknown" || build.host == "unknown" || build.panic_strategy == "unknown"
+        if tracing.statement_debug_enabled
+            || tracing.statement_reuse_info_enabled
+            || tracing.fallback_decision_debug_enabled
         {
-            validation_errors
-                .push("effective build target/host/panic identity is incomplete".to_owned());
-        }
-        if tracing.statement_debug_enabled || tracing.statement_reuse_info_enabled {
             validation_errors.push(
-                "statement tracing or statement-reuse tracing changes the selected execution lane"
+                "statement, statement-reuse, or fallback-decision tracing changes timed execution"
                     .to_owned(),
             );
         }
@@ -2080,14 +2917,14 @@ impl JsonBenchmarkProvenance {
         }
         validation_errors.extend(
             execution_routing
-                .certification_errors
+                .probe_errors
                 .iter()
-                .map(|error| format!("execution-routing certification: {error}")),
+                .map(|error| format!("execution-routing probe: {error}")),
         );
         let citable = validation_errors.is_empty();
 
         Self {
-            schema_version: BENCHMARK_PROVENANCE_SCHEMA_V1.to_owned(),
+            schema_version: BENCHMARK_PROVENANCE_SCHEMA_V3.to_owned(),
             citable,
             status: if citable {
                 "verified_citable".to_owned()
@@ -2104,6 +2941,8 @@ impl JsonBenchmarkProvenance {
             binary_sha256,
             binary_size_bytes,
             binary_modified_unix_ts,
+            binary_device_id,
+            binary_inode,
             cargo_lock_sha256,
             cargo_feature_graph_sha256,
             cargo_feature_graph,
@@ -2131,6 +2970,83 @@ impl JsonBenchmarkProvenance {
             self.validation_errors
                 .push("verification checkout dirty state changed or is no longer clean".to_owned());
         }
+        match std::env::current_exe() {
+            Ok(current_binary) => {
+                let current_binary_path = current_binary.to_string_lossy();
+                if self.binary_path.as_deref() != Some(current_binary_path.as_ref()) {
+                    self.validation_errors.push(format!(
+                        "benchmark executable path changed while running: start={:?}, end={current_binary_path}",
+                        self.binary_path
+                    ));
+                }
+                match sha256_file(&current_binary) {
+                    Ok(current_sha256)
+                        if self.binary_sha256.as_deref() == Some(current_sha256.as_str()) => {}
+                    Ok(current_sha256) => self.validation_errors.push(format!(
+                        "benchmark executable SHA-256 changed while running: start={:?}, end={current_sha256}",
+                        self.binary_sha256
+                    )),
+                    Err(error) => self.validation_errors.push(format!(
+                        "benchmark executable could not be rehashed after measurement: {error}"
+                    )),
+                }
+                match std::fs::metadata(&current_binary) {
+                    Ok(metadata) => {
+                        let (device_id, inode) = binary_file_identity(&metadata);
+                        if self.binary_size_bytes != Some(metadata.len())
+                            || self.binary_device_id != device_id
+                            || self.binary_inode != inode
+                        {
+                            self.validation_errors.push(format!(
+                                "benchmark executable file identity changed while running: start=(size={:?}, device={:?}, inode={:?}), end=(size={}, device={device_id:?}, inode={inode:?})",
+                                self.binary_size_bytes,
+                                self.binary_device_id,
+                                self.binary_inode,
+                                metadata.len()
+                            ));
+                        }
+                    }
+                    Err(error) => self.validation_errors.push(format!(
+                        "benchmark executable metadata could not be recaptured after measurement: {error}"
+                    )),
+                }
+            }
+            Err(error) => self.validation_errors.push(format!(
+                "benchmark executable path could not be recaptured after measurement: {error}"
+            )),
+        }
+        match self.build.verbose_build_log_path.as_deref() {
+            Some(path) => {
+                let path = std::path::Path::new(path);
+                match sha256_file(path) {
+                    Ok(current_sha256)
+                        if self.build.verbose_build_log_sha256.as_deref()
+                            == Some(current_sha256.as_str()) => {}
+                    Ok(current_sha256) => self.validation_errors.push(format!(
+                        "verbose build log SHA-256 changed while running: start={:?}, end={current_sha256}",
+                        self.build.verbose_build_log_sha256
+                    )),
+                    Err(error) => self.validation_errors.push(format!(
+                        "verbose build log could not be rehashed after measurement: {error}"
+                    )),
+                }
+                match std::fs::metadata(path) {
+                    Ok(metadata)
+                        if self.build.verbose_build_log_size_bytes == Some(metadata.len()) => {}
+                    Ok(metadata) => self.validation_errors.push(format!(
+                        "verbose build log size changed while running: start={:?}, end={}",
+                        self.build.verbose_build_log_size_bytes,
+                        metadata.len()
+                    )),
+                    Err(error) => self.validation_errors.push(format!(
+                        "verbose build log metadata could not be recaptured: {error}"
+                    )),
+                }
+            }
+            None => self
+                .validation_errors
+                .push("verbose build log path was absent at end of measurement".to_owned()),
+        }
         self.refresh_validation_status();
     }
 
@@ -2153,7 +3069,7 @@ impl JsonBenchmarkProvenance {
 
     fn mark_explicit_override(&mut self) {
         if !self.citable {
-            self.status = "unverified_explicit_override".to_owned();
+            "unverified_explicit_override".clone_into(&mut self.status);
         }
     }
 }
@@ -2352,6 +3268,7 @@ fn build_json_report(
                     fsqlite: row.fsqlite.as_ref().map(JsonMeasurement::from_measurement),
                     ratio_fsqlite_over_csqlite: row_ratio(row),
                     fsqlite_concurrent_profile: row.fsqlite_concurrent_profile.clone(),
+                    concurrent_readiness: row.concurrent_readiness.clone(),
                 })
                 .collect();
             JsonSection {
@@ -2364,7 +3281,7 @@ fn build_json_report(
         .collect();
 
     JsonBenchmarkReport {
-        schema_version: JSON_REPORT_SCHEMA_V4.to_owned(),
+        schema_version: JSON_REPORT_SCHEMA_V6.to_owned(),
         generated_at_utc: chrono_stamp(),
         total_elapsed_ms: u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX),
         config,
@@ -2380,7 +3297,7 @@ fn build_json_report(
 fn benchmark_json_schema() -> serde_json::Value {
     serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/comprehensive-bench-report.v4.json",
+        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/comprehensive-bench-report.v6.json",
         "title": "FrankenSQLite comprehensive benchmark JSON report",
         "type": "object",
         "additionalProperties": false,
@@ -2397,7 +3314,7 @@ fn benchmark_json_schema() -> serde_json::Value {
         ],
         "properties": {
             "schema_version": {
-                "const": JSON_REPORT_SCHEMA_V4
+                "const": JSON_REPORT_SCHEMA_V6
             },
             "generated_at_utc": {
                 "type": "string"
@@ -2474,6 +3391,8 @@ fn benchmark_json_schema() -> serde_json::Value {
                     "binary_sha256",
                     "binary_size_bytes",
                     "binary_modified_unix_ts",
+                    "binary_device_id",
+                    "binary_inode",
                     "cargo_lock_sha256",
                     "cargo_feature_graph_sha256",
                     "cargo_feature_graph",
@@ -2487,17 +3406,17 @@ fn benchmark_json_schema() -> serde_json::Value {
                     "execution_routing"
                 ],
                 "properties": {
-                    "schema_version": {"const": BENCHMARK_PROVENANCE_SCHEMA_V1},
-                    "citable": {"type": "boolean"},
+                    "schema_version": {"const": BENCHMARK_PROVENANCE_SCHEMA_V3},
+                    "citable": {"const": false},
                     "status": {
                         "enum": [
-                            "verified_citable",
                             "unverified",
                             "unverified_explicit_override"
                         ]
                     },
                     "validation_errors": {
                         "type": "array",
+                        "minItems": 1,
                         "items": {"type": "string"}
                     },
                     "build": {
@@ -2505,28 +3424,68 @@ fn benchmark_json_schema() -> serde_json::Value {
                         "additionalProperties": false,
                         "required": [
                             "workspace_root", "git_commit_sha", "git_branch", "git_dirty",
-                            "input_tracking", "cargo_profile", "declared_profile", "opt_level",
-                            "debug", "target", "host", "panic_strategy", "package_features",
-                            "encoded_rustflags_hex", "rustc_version", "cargo_version"
+                            "tracked_workspace_inputs_watched", "cargo_profile_family",
+                            "selected_profile", "declared_profile", "opt_level",
+                            "build_nonce", "debuginfo", "debug_assertions", "target", "host",
+                            "panic_strategy", "panic_abort", "package_features",
+                            "encoded_rustflags_hex", "encoded_rustflags_present",
+                            "profile_override_environment_hex",
+                            "native_override_environment_hex",
+                            "verbose_build_log_path", "verbose_build_log_sha256",
+                            "verbose_build_log_size_bytes",
+                            "verbose_build_log_verified",
+                            "profile_proof_scope", "rustc_version", "cargo_version"
                         ],
                         "properties": {
                             "workspace_root": {"type": "string"},
                             "git_commit_sha": {"type": "string"},
                             "git_branch": {"type": "string"},
                             "git_dirty": {"type": ["boolean", "null"]},
-                            "input_tracking": {"type": "string"},
-                            "cargo_profile": {"type": "string"},
+                            "tracked_workspace_inputs_watched": {"type": "string"},
+                            "cargo_profile_family": {"type": "string"},
+                            "selected_profile": {"type": "string"},
                             "declared_profile": {"type": "string"},
+                            "build_nonce": {
+                                "type": "string",
+                                "minLength": 1
+                            },
                             "opt_level": {"type": "string"},
-                            "debug": {"type": "string"},
+                            "debuginfo": {"type": "string"},
+                            "debug_assertions": {"type": "boolean"},
                             "target": {"type": "string"},
                             "host": {"type": "string"},
                             "panic_strategy": {"type": "string"},
+                            "panic_abort": {"type": "boolean"},
                             "package_features": {
                                 "type": "array",
                                 "items": {"type": "string"}
                             },
-                            "encoded_rustflags_hex": {"type": "string"},
+                            "encoded_rustflags_hex": {
+                                "type": "string",
+                                "pattern": "^[0-9a-f]*$"
+                            },
+                            "encoded_rustflags_present": {"type": "boolean"},
+                            "profile_override_environment_hex": {
+                                "type": "string",
+                                "pattern": "^[0-9a-f]*$"
+                            },
+                            "native_override_environment_hex": {
+                                "type": "string",
+                                "pattern": "^[0-9a-f]*$"
+                            },
+                            "verbose_build_log_path": {"type": ["string", "null"]},
+                            "verbose_build_log_sha256": {
+                                "type": ["string", "null"],
+                                "pattern": "^[0-9a-f]{64}$"
+                            },
+                            "verbose_build_log_size_bytes": {
+                                "type": ["integer", "null"],
+                                "minimum": 0
+                            },
+                            "verbose_build_log_verified": {
+                                "type": "boolean"
+                            },
+                            "profile_proof_scope": {"type": "string"},
                             "rustc_version": {"type": "string"},
                             "cargo_version": {"type": "string"}
                         }
@@ -2549,6 +3508,8 @@ fn benchmark_json_schema() -> serde_json::Value {
                     "binary_sha256": {"type": ["string", "null"]},
                     "binary_size_bytes": {"type": ["integer", "null"]},
                     "binary_modified_unix_ts": {"type": ["integer", "null"]},
+                    "binary_device_id": {"type": ["integer", "null"]},
+                    "binary_inode": {"type": ["integer", "null"]},
                     "cargo_lock_sha256": {"type": ["string", "null"]},
                     "cargo_feature_graph_sha256": {"type": ["string", "null"]},
                     "cargo_feature_graph": {"type": ["string", "null"]},
@@ -2562,7 +3523,9 @@ fn benchmark_json_schema() -> serde_json::Value {
                         "additionalProperties": {"type": "string"}
                     },
                     "cpu_affinity": {"type": ["string", "null"]},
-                    "runtime_bridge": {"type": "string"},
+                    "runtime_bridge": {
+                        "const": "per_operation_thread_local_block_on"
+                    },
                     "tracing": {
                         "type": "object",
                         "additionalProperties": false,
@@ -2602,7 +3565,7 @@ fn benchmark_json_schema() -> serde_json::Value {
                                 "type": "array",
                                 "items": {"type": "string"}
                             },
-                            "concurrent_mode_default": {"const": true},
+                            "concurrent_mode_default": {"type": "boolean"},
                             "verified": {"type": "boolean"},
                             "matched": {"type": "boolean"},
                             "validation_errors": {
@@ -2622,39 +3585,249 @@ fn benchmark_json_schema() -> serde_json::Value {
                         "type": "object",
                         "additionalProperties": false,
                         "required": [
-                            "capture_scope", "timed_execution_instrumented",
+                            "probe_scope", "timed_routes_verified", "limitations",
+                            "timed_execution_instrumented",
                             "parser_fast_path_executions", "parser_slow_path_executions",
                             "prepared_insert_fast_lane_hits",
                             "prepared_insert_instrumented_lane_hits",
+                            "prepared_direct_insert_executions",
                             "prepared_update_delete_fast_lane_hits",
                             "prepared_update_delete_instrumented_lane_hits",
-                            "prepared_dml_fallbacks", "select_fallback_decisions",
-                            "certification_errors"
+                            "prepared_direct_update_executions",
+                            "prepared_direct_delete_executions",
+                            "prepared_update_delete_dml_direct_handoff_runs",
+                            "prepared_table_dml_affected_only_runs",
+                            "prepared_dml_fallbacks", "select_routing_decisions",
+                            "probe_errors"
                         ],
                         "properties": {
-                            "capture_scope": {"type": "string"},
+                            "probe_scope": {"type": "string"},
+                            "timed_routes_verified": {"type": "boolean"},
+                            "limitations": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            },
                             "timed_execution_instrumented": {"type": "boolean"},
                             "parser_fast_path_executions": {"type": "integer", "minimum": 0},
                             "parser_slow_path_executions": {"type": "integer", "minimum": 0},
                             "prepared_insert_fast_lane_hits": {"type": "integer", "minimum": 0},
                             "prepared_insert_instrumented_lane_hits": {"type": "integer", "minimum": 0},
+                            "prepared_direct_insert_executions": {"type": "integer", "minimum": 0},
                             "prepared_update_delete_fast_lane_hits": {"type": "integer", "minimum": 0},
                             "prepared_update_delete_instrumented_lane_hits": {"type": "integer", "minimum": 0},
+                            "prepared_direct_update_executions": {"type": "integer", "minimum": 0},
+                            "prepared_direct_delete_executions": {"type": "integer", "minimum": 0},
+                            "prepared_update_delete_dml_direct_handoff_runs": {
+                                "type": "integer",
+                                "minimum": 0
+                            },
+                            "prepared_table_dml_affected_only_runs": {
+                                "type": "integer",
+                                "minimum": 0
+                            },
                             "prepared_dml_fallbacks": {
                                 "type": "object",
                                 "additionalProperties": {"type": "integer", "minimum": 0}
                             },
-                            "select_fallback_decisions": {
+                            "select_routing_decisions": {
                                 "type": "object",
                                 "additionalProperties": {"type": "integer", "minimum": 0}
                             },
-                            "certification_errors": {
+                            "probe_errors": {
                                 "type": "array",
                                 "items": {"type": "string"}
                             }
                         }
                     }
-                }
+                },
+                "allOf": [
+                    {
+                        "if": {
+                            "properties": {
+                                "runtime_bridge": {
+                                    "const": "per_operation_thread_local_block_on"
+                                }
+                            },
+                            "required": ["runtime_bridge"]
+                        },
+                        "then": {
+                            "properties": {
+                                "citable": {"const": false},
+                                "status": {
+                                    "enum": ["unverified", "unverified_explicit_override"]
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "if": {
+                            "properties": {"citable": {"const": true}},
+                            "required": ["citable"]
+                        },
+                        "then": {
+                            "properties": {
+                                "status": {"const": "verified_citable"},
+                                "validation_errors": {"maxItems": 0},
+                                "build": {
+                                    "properties": {
+                                        "git_dirty": {"const": false},
+                                        "git_commit_sha": {
+                                            "pattern": "^[0-9a-f]{40}$"
+                                        },
+                                        "tracked_workspace_inputs_watched": {"const": "complete"},
+                                        "cargo_profile_family": {"const": "release"},
+                                        "declared_profile": {"enum": ["release", "release-perf"]},
+                                        "build_nonce": {
+                                            "type": "string",
+                                            "pattern": "^[0-9a-f]{64}$"
+                                        },
+                                        "debug_assertions": {"const": false},
+                                        "panic_strategy": {"const": "abort"},
+                                        "panic_abort": {"const": true},
+                                        "encoded_rustflags_hex": {"const": ""},
+                                        "encoded_rustflags_present": {"const": true},
+                                        "native_override_environment_hex": {
+                                            "const": "4c494253514c495445335f464c4147533d2d4453514c4954455f454e41424c455f4d4154485f46554e4354494f4e53"
+                                        },
+                                        "profile_override_environment_hex": {
+                                            "type": "string",
+                                            "minLength": 2
+                                        },
+                                        "verbose_build_log_path": {
+                                            "type": "string",
+                                            "minLength": 1
+                                        },
+                                        "verbose_build_log_sha256": {
+                                            "type": "string",
+                                            "pattern": "^[0-9a-f]{64}$"
+                                        },
+                                        "verbose_build_log_size_bytes": {
+                                            "type": "integer",
+                                            "minimum": 1
+                                        },
+                                        "verbose_build_log_verified": {
+                                            "const": true
+                                        }
+                                    }
+                                },
+                                "runtime_source": {
+                                    "properties": {
+                                        "git_commit_sha": {
+                                            "type": "string",
+                                            "pattern": "^[0-9a-f]{40}$"
+                                        },
+                                        "git_dirty": {"const": false}
+                                    }
+                                },
+                                "binary_path": {"type": "string", "minLength": 1},
+                                "binary_sha256": {
+                                    "type": "string",
+                                    "pattern": "^[0-9a-f]{64}$"
+                                },
+                                "binary_size_bytes": {"type": "integer", "minimum": 1},
+                                "binary_modified_unix_ts": {"type": "integer", "minimum": 1},
+                                "binary_device_id": {"type": "integer", "minimum": 0},
+                                "binary_inode": {"type": "integer", "minimum": 1},
+                                "cargo_lock_sha256": {
+                                    "type": "string",
+                                    "pattern": "^[0-9a-f]{64}$"
+                                },
+                                "cargo_feature_graph_sha256": {
+                                    "type": "string",
+                                    "pattern": "^[0-9a-f]{64}$"
+                                },
+                                "cargo_feature_graph": {"type": "string", "minLength": 1},
+                                "tracing": {
+                                    "properties": {
+                                        "statement_debug_enabled": {"const": false},
+                                        "statement_reuse_info_enabled": {"const": false},
+                                        "fallback_decision_debug_enabled": {"const": false}
+                                    }
+                                },
+                                "durability": {
+                                    "properties": {
+                                        "concurrent_mode_default": {"const": true},
+                                        "verified": {"const": true},
+                                        "matched": {"const": true},
+                                        "validation_errors": {"maxItems": 0},
+                                        "effective_profiles": {
+                                            "required": [
+                                                "memory.csqlite", "memory.fsqlite",
+                                                "file.csqlite", "file.fsqlite"
+                                            ],
+                                            "minProperties": 4
+                                        }
+                                    }
+                                },
+                                "execution_routing": {
+                                    "properties": {
+                                        "timed_execution_instrumented": {"const": false},
+                                        "probe_errors": {"maxItems": 0}
+                                    }
+                                }
+                            },
+                            "allOf": [
+                                {
+                                    "if": {
+                                        "properties": {
+                                            "build": {
+                                                "properties": {
+                                                    "declared_profile": {"const": "release-perf"}
+                                                }
+                                            }
+                                        }
+                                    },
+                                    "then": {
+                                        "properties": {
+                                            "build": {
+                                                "properties": {
+                                                    "selected_profile": {"const": "release-perf"},
+                                                    "opt_level": {"const": "3"},
+                                                    "debuginfo": {"const": "false"}
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                {
+                                    "if": {
+                                        "properties": {
+                                            "build": {
+                                                "properties": {
+                                                    "declared_profile": {"const": "release"}
+                                                }
+                                            }
+                                        }
+                                    },
+                                    "then": {
+                                        "properties": {
+                                            "build": {
+                                                "properties": {
+                                                    "selected_profile": {"const": "release"},
+                                                    "opt_level": {"const": "z"},
+                                                    "debuginfo": {"const": "false"}
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "if": {
+                            "properties": {"citable": {"const": false}},
+                            "required": ["citable"]
+                        },
+                        "then": {
+                            "properties": {
+                                "status": {
+                                    "enum": ["unverified", "unverified_explicit_override"]
+                                }
+                            }
+                        }
+                    }
+                ]
             },
             "summary": {
                 "type": "object",
@@ -2803,7 +3976,8 @@ fn benchmark_json_schema() -> serde_json::Value {
                                     "csqlite": {"anyOf": [{"$ref": "#/$defs/measurement"}, {"type": "null"}]},
                                     "fsqlite": {"anyOf": [{"$ref": "#/$defs/measurement"}, {"type": "null"}]},
                                     "ratio_fsqlite_over_csqlite": {"type": ["number", "null"]},
-                                    "fsqlite_concurrent_profile": {"$ref": "#/$defs/fsqlite_concurrent_profile"}
+                                    "fsqlite_concurrent_profile": {"$ref": "#/$defs/fsqlite_concurrent_profile"},
+                                    "concurrent_readiness": {"$ref": "#/$defs/concurrent_readiness"}
                                 }
                             }
                         }
@@ -2887,6 +4061,91 @@ fn benchmark_json_schema() -> serde_json::Value {
                         "additionalProperties": {"type": "integer", "minimum": 0}
                     }
                 }
+            },
+            "concurrent_worker_settings": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "page_size_bytes", "journal_mode", "synchronous",
+                    "cache_size", "busy_timeout_ms", "concurrent_mode"
+                ],
+                "properties": {
+                    "page_size_bytes": {"type": "integer", "minimum": 512},
+                    "journal_mode": {"const": "wal"},
+                    "synchronous": {"enum": ["normal", "full"]},
+                    "cache_size": {"type": "integer"},
+                    "busy_timeout_ms": {"type": "integer", "minimum": 1},
+                    "concurrent_mode": {
+                        "enum": ["sqlite_wal_single_writer", "fsqlite_mvcc_on"]
+                    }
+                }
+            },
+            "concurrent_worker_receipt": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "worker_index", "setup_thread_id", "postflight_thread_id",
+                    "setup_cpu_affinity", "postflight_cpu_affinity",
+                    "completed_rows", "settings", "settings_verified",
+                    "thread_identity_verified", "thread_affinity_verified"
+                ],
+                "properties": {
+                    "worker_index": {"type": "integer", "minimum": 0},
+                    "setup_thread_id": {"type": "string", "minLength": 1},
+                    "postflight_thread_id": {"type": "string", "minLength": 1},
+                    "setup_cpu_affinity": {"type": "string", "minLength": 1},
+                    "postflight_cpu_affinity": {"type": "string", "minLength": 1},
+                    "completed_rows": {"type": "integer", "minimum": 1},
+                    "settings": {"$ref": "#/$defs/concurrent_worker_settings"},
+                    "settings_verified": {"const": true},
+                    "thread_identity_verified": {"const": true},
+                    "thread_affinity_verified": {"const": true}
+                }
+            },
+            "concurrent_sample_readiness": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "phase", "sample_index", "engine", "expected_cpu_affinity",
+                    "expected_workers", "expected_rows", "completed_rows",
+                    "database_rows", "expected_id_sum", "database_id_sum",
+                    "timed_scope", "workers"
+                ],
+                "properties": {
+                    "phase": {"enum": ["warmup", "measured"]},
+                    "sample_index": {"type": "integer", "minimum": 0},
+                    "engine": {"enum": ["csqlite", "fsqlite"]},
+                    "expected_cpu_affinity": {"type": "string", "minLength": 1},
+                    "expected_workers": {"type": "integer", "minimum": 1},
+                    "expected_rows": {"type": "integer", "minimum": 1},
+                    "completed_rows": {"type": "integer", "minimum": 1},
+                    "database_rows": {"type": "integer", "minimum": 1},
+                    "expected_id_sum": {"type": "integer"},
+                    "database_id_sum": {"type": "integer"},
+                    "timed_scope": {"type": "string", "minLength": 1},
+                    "workers": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"$ref": "#/$defs/concurrent_worker_receipt"}
+                    }
+                }
+            },
+            "concurrent_readiness": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["csqlite_samples", "fsqlite_samples"],
+                "properties": {
+                    "csqlite_samples": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"$ref": "#/$defs/concurrent_sample_readiness"}
+                    },
+                    "fsqlite_samples": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"$ref": "#/$defs/concurrent_sample_readiness"}
+                    }
+                }
             }
         }
     })
@@ -2896,25 +4155,49 @@ fn benchmark_json_schema() -> serde_json::Value {
 #[allow(clippy::too_many_lines)]
 fn bridge_json_schema() -> serde_json::Value {
     let comprehensive = benchmark_json_schema();
-    let provenance = comprehensive["properties"]["provenance"].clone();
+    let mut provenance = comprehensive["properties"]["provenance"].clone();
+    provenance["properties"]["runtime_bridge"] = serde_json::json!({
+        "const": "three_arm_per_operation_inside_existing_runtime_worker_sync_facade"
+    });
     let environment = comprehensive["properties"]["environment"].clone();
     serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/bridge-experiment.v1.json",
+        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/bridge-experiment.v2.json",
         "title": "FrankenSQLite async bridge experiment report",
         "type": "object",
         "additionalProperties": false,
         "required": [
             "schema_version", "generated_at_utc", "provenance", "environment",
-            "host_state_before", "host_state_after", "config", "raw_samples",
+            "host_state_before", "host_state_checkpoints", "host_state_after",
+            "config", "raw_samples",
             "arm_statistics", "paired_comparisons", "ready_runtime_entry_regression"
         ],
         "properties": {
-            "schema_version": {"const": BRIDGE_REPORT_SCHEMA_V1},
+            "schema_version": {"const": BRIDGE_REPORT_SCHEMA_V2},
             "generated_at_utc": {"type": "string"},
-            "provenance": provenance,
+            "provenance": {
+                "allOf": [
+                    provenance,
+                    {
+                        "properties": {
+                            "citable": {"const": false},
+                            "status": {
+                                "enum": [
+                                    "unverified",
+                                    "unverified_explicit_override"
+                                ]
+                            }
+                        }
+                    }
+                ]
+            },
             "environment": environment,
             "host_state_before": {"$ref": "#/$defs/host_state"},
+            "host_state_checkpoints": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"$ref": "#/$defs/host_state"}
+            },
             "host_state_after": {"$ref": "#/$defs/host_state"},
             "config": {"$ref": "#/$defs/config"},
             "raw_samples": {
@@ -2955,8 +4238,11 @@ fn bridge_json_schema() -> serde_json::Value {
                 "required": [
                     "captured_at_utc", "load_average_1m", "load_average_5m",
                     "load_average_15m", "available_parallelism", "cpu_affinity",
-                    "scaling_governors", "energy_performance_preferences",
-                    "boost_controls", "numa_nodes_online", "memory_available_gb"
+                    "selected_cpu_topology", "scaling_governors",
+                    "energy_performance_preferences",
+                    "boost_controls", "numa_nodes_online", "memory_available_gb",
+                    "cpu_pressure_some_avg10", "io_pressure_some_avg60",
+                    "competing_processes", "competing_process_scan_error"
                 ],
                 "properties": {
                     "captured_at_utc": {"type": "string"},
@@ -2965,6 +4251,11 @@ fn bridge_json_schema() -> serde_json::Value {
                     "load_average_15m": {"type": ["number", "null"], "minimum": 0},
                     "available_parallelism": {"type": ["integer", "null"], "minimum": 1},
                     "cpu_affinity": {"type": ["string", "null"]},
+                    "selected_cpu_topology": {
+                        "type": "object",
+                        "minProperties": 0,
+                        "additionalProperties": {"type": "string", "minLength": 1}
+                    },
                     "scaling_governors": {
                         "type": "array",
                         "items": {"type": "string"}
@@ -2978,7 +4269,20 @@ fn bridge_json_schema() -> serde_json::Value {
                         "additionalProperties": {"type": "string"}
                     },
                     "numa_nodes_online": {"type": ["string", "null"]},
-                    "memory_available_gb": {"type": ["number", "null"], "minimum": 0}
+                    "memory_available_gb": {"type": ["number", "null"], "minimum": 0},
+                    "cpu_pressure_some_avg10": {
+                        "type": ["number", "null"],
+                        "minimum": 0
+                    },
+                    "io_pressure_some_avg60": {
+                        "type": ["number", "null"],
+                        "minimum": 0
+                    },
+                    "competing_processes": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1}
+                    },
+                    "competing_process_scan_error": {"type": ["string", "null"]}
                 }
             },
             "config": {
@@ -2991,7 +4295,11 @@ fn bridge_json_schema() -> serde_json::Value {
                     "affinity_policy", "max_load_average_1m"
                 ],
                 "properties": {
-                    "samples_per_arm": {"type": "integer", "minimum": 32},
+                    "samples_per_arm": {
+                        "type": "integer",
+                        "minimum": 48,
+                        "multipleOf": 48
+                    },
                     "raw_insert_operations": {"type": "integer", "minimum": 1},
                     "ready_operation_counts": {
                         "type": "array",
@@ -3019,7 +4327,8 @@ fn bridge_json_schema() -> serde_json::Value {
                     "affinity_policy": {"type": "string"},
                     "max_load_average_1m": {
                         "type": ["number", "null"],
-                        "minimum": 0
+                        "minimum": 0,
+                        "maximum": 1
                     }
                 }
             },
@@ -3033,8 +4342,8 @@ fn bridge_json_schema() -> serde_json::Value {
                     "caller_future_completions_inside_timed_region",
                     "engine_dml_future_calls_inside_timed_region",
                     "worker_commands_total", "worker_commands_inside_timed_region",
-                    "worker_open_handshakes_total", "oracle_kind",
-                    "checksum_count", "checksum_sum"
+                    "worker_open_handshakes_total", "effective_settings", "oracle_kind",
+                    "checksum_count", "checksum_sum", "checksum_exact_rows"
                 ],
                 "properties": {
                     "workload": {"$ref": "#/$defs/workload"},
@@ -3060,10 +4369,40 @@ fn bridge_json_schema() -> serde_json::Value {
                     "worker_open_handshakes_total": {
                         "type": "integer", "minimum": 0
                     },
+                    "effective_settings": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"}
+                    },
                     "oracle_kind": {"type": "string"},
                     "checksum_count": {"type": "integer"},
-                    "checksum_sum": {"type": "integer"}
-                }
+                    "checksum_sum": {"type": "integer"},
+                    "checksum_exact_rows": {"type": "integer"}
+                },
+                "allOf": [
+                    {
+                        "if": {
+                            "properties": {"workload": {"const": "ready_future"}},
+                            "required": ["workload"]
+                        },
+                        "then": {
+                            "properties": {
+                                "effective_settings": {"maxProperties": 0}
+                            }
+                        },
+                        "else": {
+                            "properties": {
+                                "effective_settings": {
+                                    "required": [
+                                        "page_size", "journal_mode", "synchronous",
+                                        "cache_size", "concurrent_mode"
+                                    ],
+                                    "minProperties": 5,
+                                    "maxProperties": 5
+                                }
+                            }
+                        }
+                    }
+                ]
             },
             "arm_statistics": {
                 "type": "object",
@@ -3091,7 +4430,7 @@ fn bridge_json_schema() -> serde_json::Value {
                 "additionalProperties": false,
                 "required": [
                     "workload", "operation_count", "numerator", "denominator",
-                    "paired_blocks", "median_ratio", "geomean_ratio",
+                    "paired_blocks", "bootstrap_clusters", "median_ratio", "mean_ratio", "geomean_ratio",
                     "bootstrap_mean_ratio_ci95_low",
                     "bootstrap_mean_ratio_ci95_high"
                 ],
@@ -3101,7 +4440,9 @@ fn bridge_json_schema() -> serde_json::Value {
                     "numerator": {"$ref": "#/$defs/arm"},
                     "denominator": {"$ref": "#/$defs/arm"},
                     "paired_blocks": {"type": "integer", "minimum": 1},
+                    "bootstrap_clusters": {"type": "integer", "minimum": 1},
                     "median_ratio": {"type": "number", "exclusiveMinimum": 0},
+                    "mean_ratio": {"type": "number", "exclusiveMinimum": 0},
                     "geomean_ratio": {"type": "number", "exclusiveMinimum": 0},
                     "bootstrap_mean_ratio_ci95_low": {
                         "type": "number", "exclusiveMinimum": 0
@@ -3373,6 +4714,30 @@ impl BenchReport {
         // Summary stats.
         let summary = compute_report_summary(self);
         let avg_ratio = summary.average_ratio.unwrap_or(1.0);
+        let provenance_banner = if provenance.citable {
+            r#"<section class="max-w-6xl mx-auto px-6 mt-6">
+  <div class="rounded-xl border border-emerald-400 bg-emerald-950 p-5 text-emerald-100">
+    <p class="text-xl font-extrabold">CITABLE PROVENANCE VERIFIED</p>
+  </div>
+</section>"#
+                .to_owned()
+        } else {
+            let errors = provenance
+                .validation_errors
+                .iter()
+                .map(|error| format!("<li>{}</li>", html_escape(error)))
+                .collect::<String>();
+            format!(
+                r#"<section class="max-w-6xl mx-auto px-6 mt-6">
+  <div class="rounded-xl border-4 border-red-400 bg-red-950 p-6 text-red-50" role="alert">
+    <p class="text-3xl font-black">NON-CITABLE DIAGNOSTIC</p>
+    <p class="mt-2 font-semibold">These numbers are not release evidence and must not support a performance claim.</p>
+    <p class="mt-4 font-bold">Failed provenance checks:</p>
+    <ul class="mt-2 list-disc space-y-1 pl-6">{errors}</ul>
+  </div>
+</section>"#
+            )
+        };
 
         html.push_str(&format!(
             r#"<!DOCTYPE html>
@@ -3434,6 +4799,8 @@ tailwind.config = {{
     <p class="text-slate-500 text-sm mt-4 font-mono">{}</p>
   </div>
 </header>
+
+{provenance_banner}
 
 <!-- Summary Cards -->
 <section class="max-w-6xl mx-auto px-6 -mt-6">
@@ -3684,6 +5051,21 @@ document.querySelectorAll('[id^="section-"]').forEach(el => observer.observe(el)
     }
 }
 
+fn html_escape(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -3721,11 +5103,29 @@ impl ReportSection {
         fsqlite: Option<Measurement>,
         fsqlite_concurrent_profile: Option<JsonFsqliteConcurrentProfile>,
     ) {
+        self.add_row_with_concurrent_details(
+            scenario,
+            csqlite,
+            fsqlite,
+            fsqlite_concurrent_profile,
+            None,
+        );
+    }
+
+    fn add_row_with_concurrent_details(
+        &mut self,
+        scenario: &str,
+        csqlite: Option<Measurement>,
+        fsqlite: Option<Measurement>,
+        fsqlite_concurrent_profile: Option<JsonFsqliteConcurrentProfile>,
+        concurrent_readiness: Option<JsonConcurrentReadiness>,
+    ) {
         self.rows.push(ReportRow {
             scenario: scenario.to_string(),
             csqlite,
             fsqlite,
             fsqlite_concurrent_profile,
+            concurrent_readiness,
         });
     }
 }
@@ -3823,10 +5223,16 @@ fn print_usage() {
   cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench
   cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --quick
   cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --filter insert
-  cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --json-out report.json --no-html
-  cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --json-stdout --no-html
+  cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --json-out report.json --no-html --allow-unverified-provenance
+  cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --json-stdout --no-html --allow-unverified-provenance
   cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --print-json-schema
-  FSQLITE_BENCH_EXPECTED_CPU_AFFINITY=2-3 FSQLITE_BENCH_MAX_LOAD_1M=4 FSQLITE_BENCH_PROFILE_NAME=release-perf taskset -c 2,3 cargo run --profile release-perf -p fsqlite-e2e --features bridge-experiment --bin comprehensive-bench -- --bridge-experiment --json-out bridge.json
+  GATE0_TARGET=$(mktemp -d /data/tmp/fsqlite-gate0-target.XXXXXX)
+  GATE0_RECEIPTS=$(mktemp -d /data/tmp/fsqlite-gate0-receipts.XXXXXX)
+  GATE0_NONCE=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \\n')
+  GATE0_HOST=$(rustc -vV | sed -n 's/^host: //p')
+  env -i HOME=\"$HOME\" USER=\"$USER\" LOGNAME=\"$USER\" PATH=\"$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin\" LC_ALL=C CARGO_ENCODED_RUSTFLAGS= CARGO_BUILD_RUSTFLAGS= CARGO_BUILD_RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER= RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= CARGO_PROFILE_RELEASE_PERF_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_PERF_DEBUG=false CARGO_PROFILE_RELEASE_PERF_DEBUG_ASSERTIONS=false CARGO_PROFILE_RELEASE_PERF_INCREMENTAL=false CARGO_PROFILE_RELEASE_PERF_LTO=true CARGO_PROFILE_RELEASE_PERF_OPT_LEVEL=3 CARGO_PROFILE_RELEASE_PERF_OVERFLOW_CHECKS=false CARGO_PROFILE_RELEASE_PERF_PANIC=abort CARGO_PROFILE_RELEASE_PERF_RPATH=false CARGO_PROFILE_RELEASE_PERF_SPLIT_DEBUGINFO=off CARGO_PROFILE_RELEASE_PERF_STRIP=true LIBSQLITE3_FLAGS=-DSQLITE_ENABLE_MATH_FUNCTIONS FSQLITE_BENCH_PROFILE_NAME=release-perf FSQLITE_BENCH_BUILD_NONCE=\"$GATE0_NONCE\" cargo build --locked -vv --color never --message-format=json-render-diagnostics --target-dir \"$GATE0_TARGET\" --profile release-perf --target \"$GATE0_HOST\" -p fsqlite-e2e --features bridge-experiment --bin comprehensive-bench > \"$GATE0_RECEIPTS/gate0-build-events.jsonl\" 2> \"$GATE0_RECEIPTS/gate0-build-vv.log\"
+  BENCH_BIN=$(jq -Rr 'fromjson? | select(.reason == \"compiler-artifact\" and .target.name == \"comprehensive-bench\" and (.target.kind | index(\"bin\"))) | .executable // empty' \"$GATE0_RECEIPTS/gate0-build-events.jsonl\" | tail -n 1)
+  test -n \"$BENCH_BIN\" && FSQLITE_BENCH_BUILD_LOG_PATH=\"$GATE0_RECEIPTS/gate0-build-vv.log\" FSQLITE_BENCH_EXPECTED_CPU_AFFINITY=2-3 FSQLITE_BENCH_MAX_LOAD_1M=1 taskset -c 2,3 \"$BENCH_BIN\" --bridge-experiment --allow-unverified-provenance --json-out \"$GATE0_RECEIPTS/bridge-diagnostic.json\"
 
 Flags:
   --quick              Run the reduced benchmark matrix.
@@ -3840,8 +5246,10 @@ Flags:
   --allow-unverified-provenance
                        Emit explicitly non-citable artifacts when provenance validation fails.
   --bridge-experiment  Run the standalone three-arm async bridge experiment.
-  --bridge-samples <n> Samples per bridge arm; multiple of 16 and at least 32
-                       (default: 64).
+                       It remains diagnostic until isolated-cpuset/full-dynticks/IRQ
+                       receipts are implemented; use --allow-unverified-provenance.
+  --bridge-samples <n> Samples per bridge arm; multiple of 48 and at least 48
+                       (default: 96).
   --bridge-operations <n>
                        Timed insert operations per sample (default: 1000).
   --bridge-seed <n>    Deterministic ABBA ordering/bootstrap seed.
@@ -3854,14 +5262,14 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
         quick: false,
         filter: None,
         html_path: None,
-        emit_html: true,
+        emit_html: false,
         emit_timestamped_json: false,
         json_out_path: None,
         json_stdout: false,
         print_json_schema: false,
         allow_unverified_provenance: false,
         bridge_experiment: false,
-        bridge_samples: 64,
+        bridge_samples: 96,
         bridge_operations: 1_000,
         bridge_seed: 0x4653_514c_4954_4530,
     };
@@ -3954,8 +5362,8 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
     }
 
     if options.bridge_experiment {
-        if options.bridge_samples < 32 || options.bridge_samples % 16 != 0 {
-            return Err("--bridge-samples must be a multiple of 16 and at least 32".to_owned());
+        if options.bridge_samples < 48 || options.bridge_samples % 48 != 0 {
+            return Err("--bridge-samples must be a multiple of 48 and at least 48".to_owned());
         }
         if options.bridge_operations == 0 {
             return Err("--bridge-operations must be greater than zero".to_owned());
@@ -3976,12 +5384,22 @@ fn print_run_banner(
     options: &CliOptions,
     row_counts: &[usize],
     environment: &DetectedEnvironment,
+    provenance: &JsonBenchmarkProvenance,
 ) {
     emit_line(to_stdout, format!("\n{}", "=".repeat(80)));
     emit_line(
         to_stdout,
         "  Comprehensive FrankenSQLite vs C SQLite Benchmark",
     );
+    if !provenance.citable {
+        emit_line(
+            to_stdout,
+            "  !!! NON-CITABLE DIAGNOSTIC — NUMBERS ARE NOT RELEASE EVIDENCE !!!",
+        );
+        for error in &provenance.validation_errors {
+            emit_line(to_stdout, format!("  provenance: {error}"));
+        }
+    }
     emit_line(to_stdout, "=".repeat(80));
     environment.print(to_stdout);
     emit_line(
@@ -5053,6 +6471,1088 @@ fn profile_fsqlite_insert_with_strategy(
     );
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConcurrentGatePhase {
+    Preparing,
+    Run,
+    Postflight,
+    Abort,
+}
+
+struct ConcurrentSampleGate {
+    phase: Mutex<ConcurrentGatePhase>,
+    changed: Condvar,
+}
+
+impl ConcurrentSampleGate {
+    fn new() -> Self {
+        Self {
+            phase: Mutex::new(ConcurrentGatePhase::Preparing),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn transition(
+        &self,
+        expected: ConcurrentGatePhase,
+        next: ConcurrentGatePhase,
+    ) -> Result<(), String> {
+        let mut phase = self
+            .phase
+            .lock()
+            .map_err(|_| "concurrent sample gate mutex was poisoned".to_owned())?;
+        if *phase != expected {
+            return Err(format!(
+                "concurrent sample gate expected {expected:?}, observed {phase:?}"
+            ));
+        }
+        *phase = next;
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn wait_for(&self, target: ConcurrentGatePhase) -> Result<(), String> {
+        let mut phase = self
+            .phase
+            .lock()
+            .map_err(|_| "concurrent sample gate mutex was poisoned".to_owned())?;
+        loop {
+            match *phase {
+                ConcurrentGatePhase::Abort => {
+                    return Err("concurrent sample was aborted".to_owned());
+                }
+                current if current == target => return Ok(()),
+                ConcurrentGatePhase::Preparing | ConcurrentGatePhase::Run => {
+                    phase = self
+                        .changed
+                        .wait(phase)
+                        .map_err(|_| "concurrent sample gate mutex was poisoned".to_owned())?;
+                }
+                ConcurrentGatePhase::Postflight => {
+                    return Err(format!(
+                        "concurrent sample gate advanced to postflight before worker observed {target:?}"
+                    ));
+                }
+            }
+        }
+    }
+
+    fn abort(&self) {
+        if let Ok(mut phase) = self.phase.lock() {
+            *phase = ConcurrentGatePhase::Abort;
+            self.changed.notify_all();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ConcurrentWorkerSetup {
+    worker_index: usize,
+    thread_id: String,
+    cpu_affinity: String,
+    settings: JsonConcurrentWorkerSettings,
+}
+
+#[derive(Debug)]
+struct ConcurrentWorkerPostflight {
+    worker_index: usize,
+    thread_id: String,
+    cpu_affinity: String,
+    settings: JsonConcurrentWorkerSettings,
+}
+
+#[derive(Debug)]
+enum ConcurrentWorkerEvent {
+    Setup {
+        worker_index: usize,
+        outcome: Result<ConcurrentWorkerSetup, String>,
+    },
+    Done {
+        worker_index: usize,
+        outcome: Result<usize, String>,
+    },
+    Postflight {
+        worker_index: usize,
+        outcome: Result<ConcurrentWorkerPostflight, String>,
+    },
+}
+
+fn current_thread_identity() -> String {
+    format!("{:?}", std::thread::current().id())
+}
+
+fn current_thread_cpu_affinity() -> Result<String, String> {
+    std::fs::read_to_string("/proc/thread-self/status")
+        .map_err(|error| format!("could not read /proc/thread-self/status: {error}"))?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Cpus_allowed_list:")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| "/proc/thread-self/status did not contain Cpus_allowed_list".to_owned())
+}
+
+fn concurrent_expected_cpu_affinity() -> Result<String, String> {
+    let observed = cpu_affinity()
+        .ok_or_else(|| "could not determine benchmark process CPU affinity".to_owned())?;
+    if let Ok(expected) = std::env::var("FSQLITE_BENCH_EXPECTED_CPU_AFFINITY")
+        && expected != observed
+    {
+        return Err(format!(
+            "benchmark process CPU affinity mismatch: expected `{expected}`, observed `{observed}`"
+        ));
+    }
+    Ok(observed)
+}
+
+fn normalized_synchronous(value: &str) -> Result<String, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "0" | "off" => Ok("off".to_owned()),
+        "1" | "normal" => Ok("normal".to_owned()),
+        "2" | "full" => Ok("full".to_owned()),
+        "3" | "extra" => Ok("extra".to_owned()),
+        _ => Err(format!("unrecognized PRAGMA synchronous value `{value}`")),
+    }
+}
+
+fn parse_worker_settings(
+    profile: &BTreeMap<String, String>,
+    concurrent_mode: &str,
+) -> Result<JsonConcurrentWorkerSettings, String> {
+    let value = |name: &str| {
+        profile
+            .get(name)
+            .map(String::as_str)
+            .ok_or_else(|| format!("worker PRAGMA profile omitted `{name}`"))
+    };
+    Ok(JsonConcurrentWorkerSettings {
+        page_size_bytes: value("page_size")?
+            .parse::<u32>()
+            .map_err(|error| format!("invalid worker page_size: {error}"))?,
+        journal_mode: value("journal_mode")?.to_ascii_lowercase(),
+        synchronous: normalized_synchronous(value("synchronous")?)?,
+        cache_size: value("cache_size")?
+            .parse::<i64>()
+            .map_err(|error| format!("invalid worker cache_size: {error}"))?,
+        busy_timeout_ms: value("busy_timeout")?
+            .parse::<u64>()
+            .map_err(|error| format!("invalid worker busy_timeout: {error}"))?,
+        concurrent_mode: concurrent_mode.to_owned(),
+    })
+}
+
+fn expected_concurrent_worker_settings(concurrent_mode: &str) -> JsonConcurrentWorkerSettings {
+    JsonConcurrentWorkerSettings {
+        page_size_bytes: benchmark_page_size_bytes(),
+        journal_mode: "wal".to_owned(),
+        synchronous: concurrent_sync_mode().to_ascii_lowercase(),
+        cache_size: -64_000,
+        busy_timeout_ms: 5_000,
+        concurrent_mode: concurrent_mode.to_owned(),
+    }
+}
+
+fn verify_concurrent_worker_settings(
+    engine: &str,
+    worker_index: usize,
+    actual: &JsonConcurrentWorkerSettings,
+    concurrent_mode: &str,
+) -> Result<(), String> {
+    let expected = expected_concurrent_worker_settings(concurrent_mode);
+    if actual != &expected {
+        return Err(format!(
+            "{engine} worker {worker_index} settings mismatch: expected {expected:?}, observed {actual:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn query_csqlite_concurrent_worker_settings(
+    conn: &rusqlite::Connection,
+) -> Result<JsonConcurrentWorkerSettings, String> {
+    let mut profile = query_effective_csqlite_pragmas(conn)?;
+    let busy_timeout = conn
+        .query_row("PRAGMA busy_timeout;", [], |row| {
+            row.get_ref(0).map(normalize_csqlite_value)
+        })
+        .map_err(|error| format!("C SQLite `PRAGMA busy_timeout` failed: {error}"))?;
+    profile.insert("busy_timeout".to_owned(), busy_timeout);
+    parse_worker_settings(&profile, "sqlite_wal_single_writer")
+}
+
+fn query_fsqlite_scalar(conn: &fsqlite::Connection, sql: &str) -> Result<String, String> {
+    let rows = fsqlite_e2e::block_on(conn.query(sql))
+        .map_err(|error| format!("FrankenSQLite `{sql}` failed: {error}"))?;
+    let row = rows
+        .first()
+        .ok_or_else(|| format!("FrankenSQLite `{sql}` returned no row"))?;
+    let value = row
+        .get(0)
+        .ok_or_else(|| format!("FrankenSQLite `{sql}` returned no first column"))?;
+    Ok(normalize_fsqlite_value(value))
+}
+
+fn query_fsqlite_concurrent_worker_settings(
+    conn: &fsqlite::Connection,
+) -> Result<JsonConcurrentWorkerSettings, String> {
+    if !conn.is_concurrent_mode_default() {
+        return Err("FrankenSQLite concurrent-writer mode is not enabled".to_owned());
+    }
+    let mut profile = query_effective_fsqlite_pragmas(conn)?;
+    profile.insert(
+        "busy_timeout".to_owned(),
+        query_fsqlite_scalar(conn, "PRAGMA busy_timeout;")?,
+    );
+    let pragma_mode = query_fsqlite_scalar(conn, "PRAGMA fsqlite.concurrent_mode;")?;
+    if !matches!(pragma_mode.as_str(), "1" | "true" | "on") {
+        return Err(format!(
+            "FrankenSQLite concurrent-mode readback was `{pragma_mode}`, expected enabled"
+        ));
+    }
+    parse_worker_settings(&profile, "fsqlite_mvcc_on")
+}
+
+fn configure_csqlite_concurrent_worker(
+    conn: &rusqlite::Connection,
+) -> Result<JsonConcurrentWorkerSettings, String> {
+    conn.execute_batch(&format!(
+        "PRAGMA page_size={};\
+         PRAGMA journal_mode=WAL;\
+         PRAGMA synchronous={};\
+         PRAGMA cache_size=-64000;\
+         PRAGMA busy_timeout=5000;",
+        benchmark_page_size_bytes(),
+        concurrent_sync_mode()
+    ))
+    .map_err(|error| format!("failed to configure C SQLite worker: {error}"))?;
+    query_csqlite_concurrent_worker_settings(conn)
+}
+
+fn configure_fsqlite_concurrent_worker(
+    conn: &fsqlite::Connection,
+) -> Result<JsonConcurrentWorkerSettings, String> {
+    for pragma in [
+        format!("PRAGMA page_size={};", benchmark_page_size_bytes()),
+        "PRAGMA journal_mode=WAL;".to_owned(),
+        format!("PRAGMA synchronous={};", concurrent_sync_mode()),
+        "PRAGMA cache_size=-64000;".to_owned(),
+        "PRAGMA fsqlite_capture_time_travel_snapshots=false;".to_owned(),
+        "PRAGMA fsqlite.concurrent_mode=ON;".to_owned(),
+        "PRAGMA busy_timeout=5000;".to_owned(),
+    ] {
+        fsqlite_e2e::block_on(conn.execute(&pragma)).map_err(|error| {
+            format!("failed to configure FrankenSQLite worker `{pragma}`: {error}")
+        })?;
+    }
+    query_fsqlite_concurrent_worker_settings(conn)
+}
+
+fn send_concurrent_event(
+    sender: &mpsc::SyncSender<ConcurrentWorkerEvent>,
+    event: ConcurrentWorkerEvent,
+) -> Result<(), String> {
+    sender
+        .send(event)
+        .map_err(|error| format!("concurrent coordinator stopped receiving events: {error}"))
+}
+
+fn csqlite_concurrent_worker(
+    path: &str,
+    worker_index: usize,
+    gate: &ConcurrentSampleGate,
+    sender: &mpsc::SyncSender<ConcurrentWorkerEvent>,
+) -> Result<(), String> {
+    let setup = (|| {
+        let conn = rusqlite::Connection::open(path)
+            .map_err(|error| format!("C SQLite worker {worker_index} open failed: {error}"))?;
+        let settings = configure_csqlite_concurrent_worker(&conn)?;
+        verify_concurrent_worker_settings(
+            "C SQLite",
+            worker_index,
+            &settings,
+            "sqlite_wal_single_writer",
+        )?;
+        let setup = ConcurrentWorkerSetup {
+            worker_index,
+            thread_id: current_thread_identity(),
+            cpu_affinity: current_thread_cpu_affinity()?,
+            settings,
+        };
+        Ok::<_, String>((conn, setup))
+    })();
+    let (conn, setup) = match setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            send_concurrent_event(
+                sender,
+                ConcurrentWorkerEvent::Setup {
+                    worker_index,
+                    outcome: Err(error.clone()),
+                },
+            )?;
+            return Err(error);
+        }
+    };
+    send_concurrent_event(
+        sender,
+        ConcurrentWorkerEvent::Setup {
+            worker_index,
+            outcome: Ok(setup),
+        },
+    )?;
+    gate.wait_for(ConcurrentGatePhase::Run)?;
+
+    let transaction = (|| {
+        conn.execute_batch("BEGIN")
+            .map_err(|error| format!("C SQLite worker {worker_index} BEGIN failed: {error}"))?;
+        #[allow(clippy::cast_possible_wrap)]
+        let base = worker_index as i64 * CONCURRENT_RANGE_SIZE;
+        {
+            let mut statement = conn
+                .prepare("INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7))")
+                .map_err(|error| {
+                    format!("C SQLite worker {worker_index} prepare failed: {error}")
+                })?;
+            #[allow(clippy::cast_possible_wrap)]
+            for row_index in 0..CONCURRENT_ROWS_PER_THREAD as i64 {
+                statement
+                    .execute(rusqlite::params![base + row_index])
+                    .map_err(|error| {
+                        format!("C SQLite worker {worker_index} INSERT {row_index} failed: {error}")
+                    })?;
+            }
+        }
+        conn.execute_batch("COMMIT")
+            .map_err(|error| format!("C SQLite worker {worker_index} COMMIT failed: {error}"))?;
+        Ok::<_, String>(CONCURRENT_ROWS_PER_THREAD)
+    })();
+    match transaction {
+        Ok(completed_rows) => send_concurrent_event(
+            sender,
+            ConcurrentWorkerEvent::Done {
+                worker_index,
+                outcome: Ok(completed_rows),
+            },
+        )?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            send_concurrent_event(
+                sender,
+                ConcurrentWorkerEvent::Done {
+                    worker_index,
+                    outcome: Err(error.clone()),
+                },
+            )?;
+            return Err(error);
+        }
+    }
+
+    gate.wait_for(ConcurrentGatePhase::Postflight)?;
+    let postflight = (|| {
+        let settings = query_csqlite_concurrent_worker_settings(&conn)?;
+        verify_concurrent_worker_settings(
+            "C SQLite postflight",
+            worker_index,
+            &settings,
+            "sqlite_wal_single_writer",
+        )?;
+        Ok::<_, String>(ConcurrentWorkerPostflight {
+            worker_index,
+            thread_id: current_thread_identity(),
+            cpu_affinity: current_thread_cpu_affinity()?,
+            settings,
+        })
+    })();
+    let failed = postflight.as_ref().err().cloned();
+    send_concurrent_event(
+        sender,
+        ConcurrentWorkerEvent::Postflight {
+            worker_index,
+            outcome: postflight,
+        },
+    )?;
+    failed.map_or(Ok(()), Err)
+}
+
+fn execute_fsqlite_concurrent_transaction(
+    conn: &fsqlite::Connection,
+    worker_index: usize,
+) -> Result<usize, String> {
+    #[allow(clippy::cast_possible_wrap)]
+    let base = worker_index as i64 * CONCURRENT_RANGE_SIZE;
+    let mut retry_count = 0_u32;
+    const TXN_MAX_RETRIES: u32 = 128;
+    let jitter_salt = u64::try_from(worker_index).map_or(u64::MAX, |value| value.saturating_add(1));
+    'transaction: loop {
+        if let Err(error) = fsqlite_e2e::block_on(conn.execute("BEGIN CONCURRENT")) {
+            if error.is_transient() && retry_count < TXN_MAX_RETRIES {
+                sleep_bench_busy_backoff(retry_count, jitter_salt);
+                retry_count += 1;
+                continue;
+            }
+            return Err(format!(
+                "FrankenSQLite worker {worker_index} BEGIN CONCURRENT failed after {retry_count} retries: {error}"
+            ));
+        }
+        let statement = match fsqlite_e2e::block_on(
+            conn.prepare("INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7))"),
+        ) {
+            Ok(statement) => statement,
+            Err(error) => {
+                let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
+                return Err(format!(
+                    "FrankenSQLite worker {worker_index} prepare failed: {error}"
+                ));
+            }
+        };
+        #[allow(clippy::cast_possible_wrap)]
+        for row_index in 0..CONCURRENT_ROWS_PER_THREAD as i64 {
+            match fsqlite_e2e::block_on(
+                statement.execute_with_params(&[fsqlite::SqliteValue::Integer(base + row_index)]),
+            ) {
+                Ok(1) => {}
+                Ok(affected) => {
+                    let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
+                    return Err(format!(
+                        "FrankenSQLite worker {worker_index} INSERT {row_index} affected {affected} rows"
+                    ));
+                }
+                Err(error) if error.is_transient() && retry_count < TXN_MAX_RETRIES => {
+                    fsqlite_e2e::block_on(conn.execute("ROLLBACK")).map_err(
+                        |rollback_error| {
+                            format!(
+                                "FrankenSQLite worker {worker_index} rollback after INSERT retry failed: {rollback_error}"
+                            )
+                        },
+                    )?;
+                    sleep_bench_busy_backoff(retry_count, jitter_salt);
+                    retry_count += 1;
+                    continue 'transaction;
+                }
+                Err(error) => {
+                    let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
+                    return Err(format!(
+                        "FrankenSQLite worker {worker_index} INSERT {row_index} failed after {retry_count} retries: {error}"
+                    ));
+                }
+            }
+        }
+        match fsqlite_e2e::block_on(conn.execute("COMMIT")) {
+            Ok(_) => return Ok(CONCURRENT_ROWS_PER_THREAD),
+            Err(error) if error.is_transient() && retry_count < TXN_MAX_RETRIES => {
+                fsqlite_e2e::block_on(conn.execute("ROLLBACK")).map_err(|rollback_error| {
+                    format!(
+                        "FrankenSQLite worker {worker_index} rollback after COMMIT retry failed: {rollback_error}"
+                    )
+                })?;
+                sleep_bench_busy_backoff(retry_count, jitter_salt);
+                retry_count += 1;
+            }
+            Err(error) => {
+                let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
+                return Err(format!(
+                    "FrankenSQLite worker {worker_index} COMMIT failed after {retry_count} retries: {error}"
+                ));
+            }
+        }
+    }
+}
+
+fn fsqlite_concurrent_worker(
+    path: &str,
+    worker_index: usize,
+    gate: &ConcurrentSampleGate,
+    sender: &mpsc::SyncSender<ConcurrentWorkerEvent>,
+) -> Result<(), String> {
+    let setup = (|| {
+        let conn = fsqlite_e2e::block_on(fsqlite::Connection::open_with_page_size(
+            path,
+            benchmark_page_size_bytes(),
+        ))
+        .map_err(|error| format!("FrankenSQLite worker {worker_index} open failed: {error}"))?;
+        let settings = configure_fsqlite_concurrent_worker(&conn)?;
+        verify_concurrent_worker_settings(
+            "FrankenSQLite",
+            worker_index,
+            &settings,
+            "fsqlite_mvcc_on",
+        )?;
+        let setup = ConcurrentWorkerSetup {
+            worker_index,
+            thread_id: current_thread_identity(),
+            cpu_affinity: current_thread_cpu_affinity()?,
+            settings,
+        };
+        Ok::<_, String>((conn, setup))
+    })();
+    let (conn, setup) = match setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            send_concurrent_event(
+                sender,
+                ConcurrentWorkerEvent::Setup {
+                    worker_index,
+                    outcome: Err(error.clone()),
+                },
+            )?;
+            return Err(error);
+        }
+    };
+    send_concurrent_event(
+        sender,
+        ConcurrentWorkerEvent::Setup {
+            worker_index,
+            outcome: Ok(setup),
+        },
+    )?;
+    gate.wait_for(ConcurrentGatePhase::Run)?;
+
+    match execute_fsqlite_concurrent_transaction(&conn, worker_index) {
+        Ok(completed_rows) => send_concurrent_event(
+            sender,
+            ConcurrentWorkerEvent::Done {
+                worker_index,
+                outcome: Ok(completed_rows),
+            },
+        )?,
+        Err(error) => {
+            send_concurrent_event(
+                sender,
+                ConcurrentWorkerEvent::Done {
+                    worker_index,
+                    outcome: Err(error.clone()),
+                },
+            )?;
+            return Err(error);
+        }
+    }
+
+    gate.wait_for(ConcurrentGatePhase::Postflight)?;
+    let postflight = (|| {
+        let settings = query_fsqlite_concurrent_worker_settings(&conn)?;
+        verify_concurrent_worker_settings(
+            "FrankenSQLite postflight",
+            worker_index,
+            &settings,
+            "fsqlite_mvcc_on",
+        )?;
+        Ok::<_, String>(ConcurrentWorkerPostflight {
+            worker_index,
+            thread_id: current_thread_identity(),
+            cpu_affinity: current_thread_cpu_affinity()?,
+            settings,
+        })
+    })();
+    let failed = postflight.as_ref().err().cloned();
+    send_concurrent_event(
+        sender,
+        ConcurrentWorkerEvent::Postflight {
+            worker_index,
+            outcome: postflight,
+        },
+    )?;
+    failed.map_or(Ok(()), Err)
+}
+
+const CONCURRENT_EVENT_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn receive_concurrent_setups(
+    receiver: &mpsc::Receiver<ConcurrentWorkerEvent>,
+    worker_count: usize,
+) -> Result<BTreeMap<usize, ConcurrentWorkerSetup>, String> {
+    let mut setups = BTreeMap::new();
+    let deadline = Instant::now()
+        .checked_add(CONCURRENT_EVENT_TIMEOUT)
+        .ok_or_else(|| "worker setup deadline overflowed Instant".to_owned())?;
+    for _ in 0..worker_count {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| "timed out waiting for all worker setup receipts".to_owned())?;
+        match receiver.recv_timeout(remaining) {
+            Ok(ConcurrentWorkerEvent::Setup {
+                worker_index,
+                outcome,
+            }) => {
+                let setup = outcome?;
+                if setup.worker_index != worker_index {
+                    return Err(format!(
+                        "setup event index {worker_index} carried worker {}",
+                        setup.worker_index
+                    ));
+                }
+                if setups.insert(worker_index, setup).is_some() {
+                    return Err(format!("duplicate setup event for worker {worker_index}"));
+                }
+            }
+            Ok(event) => return Err(format!("expected worker setup event, observed {event:?}")),
+            Err(error) => return Err(format!("timed out waiting for worker setup: {error}")),
+        }
+    }
+    Ok(setups)
+}
+
+fn receive_concurrent_completions(
+    receiver: &mpsc::Receiver<ConcurrentWorkerEvent>,
+    worker_count: usize,
+) -> Result<BTreeMap<usize, usize>, String> {
+    let mut completions = BTreeMap::new();
+    let deadline = Instant::now()
+        .checked_add(CONCURRENT_EVENT_TIMEOUT)
+        .ok_or_else(|| "worker completion deadline overflowed Instant".to_owned())?;
+    for _ in 0..worker_count {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| "timed out waiting for all worker completion receipts".to_owned())?;
+        match receiver.recv_timeout(remaining) {
+            Ok(ConcurrentWorkerEvent::Done {
+                worker_index,
+                outcome,
+            }) => {
+                let completed_rows = outcome?;
+                if completions.insert(worker_index, completed_rows).is_some() {
+                    return Err(format!(
+                        "duplicate completion event for worker {worker_index}"
+                    ));
+                }
+            }
+            Ok(event) => {
+                return Err(format!(
+                    "expected worker completion event, observed {event:?}"
+                ));
+            }
+            Err(error) => return Err(format!("timed out waiting for worker completion: {error}")),
+        }
+    }
+    Ok(completions)
+}
+
+fn receive_concurrent_postflights(
+    receiver: &mpsc::Receiver<ConcurrentWorkerEvent>,
+    worker_count: usize,
+) -> Result<BTreeMap<usize, ConcurrentWorkerPostflight>, String> {
+    let mut postflights = BTreeMap::new();
+    let deadline = Instant::now()
+        .checked_add(CONCURRENT_EVENT_TIMEOUT)
+        .ok_or_else(|| "worker postflight deadline overflowed Instant".to_owned())?;
+    for _ in 0..worker_count {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| "timed out waiting for all worker postflight receipts".to_owned())?;
+        match receiver.recv_timeout(remaining) {
+            Ok(ConcurrentWorkerEvent::Postflight {
+                worker_index,
+                outcome,
+            }) => {
+                let postflight = outcome?;
+                if postflight.worker_index != worker_index {
+                    return Err(format!(
+                        "postflight event index {worker_index} carried worker {}",
+                        postflight.worker_index
+                    ));
+                }
+                if postflights.insert(worker_index, postflight).is_some() {
+                    return Err(format!(
+                        "duplicate postflight event for worker {worker_index}"
+                    ));
+                }
+            }
+            Ok(event) => {
+                return Err(format!(
+                    "expected worker postflight event, observed {event:?}"
+                ));
+            }
+            Err(error) => return Err(format!("timed out waiting for worker postflight: {error}")),
+        }
+    }
+    Ok(postflights)
+}
+
+fn join_concurrent_workers(handles: Vec<BenchTask<Result<(), String>>>) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for handle in handles {
+        match handle.try_wait() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) | Err(error) => errors.push(error),
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn abort_concurrent_sample(
+    gate: &ConcurrentSampleGate,
+    handles: Vec<BenchTask<Result<(), String>>>,
+    error: String,
+) -> String {
+    gate.abort();
+    match join_concurrent_workers(handles) {
+        Ok(()) => error,
+        Err(worker_error) => format!("{error}; worker shutdown: {worker_error}"),
+    }
+}
+
+fn expected_concurrent_id_sum(worker_count: usize) -> Result<i64, String> {
+    let rows = i128::try_from(CONCURRENT_ROWS_PER_THREAD)
+        .map_err(|_| "row count exceeds i128".to_owned())?;
+    let range = i128::from(CONCURRENT_RANGE_SIZE);
+    let mut sum = 0_i128;
+    for worker_index in 0..worker_count {
+        let worker =
+            i128::try_from(worker_index).map_err(|_| "worker index exceeds i128".to_owned())?;
+        let base = worker
+            .checked_mul(range)
+            .ok_or_else(|| "concurrent row-id base overflowed i128".to_owned())?;
+        let sequence = rows
+            .checked_mul(rows.saturating_sub(1))
+            .and_then(|value| value.checked_div(2))
+            .ok_or_else(|| "concurrent row-id sequence sum overflowed i128".to_owned())?;
+        sum = sum
+            .checked_add(
+                rows.checked_mul(base)
+                    .and_then(|value| value.checked_add(sequence))
+                    .ok_or_else(|| "concurrent worker row-id sum overflowed i128".to_owned())?,
+            )
+            .ok_or_else(|| "concurrent row-id sum overflowed i128".to_owned())?;
+    }
+    i64::try_from(sum).map_err(|_| "concurrent row-id sum exceeds i64".to_owned())
+}
+
+struct ConcurrentSampleContext<'a> {
+    engine: &'a str,
+    phase: &'a str,
+    sample_index: usize,
+    worker_count: usize,
+    expected_cpu_affinity: String,
+    gate: Arc<ConcurrentSampleGate>,
+    receiver: mpsc::Receiver<ConcurrentWorkerEvent>,
+    handles: Vec<BenchTask<Result<(), String>>>,
+}
+
+fn coordinate_concurrent_sample<F>(
+    context: ConcurrentSampleContext<'_>,
+    verify_database: F,
+) -> Result<ConcurrentSample, String>
+where
+    F: FnOnce() -> Result<(usize, i64), String>,
+{
+    let ConcurrentSampleContext {
+        engine,
+        phase,
+        sample_index,
+        worker_count,
+        expected_cpu_affinity,
+        gate,
+        receiver,
+        handles,
+    } = context;
+    let setups = match receive_concurrent_setups(&receiver, worker_count) {
+        Ok(setups) => setups,
+        Err(error) => {
+            return Err(abort_concurrent_sample(&gate, handles, error));
+        }
+    };
+    let setup_indices = setups.keys().copied().collect::<Vec<_>>();
+    let expected_indices = (0..worker_count).collect::<Vec<_>>();
+    if setup_indices != expected_indices {
+        return Err(abort_concurrent_sample(
+            &gate,
+            handles,
+            format!(
+                "{engine} setup worker indices mismatch: expected {expected_indices:?}, observed {setup_indices:?}"
+            ),
+        ));
+    }
+    let mut setup_thread_ids = std::collections::BTreeSet::new();
+    for worker_index in 0..worker_count {
+        let setup = setups
+            .get(&worker_index)
+            .expect("setup worker indices were validated");
+        if setup.cpu_affinity != expected_cpu_affinity {
+            return Err(abort_concurrent_sample(
+                &gate,
+                handles,
+                format!(
+                    "{engine} worker {worker_index} setup affinity mismatch: expected `{expected_cpu_affinity}`, observed `{}`",
+                    setup.cpu_affinity
+                ),
+            ));
+        }
+        if !setup_thread_ids.insert(setup.thread_id.clone()) {
+            return Err(abort_concurrent_sample(
+                &gate,
+                handles,
+                format!(
+                    "{engine} setup reused thread identity `{}` across workers",
+                    setup.thread_id
+                ),
+            ));
+        }
+    }
+
+    let start = Instant::now();
+    if let Err(error) = gate.transition(ConcurrentGatePhase::Preparing, ConcurrentGatePhase::Run) {
+        return Err(abort_concurrent_sample(&gate, handles, error));
+    }
+    let completions = match receive_concurrent_completions(&receiver, worker_count) {
+        Ok(completions) => completions,
+        Err(error) => {
+            return Err(abort_concurrent_sample(&gate, handles, error));
+        }
+    };
+    let elapsed = start.elapsed();
+    if let Err(error) = gate.transition(ConcurrentGatePhase::Run, ConcurrentGatePhase::Postflight) {
+        return Err(abort_concurrent_sample(&gate, handles, error));
+    }
+    let postflights = match receive_concurrent_postflights(&receiver, worker_count) {
+        Ok(postflights) => postflights,
+        Err(error) => {
+            return Err(abort_concurrent_sample(&gate, handles, error));
+        }
+    };
+    join_concurrent_workers(handles)?;
+
+    let expected_rows = worker_count
+        .checked_mul(CONCURRENT_ROWS_PER_THREAD)
+        .ok_or_else(|| "concurrent expected row count overflowed usize".to_owned())?;
+    let completed_rows = completions.values().try_fold(0_usize, |total, rows| {
+        total
+            .checked_add(*rows)
+            .ok_or_else(|| "concurrent completed row count overflowed usize".to_owned())
+    })?;
+    let expected_id_sum = expected_concurrent_id_sum(worker_count)?;
+    let (database_rows, database_id_sum) = verify_database()?;
+    if completed_rows != expected_rows
+        || database_rows != expected_rows
+        || database_id_sum != expected_id_sum
+    {
+        return Err(format!(
+            "{engine} work oracle mismatch: expected rows={expected_rows} id_sum={expected_id_sum}, \
+             completed rows={completed_rows}, database rows={database_rows} id_sum={database_id_sum}"
+        ));
+    }
+
+    let mut workers = Vec::with_capacity(worker_count);
+    for worker_index in 0..worker_count {
+        let setup = setups
+            .get(&worker_index)
+            .ok_or_else(|| format!("missing setup receipt for worker {worker_index}"))?;
+        let postflight = postflights
+            .get(&worker_index)
+            .ok_or_else(|| format!("missing postflight receipt for worker {worker_index}"))?;
+        let completed = completions
+            .get(&worker_index)
+            .copied()
+            .ok_or_else(|| format!("missing completion receipt for worker {worker_index}"))?;
+        if setup.settings != postflight.settings {
+            return Err(format!(
+                "{engine} worker {worker_index} settings changed during timed execution: setup={:?}, postflight={:?}",
+                setup.settings, postflight.settings
+            ));
+        }
+        let thread_identity_verified = setup.thread_id == postflight.thread_id;
+        let thread_affinity_verified = setup.cpu_affinity == postflight.cpu_affinity
+            && setup.cpu_affinity == expected_cpu_affinity;
+        if !thread_identity_verified || !thread_affinity_verified {
+            return Err(format!(
+                "{engine} worker {worker_index} identity/affinity changed: setup thread={} affinity={}, postflight thread={} affinity={}",
+                setup.thread_id, setup.cpu_affinity, postflight.thread_id, postflight.cpu_affinity
+            ));
+        }
+        workers.push(JsonConcurrentWorkerReceipt {
+            worker_index,
+            setup_thread_id: setup.thread_id.clone(),
+            postflight_thread_id: postflight.thread_id.clone(),
+            setup_cpu_affinity: setup.cpu_affinity.clone(),
+            postflight_cpu_affinity: postflight.cpu_affinity.clone(),
+            completed_rows: completed,
+            settings: setup.settings.clone(),
+            settings_verified: true,
+            thread_identity_verified,
+            thread_affinity_verified,
+        });
+    }
+
+    Ok(ConcurrentSample {
+        elapsed,
+        readiness: JsonConcurrentSampleReadiness {
+            phase: phase.to_owned(),
+            sample_index,
+            engine: engine.to_owned(),
+            expected_cpu_affinity,
+            expected_workers: worker_count,
+            expected_rows,
+            completed_rows,
+            database_rows,
+            expected_id_sum,
+            database_id_sum,
+            timed_scope:
+                "gate release through receipt of every worker's committed row count; runtime, file, schema, connection setup, PRAGMA verification, postflight verification, work oracle, and teardown excluded"
+                    .to_owned(),
+            workers,
+        },
+    })
+}
+
+fn run_csqlite_concurrent_sample(
+    worker_count: usize,
+    phase: &str,
+    sample_index: usize,
+) -> Result<ConcurrentSample, String> {
+    let runtime = RuntimeBuilder::new()
+        .blocking_threads(worker_count, worker_count)
+        .build()
+        .map_err(|error| format!("could not build C SQLite benchmark runtime: {error}"))?;
+    let temporary = tempfile::NamedTempFile::new()
+        .map_err(|error| format!("could not create C SQLite benchmark file: {error}"))?;
+    let path = temporary
+        .path()
+        .to_str()
+        .ok_or_else(|| "C SQLite benchmark path is not UTF-8".to_owned())?
+        .to_owned();
+    {
+        let setup = rusqlite::Connection::open(&path)
+            .map_err(|error| format!("C SQLite setup open failed: {error}"))?;
+        configure_csqlite_concurrent_worker(&setup)?;
+        setup
+            .execute_batch(
+                "CREATE TABLE bench \
+                 (id INTEGER PRIMARY KEY, name TEXT, score INTEGER);",
+            )
+            .map_err(|error| format!("C SQLite setup schema failed: {error}"))?;
+    }
+
+    let expected_cpu_affinity = concurrent_expected_cpu_affinity()?;
+    let gate = Arc::new(ConcurrentSampleGate::new());
+    let capacity = worker_count.saturating_mul(3).max(1);
+    let (sender, receiver) = mpsc::sync_channel(capacity);
+    let handles = (0..worker_count)
+        .map(|worker_index| {
+            let path = path.clone();
+            let gate = Arc::clone(&gate);
+            let sender = sender.clone();
+            spawn_bench_task(&runtime, move || {
+                csqlite_concurrent_worker(&path, worker_index, &gate, &sender)
+            })
+        })
+        .collect::<Vec<_>>();
+    drop(sender);
+
+    let verify_path = path.clone();
+    coordinate_concurrent_sample(
+        ConcurrentSampleContext {
+            engine: "csqlite",
+            phase,
+            sample_index,
+            worker_count,
+            expected_cpu_affinity,
+            gate,
+            receiver,
+            handles,
+        },
+        move || {
+            let connection = rusqlite::Connection::open(&verify_path)
+                .map_err(|error| format!("C SQLite oracle open failed: {error}"))?;
+            let (count, sum) = connection
+                .query_row(
+                    "SELECT COUNT(*), COALESCE(SUM(id), 0) FROM bench",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .map_err(|error| format!("C SQLite work oracle failed: {error}"))?;
+            let count = usize::try_from(count)
+                .map_err(|_| "C SQLite work oracle count was negative".to_owned())?;
+            Ok((count, sum))
+        },
+    )
+}
+
+fn run_fsqlite_concurrent_sample(
+    worker_count: usize,
+    phase: &str,
+    sample_index: usize,
+) -> Result<ConcurrentSample, String> {
+    let runtime = RuntimeBuilder::new()
+        .blocking_threads(worker_count, worker_count)
+        .build()
+        .map_err(|error| format!("could not build FrankenSQLite benchmark runtime: {error}"))?;
+    let temporary = tempfile::NamedTempFile::new()
+        .map_err(|error| format!("could not create FrankenSQLite benchmark file: {error}"))?;
+    let path = temporary
+        .path()
+        .to_str()
+        .ok_or_else(|| "FrankenSQLite benchmark path is not UTF-8".to_owned())?
+        .to_owned();
+    {
+        let setup = fsqlite_e2e::block_on(fsqlite::Connection::open_with_page_size(
+            &path,
+            benchmark_page_size_bytes(),
+        ))
+        .map_err(|error| format!("FrankenSQLite setup open failed: {error}"))?;
+        configure_fsqlite_concurrent_worker(&setup)?;
+        fsqlite_e2e::block_on(
+            setup.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)"),
+        )
+        .map_err(|error| format!("FrankenSQLite setup schema failed: {error}"))?;
+    }
+
+    let expected_cpu_affinity = concurrent_expected_cpu_affinity()?;
+    let gate = Arc::new(ConcurrentSampleGate::new());
+    let capacity = worker_count.saturating_mul(3).max(1);
+    let (sender, receiver) = mpsc::sync_channel(capacity);
+    let handles = (0..worker_count)
+        .map(|worker_index| {
+            let path = path.clone();
+            let gate = Arc::clone(&gate);
+            let sender = sender.clone();
+            spawn_bench_task(&runtime, move || {
+                fsqlite_concurrent_worker(&path, worker_index, &gate, &sender)
+            })
+        })
+        .collect::<Vec<_>>();
+    drop(sender);
+
+    let verify_path = path.clone();
+    coordinate_concurrent_sample(
+        ConcurrentSampleContext {
+            engine: "fsqlite",
+            phase,
+            sample_index,
+            worker_count,
+            expected_cpu_affinity,
+            gate,
+            receiver,
+            handles,
+        },
+        move || {
+            let connection = fsqlite_e2e::block_on(fsqlite::Connection::open_with_page_size(
+                &verify_path,
+                benchmark_page_size_bytes(),
+            ))
+            .map_err(|error| format!("FrankenSQLite oracle open failed: {error}"))?;
+            let rows = fsqlite_e2e::block_on(
+                connection.query("SELECT COUNT(*), COALESCE(SUM(id), 0) FROM bench"),
+            )
+            .map_err(|error| format!("FrankenSQLite work oracle failed: {error}"))?;
+            let row = rows
+                .first()
+                .ok_or_else(|| "FrankenSQLite work oracle returned no row".to_owned())?;
+            let count = usize::try_from(fsqlite_integer(
+                row,
+                0,
+                "FrankenSQLite concurrent work oracle count",
+            ))
+            .map_err(|_| "FrankenSQLite work oracle count was negative".to_owned())?;
+            let sum = fsqlite_integer(row, 1, "FrankenSQLite concurrent work oracle sum");
+            Ok((count, sum))
+        },
+    )
+}
+
 // ─── Section 4: Concurrent writers ─────────────────────────────────────
 
 fn bench_concurrent_writers(report: &mut BenchReport) {
@@ -5066,7 +7566,9 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
              `FSQLITE_BENCH_CONCURRENT_SYNC=full` to match them at FULL instead). \
              C SQLite uses WAL + busy_timeout, FrankenSQLite uses the \
              MVCC page-lock table via `PRAGMA fsqlite.concurrent_mode=ON` + \
-             `BEGIN CONCURRENT` (falling back to plain BEGIN if the pragma is declined). \
+             `BEGIN CONCURRENT`. Every scored worker connection proves its effective \
+             PRAGMAs, thread identity, CPU affinity, completed-row count, and an untimed \
+             database count/sum oracle. Setup and postflight work are outside the timer. \
              This mirrors the standalone `mt_mvcc_bench` harness. NOTE: this file-backed \
              section is disk-noise-bound on shared hosts (C medians have been observed \
              spreading 95-138 ms at 2 writers, CV up to 104%); cite `mt_mvcc_bench` for \
@@ -5080,93 +7582,11 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
         let total_rows = n_threads * CONCURRENT_ROWS_PER_THREAD;
         eprint!("  Benchmarking {n_threads} concurrent writers ({total_rows} total rows)... ");
 
-        // Built ONCE per thread count and reused across every warmup and timed
-        // iteration of both arms. It used to be constructed inside each `measure`
-        // closure, which put a full runtime build plus `n_threads` OS-thread spawns
-        // inside the timed region on all 12 iterations of both engines. A 2026-05-06
-        // profile attributed roughly HALF of all concurrent-filter samples to
-        // `Runtime::with_config_and_platform` / `pthread_create`; the fix was proposed
-        // then, measured at 1.02x, and rejected with no A/A null control — a
-        // VOID-NONULL row that could not distinguish the lever from the harness.
-        //
-        // Both arms paid it, so it was a shared additive constant, and a shared
-        // additive constant biases a RATIO toward 1.0 — it compressed the engine
-        // difference this section exists to measure. Hoisting it is a measurement
-        // correctness fix, not a performance lever: it changes what the timed region
-        // contains, so numbers before and after are not comparable.
-        //
-        // The tempfile and schema deliberately stay inside the closure: each iteration
-        // needs a fresh empty table, or rows accumulate across samples.
-        let runtime = RuntimeBuilder::new()
-            .blocking_threads(n_threads, n_threads)
-            .build()
-            .expect("comprehensive benchmark runtime should build");
-
-        // C SQLite: file-backed WAL with multiple connections.
-        let cs = measure(&format!("cs_concurrent_{n_threads}t"), total_rows, || {
-            let tmp = tempfile::NamedTempFile::new().unwrap();
-            let path = tmp.path().to_str().unwrap().to_owned();
-            {
-                let setup = rusqlite::Connection::open(&path).unwrap();
-                apply_pragmas_csqlite(&setup);
-                setup
-                    .execute_batch(
-                        "CREATE TABLE bench \
-                         (id INTEGER PRIMARY KEY, name TEXT, score INTEGER);",
-                    )
-                    .unwrap();
-            }
-
-            let barrier = Arc::new(Barrier::new(n_threads));
-            let handles: Vec<_> = (0..n_threads)
-                .map(|tid| {
-                    let p = path.clone();
-                    let bar = Arc::clone(&barrier);
-                    spawn_bench_task(&runtime, move || {
-                        // Enter the start gate before any fallible setup so one
-                        // worker error cannot strand the rest at the barrier.
-                        bar.wait();
-                        let conn = rusqlite::Connection::open(&p).unwrap();
-                        // Both `cache_size` and `synchronous` are
-                        // connection-local: configuring only the setup
-                        // connection would silently give C SQLite a different
-                        // scored workload than FrankenSQLite, and would leave
-                        // these writers on the compiled FULL default while
-                        // FrankenSQLite runs NORMAL (bd-x5gzk).
-                        apply_pragmas_csqlite(&conn);
-                        conn.execute_batch("PRAGMA busy_timeout=5000;").unwrap();
-                        let mode = concurrent_sync_mode();
-                        conn.execute_batch(&format!("PRAGMA synchronous={mode};"))
-                            .unwrap();
-
-                        conn.execute_batch("BEGIN").unwrap();
-                        #[allow(clippy::cast_possible_wrap)]
-                        let base = tid as i64 * CONCURRENT_RANGE_SIZE;
-                        let mut stmt = conn
-                            .prepare("INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7))")
-                            .unwrap();
-                        #[allow(clippy::cast_possible_wrap)]
-                        for i in 0..CONCURRENT_ROWS_PER_THREAD as i64 {
-                            stmt.execute(rusqlite::params![base + i]).unwrap();
-                        }
-                        conn.execute_batch("COMMIT").unwrap();
-                    })
-                })
-                .collect();
-
-            for h in handles {
-                h.wait();
-            }
-        });
-
-        // FrankenSQLite: file-backed WAL with multiple connections, one per
-        // OS thread — mirrors the C SQLite arm exactly. Connection is
-        // !Send + !Sync so each thread must call fsqlite::Connection::open
-        // locally inside its spawn closure. Uses BEGIN CONCURRENT where the
-        // `fsqlite.concurrent_mode` pragma is accepted (the MVCC mode that's
-        // the whole point of FrankenSQLite); falls back to plain BEGIN
-        // otherwise. See also crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs
-        // for the standalone reference implementation of this pattern.
+        let (cs, csqlite_readiness) = measure_concurrent(
+            &format!("cs_concurrent_{n_threads}t"),
+            total_rows,
+            |phase, sample_index| run_csqlite_concurrent_sample(n_threads, phase, sample_index),
+        );
         let profile_scope = if profile_concurrent_enabled {
             let previous_hot_path_profile_enabled = hot_path_profile_enabled();
             set_hot_path_profile_enabled(true);
@@ -5178,128 +7598,11 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
         } else {
             None
         };
-        let fs = measure(&format!("fs_concurrent_{n_threads}t"), total_rows, || {
-            // Reuses the runtime hoisted above the C arm, for the same reason and
-            // so both engines are measured over an identical timed region.
-            let tmp = tempfile::NamedTempFile::new().unwrap();
-            let path = tmp.path().to_str().unwrap().to_owned();
-            {
-                let setup = fsqlite_e2e::block_on(fsqlite::Connection::open_with_page_size(
-                    &path,
-                    benchmark_page_size_bytes(),
-                ))
-                .unwrap();
-                apply_pragmas_fsqlite(&setup);
-                fs_execute(
-                    &setup,
-                    "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
-                );
-            }
-
-            let barrier = Arc::new(Barrier::new(n_threads));
-            let handles: Vec<_> = (0..n_threads)
-                .map(|tid| {
-                    let p = path.clone();
-                    let bar = Arc::clone(&barrier);
-                    spawn_bench_task(&runtime, move || {
-                        // Enter the start gate before any fallible setup so one
-                        // worker error cannot strand the rest at the barrier.
-                        bar.wait();
-                        let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(&p)).unwrap();
-                        apply_pragmas_fsqlite(&conn);
-                        let mode = concurrent_sync_mode();
-                        fsqlite_e2e::block_on(conn.execute(&format!("PRAGMA synchronous={mode};")))
-                            .unwrap_or_else(|error| {
-                                panic!("failed to set FrankenSQLite synchronous={mode}: {error}")
-                            });
-                        fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;"))
-                            .unwrap_or_else(|error| {
-                                panic!("failed to enable concurrent writer mode: {error}")
-                            });
-                        fsqlite_e2e::block_on(conn.execute("PRAGMA busy_timeout=5000;"))
-                            .unwrap_or_else(|error| {
-                                panic!("failed to set FrankenSQLite busy_timeout: {error}")
-                            });
-
-                        let begin_sql = "BEGIN CONCURRENT";
-
-                        // Mirror `mt_mvcc_bench`'s pattern: wrap the entire
-                        // BEGIN + N*INSERT + COMMIT in a retry loop, because
-                        // a BusySnapshot on any individual statement aborts
-                        // the whole MVCC transaction (rollback required
-                        // before re-BEGIN). Per-statement retries cannot
-                        // recover once the containing txn is poisoned.
-                        #[allow(clippy::cast_possible_wrap)]
-                        let base = tid as i64 * CONCURRENT_RANGE_SIZE;
-                        let mut retry_count = 0_u32;
-                        const TXN_MAX_RETRIES: u32 = 128;
-                        let jitter_salt =
-                            u64::try_from(tid).map_or(u64::MAX, |value| value.saturating_add(1));
-                        'txn: loop {
-                            if let Err(e) = fsqlite_e2e::block_on(conn.execute(begin_sql)) {
-                                if e.is_transient() && retry_count < TXN_MAX_RETRIES {
-                                    sleep_bench_busy_backoff(retry_count, jitter_salt);
-                                    retry_count += 1;
-                                    continue;
-                                }
-                                panic!("fsqlite BEGIN failed after retries: {e}");
-                            }
-                            let stmt = fs_prepare(
-                                &conn,
-                                "INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7))",
-                            );
-                            #[allow(clippy::cast_possible_wrap)]
-                            for i in 0..CONCURRENT_ROWS_PER_THREAD as i64 {
-                                match fsqlite_e2e::block_on(stmt.execute_with_params(&[
-                                    fsqlite::SqliteValue::Integer(base + i),
-                                ])) {
-                                    Ok(_) => {}
-                                    Err(e) if e.is_transient() && retry_count < TXN_MAX_RETRIES => {
-                                        fsqlite_e2e::block_on(conn.execute("ROLLBACK"))
-                                            .unwrap_or_else(|rollback_error| {
-                                                panic!(
-                                                    "fsqlite rollback after INSERT retry failed: \
-                                                     {rollback_error}"
-                                                )
-                                            });
-                                        sleep_bench_busy_backoff(retry_count, jitter_salt);
-                                        retry_count += 1;
-                                        continue 'txn;
-                                    }
-                                    Err(e) => panic!(
-                                        "fsqlite INSERT tid={tid} i={i} failed: {e} \
-                                         (retry_count={retry_count})"
-                                    ),
-                                }
-                            }
-                            match fsqlite_e2e::block_on(conn.execute("COMMIT")) {
-                                Ok(_) => break 'txn,
-                                Err(e) if e.is_transient() && retry_count < TXN_MAX_RETRIES => {
-                                    fsqlite_e2e::block_on(conn.execute("ROLLBACK")).unwrap_or_else(
-                                        |rollback_error| {
-                                            panic!(
-                                                "fsqlite rollback after COMMIT retry failed: \
-                                                 {rollback_error}"
-                                            )
-                                        },
-                                    );
-                                    sleep_bench_busy_backoff(retry_count, jitter_salt);
-                                    retry_count += 1;
-                                }
-                                Err(e) => panic!(
-                                    "fsqlite COMMIT tid={tid} failed: {e} \
-                                     (retry_count={retry_count})"
-                                ),
-                            }
-                        }
-                    })
-                })
-                .collect();
-
-            for h in handles {
-                h.wait();
-            }
-        });
+        let (fs, fsqlite_readiness) = measure_concurrent(
+            &format!("fs_concurrent_{n_threads}t"),
+            total_rows,
+            |phase, sample_index| run_fsqlite_concurrent_sample(n_threads, phase, sample_index),
+        );
         let fsqlite_concurrent_profile =
             if let Some((previous_hot_path_profile_enabled, wal_before)) = profile_scope {
                 let profile = hot_path_profile_snapshot();
@@ -5350,11 +7653,15 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
             format_duration(cs.median()),
             format_duration(fs.median())
         );
-        section.add_row_with_fsqlite_concurrent_profile(
+        section.add_row_with_concurrent_details(
             &format!("{n_threads} writers x {CONCURRENT_ROWS_PER_THREAD} rows"),
             Some(cs),
             Some(fs),
             fsqlite_concurrent_profile,
+            Some(JsonConcurrentReadiness {
+                csqlite_samples: csqlite_readiness,
+                fsqlite_samples: fsqlite_readiness,
+            }),
         );
     }
 
@@ -5372,13 +7679,15 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
             let tmp = tempfile::NamedTempFile::new().unwrap();
             let path = tmp.path().to_str().unwrap().to_owned();
             let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "PRAGMA page_size = 4096;\
-                     PRAGMA journal_mode = WAL;\
-                     PRAGMA synchronous = NORMAL;\
-                     PRAGMA cache_size = -64000;\
-                     CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER);",
-            )
+            conn.execute_batch(&format!(
+                "PRAGMA page_size = {};\
+                 PRAGMA journal_mode = WAL;\
+                 PRAGMA synchronous = {};\
+                 PRAGMA cache_size = -64000;\
+                 CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER);",
+                benchmark_page_size_bytes(),
+                concurrent_sync_mode()
+            ))
             .unwrap();
 
             conn.execute_batch("BEGIN").unwrap();
@@ -5449,25 +7758,44 @@ mod tests {
 
     fn sample_provenance() -> JsonBenchmarkProvenance {
         JsonBenchmarkProvenance {
-            schema_version: BENCHMARK_PROVENANCE_SCHEMA_V1.to_owned(),
-            citable: true,
-            status: "verified_citable".to_owned(),
-            validation_errors: Vec::new(),
+            schema_version: BENCHMARK_PROVENANCE_SCHEMA_V3.to_owned(),
+            citable: false,
+            status: "unverified".to_owned(),
+            validation_errors: vec![
+                "generic comprehensive measurements are diagnostic-only".to_owned(),
+            ],
             build: JsonBuildIdentity {
                 workspace_root: "/test/frankensqlite".to_owned(),
                 git_commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 git_branch: "main".to_owned(),
                 git_dirty: Some(false),
-                input_tracking: "complete".to_owned(),
-                cargo_profile: "release".to_owned(),
+                tracked_workspace_inputs_watched: "complete".to_owned(),
+                cargo_profile_family: "release".to_owned(),
+                selected_profile: "release-perf".to_owned(),
                 declared_profile: "release-perf".to_owned(),
+                build_nonce: "34".repeat(32),
                 opt_level: "3".to_owned(),
-                debug: "false".to_owned(),
+                debuginfo: "false".to_owned(),
+                debug_assertions: false,
                 target: "x86_64-unknown-linux-gnu".to_owned(),
                 host: "x86_64-unknown-linux-gnu".to_owned(),
                 panic_strategy: "abort".to_owned(),
+                panic_abort: true,
                 package_features: Vec::new(),
                 encoded_rustflags_hex: String::new(),
+                encoded_rustflags_present: true,
+                profile_override_environment_hex: encode_build_environment(
+                    &canonical_profile_environment("release-perf")
+                        .expect("test profile is canonical"),
+                ),
+                native_override_environment_hex: encode_build_environment(
+                    &canonical_native_environment(),
+                ),
+                verbose_build_log_path: Some("/test/cargo-build-vv.log".to_owned()),
+                verbose_build_log_sha256: Some("12".repeat(32)),
+                verbose_build_log_size_bytes: Some(1024),
+                verbose_build_log_verified: true,
+                profile_proof_scope: "test".to_owned(),
                 rustc_version: "rustc test".to_owned(),
                 cargo_version: "cargo test".to_owned(),
             },
@@ -5482,11 +7810,13 @@ mod tests {
             binary_sha256: Some("ab".repeat(32)),
             binary_size_bytes: Some(1024),
             binary_modified_unix_ts: Some(1_700_000_001),
+            binary_device_id: Some(8),
+            binary_inode: Some(42),
             cargo_lock_sha256: Some("cd".repeat(32)),
             cargo_feature_graph_sha256: Some("ef".repeat(32)),
             cargo_feature_graph: Some("fsqlite-e2e v0.1.19".to_owned()),
-            cargo_feature_graph_command: "cargo tree --locked --offline -p fsqlite-e2e -e features"
-                .to_owned(),
+            cargo_feature_graph_command:
+                "cargo tree --locked --offline -p fsqlite-e2e -e features,no-dev".to_owned(),
             command_line: vec!["comprehensive-bench".to_owned(), "--quick".to_owned()],
             benchmark_environment: BTreeMap::new(),
             cpu_affinity: Some("0-7".to_owned()),
@@ -5507,20 +7837,47 @@ mod tests {
                 verified: true,
                 matched: true,
                 validation_errors: Vec::new(),
-                effective_profiles: BTreeMap::new(),
+                effective_profiles: BTreeMap::from([
+                    (
+                        "memory.csqlite".to_owned(),
+                        BTreeMap::from([("synchronous".to_owned(), "normal".to_owned())]),
+                    ),
+                    (
+                        "memory.fsqlite".to_owned(),
+                        BTreeMap::from([("synchronous".to_owned(), "normal".to_owned())]),
+                    ),
+                    (
+                        "file.csqlite".to_owned(),
+                        BTreeMap::from([("synchronous".to_owned(), "normal".to_owned())]),
+                    ),
+                    (
+                        "file.fsqlite".to_owned(),
+                        BTreeMap::from([("synchronous".to_owned(), "normal".to_owned())]),
+                    ),
+                ]),
             },
             execution_routing: JsonExecutionRouting {
-                capture_scope: "untimed test certification".to_owned(),
+                probe_scope: "untimed test probe".to_owned(),
+                timed_routes_verified: false,
+                limitations: vec!["test".to_owned()],
                 timed_execution_instrumented: false,
                 parser_fast_path_executions: 1,
                 parser_slow_path_executions: 1,
-                prepared_insert_fast_lane_hits: 1,
+                prepared_insert_fast_lane_hits: 4,
                 prepared_insert_instrumented_lane_hits: 0,
-                prepared_update_delete_fast_lane_hits: 2,
+                prepared_direct_insert_executions: 4,
+                prepared_update_delete_fast_lane_hits: 0,
                 prepared_update_delete_instrumented_lane_hits: 0,
+                prepared_direct_update_executions: 1,
+                prepared_direct_delete_executions: 1,
+                prepared_update_delete_dml_direct_handoff_runs: 0,
+                prepared_table_dml_affected_only_runs: 0,
                 prepared_dml_fallbacks: BTreeMap::new(),
-                select_fallback_decisions: BTreeMap::from([("group_by_fallback".to_owned(), 1)]),
-                certification_errors: Vec::new(),
+                select_routing_decisions: BTreeMap::from([
+                    ("group_by_fallback".to_owned(), 1),
+                    ("valid_btree_page".to_owned(), 1),
+                ]),
+                probe_errors: Vec::new(),
             },
         }
     }
@@ -5531,6 +7888,48 @@ mod tests {
             FSQLITE_BENCHMARK_PRAGMAS.iter().any(|pragma| pragma
                 .eq_ignore_ascii_case("PRAGMA fsqlite_capture_time_travel_snapshots=false;")),
             "comprehensive-bench should profile benchmark workloads, not optional time-travel snapshot cloning"
+        );
+    }
+
+    #[test]
+    fn effective_synchronous_pragma_values_have_one_canonical_representation() {
+        for (left, right, expected) in [
+            ("0", "OFF", "off"),
+            ("1", "normal", "normal"),
+            ("2", "FULL", "full"),
+            ("3", "extra", "extra"),
+        ] {
+            assert_eq!(
+                normalize_effective_pragma_value("synchronous", left.to_owned())
+                    .expect("numeric synchronous value must normalize"),
+                expected
+            );
+            assert_eq!(
+                normalize_effective_pragma_value("SYNCHRONOUS", right.to_owned())
+                    .expect("named synchronous value must normalize"),
+                expected
+            );
+        }
+        assert_eq!(
+            normalize_effective_pragma_value("page_size", "4096".to_owned())
+                .expect("unrelated pragma must pass through"),
+            "4096"
+        );
+        assert!(
+            normalize_effective_pragma_value("synchronous", "unknown".to_owned()).is_err(),
+            "unknown durability values must fail closed"
+        );
+    }
+
+    #[test]
+    fn compiled_panic_strategy_matches_the_benchmark_target_cfg() {
+        assert_eq!(
+            compiled_panic_strategy(),
+            if cfg!(panic = "abort") {
+                "abort"
+            } else {
+                "unwind"
+            }
         );
     }
 
@@ -5598,6 +7997,40 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_samples_prove_real_worker_settings_and_completed_work() {
+        for (engine, sample) in [
+            (
+                "csqlite",
+                run_csqlite_concurrent_sample(2, "measured", 0)
+                    .expect("C SQLite concurrent sample should complete"),
+            ),
+            (
+                "fsqlite",
+                run_fsqlite_concurrent_sample(2, "measured", 0)
+                    .expect("FrankenSQLite concurrent sample should complete"),
+            ),
+        ] {
+            assert!(sample.elapsed > Duration::ZERO);
+            let readiness = sample.readiness;
+            assert_eq!(readiness.engine, engine);
+            assert_eq!(readiness.expected_workers, 2);
+            assert_eq!(readiness.expected_rows, 2 * CONCURRENT_ROWS_PER_THREAD);
+            assert_eq!(readiness.completed_rows, readiness.expected_rows);
+            assert_eq!(readiness.database_rows, readiness.expected_rows);
+            assert_eq!(readiness.database_id_sum, readiness.expected_id_sum);
+            assert_eq!(readiness.workers.len(), 2);
+            for worker in readiness.workers {
+                assert_eq!(worker.completed_rows, CONCURRENT_ROWS_PER_THREAD);
+                assert!(worker.settings_verified);
+                assert!(worker.thread_identity_verified);
+                assert!(worker.thread_affinity_verified);
+                assert_eq!(worker.setup_thread_id, worker.postflight_thread_id);
+                assert_eq!(worker.setup_cpu_affinity, worker.postflight_cpu_affinity);
+            }
+        }
+    }
+
+    #[test]
     fn measure_with_teardown_runs_after_each_sample() {
         let timed_calls = Cell::new(0usize);
         let teardown_calls = Cell::new(0usize);
@@ -5644,7 +8077,7 @@ mod tests {
                 print_json_schema: false,
                 allow_unverified_provenance: false,
                 bridge_experiment: false,
-                bridge_samples: 64,
+                bridge_samples: 96,
                 bridge_operations: 1_000,
                 bridge_seed: 0x4653_514c_4954_4530,
             }
@@ -5824,7 +8257,7 @@ mod tests {
             sample_provenance(),
         );
 
-        assert_eq!(json.schema_version, JSON_REPORT_SCHEMA_V4);
+        assert_eq!(json.schema_version, JSON_REPORT_SCHEMA_V6);
         assert_eq!(json.environment.git_head_unix_ts, Some(1_700_000_000));
         assert_eq!(json.environment.git_dirty, Some(false));
         assert_eq!(
@@ -5886,12 +8319,58 @@ mod tests {
         let schema = benchmark_json_schema();
         assert!(
             jsonschema::draft202012::meta::is_valid(&schema),
-            "the published V4 schema must itself be valid Draft 2020-12 JSON Schema"
+            "the published V5 schema must itself be valid Draft 2020-12 JSON Schema"
         );
         let instance = serde_json::to_value(&json).expect("report should serialize");
         assert!(
             jsonschema::draft202012::is_valid(&schema, &instance),
-            "a complete V4 report must validate against its published schema"
+            "a complete V5 report must validate against its published schema"
+        );
+
+        let mut contradictory_citable = instance.clone();
+        contradictory_citable["provenance"]["citable"] = serde_json::Value::Bool(true);
+        contradictory_citable["provenance"]["status"] =
+            serde_json::Value::String("verified_citable".to_owned());
+        contradictory_citable["provenance"]["validation_errors"] = serde_json::json!([]);
+        assert!(
+            !jsonschema::draft202012::is_valid(&schema, &contradictory_citable),
+            "the generic V5 report cannot claim citable provenance"
+        );
+
+        let mut disabled_concurrency = instance.clone();
+        disabled_concurrency["provenance"]["durability"]["concurrent_mode_default"] =
+            serde_json::Value::Bool(false);
+        assert!(
+            jsonschema::draft202012::is_valid(&schema, &disabled_concurrency),
+            "a diagnostic artifact must represent a failed concurrency check honestly"
+        );
+
+        let mut mismatched_profile = instance.clone();
+        mismatched_profile["provenance"]["build"]["selected_profile"] =
+            serde_json::Value::String("release".to_owned());
+        assert!(
+            jsonschema::draft202012::is_valid(&schema, &mismatched_profile),
+            "a diagnostic artifact may preserve a mismatched profile receipt"
+        );
+
+        let mut wrong_design = instance.clone();
+        wrong_design["provenance"]["runtime_bridge"] = serde_json::Value::String(
+            "three_arm_per_operation_inside_existing_runtime_worker_sync_facade".to_owned(),
+        );
+        assert!(
+            !jsonschema::draft202012::is_valid(&schema, &wrong_design),
+            "the generic V5 schema must not accept a bridge-experiment provenance shape"
+        );
+
+        let mut diagnostic = instance.clone();
+        diagnostic["provenance"]["citable"] = serde_json::Value::Bool(false);
+        diagnostic["provenance"]["status"] = serde_json::Value::String("unverified".to_owned());
+        diagnostic["provenance"]["validation_errors"] = serde_json::json!(["diagnostic fixture"]);
+        diagnostic["provenance"]["durability"]["concurrent_mode_default"] =
+            serde_json::Value::Bool(false);
+        assert!(
+            jsonschema::draft202012::is_valid(&schema, &diagnostic),
+            "non-citable diagnostic artifacts should represent failed checks honestly"
         );
 
         let mut missing_build = instance.clone();
@@ -6025,7 +8504,7 @@ mod tests {
 
         let written = std::fs::read_to_string(report_path).expect("JSON report should be written");
         assert!(
-            written.contains(JSON_REPORT_SCHEMA_V4),
+            written.contains(JSON_REPORT_SCHEMA_V6),
             "written JSON should include the benchmark schema version"
         );
     }
@@ -6091,7 +8570,9 @@ mod tests {
             .expect("HTML report should be written");
         let html = std::fs::read_to_string(html_path).expect("HTML report should be readable");
         assert!(html.contains("benchmark-provenance"));
-        assert!(html.contains(BENCHMARK_PROVENANCE_SCHEMA_V1));
+        assert!(html.contains(BENCHMARK_PROVENANCE_SCHEMA_V3));
+        assert!(html.contains("NON-CITABLE DIAGNOSTIC"));
+        assert!(html.contains("generic comprehensive measurements are diagnostic-only"));
     }
 
     #[test]
@@ -6174,7 +8655,7 @@ mod tests {
 
         assert_eq!(
             schema["properties"]["schema_version"]["const"],
-            JSON_REPORT_SCHEMA_V4
+            JSON_REPORT_SCHEMA_V6
         );
         assert_eq!(
             schema["properties"]["ci_regression_gate"]["properties"]["bead_id"]["const"],
@@ -6200,6 +8681,11 @@ mod tests {
             "#/$defs/fsqlite_concurrent_profile"
         );
         assert_eq!(
+            schema["properties"]["sections"]["items"]["properties"]["rows"]["items"]["properties"]
+                ["concurrent_readiness"]["$ref"],
+            "#/$defs/concurrent_readiness"
+        );
+        assert_eq!(
             schema["$defs"]["fsqlite_concurrent_profile"]["properties"]["counters"]["additionalProperties"]
                 ["type"],
             "integer"
@@ -6213,6 +8699,228 @@ mod tests {
             schema["properties"]["ci_regression_gate"]["properties"]["observed"]["properties"]["primary_score"]
                 ["type"][0],
             "number"
+        );
+    }
+
+    #[test]
+    fn build_identity_validation_rejects_profile_misrepresentation() {
+        let canonical = sample_provenance().build;
+        assert_eq!(validate_build_identity(&canonical), Vec::<String>::new());
+        let canonical_environment =
+            canonical_profile_environment("release-perf").expect("test profile is canonical");
+        assert_eq!(
+            canonical_environment
+                .get("RUSTC_WRAPPER")
+                .map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            canonical_environment
+                .get("RUSTC_WORKSPACE_WRAPPER")
+                .map(String::as_str),
+            Some("")
+        );
+
+        let mut profile_mismatch = canonical.clone();
+        profile_mismatch.declared_profile = "release".to_owned();
+        assert!(
+            validate_build_identity(&profile_mismatch)
+                .iter()
+                .any(|error| error.contains("does not match Cargo output profile"))
+        );
+
+        let mut wrong_opt = canonical.clone();
+        wrong_opt.opt_level = "2".to_owned();
+        assert!(
+            validate_build_identity(&wrong_opt)
+                .iter()
+                .any(|error| error.contains("effective opt-level"))
+        );
+
+        let mut debug_assertions = canonical.clone();
+        debug_assertions.debug_assertions = true;
+        assert!(
+            validate_build_identity(&debug_assertions)
+                .iter()
+                .any(|error| error.contains("debug assertions"))
+        );
+
+        let mut unwind = canonical.clone();
+        unwind.panic_strategy = "unwind".to_owned();
+        unwind.panic_abort = false;
+        assert!(
+            validate_build_identity(&unwind)
+                .iter()
+                .any(|error| error.contains("panic=abort"))
+        );
+
+        let mut rustflags_override = canonical.clone();
+        rustflags_override.encoded_rustflags_hex = lowercase_hex(b"-Copt-level=0");
+        assert!(
+            validate_build_identity(&rustflags_override)
+                .iter()
+                .any(|error| error.contains("require empty encoded rustflags"))
+        );
+
+        let mut wrapper_environment = canonical_environment;
+        wrapper_environment.insert("RUSTC_WRAPPER".to_owned(), "sccache".to_owned());
+        let mut wrapper_override = canonical.clone();
+        wrapper_override.profile_override_environment_hex =
+            encode_build_environment(&wrapper_environment);
+        assert!(
+            validate_build_identity(&wrapper_override)
+                .iter()
+                .any(|error| error.contains("does not exactly force the canonical"))
+        );
+
+        let mut environment_override = canonical;
+        environment_override.profile_override_environment_hex =
+            lowercase_hex(b"CARGO_INCREMENTAL=1");
+        assert!(
+            validate_build_identity(&environment_override)
+                .iter()
+                .any(|error| error.contains("does not exactly force the canonical"))
+        );
+    }
+
+    fn canonical_test_build_log(nonce: &str) -> String {
+        let required_crates = [
+            "asupersync",
+            "fsqlite_error",
+            "fsqlite_types",
+            "fsqlite_observability",
+            "fsqlite_ast",
+            "fsqlite_parser",
+            "fsqlite_planner",
+            "fsqlite_func",
+            "fsqlite_vfs",
+            "fsqlite_wal",
+            "fsqlite_pager",
+            "fsqlite_mvcc",
+            "fsqlite_btree",
+            "fsqlite_vdbe",
+            "fsqlite_ext_json",
+            "fsqlite_ext_fts5",
+            "fsqlite_ext_rtree",
+            "fsqlite_core",
+            "fsqlite",
+            "fsqlite_e2e",
+            "comprehensive_bench",
+        ];
+        let mut log = required_crates
+            .iter()
+            .map(|crate_name| {
+                let nonce_environment = if *crate_name == "comprehensive_bench" {
+                    format!("FSQLITE_BENCH_BUILD_NONCE={nonce} ")
+                } else {
+                    String::new()
+                };
+                let lto_and_binary_options = if *crate_name == "comprehensive_bench" {
+                    "-C lto -C panic=abort -C strip=symbols"
+                } else {
+                    "-C linker-plugin-lto"
+                };
+                format!(
+                    "Running `CARGO_PKG_DESCRIPTION='FrankenSQLite differential benchmark package' CARGO_PKG_NAME=fsqlite-e2e {nonce_environment}/opt/rust/bin/rustc --crate-name {crate_name} --target x86_64-unknown-linux-gnu -C opt-level=3 -C codegen-units=1 {lto_and_binary_options} --emit link`"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        log.push_str("\nFinished `release-perf` profile [optimized] target(s) in 1.00s\n");
+        log
+    }
+
+    #[test]
+    fn verbose_build_log_proof_is_nonce_bound_and_rejects_ambiguous_invocations() {
+        let nonce = "56".repeat(32);
+        let canonical = canonical_test_build_log(&nonce);
+        assert!(build_log_proves_profile(
+            &canonical,
+            &nonce,
+            "release-perf",
+            "x86_64-unknown-linux-gnu"
+        ));
+
+        assert!(!build_log_proves_profile(
+            &canonical,
+            &"78".repeat(32),
+            "release-perf",
+            "x86_64-unknown-linux-gnu"
+        ));
+        assert!(!build_log_proves_profile(
+            &canonical,
+            &nonce,
+            "release",
+            "x86_64-unknown-linux-gnu"
+        ));
+
+        let duplicated = format!(
+            "{canonical}{}",
+            canonical
+                .lines()
+                .find(|line| line.contains("--crate-name fsqlite_core"))
+                .expect("canonical fixture includes fsqlite_core")
+        );
+        assert!(!build_log_proves_profile(
+            &duplicated,
+            &nonce,
+            "release-perf",
+            "x86_64-unknown-linux-gnu"
+        ));
+
+        let missing_codegen_flag = canonical.replace("-C codegen-units=1 ", "");
+        assert!(!build_log_proves_profile(
+            &missing_codegen_flag,
+            &nonce,
+            "release-perf",
+            "x86_64-unknown-linux-gnu"
+        ));
+
+        let conflicting_opt_level =
+            canonical.replace("-C opt-level=3", "-C opt-level=3 -C opt-level=0");
+        assert!(!build_log_proves_profile(
+            &conflicting_opt_level,
+            &nonce,
+            "release-perf",
+            "x86_64-unknown-linux-gnu"
+        ));
+
+        let wrapped = canonical.replacen("rustc --crate-name", "sccache rustc --crate-name", 1);
+        assert!(!build_log_proves_profile(
+            &wrapped,
+            &nonce,
+            "release-perf",
+            "x86_64-unknown-linux-gnu"
+        ));
+
+        assert_eq!(
+            split_posix_shell_words(
+                "A='multi word value' B=\"two words\" /opt/rust/bin/rustc --crate-name demo"
+            ),
+            Some(vec![
+                "A=multi word value".to_owned(),
+                "B=two words".to_owned(),
+                "/opt/rust/bin/rustc".to_owned(),
+                "--crate-name".to_owned(),
+                "demo".to_owned(),
+            ])
+        );
+        assert!(split_posix_shell_words("A='unterminated").is_none());
+    }
+
+    #[test]
+    fn generic_comprehensive_measurement_design_is_never_citable() {
+        assert!(
+            measurement_design_validation_errors("per_operation_thread_local_block_on")
+                .iter()
+                .any(|error| error.contains("diagnostic-only"))
+        );
+        assert!(
+            measurement_design_validation_errors(
+                "three_arm_per_operation_inside_existing_runtime_worker_sync_facade"
+            )
+            .iter()
+            .any(|error| error.contains("isolated cgroup-v2 cpuset"))
         );
     }
 
@@ -6239,33 +8947,242 @@ mod tests {
             worker_commands_total: 0,
             worker_commands_inside_timed_region: 0,
             worker_open_handshakes_total: 0,
+            effective_settings: if workload == BridgeWorkload::ReadyFuture {
+                BTreeMap::new()
+            } else {
+                bridge_expected_effective_settings()
+            },
             oracle_kind: "test_fixture".to_owned(),
             checksum_count: checksum.0,
             checksum_sum: checksum.1,
+            checksum_exact_rows: i64::try_from(operation_count)
+                .expect("test operation count should fit i64"),
         }
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
+    fn bridge_json_schema_validates_complete_report_and_rejects_drift() {
+        let host_state = JsonBridgeHostState {
+            captured_at_utc: "2026-07-26T00:00:00Z".to_owned(),
+            load_average_1m: Some(0.5),
+            load_average_5m: Some(0.4),
+            load_average_15m: Some(0.3),
+            available_parallelism: Some(2),
+            cpu_affinity: Some("2-3".to_owned()),
+            selected_cpu_topology: BTreeMap::from([
+                (
+                    "cpu2".to_owned(),
+                    "package=0,core=2,thread_siblings=2,66,numa=node0".to_owned(),
+                ),
+                (
+                    "cpu3".to_owned(),
+                    "package=0,core=3,thread_siblings=3,67,numa=node0".to_owned(),
+                ),
+            ]),
+            scaling_governors: vec!["performance".to_owned()],
+            energy_performance_preferences: vec!["performance".to_owned()],
+            boost_controls: BTreeMap::from([("cpufreq.boost".to_owned(), "1".to_owned())]),
+            numa_nodes_online: Some("0".to_owned()),
+            memory_available_gb: Some(64.0),
+            cpu_pressure_some_avg10: Some(0.0),
+            io_pressure_some_avg60: Some(0.0),
+            competing_processes: Vec::new(),
+            competing_process_scan_error: None,
+        };
+        let sample = bridge_test_sample(
+            BridgeWorkload::ReadyFuture,
+            100,
+            0,
+            BridgeArm::PerOperationBlockOn,
+            1_000,
+        );
+        let mut bridge_provenance = sample_provenance();
+        bridge_provenance.citable = false;
+        bridge_provenance.status = "unverified_explicit_override".to_owned();
+        bridge_provenance.runtime_bridge =
+            "three_arm_per_operation_inside_existing_runtime_worker_sync_facade".to_owned();
+        bridge_provenance.validation_errors =
+            vec!["test fixture models the diagnostic-only bridge contract".to_owned()];
+        let report = JsonBridgeReport {
+            schema_version: BRIDGE_REPORT_SCHEMA_V2.to_owned(),
+            generated_at_utc: "2026-07-26T00:00:01Z".to_owned(),
+            provenance: bridge_provenance,
+            environment: DetectedEnvironment {
+                os: Some("Linux".to_owned()),
+                arch: "x86_64".to_owned(),
+                kernel_release: Some("test".to_owned()),
+                cpu_model: Some("test".to_owned()),
+                cpu_cores: Some(2),
+                ram_gb: Some(64.0),
+                active_toolchain: Some("nightly".to_owned()),
+                rust_version: Some("rustc test".to_owned()),
+                cargo_version: Some("cargo test".to_owned()),
+                git_commit_sha: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+                git_branch: Some("main".to_owned()),
+                git_head_unix_ts: Some(1_700_000_000),
+                git_dirty: Some(false),
+                benchmark_binary_modified_unix_ts: Some(1_700_000_001),
+                benchmark_binary_older_than_git_head: Some(false),
+                build_profile: "release-perf".to_owned(),
+            },
+            host_state_before: host_state.clone(),
+            host_state_checkpoints: vec![host_state.clone()],
+            host_state_after: host_state,
+            config: JsonBridgeConfig {
+                samples_per_arm: 96,
+                raw_insert_operations: 100,
+                ready_operation_counts: vec![1, 10, 100, 1_000],
+                order_seed: 7,
+                ordering_policy: "test".to_owned(),
+                warmup_policy: "test".to_owned(),
+                timed_region: "test".to_owned(),
+                arm_contracts: BTreeMap::from([
+                    (
+                        BridgeArm::PerOperationBlockOn.id().to_owned(),
+                        "test".to_owned(),
+                    ),
+                    (
+                        BridgeArm::SingleRuntimeEntry.id().to_owned(),
+                        "test".to_owned(),
+                    ),
+                    (
+                        BridgeArm::WorkerSyncFacade.id().to_owned(),
+                        "test".to_owned(),
+                    ),
+                ]),
+                affinity_policy: "test".to_owned(),
+                max_load_average_1m: Some(1.0),
+            },
+            raw_samples: vec![sample],
+            arm_statistics: vec![JsonBridgeArmStats {
+                workload: BridgeWorkload::ReadyFuture,
+                operation_count: 100,
+                arm: BridgeArm::PerOperationBlockOn,
+                samples: 1,
+                median_ns: 1_000.0,
+                mean_ns: 1_000.0,
+                p95_ns: 1_000.0,
+                stddev_ns: 0.0,
+                cv_pct: 0.0,
+                median_ns_per_operation: 10.0,
+            }],
+            paired_comparisons: vec![JsonBridgePairedComparison {
+                workload: BridgeWorkload::ReadyFuture,
+                operation_count: 100,
+                numerator: BridgeArm::PerOperationBlockOn,
+                denominator: BridgeArm::SingleRuntimeEntry,
+                paired_blocks: 1,
+                bootstrap_clusters: 1,
+                median_ratio: 2.0,
+                mean_ratio: 2.0,
+                geomean_ratio: 2.0,
+                bootstrap_mean_ratio_ci95_low: 1.9,
+                bootstrap_mean_ratio_ci95_high: 2.1,
+            }],
+            ready_runtime_entry_regression: JsonBridgeReadyRegression {
+                predictor: "test".to_owned(),
+                response: "test".to_owned(),
+                interpretation: "test".to_owned(),
+                points: 8,
+                paired_blocks: 2,
+                bootstrap_clusters: 1,
+                intercept_ns: 10.0,
+                slope_ns_per_additional_runtime_entry: 5.0,
+                bootstrap_slope_ci95_low: 4.0,
+                bootstrap_slope_ci95_high: 6.0,
+                r_squared: 1.0,
+            },
+        };
+        let schema = bridge_json_schema();
+        assert!(
+            jsonschema::draft202012::meta::is_valid(&schema),
+            "bridge schema must itself be valid Draft 2020-12"
+        );
+        let instance = serde_json::to_value(report).expect("bridge report should serialize");
+        assert!(
+            jsonschema::draft202012::is_valid(&schema, &instance),
+            "complete bridge report must validate"
+        );
+
+        let mut missing_provenance = instance.clone();
+        missing_provenance
+            .as_object_mut()
+            .unwrap()
+            .remove("provenance");
+        assert!(!jsonschema::draft202012::is_valid(
+            &schema,
+            &missing_provenance
+        ));
+
+        let mut unknown_field = instance;
+        unknown_field
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown_bridge_field".to_owned(), serde_json::Value::Null);
+        assert!(!jsonschema::draft202012::is_valid(&schema, &unknown_field));
     }
 
     #[cfg(feature = "bridge-experiment")]
     #[test]
     fn bridge_orders_are_mirrored_and_balanced() {
         let mut rng = StdRng::seed_from_u64(7);
-        for _ in 0..100 {
-            let order = bridge_two_arm_order(&mut rng);
-            assert_eq!(order[0], order[3]);
-            assert_eq!(order[1], order[2]);
-            assert_ne!(order[0], order[1]);
+        let two_arm_orders = bridge_two_arm_orders(100, &mut rng)
+            .expect("complete complementary two-arm pairs should be valid");
+        for pair in two_arm_orders.chunks_exact(2) {
+            for order in pair {
+                assert_eq!(order[0], order[3]);
+                assert_eq!(order[1], order[2]);
+                assert_ne!(order[0], order[1]);
+            }
+            assert_ne!(
+                pair[0][0], pair[1][0],
+                "adjacent blocks must be complementary ABBA/BAAB orders"
+            );
+        }
+        assert!(bridge_two_arm_orders(99, &mut rng).is_err());
 
-            let order = bridge_three_arm_order(&mut rng);
+        let orders = bridge_three_arm_orders(6, &mut rng)
+            .expect("two complete carryover cycles should be valid");
+        let mut position_counts = BTreeMap::new();
+        let mut predecessor_counts = BTreeMap::new();
+        for order in &orders {
             assert_eq!(order[0], order[5]);
             assert_eq!(order[1], order[4]);
             assert_eq!(order[2], order[3]);
-            for arm in BridgeArm::ALL {
+            for (position, arm) in order.iter().copied().enumerate() {
+                *position_counts.entry((arm, position)).or_insert(0_usize) += 1;
+            }
+            for pair in order.windows(2) {
+                *predecessor_counts
+                    .entry((pair[0], pair[1]))
+                    .or_insert(0_usize) += 1;
+            }
+        }
+        for arm in BridgeArm::ALL {
+            for position in 0..6 {
                 assert_eq!(
-                    order.iter().filter(|candidate| **candidate == arm).count(),
-                    2
+                    position_counts[&(arm, position)],
+                    2,
+                    "{arm:?} should appear twice in position {position}"
+                );
+            }
+            for successor in BridgeArm::ALL {
+                assert_eq!(
+                    predecessor_counts[&(arm, successor)],
+                    if arm == successor { 2 } else { 4 },
+                    "{arm:?} -> {successor:?} carryover should be exact"
                 );
             }
         }
+        assert!(bridge_three_arm_orders(5, &mut rng).is_err());
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
+    fn bridge_percentile_interpolates_even_sample_median() {
+        let sorted = [1.0, 3.0, 7.0, 9.0];
+        assert!((bridge_percentile(&sorted, 50.0) - 5.0).abs() < f64::EPSILON);
     }
 
     #[cfg(feature = "bridge-experiment")]
@@ -6325,11 +9242,11 @@ mod tests {
             "comprehensive-bench".to_owned(),
             "--bridge-experiment".to_owned(),
             "--bridge-samples".to_owned(),
-            "32".to_owned(),
+            "48".to_owned(),
         ];
-        assert_eq!(parse_cli_args(&valid).unwrap().bridge_samples, 32);
+        assert_eq!(parse_cli_args(&valid).unwrap().bridge_samples, 48);
 
-        for invalid in ["20", "40", "30"] {
+        for invalid in ["20", "40", "64", "96x"] {
             let args = vec![
                 "comprehensive-bench".to_owned(),
                 "--bridge-experiment".to_owned(),
@@ -6342,9 +9259,55 @@ mod tests {
 
     #[cfg(feature = "bridge-experiment")]
     #[test]
+    fn bridge_competitor_classification_uses_full_process_identity() {
+        assert!(
+            !bridge_process_is_competitor("btrfs-cleaner", &[], None),
+            "an idle kernel thread must not fail the run by mere existence"
+        );
+        assert!(
+            bridge_process_is_competitor(
+                "btrfs",
+                &["/usr/bin/btrfs".to_owned(), "scrub".to_owned()],
+                Some("0::/user.slice/test.scope")
+            ),
+            "a userspace Btrfs maintenance command must remain blocked"
+        );
+        assert!(
+            !bridge_process_is_competitor(
+                "cargo-io-enforc",
+                &[
+                    "/bin/bash".to_owned(),
+                    "/home/ubuntu/.local/bin/cargo-io-enforcer".to_owned(),
+                ],
+                Some("0::/system.slice/cargo-io-enforcer.service")
+            ),
+            "the exact permanent build-priority monitor is not a Cargo build"
+        );
+        assert!(
+            bridge_process_is_competitor(
+                "cargo-io-enforc",
+                &["/bin/bash".to_owned(), "/tmp/cargo-io-enforcer".to_owned()],
+                Some("0::/user.slice/untrusted.scope")
+            ),
+            "a lookalike outside the exact service cgroup must fail closed"
+        );
+        assert!(bridge_process_is_competitor(
+            "cargo",
+            &["cargo".to_owned(), "build".to_owned()],
+            Some("0::/user.slice/test.scope")
+        ));
+        assert!(bridge_process_is_competitor(
+            "sbh",
+            &["sbh".to_owned(), "daemon".to_owned()],
+            Some("0::/user.slice/test.scope")
+        ));
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
     fn bridge_paired_comparison_uses_block_means() {
         let mut samples = Vec::new();
-        for block_index in 0..10 {
+        for block_index in 0..12 {
             samples.push(bridge_test_sample(
                 BridgeWorkload::RawExecuteWithParams,
                 100,
@@ -6381,11 +9344,14 @@ mod tests {
             100,
             BridgeArm::PerOperationBlockOn,
             BridgeArm::SingleRuntimeEntry,
+            3,
             99,
         )
         .expect("balanced blocks should compare");
-        assert_eq!(comparison.paired_blocks, 10);
+        assert_eq!(comparison.paired_blocks, 12);
+        assert_eq!(comparison.bootstrap_clusters, 4);
         assert!((comparison.median_ratio - 2.0).abs() < f64::EPSILON);
+        assert!((comparison.mean_ratio - 2.0).abs() < f64::EPSILON);
         assert!((comparison.geomean_ratio - 2.0).abs() < f64::EPSILON);
         assert!((comparison.bootstrap_mean_ratio_ci95_low - 2.0).abs() < f64::EPSILON);
         assert!((comparison.bootstrap_mean_ratio_ci95_high - 2.0).abs() < f64::EPSILON);
@@ -6395,7 +9361,7 @@ mod tests {
     #[test]
     fn bridge_ready_regression_recovers_runtime_entry_slope() {
         let mut samples = Vec::new();
-        for block_index in 0..10 {
+        for block_index in 0..16 {
             for operation_count in [1_usize, 10, 100, 1_000] {
                 let baseline = 100_u64;
                 let per_operation = baseline
@@ -6420,10 +9386,10 @@ mod tests {
             }
         }
 
-        let regression = bridge_ready_regression(&samples, 123).expect("fixture should regress");
-        assert_eq!(regression.points, 40);
-        assert_eq!(regression.paired_blocks, 10);
-        assert_eq!(regression.bootstrap_clusters, 5);
+        let regression = bridge_ready_regression(&samples, 8, 123).expect("fixture should regress");
+        assert_eq!(regression.points, 64);
+        assert_eq!(regression.paired_blocks, 16);
+        assert_eq!(regression.bootstrap_clusters, 2);
         assert!(regression.intercept_ns.abs() < 1.0e-9);
         assert!((regression.slope_ns_per_additional_runtime_entry - 5.0).abs() < 1.0e-9);
         assert!((regression.bootstrap_slope_ci95_low - 5.0).abs() < 1.0e-9);
@@ -6450,6 +9416,7 @@ mod tests {
             (per_operation.checksum_count, per_operation.checksum_sum),
             (3, 0)
         );
+        assert_eq!(per_operation.checksum_exact_rows, 3);
 
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -6470,6 +9437,7 @@ mod tests {
             (single_runtime.checksum_count, single_runtime.checksum_sum),
             (3, 0)
         );
+        assert_eq!(single_runtime.checksum_exact_rows, 3);
     }
 
     #[cfg(feature = "bridge-experiment")]
@@ -6487,12 +9455,13 @@ mod tests {
         assert_eq!(sample.engine_dml_future_calls_inside_timed_region, 3);
         assert_eq!(sample.worker_commands_inside_timed_region, 3);
         assert_eq!(sample.worker_open_handshakes_total, 1);
-        assert_eq!(sample.worker_commands_total, bridge_pragmas().len() + 7 + 3);
         assert_eq!(
-            sample.oracle_kind,
-            "untimed_database_count_and_sum_query"
+            sample.worker_commands_total,
+            bridge_pragmas().len() + 5 + 7 + 3
         );
+        assert_eq!(sample.oracle_kind, "untimed_exact_id_value_domain_query");
         assert_eq!((sample.checksum_count, sample.checksum_sum), (3, 3));
+        assert_eq!(sample.checksum_exact_rows, 3);
     }
 }
 
@@ -8165,6 +11134,131 @@ fn bridge_cpufreq_values(file_name: &str) -> Vec<String> {
 }
 
 #[cfg(feature = "bridge-experiment")]
+fn bridge_pressure_some_average(path: &str, field: &str) -> Option<f64> {
+    bridge_read_trimmed(path)?
+        .lines()
+        .find(|line| line.starts_with("some "))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|value| value.strip_prefix(field))
+        })
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_cmdline_has_program(cmdline: &[String], program: &str) -> bool {
+    cmdline.iter().any(|argument| {
+        std::path::Path::new(argument)
+            .file_name()
+            .is_some_and(|name| name == program)
+    })
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_process_is_competitor(comm: &str, cmdline: &[String], cgroup: Option<&str>) -> bool {
+    // Kernel threads have an empty cmdline. Their mere presence is not host
+    // activity: system-wide PSI and the checkpoints below still catch actual
+    // Btrfs work, while a userspace `btrfs` command remains blocked.
+    if cmdline.is_empty() {
+        return false;
+    }
+
+    // This permanent system service is a lightweight build-priority monitor,
+    // not a Cargo invocation. `/proc/<pid>/comm` truncates its name to
+    // `cargo-io-enforc`, so require both the exact service cgroup and script
+    // identity before exempting it; a real Cargo process still fails closed.
+    let cargo_io_enforcer = bridge_cmdline_has_program(cmdline, "cargo-io-enforcer")
+        && cgroup.is_some_and(|value| {
+            value
+                .lines()
+                .any(|line| line == "0::/system.slice/cargo-io-enforcer.service")
+        });
+    if cargo_io_enforcer {
+        return false;
+    }
+
+    let blocked = [
+        "btrfs",
+        "cargo",
+        "cc1",
+        "clang",
+        "comprehensive-b",
+        "fio",
+        "fsqlite",
+        "gcc",
+        "hyperfine",
+        "ld",
+        "make",
+        "mold",
+        "mt_oltp_bench",
+        "ninja",
+        "rustc",
+        "sbh",
+        "sccache",
+        "stress",
+    ];
+    blocked.iter().any(|prefix| comm.starts_with(prefix))
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_competing_processes() -> Result<Vec<String>, String> {
+    let current_pid = std::process::id();
+    let entries = std::fs::read_dir("/proc")
+        .map_err(|error| format!("could not enumerate /proc: {error}"))?;
+    let mut competitors = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("could not inspect /proc entry: {error}"))?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == current_pid {
+            continue;
+        }
+        let comm = match std::fs::read_to_string(entry.path().join("comm")) {
+            Ok(comm) => comm.trim().to_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!("could not read /proc/{pid}/comm: {error}"));
+            }
+        };
+        let raw_cmdline = match std::fs::read(entry.path().join("cmdline")) {
+            Ok(cmdline) => cmdline,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!("could not read /proc/{pid}/cmdline: {error}"));
+            }
+        };
+        let cmdline = raw_cmdline
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty())
+            .map(|argument| String::from_utf8_lossy(argument).into_owned())
+            .collect::<Vec<_>>();
+        let possible_cargo_io_enforcer = bridge_cmdline_has_program(&cmdline, "cargo-io-enforcer");
+        let cgroup = if possible_cargo_io_enforcer {
+            match std::fs::read_to_string(entry.path().join("cgroup")) {
+                Ok(cgroup) => Some(cgroup),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!("could not read /proc/{pid}/cgroup: {error}"));
+                }
+            }
+        } else {
+            None
+        };
+        if bridge_process_is_competitor(&comm, &cmdline, cgroup.as_deref()) {
+            competitors.push(format!("pid={pid},comm={comm}"));
+        }
+    }
+    competitors.sort();
+    Ok(competitors)
+}
+
+#[cfg(feature = "bridge-experiment")]
 fn capture_bridge_host_state() -> JsonBridgeHostState {
     let load_average = bridge_read_trimmed("/proc/loadavg").and_then(|loadavg| {
         let values = loadavg
@@ -8201,6 +11295,13 @@ fn capture_bridge_host_state() -> JsonBridgeHostState {
     .filter_map(|(name, path)| bridge_read_trimmed(path).map(|value| (name.to_owned(), value)))
     .collect();
 
+    let affinity = cpu_affinity();
+    let selected_cpu_topology = bridge_cpu_topology_receipt(affinity.as_deref());
+    let (competing_processes, competing_process_scan_error) = match bridge_competing_processes() {
+        Ok(processes) => (processes, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+
     JsonBridgeHostState {
         captured_at_utc: chrono_stamp(),
         load_average_1m: load_average.map(|load| load.0),
@@ -8209,18 +11310,23 @@ fn capture_bridge_host_state() -> JsonBridgeHostState {
         available_parallelism: std::thread::available_parallelism()
             .ok()
             .map(std::num::NonZero::get),
-        cpu_affinity: cpu_affinity(),
+        cpu_affinity: affinity,
+        selected_cpu_topology,
         scaling_governors: bridge_cpufreq_values("scaling_governor"),
         energy_performance_preferences: bridge_cpufreq_values("energy_performance_preference"),
         boost_controls,
         numa_nodes_online: bridge_read_trimmed("/sys/devices/system/node/online"),
         memory_available_gb,
+        cpu_pressure_some_avg10: bridge_pressure_some_average("/proc/pressure/cpu", "avg10="),
+        io_pressure_some_avg60: bridge_pressure_some_average("/proc/pressure/io", "avg60="),
+        competing_processes,
+        competing_process_scan_error,
     }
 }
 
 #[cfg(feature = "bridge-experiment")]
-fn bridge_cpu_affinity_cardinality(value: &str) -> Result<usize, String> {
-    let mut count = 0_usize;
+fn bridge_parse_cpu_affinity(value: &str) -> Result<Vec<usize>, String> {
+    let mut cpus = Vec::new();
     let mut previous_end = None;
     for segment in value.split(',') {
         if segment.is_empty() {
@@ -8249,16 +11355,97 @@ fn bridge_cpu_affinity_cardinality(value: &str) -> Result<usize, String> {
         if previous_end.is_some_and(|previous| start <= previous) {
             return Err("CPU affinity ranges overlap or are not increasing".to_owned());
         }
-        count = count
-            .checked_add(end - start + 1)
-            .ok_or_else(|| "CPU affinity cardinality overflowed usize".to_owned())?;
+        cpus.extend(start..=end);
         previous_end = Some(end);
     }
-    if count == 0 {
+    if cpus.is_empty() {
         Err("CPU affinity selects no CPUs".to_owned())
     } else {
-        Ok(count)
+        Ok(cpus)
     }
+}
+
+#[cfg(all(feature = "bridge-experiment", test))]
+fn bridge_cpu_affinity_cardinality(value: &str) -> Result<usize, String> {
+    bridge_parse_cpu_affinity(value).map(|cpus| cpus.len())
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_cpu_numa_node(cpu: usize) -> Result<String, String> {
+    let cpu_path = std::path::PathBuf::from(format!("/sys/devices/system/cpu/cpu{cpu}"));
+    let mut nodes = std::fs::read_dir(&cpu_path)
+        .map_err(|error| format!("could not inspect topology for CPU {cpu}: {error}"))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .filter(|name| {
+            name.strip_prefix("node").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
+        .collect::<Vec<_>>();
+    nodes.sort();
+    match nodes.as_slice() {
+        [node] => Ok(node.clone()),
+        [] => Err(format!("CPU {cpu} exposes no NUMA-node topology")),
+        _ => Err(format!("CPU {cpu} exposes multiple NUMA nodes: {nodes:?}")),
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_cpu_topology(cpu: usize) -> Result<(String, String, String, String), String> {
+    let topology = std::path::PathBuf::from(format!("/sys/devices/system/cpu/cpu{cpu}/topology"));
+    let read = |name: &str| {
+        bridge_read_trimmed(topology.join(name))
+            .ok_or_else(|| format!("CPU {cpu} topology omits `{name}`"))
+    };
+    Ok((
+        read("physical_package_id")?,
+        read("core_id")?,
+        read("thread_siblings_list")?,
+        bridge_cpu_numa_node(cpu)?,
+    ))
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_cpu_topology_receipt(affinity: Option<&str>) -> BTreeMap<String, String> {
+    affinity
+        .and_then(|value| bridge_parse_cpu_affinity(value).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|cpu| {
+            bridge_cpu_topology(cpu)
+                .ok()
+                .map(|(package, core, siblings, node)| {
+                    (
+                        format!("cpu{cpu}"),
+                        format!(
+                            "package={package},core={core},thread_siblings={siblings},numa={node}"
+                        ),
+                    )
+                })
+        })
+        .collect()
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_validate_cpu_topology(cpus: &[usize]) -> Result<(), String> {
+    let mut physical_cores = std::collections::BTreeSet::new();
+    let mut numa_nodes = std::collections::BTreeSet::new();
+    for &cpu in cpus {
+        let (package, core, siblings, node) = bridge_cpu_topology(cpu)?;
+        if !physical_cores.insert((package, core)) {
+            return Err(format!(
+                "selected CPUs include SMT siblings on the same physical core; CPU {cpu} reports siblings `{siblings}`"
+            ));
+        }
+        numa_nodes.insert(node);
+    }
+    if numa_nodes.len() != 1 {
+        return Err(format!(
+            "selected CPUs span NUMA nodes {numa_nodes:?}; citable bridge runs require one node"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "bridge-experiment")]
@@ -8272,11 +11459,11 @@ fn bridge_max_load_average_1m() -> Result<f64, String> {
     let maximum = raw
         .parse::<f64>()
         .map_err(|_| format!("FSQLITE_BENCH_MAX_LOAD_1M must be a finite number, got `{raw}`"))?;
-    if maximum.is_finite() && maximum >= 0.0 {
+    if maximum.is_finite() && (0.0..=BRIDGE_ABSOLUTE_MAX_LOAD_1M).contains(&maximum) {
         Ok(maximum)
     } else {
         Err(format!(
-            "FSQLITE_BENCH_MAX_LOAD_1M must be finite and nonnegative, got `{raw}`"
+            "FSQLITE_BENCH_MAX_LOAD_1M must be finite and between 0 and {BRIDGE_ABSOLUTE_MAX_LOAD_1M}, got `{raw}`"
         ))
     }
 }
@@ -8291,13 +11478,28 @@ fn bridge_validate_host_state(
 ) {
     match (expected_affinity, state.cpu_affinity.as_deref()) {
         (Some(expected), Some(observed)) if expected == observed => {
-            match bridge_cpu_affinity_cardinality(observed) {
-                Ok(1 | 2) => {}
-                Ok(count) => provenance.add_validation_error(format!(
-                    "{phase} bridge CPU affinity selects {count} CPUs; citable causal runs require exactly one or two"
+            match bridge_parse_cpu_affinity(observed) {
+                Ok(cpus) if matches!(cpus.len(), 1 | 2) => {
+                    if let Err(error) = bridge_validate_cpu_topology(&cpus) {
+                        provenance.add_validation_error(format!(
+                            "{phase} bridge CPU topology is invalid: {error}"
+                        ));
+                    }
+                    if state.selected_cpu_topology.len() != cpus.len() {
+                        provenance.add_validation_error(format!(
+                            "{phase} bridge CPU topology receipt is incomplete: expected {} CPUs, captured {}",
+                            cpus.len(),
+                            state.selected_cpu_topology.len()
+                        ));
+                    }
+                }
+                Ok(cpus) => provenance.add_validation_error(format!(
+                    "{phase} bridge CPU affinity selects {} CPUs; citable causal runs require exactly one or two",
+                    cpus.len()
                 )),
-                Err(error) => provenance
-                    .add_validation_error(format!("{phase} bridge CPU affinity is invalid: {error}")),
+                Err(error) => provenance.add_validation_error(format!(
+                    "{phase} bridge CPU affinity is invalid: {error}"
+                )),
             }
         }
         (Some(expected), observed) => provenance.add_validation_error(format!(
@@ -8314,8 +11516,70 @@ fn bridge_validate_host_state(
         )),
         (Some(_), None) => provenance
             .add_validation_error(format!("{phase} host load average could not be captured")),
-        (None, _) => provenance
-            .add_validation_error("citable bridge runs require FSQLITE_BENCH_MAX_LOAD_1M"),
+        (None, _) => {
+            provenance.add_validation_error("citable bridge runs require FSQLITE_BENCH_MAX_LOAD_1M")
+        }
+    }
+    match state.cpu_pressure_some_avg10 {
+        Some(observed) if observed <= BRIDGE_MAX_CPU_PRESSURE_SOME_AVG10 => {}
+        Some(observed) => provenance.add_validation_error(format!(
+            "{phase} CPU pressure some avg10 {observed:.3} exceeds absolute maximum {BRIDGE_MAX_CPU_PRESSURE_SOME_AVG10:.3}"
+        )),
+        None => provenance
+            .add_validation_error(format!("{phase} CPU pressure could not be captured")),
+    }
+    match state.io_pressure_some_avg60 {
+        Some(observed) if observed <= BRIDGE_MAX_IO_PRESSURE_SOME_AVG60 => {}
+        Some(observed) => provenance.add_validation_error(format!(
+            "{phase} I/O pressure some avg60 {observed:.3} exceeds absolute maximum {BRIDGE_MAX_IO_PRESSURE_SOME_AVG60:.3}"
+        )),
+        None => provenance
+            .add_validation_error(format!("{phase} I/O pressure could not be captured")),
+    }
+    if !state.competing_processes.is_empty() {
+        provenance.add_validation_error(format!(
+            "{phase} competing build, benchmark, or maintenance processes are active: {:?}",
+            state.competing_processes
+        ));
+    }
+    if let Some(error) = state.competing_process_scan_error.as_deref() {
+        provenance.add_validation_error(format!(
+            "{phase} competing-process scan was incomplete: {error}"
+        ));
+    }
+    if state.scaling_governors.is_empty()
+        || state
+            .scaling_governors
+            .iter()
+            .any(|governor| governor != "performance")
+    {
+        provenance.add_validation_error(format!(
+            "{phase} bridge CPUs are not uniformly governed by `performance`: {:?}",
+            state.scaling_governors
+        ));
+    }
+    if state
+        .energy_performance_preferences
+        .iter()
+        .any(|preference| preference != "performance")
+    {
+        provenance.add_validation_error(format!(
+            "{phase} bridge CPUs do not have uniform `performance` energy preference: {:?}",
+            state.energy_performance_preferences
+        ));
+    }
+    for (name, expected) in [
+        ("cpufreq.boost", "1"),
+        ("intel_pstate.no_turbo", "0"),
+        ("amd_pstate.status", "active"),
+    ] {
+        if let Some(observed) = state.boost_controls.get(name)
+            && observed != expected
+        {
+            provenance.add_validation_error(format!(
+                "{phase} bridge boost control `{name}` is `{observed}`, expected `{expected}`"
+            ));
+        }
     }
 }
 
@@ -8328,6 +11592,10 @@ fn bridge_validate_host_stability(
     for (name, changed) in [
         ("CPU affinity", before.cpu_affinity != after.cpu_affinity),
         (
+            "selected CPU topology",
+            before.selected_cpu_topology != after.selected_cpu_topology,
+        ),
+        (
             "CPU scaling governors",
             before.scaling_governors != after.scaling_governors,
         ),
@@ -8339,7 +11607,10 @@ fn bridge_validate_host_stability(
             "CPU boost controls",
             before.boost_controls != after.boost_controls,
         ),
-        ("NUMA online set", before.numa_nodes_online != after.numa_nodes_online),
+        (
+            "NUMA online set",
+            before.numa_nodes_online != after.numa_nodes_online,
+        ),
     ] {
         if changed {
             provenance.add_validation_error(format!(
@@ -8398,6 +11669,82 @@ fn bridge_pragmas() -> Vec<String> {
 }
 
 #[cfg(feature = "bridge-experiment")]
+fn bridge_expected_effective_settings() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "page_size".to_owned(),
+            benchmark_page_size_bytes().to_string(),
+        ),
+        ("journal_mode".to_owned(), "memory".to_owned()),
+        ("synchronous".to_owned(), "normal".to_owned()),
+        ("cache_size".to_owned(), "-64000".to_owned()),
+        ("concurrent_mode".to_owned(), "on".to_owned()),
+    ])
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_verify_effective_settings(
+    mut profile: BTreeMap<String, String>,
+    concurrent_mode: String,
+    context: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    let synchronous = profile
+        .get("synchronous")
+        .ok_or_else(|| format!("{context}: settings omitted synchronous"))
+        .and_then(|value| normalized_synchronous(value))?;
+    profile.insert("synchronous".to_owned(), synchronous);
+    if !matches!(
+        concurrent_mode.to_ascii_lowercase().as_str(),
+        "1" | "true" | "on"
+    ) {
+        return Err(format!(
+            "{context}: concurrent-mode readback was `{concurrent_mode}`, expected enabled"
+        ));
+    }
+    profile.insert("concurrent_mode".to_owned(), "on".to_owned());
+    let expected = bridge_expected_effective_settings();
+    if profile != expected {
+        return Err(format!(
+            "{context}: expected effective settings {expected:?}, observed {profile:?}"
+        ));
+    }
+    Ok(profile)
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_query_settings_per_operation(
+    conn: &fsqlite::Connection,
+    runtime_entries: &mut usize,
+) -> Result<BTreeMap<String, String>, String> {
+    let profile = query_effective_fsqlite_pragmas(conn)?;
+    *runtime_entries = runtime_entries
+        .checked_add(4)
+        .ok_or_else(|| "per-operation settings runtime-entry count overflowed usize".to_owned())?;
+    let concurrent_mode = query_fsqlite_scalar(conn, "PRAGMA fsqlite.concurrent_mode;")?;
+    *runtime_entries = runtime_entries
+        .checked_add(1)
+        .ok_or_else(|| "per-operation settings runtime-entry count overflowed usize".to_owned())?;
+    bridge_verify_effective_settings(profile, concurrent_mode, "per-operation arm")
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_setting_from_rows(rows: &[fsqlite::Row], sql: &str) -> Result<String, String> {
+    let row = rows
+        .first()
+        .ok_or_else(|| format!("bridge `{sql}` returned no row"))?;
+    row.get(0)
+        .map(normalize_fsqlite_value)
+        .ok_or_else(|| format!("bridge `{sql}` returned no first column"))
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_setting_from_row(row: &fsqlite::Row, sql: &str) -> Result<String, String> {
+    row.get(0)
+        .map(normalize_fsqlite_value)
+        .ok_or_else(|| format!("bridge `{sql}` returned no first column"))
+}
+
+#[cfg(feature = "bridge-experiment")]
 fn bridge_verify_affected_rows(affected: usize, context: &str) -> Result<(), String> {
     if affected == 1 {
         Ok(())
@@ -8413,17 +11760,25 @@ fn bridge_checksum_from_row(
     row: &fsqlite::Row,
     operation_count: usize,
     context: &str,
-) -> Result<(i64, i64), String> {
+) -> Result<(i64, i64, i64), String> {
     let actual = (
         fsqlite_integer(row, 0, context),
         fsqlite_integer(row, 1, context),
+        fsqlite_integer(row, 2, context),
     );
-    let expected = bridge_expected_checksum(operation_count)?;
+    let expected_checksum = bridge_expected_checksum(operation_count)?;
+    let expected_exact_rows = i64::try_from(operation_count)
+        .map_err(|_| format!("{context}: operation count exceeds i64::MAX"))?;
+    let expected = (
+        expected_checksum.0,
+        expected_checksum.1,
+        expected_exact_rows,
+    );
     if actual == expected {
         Ok(actual)
     } else {
         Err(format!(
-            "{context}: expected COUNT/SUM {expected:?}, got {actual:?}"
+            "{context}: expected COUNT/SUM/exact-row receipt {expected:?}, got {actual:?}"
         ))
     }
 }
@@ -8443,12 +11798,20 @@ fn bridge_sample_ready_per_operation(
     }
     let entries_before_timing = runtime_entries;
     let start = Instant::now();
-    for _ in 0..operation_count {
-        let future = std::hint::black_box(std::future::ready(()));
-        std::hint::black_box(bridge_block_on(&mut runtime_entries, future));
+    for operation_index in 0..operation_count {
+        let future = std::hint::black_box(std::future::ready(operation_index));
+        let completion = fsqlite_e2e::block_on(future);
+        let _ = std::hint::black_box(completion);
     }
     let elapsed = start.elapsed();
-    let timed_runtime_entries = runtime_entries.saturating_sub(entries_before_timing);
+    runtime_entries = runtime_entries
+        .checked_add(operation_count)
+        .ok_or_else(|| "ready-future runtime-entry count overflowed usize".to_owned())?;
+    let timed_runtime_entries = operation_count;
+    debug_assert_eq!(
+        runtime_entries.saturating_sub(entries_before_timing),
+        timed_runtime_entries
+    );
     let completion_count = i64::try_from(operation_count)
         .map_err(|_| "ready-future operation count exceeds i64::MAX".to_owned())?;
 
@@ -8466,9 +11829,11 @@ fn bridge_sample_ready_per_operation(
         worker_commands_total: 0,
         worker_commands_inside_timed_region: 0,
         worker_open_handshakes_total: 0,
+        effective_settings: BTreeMap::new(),
         oracle_kind: "untimed_ready_sentinel_plus_control_flow_completion_count".to_owned(),
         checksum_count: completion_count,
         checksum_sum: 0,
+        checksum_exact_rows: completion_count,
     })
 }
 
@@ -8487,9 +11852,10 @@ fn bridge_sample_ready_single_runtime(
             ));
         }
         let start = Instant::now();
-        for _ in 0..operation_count {
-            let future = std::hint::black_box(std::future::ready(()));
-            std::hint::black_box(future.await);
+        for operation_index in 0..operation_count {
+            let future = std::hint::black_box(std::future::ready(operation_index));
+            let completion = future.await;
+            let _ = std::hint::black_box(completion);
         }
         Ok::<_, String>(start.elapsed())
     })?;
@@ -8510,9 +11876,11 @@ fn bridge_sample_ready_single_runtime(
         worker_commands_total: 0,
         worker_commands_inside_timed_region: 0,
         worker_open_handshakes_total: 0,
+        effective_settings: BTreeMap::new(),
         oracle_kind: "untimed_ready_sentinel_plus_control_flow_completion_count".to_owned(),
         checksum_count: completion_count,
         checksum_sum: 0,
+        checksum_exact_rows: completion_count,
     })
 }
 
@@ -8537,6 +11905,7 @@ fn bridge_sample_insert_per_operation(
             &format!("per-operation arm configure `{pragma}`"),
         )?;
     }
+    let effective_settings = bridge_query_settings_per_operation(&conn, &mut runtime_entries)?;
     bridge_result(
         bridge_block_on(
             &mut runtime_entries,
@@ -8584,13 +11953,10 @@ fn bridge_sample_insert_per_operation(
                 let value = i64::try_from(value)
                     .map_err(|_| "prepared-insert value exceeds i64::MAX".to_owned())?;
                 let affected = bridge_result(
-                    bridge_block_on(
-                        &mut runtime_entries,
-                        statement.execute_with_params(&[
-                            fsqlite::SqliteValue::Integer(value),
-                            fsqlite::SqliteValue::Integer(value),
-                        ]),
-                    ),
+                    fsqlite_e2e::block_on(statement.execute_with_params(&[
+                        fsqlite::SqliteValue::Integer(value),
+                        fsqlite::SqliteValue::Integer(value),
+                    ])),
                     "per-operation prepared timed insert",
                 )?;
                 affected_total = affected_total.saturating_add(affected);
@@ -8629,16 +11995,13 @@ fn bridge_sample_insert_per_operation(
                 let value = i64::try_from(value)
                     .map_err(|_| "raw-insert value exceeds i64::MAX".to_owned())?;
                 let affected = bridge_result(
-                    bridge_block_on(
-                        &mut runtime_entries,
-                        conn.execute_with_params(
-                            BRIDGE_INSERT_SQL,
-                            &[
-                                fsqlite::SqliteValue::Integer(value),
-                                fsqlite::SqliteValue::Integer(value),
-                            ],
-                        ),
-                    ),
+                    fsqlite_e2e::block_on(conn.execute_with_params(
+                        BRIDGE_INSERT_SQL,
+                        &[
+                            fsqlite::SqliteValue::Integer(value),
+                            fsqlite::SqliteValue::Integer(value),
+                        ],
+                    )),
                     "per-operation raw timed insert",
                 )?;
                 affected_total = affected_total.saturating_add(affected);
@@ -8647,6 +12010,9 @@ fn bridge_sample_insert_per_operation(
         }
         BridgeWorkload::ReadyFuture => unreachable!(),
     };
+    runtime_entries = runtime_entries
+        .checked_add(operation_count)
+        .ok_or_else(|| "per-operation runtime-entry count overflowed usize".to_owned())?;
     if affected_total != operation_count {
         return Err(format!(
             "per-operation {} timed inserts affected {affected_total} rows, expected {operation_count}",
@@ -8661,7 +12027,13 @@ fn bridge_sample_insert_per_operation(
     let checksum_row = bridge_result(
         bridge_block_on(
             &mut runtime_entries,
-            conn.query_row("SELECT COUNT(*), COALESCE(SUM(value), 0) FROM bridge_probe"),
+            conn.query_row_with_params(
+                BRIDGE_EXACT_ORACLE_SQL,
+                &[fsqlite::SqliteValue::Integer(
+                    i64::try_from(operation_count)
+                        .map_err(|_| "per-operation oracle count exceeds i64::MAX".to_owned())?,
+                )],
+            ),
         ),
         "per-operation arm checksum query",
     )?;
@@ -8686,13 +12058,18 @@ fn bridge_sample_insert_per_operation(
         worker_commands_total: 0,
         worker_commands_inside_timed_region: 0,
         worker_open_handshakes_total: 0,
-        oracle_kind: "untimed_database_count_and_sum_query".to_owned(),
+        effective_settings,
+        oracle_kind: "untimed_exact_id_value_domain_query".to_owned(),
         checksum_count: checksum.0,
         checksum_sum: checksum.1,
+        checksum_exact_rows: checksum.2,
     })
 }
 
 #[cfg(feature = "bridge-experiment")]
+// Boxing the timed per-operation awaits would add an allocation to the mechanism
+// this diagnostic exists to measure, so retain the single enclosing future.
+#[allow(clippy::large_futures)]
 fn bridge_sample_insert_single_runtime(
     runtime: &Runtime,
     workload: BridgeWorkload,
@@ -8703,7 +12080,7 @@ fn bridge_sample_insert_single_runtime(
     if workload == BridgeWorkload::ReadyFuture {
         return Err("ready-future workload is not an insert workload".to_owned());
     }
-    let (elapsed, checksum) = runtime.block_on(async {
+    let (elapsed, checksum, effective_settings) = runtime.block_on(async {
         let conn = bridge_result(
             fsqlite::Connection::open(":memory:").await,
             "single-runtime arm open",
@@ -8714,6 +12091,29 @@ fn bridge_sample_insert_single_runtime(
                 &format!("single-runtime arm configure `{pragma}`"),
             )?;
         }
+        let mut effective_settings = BTreeMap::new();
+        for pragma in ["page_size", "journal_mode", "synchronous", "cache_size"] {
+            let sql = format!("PRAGMA {pragma};");
+            let rows = bridge_result(
+                conn.query(&sql).await,
+                &format!("single-runtime arm read back `{sql}`"),
+            )?;
+            effective_settings.insert(
+                pragma.to_owned(),
+                bridge_setting_from_rows(&rows, &sql)?,
+            );
+        }
+        let concurrent_sql = "PRAGMA fsqlite.concurrent_mode;";
+        let concurrent_rows = bridge_result(
+            conn.query(concurrent_sql).await,
+            "single-runtime arm read back concurrent mode",
+        )?;
+        let concurrent_mode = bridge_setting_from_rows(&concurrent_rows, concurrent_sql)?;
+        let effective_settings = bridge_verify_effective_settings(
+            effective_settings,
+            concurrent_mode,
+            "single-runtime arm",
+        )?;
         bridge_result(
             conn.execute(
                 "CREATE TABLE bridge_probe(\
@@ -8818,14 +12218,20 @@ fn bridge_sample_insert_single_runtime(
 
         bridge_result(conn.execute("COMMIT").await, "single-runtime arm commit")?;
         let checksum_row = bridge_result(
-            conn.query_row("SELECT COUNT(*), COALESCE(SUM(value), 0) FROM bridge_probe")
-                .await,
+            conn.query_row_with_params(
+                BRIDGE_EXACT_ORACLE_SQL,
+                &[fsqlite::SqliteValue::Integer(
+                    i64::try_from(operation_count)
+                        .map_err(|_| "single-runtime oracle count exceeds i64::MAX".to_owned())?,
+                )],
+            )
+            .await,
             "single-runtime arm checksum query",
         )?;
         let checksum =
             bridge_checksum_from_row(&checksum_row, operation_count, "single-runtime checksum")?;
         bridge_result(conn.close().await, "single-runtime arm close")?;
-        Ok::<_, String>((elapsed, checksum))
+        Ok::<_, String>((elapsed, checksum, effective_settings))
     })?;
 
     Ok(JsonBridgeSample {
@@ -8842,9 +12248,11 @@ fn bridge_sample_insert_single_runtime(
         worker_commands_total: 0,
         worker_commands_inside_timed_region: 0,
         worker_open_handshakes_total: 0,
-        oracle_kind: "untimed_database_count_and_sum_query".to_owned(),
+        effective_settings,
+        oracle_kind: "untimed_exact_id_value_domain_query".to_owned(),
         checksum_count: checksum.0,
         checksum_sum: checksum.1,
+        checksum_exact_rows: checksum.2,
     })
 }
 
@@ -8877,6 +12285,29 @@ fn bridge_sample_insert_worker(
             &format!("worker arm configure `{pragma}`"),
         )?;
     }
+    let mut effective_settings = BTreeMap::new();
+    for pragma in ["page_size", "journal_mode", "synchronous", "cache_size"] {
+        let sql = format!("PRAGMA {pragma};");
+        let result = conn.query_row_sync(&sql);
+        let row = bridge_worker_command(
+            &mut worker_commands,
+            result,
+            &format!("worker arm read back `{sql}`"),
+        )?;
+        effective_settings.insert(pragma.to_owned(), bridge_setting_from_row(&row, &sql)?);
+    }
+    let concurrent_sql = "PRAGMA fsqlite.concurrent_mode;";
+    let result = conn.query_row_sync(concurrent_sql);
+    let row = bridge_worker_command(
+        &mut worker_commands,
+        result,
+        "worker arm read back concurrent mode",
+    )?;
+    let effective_settings = bridge_verify_effective_settings(
+        effective_settings,
+        bridge_setting_from_row(&row, concurrent_sql)?,
+        "worker arm",
+    )?;
     let result = conn.execute_sync(
         "CREATE TABLE bridge_probe(\
          id INTEGER PRIMARY KEY, value INTEGER NOT NULL)",
@@ -8898,7 +12329,6 @@ fn bridge_sample_insert_worker(
     let deleted = bridge_worker_command(&mut worker_commands, result, "worker raw warmup cleanup")?;
     bridge_verify_affected_rows(deleted, "worker raw warmup cleanup")?;
 
-    let commands_before_timing = worker_commands;
     let start = Instant::now();
     let mut affected_total = 0_usize;
     for value in 0..operation_count {
@@ -8911,12 +12341,14 @@ fn bridge_sample_insert_worker(
                 fsqlite::SqliteValue::Integer(value),
             ],
         );
-        let affected =
-            bridge_worker_command(&mut worker_commands, result, "worker raw timed insert")?;
+        let affected = bridge_result(result, "worker raw timed insert")?;
         affected_total = affected_total.saturating_add(affected);
     }
     let elapsed = start.elapsed();
-    let timed_worker_commands = worker_commands.saturating_sub(commands_before_timing);
+    worker_commands = worker_commands
+        .checked_add(operation_count)
+        .ok_or_else(|| "worker command count overflowed usize".to_owned())?;
+    let timed_worker_commands = operation_count;
     if affected_total != operation_count {
         return Err(format!(
             "worker raw timed inserts affected {affected_total} rows, expected {operation_count}"
@@ -8925,7 +12357,13 @@ fn bridge_sample_insert_worker(
 
     let result = conn.commit_transaction_sync();
     bridge_worker_command(&mut worker_commands, result, "worker arm commit")?;
-    let result = conn.query_row_sync("SELECT COUNT(*), COALESCE(SUM(value), 0) FROM bridge_probe");
+    let result = conn.query_row_with_params_sync(
+        BRIDGE_EXACT_ORACLE_SQL,
+        &[fsqlite::SqliteValue::Integer(
+            i64::try_from(operation_count)
+                .map_err(|_| "worker oracle count exceeds i64::MAX".to_owned())?,
+        )],
+    );
     let checksum_row =
         bridge_worker_command(&mut worker_commands, result, "worker arm checksum query")?;
     let checksum = bridge_checksum_from_row(&checksum_row, operation_count, "worker checksum")?;
@@ -8946,17 +12384,29 @@ fn bridge_sample_insert_worker(
         worker_commands_total: worker_commands,
         worker_commands_inside_timed_region: timed_worker_commands,
         worker_open_handshakes_total: 1,
-        oracle_kind: "untimed_database_count_and_sum_query".to_owned(),
+        effective_settings,
+        oracle_kind: "untimed_exact_id_value_domain_query".to_owned(),
         checksum_count: checksum.0,
         checksum_sum: checksum.1,
+        checksum_exact_rows: checksum.2,
     })
 }
 
 #[cfg(feature = "bridge-experiment")]
 fn bridge_percentile(sorted: &[f64], percentile: f64) -> f64 {
     debug_assert!(!sorted.is_empty());
-    let index = ((percentile / 100.0) * (sorted.len() - 1) as f64).ceil() as usize;
-    sorted[index.min(sorted.len() - 1)]
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let index = (percentile / 100.0) * (sorted.len() - 1) as f64;
+    let lower = index.floor() as usize;
+    let upper = index.ceil() as usize;
+    let fraction = index - lower as f64;
+    if lower == upper {
+        sorted[lower]
+    } else {
+        sorted[upper].mul_add(fraction, sorted[lower] * (1.0 - fraction))
+    }
 }
 
 #[cfg(feature = "bridge-experiment")]
@@ -9006,23 +12456,37 @@ fn bridge_arm_statistics(samples: &[JsonBridgeSample]) -> Vec<JsonBridgeArmStats
 }
 
 #[cfg(feature = "bridge-experiment")]
-fn bridge_bootstrap_mean_ci95(values: &[f64], seed: u64) -> (f64, f64) {
+fn bridge_bootstrap_mean_ci95(
+    values: &[f64],
+    cluster_width: usize,
+    seed: u64,
+) -> Result<(f64, f64, usize), String> {
     debug_assert!(!values.is_empty());
+    if cluster_width == 0 || values.len() % cluster_width != 0 {
+        return Err(format!(
+            "bootstrap requires complete width-{cluster_width} clusters for {} values",
+            values.len()
+        ));
+    }
     const RESAMPLES: usize = 10_000;
+    let clusters = values.chunks_exact(cluster_width).collect::<Vec<_>>();
     let mut rng = StdRng::seed_from_u64(seed);
     let mut means = Vec::with_capacity(RESAMPLES);
     for _ in 0..RESAMPLES {
         let mut total = 0.0_f64;
-        for _ in 0..values.len() {
-            total += values[rng.random_range(0..values.len())];
+        for _ in 0..clusters.len() {
+            total += clusters[rng.random_range(0..clusters.len())]
+                .iter()
+                .sum::<f64>();
         }
         means.push(total / values.len() as f64);
     }
     means.sort_by(f64::total_cmp);
-    (
+    Ok((
         bridge_percentile(&means, 2.5),
         bridge_percentile(&means, 97.5),
-    )
+        clusters.len(),
+    ))
 }
 
 #[cfg(feature = "bridge-experiment")]
@@ -9032,6 +12496,7 @@ fn bridge_paired_comparison(
     operation_count: usize,
     numerator: BridgeArm,
     denominator: BridgeArm,
+    bootstrap_cluster_width: usize,
     seed: u64,
 ) -> Result<JsonBridgePairedComparison, String> {
     let mut blocks: BTreeMap<usize, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
@@ -9061,11 +12526,16 @@ fn bridge_paired_comparison(
         }
         let numerator_mean = numerator_values.iter().sum::<f64>() / 2.0;
         let denominator_mean = denominator_values.iter().sum::<f64>() / 2.0;
-        if denominator_mean <= 0.0 {
-            return Err(format!(
-                "{} operations={operation_count} block {block_index} has a zero denominator",
-                workload.id()
-            ));
+        for (arm, mean) in [
+            (numerator.id(), numerator_mean),
+            (denominator.id(), denominator_mean),
+        ] {
+            if !mean.is_finite() || mean <= 0.0 {
+                return Err(format!(
+                    "{} operations={operation_count} block {block_index} has invalid {arm} mean {mean}",
+                    workload.id()
+                ));
+            }
         }
         ratios.push(numerator_mean / denominator_mean);
     }
@@ -9080,16 +12550,20 @@ fn bridge_paired_comparison(
 
     let mut sorted = ratios.clone();
     sorted.sort_by(f64::total_cmp);
+    let mean_ratio = ratios.iter().sum::<f64>() / ratios.len() as f64;
     let geomean_ratio =
         (ratios.iter().map(|ratio| ratio.ln()).sum::<f64>() / ratios.len() as f64).exp();
-    let (ci_low, ci_high) = bridge_bootstrap_mean_ci95(&ratios, seed);
+    let (ci_low, ci_high, bootstrap_clusters) =
+        bridge_bootstrap_mean_ci95(&ratios, bootstrap_cluster_width, seed)?;
     Ok(JsonBridgePairedComparison {
         workload,
         operation_count,
         numerator,
         denominator,
         paired_blocks: ratios.len(),
+        bootstrap_clusters,
         median_ratio: bridge_percentile(&sorted, 50.0),
+        mean_ratio,
         geomean_ratio,
         bootstrap_mean_ratio_ci95_low: ci_low,
         bootstrap_mean_ratio_ci95_high: ci_high,
@@ -9118,11 +12592,11 @@ fn bridge_linear_fit(points: &[(f64, f64)]) -> Result<(f64, f64, f64), String> {
         return Err("linear fit predictor has zero variance".to_owned());
     }
     let slope = covariance / variance_x;
-    let intercept = mean_y - slope * mean_x;
+    let intercept = slope.mul_add(-mean_x, mean_y);
     let residual_sum_squares = points
         .iter()
         .map(|point| {
-            let predicted = intercept + slope * point.0;
+            let predicted = slope.mul_add(point.0, intercept);
             let residual = point.1 - predicted;
             residual * residual
         })
@@ -9147,6 +12621,7 @@ fn bridge_linear_fit(points: &[(f64, f64)]) -> Result<(f64, f64, f64), String> {
 #[cfg(feature = "bridge-experiment")]
 fn bridge_ready_regression(
     samples: &[JsonBridgeSample],
+    bootstrap_cluster_width: usize,
     seed: u64,
 ) -> Result<JsonBridgeReadyRegression, String> {
     let mut grouped: BTreeMap<(usize, usize), (Vec<f64>, Vec<f64>)> = BTreeMap::new();
@@ -9205,20 +12680,22 @@ fn bridge_ready_regression(
 
     const RESAMPLES: usize = 10_000;
     let blocks = points_by_block.values().collect::<Vec<_>>();
-    if blocks.len() % 2 != 0 {
-        return Err(
-            "ready-future regression requires adjacent forward/reverse block pairs".to_owned(),
-        );
+    if bootstrap_cluster_width == 0 || blocks.len() % bootstrap_cluster_width != 0 {
+        return Err(format!(
+            "ready-future regression requires complete width-{bootstrap_cluster_width} Williams-cycle clusters, got {} blocks",
+            blocks.len()
+        ));
     }
-    let bootstrap_clusters = blocks.chunks_exact(2).collect::<Vec<_>>();
+    let bootstrap_clusters = blocks
+        .chunks_exact(bootstrap_cluster_width)
+        .collect::<Vec<_>>();
     let mut rng = StdRng::seed_from_u64(seed);
     let mut bootstrap_slopes = Vec::with_capacity(RESAMPLES);
     for _ in 0..RESAMPLES {
         let mut resampled_points =
             Vec::with_capacity(blocks.len().saturating_mul(expected_points_per_block));
         for _ in 0..bootstrap_clusters.len() {
-            let cluster =
-                bootstrap_clusters[rng.random_range(0..bootstrap_clusters.len())];
+            let cluster = bootstrap_clusters[rng.random_range(0..bootstrap_clusters.len())];
             for block in cluster {
                 resampled_points.extend_from_slice(block);
             }
@@ -9247,36 +12724,60 @@ fn bridge_ready_regression(
 }
 
 #[cfg(feature = "bridge-experiment")]
-fn bridge_two_arm_order(rng: &mut StdRng) -> [BridgeArm; 4] {
-    if rng.random::<bool>() {
-        [
-            BridgeArm::PerOperationBlockOn,
-            BridgeArm::SingleRuntimeEntry,
-            BridgeArm::SingleRuntimeEntry,
-            BridgeArm::PerOperationBlockOn,
-        ]
-    } else {
-        [
-            BridgeArm::SingleRuntimeEntry,
-            BridgeArm::PerOperationBlockOn,
-            BridgeArm::PerOperationBlockOn,
-            BridgeArm::SingleRuntimeEntry,
-        ]
+fn bridge_two_arm_orders(
+    block_count: usize,
+    rng: &mut StdRng,
+) -> Result<Vec<[BridgeArm; 4]>, String> {
+    if block_count == 0 || block_count % 2 != 0 {
+        return Err(format!(
+            "two-arm ordering requires complete complementary ABBA/BAAB block pairs, got {block_count} blocks"
+        ));
     }
+    let abba = [
+        BridgeArm::PerOperationBlockOn,
+        BridgeArm::SingleRuntimeEntry,
+        BridgeArm::SingleRuntimeEntry,
+        BridgeArm::PerOperationBlockOn,
+    ];
+    let baab = [
+        BridgeArm::SingleRuntimeEntry,
+        BridgeArm::PerOperationBlockOn,
+        BridgeArm::PerOperationBlockOn,
+        BridgeArm::SingleRuntimeEntry,
+    ];
+    let mut orders = Vec::with_capacity(block_count);
+    while orders.len() < block_count {
+        if rng.random::<bool>() {
+            orders.extend([abba, baab]);
+        } else {
+            orders.extend([baab, abba]);
+        }
+    }
+    Ok(orders)
 }
 
 #[cfg(feature = "bridge-experiment")]
-fn bridge_three_arm_order(rng: &mut StdRng) -> [BridgeArm; 6] {
-    let mut first_half = BridgeArm::ALL;
-    first_half.shuffle(rng);
-    [
-        first_half[0],
-        first_half[1],
-        first_half[2],
-        first_half[2],
-        first_half[1],
-        first_half[0],
-    ]
+fn bridge_three_arm_orders(
+    block_count: usize,
+    rng: &mut StdRng,
+) -> Result<Vec<[BridgeArm; 6]>, String> {
+    if block_count == 0 || block_count % 3 != 0 {
+        return Err(format!(
+            "three-arm ordering requires complete three-block carryover cycles, got {block_count} blocks"
+        ));
+    }
+    let mut orders = Vec::with_capacity(block_count);
+    while orders.len() < block_count {
+        let mut labels = BridgeArm::ALL;
+        labels.shuffle(rng);
+        for rotation in 0..3 {
+            let first = labels[rotation];
+            let second = labels[(rotation + 1) % 3];
+            let third = labels[(rotation + 2) % 3];
+            orders.push([first, second, third, third, second, first]);
+        }
+    }
+    Ok(orders)
 }
 
 #[cfg(feature = "bridge-experiment")]
@@ -9334,7 +12835,7 @@ fn bridge_collect_samples(
     runtime: &Runtime,
     options: &CliOptions,
     ready_operation_counts: &[usize],
-) -> Result<Vec<JsonBridgeSample>, String> {
+) -> Result<(Vec<JsonBridgeSample>, Vec<JsonBridgeHostState>), String> {
     let mut rng = StdRng::seed_from_u64(options.bridge_seed);
     let block_count = options.bridge_samples / 2;
     let estimated = ready_operation_counts
@@ -9343,6 +12844,7 @@ fn bridge_collect_samples(
         .saturating_mul(2)
         .saturating_add(options.bridge_samples.saturating_mul(5));
     let mut samples = Vec::with_capacity(estimated);
+    let mut host_state_checkpoints = Vec::with_capacity(block_count.saturating_mul(3));
 
     eprintln!(
         "bridge ready-future control: operations={ready_operation_counts:?}, samples/arm/count={}",
@@ -9350,9 +12852,10 @@ fn bridge_collect_samples(
     );
     let ready_count_orders =
         bridge_balanced_ready_count_orders(ready_operation_counts, block_count, &mut rng)?;
+    let ready_arm_orders = bridge_two_arm_orders(block_count, &mut rng)?;
     for (block_index, ready_order) in ready_count_orders.iter().enumerate() {
         for (count_slot, &operation_count) in ready_order.iter().enumerate() {
-            for (arm_slot, arm) in bridge_two_arm_order(&mut rng).into_iter().enumerate() {
+            for (arm_slot, arm) in ready_arm_orders[block_index].into_iter().enumerate() {
                 let order_slot = count_slot.saturating_mul(4).saturating_add(arm_slot);
                 let sample = match arm {
                     BridgeArm::PerOperationBlockOn => {
@@ -9369,14 +12872,16 @@ fn bridge_collect_samples(
                 samples.push(sample);
             }
         }
+        host_state_checkpoints.push(capture_bridge_host_state());
     }
 
     eprintln!(
         "bridge retained-prepared control: operations={}, samples/arm={}",
         options.bridge_operations, options.bridge_samples
     );
-    for block_index in 0..block_count {
-        for (order_slot, arm) in bridge_two_arm_order(&mut rng).into_iter().enumerate() {
+    let prepared_arm_orders = bridge_two_arm_orders(block_count, &mut rng)?;
+    for (block_index, order) in prepared_arm_orders.iter().copied().enumerate() {
+        for (order_slot, arm) in order.into_iter().enumerate() {
             let sample = match arm {
                 BridgeArm::PerOperationBlockOn => bridge_sample_insert_per_operation(
                     BridgeWorkload::PreparedInsert,
@@ -9395,14 +12900,16 @@ fn bridge_collect_samples(
             };
             samples.push(sample);
         }
+        host_state_checkpoints.push(capture_bridge_host_state());
     }
 
     eprintln!(
         "bridge common raw-DML path: operations={}, samples/arm={}",
         options.bridge_operations, options.bridge_samples
     );
-    for block_index in 0..block_count {
-        for (order_slot, arm) in bridge_three_arm_order(&mut rng).into_iter().enumerate() {
+    let three_arm_orders = bridge_three_arm_orders(block_count, &mut rng)?;
+    for (block_index, order) in three_arm_orders.into_iter().enumerate() {
+        for (order_slot, arm) in order.into_iter().enumerate() {
             let sample = match arm {
                 BridgeArm::PerOperationBlockOn => bridge_sample_insert_per_operation(
                     BridgeWorkload::RawExecuteWithParams,
@@ -9423,9 +12930,10 @@ fn bridge_collect_samples(
             };
             samples.push(sample);
         }
+        host_state_checkpoints.push(capture_bridge_host_state());
     }
 
-    Ok(samples)
+    Ok((samples, host_state_checkpoints))
 }
 
 #[cfg(feature = "bridge-experiment")]
@@ -9436,6 +12944,7 @@ fn bridge_build_comparisons(
     seed: u64,
 ) -> Result<Vec<JsonBridgePairedComparison>, String> {
     let mut comparisons = Vec::new();
+    let ready_bootstrap_cluster_width = ready_operation_counts.len().saturating_mul(2);
     for (index, &ready_count) in ready_operation_counts.iter().enumerate() {
         comparisons.push(bridge_paired_comparison(
             samples,
@@ -9443,6 +12952,7 @@ fn bridge_build_comparisons(
             ready_count,
             BridgeArm::PerOperationBlockOn,
             BridgeArm::SingleRuntimeEntry,
+            ready_bootstrap_cluster_width,
             seed ^ 0x1000 ^ index as u64,
         )?);
     }
@@ -9452,6 +12962,7 @@ fn bridge_build_comparisons(
         operation_count,
         BridgeArm::PerOperationBlockOn,
         BridgeArm::SingleRuntimeEntry,
+        2,
         seed ^ 0x2000,
     )?);
     for (index, (numerator, denominator)) in [
@@ -9471,6 +12982,7 @@ fn bridge_build_comparisons(
             operation_count,
             numerator,
             denominator,
+            3,
             seed ^ 0x3000 ^ index as u64,
         )?);
     }
@@ -9540,8 +13052,27 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
             ));
         }
     }
+    eprintln!(
+        "!!! NON-CITABLE BRIDGE DIAGNOSTIC ({}) — NUMBERS ARE NOT RELEASE EVIDENCE !!!",
+        provenance.status
+    );
+    for error in &provenance.validation_errors {
+        eprintln!("  provenance: {error}");
+    }
 
-    let samples = bridge_collect_samples(&runtime, options, &ready_operation_counts)?;
+    let (samples, host_state_checkpoints) =
+        bridge_collect_samples(&runtime, options, &ready_operation_counts)?;
+    for (index, checkpoint) in host_state_checkpoints.iter().enumerate() {
+        let phase = format!("measurement checkpoint {index}");
+        bridge_validate_host_state(
+            &mut provenance,
+            expected_affinity.as_deref(),
+            max_load_average_1m,
+            checkpoint,
+            &phase,
+        );
+        bridge_validate_host_stability(&mut provenance, &host_state_before, checkpoint);
+    }
     let host_state_after = capture_bridge_host_state();
     bridge_validate_host_state(
         &mut provenance,
@@ -9558,7 +13089,11 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
         options.bridge_operations,
         options.bridge_seed,
     )?;
-    let ready_regression = bridge_ready_regression(&samples, options.bridge_seed ^ 0x4000)?;
+    let ready_regression = bridge_ready_regression(
+        &samples,
+        ready_operation_counts.len().saturating_mul(2),
+        options.bridge_seed ^ 0x4000,
+    )?;
 
     provenance.verify_runtime_source_unchanged();
     if !provenance.citable {
@@ -9571,13 +13106,21 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
             ));
         }
     }
+    eprintln!(
+        "!!! FINAL BRIDGE STATUS: NON-CITABLE DIAGNOSTIC ({}) — NUMBERS ARE NOT RELEASE EVIDENCE !!!",
+        provenance.status
+    );
+    for error in &provenance.validation_errors {
+        eprintln!("  provenance: {error}");
+    }
 
     let report = JsonBridgeReport {
-        schema_version: BRIDGE_REPORT_SCHEMA_V1.to_owned(),
+        schema_version: BRIDGE_REPORT_SCHEMA_V2.to_owned(),
         generated_at_utc: chrono_stamp(),
         provenance,
         environment,
         host_state_before,
+        host_state_checkpoints,
         host_state_after,
         config: JsonBridgeConfig {
             samples_per_arm: options.bridge_samples,
@@ -9585,7 +13128,7 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
             ready_operation_counts,
             order_seed: options.bridge_seed,
             ordering_policy:
-                "seeded balanced Latin/Williams order with reversed pairs for ready operation counts; random ABBA/BAAB within every two-arm block; random mirrored ABC-CBA for the three-arm workload"
+                "seeded balanced Latin/Williams order with reversed pairs for ready operation counts and full eight-block Williams-cycle bootstrap clusters at the fixed four-count matrix; randomized complementary ABBA/BAAB two-block clusters with two-block bootstrap resampling for retained-prepared two-arm self-carryover balance; complete randomized three-block rotation cycles with mirrored ABC-CBA sequences and three-block bootstrap clusters for exact three-arm position and within-block first-order carryover balance; transitions across complete design clusters are randomized but not asserted exactly balanced"
                     .to_owned(),
             warmup_policy:
                 "thread-local runtime prewarmed once; every database sample warms its exact DML path before timing"
@@ -9611,7 +13154,7 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
                 ),
             ]),
             affinity_policy:
-                "expected affinity must exactly match /proc/self/status and select exactly one or two CPUs"
+                "expected affinity must exactly match /proc/self/status, select one or two distinct physical cores on one NUMA node, exclude SMT siblings, and preserve topology throughout the run"
                     .to_owned(),
             max_load_average_1m,
         },
@@ -9751,7 +13294,9 @@ fn main() {
         if options.allow_unverified_provenance {
             provenance.mark_explicit_override();
         } else {
-            eprintln!("ERROR: refusing to run a citable benchmark with invalid provenance:");
+            eprintln!(
+                "ERROR: artifact emission requires explicit diagnostic authorization because provenance is non-citable:"
+            );
             for error in &provenance.validation_errors {
                 eprintln!("  - {error}");
             }
@@ -9770,7 +13315,13 @@ fn main() {
 
     let bench_start = Instant::now();
     let environment = DetectedEnvironment::detect(&provenance);
-    print_run_banner(!options.json_stdout, &options, row_counts, &environment);
+    print_run_banner(
+        !options.json_stdout,
+        &options,
+        row_counts,
+        &environment,
+        &provenance,
+    );
 
     let mut report = BenchReport::new();
     let total_sections = 10;

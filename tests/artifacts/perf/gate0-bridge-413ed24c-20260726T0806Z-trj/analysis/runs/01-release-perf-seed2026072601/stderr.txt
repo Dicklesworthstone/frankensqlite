@@ -1,0 +1,235 @@
+!!! NON-CITABLE BRIDGE DIAGNOSTIC (unverified_explicit_override) — NUMBERS ARE NOT RELEASE EVIDENCE !!!
+  provenance: pre-measurement I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: pre-measurement competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: pre-measurement host load average 1.370 exceeds declared maximum 1.000
+  provenance: the three-arm bridge has no fail-bounded watchdog around a wedged engine future or worker-facade call
+  provenance: the three-arm bridge is diagnostic-only until citable runs prove an isolated cgroup-v2 cpuset partition covering selected CPUs and online SMT siblings, full-dynticks coverage, disjoint effective IRQ affinities, per-thread affinity, and stable selected-policy frequency controls
+bridge ready-future control: operations=[1, 10, 100, 1000], samples/arm/count=48
+bridge retained-prepared control: operations=1000, samples/arm=48
+bridge common raw-DML path: operations=1000, samples/arm=48
+!!! FINAL BRIDGE STATUS: NON-CITABLE DIAGNOSTIC (unverified_explicit_override) — NUMBERS ARE NOT RELEASE EVIDENCE !!!
+  provenance: measurement checkpoint 0 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 0 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 0 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 1 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 1 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 1 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 10 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 10 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 10 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 11 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 11 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 11 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 12 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 12 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 12 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 13 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 13 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 13 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 14 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 14 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 14 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 15 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 15 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 15 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 16 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 16 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 16 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 17 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 17 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 17 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 18 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 18 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 18 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 19 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 19 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 19 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 2 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 2 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 2 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 20 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 20 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 20 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 21 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 21 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 21 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 22 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 22 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 22 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 23 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 23 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 23 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 24 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 24 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 24 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 25 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 25 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 25 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 26 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 26 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 26 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 27 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 27 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 27 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 28 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 28 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 28 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 29 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 29 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 29 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 3 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 3 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 3 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 30 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 30 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 30 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 31 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 31 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 31 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 32 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 32 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 32 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 33 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 33 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 33 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 34 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 34 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 34 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 35 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 35 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 35 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 36 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 36 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 36 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 37 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 37 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 37 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 38 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 38 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 38 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 39 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 39 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 39 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 4 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 4 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 4 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 40 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 40 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 40 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 41 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 41 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 41 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 42 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 42 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 42 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 43 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 43 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 43 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 44 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 44 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 44 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 45 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 45 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 45 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 46 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 46 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 46 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 47 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 47 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 47 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 48 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 48 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 48 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 49 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 49 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 49 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 5 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 5 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 5 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 50 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 50 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 50 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 51 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 51 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 51 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 52 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 52 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 52 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 53 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 53 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 53 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 54 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 54 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 54 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 55 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 55 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 55 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 56 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 56 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 56 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 57 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 57 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 57 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 58 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 58 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 58 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 59 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 59 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 59 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 6 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 6 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 6 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 60 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 60 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 60 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 61 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 61 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 61 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 62 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 62 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 62 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 63 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 63 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 63 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 64 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 64 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 64 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 65 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 65 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 65 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 66 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 66 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 66 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 67 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 67 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 67 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 68 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 68 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 68 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 69 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 69 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 69 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 7 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 7 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 7 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 70 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 70 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 70 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 71 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 71 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 71 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 8 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 8 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 8 host load average 1.370 exceeds declared maximum 1.000
+  provenance: measurement checkpoint 9 I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: measurement checkpoint 9 competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: measurement checkpoint 9 host load average 1.370 exceeds declared maximum 1.000
+  provenance: post-measurement I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: post-measurement competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: post-measurement host load average 1.370 exceeds declared maximum 1.000
+  provenance: pre-measurement I/O pressure some avg60 0.180 exceeds absolute maximum 0.100
+  provenance: pre-measurement competing build, benchmark, or maintenance processes are active: ["pid=2576076,comm=sbh"]
+  provenance: pre-measurement host load average 1.370 exceeds declared maximum 1.000
+  provenance: the three-arm bridge has no fail-bounded watchdog around a wedged engine future or worker-facade call
+  provenance: the three-arm bridge is diagnostic-only until citable runs prove an isolated cgroup-v2 cpuset partition covering selected CPUs and online SMT siblings, full-dynticks coverage, disjoint effective IRQ affinities, per-thread affinity, and stable selected-policy frequency controls
+JSON report written to: /data/tmp/fsqlite-gate0-final-413ed24c/runs/01-release-perf-seed2026072601/report.json
