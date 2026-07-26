@@ -224,7 +224,9 @@ pub trait TransactionExt {
     /// Begin a new transaction.
     ///
     /// The returned `Transaction` must be finalized by awaiting `commit()` or
-    /// `rollback()`; dropping it does NOT roll back (see `Drop`).
+    /// `rollback()`. Dropping it records a mandatory rollback obligation on
+    /// the connection; the next SQL entry point completes that rollback before
+    /// executing the caller's statement.
     fn transaction(&self) -> impl Future<Output = Result<Transaction<'_>, FrankenError>>;
 }
 
@@ -259,12 +261,12 @@ mod tests {
         });
     }
 
-    /// Dropping a `Transaction` does NOT roll back — `Drop::drop` cannot await
-    /// and this crate never builds its own runtime. The write therefore stays
-    /// in the still-open transaction and remains visible to the owning
-    /// connection (read-your-own-write); only an awaited `rollback()` undoes it.
+    /// Dropping a `Transaction` records a deferred rollback obligation because
+    /// `Drop::drop` cannot await and this crate never builds its own runtime.
+    /// The next SQL entry point must settle that obligation before it executes,
+    /// so abandoned writes are never visible to that later statement.
     #[test]
-    fn transaction_drop_leaves_txn_open() {
+    fn transaction_drop_rolls_back_before_next_statement() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
@@ -276,23 +278,19 @@ mod tests {
                 tx.execute("INSERT INTO t (val) VALUES ('not_rolled_back')")
                     .await
                     .unwrap();
-                // Dropped without commit()/rollback(): the transaction is left
-                // open on `conn` rather than rolled back.
+                // Dropped without commit()/rollback(): the connection records a
+                // rollback obligation for the next SQL entry point.
             }
 
             let rows = conn.query("SELECT val FROM t").await.unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(
-                rows[0].get_typed::<String>(0).unwrap(),
-                "not_rolled_back",
-                "dropping a Transaction must not roll back the open transaction"
+            assert!(
+                rows.is_empty(),
+                "the next statement must roll back an abandoned transaction before it reads"
             );
-
-            // The connection is still inside the transaction; finalize it so
-            // the test leaves no dangling writer state behind.
-            conn.rollback_transaction().await.unwrap();
-            let rows = conn.query("SELECT val FROM t").await.unwrap();
-            assert!(rows.is_empty(), "explicit rollback must undo the write");
+            assert!(
+                !conn.in_transaction(),
+                "settling the deferred rollback must leave the connection idle"
+            );
         });
     }
 
