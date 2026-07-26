@@ -100,11 +100,11 @@ fn all_four_constraints_on_one_column() {
             &[
                 "CREATE TABLE t (id INTEGER PRIMARY KEY, \
              a INTEGER NOT NULL DEFAULT 5 CHECK (a > 0) UNIQUE)",
-                "INSERT INTO t(id,a) VALUES (1,10)", // ok
-                "INSERT INTO t(id,a) VALUES (2,10)", // UNIQUE(a) violation -> error
-                "INSERT INTO t(id,a) VALUES (3,-5)", // CHECK(a>0) violation -> error
+                "INSERT INTO t(id,a) VALUES (1,10)",   // ok
+                "INSERT INTO t(id,a) VALUES (2,10)",   // UNIQUE(a) violation -> error
+                "INSERT INTO t(id,a) VALUES (3,-5)",   // CHECK(a>0) violation -> error
                 "INSERT INTO t(id,a) VALUES (4,NULL)", // NOT NULL violation -> error
-                "INSERT INTO t(id) VALUES (5)",      // a defaults to 5 -> ok
+                "INSERT INTO t(id) VALUES (5)",        // a defaults to 5 -> ok
             ],
             &["SELECT id, a FROM t ORDER BY id"], // (1,10),(5,5)
             "all_four_constraints_on_one_column",

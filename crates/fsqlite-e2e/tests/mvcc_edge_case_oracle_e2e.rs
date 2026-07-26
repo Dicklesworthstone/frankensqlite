@@ -203,159 +203,160 @@ fn empty_transaction_commit_rollback() {
 #[test]
 fn concurrent_writes_to_multiple_tables() {
     asupersync::test_utils::run_test(|| async {
-    let f_tmp = tempfile::NamedTempFile::new().unwrap();
-    let f_path = f_tmp.path().to_str().unwrap().to_owned();
+        let f_tmp = tempfile::NamedTempFile::new().unwrap();
+        let f_path = f_tmp.path().to_str().unwrap().to_owned();
 
-    {
-        let conn = fsqlite::Connection::open(&f_path).await.unwrap();
-        conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
-        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);")
+        {
+            let conn = fsqlite::Connection::open(&f_path).await.unwrap();
+            conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+            conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER);",
+            )
             .await
             .unwrap();
-        conn.execute(
-            "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER);",
-        )
-        .await
-        .unwrap();
-        conn.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY, msg TEXT);")
-            .await
+            conn.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY, msg TEXT);")
+                .await
+                .unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(3));
+
+        let p1 = f_path.clone();
+        let b1 = barrier.clone();
+        let t1 = thread::spawn(move || {
+            asupersync::test_utils::run_test(|| async {
+                let conn = fsqlite::Connection::open(&p1).await.unwrap();
+                conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+                b1.wait();
+                for i in 0..20 {
+                    let mut attempts = 0u32;
+                    loop {
+                        if conn.execute("BEGIN CONCURRENT").await.is_err() {
+                            attempts += 1;
+                            assert!(attempts < RETRY_LIMIT);
+                            thread::sleep(RETRY_BACKOFF);
+                            continue;
+                        }
+                        let sql = format!("INSERT INTO users VALUES ({i}, 'user_{i}');");
+                        if conn.execute(&sql).await.is_err() {
+                            drop(conn.execute("ROLLBACK").await);
+                            attempts += 1;
+                            assert!(attempts < RETRY_LIMIT);
+                            thread::sleep(RETRY_BACKOFF);
+                            continue;
+                        }
+                        match conn.execute("COMMIT").await {
+                            Ok(_) => break,
+                            Err(_) => {
+                                drop(conn.execute("ROLLBACK").await);
+                                attempts += 1;
+                                assert!(attempts < RETRY_LIMIT);
+                                thread::sleep(RETRY_BACKOFF);
+                            }
+                        }
+                    }
+                }
+            });
+        });
+
+        let p2 = f_path.clone();
+        let b2 = barrier.clone();
+        let t2 = thread::spawn(move || {
+            asupersync::test_utils::run_test(|| async {
+                let conn = fsqlite::Connection::open(&p2).await.unwrap();
+                conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+                b2.wait();
+                for i in 0..30 {
+                    let mut attempts = 0u32;
+                    loop {
+                        if conn.execute("BEGIN CONCURRENT").await.is_err() {
+                            attempts += 1;
+                            assert!(attempts < RETRY_LIMIT);
+                            thread::sleep(RETRY_BACKOFF);
+                            continue;
+                        }
+                        let sql =
+                            format!("INSERT INTO orders VALUES ({i}, {}, {});", i % 20, i * 100);
+                        if conn.execute(&sql).await.is_err() {
+                            drop(conn.execute("ROLLBACK").await);
+                            attempts += 1;
+                            assert!(attempts < RETRY_LIMIT);
+                            thread::sleep(RETRY_BACKOFF);
+                            continue;
+                        }
+                        match conn.execute("COMMIT").await {
+                            Ok(_) => break,
+                            Err(_) => {
+                                drop(conn.execute("ROLLBACK").await);
+                                attempts += 1;
+                                assert!(attempts < RETRY_LIMIT);
+                                thread::sleep(RETRY_BACKOFF);
+                            }
+                        }
+                    }
+                }
+            });
+        });
+
+        let p3 = f_path.clone();
+        let b3 = barrier.clone();
+        let t3 = thread::spawn(move || {
+            asupersync::test_utils::run_test(|| async {
+                let conn = fsqlite::Connection::open(&p3).await.unwrap();
+                conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+                b3.wait();
+                for i in 0..15 {
+                    let mut attempts = 0u32;
+                    loop {
+                        if conn.execute("BEGIN CONCURRENT").await.is_err() {
+                            attempts += 1;
+                            assert!(attempts < RETRY_LIMIT);
+                            thread::sleep(RETRY_BACKOFF);
+                            continue;
+                        }
+                        let sql = format!("INSERT INTO logs VALUES ({i}, 'log_entry_{i}');");
+                        if conn.execute(&sql).await.is_err() {
+                            drop(conn.execute("ROLLBACK").await);
+                            attempts += 1;
+                            assert!(attempts < RETRY_LIMIT);
+                            thread::sleep(RETRY_BACKOFF);
+                            continue;
+                        }
+                        match conn.execute("COMMIT").await {
+                            Ok(_) => break,
+                            Err(_) => {
+                                drop(conn.execute("ROLLBACK").await);
+                                attempts += 1;
+                                assert!(attempts < RETRY_LIMIT);
+                                thread::sleep(RETRY_BACKOFF);
+                            }
+                        }
+                    }
+                }
+            });
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+        t3.join().unwrap();
+
+        let verify = rusqlite::Connection::open(f_tmp.path()).unwrap();
+        let users: i64 = verify
+            .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
             .unwrap();
-    }
+        let orders: i64 = verify
+            .query_row("SELECT COUNT(*) FROM orders", [], |r| r.get(0))
+            .unwrap();
+        let logs: i64 = verify
+            .query_row("SELECT COUNT(*) FROM logs", [], |r| r.get(0))
+            .unwrap();
 
-    let barrier = Arc::new(Barrier::new(3));
-
-    let p1 = f_path.clone();
-    let b1 = barrier.clone();
-    let t1 = thread::spawn(move || {
-        asupersync::test_utils::run_test(|| async {
-        let conn = fsqlite::Connection::open(&p1).await.unwrap();
-        conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
-        b1.wait();
-        for i in 0..20 {
-            let mut attempts = 0u32;
-            loop {
-                if conn.execute("BEGIN CONCURRENT").await.is_err() {
-                    attempts += 1;
-                    assert!(attempts < RETRY_LIMIT);
-                    thread::sleep(RETRY_BACKOFF);
-                    continue;
-                }
-                let sql = format!("INSERT INTO users VALUES ({i}, 'user_{i}');");
-                if conn.execute(&sql).await.is_err() {
-                    drop(conn.execute("ROLLBACK").await);
-                    attempts += 1;
-                    assert!(attempts < RETRY_LIMIT);
-                    thread::sleep(RETRY_BACKOFF);
-                    continue;
-                }
-                match conn.execute("COMMIT").await {
-                    Ok(_) => break,
-                    Err(_) => {
-                        drop(conn.execute("ROLLBACK").await);
-                        attempts += 1;
-                        assert!(attempts < RETRY_LIMIT);
-                        thread::sleep(RETRY_BACKOFF);
-                    }
-                }
-            }
-        }
-        });
-    });
-
-    let p2 = f_path.clone();
-    let b2 = barrier.clone();
-    let t2 = thread::spawn(move || {
-        asupersync::test_utils::run_test(|| async {
-        let conn = fsqlite::Connection::open(&p2).await.unwrap();
-        conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
-        b2.wait();
-        for i in 0..30 {
-            let mut attempts = 0u32;
-            loop {
-                if conn.execute("BEGIN CONCURRENT").await.is_err() {
-                    attempts += 1;
-                    assert!(attempts < RETRY_LIMIT);
-                    thread::sleep(RETRY_BACKOFF);
-                    continue;
-                }
-                let sql = format!("INSERT INTO orders VALUES ({i}, {}, {});", i % 20, i * 100);
-                if conn.execute(&sql).await.is_err() {
-                    drop(conn.execute("ROLLBACK").await);
-                    attempts += 1;
-                    assert!(attempts < RETRY_LIMIT);
-                    thread::sleep(RETRY_BACKOFF);
-                    continue;
-                }
-                match conn.execute("COMMIT").await {
-                    Ok(_) => break,
-                    Err(_) => {
-                        drop(conn.execute("ROLLBACK").await);
-                        attempts += 1;
-                        assert!(attempts < RETRY_LIMIT);
-                        thread::sleep(RETRY_BACKOFF);
-                    }
-                }
-            }
-        }
-        });
-    });
-
-    let p3 = f_path.clone();
-    let b3 = barrier.clone();
-    let t3 = thread::spawn(move || {
-        asupersync::test_utils::run_test(|| async {
-        let conn = fsqlite::Connection::open(&p3).await.unwrap();
-        conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
-        b3.wait();
-        for i in 0..15 {
-            let mut attempts = 0u32;
-            loop {
-                if conn.execute("BEGIN CONCURRENT").await.is_err() {
-                    attempts += 1;
-                    assert!(attempts < RETRY_LIMIT);
-                    thread::sleep(RETRY_BACKOFF);
-                    continue;
-                }
-                let sql = format!("INSERT INTO logs VALUES ({i}, 'log_entry_{i}');");
-                if conn.execute(&sql).await.is_err() {
-                    drop(conn.execute("ROLLBACK").await);
-                    attempts += 1;
-                    assert!(attempts < RETRY_LIMIT);
-                    thread::sleep(RETRY_BACKOFF);
-                    continue;
-                }
-                match conn.execute("COMMIT").await {
-                    Ok(_) => break,
-                    Err(_) => {
-                        drop(conn.execute("ROLLBACK").await);
-                        attempts += 1;
-                        assert!(attempts < RETRY_LIMIT);
-                        thread::sleep(RETRY_BACKOFF);
-                    }
-                }
-            }
-        }
-        });
-    });
-
-    t1.join().unwrap();
-    t2.join().unwrap();
-    t3.join().unwrap();
-
-    let verify = rusqlite::Connection::open(f_tmp.path()).unwrap();
-    let users: i64 = verify
-        .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
-        .unwrap();
-    let orders: i64 = verify
-        .query_row("SELECT COUNT(*) FROM orders", [], |r| r.get(0))
-        .unwrap();
-    let logs: i64 = verify
-        .query_row("SELECT COUNT(*) FROM logs", [], |r| r.get(0))
-        .unwrap();
-
-    assert_eq!(users, 20, "users table should have 20 rows");
-    assert_eq!(orders, 30, "orders table should have 30 rows");
-    assert_eq!(logs, 15, "logs table should have 15 rows");
+        assert_eq!(users, 20, "users table should have 20 rows");
+        assert_eq!(orders, 30, "orders table should have 30 rows");
+        assert_eq!(logs, 15, "logs table should have 15 rows");
     });
 }
 

@@ -68,8 +68,12 @@ fn committed_writes_visible_to_new_connection() {
             c1.execute("CREATE TABLE vis (id INTEGER PRIMARY KEY, v INTEGER);")
                 .await
                 .unwrap();
-            c1.execute("INSERT INTO vis VALUES (1, 100);").await.unwrap();
-            c1.execute("INSERT INTO vis VALUES (2, 200);").await.unwrap();
+            c1.execute("INSERT INTO vis VALUES (1, 100);")
+                .await
+                .unwrap();
+            c1.execute("INSERT INTO vis VALUES (2, 200);")
+                .await
+                .unwrap();
         }
         {
             let c2 = fsqlite::Connection::open(&f_path).await.unwrap();

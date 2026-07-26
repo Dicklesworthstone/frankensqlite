@@ -158,19 +158,20 @@ fn lcg_next(state: &mut u64) -> u64 {
     *state
 }
 
-fn run_rw_benchmark<V: Vfs>(
+async fn run_rw_benchmark<V: Vfs>(
     vfs: &V,
     path: &str,
     iterations: usize,
     mut seed: u64,
 ) -> Result<f64, String> {
     let cx = Cx::new();
-    let mut file = open_rw_main_file(vfs, &cx, path)?;
+    let file = open_rw_main_file(vfs, &cx, path)?;
     let page = vec![0xAB_u8; BENCH_PAGE_SIZE];
     let mut read_buf = vec![0_u8; BENCH_PAGE_SIZE];
 
     for page_index in 0_u64..BENCH_PAGE_COUNT {
         file.write(&cx, &page, page_index * BENCH_PAGE_SIZE_U64)
+            .await
             .map_err(|error| format!("benchmark_prewrite_failed path={path} error={error}"))?;
     }
 
@@ -180,6 +181,7 @@ fn run_rw_benchmark<V: Vfs>(
         let read_offset = read_page * BENCH_PAGE_SIZE_U64;
         let read = file
             .read(&cx, &mut read_buf, read_offset)
+            .await
             .map_err(|error| format!("benchmark_read_failed path={path} error={error}"))?;
         if read != BENCH_PAGE_SIZE {
             return Err(format!(
@@ -190,6 +192,7 @@ fn run_rw_benchmark<V: Vfs>(
         let write_page = lcg_next(&mut seed) % BENCH_PAGE_COUNT;
         let write_offset = write_page * BENCH_PAGE_SIZE_U64;
         file.write(&cx, &page, write_offset)
+            .await
             .map_err(|error| format!("benchmark_write_failed path={path} error={error}"))?;
     }
 
@@ -263,13 +266,17 @@ fn run_lock_contract(vfs: &FaultInjectingVfs<MemoryVfs>, cx: &Cx) -> Result<Vec<
     Ok(lock_steps)
 }
 
-fn run_fault_matrix(vfs: &FaultInjectingVfs<MemoryVfs>, cx: &Cx) -> Result<Vec<String>, String> {
+async fn run_fault_matrix(
+    vfs: &FaultInjectingVfs<MemoryVfs>,
+    cx: &Cx,
+) -> Result<Vec<String>, String> {
     let mut fault_steps = Vec::new();
 
     let mut read_fail = open_rw_main_file(vfs, cx, "read_fail.db")?;
     let mut read_buf = [0_u8; 8];
     let read_error = read_fail
         .read(cx, &mut read_buf, 0)
+        .await
         .expect_err("read failure fault should force read error");
     expect_io_error(&read_error, "read_failure")?;
     fault_steps.push("read_failure=io_error".to_owned());
@@ -280,6 +287,7 @@ fn run_fault_matrix(vfs: &FaultInjectingVfs<MemoryVfs>, cx: &Cx) -> Result<Vec<S
     let mut write_fail = open_rw_main_file(vfs, cx, "write_fail.db")?;
     let write_error = write_fail
         .write(cx, b"write-fail", 0)
+        .await
         .expect_err("write failure fault should force write error");
     expect_io_error(&write_error, "write_failure")?;
     fault_steps.push("write_failure=io_error".to_owned());
@@ -290,6 +298,7 @@ fn run_fault_matrix(vfs: &FaultInjectingVfs<MemoryVfs>, cx: &Cx) -> Result<Vec<S
     let mut partial = open_rw_main_file(vfs, cx, "partial.db")?;
     let partial_error = partial
         .write(cx, b"abcdefgh", 0)
+        .await
         .expect_err("partial write fault should surface an I/O error");
     expect_io_error(&partial_error, "partial_write")?;
     let partial_size = partial
@@ -303,6 +312,7 @@ fn run_fault_matrix(vfs: &FaultInjectingVfs<MemoryVfs>, cx: &Cx) -> Result<Vec<S
     let mut partial_buf = [0_u8; 8];
     let partial_read = partial
         .read(cx, &mut partial_buf, 0)
+        .await
         .map_err(|error| format!("partial_read_failed error={error}"))?;
     if partial_read != 3 || &partial_buf[..3] != b"abc" {
         return Err(format!(
@@ -318,6 +328,7 @@ fn run_fault_matrix(vfs: &FaultInjectingVfs<MemoryVfs>, cx: &Cx) -> Result<Vec<S
     let mut disk_full = open_rw_main_file(vfs, cx, "disk_full.db")?;
     let disk_error = disk_full
         .write(cx, b"disk", 0)
+        .await
         .expect_err("disk full fault should fail writes");
     if !matches!(disk_error, FrankenError::DatabaseFull) {
         return Err(format!(
@@ -334,6 +345,7 @@ fn run_fault_matrix(vfs: &FaultInjectingVfs<MemoryVfs>, cx: &Cx) -> Result<Vec<S
     let latency_start = Instant::now();
     let latency_read = latency
         .read(cx, &mut latency_buf, 0)
+        .await
         .map_err(|error| format!("latency_read_failed error={error}"))?;
     let latency_elapsed = latency_start.elapsed();
     if latency_read != 0 {
@@ -355,6 +367,7 @@ fn run_fault_matrix(vfs: &FaultInjectingVfs<MemoryVfs>, cx: &Cx) -> Result<Vec<S
     let mut torn = open_rw_main_file(vfs, cx, "torn.db")?;
     let torn_error = torn
         .write(cx, b"abcdefgh", 0)
+        .await
         .expect_err("torn write should fail write call after partial persistence");
     expect_io_error(&torn_error, "torn_write")?;
     let torn_size = torn
@@ -368,6 +381,7 @@ fn run_fault_matrix(vfs: &FaultInjectingVfs<MemoryVfs>, cx: &Cx) -> Result<Vec<S
     let mut torn_buf = [0_u8; 8];
     let torn_read = torn
         .read(cx, &mut torn_buf, 0)
+        .await
         .map_err(|error| format!("torn_read_failed error={error}"))?;
     if torn_read != 4 || &torn_buf[..4] != b"abcd" {
         return Err(format!(
@@ -382,6 +396,7 @@ fn run_fault_matrix(vfs: &FaultInjectingVfs<MemoryVfs>, cx: &Cx) -> Result<Vec<S
     let mut power = open_rw_main_file(vfs, cx, "power.db")?;
     power
         .write(cx, b"power", 0)
+        .await
         .map_err(|error| format!("power_write_before_cut_failed error={error}"))?;
     let sync_error = power
         .sync(cx, SyncFlags::FULL)
@@ -389,6 +404,7 @@ fn run_fault_matrix(vfs: &FaultInjectingVfs<MemoryVfs>, cx: &Cx) -> Result<Vec<S
     expect_io_error(&sync_error, "power_cut_sync")?;
     let write_after_cut = power
         .write(cx, b"down", 2)
+        .await
         .expect_err("writes after power cut should fail");
     expect_io_error(&write_after_cut, "power_cut_write_after")?;
     fault_steps.push("power_cut=sync_error_then_powered_off".to_owned());
@@ -571,7 +587,7 @@ fn run_unix_same_process_lock_probe() -> Result<String, String> {
 }
 
 #[cfg(unix)]
-fn run_unix_cross_process_lock_probe() -> Result<String, String> {
+async fn run_unix_cross_process_lock_probe() -> Result<String, String> {
     let cx = Cx::new();
     let tempdir = TempDir::new().map_err(|error| format!("unix_cross_tempdir_failed: {error}"))?;
     let path = tempdir.path().join("bd_3u7_4_unix_cross_process_lock.db");
@@ -583,6 +599,7 @@ fn run_unix_cross_process_lock_probe() -> Result<String, String> {
         .map_err(|error| format!("unix_cross_open_bootstrap_failed error={error}"))?;
     bootstrap
         .write(&cx, b"seed", 0)
+        .await
         .map_err(|error| format!("unix_cross_bootstrap_write_failed error={error}"))?;
     bootstrap
         .close(&cx)
@@ -715,18 +732,19 @@ fn run_unix_cross_process_lock_probe() -> Result<String, String> {
 }
 
 #[cfg(unix)]
-fn run_unix_lock_probe() -> Result<String, String> {
+async fn run_unix_lock_probe() -> Result<String, String> {
     let same_process = run_unix_same_process_lock_probe()?;
-    let cross_process = run_unix_cross_process_lock_probe()?;
+    let cross_process = run_unix_cross_process_lock_probe().await?;
     Ok(format!("{same_process}|{cross_process}"))
 }
 
 #[cfg(not(unix))]
-fn run_unix_lock_probe() -> Result<String, String> {
+#[allow(clippy::unused_async)]
+async fn run_unix_lock_probe() -> Result<String, String> {
     Ok("unix_lock_probe_skipped_non_unix".to_owned())
 }
 
-fn run_fault_contract(seed: u64) -> Result<FaultContractRun, String> {
+async fn run_fault_contract(seed: u64) -> Result<FaultContractRun, String> {
     let vfs = FaultInjectingVfs::with_seed(MemoryVfs::new(), seed);
     vfs.inject_fault(FaultSpec::read_failure("read_fail.db").build());
     vfs.inject_fault(FaultSpec::write_failure("write_fail.db").build());
@@ -751,9 +769,9 @@ fn run_fault_contract(seed: u64) -> Result<FaultContractRun, String> {
     vfs.inject_fault(FaultSpec::power_cut("power.db").after_nth_sync(0).build());
 
     let cx = Cx::new();
-    let unix_lock_probe = run_unix_lock_probe()?;
+    let unix_lock_probe = run_unix_lock_probe().await?;
     let lock_steps = run_lock_contract(&vfs, &cx)?;
-    let fault_steps = run_fault_matrix(&vfs, &cx)?;
+    let fault_steps = run_fault_matrix(&vfs, &cx).await?;
     let FaultMetricsSnapshot {
         metric_name,
         by_fault_type,
@@ -772,14 +790,18 @@ fn run_fault_contract(seed: u64) -> Result<FaultContractRun, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn run_uring_comparison(seed: u64, iterations: usize) -> Result<(f64, f64, bool, String), String> {
+async fn run_uring_comparison(
+    seed: u64,
+    iterations: usize,
+) -> Result<(f64, f64, bool, String), String> {
     let unix_vfs = UnixVfs::new();
     let unix_ops_per_sec = run_rw_benchmark(
         &unix_vfs,
         "bench_unix.db",
         iterations,
         seed ^ 0x5151_7272_9393_A4A4,
-    )?;
+    )
+    .await?;
 
     let io_uring_vfs = IoUringVfs::new();
     let io_uring_available = io_uring_vfs.is_available();
@@ -793,7 +815,8 @@ fn run_uring_comparison(seed: u64, iterations: usize) -> Result<(f64, f64, bool,
         "bench_io_uring.db",
         iterations,
         seed ^ 0xB1B1_C2C2_D3D3_E4E4,
-    )?;
+    )
+    .await?;
     Ok((
         unix_ops_per_sec,
         io_uring_ops_per_sec,
@@ -803,14 +826,18 @@ fn run_uring_comparison(seed: u64, iterations: usize) -> Result<(f64, f64, bool,
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn run_uring_comparison(seed: u64, iterations: usize) -> Result<(f64, f64, bool, String), String> {
+async fn run_uring_comparison(
+    seed: u64,
+    iterations: usize,
+) -> Result<(f64, f64, bool, String), String> {
     let unix_vfs = UnixVfs::new();
     let unix_ops_per_sec = run_rw_benchmark(
         &unix_vfs,
         "bench_unix.db",
         iterations,
         seed ^ 0x5151_7272_9393_A4A4,
-    )?;
+    )
+    .await?;
     Ok((
         unix_ops_per_sec,
         0.0,
@@ -820,14 +847,15 @@ fn run_uring_comparison(seed: u64, iterations: usize) -> Result<(f64, f64, bool,
 }
 
 #[cfg(not(unix))]
-fn run_uring_comparison(
+#[allow(clippy::unused_async)]
+async fn run_uring_comparison(
     _seed: u64,
     _iterations: usize,
 ) -> Result<(f64, f64, bool, String), String> {
     Ok((0.0, 0.0, false, "unsupported_non_unix".to_owned()))
 }
 
-fn run_throughput(seed: u64, iterations: usize) -> Result<ThroughputRun, String> {
+async fn run_throughput(seed: u64, iterations: usize) -> Result<ThroughputRun, String> {
     let baseline_vfs = MemoryVfs::new();
     let wrapped_vfs = FaultInjectingVfs::with_seed(MemoryVfs::new(), seed ^ 0xA5A5_A5A5_A5A5_A5A5);
 
@@ -836,13 +864,15 @@ fn run_throughput(seed: u64, iterations: usize) -> Result<ThroughputRun, String>
         "bench_baseline.db",
         iterations,
         seed ^ 0x1111_2222,
-    )?;
+    )
+    .await?;
     let wrapped_ops_per_sec = run_rw_benchmark(
         &wrapped_vfs,
         "bench_wrapped.db",
         iterations,
         seed ^ 0x3333_4444,
-    )?;
+    )
+    .await?;
     let wrapped_vs_baseline_ratio = if baseline_ops_per_sec > 0.0 {
         wrapped_ops_per_sec / baseline_ops_per_sec
     } else {
@@ -850,7 +880,7 @@ fn run_throughput(seed: u64, iterations: usize) -> Result<ThroughputRun, String>
     };
 
     let (unix_ops_per_sec, io_uring_ops_per_sec, io_uring_available, io_uring_status) =
-        run_uring_comparison(seed, iterations)?;
+        run_uring_comparison(seed, iterations).await?;
     let io_uring_vs_unix_ratio = if io_uring_available && unix_ops_per_sec > 0.0 {
         io_uring_ops_per_sec / unix_ops_per_sec
     } else {
@@ -877,108 +907,116 @@ fn test_e2e_bd_3u7_4_vfs_contract_fault_matrix() {
         return;
     }
 
-    let seed = scenario_seed();
-    let iterations = bench_iters();
-    let started = Instant::now();
+    asupersync::test_utils::run_test(|| async {
+        let seed = scenario_seed();
+        let iterations = bench_iters();
+        let started = Instant::now();
 
-    let first = run_fault_contract(seed).expect("bd-3u7.4 fault contract run should pass");
-    let second = run_fault_contract(seed).expect("bd-3u7.4 deterministic replay should pass");
-    assert_eq!(
-        first, second,
-        "bead_id={BEAD_ID} deterministic fault contract replay failed for seed={seed}"
-    );
-    #[cfg(unix)]
-    assert!(
-        first
-            .unix_lock_probe
-            .contains("unix_same_process_reserved_lock_pass")
-            && first
+        let first = run_fault_contract(seed)
+            .await
+            .expect("bd-3u7.4 fault contract run should pass");
+        let second = run_fault_contract(seed)
+            .await
+            .expect("bd-3u7.4 deterministic replay should pass");
+        assert_eq!(
+            first, second,
+            "bead_id={BEAD_ID} deterministic fault contract replay failed for seed={seed}"
+        );
+        #[cfg(unix)]
+        assert!(
+            first
                 .unix_lock_probe
-                .contains("unix_cross_process_reserved_lock_pass"),
-        "bead_id={BEAD_ID} unix lock probe must include same-process and cross-process pass markers, got={}",
-        first.unix_lock_probe
-    );
-    #[cfg(not(unix))]
-    assert!(
-        first.unix_lock_probe.contains("skipped"),
-        "bead_id={BEAD_ID} unix lock probe result should be skipped on non-unix, got={}",
-        first.unix_lock_probe
-    );
-
-    assert_eq!(first.metric_name, TEST_VFS_FAULT_COUNTER_NAME);
-    for fault_type in [
-        "read_failure",
-        "write_failure",
-        "partial_write",
-        "disk_full",
-        "latency",
-        "torn_write",
-        "power_cut",
-    ] {
+                .contains("unix_same_process_reserved_lock_pass")
+                && first
+                    .unix_lock_probe
+                    .contains("unix_cross_process_reserved_lock_pass"),
+            "bead_id={BEAD_ID} unix lock probe must include same-process and cross-process pass markers, got={}",
+            first.unix_lock_probe
+        );
+        #[cfg(not(unix))]
         assert!(
-            first.metrics_by_fault_type.contains_key(fault_type),
-            "bead_id={BEAD_ID} missing metric counter for fault_type={fault_type}",
+            first.unix_lock_probe.contains("skipped"),
+            "bead_id={BEAD_ID} unix lock probe result should be skipped on non-unix, got={}",
+            first.unix_lock_probe
         );
-    }
 
-    let throughput = run_throughput(seed, iterations).expect("bd-3u7.4 throughput run should pass");
-    assert!(
-        throughput.baseline_ops_per_sec > 0.0,
-        "bead_id={BEAD_ID} baseline throughput must be positive"
-    );
-    assert!(
-        throughput.wrapped_ops_per_sec > 0.0,
-        "bead_id={BEAD_ID} wrapped throughput must be positive"
-    );
-    assert!(
-        throughput.wrapped_vs_baseline_ratio > 0.0,
-        "bead_id={BEAD_ID} wrapped/baseline ratio must be positive"
-    );
-    if require_io_uring() && !throughput.io_uring_available {
-        panic!(
-            "bead_id={BEAD_ID} io_uring benchmark required but io_uring support is unavailable in tree"
-        );
-    }
-    if require_io_uring() {
+        assert_eq!(first.metric_name, TEST_VFS_FAULT_COUNTER_NAME);
+        for fault_type in [
+            "read_failure",
+            "write_failure",
+            "partial_write",
+            "disk_full",
+            "latency",
+            "torn_write",
+            "power_cut",
+        ] {
+            assert!(
+                first.metrics_by_fault_type.contains_key(fault_type),
+                "bead_id={BEAD_ID} missing metric counter for fault_type={fault_type}",
+            );
+        }
+
+        let throughput = run_throughput(seed, iterations)
+            .await
+            .expect("bd-3u7.4 throughput run should pass");
         assert!(
-            throughput.io_uring_vs_unix_ratio >= 2.0,
-            "bead_id={BEAD_ID} io_uring throughput target unmet ratio={} unix_ops={} io_uring_ops={} status={}",
-            throughput.io_uring_vs_unix_ratio,
-            throughput.unix_ops_per_sec,
-            throughput.io_uring_ops_per_sec,
-            throughput.io_uring_status,
+            throughput.baseline_ops_per_sec > 0.0,
+            "bead_id={BEAD_ID} baseline throughput must be positive"
         );
-    }
+        assert!(
+            throughput.wrapped_ops_per_sec > 0.0,
+            "bead_id={BEAD_ID} wrapped throughput must be positive"
+        );
+        assert!(
+            throughput.wrapped_vs_baseline_ratio > 0.0,
+            "bead_id={BEAD_ID} wrapped/baseline ratio must be positive"
+        );
+        if require_io_uring() && !throughput.io_uring_available {
+            panic!(
+                "bead_id={BEAD_ID} io_uring benchmark required but io_uring support is unavailable in tree"
+            );
+        }
+        if require_io_uring() {
+            assert!(
+                throughput.io_uring_vs_unix_ratio >= 2.0,
+                "bead_id={BEAD_ID} io_uring throughput target unmet ratio={} unix_ops={} io_uring_ops={} status={}",
+                throughput.io_uring_vs_unix_ratio,
+                throughput.unix_ops_per_sec,
+                throughput.io_uring_ops_per_sec,
+                throughput.io_uring_status,
+            );
+        }
 
-    let run_id = format!("{BEAD_ID}-seed-{seed:016x}");
-    let trace_id = format!("trace-{seed:016x}");
-    let replay_commands = vec![
-        format!(
-            "BD_3U7_4_SEED={seed} BD_3U7_4_BENCH_ITERS={iterations} cargo test -p fsqlite-harness --test bd_3u7_4_vfs_contract_fault_injection -- --nocapture"
-        ),
-        format!(
-            "BD_3U7_4_SEED={seed} BD_3U7_4_BENCH_ITERS={iterations} scripts/verify_bd_3u7_4_vfs_contract_fault_injection.sh"
-        ),
-    ];
-    let artifact = ContractSuiteArtifact {
-        schema_version: 1,
-        bead_id: BEAD_ID.to_owned(),
-        run_id: run_id.clone(),
-        trace_id: trace_id.clone(),
-        scenario_id: SCENARIO_ID.to_owned(),
-        seed,
-        duration_ms: started.elapsed().as_millis(),
-        replay_commands,
-        fault_contract: first,
-        throughput,
-    };
-    let artifact_path =
-        write_suite_artifact(&artifact).expect("bd-3u7.4 contract artifact write should pass");
+        let run_id = format!("{BEAD_ID}-seed-{seed:016x}");
+        let trace_id = format!("trace-{seed:016x}");
+        let replay_commands = vec![
+            format!(
+                "BD_3U7_4_SEED={seed} BD_3U7_4_BENCH_ITERS={iterations} cargo test -p fsqlite-harness --test bd_3u7_4_vfs_contract_fault_injection -- --nocapture"
+            ),
+            format!(
+                "BD_3U7_4_SEED={seed} BD_3U7_4_BENCH_ITERS={iterations} scripts/verify_bd_3u7_4_vfs_contract_fault_injection.sh"
+            ),
+        ];
+        let artifact = ContractSuiteArtifact {
+            schema_version: 1,
+            bead_id: BEAD_ID.to_owned(),
+            run_id: run_id.clone(),
+            trace_id: trace_id.clone(),
+            scenario_id: SCENARIO_ID.to_owned(),
+            seed,
+            duration_ms: started.elapsed().as_millis(),
+            replay_commands,
+            fault_contract: first,
+            throughput,
+        };
+        let artifact_path =
+            write_suite_artifact(&artifact).expect("bd-3u7.4 contract artifact write should pass");
 
-    println!(
-        "INFO bead_id={BEAD_ID} case=suite_artifact path={} run_id={} trace_id={} scenario_id={SCENARIO_ID}",
-        artifact_path.display(),
-        run_id,
-        trace_id,
-    );
+        println!(
+            "INFO bead_id={BEAD_ID} case=suite_artifact path={} run_id={} trace_id={} scenario_id={SCENARIO_ID}",
+            artifact_path.display(),
+            run_id,
+            trace_id,
+        );
+    });
 }

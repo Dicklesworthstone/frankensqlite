@@ -218,7 +218,11 @@ fn v3_nested_savepoint_trigger_view() {
             .expect("release inner");
 
         // View should show 3 entries (baseline + outer + inner)
-        let mid = conn.query("SELECT * FROM v_audit").await.expect("mid").len();
+        let mid = conn
+            .query("SELECT * FROM v_audit")
+            .await
+            .expect("mid")
+            .len();
         assert_eq!(mid, 3);
 
         // Rollback outer — both outer and inner inserts should revert
@@ -272,7 +276,11 @@ fn v4_update_trigger_view_rollback() {
             .await
             .expect("seed");
 
-        let before = conn.query("SELECT * FROM v_history").await.expect("q").len();
+        let before = conn
+            .query("SELECT * FROM v_history")
+            .await
+            .expect("q")
+            .len();
         assert_eq!(before, 0, "no history before any update");
 
         conn.execute("SAVEPOINT sp").await.expect("savepoint");
@@ -341,7 +349,11 @@ fn v5_delete_trigger_view_rollback() {
             .await
             .expect("delete");
 
-        let mid_trash = conn.query("SELECT * FROM v_trash").await.expect("mid").len();
+        let mid_trash = conn
+            .query("SELECT * FROM v_trash")
+            .await
+            .expect("mid")
+            .len();
         assert_eq!(mid_trash, 1, "trash has one entry mid-savepoint");
 
         conn.execute("ROLLBACK TO sp").await.expect("rollback");

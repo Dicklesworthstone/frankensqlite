@@ -62,7 +62,9 @@ fn w1_basic_wal_recovery() {
         // Recovery phase — reopen and verify
         {
             let conn = Connection::open(path_str).await.expect("reopen");
-            let count = get_int(&conn, "SELECT COUNT(*) FROM wal_test").await.unwrap();
+            let count = get_int(&conn, "SELECT COUNT(*) FROM wal_test")
+                .await
+                .unwrap();
             assert_eq!(
                 count, 100,
                 "W1: expected 100 rows after recovery, got {count}"
@@ -245,7 +247,9 @@ fn w4_large_transaction_recovery() {
         // Recovery
         {
             let conn = Connection::open(path_str).await.expect("reopen");
-            let count = get_int(&conn, "SELECT COUNT(*) FROM large_txn").await.unwrap();
+            let count = get_int(&conn, "SELECT COUNT(*) FROM large_txn")
+                .await
+                .unwrap();
             assert_eq!(count, 10_000, "W4: expected 10000 rows after recovery");
 
             // Verify each batch
@@ -259,7 +263,9 @@ fn w4_large_transaction_recovery() {
                 assert_eq!(bc, 1000, "W4: batch {batch} count wrong");
             }
 
-            let sum = get_int(&conn, "SELECT SUM(val) FROM large_txn").await.unwrap();
+            let sum = get_int(&conn, "SELECT SUM(val) FROM large_txn")
+                .await
+                .unwrap();
             // sum(i*3 for i in 1..=10000) = 3 * 10000*10001/2 = 150_015_000
             assert_eq!(
                 sum, 150_015_000,
@@ -401,7 +407,9 @@ fn w6_multi_connection_restart() {
 
         // Phase 2: reopen and verify
         let verify = Connection::open(path_str).await.expect("verify open");
-        let actual = get_int(&verify, "SELECT COUNT(*) FROM multi_w").await.unwrap();
+        let actual = get_int(&verify, "SELECT COUNT(*) FROM multi_w")
+            .await
+            .unwrap();
 
         // Allow small tolerance for race at stop boundary
         assert!(
@@ -447,10 +455,14 @@ fn w7_many_small_transactions() {
         // Recovery
         {
             let conn = Connection::open(path_str).await.expect("reopen");
-            let count = get_int(&conn, "SELECT COUNT(*) FROM small_txn").await.unwrap();
+            let count = get_int(&conn, "SELECT COUNT(*) FROM small_txn")
+                .await
+                .unwrap();
             assert_eq!(count, 500, "W7: expected 500 rows after recovery");
 
-            let sum = get_int(&conn, "SELECT SUM(val) FROM small_txn").await.unwrap();
+            let sum = get_int(&conn, "SELECT SUM(val) FROM small_txn")
+                .await
+                .unwrap();
             assert_eq!(sum, 125_250, "W7: data corruption");
         }
 
@@ -469,8 +481,10 @@ fn w8_oracle_parity_after_recovery() {
         let c_path = dir.path().join("w8_c.db");
         {
             let c = rusqlite::Connection::open(&c_path).expect("c open");
-            c.execute_batch("CREATE TABLE recovery (id INTEGER PRIMARY KEY, val INTEGER, tag TEXT)")
-                .expect("c create");
+            c.execute_batch(
+                "CREATE TABLE recovery (id INTEGER PRIMARY KEY, val INTEGER, tag TEXT)",
+            )
+            .expect("c create");
             for i in 1..=200 {
                 c.execute(
                     "INSERT INTO recovery VALUES (?1, ?2, ?3)",

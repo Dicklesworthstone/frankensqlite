@@ -83,7 +83,9 @@ fn delete_reinsert_freeblock_accounting() {
             conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
                 .await
                 .unwrap();
-            conn.execute("CREATE INDEX idx_val ON t(val)").await.unwrap();
+            conn.execute("CREATE INDEX idx_val ON t(val)")
+                .await
+                .unwrap();
             for i in 0..100 {
                 conn.execute(&format!("INSERT INTO t VALUES ({i}, 'row_{i}')"))
                     .await
@@ -116,7 +118,9 @@ fn delete_all_reinsert_freelist() {
             conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
                 .await
                 .unwrap();
-            conn.execute("CREATE INDEX idx_val ON t(val)").await.unwrap();
+            conn.execute("CREATE INDEX idx_val ON t(val)")
+                .await
+                .unwrap();
             for i in 0..100 {
                 conn.execute(&format!("INSERT INTO t VALUES ({i}, 'row_{i}')"))
                     .await
@@ -149,7 +153,9 @@ fn multiple_indexes_balance() {
             conn.execute("CREATE INDEX idx_b ON t(b)").await.unwrap();
             conn.execute("CREATE INDEX idx_c ON t(c)").await.unwrap();
             conn.execute("CREATE INDEX idx_d ON t(d)").await.unwrap();
-            conn.execute("CREATE INDEX idx_bc ON t(b, c)").await.unwrap();
+            conn.execute("CREATE INDEX idx_bc ON t(b, c)")
+                .await
+                .unwrap();
             for i in 0..200 {
                 conn.execute(&format!(
                     "INSERT INTO t VALUES ({i}, 'val_{i}', {i}.5, {})",
@@ -202,7 +208,9 @@ fn updates_with_index() {
             conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
                 .await
                 .unwrap();
-            conn.execute("CREATE INDEX idx_val ON t(val)").await.unwrap();
+            conn.execute("CREATE INDEX idx_val ON t(val)")
+                .await
+                .unwrap();
             for i in 0..100 {
                 conn.execute(&format!("INSERT INTO t VALUES ({i}, 'original_{i}')"))
                     .await
@@ -286,9 +294,11 @@ fn unique_constraint_delete_reinsert() {
             let conn = fsqlite::Connection::open(path.to_str().unwrap())
                 .await
                 .unwrap();
-            conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT)")
-                .await
-                .unwrap();
+            conn.execute(
+                "CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT)",
+            )
+            .await
+            .unwrap();
             for i in 0..50 {
                 conn.execute(&format!(
                     "INSERT INTO users VALUES ({i}, 'user{i}@example.com', 'User {i}')"
@@ -358,7 +368,9 @@ fn wal_mode_checkpoint() {
             conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
                 .await
                 .unwrap();
-            conn.execute("CREATE INDEX idx_val ON t(val)").await.unwrap();
+            conn.execute("CREATE INDEX idx_val ON t(val)")
+                .await
+                .unwrap();
             for i in 0..100 {
                 conn.execute(&format!("INSERT INTO t VALUES ({i}, 'row_{i}')"))
                     .await
@@ -581,7 +593,9 @@ fn multi_table_explicit_indexes_no_autoincrement() {
             conn.execute("CREATE TABLE t1(id TEXT PRIMARY KEY, a TEXT, b INTEGER)")
                 .await
                 .unwrap();
-            conn.execute("CREATE INDEX idx_t1_a ON t1(a)").await.unwrap();
+            conn.execute("CREATE INDEX idx_t1_a ON t1(a)")
+                .await
+                .unwrap();
             conn.execute("CREATE TABLE t2(id TEXT PRIMARY KEY, t1_id TEXT, c REAL)")
                 .await
                 .unwrap();

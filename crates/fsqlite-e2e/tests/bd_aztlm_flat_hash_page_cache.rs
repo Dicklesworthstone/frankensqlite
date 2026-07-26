@@ -362,8 +362,7 @@ fn bd_aztlm_flat_hash_four_concurrent_writers_no_data_loss() {
         let elapsed = started.elapsed();
 
         let verifier = open_fsqlite(&fsqlite_db).await;
-        let total_rows =
-            query_single_integer(&verifier, "SELECT COUNT(*) FROM writer_rows;").await;
+        let total_rows = query_single_integer(&verifier, "SELECT COUNT(*) FROM writer_rows;").await;
         assert_eq!(
             total_rows,
             i64::try_from(total_committed).expect("committed count fits"),

@@ -43,11 +43,7 @@ fn nearest_rank_percentile(sorted: &[u64], pct: u32) -> u64 {
 /// `.await`. This helper runs the identical warmup/measurement/percentile
 /// pipeline over an async closure so that FrankenSQLite engine calls (which are
 /// now `async`) can be measured with exactly the same statistics.
-async fn measure_operation_async<F>(
-    warmup: u32,
-    iterations: u32,
-    mut f: F,
-) -> (LatencyStats, f64)
+async fn measure_operation_async<F>(warmup: u32, iterations: u32, mut f: F) -> (LatencyStats, f64)
 where
     F: std::ops::AsyncFnMut(),
 {
@@ -1966,62 +1962,63 @@ fn manual_perf_probe_write_10k_autocommit_prepared_unique_email_index() {
 #[ignore = "manual perf probe; run via rch when investigating repeated prepare reuse"]
 fn manual_perf_probe_prepare_cache_reuse_vs_unique_sql_variants() {
     asupersync::test_utils::run_test(|| async {
-    const ROW_COUNT: i64 = 10_000;
-    const INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137))";
+        const ROW_COUNT: i64 = 10_000;
+        const INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137))";
 
-    let unique_sqls: Vec<String> = (0..ROW_COUNT)
-        .map(|i| format!("{INSERT_SQL} -- prepare-cache-miss-{i}"))
-        .collect();
+        let unique_sqls: Vec<String> = (0..ROW_COUNT)
+            .map(|i| format!("{INSERT_SQL} -- prepare-cache-miss-{i}"))
+            .collect();
 
-    let reused = run_fsqlite_prepare_cache_probe(
-        std::iter::repeat_n(INSERT_SQL, usize::try_from(ROW_COUNT).unwrap()),
-        ROW_COUNT,
-    )
-    .await;
-    let unique =
-        run_fsqlite_prepare_cache_probe(unique_sqls.iter().map(String::as_str), ROW_COUNT).await;
+        let reused = run_fsqlite_prepare_cache_probe(
+            std::iter::repeat_n(INSERT_SQL, usize::try_from(ROW_COUNT).unwrap()),
+            ROW_COUNT,
+        )
+        .await;
+        let unique =
+            run_fsqlite_prepare_cache_probe(unique_sqls.iter().map(String::as_str), ROW_COUNT)
+                .await;
 
-    eprintln!(
-        "manual_perf_probe.prepare_cache_reuse.reused rows_per_sec={:.1} parse_cache_hit={} parse_cache_miss={} compiled_cache_hit={} compiled_cache_miss={} prepared_cache_hit={} prepared_cache_miss={}",
-        reused.rows_per_sec,
-        reused.parse_cache_hits,
-        reused.parse_cache_misses,
-        reused.compiled_cache_hits,
-        reused.compiled_cache_misses,
-        reused.prepared_cache_hits,
-        reused.prepared_cache_misses,
-    );
-    eprintln!(
-        "manual_perf_probe.prepare_cache_reuse.unique_sql rows_per_sec={:.1} parse_cache_hit={} parse_cache_miss={} compiled_cache_hit={} compiled_cache_miss={} prepared_cache_hit={} prepared_cache_miss={}",
-        unique.rows_per_sec,
-        unique.parse_cache_hits,
-        unique.parse_cache_misses,
-        unique.compiled_cache_hits,
-        unique.compiled_cache_misses,
-        unique.prepared_cache_hits,
-        unique.prepared_cache_misses,
-    );
-    eprintln!(
-        "manual_perf_probe.prepare_cache_reuse.ratio reused_vs_unique={:.4}",
-        reused.rows_per_sec / unique.rows_per_sec
-    );
+        eprintln!(
+            "manual_perf_probe.prepare_cache_reuse.reused rows_per_sec={:.1} parse_cache_hit={} parse_cache_miss={} compiled_cache_hit={} compiled_cache_miss={} prepared_cache_hit={} prepared_cache_miss={}",
+            reused.rows_per_sec,
+            reused.parse_cache_hits,
+            reused.parse_cache_misses,
+            reused.compiled_cache_hits,
+            reused.compiled_cache_misses,
+            reused.prepared_cache_hits,
+            reused.prepared_cache_misses,
+        );
+        eprintln!(
+            "manual_perf_probe.prepare_cache_reuse.unique_sql rows_per_sec={:.1} parse_cache_hit={} parse_cache_miss={} compiled_cache_hit={} compiled_cache_miss={} prepared_cache_hit={} prepared_cache_miss={}",
+            unique.rows_per_sec,
+            unique.parse_cache_hits,
+            unique.parse_cache_misses,
+            unique.compiled_cache_hits,
+            unique.compiled_cache_misses,
+            unique.prepared_cache_hits,
+            unique.prepared_cache_misses,
+        );
+        eprintln!(
+            "manual_perf_probe.prepare_cache_reuse.ratio reused_vs_unique={:.4}",
+            reused.rows_per_sec / unique.rows_per_sec
+        );
 
-    assert!(reused.rows_per_sec > 0.0);
-    assert!(unique.rows_per_sec > 0.0);
-    assert_eq!(reused.prepared_cache_misses, 1);
-    assert!(
-        reused.prepared_cache_hits >= u64::try_from(ROW_COUNT - 1).unwrap(),
-        "stable SQL should hit the prepared cache after the first prepare: {reused:?}"
-    );
-    assert_eq!(unique.prepared_cache_hits, 0);
-    assert_eq!(
-        unique.prepared_cache_misses,
-        u64::try_from(ROW_COUNT).unwrap()
-    );
-    assert!(
-        reused.rows_per_sec > unique.rows_per_sec,
-        "prepared-cache reuse should outperform forced unique-SQL misses: reused={reused:?} unique={unique:?}"
-    );
+        assert!(reused.rows_per_sec > 0.0);
+        assert!(unique.rows_per_sec > 0.0);
+        assert_eq!(reused.prepared_cache_misses, 1);
+        assert!(
+            reused.prepared_cache_hits >= u64::try_from(ROW_COUNT - 1).unwrap(),
+            "stable SQL should hit the prepared cache after the first prepare: {reused:?}"
+        );
+        assert_eq!(unique.prepared_cache_hits, 0);
+        assert_eq!(
+            unique.prepared_cache_misses,
+            u64::try_from(ROW_COUNT).unwrap()
+        );
+        assert!(
+            reused.rows_per_sec > unique.rows_per_sec,
+            "prepared-cache reuse should outperform forced unique-SQL misses: reused={reused:?} unique={unique:?}"
+        );
     });
 }
 

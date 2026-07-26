@@ -421,10 +421,7 @@ fn concurrent_insert_no_data_loss_8_threads() {
                                 if conn.execute("BEGIN CONCURRENT").await.is_err() {
                                     local_retries += 1;
                                     attempts += 1;
-                                    assert!(
-                                        attempts < RETRY_LIMIT,
-                                        "stuck on BEGIN, thread {tid}"
-                                    );
+                                    assert!(attempts < RETRY_LIMIT, "stuck on BEGIN, thread {tid}");
                                     thread::sleep(RETRY_BACKOFF);
                                     continue;
                                 }
@@ -544,7 +541,10 @@ fn read_snapshot_isolation_during_concurrent_write() {
             .execute("INSERT INTO snap VALUES (3, 300);")
             .await
             .unwrap();
-        if let Err(e) = wconn.execute("UPDATE snap SET val = 999 WHERE id = 1;").await {
+        if let Err(e) = wconn
+            .execute("UPDATE snap SET val = 999 WHERE id = 1;")
+            .await
+        {
             drop(wconn.execute("ROLLBACK").await);
             eprintln!("writer UPDATE failed (may be bd-jamrd): {e}");
         }
@@ -596,8 +596,7 @@ fn concurrent_batch_inserts_verify_total() {
                                 }
                                 let mut ok = true;
                                 for seq in 0..rows_per_batch {
-                                    let pk =
-                                        (tid as i64) * 1000 + (batch as i64) * 100 + seq;
+                                    let pk = (tid as i64) * 1000 + (batch as i64) * 100 + seq;
                                     let sql = format!(
                                         "INSERT INTO batched VALUES ({pk}, {tid}, {batch}, {seq});"
                                     );
@@ -835,10 +834,8 @@ fn concurrent_scaling_ratio_does_not_degrade() {
                                         thread::sleep(RETRY_BACKOFF);
                                         continue;
                                     }
-                                    let sql = format!(
-                                        "INSERT INTO scale_{tid} VALUES ({i}, {});",
-                                        i * 3
-                                    );
+                                    let sql =
+                                        format!("INSERT INTO scale_{tid} VALUES ({i}, {});", i * 3);
                                     if conn.execute(&sql).await.is_err() {
                                         drop(conn.execute("ROLLBACK").await);
                                         attempts += 1;

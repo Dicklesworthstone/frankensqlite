@@ -430,7 +430,7 @@ fn index_range_seek_text_binary_matches_sqlite() {
             "SELECT id FROM t WHERE w < 'Date'",
             "SELECT id FROM t WHERE w BETWEEN 'B' AND 'd'",
             "SELECT id, w FROM t WHERE w > 'a'",
-            "SELECT id FROM t WHERE w > 'zzz'",             // empty
+            "SELECT id FROM t WHERE w > 'zzz'", // empty
             "SELECT id FROM t WHERE w BETWEEN 'z' AND 'a'", // empty (lo > hi)
             // NOCASE (idx_wc) — must decline the BINARY seek but stay correct.
             "SELECT id FROM t WHERE wc > 'cherry'",
@@ -584,7 +584,7 @@ fn index_range_seek_composite_prefix_matches_sqlite() {
             "SELECT id, c FROM t WHERE a = 2 AND b > 2", // non-covering (c -> table lookup)
             "SELECT id FROM t WHERE a = 1 AND b = 2 AND c > 'a'", // multi-eq-prefix on idx_abc
             // Declines that must still be correct.
-            "SELECT id FROM t WHERE b > 5",           // no equality prefix
+            "SELECT id FROM t WHERE b > 5", // no equality prefix
             "SELECT id FROM t WHERE a > 1 AND b > 0", // prefix col not equality
             "SELECT id FROM t NOT INDEXED WHERE a = 2 AND b > 5",
         ] {
@@ -668,10 +668,13 @@ fn index_range_seek_composite_prefix_matches_sqlite() {
 
         // The satisfied ORDER BY streams from the seek without a sorter.
         assert!(
-            !opcodes(&f, "SELECT id, b FROM t WHERE a = 2 AND b > 0 ORDER BY b, id")
-                .await
-                .iter()
-                .any(|o| o.starts_with("Sorter")),
+            !opcodes(
+                &f,
+                "SELECT id, b FROM t WHERE a = 2 AND b > 0 ORDER BY b, id"
+            )
+            .await
+            .iter()
+            .any(|o| o.starts_with("Sorter")),
             "composite ORDER BY <range col>, id must avoid the sorter"
         );
         assert!(

@@ -179,7 +179,7 @@ fn glob_character_classes() {
             &[
                 "SELECT 'cat' GLOB '[cb]at'",
                 "SELECT 'bat' GLOB '[cb]at'",
-                "SELECT 'rat' GLOB '[cb]at'", // -> 0
+                "SELECT 'rat' GLOB '[cb]at'",  // -> 0
                 "SELECT 'a5z' GLOB 'a[0-9]z'", // digit range
                 "SELECT 'aXz' GLOB 'a[0-9]z'", // -> 0
                 "SELECT 'mid' GLOB '[a-z][a-z][a-z]'",

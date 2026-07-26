@@ -14,6 +14,7 @@ workspace = true
 
 [features]
 default = []
+bridge-experiment = ["fsqlite/async-api"]
 tui = ["dep:ftui"]
 pgo = []
 linux-asupersync-uring = ["fsqlite-vfs/linux-asupersync-uring", "fsqlite-core/linux-asupersync-uring", "fsqlite/linux-asupersync-uring"]

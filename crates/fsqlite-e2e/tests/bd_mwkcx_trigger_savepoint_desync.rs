@@ -100,7 +100,11 @@ fn t1_trigger_savepoint_rollback_basic() -> Result<(), String> {
                 conn.execute("RELEASE sp").await.expect("release");
 
                 // Verify rollback worked
-                let after_audit = conn.query("SELECT * FROM audit").await.expect("after").len();
+                let after_audit = conn
+                    .query("SELECT * FROM audit")
+                    .await
+                    .expect("after")
+                    .len();
                 assert_eq!(after_audit, 1, "round {round}: audit should be back to 1");
             }
             eprintln!("T1: 20 rounds of trigger+savepoint+rollback — correct");
@@ -347,7 +351,10 @@ fn t4_before_after_trigger_savepoint() {
             .expect("update");
 
         assert_eq!(
-            conn.query("SELECT * FROM pre_log").await.expect("pre").len(),
+            conn.query("SELECT * FROM pre_log")
+                .await
+                .expect("pre")
+                .len(),
             1
         );
         assert_eq!(
@@ -363,7 +370,10 @@ fn t4_before_after_trigger_savepoint() {
 
         // Both trigger logs should be rolled back
         assert_eq!(
-            conn.query("SELECT * FROM pre_log").await.expect("pre").len(),
+            conn.query("SELECT * FROM pre_log")
+                .await
+                .expect("pre")
+                .len(),
             0,
             "BEFORE trigger log leaked through rollback"
         );
@@ -545,7 +555,10 @@ fn t6_multi_trigger_savepoint_nesting() {
             .await
             .expect("insert p1");
         assert_eq!(
-            conn.query("SELECT * FROM inventory").await.expect("inv").len(),
+            conn.query("SELECT * FROM inventory")
+                .await
+                .expect("inv")
+                .len(),
             1
         );
 
@@ -558,7 +571,10 @@ fn t6_multi_trigger_savepoint_nesting() {
             .expect("update p1");
 
         assert_eq!(
-            conn.query("SELECT * FROM inventory").await.expect("inv").len(),
+            conn.query("SELECT * FROM inventory")
+                .await
+                .expect("inv")
+                .len(),
             2
         );
         assert_eq!(
@@ -574,7 +590,10 @@ fn t6_multi_trigger_savepoint_nesting() {
         conn.execute("RELEASE sp2").await.expect("release sp2");
 
         assert_eq!(
-            conn.query("SELECT * FROM inventory").await.expect("inv").len(),
+            conn.query("SELECT * FROM inventory")
+                .await
+                .expect("inv")
+                .len(),
             1,
             "sp2 rollback: inventory should have 1"
         );
@@ -592,12 +611,18 @@ fn t6_multi_trigger_savepoint_nesting() {
         conn.execute("RELEASE sp1").await.expect("release sp1");
 
         assert_eq!(
-            conn.query("SELECT * FROM products").await.expect("prod").len(),
+            conn.query("SELECT * FROM products")
+                .await
+                .expect("prod")
+                .len(),
             0,
             "sp1 rollback: products should be empty"
         );
         assert_eq!(
-            conn.query("SELECT * FROM inventory").await.expect("inv").len(),
+            conn.query("SELECT * FROM inventory")
+                .await
+                .expect("inv")
+                .len(),
             0,
             "sp1 rollback: inventory should be empty"
         );

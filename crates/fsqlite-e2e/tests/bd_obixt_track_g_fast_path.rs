@@ -277,7 +277,8 @@ fn bd_obixt_track_g_begin_concurrent_sequential_vs_interleaved_metrics() {
             "interleaved BEGIN CONCURRENT workload should force more existence seeks than the sequential workload: seq={seq_metrics:?} gap={gap_metrics:?}"
         );
         assert!(
-            gap_metrics.insert_append_hint_clear_count >= seq_metrics.insert_append_hint_clear_count,
+            gap_metrics.insert_append_hint_clear_count
+                >= seq_metrics.insert_append_hint_clear_count,
             "interleaved BEGIN CONCURRENT workload should not preserve the append hint better than the sequential workload: seq={seq_metrics:?} gap={gap_metrics:?}"
         );
 

@@ -22,11 +22,7 @@ const REPLAY_COMMAND: &str = "cargo test -p fsqlite-e2e --test bd_db300_6_1_1_st
 
 static E2E_LOCK: Mutex<()> = Mutex::new(());
 
-async fn capture_hot_path_metrics<T, F, Fut>(f: F) -> (T, HotPathProfileSnapshot)
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = T>,
-{
+async fn capture_hot_path_metrics<T>(f: impl AsyncFnOnce() -> T) -> (T, HotPathProfileSnapshot) {
     set_hot_path_profile_enabled(true);
     reset_hot_path_profile();
     let result = f().await;
@@ -73,7 +69,7 @@ fn bd_db300_6_1_1_same_statement_repeat_captures_reuse() {
 
         const REPEAT_COUNT: usize = 20;
 
-        let (_result, profile) = capture_hot_path_metrics(|| async {
+        let (_result, profile) = capture_hot_path_metrics(async || {
             // Execute the same statement multiple times
             for i in 0..REPEAT_COUNT {
                 conn.execute(&format!("INSERT INTO t VALUES ({i}, 'value-{i}')"))
@@ -140,7 +136,7 @@ fn bd_db300_6_1_1_interleaved_statements_measure_distance() {
             .await
             .expect("create t2");
 
-        let (_result, profile) = capture_hot_path_metrics(|| async {
+        let (_result, profile) = capture_hot_path_metrics(async || {
             // Interleave statements: A, B, A, B, A, B...
             // Reuse distance for A should be 1 (one B between each A)
             for i in 0..10 {
@@ -191,7 +187,7 @@ fn bd_db300_6_1_1_no_reuse_yields_zero_metrics() {
             .await
             .expect("create table");
 
-        let (_result, profile) = capture_hot_path_metrics(|| async {
+        let (_result, profile) = capture_hot_path_metrics(async || {
             // Execute unique statements (no fingerprint reuse)
             for i in 0..5 {
                 conn.execute(&format!("INSERT INTO t VALUES ({i}, 'unique-val-{i}')"))
@@ -230,7 +226,7 @@ fn bd_db300_6_1_1_max_reuse_distance_tracked() {
             .await
             .expect("create table");
 
-        let (_result, profile) = capture_hot_path_metrics(|| async {
+        let (_result, profile) = capture_hot_path_metrics(async || {
             // Execute a statement, then many different statements, then repeat the first
             // This should create a large reuse distance for the first statement
 

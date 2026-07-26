@@ -119,7 +119,7 @@ fn json_each_with_path() {
         assert_scalar(
             &[
                 "SELECT value FROM json_each('{\"items\":[5,6,7]}', '$.items') ORDER BY value", // 5,6,7
-                "SELECT sum(value) FROM json_each('{\"nums\":[10,20,30]}', '$.nums')",          // 60
+                "SELECT sum(value) FROM json_each('{\"nums\":[10,20,30]}', '$.nums')", // 60
             ],
             "json_each_with_path",
         )

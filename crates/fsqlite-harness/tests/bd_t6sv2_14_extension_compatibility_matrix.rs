@@ -520,109 +520,132 @@ fn connection_runtime_state_tags_document_extension_reachability() {
 
 #[test]
 fn connection_runtime_wired_extension_surfaces_dispatch_through_connection_path() {
-    let conn = Connection::open(":memory:").expect("in-memory connection should open");
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:")
+            .await
+            .expect("in-memory connection should open");
 
-    let json_rows = conn
-        .query(r#"SELECT key, value FROM json_each('{"a":10,"b":20}') ORDER BY key;"#)
-        .expect("json_each() should dispatch through the connection path");
-    assert_eq!(json_rows.len(), 2);
-    assert_eq!(
-        json_rows[0].values(),
-        &[SqliteValue::Text("a".into()), SqliteValue::Integer(10),]
-    );
-    assert_eq!(
-        json_rows[1].values(),
-        &[SqliteValue::Text("b".into()), SqliteValue::Integer(20),]
-    );
+        let json_rows = conn
+            .query(r#"SELECT key, value FROM json_each('{"a":10,"b":20}') ORDER BY key;"#)
+            .await
+            .expect("json_each() should dispatch through the connection path");
+        assert_eq!(json_rows.len(), 2);
+        assert_eq!(
+            json_rows[0].values(),
+            &[SqliteValue::Text("a".into()), SqliteValue::Integer(10),]
+        );
+        assert_eq!(
+            json_rows[1].values(),
+            &[SqliteValue::Text("b".into()), SqliteValue::Integer(20),]
+        );
 
-    let series_rows = conn
-        .query("SELECT value FROM generate_series(1, 5, 2);")
-        .expect("generate_series() should dispatch through the connection path");
-    assert_eq!(series_rows.len(), 3);
-    assert_eq!(series_rows[0].values(), &[SqliteValue::Integer(1)]);
-    assert_eq!(series_rows[1].values(), &[SqliteValue::Integer(3)]);
-    assert_eq!(series_rows[2].values(), &[SqliteValue::Integer(5)]);
+        let series_rows = conn
+            .query("SELECT value FROM generate_series(1, 5, 2);")
+            .await
+            .expect("generate_series() should dispatch through the connection path");
+        assert_eq!(series_rows.len(), 3);
+        assert_eq!(series_rows[0].values(), &[SqliteValue::Integer(1)]);
+        assert_eq!(series_rows[1].values(), &[SqliteValue::Integer(3)]);
+        assert_eq!(series_rows[2].values(), &[SqliteValue::Integer(5)]);
 
-    conn.execute("CREATE VIRTUAL TABLE docs USING fts5(title, body)")
-        .expect("FTS5 virtual table should be creatable via default registry wiring");
-    conn.execute("INSERT INTO docs(rowid, title, body) VALUES (1, 'hello', 'world')")
-        .expect("FTS5 insert should succeed");
-    let fts_rows = conn
-        .query("SELECT title FROM docs WHERE docs MATCH 'world';")
-        .expect("FTS5 MATCH should dispatch through the connection path");
-    assert_eq!(fts_rows.len(), 1);
-    assert_eq!(fts_rows[0].values(), &[SqliteValue::Text("hello".into())]);
+        conn.execute("CREATE VIRTUAL TABLE docs USING fts5(title, body)")
+            .await
+            .expect("FTS5 virtual table should be creatable via default registry wiring");
+        conn.execute("INSERT INTO docs(rowid, title, body) VALUES (1, 'hello', 'world')")
+            .await
+            .expect("FTS5 insert should succeed");
+        let fts_rows = conn
+            .query("SELECT title FROM docs WHERE docs MATCH 'world';")
+            .await
+            .expect("FTS5 MATCH should dispatch through the connection path");
+        assert_eq!(fts_rows.len(), 1);
+        assert_eq!(fts_rows[0].values(), &[SqliteValue::Text("hello".into())]);
 
-    conn.execute("CREATE VIRTUAL TABLE boxes USING rtree(id, min_x, max_x, min_y, max_y)")
-        .expect("R-tree virtual table should be creatable via default registry wiring");
-    conn.execute("INSERT INTO boxes VALUES (1, 0.0, 1.0, 0.0, 1.0)")
-        .expect("R-tree insert should succeed");
-    conn.execute("INSERT INTO boxes VALUES (2, 4.0, 5.0, 4.0, 5.0)")
-        .expect("R-tree insert should succeed");
-    let rtree_rows = conn
-        .query(
-            "SELECT rowid FROM boxes \
+        conn.execute("CREATE VIRTUAL TABLE boxes USING rtree(id, min_x, max_x, min_y, max_y)")
+            .await
+            .expect("R-tree virtual table should be creatable via default registry wiring");
+        conn.execute("INSERT INTO boxes VALUES (1, 0.0, 1.0, 0.0, 1.0)")
+            .await
+            .expect("R-tree insert should succeed");
+        conn.execute("INSERT INTO boxes VALUES (2, 4.0, 5.0, 4.0, 5.0)")
+            .await
+            .expect("R-tree insert should succeed");
+        let rtree_rows = conn
+            .query(
+                "SELECT rowid FROM boxes \
              WHERE min_x <= 4.5 AND max_x >= 3.5 AND min_y <= 4.5 AND max_y >= 3.5 \
              ORDER BY rowid;",
-        )
-        .expect("R-tree range query should dispatch through the connection path");
-    assert_eq!(rtree_rows.len(), 1);
-    assert_eq!(rtree_rows[0].values(), &[SqliteValue::Integer(2)]);
+            )
+            .await
+            .expect("R-tree range query should dispatch through the connection path");
+        assert_eq!(rtree_rows.len(), 1);
+        assert_eq!(rtree_rows[0].values(), &[SqliteValue::Integer(2)]);
 
-    let icu_rows = conn
-        .query("SELECT icu_upper('straße', 'de_DE'), uuid();")
-        .expect("ICU and misc scalar functions should be reachable");
-    assert_eq!(icu_rows.len(), 1);
-    assert_eq!(icu_rows[0].values()[0], SqliteValue::Text("STRASSE".into()));
-    match &icu_rows[0].values()[1] {
-        SqliteValue::Text(uuid) => assert_eq!(uuid.len(), 36, "uuid() should return RFC4122 text"),
-        other => panic!("uuid() should return text, got {other:?}"),
-    }
+        let icu_rows = conn
+            .query("SELECT icu_upper('straße', 'de_DE'), uuid();")
+            .await
+            .expect("ICU and misc scalar functions should be reachable");
+        assert_eq!(icu_rows.len(), 1);
+        assert_eq!(icu_rows[0].values()[0], SqliteValue::Text("STRASSE".into()));
+        match &icu_rows[0].values()[1] {
+            SqliteValue::Text(uuid) => {
+                assert_eq!(uuid.len(), 36, "uuid() should return RFC4122 text");
+            }
+            other => panic!("uuid() should return text, got {other:?}"),
+        }
 
-    let geopoly_rows = conn
-        .query(
-            "SELECT \
+        let geopoly_rows = conn
+            .query(
+                "SELECT \
                 geopoly_json(geopoly_blob('[[0,0],[2,0],[2,2],[0,2]]')), \
                 geopoly_svg('[[0,0],[2,0],[2,2],[0,2]]'), \
                 geopoly_area('[[0,0],[2,0],[2,2],[0,2]]'), \
                 geopoly_overlap('[[0,0],[2,0],[2,2],[0,2]]', '[[1,1],[3,1],[3,3],[1,3]]'), \
                 geopoly_within('[[0.5,0.5],[1.5,0.5],[1.5,1.5],[0.5,1.5]]', '[[0,0],[2,0],[2,2],[0,2]]');",
-        )
-        .expect("Geopoly scalar functions should dispatch through the connection path");
-    assert_eq!(geopoly_rows.len(), 1);
-    assert_eq!(
-        geopoly_rows[0].values(),
-        &[
-            SqliteValue::Text("[[0,0],[2,0],[2,2],[0,2],[0,0]]".into()),
-            SqliteValue::Text("M 0 0 L 2 0 L 2 2 L 0 2 Z".into()),
-            SqliteValue::Float(4.0),
-            SqliteValue::Integer(1),
-            SqliteValue::Integer(1),
-        ]
-    );
+            )
+            .await
+            .expect("Geopoly scalar functions should dispatch through the connection path");
+        assert_eq!(geopoly_rows.len(), 1);
+        assert_eq!(
+            geopoly_rows[0].values(),
+            &[
+                SqliteValue::Text("[[0,0],[2,0],[2,2],[0,2],[0,0]]".into()),
+                SqliteValue::Text("M 0 0 L 2 0 L 2 2 L 0 2 Z".into()),
+                SqliteValue::Float(4.0),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+            ]
+        );
+    });
 }
 
 #[test]
 fn connection_runtime_unwired_extension_surfaces_fail_closed() {
-    let conn = Connection::open(":memory:").expect("in-memory connection should open");
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:")
+            .await
+            .expect("in-memory connection should open");
 
-    let fts3_err = conn
-        .execute("CREATE VIRTUAL TABLE docs_fts3 USING fts3(content)")
-        .expect_err("FTS3 should fail closed until runtime wiring is implemented");
-    assert!(matches!(fts3_err, FrankenError::NotImplemented(_)));
-    assert!(
-        fts3_err.to_string().contains("no module registered"),
-        "expected missing-module error for FTS3, got {fts3_err}"
-    );
+        let fts3_err = conn
+            .execute("CREATE VIRTUAL TABLE docs_fts3 USING fts3(content)")
+            .await
+            .expect_err("FTS3 should fail closed until runtime wiring is implemented");
+        assert!(matches!(fts3_err, FrankenError::NotImplemented(_)));
+        assert!(
+            fts3_err.to_string().contains("no module registered"),
+            "expected missing-module error for FTS3, got {fts3_err}"
+        );
 
-    let geopoly_err = conn
-        .execute("CREATE VIRTUAL TABLE regions USING geopoly(_shape)")
-        .expect_err("Geopoly virtual table should fail closed until runtime wiring exists");
-    assert!(matches!(geopoly_err, FrankenError::NotImplemented(_)));
-    assert!(
-        geopoly_err.to_string().contains("no module registered"),
-        "expected missing-module error for Geopoly, got {geopoly_err}"
-    );
+        let geopoly_err = conn
+            .execute("CREATE VIRTUAL TABLE regions USING geopoly(_shape)")
+            .await
+            .expect_err("Geopoly virtual table should fail closed until runtime wiring exists");
+        assert!(matches!(geopoly_err, FrankenError::NotImplemented(_)));
+        assert!(
+            geopoly_err.to_string().contains("no module registered"),
+            "expected missing-module error for Geopoly, got {geopoly_err}"
+        );
+    });
 }
 
 // ── 12. Parity status scoring ────────────────────────────────────────────────

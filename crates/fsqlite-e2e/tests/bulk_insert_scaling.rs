@@ -151,10 +151,7 @@ fn bulk_insert_scaling_profile() {
                 .unwrap();
         }
         drop(ins2);
-        let del = conn4
-            .prepare("DELETE FROM td WHERE id = ?1")
-            .await
-            .unwrap();
+        let del = conn4.prepare("DELETE FROM td WHERE id = ?1").await.unwrap();
         eprintln!("=== PREPARED DELETE by PK (single-row) ===");
         let mut t = Instant::now();
         for i in 1..=n {

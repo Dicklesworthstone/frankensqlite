@@ -100,10 +100,14 @@ fn j2_hot_insert_loop() {
             conn.execute("COMMIT").await.expect("commit");
         }
 
-        let count = get_int(&conn, "SELECT COUNT(*) FROM hot_ins").await.unwrap();
+        let count = get_int(&conn, "SELECT COUNT(*) FROM hot_ins")
+            .await
+            .unwrap();
         assert_eq!(count, 1000, "J2: expected 1000 rows");
 
-        let sum = get_int(&conn, "SELECT SUM(val) FROM hot_ins").await.unwrap();
+        let sum = get_int(&conn, "SELECT SUM(val) FROM hot_ins")
+            .await
+            .unwrap();
         // sum(i*3 for i in 1..=1000) = 3 * 1000*1001/2 = 1_501_500
         assert_eq!(sum, 1_501_500, "J2: sum wrong after hot insert loop");
 

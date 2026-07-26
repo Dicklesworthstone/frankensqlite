@@ -164,8 +164,10 @@ fn repeated_write_checkpoint_cycles_parity() {
             .await
             .unwrap();
         r.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
-        r.execute_batch("CREATE TABLE cycles (id INTEGER PRIMARY KEY, cycle INTEGER, val INTEGER);")
-            .unwrap();
+        r.execute_batch(
+            "CREATE TABLE cycles (id INTEGER PRIMARY KEY, cycle INTEGER, val INTEGER);",
+        )
+        .unwrap();
 
         let mut pk = 0i64;
         for cycle in 0..5 {

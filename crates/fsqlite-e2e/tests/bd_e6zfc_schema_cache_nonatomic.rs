@@ -213,7 +213,9 @@ fn s2_concurrent_create_trigger_dml() {
             logs <= events,
             "more logs ({logs}) than events ({events}) — trigger fired extra times?"
         );
-        eprintln!("S2: {ddl_ops} trigger DDL ops, {inserted} inserts, {events} events, {logs} logs");
+        eprintln!(
+            "S2: {ddl_ops} trigger DDL ops, {inserted} inserts, {events} events, {logs} logs"
+        );
     });
 }
 

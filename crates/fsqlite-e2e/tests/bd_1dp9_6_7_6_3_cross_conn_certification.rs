@@ -373,170 +373,170 @@ fn r3_nested_savepoint_chains() {
 
 #[test]
 fn p1_restart_recovery() {
-    let dir = test_tmpdir();
-    let db_path = dir.path().join("p1.db");
-    let path_str = db_path.to_str().expect("path");
+    asupersync::test_utils::run_test(|| async {
+        let dir = test_tmpdir();
+        let db_path = dir.path().join("p1.db");
+        let path_str = db_path.to_str().expect("path");
 
-    // Phase 1: create and populate
-    {
-        let conn = Connection::open(path_str).expect("open");
-        conn.execute("CREATE TABLE persist (id INTEGER PRIMARY KEY, data TEXT)")
-            .expect("create");
-        conn.execute("BEGIN").expect("begin");
-        for i in 1..=100 {
-            conn.execute(&format!(
-                "INSERT INTO persist VALUES ({i}, 'row_{i}_phase1')"
-            ))
-            .expect("insert");
+        // Phase 1: create and populate
+        {
+            let conn = Connection::open(path_str).await.expect("open");
+            conn.execute("CREATE TABLE persist (id INTEGER PRIMARY KEY, data TEXT)")
+                .await
+                .expect("create");
+            conn.execute("BEGIN").await.expect("begin");
+            for i in 1..=100 {
+                conn.execute(&format!(
+                    "INSERT INTO persist VALUES ({i}, 'row_{i}_phase1')"
+                ))
+                .await
+                .expect("insert");
+            }
+            conn.execute("COMMIT").await.expect("commit");
         }
-        conn.execute("COMMIT").expect("commit");
-    }
-    // conn dropped — fully closed
+        // conn dropped — fully closed
 
-    // Phase 2: reopen, verify, add more
-    {
-        let conn = Connection::open(path_str).expect("reopen");
-        let rows = count_rows(&conn, "SELECT * FROM persist");
-        assert_eq!(rows, 100, "P1: phase1 data lost after reopen, got {rows}");
+        // Phase 2: reopen, verify, add more
+        {
+            let conn = Connection::open(path_str).await.expect("reopen");
+            let rows = count_rows(&conn, "SELECT * FROM persist").await;
+            assert_eq!(rows, 100, "P1: phase1 data lost after reopen, got {rows}");
 
-        conn.execute("BEGIN").expect("begin2");
-        for i in 101..=200 {
-            conn.execute(&format!(
-                "INSERT INTO persist VALUES ({i}, 'row_{i}_phase2')"
-            ))
-            .expect("insert2");
+            conn.execute("BEGIN").await.expect("begin2");
+            for i in 101..=200 {
+                conn.execute(&format!(
+                    "INSERT INTO persist VALUES ({i}, 'row_{i}_phase2')"
+                ))
+                .await
+                .expect("insert2");
+            }
+            conn.execute("COMMIT").await.expect("commit2");
         }
-        conn.execute("COMMIT").expect("commit2");
-    }
-    // conn dropped again
+        // conn dropped again
 
-    // Phase 3: final verification
-    {
-        let conn = Connection::open(path_str).expect("reopen2");
-        let rows = count_rows(&conn, "SELECT * FROM persist");
-        assert_eq!(
-            rows, 200,
-            "P1: phase1+phase2 data lost after second reopen, got {rows}"
-        );
+        // Phase 3: final verification
+        {
+            let conn = Connection::open(path_str).await.expect("reopen2");
+            let rows = count_rows(&conn, "SELECT * FROM persist").await;
+            assert_eq!(
+                rows, 200,
+                "P1: phase1+phase2 data lost after second reopen, got {rows}"
+            );
 
-        // Verify specific rows
-        let phase1 = count_rows(&conn, "SELECT * FROM persist WHERE data LIKE '%phase1%'");
-        let phase2 = count_rows(&conn, "SELECT * FROM persist WHERE data LIKE '%phase2%'");
-        assert_eq!(phase1, 100, "P1: phase1 rows corrupted");
-        assert_eq!(phase2, 100, "P1: phase2 rows corrupted");
-    }
+            // Verify specific rows
+            let phase1 =
+                count_rows(&conn, "SELECT * FROM persist WHERE data LIKE '%phase1%'").await;
+            let phase2 =
+                count_rows(&conn, "SELECT * FROM persist WHERE data LIKE '%phase2%'").await;
+            assert_eq!(phase1, 100, "P1: phase1 rows corrupted");
+            assert_eq!(phase2, 100, "P1: phase2 rows corrupted");
+        }
 
-    eprintln!("P1: restart recovery — 200 rows survive 2 close/reopen cycles");
+        eprintln!("P1: restart recovery — 200 rows survive 2 close/reopen cycles");
+    });
 }
 
 // ─── P2: Repeated open/close with data accumulation ───────────────
 
 #[test]
 fn p2_repeated_open_close_accumulation() {
-    let dir = test_tmpdir();
-    let db_path = dir.path().join("p2.db");
-    let path_str = db_path.to_str().expect("path");
+    asupersync::test_utils::run_test(|| async {
+        let dir = test_tmpdir();
+        let db_path = dir.path().join("p2.db");
+        let path_str = db_path.to_str().expect("path");
 
-    // Create table on first open
-    {
-        let conn = Connection::open(path_str).expect("open");
-        conn.execute("CREATE TABLE acc (id INTEGER PRIMARY KEY, round INTEGER)")
-            .expect("create");
-    }
+        // Create table on first open
+        {
+            let conn = Connection::open(path_str).await.expect("open");
+            conn.execute("CREATE TABLE acc (id INTEGER PRIMARY KEY, round INTEGER)")
+                .await
+                .expect("create");
+        }
 
-    let rows_per_round = 10;
-    let total_rounds = 20;
+        let rows_per_round = 10;
+        let total_rounds = 20;
 
-    for round in 0..total_rounds {
-        let conn = Connection::open(path_str).expect("open round");
+        for round in 0..total_rounds {
+            let conn = Connection::open(path_str).await.expect("open round");
 
-        // Verify accumulated rows from previous rounds
-        let expected = round * rows_per_round;
-        let actual = count_rows(&conn, "SELECT * FROM acc");
+            // Verify accumulated rows from previous rounds
+            let expected = round * rows_per_round;
+            let actual = count_rows(&conn, "SELECT * FROM acc").await;
+            assert_eq!(
+                actual, expected,
+                "P2: round {round}: expected {expected} rows, got {actual}"
+            );
+
+            // Add this round's rows
+            conn.execute("BEGIN").await.expect("begin");
+            for i in 0..rows_per_round {
+                let id = round * rows_per_round + i;
+                conn.execute(&format!("INSERT INTO acc VALUES ({id}, {round})"))
+                    .await
+                    .expect("insert");
+            }
+            conn.execute("COMMIT").await.expect("commit");
+        }
+
+        // Final verification
+        let conn = Connection::open(path_str).await.expect("final open");
+        let total = count_rows(&conn, "SELECT * FROM acc").await;
+        let expected_total = total_rounds * rows_per_round;
         assert_eq!(
-            actual, expected,
-            "P2: round {round}: expected {expected} rows, got {actual}"
+            total, expected_total,
+            "P2: final count {total} != expected {expected_total}"
         );
 
-        // Add this round's rows
-        conn.execute("BEGIN").expect("begin");
-        for i in 0..rows_per_round {
-            let id = round * rows_per_round + i;
-            conn.execute(&format!("INSERT INTO acc VALUES ({id}, {round})"))
-                .expect("insert");
-        }
-        conn.execute("COMMIT").expect("commit");
-    }
-
-    // Final verification
-    let conn = Connection::open(path_str).expect("final open");
-    let total = count_rows(&conn, "SELECT * FROM acc");
-    let expected_total = total_rounds * rows_per_round;
-    assert_eq!(
-        total, expected_total,
-        "P2: final count {total} != expected {expected_total}"
-    );
-
-    eprintln!("P2: {total_rounds} open/close cycles, {expected_total} rows accumulated correctly");
+        eprintln!(
+            "P2: {total_rounds} open/close cycles, {expected_total} rows accumulated correctly"
+        );
+    });
 }
 
 // ─── B1: Backend identity — file-backed consistency ───────────────
 
 #[test]
 fn b1_backend_identity_file_backed() {
-    let dir = test_tmpdir();
-    let db_path = dir.path().join("b1.db");
-    let path_str = db_path.to_str().expect("path");
+    asupersync::test_utils::run_test(|| async {
+        let dir = test_tmpdir();
+        let db_path = dir.path().join("b1.db");
+        let path_str = db_path.to_str().expect("path");
 
-    // Create and populate via connection 1
-    let conn1 = Connection::open(path_str).expect("conn1");
-    conn1
-        .execute("CREATE TABLE ident (id INTEGER PRIMARY KEY, src TEXT)")
-        .expect("create");
-    conn1.execute("BEGIN").expect("begin");
-    for i in 1..=50 {
+        // Create and populate via connection 1
+        let conn1 = Connection::open(path_str).await.expect("conn1");
         conn1
-            .execute(&format!("INSERT INTO ident VALUES ({i}, 'conn1')"))
-            .expect("insert");
-    }
-    conn1.execute("COMMIT").expect("commit");
+            .execute("CREATE TABLE ident (id INTEGER PRIMARY KEY, src TEXT)")
+            .await
+            .expect("create");
+        conn1.execute("BEGIN").await.expect("begin");
+        for i in 1..=50 {
+            conn1
+                .execute(&format!("INSERT INTO ident VALUES ({i}, 'conn1')"))
+                .await
+                .expect("insert");
+        }
+        conn1.execute("COMMIT").await.expect("commit");
 
-    // 4 concurrent readers all see the same data
-    let readers: Vec<Connection> = (0..4)
-        .map(|_| Connection::open(path_str).expect("reader open"))
-        .collect();
+        // 4 concurrent readers all see the same data
+        let mut readers: Vec<Connection> = Vec::new();
+        for _ in 0..4 {
+            readers.push(Connection::open(path_str).await.expect("reader open"));
+        }
 
-    let counts: Vec<usize> = readers
-        .iter()
-        .map(|r| count_rows(r, "SELECT * FROM ident"))
-        .collect();
+        let mut counts: Vec<usize> = Vec::new();
+        for r in &readers {
+            counts.push(count_rows(r, "SELECT * FROM ident").await);
+        }
 
-    for (i, &c) in counts.iter().enumerate() {
-        assert_eq!(c, 50, "B1: reader {i} sees {c} rows instead of 50");
-    }
+        for (i, &c) in counts.iter().enumerate() {
+            assert_eq!(c, 50, "B1: reader {i} sees {c} rows instead of 50");
+        }
 
-    // All readers see identical data content
-    let reference: Vec<String> = conn1
-        .query("SELECT id, src FROM ident ORDER BY id")
-        .expect("ref query")
-        .iter()
-        .map(|row| {
-            let id = match row.get(0) {
-                Some(SqliteValue::Integer(v)) => *v,
-                _ => -1,
-            };
-            let src = match row.get(1) {
-                Some(SqliteValue::Text(s)) => s.as_str().to_string(),
-                _ => "?".to_string(),
-            };
-            format!("{id}:{src}")
-        })
-        .collect();
-
-    for (i, reader) in readers.iter().enumerate() {
-        let reader_data: Vec<String> = reader
+        // All readers see identical data content
+        let reference: Vec<String> = conn1
             .query("SELECT id, src FROM ident ORDER BY id")
-            .expect("reader query")
+            .await
+            .expect("ref query")
             .iter()
             .map(|row| {
                 let id = match row.get(0) {
@@ -550,288 +550,338 @@ fn b1_backend_identity_file_backed() {
                 format!("{id}:{src}")
             })
             .collect();
-        assert_eq!(
-            reader_data, reference,
-            "B1: reader {i} has different data than conn1"
-        );
-    }
 
-    eprintln!("B1: backend identity — 4 readers see identical file-backed data");
+        for (i, reader) in readers.iter().enumerate() {
+            let reader_data: Vec<String> = reader
+                .query("SELECT id, src FROM ident ORDER BY id")
+                .await
+                .expect("reader query")
+                .iter()
+                .map(|row| {
+                    let id = match row.get(0) {
+                        Some(SqliteValue::Integer(v)) => *v,
+                        _ => -1,
+                    };
+                    let src = match row.get(1) {
+                        Some(SqliteValue::Text(s)) => s.as_str().to_string(),
+                        _ => "?".to_string(),
+                    };
+                    format!("{id}:{src}")
+                })
+                .collect();
+            assert_eq!(
+                reader_data, reference,
+                "B1: reader {i} has different data than conn1"
+            );
+        }
+
+        eprintln!("B1: backend identity — 4 readers see identical file-backed data");
+    });
 }
 
 // ─── B2: Multiple databases isolation ─────────────────────────────
 
 #[test]
 fn b2_multiple_database_isolation() {
-    let dir = test_tmpdir();
-    let db_a = dir.path().join("b2_a.db");
-    let db_b = dir.path().join("b2_b.db");
+    asupersync::test_utils::run_test(|| async {
+        let dir = test_tmpdir();
+        let db_a = dir.path().join("b2_a.db");
+        let db_b = dir.path().join("b2_b.db");
 
-    let conn_a = Connection::open(db_a.to_str().expect("a")).expect("open a");
-    let conn_b = Connection::open(db_b.to_str().expect("b")).expect("open b");
+        let conn_a = Connection::open(db_a.to_str().expect("a"))
+            .await
+            .expect("open a");
+        let conn_b = Connection::open(db_b.to_str().expect("b"))
+            .await
+            .expect("open b");
 
-    // Different schemas in each DB
-    conn_a
-        .execute("CREATE TABLE tbl (id INTEGER PRIMARY KEY, val TEXT)")
-        .expect("create a");
-    conn_b
-        .execute("CREATE TABLE tbl (id INTEGER PRIMARY KEY, num INTEGER)")
-        .expect("create b");
-
-    // Insert different data
-    conn_a.execute("BEGIN").expect("begin a");
-    for i in 1..=10 {
+        // Different schemas in each DB
         conn_a
-            .execute(&format!("INSERT INTO tbl VALUES ({i}, 'alpha_{i}')"))
-            .expect("insert a");
-    }
-    conn_a.execute("COMMIT").expect("commit a");
-
-    conn_b.execute("BEGIN").expect("begin b");
-    for i in 1..=20 {
+            .execute("CREATE TABLE tbl (id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .expect("create a");
         conn_b
-            .execute(&format!("INSERT INTO tbl VALUES ({i}, {i})"))
-            .expect("insert b");
-    }
-    conn_b.execute("COMMIT").expect("commit b");
+            .execute("CREATE TABLE tbl (id INTEGER PRIMARY KEY, num INTEGER)")
+            .await
+            .expect("create b");
 
-    // Verify isolation
-    assert_eq!(count_rows(&conn_a, "SELECT * FROM tbl"), 10);
-    assert_eq!(count_rows(&conn_b, "SELECT * FROM tbl"), 20);
+        // Insert different data
+        conn_a.execute("BEGIN").await.expect("begin a");
+        for i in 1..=10 {
+            conn_a
+                .execute(&format!("INSERT INTO tbl VALUES ({i}, 'alpha_{i}')"))
+                .await
+                .expect("insert a");
+        }
+        conn_a.execute("COMMIT").await.expect("commit a");
 
-    // Verify data types are correct per DB
-    let a_val = conn_a
-        .query("SELECT val FROM tbl WHERE id = 1")
-        .expect("query a");
-    match a_val[0].get(0) {
-        Some(SqliteValue::Text(_)) => {}
-        other => panic!("B2: DB A should have Text, got {other:?}"),
-    }
+        conn_b.execute("BEGIN").await.expect("begin b");
+        for i in 1..=20 {
+            conn_b
+                .execute(&format!("INSERT INTO tbl VALUES ({i}, {i})"))
+                .await
+                .expect("insert b");
+        }
+        conn_b.execute("COMMIT").await.expect("commit b");
 
-    let b_val = conn_b
-        .query("SELECT num FROM tbl WHERE id = 1")
-        .expect("query b");
-    match b_val[0].get(0) {
-        Some(SqliteValue::Integer(1)) => {}
-        other => panic!("B2: DB B should have Integer(1), got {other:?}"),
-    }
+        // Verify isolation
+        assert_eq!(count_rows(&conn_a, "SELECT * FROM tbl").await, 10);
+        assert_eq!(count_rows(&conn_b, "SELECT * FROM tbl").await, 20);
 
-    eprintln!("B2: multiple database isolation — separate schemas and data confirmed");
+        // Verify data types are correct per DB
+        let a_val = conn_a
+            .query("SELECT val FROM tbl WHERE id = 1")
+            .await
+            .expect("query a");
+        match a_val[0].get(0) {
+            Some(SqliteValue::Text(_)) => {}
+            other => panic!("B2: DB A should have Text, got {other:?}"),
+        }
+
+        let b_val = conn_b
+            .query("SELECT num FROM tbl WHERE id = 1")
+            .await
+            .expect("query b");
+        match b_val[0].get(0) {
+            Some(SqliteValue::Integer(1)) => {}
+            other => panic!("B2: DB B should have Integer(1), got {other:?}"),
+        }
+
+        eprintln!("B2: multiple database isolation — separate schemas and data confirmed");
+    });
 }
 
 // ─── S1: Stale reader snapshot advancement ────────────────────────
 
 #[test]
 fn s1_stale_reader_snapshot_advancement() {
-    let dir = test_tmpdir();
-    let db_path = dir.path().join("s1.db");
-    let path_str = db_path.to_str().expect("path");
+    asupersync::test_utils::run_test(|| async {
+        let dir = test_tmpdir();
+        let db_path = dir.path().join("s1.db");
+        let path_str = db_path.to_str().expect("path");
 
-    {
-        let conn = Connection::open(path_str).expect("open");
-        conn.execute("CREATE TABLE evolving (id INTEGER PRIMARY KEY, gen INTEGER)")
-            .expect("create");
-        conn.execute("INSERT INTO evolving VALUES (1, 0)")
-            .expect("seed");
-    }
+        {
+            let conn = Connection::open(path_str).await.expect("open");
+            conn.execute("CREATE TABLE evolving (id INTEGER PRIMARY KEY, gen INTEGER)")
+                .await
+                .expect("create");
+            conn.execute("INSERT INTO evolving VALUES (1, 0)")
+                .await
+                .expect("seed");
+        }
 
-    let reader = Connection::open(path_str).expect("reader open");
+        let reader = Connection::open(path_str).await.expect("reader open");
 
-    // Read initial state
-    let gen0 = get_int(&reader, "SELECT gen FROM evolving WHERE id = 1");
-    assert_eq!(gen0, Some(0), "S1: initial gen should be 0");
+        // Read initial state
+        let gen0 = get_int(&reader, "SELECT gen FROM evolving WHERE id = 1").await;
+        assert_eq!(gen0, Some(0), "S1: initial gen should be 0");
 
-    // Writer updates 10 times
-    for generation in 1..=10 {
-        let writer = Connection::open(path_str).expect("writer open");
-        writer
-            .execute(&format!(
-                "UPDATE evolving SET gen = {generation} WHERE id = 1"
-            ))
-            .expect("update");
-    }
+        // Writer updates 10 times
+        for generation in 1..=10 {
+            let writer = Connection::open(path_str).await.expect("writer open");
+            writer
+                .execute(&format!(
+                    "UPDATE evolving SET gen = {generation} WHERE id = 1"
+                ))
+                .await
+                .expect("update");
+        }
 
-    // Reader should see the latest committed value (no stale snapshot)
-    let gen_final = get_int(&reader, "SELECT gen FROM evolving WHERE id = 1");
-    assert!(
-        gen_final.is_some(),
-        "S1: reader can't read after writer updates"
-    );
-    let gf = gen_final.unwrap();
-    assert!(
-        gf >= 1,
-        "S1: reader still sees stale gen 0 after 10 writer updates, got {gf}"
-    );
+        // Reader should see the latest committed value (no stale snapshot)
+        let gen_final = get_int(&reader, "SELECT gen FROM evolving WHERE id = 1").await;
+        assert!(
+            gen_final.is_some(),
+            "S1: reader can't read after writer updates"
+        );
+        let gf = gen_final.unwrap();
+        assert!(
+            gf >= 1,
+            "S1: reader still sees stale gen 0 after 10 writer updates, got {gf}"
+        );
 
-    eprintln!("S1: stale reader sees gen={gf} after 10 writer updates");
+        eprintln!("S1: stale reader sees gen={gf} after 10 writer updates");
+    });
 }
 
 // ─── C1: Concurrent writers no data loss ──────────────────────────
 
 #[test]
 fn c1_concurrent_writers_no_data_loss() {
-    let dir = test_tmpdir();
-    let db_path = dir.path().join("c1.db");
-    let path_str = db_path.to_str().expect("path");
+    asupersync::test_utils::run_test(|| async {
+        let dir = test_tmpdir();
+        let db_path = dir.path().join("c1.db");
+        let path_str = db_path.to_str().expect("path");
 
-    {
-        let conn = Connection::open(path_str).expect("open");
-        conn.execute("CREATE TABLE writes (id INTEGER PRIMARY KEY, writer INTEGER)")
-            .expect("create");
-    }
+        {
+            let conn = Connection::open(path_str).await.expect("open");
+            conn.execute("CREATE TABLE writes (id INTEGER PRIMARY KEY, writer INTEGER)")
+                .await
+                .expect("create");
+        }
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let total_committed = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let total_committed = Arc::new(AtomicU64::new(0));
 
-    // 4 writer threads, each inserting unique IDs
-    let threads: Vec<_> = (0..4u64)
-        .map(|tid| {
-            let path = path_str.to_string();
-            let s = Arc::clone(&stop);
-            let tc = Arc::clone(&total_committed);
-            std::thread::spawn(move || {
-                let conn = Connection::open(&path).expect("open");
-                let mut committed = 0u64;
-                let mut seq = 0u64;
-                while !s.load(Ordering::Relaxed) {
-                    let id = tid * 1_000_000 + seq;
-                    if conn.execute("BEGIN").is_ok() {
-                        if conn
-                            .execute(&format!("INSERT INTO writes VALUES ({id}, {tid})"))
-                            .is_ok()
-                        {
-                            if conn.execute("COMMIT").is_ok() {
-                                committed += 1;
-                            } else {
-                                conn.execute("ROLLBACK").ok();
+        // 4 writer threads, each inserting unique IDs
+        let threads: Vec<_> = (0..4u64)
+            .map(|tid| {
+                let path = path_str.to_string();
+                let s = Arc::clone(&stop);
+                let tc = Arc::clone(&total_committed);
+                std::thread::spawn(move || {
+                    let mut committed = 0u64;
+                    asupersync::test_utils::run_test(|| async {
+                        let conn = Connection::open(&path).await.expect("open");
+                        let mut seq = 0u64;
+                        while !s.load(Ordering::Relaxed) {
+                            let id = tid * 1_000_000 + seq;
+                            if conn.execute("BEGIN").await.is_ok() {
+                                if conn
+                                    .execute(&format!("INSERT INTO writes VALUES ({id}, {tid})"))
+                                    .await
+                                    .is_ok()
+                                {
+                                    if conn.execute("COMMIT").await.is_ok() {
+                                        committed += 1;
+                                    } else {
+                                        conn.execute("ROLLBACK").await.ok();
+                                    }
+                                } else {
+                                    conn.execute("ROLLBACK").await.ok();
+                                }
                             }
-                        } else {
-                            conn.execute("ROLLBACK").ok();
+                            seq += 1;
                         }
-                    }
-                    seq += 1;
-                }
-                tc.fetch_add(committed, Ordering::Relaxed);
-                committed
+                    });
+                    tc.fetch_add(committed, Ordering::Relaxed);
+                    committed
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    std::thread::sleep(Duration::from_secs(2));
-    stop.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_secs(2));
+        stop.store(true, Ordering::Relaxed);
 
-    let per_thread: Vec<u64> = threads
-        .into_iter()
-        .map(|t| t.join().expect("writer must not panic"))
-        .collect();
+        let per_thread: Vec<u64> = threads
+            .into_iter()
+            .map(|t| t.join().expect("writer must not panic"))
+            .collect();
 
-    let expected_total: u64 = per_thread.iter().sum();
-    assert!(expected_total > 0, "C1: no commits succeeded");
+        let expected_total: u64 = per_thread.iter().sum();
+        assert!(expected_total > 0, "C1: no commits succeeded");
 
-    // Verify actual row count matches committed count
-    let verify = Connection::open(path_str).expect("verify");
-    let actual = count_rows(&verify, "SELECT * FROM writes");
+        // Verify actual row count matches committed count
+        let verify = Connection::open(path_str).await.expect("verify");
+        let actual = count_rows(&verify, "SELECT * FROM writes").await;
 
-    assert_eq!(
-        actual as u64, expected_total,
-        "C1: data loss! actual={actual} vs committed={expected_total}"
-    );
-
-    // Verify per-writer counts
-    for (tid, &expected) in per_thread.iter().enumerate() {
-        let writer_rows = count_rows(
-            &verify,
-            &format!("SELECT * FROM writes WHERE writer = {tid}"),
-        );
         assert_eq!(
-            writer_rows as u64, expected,
-            "C1: writer {tid}: actual={writer_rows} vs committed={expected}"
+            actual as u64, expected_total,
+            "C1: data loss! actual={actual} vs committed={expected_total}"
         );
-    }
 
-    eprintln!(
-        "C1: 4 writers, {} total committed, per-thread: {:?}",
-        expected_total, per_thread
-    );
+        // Verify per-writer counts
+        for (tid, &expected) in per_thread.iter().enumerate() {
+            let writer_rows = count_rows(
+                &verify,
+                &format!("SELECT * FROM writes WHERE writer = {tid}"),
+            )
+            .await;
+            assert_eq!(
+                writer_rows as u64, expected,
+                "C1: writer {tid}: actual={writer_rows} vs committed={expected}"
+            );
+        }
+
+        eprintln!(
+            "C1: 4 writers, {} total committed, per-thread: {:?}",
+            expected_total, per_thread
+        );
+    });
 }
 
 // ─── C2: Concurrent writer fairness (Jain's index) ───────────────
 
 #[test]
 fn c2_concurrent_writer_fairness() {
-    let dir = test_tmpdir();
-    let db_path = dir.path().join("c2.db");
-    let path_str = db_path.to_str().expect("path");
+    asupersync::test_utils::run_test(|| async {
+        let dir = test_tmpdir();
+        let db_path = dir.path().join("c2.db");
+        let path_str = db_path.to_str().expect("path");
 
-    {
-        let conn = Connection::open(path_str).expect("open");
-        conn.execute("CREATE TABLE fair (id INTEGER PRIMARY KEY, writer INTEGER)")
-            .expect("create");
-    }
+        {
+            let conn = Connection::open(path_str).await.expect("open");
+            conn.execute("CREATE TABLE fair (id INTEGER PRIMARY KEY, writer INTEGER)")
+                .await
+                .expect("create");
+        }
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let n_threads = 4u64;
+        let stop = Arc::new(AtomicBool::new(false));
+        let n_threads = 4u64;
 
-    let threads: Vec<_> = (0..n_threads)
-        .map(|tid| {
-            let path = path_str.to_string();
-            let s = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                let conn = Connection::open(&path).expect("open");
-                let mut committed = 0u64;
-                let mut seq = 0u64;
-                while !s.load(Ordering::Relaxed) {
-                    let id = tid * 10_000_000 + seq;
-                    if conn.execute("BEGIN").is_ok() {
-                        if conn
-                            .execute(&format!("INSERT INTO fair VALUES ({id}, {tid})"))
-                            .is_ok()
-                        {
-                            if conn.execute("COMMIT").is_ok() {
-                                committed += 1;
-                            } else {
-                                conn.execute("ROLLBACK").ok();
+        let threads: Vec<_> = (0..n_threads)
+            .map(|tid| {
+                let path = path_str.to_string();
+                let s = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut committed = 0u64;
+                    asupersync::test_utils::run_test(|| async {
+                        let conn = Connection::open(&path).await.expect("open");
+                        let mut seq = 0u64;
+                        while !s.load(Ordering::Relaxed) {
+                            let id = tid * 10_000_000 + seq;
+                            if conn.execute("BEGIN").await.is_ok() {
+                                if conn
+                                    .execute(&format!("INSERT INTO fair VALUES ({id}, {tid})"))
+                                    .await
+                                    .is_ok()
+                                {
+                                    if conn.execute("COMMIT").await.is_ok() {
+                                        committed += 1;
+                                    } else {
+                                        conn.execute("ROLLBACK").await.ok();
+                                    }
+                                } else {
+                                    conn.execute("ROLLBACK").await.ok();
+                                }
                             }
-                        } else {
-                            conn.execute("ROLLBACK").ok();
+                            seq += 1;
                         }
-                    }
-                    seq += 1;
-                }
-                committed
+                    });
+                    committed
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    std::thread::sleep(Duration::from_secs(2));
-    stop.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_secs(2));
+        stop.store(true, Ordering::Relaxed);
 
-    let per_thread: Vec<u64> = threads
-        .into_iter()
-        .map(|t| t.join().expect("writer must not panic"))
-        .collect();
+        let per_thread: Vec<u64> = threads
+            .into_iter()
+            .map(|t| t.join().expect("writer must not panic"))
+            .collect();
 
-    let total: u64 = per_thread.iter().sum();
-    assert!(total > 0, "C2: no commits completed");
+        let total: u64 = per_thread.iter().sum();
+        assert!(total > 0, "C2: no commits completed");
 
-    // Jain's fairness index: J = (sum(x_i))^2 / (n * sum(x_i^2))
-    // J = 1.0 means perfectly fair, J = 1/n means maximally unfair
-    let sum: f64 = per_thread.iter().map(|&x| x as f64).sum();
-    let sum_sq: f64 = per_thread.iter().map(|&x| (x as f64) * (x as f64)).sum();
-    let n = n_threads as f64;
-    let numerator = sum * sum;
-    let denominator = n * sum_sq;
-    let jain = numerator / denominator;
+        // Jain's fairness index: J = (sum(x_i))^2 / (n * sum(x_i^2))
+        // J = 1.0 means perfectly fair, J = 1/n means maximally unfair
+        let sum: f64 = per_thread.iter().map(|&x| x as f64).sum();
+        let sum_sq: f64 = per_thread.iter().map(|&x| (x as f64) * (x as f64)).sum();
+        let n = n_threads as f64;
+        let numerator = sum * sum;
+        let denominator = n * sum_sq;
+        let jain = numerator / denominator;
 
-    eprintln!(
-        "C2: fairness — per-thread: {:?}, total: {}, Jain's index: {:.4}",
-        per_thread, total, jain
-    );
+        eprintln!(
+            "C2: fairness — per-thread: {:?}, total: {}, Jain's index: {:.4}",
+            per_thread, total, jain
+        );
 
-    // Fairness threshold: Jain's index should be > 0.5 (moderate fairness)
-    // A perfectly fair system would be 1.0, totally unfair would be 0.25 for 4 threads
-    assert!(
-        jain > 0.5,
-        "C2: Jain's fairness index {jain:.4} below 0.5 threshold — severe unfairness"
-    );
+        // Fairness threshold: Jain's index should be > 0.5 (moderate fairness)
+        // A perfectly fair system would be 1.0, totally unfair would be 0.25 for 4 threads
+        assert!(
+            jain > 0.5,
+            "C2: Jain's fairness index {jain:.4} below 0.5 threshold — severe unfairness"
+        );
+    });
 }

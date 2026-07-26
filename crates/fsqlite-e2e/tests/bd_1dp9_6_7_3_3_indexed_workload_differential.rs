@@ -178,13 +178,13 @@ const SCHEMA: &str = "
     CREATE UNIQUE INDEX idx_name ON products(name);
 ";
 
-async fn seed_data(exec: impl AsyncFn(&str)) {
+async fn seed_data(exec: impl AsyncFn(String)) {
     let categories = ["electronics", "books", "clothing", "food", "toys"];
     for i in 0..200 {
         let cat = categories[i % categories.len()];
         let price = (i as f64).mul_add(1.5, 0.99);
         let stock = (i * 7 + 3) % 100;
-        exec(&format!(
+        exec(format!(
             "INSERT INTO products (id, category, name, price, stock) VALUES ({i}, '{cat}', 'product-{i:04}', {price}, {stock})"
         ))
         .await;
@@ -200,15 +200,15 @@ fn i1_equality_lookup() {
 
         let c = setup_csqlite();
         c.execute_batch(SCHEMA).expect("schema");
-        seed_data(async |sql: &str| {
-            c.execute(sql, []).unwrap();
+        seed_data(async |sql: String| {
+            c.execute(&sql, []).unwrap();
         })
         .await;
 
         let f = setup_fsqlite().await;
         f.execute(SCHEMA).await.expect("schema");
-        seed_data(async |sql: &str| {
-            f.execute(sql).await.unwrap();
+        seed_data(async |sql: String| {
+            f.execute(&sql).await.unwrap();
         })
         .await;
 
@@ -252,15 +252,15 @@ fn i2_range_scan() {
 
         let c = setup_csqlite();
         c.execute_batch(SCHEMA).expect("schema");
-        seed_data(async |sql: &str| {
-            c.execute(sql, []).unwrap();
+        seed_data(async |sql: String| {
+            c.execute(&sql, []).unwrap();
         })
         .await;
 
         let f = setup_fsqlite().await;
         f.execute(SCHEMA).await.expect("schema");
-        seed_data(async |sql: &str| {
-            f.execute(sql).await.unwrap();
+        seed_data(async |sql: String| {
+            f.execute(&sql).await.unwrap();
         })
         .await;
 
@@ -341,15 +341,15 @@ fn i4_covering_index() {
 
         let c = setup_csqlite();
         c.execute_batch(SCHEMA).expect("schema");
-        seed_data(async |sql: &str| {
-            c.execute(sql, []).unwrap();
+        seed_data(async |sql: String| {
+            c.execute(&sql, []).unwrap();
         })
         .await;
 
         let f = setup_fsqlite().await;
         f.execute(SCHEMA).await.expect("schema");
-        seed_data(async |sql: &str| {
-            f.execute(sql).await.unwrap();
+        seed_data(async |sql: String| {
+            f.execute(&sql).await.unwrap();
         })
         .await;
 
@@ -381,15 +381,15 @@ fn i5_multi_column_index() {
 
         let c = setup_csqlite();
         c.execute_batch(SCHEMA).expect("schema");
-        seed_data(async |sql: &str| {
-            c.execute(sql, []).unwrap();
+        seed_data(async |sql: String| {
+            c.execute(&sql, []).unwrap();
         })
         .await;
 
         let f = setup_fsqlite().await;
         f.execute(SCHEMA).await.expect("schema");
-        seed_data(async |sql: &str| {
-            f.execute(sql).await.unwrap();
+        seed_data(async |sql: String| {
+            f.execute(&sql).await.unwrap();
         })
         .await;
 
@@ -424,15 +424,15 @@ fn i6_unique_constraint() {
 
         let c = setup_csqlite();
         c.execute_batch(SCHEMA).expect("schema");
-        seed_data(async |sql: &str| {
-            c.execute(sql, []).unwrap();
+        seed_data(async |sql: String| {
+            c.execute(&sql, []).unwrap();
         })
         .await;
 
         let f = setup_fsqlite().await;
         f.execute(SCHEMA).await.expect("schema");
-        seed_data(async |sql: &str| {
-            f.execute(sql).await.unwrap();
+        seed_data(async |sql: String| {
+            f.execute(&sql).await.unwrap();
         })
         .await;
 
@@ -471,15 +471,15 @@ fn i7_order_by_indexed() {
 
         let c = setup_csqlite();
         c.execute_batch(SCHEMA).expect("schema");
-        seed_data(async |sql: &str| {
-            c.execute(sql, []).unwrap();
+        seed_data(async |sql: String| {
+            c.execute(&sql, []).unwrap();
         })
         .await;
 
         let f = setup_fsqlite().await;
         f.execute(SCHEMA).await.expect("schema");
-        seed_data(async |sql: &str| {
-            f.execute(sql).await.unwrap();
+        seed_data(async |sql: String| {
+            f.execute(&sql).await.unwrap();
         })
         .await;
 
@@ -511,15 +511,15 @@ fn i8_mixed_dml_with_index() {
 
         let c = setup_csqlite();
         c.execute_batch(SCHEMA).expect("schema");
-        seed_data(async |sql: &str| {
-            c.execute(sql, []).unwrap();
+        seed_data(async |sql: String| {
+            c.execute(&sql, []).unwrap();
         })
         .await;
 
         let f = setup_fsqlite().await;
         f.execute(SCHEMA).await.expect("schema");
-        seed_data(async |sql: &str| {
-            f.execute(sql).await.unwrap();
+        seed_data(async |sql: String| {
+            f.execute(&sql).await.unwrap();
         })
         .await;
 
@@ -529,7 +529,12 @@ fn i8_mixed_dml_with_index() {
         f.execute(update_sql).await.unwrap();
 
         let q1 = "SELECT id, stock FROM products WHERE category = 'electronics' ORDER BY id";
-        differential_check("I8", q1, &csqlite_query(&c, q1), &fsqlite_query(&f, q1).await);
+        differential_check(
+            "I8",
+            q1,
+            &csqlite_query(&c, q1),
+            &fsqlite_query(&f, q1).await,
+        );
 
         // DELETE via indexed column
         let delete_sql = "DELETE FROM products WHERE price > 250.0";
@@ -537,7 +542,12 @@ fn i8_mixed_dml_with_index() {
         f.execute(delete_sql).await.unwrap();
 
         let q2 = "SELECT COUNT(*) FROM products";
-        differential_check("I8", q2, &csqlite_query(&c, q2), &fsqlite_query(&f, q2).await);
+        differential_check(
+            "I8",
+            q2,
+            &csqlite_query(&c, q2),
+            &fsqlite_query(&f, q2).await,
+        );
 
         // INSERT new rows, verify index updated
         let insert_sql = "INSERT INTO products (id, category, name, price, stock) VALUES (9001, 'new', 'product-new-1', 999.99, 50)";
@@ -615,69 +625,72 @@ fn i9_null_handling() {
 
 #[test]
 fn i10_large_dataset() {
-    let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    asupersync::test_utils::run_test(|| async {
+        let _guard = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-    let schema = "
+        let schema = "
         CREATE TABLE large (id INTEGER PRIMARY KEY, bucket INTEGER NOT NULL, payload TEXT);
         CREATE INDEX idx_bucket ON large(bucket);
     ";
 
-    let c = setup_csqlite();
-    c.execute_batch(schema).expect("schema");
+        let c = setup_csqlite();
+        c.execute_batch(schema).expect("schema");
 
-    let f = setup_fsqlite();
-    f.execute(schema).expect("schema");
+        let f = setup_fsqlite().await;
+        f.execute(schema).await.expect("schema");
 
-    let row_count = 10_000;
-    let start = Instant::now();
-    c.execute_batch("BEGIN;").unwrap();
-    for i in 0..row_count {
-        c.execute(
-            "INSERT INTO large VALUES (?1, ?2, ?3)",
-            rusqlite::params![i, i % 50, format!("data-{i:06}")],
-        )
-        .unwrap();
-    }
-    c.execute_batch("COMMIT;").unwrap();
-    let c_insert_ns = start.elapsed().as_nanos() as u64;
-
-    let start = Instant::now();
-    f.execute("BEGIN").unwrap();
-    for i in 0..row_count {
-        f.execute(&format!(
-            "INSERT INTO large VALUES ({i}, {}, 'data-{i:06}')",
-            i % 50
-        ))
-        .unwrap();
-    }
-    f.execute("COMMIT").unwrap();
-    let f_insert_ns = start.elapsed().as_nanos() as u64;
-
-    let queries = [
-        "SELECT COUNT(*) FROM large",
-        "SELECT COUNT(*) FROM large WHERE bucket = 7",
-        "SELECT id, payload FROM large WHERE bucket = 25 ORDER BY id LIMIT 10",
-        "SELECT bucket, COUNT(*), MIN(id), MAX(id) FROM large GROUP BY bucket ORDER BY bucket LIMIT 5",
-    ];
-
-    let mut all_match = true;
-    for q in &queries {
-        let c_rows = csqlite_query(&c, q);
-        let f_rows = fsqlite_query(&f, q);
-        if c_rows != f_rows {
-            all_match = false;
+        let row_count = 10_000;
+        let start = Instant::now();
+        c.execute_batch("BEGIN;").unwrap();
+        for i in 0..row_count {
+            c.execute(
+                "INSERT INTO large VALUES (?1, ?2, ?3)",
+                rusqlite::params![i, i % 50, format!("data-{i:06}")],
+            )
+            .unwrap();
         }
-        differential_check("I10", q, &c_rows, &f_rows);
-    }
+        c.execute_batch("COMMIT;").unwrap();
+        let c_insert_ns = start.elapsed().as_nanos() as u64;
 
-    emit_log(
-        "I10",
-        "result",
-        json!({
-            "row_count": row_count,
-            "csqlite_insert_ns": c_insert_ns,
-            "fsqlite_insert_ns": f_insert_ns,
-            "all_queries_match": all_match,
-        }),
-    );
+        let start = Instant::now();
+        f.execute("BEGIN").await.unwrap();
+        for i in 0..row_count {
+            f.execute(&format!(
+                "INSERT INTO large VALUES ({i}, {}, 'data-{i:06}')",
+                i % 50
+            ))
+            .await
+            .unwrap();
+        }
+        f.execute("COMMIT").await.unwrap();
+        let f_insert_ns = start.elapsed().as_nanos() as u64;
+
+        let queries = [
+            "SELECT COUNT(*) FROM large",
+            "SELECT COUNT(*) FROM large WHERE bucket = 7",
+            "SELECT id, payload FROM large WHERE bucket = 25 ORDER BY id LIMIT 10",
+            "SELECT bucket, COUNT(*), MIN(id), MAX(id) FROM large GROUP BY bucket ORDER BY bucket LIMIT 5",
+        ];
+
+        let mut all_match = true;
+        for q in &queries {
+            let c_rows = csqlite_query(&c, q);
+            let f_rows = fsqlite_query(&f, q).await;
+            if c_rows != f_rows {
+                all_match = false;
+            }
+            differential_check("I10", q, &c_rows, &f_rows);
+        }
+
+        emit_log(
+            "I10",
+            "result",
+            json!({
+                "row_count": row_count,
+                "csqlite_insert_ns": c_insert_ns,
+                "fsqlite_insert_ns": f_insert_ns,
+                "all_queries_match": all_match,
+            }),
+        );
+    });
 }

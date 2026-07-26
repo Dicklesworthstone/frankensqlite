@@ -573,7 +573,10 @@ fn s12_savepoint_ddl_release_persists() {
             cconn.execute_batch(&format!("{sql};")).unwrap();
         }
 
-        let f = fconn.query("SELECT a, b FROM t12 ORDER BY a").await.unwrap();
+        let f = fconn
+            .query("SELECT a, b FROM t12 ORDER BY a")
+            .await
+            .unwrap();
         let c = csqlite_query(&cconn, "SELECT a, b FROM t12 ORDER BY a");
         assert_fsqlite_csqlite_eq(tn, "after_release", &f, &c);
 
@@ -612,7 +615,10 @@ fn s13_nested_savepoint_ddl_rollback() {
         }
 
         // Outer savepoint released: ALTER + row 2 persists, row 3 rolled back
-        let f = fconn.query("SELECT a, b FROM t13 ORDER BY a").await.unwrap();
+        let f = fconn
+            .query("SELECT a, b FROM t13 ORDER BY a")
+            .await
+            .unwrap();
         let c = csqlite_query(&cconn, "SELECT a, b FROM t13 ORDER BY a");
         assert_fsqlite_csqlite_eq(tn, "nested_sp_result", &f, &c);
 

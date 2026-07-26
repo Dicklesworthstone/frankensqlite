@@ -164,7 +164,10 @@ fn test_csqlite_writes_fsqlite_reads() {
             }
 
             // Verify specific row
-            let rows = match conn.query("SELECT id, name, val FROM t WHERE id = 50").await {
+            let rows = match conn
+                .query("SELECT id, name, val FROM t WHERE id = 50")
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     compat_log!(

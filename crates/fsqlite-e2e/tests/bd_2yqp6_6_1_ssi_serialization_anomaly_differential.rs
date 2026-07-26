@@ -7,6 +7,7 @@
 //! - non-serializable schedules are not silently accepted,
 //! - conflict/abort semantics are measured and surfaced,
 //! - replay payloads carry seed/trace metadata and conform to schema.
+#![recursion_limit = "512"]
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::env;
@@ -255,109 +256,113 @@ fn serialization_checker_flags_rw_cycle_and_accepts_disjoint() {
 
 #[test]
 fn bd_2yqp6_6_1_ssi_serialization_anomaly_differential_matrix() {
-    let scenarios = [
-        ScenarioKind::WriteSkewGuard,
-        ScenarioKind::DisjointWrites,
-        ScenarioKind::HotRowConflict,
-    ];
+    asupersync::test_utils::run_test(|| async {
+        let scenarios = [
+            ScenarioKind::WriteSkewGuard,
+            ScenarioKind::DisjointWrites,
+            ScenarioKind::HotRowConflict,
+        ];
 
-    let mut run_records = Vec::new();
-    let mut first_failure: Option<String> = None;
+        let mut run_records = Vec::new();
+        let mut first_failure: Option<String> = None;
 
-    for scenario in scenarios {
-        for seed in DEFAULT_SEEDS {
-            let scheduler = SchedulerPlan::from_seed(seed);
-            let run_id = format!("{BEAD_ID}-{}-{seed:016x}", scenario.scenario_name());
-            let trace_id = format!("trace-{run_id}");
+        for scenario in scenarios {
+            for seed in DEFAULT_SEEDS {
+                let scheduler = SchedulerPlan::from_seed(seed);
+                let run_id = format!("{BEAD_ID}-{}-{seed:016x}", scenario.scenario_name());
+                let trace_id = format!("trace-{run_id}");
 
-            let oracle = run_engine_scenario(EngineKind::Sqlite, scenario, &scheduler);
-            let candidate = run_engine_scenario(EngineKind::Fsqlite, scenario, &scheduler);
+                let oracle = run_engine_scenario(EngineKind::Sqlite, scenario, &scheduler).await;
+                let candidate =
+                    run_engine_scenario(EngineKind::Fsqlite, scenario, &scheduler).await;
 
-            let oracle_cycle = detect_cycle(&oracle.committed_for_graph).is_some();
-            let candidate_cycle = detect_cycle(&candidate.committed_for_graph).is_some();
+                let oracle_cycle = detect_cycle(&oracle.committed_for_graph).is_some();
+                let candidate_cycle = detect_cycle(&candidate.committed_for_graph).is_some();
 
-            let mut checks = Vec::new();
+                let mut checks = Vec::new();
 
-            if oracle_cycle {
-                checks.push("sqlite oracle produced serialization cycle".to_owned());
-            }
-            if candidate_cycle {
-                checks.push("fsqlite accepted non-serializable committed schedule".to_owned());
-            }
-
-            if scenario == ScenarioKind::WriteSkewGuard {
-                let final_sum = row_sum(&candidate.final_rows);
-                if final_sum < 1 {
-                    checks.push(format!(
-                        "write-skew guard violated: final_sum={final_sum}, expected >= 1"
-                    ));
+                if oracle_cycle {
+                    checks.push("sqlite oracle produced serialization cycle".to_owned());
                 }
-                if candidate.abort_count() == 0 {
+                if candidate_cycle {
+                    checks.push("fsqlite accepted non-serializable committed schedule".to_owned());
+                }
+
+                if scenario == ScenarioKind::WriteSkewGuard {
+                    let final_sum = row_sum(&candidate.final_rows);
+                    if final_sum < 1 {
+                        checks.push(format!(
+                            "write-skew guard violated: final_sum={final_sum}, expected >= 1"
+                        ));
+                    }
+                    if candidate.abort_count() == 0 {
+                        checks.push(
+                            "write-skew scenario did not surface abort/error semantics".to_owned(),
+                        );
+                    }
+                }
+
+                if scenario == ScenarioKind::DisjointWrites && candidate.committed_count() == 0 {
+                    checks.push("disjoint scenario made no forward progress".to_owned());
+                }
+
+                if scenario == ScenarioKind::HotRowConflict && candidate.abort_count() == 0 {
                     checks.push(
-                        "write-skew scenario did not surface abort/error semantics".to_owned(),
+                        "hot-row contention did not report conflict/abort semantics".to_owned(),
                     );
                 }
+
+                let status = if checks.is_empty() { "pass" } else { "fail" };
+                let first_failure_for_record = checks.first().cloned();
+                if first_failure.is_none() {
+                    first_failure = first_failure_for_record.clone();
+                }
+
+                let record = json!({
+                    "bead_id": BEAD_ID,
+                    "trace_id": trace_id,
+                    "run_id": run_id,
+                    "scenario_id": scenario.scenario_id(),
+                    "seed": seed,
+                    "scheduler": {
+                        "seed": scheduler.seed,
+                        "commit_order": scheduler.commit_order,
+                    },
+                    "timing_ms": {
+                        "sqlite3": oracle.elapsed_ms,
+                        "fsqlite": candidate.elapsed_ms,
+                    },
+                    "outcome": status,
+                    "first_failure": first_failure_for_record,
+                    "checks": {
+                        "non_serializable_schedule_rejected": !candidate_cycle,
+                        "oracle_cycle_free": !oracle_cycle,
+                        "abort_semantics_measured": candidate.abort_count() > 0 || scenario == ScenarioKind::DisjointWrites,
+                        "disjoint_no_false_abort": scenario != ScenarioKind::DisjointWrites || candidate.committed_count() > 0,
+                    },
+                    "sqlite3": summarize_engine_run(&oracle),
+                    "fsqlite": summarize_engine_run(&candidate),
+                    "log_standard_ref": LOG_STANDARD_REF,
+                    "replay_command": REPLAY_COMMAND,
+                });
+
+                assert_outcome_schema_valid(&record);
+                println!("SCENARIO_OUTCOME:{record}");
+                run_records.push(record);
             }
-
-            if scenario == ScenarioKind::DisjointWrites && candidate.committed_count() == 0 {
-                checks.push("disjoint scenario made no forward progress".to_owned());
-            }
-
-            if scenario == ScenarioKind::HotRowConflict && candidate.abort_count() == 0 {
-                checks
-                    .push("hot-row contention did not report conflict/abort semantics".to_owned());
-            }
-
-            let status = if checks.is_empty() { "pass" } else { "fail" };
-            let first_failure_for_record = checks.first().cloned();
-            if first_failure.is_none() {
-                first_failure = first_failure_for_record.clone();
-            }
-
-            let record = json!({
-                "bead_id": BEAD_ID,
-                "trace_id": trace_id,
-                "run_id": run_id,
-                "scenario_id": scenario.scenario_id(),
-                "seed": seed,
-                "scheduler": {
-                    "seed": scheduler.seed,
-                    "commit_order": scheduler.commit_order,
-                },
-                "timing_ms": {
-                    "sqlite3": oracle.elapsed_ms,
-                    "fsqlite": candidate.elapsed_ms,
-                },
-                "outcome": status,
-                "first_failure": first_failure_for_record,
-                "checks": {
-                    "non_serializable_schedule_rejected": !candidate_cycle,
-                    "oracle_cycle_free": !oracle_cycle,
-                    "abort_semantics_measured": candidate.abort_count() > 0 || scenario == ScenarioKind::DisjointWrites,
-                    "disjoint_no_false_abort": scenario != ScenarioKind::DisjointWrites || candidate.committed_count() > 0,
-                },
-                "sqlite3": summarize_engine_run(&oracle),
-                "fsqlite": summarize_engine_run(&candidate),
-                "log_standard_ref": LOG_STANDARD_REF,
-                "replay_command": REPLAY_COMMAND,
-            });
-
-            assert_outcome_schema_valid(&record);
-            println!("SCENARIO_OUTCOME:{record}");
-            run_records.push(record);
         }
-    }
 
-    maybe_write_artifact(&run_records);
+        maybe_write_artifact(&run_records);
 
-    assert!(
-        first_failure.is_none(),
-        "{BEAD_ID} differential matrix failed: {}",
-        first_failure.unwrap_or_else(|| "unknown failure".to_owned())
-    );
+        assert!(
+            first_failure.is_none(),
+            "{BEAD_ID} differential matrix failed: {}",
+            first_failure.unwrap_or_else(|| "unknown failure".to_owned())
+        );
+    });
 }
 
-fn run_engine_scenario(
+async fn run_engine_scenario(
     engine: EngineKind,
     scenario: ScenarioKind,
     scheduler: &SchedulerPlan,
@@ -371,24 +376,28 @@ fn run_engine_scenario(
     ));
 
     match engine {
-        EngineKind::Fsqlite => run_fsqlite(db_path.as_path(), scenario, scheduler),
+        EngineKind::Fsqlite => run_fsqlite(db_path.as_path(), scenario, scheduler).await,
         EngineKind::Sqlite => run_sqlite(db_path.as_path(), scenario, scheduler),
     }
 }
 
-fn run_fsqlite(db_path: &Path, scenario: ScenarioKind, scheduler: &SchedulerPlan) -> EngineRun {
-    initialize_fsqlite_db(db_path, scenario);
+async fn run_fsqlite(
+    db_path: &Path,
+    scenario: ScenarioKind,
+    scheduler: &SchedulerPlan,
+) -> EngineRun {
+    initialize_fsqlite_db(db_path, scenario).await;
 
     let start_time = Instant::now();
-    let conn_a = open_fsqlite_worker(db_path);
-    let conn_b = open_fsqlite_worker(db_path);
+    let conn_a = open_fsqlite_worker(db_path).await;
+    let conn_b = open_fsqlite_worker(db_path).await;
 
     let mut runtimes = [
-        begin_and_prepare_fsqlite_txn(&conn_a, 0, scenario),
-        begin_and_prepare_fsqlite_txn(&conn_b, 1, scenario),
+        begin_and_prepare_fsqlite_txn(&conn_a, 0, scenario).await,
+        begin_and_prepare_fsqlite_txn(&conn_b, 1, scenario).await,
     ];
 
-    commit_in_order_fsqlite(&conn_a, &conn_b, &mut runtimes, scheduler.commit_order);
+    commit_in_order_fsqlite(&conn_a, &conn_b, &mut runtimes, scheduler.commit_order).await;
 
     let committed_for_graph = committed_txns_from_runtime(&runtimes);
     let elapsed_ms = duration_to_ms(start_time.elapsed().as_millis());
@@ -428,22 +437,30 @@ fn run_sqlite(db_path: &Path, scenario: ScenarioKind, scheduler: &SchedulerPlan)
     }
 }
 
-fn initialize_fsqlite_db(path: &Path, scenario: ScenarioKind) {
+async fn initialize_fsqlite_db(path: &Path, scenario: ScenarioKind) {
     let path_str = path.to_str().expect("utf8 path");
-    let conn = fsqlite::Connection::open(path_str).expect("open setup fsqlite connection");
+    let conn = fsqlite::Connection::open(path_str)
+        .await
+        .expect("open setup fsqlite connection");
     conn.execute("PRAGMA journal_mode=WAL;")
+        .await
         .expect("set WAL mode");
     conn.execute("PRAGMA busy_timeout=0;")
+        .await
         .expect("set busy timeout");
     conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")
+        .await
         .expect("enable concurrent mode");
     conn.execute("CREATE TABLE guard (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+        .await
         .expect("create guard table");
 
     let [left, right] = scenario.initial_rows();
     conn.execute(&format!("INSERT INTO guard (id, v) VALUES (1, {left});"))
+        .await
         .expect("insert row 1");
     conn.execute(&format!("INSERT INTO guard (id, v) VALUES (2, {right});"))
+        .await
         .expect("insert row 2");
 }
 
@@ -467,12 +484,16 @@ fn initialize_sqlite_db(path: &Path, scenario: ScenarioKind) {
     .expect("insert row 2");
 }
 
-fn open_fsqlite_worker(path: &Path) -> fsqlite::Connection {
+async fn open_fsqlite_worker(path: &Path) -> fsqlite::Connection {
     let path_str = path.to_str().expect("utf8 path");
-    let conn = fsqlite::Connection::open(path_str).expect("open fsqlite worker");
+    let conn = fsqlite::Connection::open(path_str)
+        .await
+        .expect("open fsqlite worker");
     conn.execute("PRAGMA busy_timeout=0;")
+        .await
         .expect("set fsqlite worker busy_timeout");
     conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")
+        .await
         .expect("enable fsqlite worker concurrent mode");
     conn
 }
@@ -484,7 +505,7 @@ fn open_sqlite_worker(path: &Path) -> rusqlite::Connection {
     conn
 }
 
-fn begin_and_prepare_fsqlite_txn(
+async fn begin_and_prepare_fsqlite_txn(
     conn: &fsqlite::Connection,
     tx_index: usize,
     scenario: ScenarioKind,
@@ -511,7 +532,7 @@ fn begin_and_prepare_fsqlite_txn(
         open: false,
     };
 
-    if let Err(err) = conn.execute("BEGIN CONCURRENT;") {
+    if let Err(err) = conn.execute("BEGIN CONCURRENT;").await {
         apply_fsqlite_error(&mut runtime, err);
         return runtime;
     }
@@ -522,18 +543,18 @@ fn begin_and_prepare_fsqlite_txn(
     }
 
     let read_sql = format!("SELECT v FROM guard WHERE id = {};", plan.read_key);
-    let observed = match conn.query_row(read_sql.as_str()) {
+    let observed = match conn.query_row(read_sql.as_str()).await {
         Ok(row) => match extract_int_fsqlite(&row, 0) {
             Ok(v) => v,
             Err(err) => {
-                let _ = conn.execute("ROLLBACK;");
+                let _ = conn.execute("ROLLBACK;").await;
                 runtime.open = false;
                 apply_fsqlite_error(&mut runtime, err);
                 return runtime;
             }
         },
         Err(err) => {
-            let _ = conn.execute("ROLLBACK;");
+            let _ = conn.execute("ROLLBACK;").await;
             runtime.open = false;
             apply_fsqlite_error(&mut runtime, err);
             return runtime;
@@ -548,8 +569,8 @@ fn begin_and_prepare_fsqlite_txn(
     if planned_write {
         runtime.trace.write_attempted = true;
         let write_sql = write_statement(scenario, plan.write_key);
-        if let Err(err) = conn.execute(write_sql.as_str()) {
-            let _ = conn.execute("ROLLBACK;");
+        if let Err(err) = conn.execute(write_sql.as_str()).await {
+            let _ = conn.execute("ROLLBACK;").await;
             runtime.open = false;
             apply_fsqlite_error(&mut runtime, err);
             return runtime;
@@ -628,7 +649,7 @@ fn begin_and_prepare_sqlite_txn(
     runtime
 }
 
-fn commit_in_order_fsqlite(
+async fn commit_in_order_fsqlite(
     conn_a: &fsqlite::Connection,
     conn_b: &fsqlite::Connection,
     runtimes: &mut [TxnRuntime; 2],
@@ -642,9 +663,9 @@ fn commit_in_order_fsqlite(
         }
 
         if tx_index == 0 {
-            commit_single_fsqlite_txn(conn_a, runtime, commit_seq);
+            commit_single_fsqlite_txn(conn_a, runtime, commit_seq).await;
         } else {
-            commit_single_fsqlite_txn(conn_b, runtime, commit_seq);
+            commit_single_fsqlite_txn(conn_b, runtime, commit_seq).await;
         }
         commit_seq = commit_seq.saturating_add(1);
     }
@@ -672,19 +693,19 @@ fn commit_in_order_sqlite(
     }
 }
 
-fn commit_single_fsqlite_txn(
+async fn commit_single_fsqlite_txn(
     conn: &fsqlite::Connection,
     runtime: &mut TxnRuntime,
     commit_seq: u64,
 ) {
-    match conn.execute("COMMIT;") {
+    match conn.execute("COMMIT;").await {
         Ok(_) => {
             runtime.trace.outcome = TxnOutcome::Committed;
             runtime.trace.commit_order = conn.last_local_commit_seq().or(Some(commit_seq));
             runtime.open = false;
         }
         Err(err) => {
-            let _ = conn.execute("ROLLBACK;");
+            let _ = conn.execute("ROLLBACK;").await;
             runtime.open = false;
             apply_fsqlite_error(runtime, err);
         }

@@ -38,7 +38,9 @@ const FIXTURE_PRAGMAS: [&str; 5] = [
 
 async fn apply_fixture_pragmas(conn: &Connection) {
     for pragma in FIXTURE_PRAGMAS {
-        conn.execute(pragma).await.ok();
+        conn.execute(pragma).await.unwrap_or_else(|error| {
+            panic!("failed to execute benchmark PRAGMA `{pragma}`: {error:?}")
+        });
     }
 }
 
@@ -80,10 +82,12 @@ async fn bench_mt_mvcc_prepare_then_execute_cycle(iterations: u64) -> f64 {
         SqliteValue::Integer(0),
         SqliteValue::Text(String::from("warmup").into()),
     ];
-    warmed
+    let warmed_inserted = warmed
         .execute_with_params(&warmed_params)
         .await
         .expect("warm execute");
+    assert_eq!(warmed_inserted, 1, "warm INSERT affected-row count");
+    black_box(warmed_inserted);
     black_box(&warmed);
 
     let start = Instant::now();
@@ -124,7 +128,7 @@ async fn open_prepared_select_fast_path_conn_with_count(count: i64) -> Connectio
         .await
         .expect("prepare select bench insert");
     for id in 1..=count {
-        insert
+        let inserted = insert
             .execute_with_params(&[
                 SqliteValue::Integer(id),
                 SqliteValue::Text(format!("name_{id}").into()),
@@ -132,6 +136,7 @@ async fn open_prepared_select_fast_path_conn_with_count(count: i64) -> Connectio
             ])
             .await
             .expect("seed select bench row");
+        assert_eq!(inserted, 1, "select-bench seed INSERT affected-row count");
     }
     conn.execute("COMMIT;")
         .await
@@ -157,13 +162,20 @@ async fn bench_prepared_select_fast_path_pair(iterations: u64) -> f64 {
         .await
         .expect("prepare covering indexed equality");
     let probe = [SqliteValue::Text("name_32".into())];
-    black_box(count_sum.query_row().await.expect("warm count/sum"));
-    black_box(
-        covering_index
-            .query_with_params(&probe)
-            .await
-            .expect("warm covering indexed equality"),
+    let warm_count_sum = count_sum.query_row().await.expect("warm count/sum");
+    assert_eq!(warm_count_sum.get(0), Some(&SqliteValue::Integer(64)));
+    assert_eq!(warm_count_sum.get(1), Some(&SqliteValue::Integer(14_560)));
+    black_box(warm_count_sum);
+    let warm_covering_index = covering_index
+        .query_with_params(&probe)
+        .await
+        .expect("warm covering indexed equality");
+    assert_eq!(warm_covering_index.len(), 1);
+    assert_eq!(
+        warm_covering_index[0].get(0),
+        Some(&SqliteValue::Text("name_32".into()))
     );
+    black_box(warm_covering_index);
 
     let start = Instant::now();
     for _ in 0..iterations {
@@ -185,18 +197,23 @@ async fn bench_prepared_indexed_equality_query(iterations: u64, count: i64) -> f
         .await
         .expect("prepare indexed equality");
     let probe = [SqliteValue::Text(format!("name_{}", count / 2).into())];
-    black_box(
-        indexed_equality
-            .query_with_params(&probe)
-            .await
-            .expect("warm indexed equality"),
+    let warm_rows = indexed_equality
+        .query_with_params(&probe)
+        .await
+        .expect("warm indexed equality");
+    assert_eq!(warm_rows.len(), 1);
+    assert_eq!(warm_rows[0].get(0), Some(&SqliteValue::Integer(count / 2)));
+    black_box(warm_rows);
+    let warm_cached_rows = indexed_equality
+        .query_with_params(&probe)
+        .await
+        .expect("warm cached indexed equality");
+    assert_eq!(warm_cached_rows.len(), 1);
+    assert_eq!(
+        warm_cached_rows[0].get(0),
+        Some(&SqliteValue::Integer(count / 2))
     );
-    black_box(
-        indexed_equality
-            .query_with_params(&probe)
-            .await
-            .expect("warm cached indexed equality"),
-    );
+    black_box(warm_cached_rows);
 
     let start = Instant::now();
     let mut row_count = 0_usize;
@@ -232,10 +249,11 @@ async fn open_e2e_read_indexed_equality_shape_conn(count: i64) -> Connection {
         .await
         .expect("prepare e2e-shaped insert");
     for id in 0..count {
-        insert
+        let inserted = insert
             .execute_with_params(&[SqliteValue::Integer(id)])
             .await
             .expect("seed e2e-shaped row");
+        assert_eq!(inserted, 1, "e2e-shaped seed INSERT affected-row count");
     }
     conn.execute("COMMIT;")
         .await
@@ -256,19 +274,26 @@ async fn bench_prepared_indexed_equality_e2e_shape_query(
         .await
         .expect("prepare e2e-shaped indexed equality");
     let probe = [SqliteValue::Text(format!("user_{}", count / 2).into())];
-    black_box(
-        indexed_equality
-            .query_with_params(&probe)
-            .await
-            .expect("warm e2e-shaped indexed equality"),
+    let warm_rows = indexed_equality
+        .query_with_params(&probe)
+        .await
+        .expect("warm e2e-shaped indexed equality");
+    assert_eq!(warm_rows.len(), 1);
+    assert_eq!(warm_rows[0].get(0), Some(&SqliteValue::Integer(count / 2)));
+    black_box(warm_rows);
+    let warm_cached_rows = indexed_equality
+        .query_with_params(&probe)
+        .await
+        .expect("warm cached e2e-shaped indexed equality");
+    assert_eq!(warm_cached_rows.len(), 1);
+    assert_eq!(
+        warm_cached_rows[0].get(0),
+        Some(&SqliteValue::Integer(count / 2))
     );
-    black_box(
-        indexed_equality
-            .query_with_params(&probe)
-            .await
-            .expect("warm cached e2e-shaped indexed equality"),
-    );
+    black_box(warm_cached_rows);
 
+    // Warmups and their correctness checks must complete before the reset so
+    // the measured hit count covers only the timed loop below.
     reset_hot_path_profile();
     let start = Instant::now();
     let mut row_count = 0_usize;
@@ -309,18 +334,22 @@ async fn open_prepared_count_indexed_rowid_probe_conn(count: i64) -> Connection 
         .expect("begin fixture transaction");
     let cat_count = (count / 20).max(5);
     for id in 1..=cat_count {
-        conn.execute(&format!("INSERT INTO categories VALUES ({id}, 'cat_{id}')"))
+        let inserted = conn
+            .execute(&format!("INSERT INTO categories VALUES ({id}, 'cat_{id}')"))
             .await
             .expect("seed category row");
+        assert_eq!(inserted, 1, "category seed INSERT affected-row count");
     }
     for id in 1..=count {
         let cid = (id % cat_count) + 1;
         let price = id as f64 * 3.14;
-        conn.execute(&format!(
-            "INSERT INTO products VALUES ({id}, 'prod_{id}', {price}, {cid})"
-        ))
-        .await
-        .expect("seed product row");
+        let inserted = conn
+            .execute(&format!(
+                "INSERT INTO products VALUES ({id}, 'prod_{id}', {price}, {cid})"
+            ))
+            .await
+            .expect("seed product row");
+        assert_eq!(inserted, 1, "product seed INSERT affected-row count");
     }
     conn.execute("COMMIT;")
         .await
@@ -337,16 +366,24 @@ async fn bench_prepared_count_indexed_rowid_probe_query_row(iterations: u64, cou
         .prepare(COUNT_INDEXED_ROWID_PROBE_SQL)
         .await
         .expect("prepare count indexed rowid probe");
-    black_box(
-        stmt.query_row()
-            .await
-            .expect("warm count indexed rowid probe"),
+    let cat_count = (count / 20).max(5);
+    let expected_count = (1..=count).filter(|id| ((id % cat_count) + 1) <= 5).count();
+    let expected_count = i64::try_from(expected_count).expect("probe count fits i64");
+    let warm_row = stmt
+        .query_row()
+        .await
+        .expect("warm count indexed rowid probe");
+    assert_eq!(warm_row.get(0), Some(&SqliteValue::Integer(expected_count)));
+    black_box(warm_row);
+    let warm_cached_row = stmt
+        .query_row()
+        .await
+        .expect("warm cached count indexed rowid probe");
+    assert_eq!(
+        warm_cached_row.get(0),
+        Some(&SqliteValue::Integer(expected_count))
     );
-    black_box(
-        stmt.query_row()
-            .await
-            .expect("warm cached count indexed rowid probe"),
-    );
+    black_box(warm_cached_row);
 
     let start = Instant::now();
     let mut count_sum = 0_i64;
@@ -385,16 +422,20 @@ async fn bench_prepared_param_null_predicate_mix(iterations: u64) -> (f64, u64) 
         SqliteValue::Integer(3),
         SqliteValue::Integer(100),
     ];
-    black_box(
-        stmt.query_with_params(&non_null_params)
-            .await
-            .expect("warm non-null branch"),
-    );
-    black_box(
-        stmt.query_with_params(&null_params)
-            .await
-            .expect("warm null branch"),
-    );
+    let warm_non_null_rows = stmt
+        .query_with_params(&non_null_params)
+        .await
+        .expect("warm non-null branch");
+    assert_eq!(warm_non_null_rows.len(), 1);
+    assert_eq!(warm_non_null_rows[0].get(0), Some(&SqliteValue::Integer(5)));
+    black_box(warm_non_null_rows);
+    let warm_null_rows = stmt
+        .query_with_params(&null_params)
+        .await
+        .expect("warm null branch");
+    assert_eq!(warm_null_rows.len(), 1);
+    assert_eq!(warm_null_rows[0].get(0), Some(&SqliteValue::Integer(100)));
+    black_box(warm_null_rows);
 
     let start = Instant::now();
     let mut checksum = 0_u64;

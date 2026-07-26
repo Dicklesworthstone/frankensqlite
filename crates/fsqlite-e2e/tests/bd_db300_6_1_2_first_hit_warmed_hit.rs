@@ -387,8 +387,7 @@ fn bd_db300_6_1_2_compile_cache_consistency() {
 
         // First hits + warmed hits should roughly match cache misses + hits
         let total_hits = profile.statement_first_hit_count + profile.statement_warmed_hit_count;
-        let cache_total =
-            profile.parser.compiled_cache_hits + profile.parser.compiled_cache_misses;
+        let cache_total = profile.parser.compiled_cache_hits + profile.parser.compiled_cache_misses;
 
         eprintln!(
             "INFO bead_id={BEAD_ID} scenario=CACHE-CONSISTENCY \

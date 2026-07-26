@@ -154,10 +154,10 @@ fn check_multiple_constraints() {
                 "CREATE TABLE t (id INTEGER PRIMARY KEY, \
                age INTEGER CHECK (age >= 0), \
                score INTEGER CHECK (score BETWEEN 0 AND 100))",
-                "INSERT INTO t VALUES (1, 25, 80)", // ok
-                "INSERT INTO t VALUES (2, -1, 80)", // age fails
+                "INSERT INTO t VALUES (1, 25, 80)",  // ok
+                "INSERT INTO t VALUES (2, -1, 80)",  // age fails
                 "INSERT INTO t VALUES (3, 25, 150)", // score fails
-                "INSERT INTO t VALUES (4, 0, 0)",  // ok (boundaries)
+                "INSERT INTO t VALUES (4, 0, 0)",    // ok (boundaries)
             ],
             &["SELECT id, age, score FROM t ORDER BY id"], // 1 and 4
             "check_multiple_constraints",

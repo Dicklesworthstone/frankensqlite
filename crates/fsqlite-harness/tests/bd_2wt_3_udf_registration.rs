@@ -26,33 +26,36 @@ use fsqlite_types::value::SqliteValue;
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-fn open_mem() -> Connection {
-    Connection::open(":memory:").expect("in-memory connection")
+async fn open_mem() -> Connection {
+    Connection::open(":memory:")
+        .await
+        .expect("in-memory connection")
 }
 
-fn query_first_int(conn: &Connection, sql: &str) -> i64 {
-    match conn.query(sql).expect("query")[0].values()[0] {
+async fn query_first_int(conn: &Connection, sql: &str) -> i64 {
+    match conn.query(sql).await.expect("query")[0].values()[0] {
         SqliteValue::Integer(v) => v,
         ref other => panic!("expected integer, got {other:?}"),
     }
 }
 
-fn query_first_float(conn: &Connection, sql: &str) -> f64 {
-    match conn.query(sql).expect("query")[0].values()[0] {
+async fn query_first_float(conn: &Connection, sql: &str) -> f64 {
+    match conn.query(sql).await.expect("query")[0].values()[0] {
         SqliteValue::Float(v) => v,
         ref other => panic!("expected float, got {other:?}"),
     }
 }
 
-fn query_first_text(conn: &Connection, sql: &str) -> String {
-    match &conn.query(sql).expect("query")[0].values()[0] {
+async fn query_first_text(conn: &Connection, sql: &str) -> String {
+    match &conn.query(sql).await.expect("query")[0].values()[0] {
         SqliteValue::Text(v) => v.to_string(),
         other => panic!("expected text, got {other:?}"),
     }
 }
 
-fn query_ints(conn: &Connection, sql: &str) -> Vec<i64> {
+async fn query_ints(conn: &Connection, sql: &str) -> Vec<i64> {
     conn.query(sql)
+        .await
         .unwrap_or_default()
         .iter()
         .filter_map(|r| match r.values().first() {
@@ -298,50 +301,52 @@ impl WindowFunction for RunningSumWindow {
 
 #[test]
 fn test_scalar_udf_registration_and_invocation() {
-    let conn = open_mem();
+    asupersync::test_utils::run_test(|| async {
+        let conn = open_mem().await;
 
-    // Register double(x) UDF
-    conn.register_scalar_function(DoubleFunc);
+        // Register double(x) UDF
+        conn.register_scalar_function(DoubleFunc);
 
-    // Invoke via expression-only SELECT
-    let result = query_first_int(&conn, "SELECT double(21)");
-    assert_eq!(result, 42, "double(21) should return 42");
+        // Invoke via expression-only SELECT
+        let result = query_first_int(&conn, "SELECT double(21)").await;
+        assert_eq!(result, 42, "double(21) should return 42");
 
-    // Float argument
-    let result = query_first_float(&conn, "SELECT double(1.5)");
-    assert!(
-        (result - 3.0).abs() < 1e-10,
-        "double(1.5) should return 3.0"
-    );
+        // Float argument
+        let result = query_first_float(&conn, "SELECT double(1.5)").await;
+        assert!(
+            (result - 3.0).abs() < 1e-10,
+            "double(1.5) should return 3.0"
+        );
 
-    // NULL propagation
-    let rows = conn.query("SELECT double(NULL)").expect("query");
-    assert_eq!(
-        rows[0].values()[0],
-        SqliteValue::Null,
-        "double(NULL) should return NULL"
-    );
+        // NULL propagation
+        let rows = conn.query("SELECT double(NULL)").await.expect("query");
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Null,
+            "double(NULL) should return NULL"
+        );
 
-    // Multiple-arg UDF: add3(a, b, c)
-    conn.register_scalar_function(Add3Func);
-    let result = query_first_int(&conn, "SELECT add3(10, 20, 12)");
-    assert_eq!(result, 42, "add3(10, 20, 12) should return 42");
+        // Multiple-arg UDF: add3(a, b, c)
+        conn.register_scalar_function(Add3Func);
+        let result = query_first_int(&conn, "SELECT add3(10, 20, 12)").await;
+        assert_eq!(result, 42, "add3(10, 20, 12) should return 42");
 
-    // Text-returning UDF: greet(name)
-    conn.register_scalar_function(GreetFunc);
-    let result = query_first_text(&conn, "SELECT greet('World')");
-    assert_eq!(
-        result, "Hello, World!",
-        "greet('World') should return 'Hello, World!'"
-    );
+        // Text-returning UDF: greet(name)
+        conn.register_scalar_function(GreetFunc);
+        let result = query_first_text(&conn, "SELECT greet('World')").await;
+        assert_eq!(
+            result, "Hello, World!",
+            "greet('World') should return 'Hello, World!'"
+        );
 
-    let result = query_first_text(&conn, "SELECT greet(NULL)");
-    assert_eq!(
-        result, "Hello, stranger!",
-        "greet(NULL) should return 'Hello, stranger!'"
-    );
+        let result = query_first_text(&conn, "SELECT greet(NULL)").await;
+        assert_eq!(
+            result, "Hello, stranger!",
+            "greet(NULL) should return 'Hello, stranger!'"
+        );
 
-    println!("[PASS] scalar UDF registration and invocation");
+        println!("[PASS] scalar UDF registration and invocation");
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -350,36 +355,41 @@ fn test_scalar_udf_registration_and_invocation() {
 
 #[test]
 fn test_udf_with_table_queries() {
-    let conn = open_mem();
-    conn.register_scalar_function(DoubleFunc);
+    asupersync::test_utils::run_test(|| async {
+        let conn = open_mem().await;
+        conn.register_scalar_function(DoubleFunc);
 
-    conn.execute("CREATE TABLE nums (val INTEGER)").unwrap();
-    conn.execute("INSERT INTO nums VALUES (1)").unwrap();
-    conn.execute("INSERT INTO nums VALUES (2)").unwrap();
-    conn.execute("INSERT INTO nums VALUES (3)").unwrap();
-    conn.execute("INSERT INTO nums VALUES (4)").unwrap();
-    conn.execute("INSERT INTO nums VALUES (5)").unwrap();
+        conn.execute("CREATE TABLE nums (val INTEGER)")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO nums VALUES (1)").await.unwrap();
+        conn.execute("INSERT INTO nums VALUES (2)").await.unwrap();
+        conn.execute("INSERT INTO nums VALUES (3)").await.unwrap();
+        conn.execute("INSERT INTO nums VALUES (4)").await.unwrap();
+        conn.execute("INSERT INTO nums VALUES (5)").await.unwrap();
 
-    // UDF in SELECT clause
-    let results = query_ints(&conn, "SELECT double(val) FROM nums ORDER BY val");
-    assert_eq!(
-        results,
-        vec![2, 4, 6, 8, 10],
-        "double(val) across table rows"
-    );
+        // UDF in SELECT clause
+        let results = query_ints(&conn, "SELECT double(val) FROM nums ORDER BY val").await;
+        assert_eq!(
+            results,
+            vec![2, 4, 6, 8, 10],
+            "double(val) across table rows"
+        );
 
-    // UDF in WHERE clause
-    let results = query_ints(
-        &conn,
-        "SELECT val FROM nums WHERE double(val) > 6 ORDER BY val",
-    );
-    assert_eq!(
-        results,
-        vec![4, 5],
-        "WHERE double(val) > 6 filters correctly"
-    );
+        // UDF in WHERE clause
+        let results = query_ints(
+            &conn,
+            "SELECT val FROM nums WHERE double(val) > 6 ORDER BY val",
+        )
+        .await;
+        assert_eq!(
+            results,
+            vec![4, 5],
+            "WHERE double(val) > 6 filters correctly"
+        );
 
-    println!("[PASS] UDF with table-backed queries");
+        println!("[PASS] UDF with table-backed queries");
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -388,40 +398,60 @@ fn test_udf_with_table_queries() {
 
 #[test]
 fn test_aggregate_udf_registration_and_invocation() {
-    let conn = open_mem();
-    conn.register_aggregate_function(ProductAgg);
+    asupersync::test_utils::run_test(|| async {
+        let conn = open_mem().await;
+        conn.register_aggregate_function(ProductAgg);
 
-    conn.execute("CREATE TABLE factors (grp TEXT, val INTEGER)")
-        .unwrap();
-    conn.execute("INSERT INTO factors VALUES ('a', 2)").unwrap();
-    conn.execute("INSERT INTO factors VALUES ('a', 3)").unwrap();
-    conn.execute("INSERT INTO factors VALUES ('a', 5)").unwrap();
-    conn.execute("INSERT INTO factors VALUES ('b', 7)").unwrap();
-    conn.execute("INSERT INTO factors VALUES ('b', 11)")
-        .unwrap();
+        conn.execute("CREATE TABLE factors (grp TEXT, val INTEGER)")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO factors VALUES ('a', 2)")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO factors VALUES ('a', 3)")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO factors VALUES ('a', 5)")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO factors VALUES ('b', 7)")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO factors VALUES ('b', 11)")
+            .await
+            .unwrap();
 
-    // Aggregate over all rows
-    let result = query_first_int(&conn, "SELECT product(val) FROM factors WHERE grp = 'a'");
-    assert_eq!(result, 30, "product of (2,3,5) = 30");
+        // Aggregate over all rows
+        let result =
+            query_first_int(&conn, "SELECT product(val) FROM factors WHERE grp = 'a'").await;
+        assert_eq!(result, 30, "product of (2,3,5) = 30");
 
-    let result = query_first_int(&conn, "SELECT product(val) FROM factors WHERE grp = 'b'");
-    assert_eq!(result, 77, "product of (7,11) = 77");
+        let result =
+            query_first_int(&conn, "SELECT product(val) FROM factors WHERE grp = 'b'").await;
+        assert_eq!(result, 77, "product of (7,11) = 77");
 
-    // String concatenation aggregate
-    conn.register_aggregate_function(StringConcatAgg);
+        // String concatenation aggregate
+        conn.register_aggregate_function(StringConcatAgg);
 
-    conn.execute("CREATE TABLE words (w TEXT)").unwrap();
-    conn.execute("INSERT INTO words VALUES ('foo')").unwrap();
-    conn.execute("INSERT INTO words VALUES ('bar')").unwrap();
-    conn.execute("INSERT INTO words VALUES ('baz')").unwrap();
+        conn.execute("CREATE TABLE words (w TEXT)").await.unwrap();
+        conn.execute("INSERT INTO words VALUES ('foo')")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO words VALUES ('bar')")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO words VALUES ('baz')")
+            .await
+            .unwrap();
 
-    let result = query_first_text(&conn, "SELECT string_concat(w) FROM words");
-    // Order may vary; just check it contains all three
-    assert!(result.contains("foo"), "concat contains foo");
-    assert!(result.contains("bar"), "concat contains bar");
-    assert!(result.contains("baz"), "concat contains baz");
+        let result = query_first_text(&conn, "SELECT string_concat(w) FROM words").await;
+        // Order may vary; just check it contains all three
+        assert!(result.contains("foo"), "concat contains foo");
+        assert!(result.contains("bar"), "concat contains bar");
+        assert!(result.contains("baz"), "concat contains baz");
 
-    println!("[PASS] aggregate UDF registration and invocation");
+        println!("[PASS] aggregate UDF registration and invocation");
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -430,19 +460,21 @@ fn test_aggregate_udf_registration_and_invocation() {
 
 #[test]
 fn test_window_udf_registration() {
-    let conn = open_mem();
+    asupersync::test_utils::run_test(|| async {
+        let conn = open_mem().await;
 
-    // Register window function — verifies the API compiles and doesn't panic
-    conn.register_window_function(RunningSumWindow);
+        // Register window function — verifies the API compiles and doesn't panic
+        conn.register_window_function(RunningSumWindow);
 
-    // The window function is registered; verify it doesn't break normal queries
-    let result = query_first_int(&conn, "SELECT 1 + 1");
-    assert_eq!(
-        result, 2,
-        "connection still works after window UDF registration"
-    );
+        // The window function is registered; verify it doesn't break normal queries
+        let result = query_first_int(&conn, "SELECT 1 + 1").await;
+        assert_eq!(
+            result, 2,
+            "connection still works after window UDF registration"
+        );
 
-    println!("[PASS] window UDF registration (API surface)");
+        println!("[PASS] window UDF registration (API surface)");
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -451,19 +483,21 @@ fn test_window_udf_registration() {
 
 #[test]
 fn test_udf_overwrite() {
-    let conn = open_mem();
+    asupersync::test_utils::run_test(|| async {
+        let conn = open_mem().await;
 
-    // Register double(x) = x * 2
-    conn.register_scalar_function(DoubleFunc);
-    let result = query_first_int(&conn, "SELECT double(10)");
-    assert_eq!(result, 20, "double(10) = 20 (original)");
+        // Register double(x) = x * 2
+        conn.register_scalar_function(DoubleFunc);
+        let result = query_first_int(&conn, "SELECT double(10)").await;
+        assert_eq!(result, 20, "double(10) = 20 (original)");
 
-    // Overwrite with triple(x) = x * 3 (same function name "double")
-    conn.register_scalar_function(TripleFunc);
-    let result = query_first_int(&conn, "SELECT double(10)");
-    assert_eq!(result, 30, "double(10) = 30 (after overwrite with triple)");
+        // Overwrite with triple(x) = x * 3 (same function name "double")
+        conn.register_scalar_function(TripleFunc);
+        let result = query_first_int(&conn, "SELECT double(10)").await;
+        assert_eq!(result, 30, "double(10) = 30 (after overwrite with triple)");
 
-    println!("[PASS] UDF overwrite (name collision)");
+        println!("[PASS] UDF overwrite (name collision)");
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -472,49 +506,51 @@ fn test_udf_overwrite() {
 
 #[test]
 fn test_udf_metrics() {
-    let before = fsqlite_func::udf_registered_count();
+    asupersync::test_utils::run_test(|| async {
+        let before = fsqlite_func::udf_registered_count();
 
-    let conn = open_mem();
-    conn.register_scalar_function(DoubleFunc);
-    let delta = fsqlite_func::udf_registered_count() - before;
-    assert!(
-        delta >= 1,
-        "expected at least 1 registration after scalar UDF, got delta={delta}"
-    );
+        let conn = open_mem().await;
+        conn.register_scalar_function(DoubleFunc);
+        let delta = fsqlite_func::udf_registered_count() - before;
+        assert!(
+            delta >= 1,
+            "expected at least 1 registration after scalar UDF, got delta={delta}"
+        );
 
-    let before2 = fsqlite_func::udf_registered_count();
-    conn.register_aggregate_function(ProductAgg);
-    let delta2 = fsqlite_func::udf_registered_count() - before2;
-    assert!(
-        delta2 >= 1,
-        "expected at least 1 registration after aggregate UDF, got delta={delta2}"
-    );
+        let before2 = fsqlite_func::udf_registered_count();
+        conn.register_aggregate_function(ProductAgg);
+        let delta2 = fsqlite_func::udf_registered_count() - before2;
+        assert!(
+            delta2 >= 1,
+            "expected at least 1 registration after aggregate UDF, got delta={delta2}"
+        );
 
-    let before3 = fsqlite_func::udf_registered_count();
-    conn.register_window_function(RunningSumWindow);
-    let delta3 = fsqlite_func::udf_registered_count() - before3;
-    assert!(
-        delta3 >= 1,
-        "expected at least 1 registration after window UDF, got delta={delta3}"
-    );
+        let before3 = fsqlite_func::udf_registered_count();
+        conn.register_window_function(RunningSumWindow);
+        let delta3 = fsqlite_func::udf_registered_count() - before3;
+        assert!(
+            delta3 >= 1,
+            "expected at least 1 registration after window UDF, got delta={delta3}"
+        );
 
-    // Overwrite counts as another registration
-    let before4 = fsqlite_func::udf_registered_count();
-    conn.register_scalar_function(TripleFunc);
-    let delta4 = fsqlite_func::udf_registered_count() - before4;
-    assert!(
-        delta4 >= 1,
-        "expected at least 1 registration (overwrite counts), got delta={delta4}"
-    );
+        // Overwrite counts as another registration
+        let before4 = fsqlite_func::udf_registered_count();
+        conn.register_scalar_function(TripleFunc);
+        let delta4 = fsqlite_func::udf_registered_count() - before4;
+        assert!(
+            delta4 >= 1,
+            "expected at least 1 registration (overwrite counts), got delta={delta4}"
+        );
 
-    // Overall: 4 registrations in this test
-    let total_delta = fsqlite_func::udf_registered_count() - before;
-    assert!(
-        total_delta >= 4,
-        "expected at least 4 total registrations, got delta={total_delta}"
-    );
+        // Overall: 4 registrations in this test
+        let total_delta = fsqlite_func::udf_registered_count() - before;
+        assert!(
+            total_delta >= 4,
+            "expected at least 4 total registrations, got delta={total_delta}"
+        );
 
-    println!("[PASS] UDF metrics");
+        println!("[PASS] UDF metrics");
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -523,18 +559,20 @@ fn test_udf_metrics() {
 
 #[test]
 fn test_variadic_udf() {
-    let conn = open_mem();
-    conn.register_scalar_function(ConcatAllFunc);
+    asupersync::test_utils::run_test(|| async {
+        let conn = open_mem().await;
+        conn.register_scalar_function(ConcatAllFunc);
 
-    // 2 args
-    let result = query_first_text(&conn, "SELECT concat_all('hello', ' world')");
-    assert_eq!(result, "hello world", "concat_all with 2 text args");
+        // 2 args
+        let result = query_first_text(&conn, "SELECT concat_all('hello', ' world')").await;
+        assert_eq!(result, "hello world", "concat_all with 2 text args");
 
-    // 3 args with mixed types
-    let result = query_first_text(&conn, "SELECT concat_all('n=', 42)");
-    assert_eq!(result, "n=42", "concat_all with text + int");
+        // 3 args with mixed types
+        let result = query_first_text(&conn, "SELECT concat_all('n=', 42)").await;
+        assert_eq!(result, "n=42", "concat_all with text + int");
 
-    println!("[PASS] variadic UDF");
+        println!("[PASS] variadic UDF");
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -543,21 +581,23 @@ fn test_variadic_udf() {
 
 #[test]
 fn test_case_insensitive_udf_name() {
-    let conn = open_mem();
-    conn.register_scalar_function(DoubleFunc);
+    asupersync::test_utils::run_test(|| async {
+        let conn = open_mem().await;
+        conn.register_scalar_function(DoubleFunc);
 
-    // Function registered as "double" — should be callable as DOUBLE, Double, etc.
-    let r1 = query_first_int(&conn, "SELECT double(5)");
-    let r2 = query_first_int(&conn, "SELECT DOUBLE(5)");
-    let r3 = query_first_int(&conn, "SELECT Double(5)");
-    let r4 = query_first_int(&conn, "SELECT dOuBlE(5)");
+        // Function registered as "double" — should be callable as DOUBLE, Double, etc.
+        let r1 = query_first_int(&conn, "SELECT double(5)").await;
+        let r2 = query_first_int(&conn, "SELECT DOUBLE(5)").await;
+        let r3 = query_first_int(&conn, "SELECT Double(5)").await;
+        let r4 = query_first_int(&conn, "SELECT dOuBlE(5)").await;
 
-    assert_eq!(r1, 10);
-    assert_eq!(r2, 10);
-    assert_eq!(r3, 10);
-    assert_eq!(r4, 10);
+        assert_eq!(r1, 10);
+        assert_eq!(r2, 10);
+        assert_eq!(r3, 10);
+        assert_eq!(r4, 10);
 
-    println!("[PASS] case-insensitive UDF name resolution");
+        println!("[PASS] case-insensitive UDF name resolution");
+    });
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -566,137 +606,147 @@ fn test_case_insensitive_udf_name() {
 
 #[test]
 fn test_conformance_summary() {
-    #[derive(Debug)]
-    struct TestCase {
-        name: &'static str,
-        pass: bool,
-    }
+    asupersync::test_utils::run_test(|| async {
+        #[derive(Debug)]
+        struct TestCase {
+            name: &'static str,
+            pass: bool,
+        }
 
-    let conn = open_mem();
-    let mut cases = Vec::new();
+        let conn = open_mem().await;
+        let mut cases = Vec::new();
 
-    // 1. Scalar registration
-    conn.register_scalar_function(DoubleFunc);
-    let v = query_first_int(&conn, "SELECT double(7)");
-    cases.push(TestCase {
-        name: "scalar_register_invoke",
-        pass: v == 14,
-    });
+        // 1. Scalar registration
+        conn.register_scalar_function(DoubleFunc);
+        let v = query_first_int(&conn, "SELECT double(7)").await;
+        cases.push(TestCase {
+            name: "scalar_register_invoke",
+            pass: v == 14,
+        });
 
-    // 2. Multi-arg scalar
-    conn.register_scalar_function(Add3Func);
-    let v = query_first_int(&conn, "SELECT add3(1, 2, 3)");
-    cases.push(TestCase {
-        name: "multi_arg_scalar",
-        pass: v == 6,
-    });
+        // 2. Multi-arg scalar
+        conn.register_scalar_function(Add3Func);
+        let v = query_first_int(&conn, "SELECT add3(1, 2, 3)").await;
+        cases.push(TestCase {
+            name: "multi_arg_scalar",
+            pass: v == 6,
+        });
 
-    // 3. Text-returning scalar
-    conn.register_scalar_function(GreetFunc);
-    let v = query_first_text(&conn, "SELECT greet('UDF')");
-    cases.push(TestCase {
-        name: "text_returning_scalar",
-        pass: v == "Hello, UDF!",
-    });
+        // 3. Text-returning scalar
+        conn.register_scalar_function(GreetFunc);
+        let v = query_first_text(&conn, "SELECT greet('UDF')").await;
+        cases.push(TestCase {
+            name: "text_returning_scalar",
+            pass: v == "Hello, UDF!",
+        });
 
-    // 4. NULL propagation
-    let rows = conn.query("SELECT double(NULL)").expect("query");
-    cases.push(TestCase {
-        name: "null_propagation",
-        pass: rows[0].values()[0] == SqliteValue::Null,
-    });
+        // 4. NULL propagation
+        let rows = conn.query("SELECT double(NULL)").await.expect("query");
+        cases.push(TestCase {
+            name: "null_propagation",
+            pass: rows[0].values()[0] == SqliteValue::Null,
+        });
 
-    // 5. Aggregate registration
-    conn.register_aggregate_function(ProductAgg);
-    conn.execute("CREATE TABLE agg_test (v INTEGER)").unwrap();
-    conn.execute("INSERT INTO agg_test VALUES (2)").unwrap();
-    conn.execute("INSERT INTO agg_test VALUES (3)").unwrap();
-    conn.execute("INSERT INTO agg_test VALUES (7)").unwrap();
-    let v = query_first_int(&conn, "SELECT product(v) FROM agg_test");
-    cases.push(TestCase {
-        name: "aggregate_register_invoke",
-        pass: v == 42,
-    });
+        // 5. Aggregate registration
+        conn.register_aggregate_function(ProductAgg);
+        conn.execute("CREATE TABLE agg_test (v INTEGER)")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO agg_test VALUES (2)")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO agg_test VALUES (3)")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO agg_test VALUES (7)")
+            .await
+            .unwrap();
+        let v = query_first_int(&conn, "SELECT product(v) FROM agg_test").await;
+        cases.push(TestCase {
+            name: "aggregate_register_invoke",
+            pass: v == 42,
+        });
 
-    // 6. Window registration (API)
-    conn.register_window_function(RunningSumWindow);
-    let v = query_first_int(&conn, "SELECT 1");
-    cases.push(TestCase {
-        name: "window_register_api",
-        pass: v == 1,
-    });
+        // 6. Window registration (API)
+        conn.register_window_function(RunningSumWindow);
+        let v = query_first_int(&conn, "SELECT 1").await;
+        cases.push(TestCase {
+            name: "window_register_api",
+            pass: v == 1,
+        });
 
-    // 7. UDF overwrite
-    conn.register_scalar_function(TripleFunc); // overwrites "double"
-    let v = query_first_int(&conn, "SELECT double(10)");
-    cases.push(TestCase {
-        name: "udf_overwrite",
-        pass: v == 30,
-    });
+        // 7. UDF overwrite
+        conn.register_scalar_function(TripleFunc); // overwrites "double"
+        let v = query_first_int(&conn, "SELECT double(10)").await;
+        cases.push(TestCase {
+            name: "udf_overwrite",
+            pass: v == 30,
+        });
 
-    // 8. Case-insensitive name
-    let v = query_first_int(&conn, "SELECT DOUBLE(10)");
-    cases.push(TestCase {
-        name: "case_insensitive",
-        pass: v == 30,
-    });
+        // 8. Case-insensitive name
+        let v = query_first_int(&conn, "SELECT DOUBLE(10)").await;
+        cases.push(TestCase {
+            name: "case_insensitive",
+            pass: v == 30,
+        });
 
-    // 9. UDF in table query
-    conn.register_scalar_function(DoubleFunc); // re-register original
-    conn.execute("CREATE TABLE tbl (x INTEGER)").unwrap();
-    conn.execute("INSERT INTO tbl VALUES (5)").unwrap();
-    let v = query_first_int(&conn, "SELECT double(x) FROM tbl");
-    cases.push(TestCase {
-        name: "udf_in_table_query",
-        pass: v == 10,
-    });
+        // 9. UDF in table query
+        conn.register_scalar_function(DoubleFunc); // re-register original
+        conn.execute("CREATE TABLE tbl (x INTEGER)").await.unwrap();
+        conn.execute("INSERT INTO tbl VALUES (5)").await.unwrap();
+        let v = query_first_int(&conn, "SELECT double(x) FROM tbl").await;
+        cases.push(TestCase {
+            name: "udf_in_table_query",
+            pass: v == 10,
+        });
 
-    // 10. UDF in WHERE
-    conn.execute("INSERT INTO tbl VALUES (10)").unwrap();
-    let vals = query_ints(&conn, "SELECT x FROM tbl WHERE double(x) >= 20 ORDER BY x");
-    cases.push(TestCase {
-        name: "udf_in_where",
-        pass: vals == vec![10],
-    });
+        // 10. UDF in WHERE
+        conn.execute("INSERT INTO tbl VALUES (10)").await.unwrap();
+        let vals = query_ints(&conn, "SELECT x FROM tbl WHERE double(x) >= 20 ORDER BY x").await;
+        cases.push(TestCase {
+            name: "udf_in_where",
+            pass: vals == vec![10],
+        });
 
-    // Summary
-    let total = cases.len();
-    let passed = cases.iter().filter(|c| c.pass).count();
-    let failed = total - passed;
+        // Summary
+        let total = cases.len();
+        let passed = cases.iter().filter(|c| c.pass).count();
+        let failed = total - passed;
 
-    println!("\n=== bd-2wt.3: UDF Registration Conformance Summary ===");
-    println!("{{");
-    println!("  \"bead\": \"bd-2wt.3\",");
-    println!("  \"suite\": \"udf_registration\",");
-    println!("  \"total\": {total},");
-    println!("  \"passed\": {passed},");
-    println!("  \"failed\": {failed},");
-    println!(
-        "  \"pass_rate\": \"{:.1}%\",",
-        passed as f64 / total as f64 * 100.0
-    );
-    println!("  \"cases\": [");
-    for (i, c) in cases.iter().enumerate() {
-        let comma = if i + 1 < total { "," } else { "" };
-        let status = if c.pass { "PASS" } else { "FAIL" };
+        println!("\n=== bd-2wt.3: UDF Registration Conformance Summary ===");
+        println!("{{");
+        println!("  \"bead\": \"bd-2wt.3\",");
+        println!("  \"suite\": \"udf_registration\",");
+        println!("  \"total\": {total},");
+        println!("  \"passed\": {passed},");
+        println!("  \"failed\": {failed},");
         println!(
-            "    {{ \"name\": \"{}\", \"status\": \"{status}\" }}{comma}",
-            c.name
+            "  \"pass_rate\": \"{:.1}%\",",
+            passed as f64 / total as f64 * 100.0
         );
-    }
-    println!("  ]");
-    println!("}}");
+        println!("  \"cases\": [");
+        for (i, c) in cases.iter().enumerate() {
+            let comma = if i + 1 < total { "," } else { "" };
+            let status = if c.pass { "PASS" } else { "FAIL" };
+            println!(
+                "    {{ \"name\": \"{}\", \"status\": \"{status}\" }}{comma}",
+                c.name
+            );
+        }
+        println!("  ]");
+        println!("}}");
 
-    assert_eq!(
-        failed,
-        0,
-        "{failed}/{total} UDF conformance tests failed: {:?}",
-        cases
-            .iter()
-            .filter(|c| !c.pass)
-            .map(|c| c.name)
-            .collect::<Vec<_>>()
-    );
+        assert_eq!(
+            failed,
+            0,
+            "{failed}/{total} UDF conformance tests failed: {:?}",
+            cases
+                .iter()
+                .filter(|c| !c.pass)
+                .map(|c| c.name)
+                .collect::<Vec<_>>()
+        );
 
-    println!("[PASS] all {total} UDF conformance tests passed");
+        println!("[PASS] all {total} UDF conformance tests passed");
+    });
 }

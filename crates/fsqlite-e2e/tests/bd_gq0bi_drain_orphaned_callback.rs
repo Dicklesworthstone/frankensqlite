@@ -84,8 +84,8 @@ fn d1_concurrent_txns_no_deadlock_during_gc() {
                                     ))
                                     .await
                                     .ok();
-                                    let should_rollback = local_ops % 3 == 0
-                                        || conn.execute("COMMIT").await.is_err();
+                                    let should_rollback =
+                                        local_ops % 3 == 0 || conn.execute("COMMIT").await.is_err();
                                     if should_rollback {
                                         conn.execute("ROLLBACK").await.ok();
                                     }
@@ -335,7 +335,11 @@ fn d4_drain_under_sustained_write_pressure() {
         assert!(churn_cycles > 0, "no churn cycles completed");
 
         let verify = Connection::open(path_str).await.expect("verify");
-        let rows = verify.query("SELECT * FROM log").await.expect("count").len();
+        let rows = verify
+            .query("SELECT * FROM log")
+            .await
+            .expect("count")
+            .len();
         assert_eq!(
             rows, committed as usize,
             "row count mismatch: {rows} visible vs {committed} committed"

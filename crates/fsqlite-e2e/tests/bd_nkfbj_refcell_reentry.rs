@@ -355,9 +355,11 @@ fn t8_mam_rust_118_send_message_scenario() {
         // The send_message operation: INSERT into messages fires both triggers.
         // Trigger 1: UPDATE conversations (same MemDatabase borrow path)
         // Trigger 2: INSERT read_receipts (another MemDatabase borrow path)
-        conn.execute("INSERT INTO messages VALUES (1, 1, 'alice', 'Hello!', '2026-01-15T10:00:00')")
-            .await
-            .expect("send_message must not panic (mam_rust #118)");
+        conn.execute(
+            "INSERT INTO messages VALUES (1, 1, 'alice', 'Hello!', '2026-01-15T10:00:00')",
+        )
+        .await
+        .expect("send_message must not panic (mam_rust #118)");
 
         // Verify all side effects
         let conv = conn
@@ -373,9 +375,11 @@ fn t8_mam_rust_118_send_message_scenario() {
         assert_eq!(receipts.len(), 1, "self-read receipt must exist");
 
         // Send a second message to verify repeated trigger firing
-        conn.execute("INSERT INTO messages VALUES (2, 1, 'bob', 'Hi Alice!', '2026-01-15T10:01:00')")
-            .await
-            .expect("second send_message must not panic");
+        conn.execute(
+            "INSERT INTO messages VALUES (2, 1, 'bob', 'Hi Alice!', '2026-01-15T10:01:00')",
+        )
+        .await
+        .expect("second send_message must not panic");
 
         let conv2 = conn
             .query("SELECT msg_count FROM conversations WHERE id = 1")
@@ -849,7 +853,9 @@ fn t17_full_doctor_repair_then_send_message() {
         conn.execute("DROP TABLE read_receipts")
             .await
             .expect("drop rr");
-        conn.execute("DROP TABLE messages").await.expect("drop msgs");
+        conn.execute("DROP TABLE messages")
+            .await
+            .expect("drop msgs");
         conn.execute("DROP TABLE conversations")
             .await
             .expect("drop convs");

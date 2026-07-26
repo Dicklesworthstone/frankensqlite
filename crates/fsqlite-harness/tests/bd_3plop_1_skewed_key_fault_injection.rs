@@ -203,66 +203,77 @@ fn hot_hit_expectation(distribution: KeyDistribution) -> (f64, f64, &'static str
     }
 }
 
-fn execute_insert(conn: &Connection, key: u64) -> Result<(), String> {
+async fn execute_insert(conn: &Connection, key: u64) -> Result<(), String> {
     let sql = format!("INSERT OR IGNORE INTO kv (id, v) VALUES ({key}, 1)");
     conn.execute(&sql)
+        .await
         .map_err(|error| format!("insert_failed key={key} error={error}"))?;
     let sql = format!("UPDATE kv SET v = v + 1 WHERE id = {key}");
     conn.execute(&sql)
+        .await
         .map_err(|error| format!("post_insert_update_failed key={key} error={error}"))?;
     Ok(())
 }
 
-fn execute_update(conn: &Connection, key: u64) -> Result<(), String> {
+async fn execute_update(conn: &Connection, key: u64) -> Result<(), String> {
     let sql = format!("UPDATE kv SET v = v + 1 WHERE id = {key}");
     let changed = conn
         .execute(&sql)
+        .await
         .map_err(|error| format!("update_failed key={key} error={error}"))?;
     if changed == 0 {
-        execute_insert(conn, key)?;
+        execute_insert(conn, key).await?;
     }
     Ok(())
 }
 
-fn configure_connection(conn: &Connection) -> Result<(), String> {
+async fn configure_connection(conn: &Connection) -> Result<(), String> {
     conn.execute("PRAGMA journal_mode = WAL")
+        .await
         .map_err(|error| format!("pragma_wal_failed error={error}"))?;
     conn.execute("PRAGMA synchronous = NORMAL")
+        .await
         .map_err(|error| format!("pragma_sync_failed error={error}"))?;
     conn.execute("PRAGMA busy_timeout = 25")
+        .await
         .map_err(|error| format!("pragma_busy_timeout_failed error={error}"))?;
     Ok(())
 }
 
-fn setup_database(path: &str) -> Result<(), String> {
-    let conn =
-        Connection::open(path).map_err(|error| format!("open_failed path={path} {error}"))?;
-    configure_connection(&conn)?;
+async fn setup_database(path: &str) -> Result<(), String> {
+    let conn = Connection::open(path)
+        .await
+        .map_err(|error| format!("open_failed path={path} {error}"))?;
+    configure_connection(&conn).await?;
     conn.execute("CREATE TABLE IF NOT EXISTS kv (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+        .await
         .map_err(|error| format!("create_table_failed error={error}"))?;
     Ok(())
 }
 
-fn prepopulate_for_update(
+async fn prepopulate_for_update(
     path: &str,
     distribution: KeyDistribution,
     target_rows: u64,
 ) -> Result<(), String> {
-    let conn =
-        Connection::open(path).map_err(|error| format!("open_failed path={path} {error}"))?;
-    configure_connection(&conn)?;
+    let conn = Connection::open(path)
+        .await
+        .map_err(|error| format!("open_failed path={path} {error}"))?;
+    configure_connection(&conn).await?;
     let row_limit = target_rows.max(1).min(key_space(distribution));
     for key in 1..=row_limit {
         let sql = format!("INSERT OR IGNORE INTO kv (id, v) VALUES ({key}, 0)");
         conn.execute(&sql)
+            .await
             .map_err(|error| format!("prepopulate_failed key={key} error={error}"))?;
     }
     Ok(())
 }
 
-fn row_count(conn: &Connection) -> Result<u64, String> {
+async fn row_count(conn: &Connection) -> Result<u64, String> {
     let rows = conn
         .query("SELECT count(*) FROM kv")
+        .await
         .map_err(|error| format!("count_query_failed error={error}"))?;
     let Some(row) = rows.first() else {
         return Err("count_query_empty_result".to_owned());
@@ -276,9 +287,10 @@ fn row_count(conn: &Connection) -> Result<u64, String> {
     }
 }
 
-fn integrity_ok(conn: &Connection) -> Result<bool, String> {
+async fn integrity_ok(conn: &Connection) -> Result<bool, String> {
     let rows = conn
         .query("PRAGMA integrity_check")
+        .await
         .map_err(|error| format!("integrity_check_failed error={error}"))?;
     let Some(row) = rows.first() else {
         return Err("integrity_check_empty".to_owned());
@@ -290,9 +302,10 @@ fn integrity_ok(conn: &Connection) -> Result<bool, String> {
     }
 }
 
-fn btree_order_check(conn: &Connection) -> Result<bool, String> {
+async fn btree_order_check(conn: &Connection) -> Result<bool, String> {
     let rows = conn
         .query("SELECT id FROM kv ORDER BY id ASC")
+        .await
         .map_err(|error| format!("order_query_failed error={error}"))?;
     let mut previous = None::<i64>;
     for row in &rows {
@@ -310,7 +323,7 @@ fn btree_order_check(conn: &Connection) -> Result<bool, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_thread_workload(
+async fn run_thread_workload(
     path: String,
     distribution: KeyDistribution,
     workload: WorkloadKind,
@@ -320,11 +333,11 @@ fn run_thread_workload(
 ) -> ThreadStats {
     let mut stats = ThreadStats::default();
     let mut rng_state = seed ^ (u64::try_from(thread_idx).expect("thread index fits u64") << 32);
-    let Ok(conn) = Connection::open(&path) else {
+    let Ok(conn) = Connection::open(&path).await else {
         stats.aborted_ops = ops;
         return stats;
     };
-    let _ = configure_connection(&conn);
+    drop(configure_connection(&conn).await);
 
     for step in 0..ops {
         let seq = thread_idx
@@ -333,13 +346,13 @@ fn run_thread_workload(
             .unwrap_or(step);
         let key = sample_key(distribution, &mut rng_state, seq);
         let op_result = match workload {
-            WorkloadKind::Insert => execute_insert(&conn, key),
-            WorkloadKind::Update => execute_update(&conn, key),
+            WorkloadKind::Insert => execute_insert(&conn, key).await,
+            WorkloadKind::Update => execute_update(&conn, key).await,
             WorkloadKind::Mixed | WorkloadKind::Concurrent => {
                 if (lcg_next(&mut rng_state) & 1) == 0 {
-                    execute_insert(&conn, key)
+                    execute_insert(&conn, key).await
                 } else {
-                    execute_update(&conn, key)
+                    execute_update(&conn, key).await
                 }
             }
         };
@@ -385,14 +398,22 @@ fn run_concurrent_db_workload(
     for thread_idx in 0..CONCURRENT_THREADS {
         let thread_path = path.clone();
         handles.push(thread::spawn(move || {
-            run_thread_workload(
-                thread_path,
-                distribution,
-                WorkloadKind::Concurrent,
-                seed,
-                ops_per_thread,
-                thread_idx,
-            )
+            // `Connection` is `!Send`, so each worker thread owns its own runtime.
+            let mut thread_stats: Option<ThreadStats> = None;
+            asupersync::test_utils::run_test(|| async {
+                thread_stats = Some(
+                    run_thread_workload(
+                        thread_path,
+                        distribution,
+                        WorkloadKind::Concurrent,
+                        seed,
+                        ops_per_thread,
+                        thread_idx,
+                    )
+                    .await,
+                );
+            });
+            thread_stats.expect("thread workload must produce stats")
         }));
     }
 
@@ -465,7 +486,7 @@ fn build_distribution_analysis(cases: &[CaseArtifact]) -> Result<Vec<Distributio
     Ok(summaries)
 }
 
-fn run_case(
+async fn run_case(
     distribution: KeyDistribution,
     workload: WorkloadKind,
     suite_seed: u64,
@@ -478,12 +499,12 @@ fn run_case(
         .to_str()
         .ok_or_else(|| "db_path_utf8_failed".to_owned())?
         .to_owned();
-    setup_database(&db_str)?;
+    setup_database(&db_str).await?;
 
     if matches!(workload, WorkloadKind::Update) {
         let prepopulate_rows =
             u64::try_from(ops.saturating_mul(2).max(256)).expect("prepopulate row count fits u64");
-        prepopulate_for_update(&db_str, distribution, prepopulate_rows)?;
+        prepopulate_for_update(&db_str, distribution, prepopulate_rows).await?;
     }
 
     let started = Instant::now();
@@ -506,15 +527,18 @@ fn run_case(
                 suite_seed ^ case_seed,
                 ops,
                 0,
-            ),
+            )
+            .await,
             ops,
         )
     };
 
-    let conn = Connection::open(&db_str).map_err(|error| format!("open_final_failed {error}"))?;
-    let row_count = row_count(&conn)?;
-    let integrity_ok = integrity_ok(&conn)?;
-    let btree_order_check_ok = btree_order_check(&conn)?;
+    let conn = Connection::open(&db_str)
+        .await
+        .map_err(|error| format!("open_final_failed {error}"))?;
+    let row_count = row_count(&conn).await?;
+    let integrity_ok = integrity_ok(&conn).await?;
+    let btree_order_check_ok = btree_order_check(&conn).await?;
 
     let hot_total = aggregate.hot_hits + aggregate.cold_hits;
     #[allow(clippy::cast_precision_loss)]
@@ -597,113 +621,116 @@ fn skewed_key_sampling_is_deterministic() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn test_e2e_bd_3plop_1_skewed_key_fault_injection() {
-    let suite_seed = 0x5EED_3A10_u64;
-    let ops = ops_per_case();
-    let mut artifacts = Vec::new();
+    asupersync::test_utils::run_test(|| async {
+        let suite_seed = 0x5EED_3A10_u64;
+        let ops = ops_per_case();
+        let mut artifacts = Vec::new();
 
-    for (dist_idx, distribution) in KeyDistribution::ALL.into_iter().enumerate() {
-        for (workload_idx, workload) in WorkloadKind::ALL.into_iter().enumerate() {
-            let case_seed = suite_seed
-                + (u64::try_from(dist_idx).expect("dist index fits u64") * 1_000)
-                + (u64::try_from(workload_idx).expect("workload index fits u64") * 10);
+        for (dist_idx, distribution) in KeyDistribution::ALL.into_iter().enumerate() {
+            for (workload_idx, workload) in WorkloadKind::ALL.into_iter().enumerate() {
+                let case_seed = suite_seed
+                    + (u64::try_from(dist_idx).expect("dist index fits u64") * 1_000)
+                    + (u64::try_from(workload_idx).expect("workload index fits u64") * 10);
 
-            let artifact = run_case(distribution, workload, suite_seed, case_seed, ops)
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "bead_id={BEAD_ID} distribution={} workload={} case_seed={} failed: {error}",
-                        distribution.as_str(),
-                        workload.as_str(),
-                        case_seed
-                    )
-                });
+                let artifact = run_case(distribution, workload, suite_seed, case_seed, ops)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "bead_id={BEAD_ID} distribution={} workload={} case_seed={} failed: {error}",
+                            distribution.as_str(),
+                            workload.as_str(),
+                            case_seed
+                        )
+                    });
 
-            assert!(
-                artifact.integrity_ok,
-                "bead_id={BEAD_ID} integrity_check failed distribution={} workload={}",
-                artifact.distribution, artifact.workload
-            );
-            assert!(
-                artifact.btree_order_check_ok,
-                "bead_id={BEAD_ID} btree order check failed distribution={} workload={}",
-                artifact.distribution, artifact.workload
-            );
+                assert!(
+                    artifact.integrity_ok,
+                    "bead_id={BEAD_ID} integrity_check failed distribution={} workload={}",
+                    artifact.distribution, artifact.workload
+                );
+                assert!(
+                    artifact.btree_order_check_ok,
+                    "bead_id={BEAD_ID} btree order check failed distribution={} workload={}",
+                    artifact.distribution, artifact.workload
+                );
 
-            eprintln!(
-                "INFO bead_id={BEAD_ID} case=skewed_fault_run distribution={} workload={} seed={} requested_ops={} committed_ops={} aborted_ops={} row_count={} hot_hit_rate={:.4} max_chain_proxy={} elapsed_ms={}",
-                artifact.distribution,
-                artifact.workload,
-                artifact.seed,
-                artifact.requested_ops,
-                artifact.committed_ops,
-                artifact.aborted_ops,
-                artifact.row_count,
-                artifact.hot_hit_rate,
-                artifact.max_version_chain_len_proxy,
-                artifact.elapsed_ms,
-            );
+                eprintln!(
+                    "INFO bead_id={BEAD_ID} case=skewed_fault_run distribution={} workload={} seed={} requested_ops={} committed_ops={} aborted_ops={} row_count={} hot_hit_rate={:.4} max_chain_proxy={} elapsed_ms={}",
+                    artifact.distribution,
+                    artifact.workload,
+                    artifact.seed,
+                    artifact.requested_ops,
+                    artifact.committed_ops,
+                    artifact.aborted_ops,
+                    artifact.row_count,
+                    artifact.hot_hit_rate,
+                    artifact.max_version_chain_len_proxy,
+                    artifact.elapsed_ms,
+                );
 
-            artifacts.push(artifact);
+                artifacts.push(artifact);
+            }
         }
-    }
 
-    let distribution_analysis =
-        build_distribution_analysis(&artifacts).expect("distribution analysis must be computed");
-    for summary in &distribution_analysis {
-        assert_eq!(
-            summary.workloads_covered,
-            WorkloadKind::ALL.len(),
-            "bead_id={BEAD_ID} distribution={} must include all workloads",
-            summary.distribution
-        );
-        assert!(
-            summary.all_integrity_ok,
-            "bead_id={BEAD_ID} distribution={} must preserve integrity_check",
-            summary.distribution
-        );
-        assert!(
-            summary.all_btree_order_ok,
-            "bead_id={BEAD_ID} distribution={} must preserve btree ordering",
-            summary.distribution
-        );
-        assert!(
-            summary.expectation_met,
-            "bead_id={BEAD_ID} distribution={} avg_hot_hit_rate={} violated expectation={}",
-            summary.distribution, summary.avg_hot_hit_rate, summary.expectation
-        );
+        let distribution_analysis = build_distribution_analysis(&artifacts)
+            .expect("distribution analysis must be computed");
+        for summary in &distribution_analysis {
+            assert_eq!(
+                summary.workloads_covered,
+                WorkloadKind::ALL.len(),
+                "bead_id={BEAD_ID} distribution={} must include all workloads",
+                summary.distribution
+            );
+            assert!(
+                summary.all_integrity_ok,
+                "bead_id={BEAD_ID} distribution={} must preserve integrity_check",
+                summary.distribution
+            );
+            assert!(
+                summary.all_btree_order_ok,
+                "bead_id={BEAD_ID} distribution={} must preserve btree ordering",
+                summary.distribution
+            );
+            assert!(
+                summary.expectation_met,
+                "bead_id={BEAD_ID} distribution={} avg_hot_hit_rate={} violated expectation={}",
+                summary.distribution, summary.avg_hot_hit_rate, summary.expectation
+            );
+            eprintln!(
+                "INFO bead_id={BEAD_ID} case=distribution_analysis distribution={} workloads={} total_committed_ops={} max_chain_proxy={} avg_hot_hit_rate={:.4} expectation_met={}",
+                summary.distribution,
+                summary.workloads_covered,
+                summary.total_committed_ops,
+                summary.max_chain_proxy,
+                summary.avg_hot_hit_rate,
+                summary.expectation_met,
+            );
+        }
+
+        let acceptance_checks = vec![
+            "all 5 distributions executed across 4 workload types".to_owned(),
+            "real concurrent workload executed with 32 writer threads".to_owned(),
+            "integrity_check + btree ordering validated for every case".to_owned(),
+            "distribution-specific hot-hit expectations validated".to_owned(),
+            "version-chain pressure proxy captured per case/distribution".to_owned(),
+        ];
+
+        let run_id = format!("{BEAD_ID}-{}-ops{ops}", suite_seed);
+        let suite = SuiteArtifact {
+            schema_version: 1,
+            bead_id: BEAD_ID.to_owned(),
+            run_id: run_id.clone(),
+            ops_per_case: ops,
+            cases: artifacts,
+            distribution_analysis,
+            acceptance_checks,
+        };
+        let output_path = write_suite_artifact(&suite).expect("suite artifact should be written");
         eprintln!(
-            "INFO bead_id={BEAD_ID} case=distribution_analysis distribution={} workloads={} total_committed_ops={} max_chain_proxy={} avg_hot_hit_rate={:.4} expectation_met={}",
-            summary.distribution,
-            summary.workloads_covered,
-            summary.total_committed_ops,
-            summary.max_chain_proxy,
-            summary.avg_hot_hit_rate,
-            summary.expectation_met,
+            "INFO bead_id={BEAD_ID} case=suite_artifact path={} run_id={} cases={}",
+            output_path.display(),
+            run_id,
+            suite.cases.len()
         );
-    }
-
-    let acceptance_checks = vec![
-        "all 5 distributions executed across 4 workload types".to_owned(),
-        "real concurrent workload executed with 32 writer threads".to_owned(),
-        "integrity_check + btree ordering validated for every case".to_owned(),
-        "distribution-specific hot-hit expectations validated".to_owned(),
-        "version-chain pressure proxy captured per case/distribution".to_owned(),
-    ];
-
-    let run_id = format!("{BEAD_ID}-{}-ops{ops}", suite_seed);
-    let suite = SuiteArtifact {
-        schema_version: 1,
-        bead_id: BEAD_ID.to_owned(),
-        run_id: run_id.clone(),
-        ops_per_case: ops,
-        cases: artifacts,
-        distribution_analysis,
-        acceptance_checks,
-    };
-    let output_path = write_suite_artifact(&suite).expect("suite artifact should be written");
-    eprintln!(
-        "INFO bead_id={BEAD_ID} case=suite_artifact path={} run_id={} cases={}",
-        output_path.display(),
-        run_id,
-        suite.cases.len()
-    );
+    });
 }

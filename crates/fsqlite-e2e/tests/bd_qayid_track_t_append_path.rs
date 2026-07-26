@@ -228,202 +228,222 @@ fn bd_qayid_track_t_oracle_10k_sequential_append_matches_sqlite() {
 #[test]
 fn bd_qayid_track_t_oracle_begin_concurrent_seq_vs_interleaved_metrics() {
     let _guard = TRACK_T_E2E_LOCK.lock().unwrap();
-    let rows: Vec<i64> = (1..=1_024).collect();
-    let interleaved_rows = interleaved_rowids(1_024);
 
-    let temp = tempdir().expect("tempdir");
-    let seq_fsqlite_db = temp.path().join("track_t_seq_fsqlite.db");
-    let seq_sqlite_db = temp.path().join("track_t_seq_sqlite.db");
-    let gap_fsqlite_db = temp.path().join("track_t_gap_fsqlite.db");
-    let gap_sqlite_db = temp.path().join("track_t_gap_sqlite.db");
+    asupersync::test_utils::run_test(|| async {
+        let rows: Vec<i64> = (1..=1_024).collect();
+        let interleaved_rows = interleaved_rowids(1_024);
 
-    let seq_fconn = open_fsqlite(&seq_fsqlite_db);
-    let seq_sconn = open_sqlite(&seq_sqlite_db);
-    let gap_fconn = open_fsqlite(&gap_fsqlite_db);
-    let gap_sconn = open_sqlite(&gap_sqlite_db);
+        let temp = tempdir().expect("tempdir");
+        let seq_fsqlite_db = temp.path().join("track_t_seq_fsqlite.db");
+        let seq_sqlite_db = temp.path().join("track_t_seq_sqlite.db");
+        let gap_fsqlite_db = temp.path().join("track_t_gap_fsqlite.db");
+        let gap_sqlite_db = temp.path().join("track_t_gap_sqlite.db");
 
-    for conn in [&seq_fconn, &gap_fconn] {
-        conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")
-            .expect("enable fsqlite concurrent mode");
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
-            .expect("create fsqlite table");
-    }
-    for conn in [&seq_sconn, &gap_sconn] {
-        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
-            .expect("create sqlite table");
-    }
+        let seq_fconn = open_fsqlite(&seq_fsqlite_db).await;
+        let seq_sconn = open_sqlite(&seq_sqlite_db);
+        let gap_fconn = open_fsqlite(&gap_fsqlite_db).await;
+        let gap_sconn = open_sqlite(&gap_sqlite_db);
 
-    let seq_sql = explicit_row_insert_sql("t", &rows);
-    let gap_sql = explicit_row_insert_sql("t", &interleaved_rows);
+        for conn in [&seq_fconn, &gap_fconn] {
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")
+                .await
+                .expect("enable fsqlite concurrent mode");
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+                .await
+                .expect("create fsqlite table");
+        }
+        for conn in [&seq_sconn, &gap_sconn] {
+            conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+                .expect("create sqlite table");
+        }
 
-    let (_result, seq_metrics) = capture_vdbe_metrics(|| {
-        seq_fconn
-            .execute("BEGIN CONCURRENT;")
-            .expect("fsqlite sequential begin concurrent");
-        seq_fconn
-            .execute(&seq_sql)
-            .expect("fsqlite sequential bulk insert");
-        seq_fconn
-            .execute("COMMIT;")
-            .expect("fsqlite sequential commit");
+        let seq_sql = explicit_row_insert_sql("t", &rows);
+        let gap_sql = explicit_row_insert_sql("t", &interleaved_rows);
+
+        let (_result, seq_metrics) = capture_vdbe_metrics(|| async {
+            seq_fconn
+                .execute("BEGIN CONCURRENT;")
+                .await
+                .expect("fsqlite sequential begin concurrent");
+            seq_fconn
+                .execute(&seq_sql)
+                .await
+                .expect("fsqlite sequential bulk insert");
+            seq_fconn
+                .execute("COMMIT;")
+                .await
+                .expect("fsqlite sequential commit");
+        })
+        .await;
+        seq_sconn
+            .execute_batch("BEGIN;")
+            .expect("sqlite sequential begin");
+        seq_sconn
+            .execute_batch(&(seq_sql.clone() + ";"))
+            .expect("sqlite sequential bulk insert");
+        seq_sconn
+            .execute_batch("COMMIT;")
+            .expect("sqlite sequential commit");
+
+        let (_result, gap_metrics) = capture_vdbe_metrics(|| async {
+            gap_fconn
+                .execute("BEGIN CONCURRENT;")
+                .await
+                .expect("fsqlite interleaved begin concurrent");
+            gap_fconn
+                .execute(&gap_sql)
+                .await
+                .expect("fsqlite interleaved bulk insert");
+            gap_fconn
+                .execute("COMMIT;")
+                .await
+                .expect("fsqlite interleaved commit");
+        })
+        .await;
+        gap_sconn
+            .execute_batch("BEGIN;")
+            .expect("sqlite interleaved begin");
+        gap_sconn
+            .execute_batch(&(gap_sql.clone() + ";"))
+            .expect("sqlite interleaved bulk insert");
+        gap_sconn
+            .execute_batch("COMMIT;")
+            .expect("sqlite interleaved commit");
+
+        let seq_fsqlite_rows = fetch_fsqlite_rows(&seq_fconn, "t").await;
+        let seq_sqlite_rows = fetch_sqlite_rows(&seq_sconn, "t");
+        let gap_fsqlite_rows = fetch_fsqlite_rows(&gap_fconn, "t").await;
+        let gap_sqlite_rows = fetch_sqlite_rows(&gap_sconn, "t");
+        assert_eq!(
+            seq_fsqlite_rows, seq_sqlite_rows,
+            "sequential BEGIN CONCURRENT rowset mismatch"
+        );
+        assert_eq!(
+            gap_fsqlite_rows, gap_sqlite_rows,
+            "interleaved BEGIN CONCURRENT rowset mismatch"
+        );
+
+        assert!(
+            seq_metrics.insert_append_count > gap_metrics.insert_append_count,
+            "sequential workload should stay on the append lane more often than the interleaved workload: seq={seq_metrics:?} gap={gap_metrics:?}"
+        );
+        assert!(
+            gap_metrics.insert_seek_count > seq_metrics.insert_seek_count,
+            "interleaved workload should force more existence seeks than the sequential workload: seq={seq_metrics:?} gap={gap_metrics:?}"
+        );
     });
-    seq_sconn
-        .execute_batch("BEGIN;")
-        .expect("sqlite sequential begin");
-    seq_sconn
-        .execute_batch(&(seq_sql.clone() + ";"))
-        .expect("sqlite sequential bulk insert");
-    seq_sconn
-        .execute_batch("COMMIT;")
-        .expect("sqlite sequential commit");
-
-    let (_result, gap_metrics) = capture_vdbe_metrics(|| {
-        gap_fconn
-            .execute("BEGIN CONCURRENT;")
-            .expect("fsqlite interleaved begin concurrent");
-        gap_fconn
-            .execute(&gap_sql)
-            .expect("fsqlite interleaved bulk insert");
-        gap_fconn
-            .execute("COMMIT;")
-            .expect("fsqlite interleaved commit");
-    });
-    gap_sconn
-        .execute_batch("BEGIN;")
-        .expect("sqlite interleaved begin");
-    gap_sconn
-        .execute_batch(&(gap_sql.clone() + ";"))
-        .expect("sqlite interleaved bulk insert");
-    gap_sconn
-        .execute_batch("COMMIT;")
-        .expect("sqlite interleaved commit");
-
-    let seq_fsqlite_rows = fetch_fsqlite_rows(&seq_fconn, "t");
-    let seq_sqlite_rows = fetch_sqlite_rows(&seq_sconn, "t");
-    let gap_fsqlite_rows = fetch_fsqlite_rows(&gap_fconn, "t");
-    let gap_sqlite_rows = fetch_sqlite_rows(&gap_sconn, "t");
-    assert_eq!(
-        seq_fsqlite_rows, seq_sqlite_rows,
-        "sequential BEGIN CONCURRENT rowset mismatch"
-    );
-    assert_eq!(
-        gap_fsqlite_rows, gap_sqlite_rows,
-        "interleaved BEGIN CONCURRENT rowset mismatch"
-    );
-
-    assert!(
-        seq_metrics.insert_append_count > gap_metrics.insert_append_count,
-        "sequential workload should stay on the append lane more often than the interleaved workload: seq={seq_metrics:?} gap={gap_metrics:?}"
-    );
-    assert!(
-        gap_metrics.insert_seek_count > seq_metrics.insert_seek_count,
-        "interleaved workload should force more existence seeks than the sequential workload: seq={seq_metrics:?} gap={gap_metrics:?}"
-    );
 }
 
 #[test]
 #[ignore = "manual perf probe; run via rch when investigating Track T append throughput"]
 fn bd_qayid_track_t_append_throughput_probe_emits_metrics() {
     let _guard = TRACK_T_E2E_LOCK.lock().unwrap();
-    let seed = env::var("SEED")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .unwrap_or(PERF_SEED);
-    let trace_id = env::var("TRACE_ID").unwrap_or_else(|_| seed.to_string());
-    let run_id = env::var("RUN_ID").unwrap_or_else(|_| format!("{BEAD_ID}-track-t-throughput"));
-    let scenario_id =
-        env::var("SCENARIO_ID").unwrap_or_else(|_| "TRACK-T-APPEND-THROUGHPUT".to_owned());
-    let sequential_rows: Vec<i64> = (1..=10_000).collect();
-    let gapped_rows = interleaved_rowids(10_000);
 
-    let temp = tempdir().expect("tempdir");
-    let seq_db_path = temp.path().join("track_t_probe_seq.db");
-    let gap_db_path = temp.path().join("track_t_probe_gap.db");
-    let seq_conn = open_fsqlite(&seq_db_path);
-    let gap_conn = open_fsqlite(&gap_db_path);
-    seq_conn
-        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
-        .expect("create seq table");
-    gap_conn
-        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
-        .expect("create gap table");
+    asupersync::test_utils::run_test(|| async {
+        let seed = env::var("SEED")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(PERF_SEED);
+        let trace_id = env::var("TRACE_ID").unwrap_or_else(|_| seed.to_string());
+        let run_id = env::var("RUN_ID").unwrap_or_else(|_| format!("{BEAD_ID}-track-t-throughput"));
+        let scenario_id =
+            env::var("SCENARIO_ID").unwrap_or_else(|_| "TRACK-T-APPEND-THROUGHPUT".to_owned());
+        let sequential_rows: Vec<i64> = (1..=10_000).collect();
+        let gapped_rows = interleaved_rowids(10_000);
 
-    let seq_sql = explicit_row_insert_sql("t", &sequential_rows);
-    let gap_sql = explicit_row_insert_sql("t", &gapped_rows);
+        let temp = tempdir().expect("tempdir");
+        let seq_db_path = temp.path().join("track_t_probe_seq.db");
+        let gap_db_path = temp.path().join("track_t_probe_gap.db");
+        let seq_conn = open_fsqlite(&seq_db_path).await;
+        let gap_conn = open_fsqlite(&gap_db_path).await;
+        seq_conn
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .expect("create seq table");
+        gap_conn
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .expect("create gap table");
 
-    let seq_start = Instant::now();
-    let (_seq_result, seq_metrics) = capture_vdbe_metrics(|| {
-        seq_conn.execute(&seq_sql).expect("sequential insert");
-    });
-    let seq_elapsed = seq_start.elapsed();
+        let seq_sql = explicit_row_insert_sql("t", &sequential_rows);
+        let gap_sql = explicit_row_insert_sql("t", &gapped_rows);
 
-    let gap_start = Instant::now();
-    let (_gap_result, gap_metrics) = capture_vdbe_metrics(|| {
-        gap_conn.execute(&gap_sql).expect("gapped insert");
-    });
-    let gap_elapsed = gap_start.elapsed();
+        let seq_start = Instant::now();
+        let (_seq_result, seq_metrics) = capture_vdbe_metrics(|| async {
+            seq_conn.execute(&seq_sql).await.expect("sequential insert");
+        })
+        .await;
+        let seq_elapsed = seq_start.elapsed();
 
-    let seq_count = fetch_fsqlite_rows(&seq_conn, "t").len();
-    let gap_count = fetch_fsqlite_rows(&gap_conn, "t").len();
-    assert_eq!(seq_count, sequential_rows.len());
-    assert_eq!(gap_count, gapped_rows.len());
-    assert!(
-        seq_metrics.insert_append_count > gap_metrics.insert_append_count,
-        "sequential insert should use the append path more often than the gapped variant"
-    );
-    assert!(
-        gap_metrics.insert_seek_count > seq_metrics.insert_seek_count,
-        "gapped insert should force more seeks than the sequential append shape"
-    );
+        let gap_start = Instant::now();
+        let (_gap_result, gap_metrics) = capture_vdbe_metrics(|| async {
+            gap_conn.execute(&gap_sql).await.expect("gapped insert");
+        })
+        .await;
+        let gap_elapsed = gap_start.elapsed();
 
-    if let Ok(path) = env::var("FSQLITE_TRACK_T_E2E_ARTIFACT") {
-        let artifact_path = PathBuf::from(path);
-        write_artifact(
-            &artifact_path,
-            json!({
-                "bead_id": BEAD_ID,
-                "run_id": run_id,
-                "trace_id": trace_id,
-                "scenario_id": scenario_id,
-                "seed": seed,
-                "log_standard_ref": LOG_STANDARD_REF,
-                "replay_command": REPLAY_COMMAND,
-                "overall_status": "pass",
-                "sequential": {
-                    "rows": seq_count,
-                    "elapsed_ms": seq_elapsed.as_millis(),
-                    "rows_per_sec": rows_per_sec(seq_count, seq_elapsed),
-                    "append_count": seq_metrics.insert_append_count,
-                    "seek_count": seq_metrics.insert_seek_count,
-                    "append_hint_clear_count": seq_metrics.insert_append_hint_clear_count,
-                },
-                "gapped": {
-                    "rows": gap_count,
-                    "elapsed_ms": gap_elapsed.as_millis(),
-                    "rows_per_sec": rows_per_sec(gap_count, gap_elapsed),
-                    "append_count": gap_metrics.insert_append_count,
-                    "seek_count": gap_metrics.insert_seek_count,
-                    "append_hint_clear_count": gap_metrics.insert_append_hint_clear_count,
-                }
-            }),
+        let seq_count = fetch_fsqlite_rows(&seq_conn, "t").await.len();
+        let gap_count = fetch_fsqlite_rows(&gap_conn, "t").await.len();
+        assert_eq!(seq_count, sequential_rows.len());
+        assert_eq!(gap_count, gapped_rows.len());
+        assert!(
+            seq_metrics.insert_append_count > gap_metrics.insert_append_count,
+            "sequential insert should use the append path more often than the gapped variant"
         );
+        assert!(
+            gap_metrics.insert_seek_count > seq_metrics.insert_seek_count,
+            "gapped insert should force more seeks than the sequential append shape"
+        );
+
+        if let Ok(path) = env::var("FSQLITE_TRACK_T_E2E_ARTIFACT") {
+            let artifact_path = PathBuf::from(path);
+            write_artifact(
+                &artifact_path,
+                json!({
+                    "bead_id": BEAD_ID,
+                    "run_id": run_id,
+                    "trace_id": trace_id,
+                    "scenario_id": scenario_id,
+                    "seed": seed,
+                    "log_standard_ref": LOG_STANDARD_REF,
+                    "replay_command": REPLAY_COMMAND,
+                    "overall_status": "pass",
+                    "sequential": {
+                        "rows": seq_count,
+                        "elapsed_ms": seq_elapsed.as_millis(),
+                        "rows_per_sec": rows_per_sec(seq_count, seq_elapsed),
+                        "append_count": seq_metrics.insert_append_count,
+                        "seek_count": seq_metrics.insert_seek_count,
+                        "append_hint_clear_count": seq_metrics.insert_append_hint_clear_count,
+                    },
+                    "gapped": {
+                        "rows": gap_count,
+                        "elapsed_ms": gap_elapsed.as_millis(),
+                        "rows_per_sec": rows_per_sec(gap_count, gap_elapsed),
+                        "append_count": gap_metrics.insert_append_count,
+                        "seek_count": gap_metrics.insert_seek_count,
+                        "append_hint_clear_count": gap_metrics.insert_append_hint_clear_count,
+                    }
+                }),
+            );
+            eprintln!(
+                "DEBUG bead_id={BEAD_ID} run_id={run_id} trace_id={trace_id} scenario_id={scenario_id} seed={seed} artifact_path={} replay_command={REPLAY_COMMAND}",
+                artifact_path.display()
+            );
+        }
+
         eprintln!(
-            "DEBUG bead_id={BEAD_ID} run_id={run_id} trace_id={trace_id} scenario_id={scenario_id} seed={seed} artifact_path={} replay_command={REPLAY_COMMAND}",
-            artifact_path.display()
+            "INFO bead_id={BEAD_ID} run_id={run_id} trace_id={trace_id} scenario_id={scenario_id} seed={seed} sequential_rows={} sequential_append_count={} sequential_seek_count={} sequential_append_hint_clear_count={} sequential_rows_per_sec={:.1} gapped_rows={} gapped_append_count={} gapped_seek_count={} gapped_append_hint_clear_count={} gapped_rows_per_sec={:.1} log_standard_ref={LOG_STANDARD_REF}",
+            seq_count,
+            seq_metrics.insert_append_count,
+            seq_metrics.insert_seek_count,
+            seq_metrics.insert_append_hint_clear_count,
+            rows_per_sec(seq_count, seq_elapsed),
+            gap_count,
+            gap_metrics.insert_append_count,
+            gap_metrics.insert_seek_count,
+            gap_metrics.insert_append_hint_clear_count,
+            rows_per_sec(gap_count, gap_elapsed),
         );
-    }
-
-    eprintln!(
-        "INFO bead_id={BEAD_ID} run_id={run_id} trace_id={trace_id} scenario_id={scenario_id} seed={seed} sequential_rows={} sequential_append_count={} sequential_seek_count={} sequential_append_hint_clear_count={} sequential_rows_per_sec={:.1} gapped_rows={} gapped_append_count={} gapped_seek_count={} gapped_append_hint_clear_count={} gapped_rows_per_sec={:.1} log_standard_ref={LOG_STANDARD_REF}",
-        seq_count,
-        seq_metrics.insert_append_count,
-        seq_metrics.insert_seek_count,
-        seq_metrics.insert_append_hint_clear_count,
-        rows_per_sec(seq_count, seq_elapsed),
-        gap_count,
-        gap_metrics.insert_append_count,
-        gap_metrics.insert_seek_count,
-        gap_metrics.insert_append_hint_clear_count,
-        rows_per_sec(gap_count, gap_elapsed),
-    );
+    });
 }

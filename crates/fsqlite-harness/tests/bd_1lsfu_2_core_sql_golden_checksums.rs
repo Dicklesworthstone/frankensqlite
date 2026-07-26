@@ -133,7 +133,7 @@ fn append_record(hasher: &mut Hasher, record: &str) {
     hasher.update(b"\n");
 }
 
-fn seed_execution_database(conn: &Connection, exec_hasher: &mut Hasher) {
+async fn seed_execution_database(conn: &Connection, exec_hasher: &mut Hasher) {
     const FIXED_SEED_SQL: [&str; 5] = [
         "CREATE TABLE IF NOT EXISTS __seed_numbers(id INTEGER PRIMARY KEY, x INTEGER, y REAL, tag TEXT)",
         "DELETE FROM __seed_numbers",
@@ -143,7 +143,7 @@ fn seed_execution_database(conn: &Connection, exec_hasher: &mut Hasher) {
     ];
 
     for sql in FIXED_SEED_SQL {
-        match conn.execute(sql) {
+        match conn.execute(sql).await {
             Ok(rows) => append_record(exec_hasher, &format!("SEED_OK|{sql}|affected_rows={rows}")),
             Err(error) => append_error_record(exec_hasher, "SEED_ERR", sql, &error),
         }
@@ -238,9 +238,9 @@ fn append_error_record(
     );
 }
 
-fn hash_planner_query(planner_hasher: &mut Hasher, conn: &Connection, sql: &str) {
+async fn hash_planner_query(planner_hasher: &mut Hasher, conn: &Connection, sql: &str) {
     let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
-    match conn.query(&explain_sql) {
+    match conn.query(&explain_sql).await {
         Ok(rows) => {
             append_record(planner_hasher, &format!("PLAN_SQL|{}", explain_sql.trim()));
             let canonical = canonical_rows(&rows, true);
@@ -253,8 +253,8 @@ fn hash_planner_query(planner_hasher: &mut Hasher, conn: &Connection, sql: &str)
     }
 }
 
-fn hash_exec_statement(exec_hasher: &mut Hasher, conn: &Connection, sql: &str) {
-    match conn.execute(sql) {
+async fn hash_exec_statement(exec_hasher: &mut Hasher, conn: &Connection, sql: &str) {
+    match conn.execute(sql).await {
         Ok(affected_rows) => append_record(
             exec_hasher,
             &format!("EXEC_OK|{}|affected_rows={affected_rows}", sql.trim()),
@@ -263,8 +263,13 @@ fn hash_exec_statement(exec_hasher: &mut Hasher, conn: &Connection, sql: &str) {
     }
 }
 
-fn hash_query_statement(exec_hasher: &mut Hasher, conn: &Connection, sql: &str, ordered: bool) {
-    match conn.query(sql) {
+async fn hash_query_statement(
+    exec_hasher: &mut Hasher,
+    conn: &Connection,
+    sql: &str,
+    ordered: bool,
+) {
+    match conn.query(sql).await {
         Ok(rows) => {
             let canonical = canonical_rows(&rows, ordered);
             append_record(
@@ -279,7 +284,7 @@ fn hash_query_statement(exec_hasher: &mut Hasher, conn: &Connection, sql: &str, 
     }
 }
 
-fn compute_manifest() -> Result<CoreSqlGoldenManifest, String> {
+async fn compute_manifest() -> Result<CoreSqlGoldenManifest, String> {
     let fixtures = oracle::load_fixtures_from_dir(&fixture_dir()?)
         .map_err(|error| format!("bead_id={BEAD_ID} case=load_fixtures error={error}"))?;
     let mut entries = Vec::with_capacity(fixtures.len());
@@ -289,6 +294,7 @@ fn compute_manifest() -> Result<CoreSqlGoldenManifest, String> {
         let mut planner_hasher = Hasher::new();
         let mut execution_hasher = Hasher::new();
         let mut conn = Connection::open(":memory:")
+            .await
             .map_err(|error| format!("bead_id={BEAD_ID} case=open_connection error={error}"))?;
         let mut statement_count = 0_usize;
         let mut query_count = 0_usize;
@@ -296,7 +302,7 @@ fn compute_manifest() -> Result<CoreSqlGoldenManifest, String> {
         for op in &fixture.ops {
             match op {
                 FixtureOp::Open { path } => {
-                    conn = Connection::open(path).map_err(|error| {
+                    conn = Connection::open(path).await.map_err(|error| {
                         format!(
                             "bead_id={BEAD_ID} case=open_fixture_connection fixture_id={} path={} error={error}",
                             fixture.id, path
@@ -307,14 +313,14 @@ fn compute_manifest() -> Result<CoreSqlGoldenManifest, String> {
                 FixtureOp::Exec { sql, .. } => {
                     statement_count += 1;
                     hash_parser_sql(&mut parser_hasher, sql);
-                    hash_exec_statement(&mut execution_hasher, &conn, sql);
+                    hash_exec_statement(&mut execution_hasher, &conn, sql).await;
                 }
                 FixtureOp::Query { sql, expect } => {
                     statement_count += 1;
                     query_count += 1;
                     hash_parser_sql(&mut parser_hasher, sql);
-                    hash_planner_query(&mut planner_hasher, &conn, sql);
-                    hash_query_statement(&mut execution_hasher, &conn, sql, expect.ordered);
+                    hash_planner_query(&mut planner_hasher, &conn, sql).await;
+                    hash_query_statement(&mut execution_hasher, &conn, sql, expect.ordered).await;
                 }
             }
         }
@@ -333,10 +339,10 @@ fn compute_manifest() -> Result<CoreSqlGoldenManifest, String> {
         let mut parser_hasher = Hasher::new();
         let mut planner_hasher = Hasher::new();
         let mut execution_hasher = Hasher::new();
-        let conn = Connection::open(":memory:").map_err(|error| {
+        let conn = Connection::open(":memory:").await.map_err(|error| {
             format!("bead_id={BEAD_ID} case=open_edge_connection error={error}")
         })?;
-        seed_execution_database(&conn, &mut execution_hasher);
+        seed_execution_database(&conn, &mut execution_hasher).await;
 
         let mut statement_count = 0_usize;
         let mut query_count = 0_usize;
@@ -344,8 +350,8 @@ fn compute_manifest() -> Result<CoreSqlGoldenManifest, String> {
             statement_count += 1;
             query_count += 1;
             hash_parser_sql(&mut parser_hasher, sql);
-            hash_planner_query(&mut planner_hasher, &conn, sql);
-            hash_query_statement(&mut execution_hasher, &conn, sql, true);
+            hash_planner_query(&mut planner_hasher, &conn, sql).await;
+            hash_query_statement(&mut execution_hasher, &conn, sql, true).await;
         }
 
         entries.push(CoreSqlGoldenEntry {
@@ -362,14 +368,14 @@ fn compute_manifest() -> Result<CoreSqlGoldenManifest, String> {
         let mut parser_hasher = Hasher::new();
         let mut planner_hasher = Hasher::new();
         let mut execution_hasher = Hasher::new();
-        let conn = Connection::open(":memory:").map_err(|error| {
+        let conn = Connection::open(":memory:").await.map_err(|error| {
             format!("bead_id={BEAD_ID} case=open_fuzz_connection error={error}")
         })?;
-        seed_execution_database(&conn, &mut execution_hasher);
+        seed_execution_database(&conn, &mut execution_hasher).await;
 
         hash_parser_sql(&mut parser_hasher, &sql);
-        hash_planner_query(&mut planner_hasher, &conn, &sql);
-        hash_query_statement(&mut execution_hasher, &conn, &sql, false);
+        hash_planner_query(&mut planner_hasher, &conn, &sql).await;
+        hash_query_statement(&mut execution_hasher, &conn, &sql, false).await;
 
         entries.push(CoreSqlGoldenEntry {
             fixture_id,
@@ -486,71 +492,78 @@ fn diff_entries(expected: &CoreSqlGoldenManifest, actual: &CoreSqlGoldenManifest
 
 #[test]
 fn test_bd_1lsfu_2_core_sql_golden_checksums() -> Result<(), String> {
-    let manifest = compute_manifest()?;
-    let path = manifest_path()?;
-    let actual_total_queries = manifest
-        .entries
-        .iter()
-        .map(|entry| entry.query_count)
-        .sum::<usize>();
-    if actual_total_queries < MIN_CORE_SQL_QUERY_COUNT {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=query_count_underflow required>={MIN_CORE_SQL_QUERY_COUNT} actual={actual_total_queries}"
-        ));
-    }
+    let mut outcome: Result<(), String> = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let manifest = compute_manifest().await?;
+            let path = manifest_path()?;
+            let actual_total_queries = manifest
+                .entries
+                .iter()
+                .map(|entry| entry.query_count)
+                .sum::<usize>();
+            if actual_total_queries < MIN_CORE_SQL_QUERY_COUNT {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=query_count_underflow required>={MIN_CORE_SQL_QUERY_COUNT} actual={actual_total_queries}"
+                ));
+            }
 
-    if update_requested() {
-        write_manifest(&path, &manifest)?;
-        eprintln!(
-            "INFO bead_id={BEAD_ID} case=manifest_updated path={} entries={} query_count={actual_total_queries}",
-            path.display(),
-            manifest.entries.len()
-        );
-        return Ok(());
-    }
+            if update_requested() {
+                write_manifest(&path, &manifest)?;
+                eprintln!(
+                    "INFO bead_id={BEAD_ID} case=manifest_updated path={} entries={} query_count={actual_total_queries}",
+                    path.display(),
+                    manifest.entries.len()
+                );
+                return Ok(());
+            }
 
-    if !path.exists() {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=manifest_missing path={} hint='set {UPDATE_ENV_VAR}=1 to generate'",
-            path.display()
-        ));
-    }
+            if !path.exists() {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=manifest_missing path={} hint='set {UPDATE_ENV_VAR}=1 to generate'",
+                    path.display()
+                ));
+            }
 
-    let expected = read_manifest(&path)?;
-    if expected.schema_version != SCHEMA_VERSION {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=schema_version_mismatch expected={} actual={}",
-            SCHEMA_VERSION, expected.schema_version
-        ));
-    }
-    if expected.hash_algorithm != HASH_ALGORITHM {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=hash_algorithm_mismatch expected={} actual={}",
-            HASH_ALGORITHM, expected.hash_algorithm
-        ));
-    }
-    if expected.entries.is_empty() {
-        return Err(format!("bead_id={BEAD_ID} case=manifest_empty"));
-    }
-    let expected_total_queries = expected
-        .entries
-        .iter()
-        .map(|entry| entry.query_count)
-        .sum::<usize>();
-    if expected_total_queries < MIN_CORE_SQL_QUERY_COUNT {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=manifest_query_count_underflow required>={MIN_CORE_SQL_QUERY_COUNT} actual={expected_total_queries}"
-        ));
-    }
+            let expected = read_manifest(&path)?;
+            if expected.schema_version != SCHEMA_VERSION {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=schema_version_mismatch expected={} actual={}",
+                    SCHEMA_VERSION, expected.schema_version
+                ));
+            }
+            if expected.hash_algorithm != HASH_ALGORITHM {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=hash_algorithm_mismatch expected={} actual={}",
+                    HASH_ALGORITHM, expected.hash_algorithm
+                ));
+            }
+            if expected.entries.is_empty() {
+                return Err(format!("bead_id={BEAD_ID} case=manifest_empty"));
+            }
+            let expected_total_queries = expected
+                .entries
+                .iter()
+                .map(|entry| entry.query_count)
+                .sum::<usize>();
+            if expected_total_queries < MIN_CORE_SQL_QUERY_COUNT {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=manifest_query_count_underflow required>={MIN_CORE_SQL_QUERY_COUNT} actual={expected_total_queries}"
+                ));
+            }
 
-    let diff = diff_entries(&expected, &manifest);
-    if !diff.is_empty() {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=checksum_mismatch\n{}\nupdate_command='{}=1 cargo test -p fsqlite-harness --test bd_1lsfu_2_core_sql_golden_checksums'",
-            diff.join("\n"),
-            UPDATE_ENV_VAR
-        ));
-    }
+            let diff = diff_entries(&expected, &manifest);
+            if !diff.is_empty() {
+                return Err(format!(
+                    "bead_id={BEAD_ID} case=checksum_mismatch\n{}\nupdate_command='{}=1 cargo test -p fsqlite-harness --test bd_1lsfu_2_core_sql_golden_checksums'",
+                    diff.join("\n"),
+                    UPDATE_ENV_VAR
+                ));
+            }
 
-    Ok(())
+            Ok(())
+        }
+        .await;
+    });
+    outcome
 }

@@ -13,8 +13,10 @@ const SCENARIO_IDS: [&str; 3] = [
 const SHELL_RUNNER_PATH: &str = "scripts/verify_bd_1sf8n_phase9_time_travel.sh";
 const HARNESS_TEST_PATH: &str = "crates/fsqlite-harness/tests/bd_1sf8n_phase9_time_travel_gate.rs";
 
-fn open_connection() -> Connection {
-    let conn = Connection::open(":memory:").expect("in-memory connection should open");
+async fn open_connection() -> Connection {
+    let conn = Connection::open(":memory:")
+        .await
+        .expect("in-memory connection should open");
     assert!(
         conn.is_concurrent_mode_default(),
         "bead_id={BEAD_ID} case=concurrent_mode_default_guard"
@@ -22,20 +24,23 @@ fn open_connection() -> Connection {
     conn
 }
 
-fn seed_time_travel_rows(conn: &Connection) {
+async fn seed_time_travel_rows(conn: &Connection) {
     conn.execute("CREATE TABLE tt_events (id INTEGER PRIMARY KEY, name TEXT);")
+        .await
         .expect("create tt_events table");
 
     for (id, name) in [(1_i64, "boot"), (2_i64, "steady"), (3_i64, "settled")] {
-        conn.execute("BEGIN;").expect("begin transaction");
+        conn.execute("BEGIN;").await.expect("begin transaction");
         conn.execute(&format!("INSERT INTO tt_events VALUES ({id}, '{name}');"))
+            .await
             .expect("insert tt_events row");
-        conn.execute("COMMIT;").expect("commit transaction");
+        conn.execute("COMMIT;").await.expect("commit transaction");
     }
 }
 
-fn query_names(conn: &Connection, sql: &str) -> Vec<String> {
+async fn query_names(conn: &Connection, sql: &str) -> Vec<String> {
     conn.query(sql)
+        .await
         .expect("query should succeed")
         .into_iter()
         .map(|row| match row.get(0) {
@@ -185,89 +190,98 @@ fn scenario_outcome_metadata_contract() {
 
 #[test]
 fn commitseq_historical_read_returns_point_in_time_state() {
-    let conn = open_connection();
-    seed_time_travel_rows(&conn);
+    asupersync::test_utils::run_test(|| async {
+        let conn = open_connection().await;
+        seed_time_travel_rows(&conn).await;
 
-    let historical_names = query_names(
-        &conn,
-        "SELECT name FROM tt_events FOR SYSTEM_TIME AS OF COMMITSEQ 3 ORDER BY id;",
-    );
-    assert_eq!(
-        historical_names,
-        vec!["boot".to_owned(), "steady".to_owned()],
-        "bead_id={BEAD_ID} case=commitseq_historical_rows"
-    );
+        let historical_names = query_names(
+            &conn,
+            "SELECT name FROM tt_events FOR SYSTEM_TIME AS OF COMMITSEQ 3 ORDER BY id;",
+        )
+        .await;
+        assert_eq!(
+            historical_names,
+            vec!["boot".to_owned(), "steady".to_owned()],
+            "bead_id={BEAD_ID} case=commitseq_historical_rows"
+        );
 
-    let live_names = query_names(&conn, "SELECT name FROM tt_events ORDER BY id;");
-    assert_eq!(
-        live_names,
-        vec!["boot".to_owned(), "steady".to_owned(), "settled".to_owned()],
-        "bead_id={BEAD_ID} case=commitseq_live_state_preserved"
-    );
+        let live_names = query_names(&conn, "SELECT name FROM tt_events ORDER BY id;").await;
+        assert_eq!(
+            live_names,
+            vec!["boot".to_owned(), "steady".to_owned(), "settled".to_owned()],
+            "bead_id={BEAD_ID} case=commitseq_live_state_preserved"
+        );
 
-    emit_scenario_outcome(
-        SCENARIO_IDS[0],
-        json!({
-            "historical_commit_seq": 3,
-            "historical_names": historical_names,
-            "live_names": live_names,
-        }),
-    );
+        emit_scenario_outcome(
+            SCENARIO_IDS[0],
+            json!({
+                "historical_commit_seq": 3,
+                "historical_names": historical_names,
+                "live_names": live_names,
+            }),
+        );
+    });
 }
 
 #[test]
 fn future_timestamp_resolves_latest_retained_snapshot() {
-    let conn = open_connection();
-    seed_time_travel_rows(&conn);
+    asupersync::test_utils::run_test(|| async {
+        let conn = open_connection().await;
+        seed_time_travel_rows(&conn).await;
 
-    let historical_names = query_names(
-        &conn,
-        "SELECT name FROM tt_events FOR SYSTEM_TIME AS OF '9999-12-31 23:59:59' ORDER BY id;",
-    );
-    let live_names = query_names(&conn, "SELECT name FROM tt_events ORDER BY id;");
-    assert_eq!(
-        historical_names, live_names,
-        "bead_id={BEAD_ID} case=future_timestamp_latest_snapshot"
-    );
+        let historical_names = query_names(
+            &conn,
+            "SELECT name FROM tt_events FOR SYSTEM_TIME AS OF '9999-12-31 23:59:59' ORDER BY id;",
+        )
+        .await;
+        let live_names = query_names(&conn, "SELECT name FROM tt_events ORDER BY id;").await;
+        assert_eq!(
+            historical_names, live_names,
+            "bead_id={BEAD_ID} case=future_timestamp_latest_snapshot"
+        );
 
-    emit_scenario_outcome(
-        SCENARIO_IDS[1],
-        json!({
-            "target_timestamp": "9999-12-31 23:59:59",
-            "resolved_names": historical_names,
-        }),
-    );
+        emit_scenario_outcome(
+            SCENARIO_IDS[1],
+            json!({
+                "target_timestamp": "9999-12-31 23:59:59",
+                "resolved_names": historical_names,
+            }),
+        );
+    });
 }
 
 #[test]
 fn early_timestamp_errors_explicitly_without_corrupting_live_state() {
-    let conn = open_connection();
-    seed_time_travel_rows(&conn);
+    asupersync::test_utils::run_test(|| async {
+        let conn = open_connection().await;
+        seed_time_travel_rows(&conn).await;
 
-    let error = conn
-        .query(
-            "SELECT name FROM tt_events FOR SYSTEM_TIME AS OF '1970-01-01 00:00:00' ORDER BY id;",
-        )
-        .expect_err("early timestamp should miss the retained snapshot ring");
-    let error_text = error.to_string();
-    assert!(
-        error_text.contains("time-travel") || error_text.contains("no snapshot available"),
-        "bead_id={BEAD_ID} case=missing_snapshot_error_text error={error_text}"
-    );
+        let error = conn
+            .query(
+                "SELECT name FROM tt_events FOR SYSTEM_TIME AS OF '1970-01-01 00:00:00' ORDER BY id;",
+            )
+            .await
+            .expect_err("early timestamp should miss the retained snapshot ring");
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains("time-travel") || error_text.contains("no snapshot available"),
+            "bead_id={BEAD_ID} case=missing_snapshot_error_text error={error_text}"
+        );
 
-    let live_names = query_names(&conn, "SELECT name FROM tt_events ORDER BY id;");
-    assert_eq!(
-        live_names,
-        vec!["boot".to_owned(), "steady".to_owned(), "settled".to_owned()],
-        "bead_id={BEAD_ID} case=early_timestamp_live_state_preserved"
-    );
+        let live_names = query_names(&conn, "SELECT name FROM tt_events ORDER BY id;").await;
+        assert_eq!(
+            live_names,
+            vec!["boot".to_owned(), "steady".to_owned(), "settled".to_owned()],
+            "bead_id={BEAD_ID} case=early_timestamp_live_state_preserved"
+        );
 
-    emit_scenario_outcome(
-        SCENARIO_IDS[2],
-        json!({
-            "target_timestamp": "1970-01-01 00:00:00",
-            "error_text": error_text,
-            "live_names": live_names,
-        }),
-    );
+        emit_scenario_outcome(
+            SCENARIO_IDS[2],
+            json!({
+                "target_timestamp": "1970-01-01 00:00:00",
+                "error_text": error_text,
+                "live_names": live_names,
+            }),
+        );
+    });
 }

@@ -182,7 +182,9 @@ fn l3_random_order_inserts() {
         conn.execute("COMMIT").await.expect("commit");
 
         // Despite random insert order, all rows should be present
-        let count = get_int(&conn, "SELECT COUNT(*) FROM shuffled").await.unwrap();
+        let count = get_int(&conn, "SELECT COUNT(*) FROM shuffled")
+            .await
+            .unwrap();
         assert_eq!(count, n as i64, "L3: not all rows inserted");
 
         // ORDER BY should work correctly (tree structure is correct)
@@ -200,7 +202,9 @@ fn l3_random_order_inserts() {
         assert_eq!(first_ids, vec![1, 2, 3, 4, 5], "L3: ORDER BY broken");
 
         // Sum should be correct
-        let sum = get_int(&conn, "SELECT SUM(val) FROM shuffled").await.unwrap();
+        let sum = get_int(&conn, "SELECT SUM(val) FROM shuffled")
+            .await
+            .unwrap();
         // sum(i*7 for i in 1..=5000) = 7 * 5000*5001/2 = 87_517_500
         assert_eq!(sum, 87_517_500, "L3: sum wrong after random-order inserts");
 
@@ -258,7 +262,9 @@ fn l4_secondary_index_consistency() {
             .await
             .expect("delete via index");
 
-        let after_delete = get_int(&conn, "SELECT COUNT(*) FROM idx_tbl").await.unwrap();
+        let after_delete = get_int(&conn, "SELECT COUNT(*) FROM idx_tbl")
+            .await
+            .unwrap();
         assert_eq!(
             after_delete, 2970,
             "L4: should have 2970 after deleting key_00000"
@@ -303,7 +309,9 @@ fn l5_insert_delete_reinsert_cycles() {
             }
             conn.execute("COMMIT").await.expect("commit");
 
-            let count = get_int(&conn, "SELECT COUNT(*) FROM cycling").await.unwrap();
+            let count = get_int(&conn, "SELECT COUNT(*) FROM cycling")
+                .await
+                .unwrap();
             assert_eq!(count, 500, "L5: cycle {cycle} insert count wrong");
 
             // Delete half
@@ -311,12 +319,16 @@ fn l5_insert_delete_reinsert_cycles() {
                 .await
                 .expect("delete half");
 
-            let after = get_int(&conn, "SELECT COUNT(*) FROM cycling").await.unwrap();
+            let after = get_int(&conn, "SELECT COUNT(*) FROM cycling")
+                .await
+                .unwrap();
             assert_eq!(after, 250, "L5: cycle {cycle} after delete count wrong");
         }
 
         // Final state: 250 rows from the last cycle
-        let final_count = get_int(&conn, "SELECT COUNT(*) FROM cycling").await.unwrap();
+        let final_count = get_int(&conn, "SELECT COUNT(*) FROM cycling")
+            .await
+            .unwrap();
         assert_eq!(final_count, 250);
 
         // All remaining rows should be from cycle 9

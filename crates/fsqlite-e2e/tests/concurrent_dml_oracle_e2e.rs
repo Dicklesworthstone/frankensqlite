@@ -627,8 +627,7 @@ fn delete_with_subquery_predicate() {
         }
 
         // Delete children whose parent is 'deleted'
-        let delete_sql =
-            "DELETE FROM child WHERE parent_id IN (SELECT id FROM parent WHERE status = 'deleted');";
+        let delete_sql = "DELETE FROM child WHERE parent_id IN (SELECT id FROM parent WHERE status = 'deleted');";
 
         {
             let f = fsqlite::Connection::open(&f_path).await.unwrap();

@@ -948,8 +948,7 @@ fn txn_wal_checkpoint_journal_mode_transitions_file_backed() {
         );
 
         let c_ckpt_nonwal = csqlite_query_values(&c_conn, "PRAGMA wal_checkpoint(TRUNCATE);");
-        let f_ckpt_nonwal =
-            fsqlite_query_values(&f_conn, "PRAGMA wal_checkpoint(TRUNCATE);").await;
+        let f_ckpt_nonwal = fsqlite_query_values(&f_conn, "PRAGMA wal_checkpoint(TRUNCATE);").await;
         eprintln!(
             "bead_id={BEAD_ID} run_id={run_id} seed={SEED} phase=checkpoint_nonwal c_rows={c_ckpt_nonwal:?} f_rows={f_ckpt_nonwal:?}"
         );
@@ -1624,7 +1623,8 @@ fn txn_mixed_connection_modes_remain_local_and_preserve_rows() {
                                     match conn.execute("ROLLBACK;").await {
                                         Ok(_) => error_history.push(format!(
                                             "attempt {attempt} {}",
-                                            mode_mix_post_rollback_probe(&mvcc_path, &conn, 0).await
+                                            mode_mix_post_rollback_probe(&mvcc_path, &conn, 0)
+                                                .await
                                         )),
                                         Err(rollback_err) => {
                                             error_history.push(format!(
@@ -1951,8 +1951,7 @@ fn txn_concurrent_schema_and_dml_preserve_index_and_rows() {
             .await
             .expect("reopen candidate db");
         let state_sql = "SELECT COUNT(*), MIN(id), MAX(id) FROM schema_mix;";
-        let index_sql =
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_schema_mix_category';";
+        let index_sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_schema_mix_category';";
         let writer_sql = "SELECT COUNT(*) FROM schema_mix WHERE category='writer';";
         assert_eq!(
             csqlite_query_values(&oracle, state_sql),
@@ -1997,137 +1996,137 @@ fn txn_concurrent_schema_and_dml_preserve_index_and_rows() {
 #[test]
 fn txn_attach_cross_db_insert_select_is_statement_atomic() {
     asupersync::test_utils::run_test(|| async {
-    let temp = tempdir().expect("tempdir");
-    let oracle_db1 = temp.path().join("oracle_db1.db");
-    let oracle_db2 = temp.path().join("oracle_db2.db");
-    let candidate_db1 = temp.path().join("candidate_db1.db");
-    let candidate_db2 = temp.path().join("candidate_db2.db");
+        let temp = tempdir().expect("tempdir");
+        let oracle_db1 = temp.path().join("oracle_db1.db");
+        let oracle_db2 = temp.path().join("oracle_db2.db");
+        let candidate_db1 = temp.path().join("candidate_db1.db");
+        let candidate_db2 = temp.path().join("candidate_db2.db");
 
-    let oracle_db1_sql = oracle_db1.to_string_lossy().replace('\'', "''");
-    let oracle_db2_sql = oracle_db2.to_string_lossy().replace('\'', "''");
-    let candidate_db1_sql = candidate_db1.to_string_lossy().replace('\'', "''");
-    let candidate_db2_sql = candidate_db2.to_string_lossy().replace('\'', "''");
+        let oracle_db1_sql = oracle_db1.to_string_lossy().replace('\'', "''");
+        let oracle_db2_sql = oracle_db2.to_string_lossy().replace('\'', "''");
+        let candidate_db1_sql = candidate_db1.to_string_lossy().replace('\'', "''");
+        let candidate_db2_sql = candidate_db2.to_string_lossy().replace('\'', "''");
 
-    let oracle = rusqlite::Connection::open_in_memory().expect("open oracle main");
-    oracle
-        .execute(&format!("ATTACH DATABASE '{oracle_db1_sql}' AS db1;"), [])
-        .expect("oracle attach db1");
-    oracle
-        .execute(&format!("ATTACH DATABASE '{oracle_db2_sql}' AS db2;"), [])
-        .expect("oracle attach db2");
-    oracle
-        .execute(
-            "CREATE TABLE db1.dest (id INTEGER PRIMARY KEY, value TEXT UNIQUE);",
-            [],
+        let oracle = rusqlite::Connection::open_in_memory().expect("open oracle main");
+        oracle
+            .execute(&format!("ATTACH DATABASE '{oracle_db1_sql}' AS db1;"), [])
+            .expect("oracle attach db1");
+        oracle
+            .execute(&format!("ATTACH DATABASE '{oracle_db2_sql}' AS db2;"), [])
+            .expect("oracle attach db2");
+        oracle
+            .execute(
+                "CREATE TABLE db1.dest (id INTEGER PRIMARY KEY, value TEXT UNIQUE);",
+                [],
+            )
+            .expect("oracle create dest");
+        oracle
+            .execute("CREATE TABLE db2.src (id INTEGER, value TEXT);", [])
+            .expect("oracle create src");
+        oracle
+            .execute("INSERT INTO db2.src VALUES (1, 'dup');", [])
+            .expect("oracle insert src row 1");
+        oracle
+            .execute("INSERT INTO db2.src VALUES (2, 'dup');", [])
+            .expect("oracle insert src row 2");
+        let oracle_err = oracle
+            .execute(
+                "INSERT INTO db1.dest SELECT id, value FROM db2.src ORDER BY id;",
+                [],
+            )
+            .expect_err("oracle duplicate insert should fail atomically");
+        assert!(
+            matches!(
+                oracle_err,
+                rusqlite::Error::SqliteFailure(_, _) | rusqlite::Error::StatementChangedRows(_)
+            ) || oracle_err
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("constraint"),
+            "unexpected oracle error: {oracle_err:?}"
+        );
+
+        let candidate = fsqlite::Connection::open(":memory:")
+            .await
+            .expect("open candidate main");
+        candidate
+            .execute(&format!("ATTACH DATABASE '{candidate_db1_sql}' AS db1;"))
+            .await
+            .expect("candidate attach db1");
+        candidate
+            .execute(&format!("ATTACH DATABASE '{candidate_db2_sql}' AS db2;"))
+            .await
+            .expect("candidate attach db2");
+        candidate
+            .execute("CREATE TABLE db1.dest (id INTEGER PRIMARY KEY, value TEXT UNIQUE);")
+            .await
+            .expect("candidate create dest");
+        candidate
+            .execute("CREATE TABLE db2.src (id INTEGER, value TEXT);")
+            .await
+            .expect("candidate create src");
+        candidate
+            .execute("INSERT INTO db2.src VALUES (1, 'dup');")
+            .await
+            .expect("candidate insert src row 1");
+        candidate
+            .execute("INSERT INTO db2.src VALUES (2, 'dup');")
+            .await
+            .expect("candidate insert src row 2");
+        let candidate_err = candidate
+            .execute("INSERT INTO db1.dest SELECT id, value FROM db2.src ORDER BY id;")
+            .await
+            .expect_err("candidate duplicate insert should fail atomically");
+        assert!(
+            candidate_err
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("unique"),
+            "unexpected candidate error: {candidate_err:?}"
+        );
+
+        let expected_dest_rows = csqlite_query_values(
+            &rusqlite::Connection::open(&oracle_db1).expect("open oracle db1"),
+            "SELECT id, value FROM dest ORDER BY id;",
+        );
+        let candidate_dest_rows = fsqlite_query_values(
+            &fsqlite::Connection::open(
+                candidate_db1
+                    .to_str()
+                    .expect("candidate db1 path should be utf-8"),
+            )
+            .await
+            .expect("open candidate db1"),
+            "SELECT id, value FROM dest ORDER BY id;",
         )
-        .expect("oracle create dest");
-    oracle
-        .execute("CREATE TABLE db2.src (id INTEGER, value TEXT);", [])
-        .expect("oracle create src");
-    oracle
-        .execute("INSERT INTO db2.src VALUES (1, 'dup');", [])
-        .expect("oracle insert src row 1");
-    oracle
-        .execute("INSERT INTO db2.src VALUES (2, 'dup');", [])
-        .expect("oracle insert src row 2");
-    let oracle_err = oracle
-        .execute(
-            "INSERT INTO db1.dest SELECT id, value FROM db2.src ORDER BY id;",
-            [],
-        )
-        .expect_err("oracle duplicate insert should fail atomically");
-    assert!(
-        matches!(
-            oracle_err,
-            rusqlite::Error::SqliteFailure(_, _) | rusqlite::Error::StatementChangedRows(_)
-        ) || oracle_err
-            .to_string()
-            .to_ascii_lowercase()
-            .contains("constraint"),
-        "unexpected oracle error: {oracle_err:?}"
-    );
+        .await;
+        assert_eq!(
+            expected_dest_rows, candidate_dest_rows,
+            "cross-db INSERT ... SELECT should leave the destination identical after duplicate failure"
+        );
+        assert!(
+            candidate_dest_rows.is_empty(),
+            "destination should stay empty after the failed cross-db statement"
+        );
 
-    let candidate = fsqlite::Connection::open(":memory:")
-        .await
-        .expect("open candidate main");
-    candidate
-        .execute(&format!("ATTACH DATABASE '{candidate_db1_sql}' AS db1;"))
-        .await
-        .expect("candidate attach db1");
-    candidate
-        .execute(&format!("ATTACH DATABASE '{candidate_db2_sql}' AS db2;"))
-        .await
-        .expect("candidate attach db2");
-    candidate
-        .execute("CREATE TABLE db1.dest (id INTEGER PRIMARY KEY, value TEXT UNIQUE);")
-        .await
-        .expect("candidate create dest");
-    candidate
-        .execute("CREATE TABLE db2.src (id INTEGER, value TEXT);")
-        .await
-        .expect("candidate create src");
-    candidate
-        .execute("INSERT INTO db2.src VALUES (1, 'dup');")
-        .await
-        .expect("candidate insert src row 1");
-    candidate
-        .execute("INSERT INTO db2.src VALUES (2, 'dup');")
-        .await
-        .expect("candidate insert src row 2");
-    let candidate_err = candidate
-        .execute("INSERT INTO db1.dest SELECT id, value FROM db2.src ORDER BY id;")
-        .await
-        .expect_err("candidate duplicate insert should fail atomically");
-    assert!(
-        candidate_err
-            .to_string()
-            .to_ascii_lowercase()
-            .contains("unique"),
-        "unexpected candidate error: {candidate_err:?}"
-    );
-
-    let expected_dest_rows = csqlite_query_values(
-        &rusqlite::Connection::open(&oracle_db1).expect("open oracle db1"),
-        "SELECT id, value FROM dest ORDER BY id;",
-    );
-    let candidate_dest_rows = fsqlite_query_values(
-        &fsqlite::Connection::open(
-            candidate_db1
-                .to_str()
-                .expect("candidate db1 path should be utf-8"),
+        let expected_src_rows = csqlite_query_values(
+            &rusqlite::Connection::open(&oracle_db2).expect("open oracle db2"),
+            "SELECT id, value FROM src ORDER BY id;",
+        );
+        let candidate_src_rows = fsqlite_query_values(
+            &fsqlite::Connection::open(
+                candidate_db2
+                    .to_str()
+                    .expect("candidate db2 path should be utf-8"),
+            )
+            .await
+            .expect("open candidate db2"),
+            "SELECT id, value FROM src ORDER BY id;",
         )
-        .await
-        .expect("open candidate db1"),
-        "SELECT id, value FROM dest ORDER BY id;",
-    )
-    .await;
-    assert_eq!(
-        expected_dest_rows, candidate_dest_rows,
-        "cross-db INSERT ... SELECT should leave the destination identical after duplicate failure"
-    );
-    assert!(
-        candidate_dest_rows.is_empty(),
-        "destination should stay empty after the failed cross-db statement"
-    );
-
-    let expected_src_rows = csqlite_query_values(
-        &rusqlite::Connection::open(&oracle_db2).expect("open oracle db2"),
-        "SELECT id, value FROM src ORDER BY id;",
-    );
-    let candidate_src_rows = fsqlite_query_values(
-        &fsqlite::Connection::open(
-            candidate_db2
-                .to_str()
-                .expect("candidate db2 path should be utf-8"),
-        )
-        .await
-        .expect("open candidate db2"),
-        "SELECT id, value FROM src ORDER BY id;",
-    )
-    .await;
-    assert_eq!(
-        expected_src_rows, candidate_src_rows,
-        "source database contents should remain unchanged after the failed cross-db statement"
-    );
+        .await;
+        assert_eq!(
+            expected_src_rows, candidate_src_rows,
+            "source database contents should remain unchanged after the failed cross-db statement"
+        );
     });
 }

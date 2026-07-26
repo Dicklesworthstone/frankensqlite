@@ -9480,6 +9480,36 @@ impl Drop for MemFallbackRejectionOverrideGuard<'_> {
     }
 }
 
+/// RAII depth guard for the foreign-key cascade counter.
+///
+/// The cascade sites `await` a nested statement between incrementing and
+/// decrementing `fk_cascade_depth`. Doing that by hand is not cancel-safe:
+/// dropping the future at the await point skips the decrement, the counter
+/// stays elevated, and because `fk_enforcement_enabled()` is
+/// `foreign_keys && fk_cascade_depth.get() == 0`, foreign-key enforcement is
+/// then silently disabled for the remaining life of the connection.
+///
+/// Holding the increment in a guard makes the decrement run on the drop path
+/// too, so cancellation restores the counter instead of corrupting it.
+struct FkCascadeDepthGuard<'a> {
+    depth: &'a Cell<usize>,
+}
+
+impl<'a> FkCascadeDepthGuard<'a> {
+    fn enter(depth: &'a Cell<usize>) -> Self {
+        depth.set(depth.get() + 1);
+        Self { depth }
+    }
+}
+
+impl Drop for FkCascadeDepthGuard<'_> {
+    fn drop(&mut self) {
+        // saturating_sub: a guard can never legitimately see zero here, but a
+        // panic-unwind through nested cascades must not underflow.
+        self.depth.set(self.depth.get().saturating_sub(1));
+    }
+}
+
 struct BoolCellRestoreGuard<'a> {
     cell: &'a Cell<bool>,
     previous: bool,
@@ -45597,9 +45627,10 @@ impl Connection {
                     quote_identifier(child_table),
                     where_parts.join(" AND ")
                 );
-                self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
-                let result = self.execute_with_params(&sql, parent_values).await;
-                self.fk_cascade_depth.set(self.fk_cascade_depth.get() - 1);
+                let result = {
+                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth);
+                    self.execute_with_params(&sql, parent_values).await
+                };
                 result?;
                 Ok(())
             }
@@ -45623,9 +45654,10 @@ impl Connection {
                     set_parts.join(", "),
                     where_parts.join(" AND ")
                 );
-                self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
-                let result = self.execute_with_params(&sql, parent_values).await;
-                self.fk_cascade_depth.set(self.fk_cascade_depth.get() - 1);
+                let result = {
+                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth);
+                    self.execute_with_params(&sql, parent_values).await
+                };
                 result?;
                 Ok(())
             }
@@ -45651,9 +45683,10 @@ impl Connection {
                     set_parts.join(", "),
                     where_parts.join(" AND ")
                 );
-                self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
-                let result = self.execute_with_params(&sql, parent_values).await;
-                self.fk_cascade_depth.set(self.fk_cascade_depth.get() - 1);
+                let result = {
+                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth);
+                    self.execute_with_params(&sql, parent_values).await
+                };
                 result?;
                 Ok(())
             }
@@ -45840,9 +45873,10 @@ impl Connection {
                 );
                 let mut params = new_parent_values.clone();
                 params.extend_from_slice(old_parent_values);
-                self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
-                let result = self.execute_with_params(&sql, &params).await;
-                self.fk_cascade_depth.set(self.fk_cascade_depth.get() - 1);
+                let result = {
+                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth);
+                    self.execute_with_params(&sql, &params).await
+                };
                 result?;
                 Ok(())
             }
@@ -45866,9 +45900,10 @@ impl Connection {
                     set_parts.join(", "),
                     where_parts.join(" AND ")
                 );
-                self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
-                let result = self.execute_with_params(&sql, old_parent_values).await;
-                self.fk_cascade_depth.set(self.fk_cascade_depth.get() - 1);
+                let result = {
+                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth);
+                    self.execute_with_params(&sql, old_parent_values).await
+                };
                 result?;
                 Ok(())
             }
@@ -45894,9 +45929,10 @@ impl Connection {
                     set_parts.join(", "),
                     where_parts.join(" AND ")
                 );
-                self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
-                let result = self.execute_with_params(&sql, old_parent_values).await;
-                self.fk_cascade_depth.set(self.fk_cascade_depth.get() - 1);
+                let result = {
+                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth);
+                    self.execute_with_params(&sql, old_parent_values).await
+                };
                 result?;
                 Ok(())
             }

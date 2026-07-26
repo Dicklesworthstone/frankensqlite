@@ -122,9 +122,9 @@ fn check_on_stored_generated_column() {
             &[
                 "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, \
                  sq INTEGER GENERATED ALWAYS AS (a * a) STORED CHECK (sq < 100))",
-                "INSERT INTO t (id,a) VALUES (1,5)", // sq=25 ok
+                "INSERT INTO t (id,a) VALUES (1,5)",  // sq=25 ok
                 "INSERT INTO t (id,a) VALUES (2,10)", // sq=100 -> CHECK fails -> error both
-                "INSERT INTO t (id,a) VALUES (3,9)", // sq=81 ok
+                "INSERT INTO t (id,a) VALUES (3,9)",  // sq=81 ok
             ],
             &["SELECT id, a, sq FROM t ORDER BY id"], // (1,5,25),(3,9,81)
             "check_on_stored_generated_column",

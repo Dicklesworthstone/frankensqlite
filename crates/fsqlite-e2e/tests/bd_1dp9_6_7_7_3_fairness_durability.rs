@@ -48,6 +48,7 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::similar_names)]
 #![allow(clippy::cast_precision_loss)]
+#![recursion_limit = "512"]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -349,7 +350,7 @@ fn run_csqlite_hot_page(
 
 // ─── FrankenSQLite runner ────────────────────────────────────────────
 
-fn run_fsqlite_disjoint(
+async fn run_fsqlite_disjoint(
     scenario_id: &str,
     seed: u64,
     n_threads: usize,
@@ -362,10 +363,13 @@ fn run_fsqlite_disjoint(
         json!({"backend": "fsqlite", "threads": n_threads}),
     );
 
-    let conn = fsqlite::Connection::open(":memory:").expect("fsqlite open");
+    let conn = fsqlite::Connection::open(":memory:")
+        .await
+        .expect("fsqlite open");
     conn.execute(
         "CREATE TABLE fairness_bench (id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, val INTEGER NOT NULL)",
     )
+    .await
     .expect("fsqlite create");
 
     let wall_start = Instant::now();
@@ -373,7 +377,7 @@ fn run_fsqlite_disjoint(
     for tid in 0..n_threads {
         let t_start = Instant::now();
         let base = (tid as u64) * RANGE_SIZE;
-        conn.execute("BEGIN").expect("begin");
+        conn.execute("BEGIN").await.expect("begin");
         for i in 0..ops_per_thread {
             conn.execute(&format!(
                 "INSERT INTO fairness_bench (id, thread_id, val) VALUES ({}, {}, {})",
@@ -381,9 +385,10 @@ fn run_fsqlite_disjoint(
                 tid,
                 i * 7 + 13
             ))
+            .await
             .expect("insert");
         }
-        conn.execute("COMMIT").expect("commit");
+        conn.execute("COMMIT").await.expect("commit");
         threads.push(ThreadResult {
             _thread_id: tid,
             ops_completed: ops_per_thread,
@@ -394,6 +399,7 @@ fn run_fsqlite_disjoint(
 
     let row_count = conn
         .query("SELECT COUNT(*) FROM fairness_bench")
+        .await
         .expect("count");
     let count = match &row_count[0].values()[0] {
         fsqlite_types::value::SqliteValue::Integer(n) => *n,
@@ -415,7 +421,7 @@ fn run_fsqlite_disjoint(
     }
 }
 
-fn run_fsqlite_hot_page(
+async fn run_fsqlite_hot_page(
     scenario_id: &str,
     seed: u64,
     n_threads: usize,
@@ -428,10 +434,13 @@ fn run_fsqlite_hot_page(
         json!({"backend": "fsqlite", "threads": n_threads, "workload": "hot_page"}),
     );
 
-    let conn = fsqlite::Connection::open(":memory:").expect("fsqlite open");
+    let conn = fsqlite::Connection::open(":memory:")
+        .await
+        .expect("fsqlite open");
     conn.execute(
         "CREATE TABLE fairness_bench (id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, val INTEGER NOT NULL)",
     )
+    .await
     .expect("fsqlite create");
 
     let wall_start = Instant::now();
@@ -439,16 +448,17 @@ fn run_fsqlite_hot_page(
     let mut next_id: u64 = 1;
     for tid in 0..n_threads {
         let t_start = Instant::now();
-        conn.execute("BEGIN").expect("begin");
+        conn.execute("BEGIN").await.expect("begin");
         for _ in 0..ops_per_thread {
             conn.execute(&format!(
                 "INSERT INTO fairness_bench (id, thread_id, val) VALUES ({next_id}, {tid}, {})",
                 next_id * 3
             ))
+            .await
             .expect("insert");
             next_id += 1;
         }
-        conn.execute("COMMIT").expect("commit");
+        conn.execute("COMMIT").await.expect("commit");
         threads.push(ThreadResult {
             _thread_id: tid,
             ops_completed: ops_per_thread,
@@ -469,7 +479,7 @@ fn run_fsqlite_hot_page(
 
 // ─── Fairness comparison helper ──────────────────────────────────────
 
-fn run_fairness_scenario(
+async fn run_fairness_scenario(
     scenario_id: &str,
     seed: u64,
     n_threads: usize,
@@ -479,12 +489,12 @@ fn run_fairness_scenario(
     let (csqlite_report, fsqlite_report) = if hot_page {
         (
             run_csqlite_hot_page(scenario_id, seed, n_threads, ops_per_thread),
-            run_fsqlite_hot_page(scenario_id, seed, n_threads, ops_per_thread),
+            run_fsqlite_hot_page(scenario_id, seed, n_threads, ops_per_thread).await,
         )
     } else {
         (
             run_csqlite_disjoint(scenario_id, seed, n_threads, ops_per_thread),
-            run_fsqlite_disjoint(scenario_id, seed, n_threads, ops_per_thread),
+            run_fsqlite_disjoint(scenario_id, seed, n_threads, ops_per_thread).await,
         )
     };
 
@@ -550,22 +560,30 @@ fn verify_csqlite_integrity(path: &str) -> bool {
 
 #[test]
 fn f1_disjoint_fairness_2t() {
-    run_fairness_scenario("F1", SEED_F1, 2, OPS_PER_THREAD, false);
+    asupersync::test_utils::run_test(|| async {
+        run_fairness_scenario("F1", SEED_F1, 2, OPS_PER_THREAD, false).await;
+    });
 }
 
 #[test]
 fn f2_disjoint_fairness_4t() {
-    run_fairness_scenario("F2", SEED_F2, 4, OPS_PER_THREAD, false);
+    asupersync::test_utils::run_test(|| async {
+        run_fairness_scenario("F2", SEED_F2, 4, OPS_PER_THREAD, false).await;
+    });
 }
 
 #[test]
 fn f3_disjoint_fairness_8t() {
-    run_fairness_scenario("F3", SEED_F3, 8, OPS_PER_THREAD, false);
+    asupersync::test_utils::run_test(|| async {
+        run_fairness_scenario("F3", SEED_F3, 8, OPS_PER_THREAD, false).await;
+    });
 }
 
 #[test]
 fn f4_hot_page_fairness_4t() {
-    run_fairness_scenario("F4", SEED_F4, 4, HOT_PAGE_OPS, true);
+    asupersync::test_utils::run_test(|| async {
+        run_fairness_scenario("F4", SEED_F4, 4, HOT_PAGE_OPS, true).await;
+    });
 }
 
 // ─── D-scenarios: durability ─────────────────────────────────────────
@@ -918,100 +936,105 @@ fn s1_scaling_curve() {
 
 #[test]
 fn fsqlite_sequential_correctness_4t() {
-    let scenario_id = "FS1";
-    let n_threads = 4;
-    let ops_per_thread = 500u64;
+    asupersync::test_utils::run_test(|| async {
+        let scenario_id = "FS1";
+        let n_threads = 4;
+        let ops_per_thread = 500u64;
 
-    emit_log(
-        scenario_id,
-        SEED_F2,
-        "start",
-        json!({"test": "fsqlite_sequential_correctness"}),
-    );
-
-    let conn = fsqlite::Connection::open(":memory:").expect("open");
-    conn.execute(
-        "CREATE TABLE fairness_bench (id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, val INTEGER NOT NULL)",
-    )
-    .expect("create");
-
-    let wall_start = Instant::now();
-    let mut per_thread_ops = Vec::new();
-    let mut per_thread_ns = Vec::new();
-
-    for tid in 0..n_threads {
-        let t_start = Instant::now();
-        let base = (tid as u64) * RANGE_SIZE;
-        conn.execute("BEGIN").expect("begin");
-        for i in 0..ops_per_thread {
-            conn.execute(&format!(
-                "INSERT INTO fairness_bench (id, thread_id, val) VALUES ({}, {tid}, {})",
-                base + i,
-                i * 7 + 13
-            ))
-            .expect("insert");
-        }
-        conn.execute("COMMIT").expect("commit");
-        per_thread_ops.push(ops_per_thread);
-        per_thread_ns.push(t_start.elapsed().as_nanos() as u64);
-    }
-
-    let total_wall_ns = wall_start.elapsed().as_nanos() as u64;
-
-    // Verify final state
-    let rows = conn
-        .query("SELECT COUNT(*) FROM fairness_bench")
-        .expect("count");
-    let count = match &rows[0].values()[0] {
-        fsqlite_types::value::SqliteValue::Integer(n) => *n,
-        other => panic!("unexpected: {other:?}"),
-    };
-    assert_eq!(
-        count as u64,
-        n_threads as u64 * ops_per_thread,
-        "fsqlite row count mismatch"
-    );
-
-    // Verify per-thread data integrity: each thread's rows should have correct thread_id
-    for tid in 0..n_threads {
-        let base = (tid as u64) * RANGE_SIZE;
-        let q = format!(
-            "SELECT COUNT(*) FROM fairness_bench WHERE id >= {base} AND id < {} AND thread_id = {tid}",
-            base + ops_per_thread
+        emit_log(
+            scenario_id,
+            SEED_F2,
+            "start",
+            json!({"test": "fsqlite_sequential_correctness"}),
         );
-        let r = conn.query(&q).expect("thread count");
-        let tc = match &r[0].values()[0] {
+
+        let conn = fsqlite::Connection::open(":memory:").await.expect("open");
+        conn.execute(
+            "CREATE TABLE fairness_bench (id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, val INTEGER NOT NULL)",
+        )
+        .await
+        .expect("create");
+
+        let wall_start = Instant::now();
+        let mut per_thread_ops = Vec::new();
+        let mut per_thread_ns = Vec::new();
+
+        for tid in 0..n_threads {
+            let t_start = Instant::now();
+            let base = (tid as u64) * RANGE_SIZE;
+            conn.execute("BEGIN").await.expect("begin");
+            for i in 0..ops_per_thread {
+                conn.execute(&format!(
+                    "INSERT INTO fairness_bench (id, thread_id, val) VALUES ({}, {tid}, {})",
+                    base + i,
+                    i * 7 + 13
+                ))
+                .await
+                .expect("insert");
+            }
+            conn.execute("COMMIT").await.expect("commit");
+            per_thread_ops.push(ops_per_thread);
+            per_thread_ns.push(t_start.elapsed().as_nanos() as u64);
+        }
+
+        let total_wall_ns = wall_start.elapsed().as_nanos() as u64;
+
+        // Verify final state
+        let rows = conn
+            .query("SELECT COUNT(*) FROM fairness_bench")
+            .await
+            .expect("count");
+        let count = match &rows[0].values()[0] {
             fsqlite_types::value::SqliteValue::Integer(n) => *n,
             other => panic!("unexpected: {other:?}"),
         };
         assert_eq!(
-            tc as u64, ops_per_thread,
-            "thread {tid} row count mismatch: got {tc}"
+            count as u64,
+            n_threads as u64 * ops_per_thread,
+            "fsqlite row count mismatch"
         );
-    }
 
-    let jfi = jains_fairness_index(
-        &per_thread_ns
-            .iter()
-            .map(|&ns| ns as f64)
-            .collect::<Vec<_>>(),
-    );
+        // Verify per-thread data integrity: each thread's rows should have correct thread_id
+        for tid in 0..n_threads {
+            let base = (tid as u64) * RANGE_SIZE;
+            let q = format!(
+                "SELECT COUNT(*) FROM fairness_bench WHERE id >= {base} AND id < {} AND thread_id = {tid}",
+                base + ops_per_thread
+            );
+            let r = conn.query(&q).await.expect("thread count");
+            let tc = match &r[0].values()[0] {
+                fsqlite_types::value::SqliteValue::Integer(n) => *n,
+                other => panic!("unexpected: {other:?}"),
+            };
+            assert_eq!(
+                tc as u64, ops_per_thread,
+                "thread {tid} row count mismatch: got {tc}"
+            );
+        }
 
-    emit_log(
-        scenario_id,
-        SEED_F2,
-        "result",
-        json!({
-            "backend": "fsqlite",
-            "writer_count": n_threads,
-            "per_thread_ops": per_thread_ops,
-            "per_thread_ns": per_thread_ns,
-            "total_ops": count,
-            "wall_ns": total_wall_ns,
-            "jains_fairness_index": jfi,
-            "data_integrity_verified": true,
-        }),
-    );
+        let jfi = jains_fairness_index(
+            &per_thread_ns
+                .iter()
+                .map(|&ns| ns as f64)
+                .collect::<Vec<_>>(),
+        );
+
+        emit_log(
+            scenario_id,
+            SEED_F2,
+            "result",
+            json!({
+                "backend": "fsqlite",
+                "writer_count": n_threads,
+                "per_thread_ops": per_thread_ops,
+                "per_thread_ns": per_thread_ns,
+                "total_ops": count,
+                "wall_ns": total_wall_ns,
+                "jains_fairness_index": jfi,
+                "data_integrity_verified": true,
+            }),
+        );
+    });
 }
 
 // ─── Jain's fairness index unit tests ────────────────────────────────

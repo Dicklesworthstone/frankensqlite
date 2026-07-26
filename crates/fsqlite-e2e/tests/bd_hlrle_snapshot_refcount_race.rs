@@ -468,7 +468,9 @@ fn s6_mixed_long_short_txn_lifetimes() {
         let long_reader = std::thread::spawn(move || {
             let mut snapshots_held = 0u64;
             asupersync::test_utils::run_test(|| async {
-                let conn = Connection::open(&path_long).await.expect("long reader open");
+                let conn = Connection::open(&path_long)
+                    .await
+                    .expect("long reader open");
                 while !long_stop.load(Ordering::Relaxed) {
                     if conn.execute("BEGIN").await.is_ok() {
                         // Read then hold the snapshot for a bit
@@ -525,6 +527,8 @@ fn s6_mixed_long_short_txn_lifetimes() {
         let verify = Connection::open(path_str).await.expect("verify");
         let rows = verify.query("SELECT * FROM kv").await.expect("count").len();
         assert!(rows > 0, "no data survived mixed txn lifetimes");
-        eprintln!("S6: {snapshots} long snapshots, {total_written} short writes, {rows} final rows");
+        eprintln!(
+            "S6: {snapshots} long snapshots, {total_written} short writes, {rows} final rows"
+        );
     });
 }

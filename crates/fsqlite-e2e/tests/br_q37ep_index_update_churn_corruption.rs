@@ -169,13 +169,7 @@ async fn churn_delete_reinsert_with_overflow(rows: i64, cycles: i64) {
         let big = "x".repeat(900);
 
         let mut next_id: i64 = 1;
-        async fn seed(
-            conn: &fsqlite::Connection,
-            states: &[&str],
-            big: &str,
-            from: i64,
-            to: i64,
-        ) {
+        async fn seed(conn: &fsqlite::Connection, states: &[&str], big: &str, from: i64, to: i64) {
             let mut chunk = String::new();
             for id in from..to {
                 if !chunk.is_empty() {
@@ -918,9 +912,11 @@ fn gh289_post_stock_vacuum_stress(seed_rows: i64, transactions: i64, readers: us
 
                 for rollback in 0..3_i64 {
                     let ordinal = 10_000_000 + transaction * 10 + rollback;
-                    conn.execute("BEGIN IMMEDIATE").await.unwrap_or_else(|error| {
-                        panic!("GH#289 txn {transaction} rollback {rollback} begin: {error}")
-                    });
+                    conn.execute("BEGIN IMMEDIATE")
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("GH#289 txn {transaction} rollback {rollback} begin: {error}")
+                        });
                     gh289_insert_target_row(&conn, ordinal, &payload).await;
                     conn.execute("ROLLBACK").await.unwrap_or_else(|error| {
                         panic!("GH#289 txn {transaction} rollback {rollback}: {error}")
@@ -1184,9 +1180,10 @@ async fn cc_writer(
             }
             if !chunk.is_empty() {
                 let stmt = format!("INSERT INTO atc_experiences(id,state,payload) VALUES {chunk}");
-                cc_with_retry(&format!("reinsert tail w{writer_id} r{round}"), async || {
-                    conn.execute(&stmt).await.map(|_| ())
-                })
+                cc_with_retry(
+                    &format!("reinsert tail w{writer_id} r{round}"),
+                    async || conn.execute(&stmt).await.map(|_| ()),
+                )
                 .await?;
             }
         }
@@ -1248,7 +1245,8 @@ async fn concurrent_shared_index_churn(writers: usize, rows: i64, rounds: i64, w
             let errors = std::sync::Arc::clone(&errors);
             std::thread::spawn(move || {
                 asupersync::test_utils::run_test(|| async {
-                    if let Err(e) = cc_writer(&path, w, writers, rows, rounds, wal, &barrier).await {
+                    if let Err(e) = cc_writer(&path, w, writers, rows, rounds, wal, &barrier).await
+                    {
                         eprintln!("[cc writer {w}] FAILED: {e}");
                         errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
