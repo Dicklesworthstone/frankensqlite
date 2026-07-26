@@ -65,18 +65,41 @@ workload shape (bd-nhc6g).
 | Engine | Merge outcome | DB size after | `integrity_check` |
 |---|---|---|---|
 | fsqlite **0.1.12** | **aborts** mid-merge with the malformed-image error above | 19 MB → 25 MB (partial) | **corrupt** |
+| fsqlite **v0.1.18** tag | **completes** | — | **ok** |
 | fsqlite **v0.1.19** tag | **completes**: *"Base snapshot updated. JSONL exported."* | 19 MB → 34 MB | **ok** |
 
-v0.1.19 is not merely avoiding the fault — it finishes strictly more work than
-the run that corrupts, and 8 issue rows carry fresh `updated_at` timestamps
-afterwards, so this is not a short-circuit.
+The clean engines are not merely avoiding the fault — they finish strictly more
+work than the run that corrupts, and 8 issue rows carry fresh `updated_at`
+timestamps afterwards, so this is not a short-circuit.
 
-**This does not prove the balance defect is repaired.** The v0.1.19 diff
-contains no `fsqlite-btree` changes at all, so the likelier reading is that a
-DML-lowering or execution change stopped *reaching* the faulty balance path —
-masked rather than fixed, and able to resurface under a different write shape.
-Supportable wording is "v0.1.19 passes the bd-105ga reproducer", not
-"v0.1.19 fixes the corruption".
+**v0.1.18 being clean corrects the original bound.** bd-105ga recorded the
+defect as "present in published 0.1.12–0.1.18"; the upper end is wrong. The
+change that stops it landed *between* 0.1.12 and 0.1.18, and therefore not in
+the v0.1.19 squash — an earlier reading of that squash was a false lead.
+
+Candidate fixes, by first containing tag (btree commits in `v0.1.12..v0.1.18`):
+
+| Tag | Commit | Subject |
+|---|---|---|
+| v0.1.16 | `3e81ad0a` | rebuild rootless cursor path before delete so REPLACE churn stays stock-SQLite-canonical (bd-kwei8) |
+| v0.1.16 | `d1a543e3` | rebuild rootless cursor path before INSERT OR REPLACE, matching the delete-path guard (bd-kwei8) |
+| v0.1.16 | `e021f1f7` | retain old overflow until balance succeeds |
+| v0.1.17 | `c57499fb` | harden mutation paths against rootless cursors |
+
+The bd-kwei8 "rootless cursor" series is the prime candidate: a cursor that has
+lost its root path is exactly the shape that yields descent-vs-scan
+disagreement and out-of-order cells on an interior root, and those commits
+specifically target `INSERT OR REPLACE` and delete churn — the merge's write
+mix.
+
+### Is `main` affected?
+
+Not directly testable through `br`, which is sync while `main` is async. What is
+known: `v0.1.18` is an ancestor of `main` and all four candidate fixes above are
+ancestors of `main`, so `main` inherits them. However **6 btree commits landed
+on `main` after `v0.1.18`** (async migration), and none has been exercised
+against this reproducer. Treat `main` as un-verified rather than known-good
+until the engine-level reproducer in bd-nhc6g exists.
 
 ## Why the statement stream is a dead end
 
