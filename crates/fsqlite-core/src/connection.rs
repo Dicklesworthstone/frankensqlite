@@ -394,6 +394,25 @@ const MAX_TRIGGER_DEPTH: usize = 8;
 const MAX_FK_CASCADE_DEPTH: usize = 50;
 
 static FSQLITE_HOT_PATH_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Opt-in for the per-column INSERT preserialize sub-timers.
+///
+/// The insert preserialize path can time seven nested regions per row
+/// (`row_build`, `preserialize`, `cell_build`, `eval`, `affinity`, `layout`,
+/// `encode`). One region is `Instant::now()` + `elapsed()` (a second clock read)
+/// + an `AtomicU64::fetch_add`, measured at ~55 ns on this hardware; seven cost
+/// ~360 ns/row. A `tiny_1col` row's *entire* reported `row_build_ns` is
+/// ~139 ns/row, so with all seven armed the observer is ~2.6x the quantity it
+/// reports, and because the regions nest, the outer counters absorb the inner
+/// counters' clock cost — which is why `row_build_ns` ranked as the largest
+/// component of the small-N write gap and why that profile concluded "no single
+/// fat component" (bd-he3ua).
+///
+/// So the sub-timers are OFF unless `FSQLITE_DML_PROFILE_DEEP` is set, leaving
+/// one timed region per row (~55 ns, ~6.5% of a ~850 ns row) in the default
+/// profile. Deep mode is for wide/large rows where ~360 ns/row amortizes; its
+/// component attribution is not trustworthy for rows under ~2 us.
+static FSQLITE_DML_PROFILE_DEEP_ENABLED: OnceLock<bool> = OnceLock::new();
 #[cfg(test)]
 thread_local! {
     // Thread-local override for hot-path profiling. When `Some(true)`, profiling
@@ -1027,6 +1046,21 @@ pub fn set_hot_path_profile_enabled(enabled: bool) {
         set_vdbe_metrics_enabled(enabled);
         fsqlite_pager::set_pager_commit_profile_enabled(enabled);
     }
+}
+
+/// Whether the per-column INSERT preserialize sub-timers are armed.
+///
+/// Cached in a `OnceLock` rather than read per call: every other env read on a
+/// hot path in this workspace is already behind one, and an uncached
+/// `std::env::var` here would itself be a per-row cost on the path this flag
+/// exists to keep cheap.
+#[inline]
+fn dml_profile_deep_enabled() -> bool {
+    *FSQLITE_DML_PROFILE_DEEP_ENABLED.get_or_init(|| {
+        std::env::var("FSQLITE_DML_PROFILE_DEEP")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 #[inline]
@@ -20754,7 +20788,11 @@ impl Connection {
                     let mut record_scratch =
                         self.prepared_direct_insert_record_scratch.borrow_mut();
                     let mut text_scratch = self.prepared_direct_insert_text_scratch.borrow_mut();
-                    let preserialize_start = profile_enabled.then(Instant::now);
+                    // Deep-only: `row_build_ns` below already brackets this
+                    // region, so timing it again in the default profile doubles
+                    // the per-row clock cost without adding attribution (bd-he3ua).
+                    let preserialize_start =
+                        (profile_enabled && dml_profile_deep_enabled()).then(Instant::now);
                     let preserialize_result =
                         Self::try_serialize_prepared_direct_simple_insert_record(
                             table_name,
@@ -22453,7 +22491,10 @@ impl Connection {
                 direct.columns.len()
             )));
         }
-        let cell_build_start = profile_enabled.then(Instant::now);
+        // Per-column sub-timers only under deep mode: at ~55 ns per timed region
+        // they otherwise cost more than the row they measure (bd-he3ua).
+        let deep_profile = profile_enabled && dml_profile_deep_enabled();
+        let cell_build_start = deep_profile.then(Instant::now);
         text_scratch.clear();
         let mut param_one_integer_buffer = itoa::Buffer::new();
         let cached_param_one_integer_text = match params.and_then(|values| values.first()) {
@@ -22476,13 +22517,13 @@ impl Connection {
         {
             let is_rowid_alias = column.is_ipk || direct.rowid_alias_col_idx == Some(col_idx);
             if is_rowid_alias {
-                let eval_start = profile_enabled.then(Instant::now);
+                let eval_start = deep_profile.then(Instant::now);
                 let raw_value = Self::eval_prepared_direct_simple_insert_expr(expr, params, None)?;
                 if let Some(elapsed_ns) = hot_path_elapsed_ns(eval_start) {
                     eval_time_ns = eval_time_ns.saturating_add(elapsed_ns);
                 }
                 explicit_rowid = Self::coerce_insert_rowid_value(&raw_value)?;
-                let layout_start = profile_enabled.then(Instant::now);
+                let layout_start = deep_profile.then(Instant::now);
                 let cell =
                     Self::prepared_direct_insert_record_cell(PreparedDirectInsertRecordValue::Null);
                 header_content_size += varint_len(cell.serial_type);
@@ -22494,7 +22535,7 @@ impl Connection {
                 continue;
             }
 
-            let eval_start = profile_enabled.then(Instant::now);
+            let eval_start = deep_profile.then(Instant::now);
             let raw_value = Self::try_eval_prepared_direct_insert_record_value(
                 expr,
                 params,
@@ -22511,7 +22552,7 @@ impl Connection {
                 });
             }
             let affinity = Self::type_affinity_for_direct_insert(column.affinity);
-            let affinity_start = profile_enabled.then(Instant::now);
+            let affinity_start = deep_profile.then(Instant::now);
             let value = Self::apply_prepared_direct_insert_record_affinity(
                 raw_value,
                 affinity,
@@ -22527,7 +22568,7 @@ impl Connection {
             if let Some(elapsed_ns) = affinity_elapsed_ns {
                 affinity_time_ns = affinity_time_ns.saturating_add(elapsed_ns);
             }
-            let layout_start = profile_enabled.then(Instant::now);
+            let layout_start = deep_profile.then(Instant::now);
             let cell = Self::prepared_direct_insert_record_cell(value);
             header_content_size += varint_len(cell.serial_type);
             body_size += cell.payload_len;
@@ -22538,7 +22579,7 @@ impl Connection {
         }
 
         let cell_build_elapsed_ns = hot_path_elapsed_ns(cell_build_start);
-        if profile_enabled {
+        if deep_profile {
             record_hot_path_elapsed_ns(
                 &FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_EVAL_TIME_NS,
                 Some(eval_time_ns),
@@ -22556,7 +22597,7 @@ impl Connection {
             &FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_CELL_TIME_NS,
             cell_build_elapsed_ns,
         );
-        let encode_start = profile_enabled.then(Instant::now);
+        let encode_start = deep_profile.then(Instant::now);
         Self::serialize_prepared_direct_insert_record_cells_into(
             cells.as_slice(),
             header_content_size,

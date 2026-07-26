@@ -1087,13 +1087,12 @@ impl<F: VfsFile> WalFile<F> {
             &format!("start_frame={start_frame_index} frame_count={frame_count}"),
         )?;
 
+        preflight.hand_off();
         if let Some(completion) = completion {
-            preflight.hand_off();
             self.file
                 .write_tracked(cx, prepared_frame_bytes, offset, completion.clone())
                 .await?;
         } else {
-            preflight.hand_off();
             self.file.write(cx, prepared_frame_bytes, offset).await?;
         }
         self.advance_state_after_write(frame_count, final_running_checksum)?;
