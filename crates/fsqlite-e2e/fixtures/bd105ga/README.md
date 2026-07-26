@@ -48,19 +48,32 @@ only variable is the linked engine — same input, same `.beads/`, same command,
 same host. To test any sync-API engine revision:
 
 ```bash
-git worktree add --detach /tmp/fsq-<rev> <rev>          # e.g. v0.1.18, v0.1.19
-# in a copy of the br source tree, replace [patch.crates-io] with one line per
-# fsqlite crate pointing at /tmp/fsq-<rev>/crates/<crate>, then:
+git worktree add --detach /tmp/fsq-<rev> <rev>          # e.g. v0.1.15, v0.1.18
+# in a copy of the br source tree:
+#   1. rewrite every `fsqlite* = "0.1.18"` dependency line to `= "=<rev-version>"`
+#   2. replace [patch.crates-io] with one line per fsqlite crate pointing at
+#      /tmp/fsq-<rev>/crates/<crate>
 cargo +nightly build --release --bin br
+# 3. VERIFY before trusting any result:
+grep "was not used in the crate graph" build.log      # must find nothing
+strings target/release/br | grep fsq-<rev>/crates/fsqlite-core   # must match
 ```
 
-Two gotchas worth knowing. First, `br` pins an older toolchain in its own
-`rust-toolchain.toml`, which fails to build current `sysinfo`; the `+nightly`
-override above is what makes it build. Second, patch every fsqlite crate, not
-just `fsqlite-core` — patching one leaves the rest resolving to crates.io at a
-different version. This does **not** work for `main`, which is async while `br`
-is sync; testing `main` needs an engine-level reproducer built from the merge
-workload shape (bd-nhc6g).
+Three gotchas, the third of which silently produces confident wrong answers:
+
+1. `br` pins an older toolchain in its own `rust-toolchain.toml` that cannot
+   build current `sysinfo`; the `+nightly` override is what makes it build.
+2. Patch every fsqlite crate, not just `fsqlite-core`, or the rest resolve to
+   crates.io at a different version.
+3. **`[patch.crates-io]` is only honoured when the patched version satisfies the
+   dependency requirement.** `br` requires `fsqlite = "0.1.18"`, so patching in
+   an *older* tree (0.1.15, 0.1.16…) is silently **discarded** — cargo emits
+   only a `patch ... was not used in the crate graph` warning and builds
+   crates.io 0.1.18 instead. Without step 1 and the verification in step 3, a
+   test of an old revision actually measures 0.1.18 and reports it as clean.
+
+None of this works for `main`, which is async while `br` is sync; testing `main`
+needs an engine-level reproducer built from the merge workload shape (bd-nhc6g).
 
 | Engine | Merge outcome | DB size after | `integrity_check` |
 |---|---|---|---|
