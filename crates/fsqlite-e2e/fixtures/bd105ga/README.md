@@ -45,7 +45,22 @@ semantic conflicts before writing anything).
 
 `br` compiles unmodified against both engines (both are the sync API), so the
 only variable is the linked engine — same input, same `.beads/`, same command,
-same host. Point `[patch.crates-io]` at a tag worktree to reproduce:
+same host. To test any sync-API engine revision:
+
+```bash
+git worktree add --detach /tmp/fsq-<rev> <rev>          # e.g. v0.1.18, v0.1.19
+# in a copy of the br source tree, replace [patch.crates-io] with one line per
+# fsqlite crate pointing at /tmp/fsq-<rev>/crates/<crate>, then:
+cargo +nightly build --release --bin br
+```
+
+Two gotchas worth knowing. First, `br` pins an older toolchain in its own
+`rust-toolchain.toml`, which fails to build current `sysinfo`; the `+nightly`
+override above is what makes it build. Second, patch every fsqlite crate, not
+just `fsqlite-core` — patching one leaves the rest resolving to crates.io at a
+different version. This does **not** work for `main`, which is async while `br`
+is sync; testing `main` needs an engine-level reproducer built from the merge
+workload shape (bd-nhc6g).
 
 | Engine | Merge outcome | DB size after | `integrity_check` |
 |---|---|---|---|
