@@ -36,7 +36,7 @@
 //! ## CLI
 //!
 //! ```text
-//! mt-mvcc-bench [--rows-per-thread=1000] [--threads=1,2,4,8,16] [--iters=3]
+//! mt-mvcc-bench [--rows-per-thread=1000] [--threads=1,2,4,8,16] [--iters=21]
 //! [--json-output=PATH] [--summary-md=PATH]
 //! [--separate-tables]
 //! ```
@@ -52,10 +52,13 @@
 //!   and reopening the whole transaction, up to `MAX_RETRIES`; hard row-level
 //!   failures are counted in `failed_rows` and included in the report so you
 //!   can tell when the numbers are bogus.
-//! * Each iteration creates a fresh tempfile so there's no state carried
-//!   across runs. `--iters=3` reports p50/p95/p99 across those 3 samples.
+//! * Each paired round creates fresh tempfiles so no database state carries
+//!   across runs. Every F/C claim is preceded by a same-invocation interleaved
+//!   C/C A/A null. The verdict uses a bootstrap CI for the per-round median
+//!   ratio; CV and MAD are provenance only.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -67,12 +70,14 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 // ─── Defaults ─────────────────────────────────────────────────────────────
 
 const DEFAULT_ROWS_PER_THREAD: usize = 1_000;
 const DEFAULT_THREADS: &[usize] = &[1, 2, 4, 8, 16];
-const DEFAULT_ITERS: usize = 3;
+const DEFAULT_ITERS: usize = 21;
+const CONTRACT_BOOTSTRAP_REPS: usize = 10_000;
 const DEFAULT_HISTORY_JSON: &str = ".bench-history/mt-mvcc-bench.latest.json";
 const DEFAULT_SEPARATE_TABLES_HISTORY_JSON: &str =
     ".bench-history/mt-mvcc-bench.separate-tables.latest.json";
@@ -85,7 +90,44 @@ const SHARED_INSERT_SQL: &str = "INSERT INTO bench (id, payload) VALUES (?1, ?2)
 const STARTUP_COORDINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const PASS_OVER_PASS_SCHEMA_V1: &str = "fsqlite-e2e.mt_mvcc_bench.pass_over_pass.v1";
 const PASS_OVER_PASS_MAX_RATIO_DROP_PCT: f64 = 5.0;
-const REPORT_SCHEMA_V3: &str = "fsqlite-e2e.mt_mvcc_bench_report.v3";
+const REPORT_SCHEMA_V4: &str = "fsqlite-e2e.mt_mvcc_bench_report.v4";
+
+fn bytes_to_lower_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
+}
+
+fn file_identity(path: &Path) -> String {
+    let Ok(bytes) = fs::read(path) else {
+        return format!("unavailable:{}", path.display());
+    };
+    let digest = Sha256::digest(&bytes);
+    format!(
+        "{}:{}:{}",
+        path.display(),
+        bytes_to_lower_hex(&digest),
+        bytes.len()
+    )
+}
+
+fn self_identity() -> String {
+    let Ok(path) = std::env::current_exe() else {
+        return "unavailable current_exe".to_owned();
+    };
+    let Ok(bytes) = fs::read(&path) else {
+        return format!("unavailable read_error {}", path.display());
+    };
+    let digest = Sha256::digest(&bytes);
+    format!(
+        "{} ({} bytes) {}",
+        bytes_to_lower_hex(&digest),
+        bytes.len(),
+        path.display()
+    )
+}
 
 // ─── CLI parsing (manual — no clap in workspace) ─────────────────────────
 
@@ -291,6 +333,41 @@ impl RunStats {
     }
 }
 
+#[derive(Debug, Clone)]
+struct RatioStats {
+    median: f64,
+    ci95: (f64, f64),
+    cv_pct: f64,
+    mad: f64,
+}
+
+#[derive(Debug, Clone)]
+struct PairedRunStats {
+    arm_a: RunStats,
+    arm_b: RunStats,
+    ratio: RatioStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct MedianCiContractReport {
+    null_ratio_median: f64,
+    null_ratio_ci95_low: f64,
+    null_ratio_ci95_high: f64,
+    null_ratio_cv_pct: f64,
+    null_ratio_mad: f64,
+    claim_ratio_median: f64,
+    claim_ratio_ci95_low: f64,
+    claim_ratio_ci95_high: f64,
+    claim_ratio_cv_pct: f64,
+    claim_ratio_mad: f64,
+    null_radius: f64,
+    min_decidable_gain: f64,
+    max_decidable_regression: f64,
+    claim_margin: f64,
+    cv_gate: String,
+    verdict: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct ThreadComparisonReport {
     threads: usize,
@@ -310,6 +387,8 @@ struct ThreadComparisonReport {
     time_ratio: f64,
     fsqlite_failed_rows: usize,
     sqlite_failed_rows: usize,
+    #[serde(default)]
+    median_ci_contract: Option<MedianCiContractReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -404,18 +483,157 @@ struct StartupGateState {
     abort: bool,
 }
 
-fn build_thread_report(
-    threads: usize,
-    fsqlite: &RunStats,
-    sqlite: &RunStats,
-) -> ThreadComparisonReport {
-    let fsqlite_wps_p50 = fsqlite.p50_writes_per_sec();
-    let sqlite_wps_p50 = sqlite.p50_writes_per_sec();
-    let throughput_ratio = if sqlite_wps_p50 > 0.0 {
-        fsqlite_wps_p50 / sqlite_wps_p50
+fn median(values: &mut [f64]) -> f64 {
+    assert!(!values.is_empty(), "median requires at least one sample");
+    values.sort_by(f64::total_cmp);
+    let upper = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[upper - 1] + values[upper]) / 2.0
+    } else {
+        values[upper]
+    }
+}
+
+fn bootstrap_median_ci95(ratios: &[f64]) -> (f64, f64) {
+    assert!(!ratios.is_empty(), "bootstrap requires at least one sample");
+    let mut state = 0x7a25_2026_c011_cafe_u64;
+    let mut bootstrap_medians = Vec::with_capacity(CONTRACT_BOOTSTRAP_REPS);
+    let mut resample = vec![0.0; ratios.len()];
+    let len_u64 = u64::try_from(ratios.len()).expect("sample count fits in u64");
+
+    for _ in 0..CONTRACT_BOOTSTRAP_REPS {
+        for value in &mut resample {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let index = usize::try_from(state % len_u64).expect("sample index fits in usize");
+            *value = ratios[index];
+        }
+        bootstrap_medians.push(median(&mut resample));
+    }
+
+    bootstrap_medians.sort_by(f64::total_cmp);
+    let low = CONTRACT_BOOTSTRAP_REPS * 25 / 1_000;
+    let high = (CONTRACT_BOOTSTRAP_REPS * 975 / 1_000).min(CONTRACT_BOOTSTRAP_REPS - 1);
+    (bootstrap_medians[low], bootstrap_medians[high])
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn ratio_stats(ratios: &[f64]) -> RatioStats {
+    let mut ratios_for_median = ratios.to_vec();
+    let ratio_median = median(&mut ratios_for_median);
+    let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+    let variance = if ratios.len() > 1 {
+        ratios
+            .iter()
+            .map(|ratio| (ratio - mean).powi(2))
+            .sum::<f64>()
+            / (ratios.len() - 1) as f64
     } else {
         0.0
     };
+    let cv_pct = if mean == 0.0 {
+        0.0
+    } else {
+        variance.sqrt() / mean.abs() * 100.0
+    };
+    let mut deviations = ratios
+        .iter()
+        .map(|ratio| (ratio - ratio_median).abs())
+        .collect::<Vec<_>>();
+
+    RatioStats {
+        median: ratio_median,
+        ci95: bootstrap_median_ci95(ratios),
+        cv_pct,
+        mad: median(&mut deviations),
+    }
+}
+
+fn paired_run_stats(arm_a: Vec<RunResult>, arm_b: Vec<RunResult>) -> PairedRunStats {
+    assert_eq!(
+        arm_a.len(),
+        arm_b.len(),
+        "paired arms must contain the same number of rounds"
+    );
+    assert!(!arm_a.is_empty(), "paired run requires at least one round");
+    let ratios = arm_a
+        .iter()
+        .zip(&arm_b)
+        .map(|(baseline, candidate)| {
+            assert_eq!(
+                baseline.total_rows, candidate.total_rows,
+                "paired arms must execute equal total work"
+            );
+            baseline.best_elapsed.as_secs_f64()
+                / candidate.best_elapsed.as_secs_f64().max(f64::EPSILON)
+        })
+        .collect::<Vec<_>>();
+
+    PairedRunStats {
+        arm_a: RunStats::new(arm_a),
+        arm_b: RunStats::new(arm_b),
+        ratio: ratio_stats(&ratios),
+    }
+}
+
+fn median_ci_contract(null: &PairedRunStats, claim: &PairedRunStats) -> MedianCiContractReport {
+    let null_radius = (null.ratio.ci95.0 - 1.0)
+        .abs()
+        .max((null.ratio.ci95.1 - 1.0).abs());
+    let decisive_effect = (2.0 * null_radius).max(0.01);
+    let min_decidable_gain = 1.0 + decisive_effect;
+    let max_decidable_regression = 1.0 - decisive_effect;
+    let claim_effect = (claim.ratio.median - 1.0).abs();
+    let claim_margin = if null_radius == 0.0 {
+        f64::INFINITY
+    } else {
+        claim_effect / null_radius
+    };
+    let failed_rows = null.arm_a.total_failed_rows()
+        + null.arm_b.total_failed_rows()
+        + claim.arm_a.total_failed_rows()
+        + claim.arm_b.total_failed_rows();
+    let verdict = if failed_rows != 0 {
+        "INVALID_FAILED_ROWS"
+    } else if claim.ratio.ci95.0 > min_decidable_gain {
+        "FSQLITE_FASTER"
+    } else if claim.ratio.ci95.1 < max_decidable_regression {
+        "FSQLITE_SLOWER"
+    } else {
+        "INCONCLUSIVE"
+    };
+
+    MedianCiContractReport {
+        null_ratio_median: null.ratio.median,
+        null_ratio_ci95_low: null.ratio.ci95.0,
+        null_ratio_ci95_high: null.ratio.ci95.1,
+        null_ratio_cv_pct: null.ratio.cv_pct,
+        null_ratio_mad: null.ratio.mad,
+        claim_ratio_median: claim.ratio.median,
+        claim_ratio_ci95_low: claim.ratio.ci95.0,
+        claim_ratio_ci95_high: claim.ratio.ci95.1,
+        claim_ratio_cv_pct: claim.ratio.cv_pct,
+        claim_ratio_mad: claim.ratio.mad,
+        null_radius,
+        min_decidable_gain,
+        max_decidable_regression,
+        claim_margin,
+        cv_gate: "never".to_owned(),
+        verdict: verdict.to_owned(),
+    }
+}
+
+fn build_thread_report(
+    threads: usize,
+    null: &PairedRunStats,
+    claim: &PairedRunStats,
+) -> ThreadComparisonReport {
+    let sqlite = &claim.arm_a;
+    let fsqlite = &claim.arm_b;
+    let fsqlite_wps_p50 = fsqlite.p50_writes_per_sec();
+    let sqlite_wps_p50 = sqlite.p50_writes_per_sec();
+    let throughput_ratio = claim.ratio.median;
     let fsqlite_ms_p50 = fsqlite.p50_elapsed_ms();
     let sqlite_ms_p50 = sqlite.p50_elapsed_ms();
     let time_ratio = if sqlite_ms_p50 > 0.0 {
@@ -442,6 +660,7 @@ fn build_thread_report(
         time_ratio,
         fsqlite_failed_rows: fsqlite.total_failed_rows(),
         sqlite_failed_rows: sqlite.total_failed_rows(),
+        median_ci_contract: Some(median_ci_contract(null, claim)),
     }
 }
 
@@ -482,23 +701,45 @@ fn render_markdown_summary(report: &MtMvccBenchReport) -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "| Threads | fsqlite p50 wps | sqlite p50 wps | Throughput ratio | fsqlite p50 ms | sqlite p50 ms | Time ratio | fsqlite failed | sqlite failed |"
+        "| Threads | fsqlite p50 wps | sqlite p50 wps | F/C median | F/C median CI95 | C/C A/A CI95 | Verdict | fsqlite failed | sqlite failed |"
     );
     let _ = writeln!(
         out,
-        "|---------|-----------------:|---------------:|-----------------:|---------------:|--------------:|-----------:|---------------:|--------------:|"
+        "|---------|-----------------:|---------------:|-----------:|----------------:|-------------:|:--------|---------------:|--------------:|"
     );
     for row in &report.thread_results {
+        let (claim_ci, null_ci, verdict) = row.median_ci_contract.as_ref().map_or_else(
+            || {
+                (
+                    "unavailable".to_owned(),
+                    "unavailable".to_owned(),
+                    "unavailable",
+                )
+            },
+            |contract| {
+                (
+                    format!(
+                        "[{:.3}, {:.3}]",
+                        contract.claim_ratio_ci95_low, contract.claim_ratio_ci95_high
+                    ),
+                    format!(
+                        "[{:.3}, {:.3}]",
+                        contract.null_ratio_ci95_low, contract.null_ratio_ci95_high
+                    ),
+                    contract.verdict.as_str(),
+                )
+            },
+        );
         let _ = writeln!(
             out,
-            "| {} | {:.0} | {:.0} | {:.2}x | {:.2} | {:.2} | {:.2}x | {} | {} |",
+            "| {} | {:.0} | {:.0} | {:.3}x | {} | {} | {} | {} | {} |",
             row.threads,
             row.fsqlite_wps_p50,
             row.sqlite_wps_p50,
             row.throughput_ratio,
-            row.fsqlite_ms_p50,
-            row.sqlite_ms_p50,
-            row.time_ratio,
+            claim_ci,
+            null_ci,
+            verdict,
             row.fsqlite_failed_rows,
             row.sqlite_failed_rows
         );
@@ -687,6 +928,16 @@ fn percentile_value(mut values: Vec<f64>, percentile: f64) -> f64 {
 fn open_fsqlite_worker(path: &str) -> Result<(fsqlite::Connection, bool), String> {
     let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.to_owned()))
         .map_err(|error| format!("fsqlite open (worker): {error}"))?;
+    // `synchronous` is PER-CONNECTION: `prepare_fsqlite_schema`'s NORMAL does not
+    // carry to worker connections, so state it here. FrankenSQLite's default is
+    // already NORMAL (`WalCommitSyncPolicy::Deferred`) and the rusqlite worker
+    // sets NORMAL explicitly, so this is a no-op today — it pins the matched
+    // durability the published concurrent-writer numbers depend on, rather than
+    // leaving it to agree with C SQLite by coincidence of defaults. The same
+    // omission on the C side of `comprehensive_bench::bench_concurrent_writers`
+    // silently compared C-FULL against F-NORMAL for the life of that section
+    // (bd-x5gzk); see docs/bench-methodology-concurrent-writers.md.
+    let _ = fsqlite_e2e::block_on(conn.execute("PRAGMA synchronous=NORMAL;"));
     let concurrent_ok =
         fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")).is_ok();
     let _ = fsqlite_e2e::block_on(conn.execute("PRAGMA busy_timeout=5000;"));
@@ -1050,19 +1301,67 @@ fn run_rusqlite(threads: usize, rows_per_thread: usize, separate_tables: bool) -
 
 // ─── Driver ───────────────────────────────────────────────────────────────
 
-fn collect_samples<F: FnMut() -> Result<RunResult, String>>(
+fn collect_contract<N1, N2, A, B>(
     iters: usize,
-    mut f: F,
-) -> Result<RunStats, String> {
-    let mut samples = Vec::with_capacity(iters);
-    for _ in 0..iters {
-        samples.push(f()?);
+    mut null_a: N1,
+    mut null_b: N2,
+    mut baseline: A,
+    mut candidate: B,
+) -> Result<(PairedRunStats, PairedRunStats), String>
+where
+    N1: FnMut() -> Result<RunResult, String>,
+    N2: FnMut() -> Result<RunResult, String>,
+    A: FnMut() -> Result<RunResult, String>,
+    B: FnMut() -> Result<RunResult, String>,
+{
+    let mut null_a_samples = Vec::with_capacity(iters);
+    let mut null_b_samples = Vec::with_capacity(iters);
+    let mut baseline_samples = Vec::with_capacity(iters);
+    let mut candidate_samples = Vec::with_capacity(iters);
+
+    for round in 0..iters {
+        let (null_a_sample, null_b_sample, baseline_sample, candidate_sample) = if round % 2 == 0 {
+            (null_a()?, null_b()?, baseline()?, candidate()?)
+        } else {
+            let candidate_sample = candidate()?;
+            let baseline_sample = baseline()?;
+            let null_b_sample = null_b()?;
+            let null_a_sample = null_a()?;
+            (
+                null_a_sample,
+                null_b_sample,
+                baseline_sample,
+                candidate_sample,
+            )
+        };
+        null_a_samples.push(null_a_sample);
+        null_b_samples.push(null_b_sample);
+        baseline_samples.push(baseline_sample);
+        candidate_samples.push(candidate_sample);
     }
-    Ok(RunStats::new(samples))
+
+    Ok((
+        paired_run_stats(null_a_samples, null_b_samples),
+        paired_run_stats(baseline_samples, candidate_samples),
+    ))
 }
 
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn main() {
+    {
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        writeln!(lock, "bench_elf_sha256={}", self_identity()).expect("write executable identity");
+        lock.flush().expect("flush executable identity");
+    }
+    println!(
+        "bench_source_sha256 {}",
+        file_identity(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/bin/mt_mvcc_bench.rs"
+        )))
+    );
+
     if let Err(error) = run() {
         eprintln!("error: {error}");
         std::process::exit(1);
@@ -1074,8 +1373,13 @@ fn run() -> Result<(), String> {
     let opts = parse_args();
 
     eprintln!(
-        "mt-mvcc-bench: rows_per_thread={} threads={:?} iters={} apples_to_apples={} separate_tables={}",
-        opts.rows_per_thread, opts.threads, opts.iters, opts.apples_to_apples, opts.separate_tables,
+        "mt-mvcc-bench: rows_per_thread={} threads={:?} paired_rounds={} bootstrap_reps={} synchronous=NORMAL apples_to_apples={} separate_tables={}",
+        opts.rows_per_thread,
+        opts.threads,
+        opts.iters,
+        CONTRACT_BOOTSTRAP_REPS,
+        opts.apples_to_apples,
+        opts.separate_tables,
     );
 
     println!(
@@ -1086,13 +1390,18 @@ fn run() -> Result<(), String> {
         if n == 0 {
             continue;
         }
-        let fs = collect_samples(opts.iters, || {
-            run_fsqlite(n, opts.rows_per_thread, opts.separate_tables)
-        })?;
-        let cs = collect_samples(opts.iters, || {
-            Ok(run_rusqlite(n, opts.rows_per_thread, opts.separate_tables))
-        })?;
-        let report = build_thread_report(n, &fs, &cs);
+        let (null, claim) = collect_contract(
+            opts.iters,
+            || Ok(run_rusqlite(n, opts.rows_per_thread, opts.separate_tables)),
+            || Ok(run_rusqlite(n, opts.rows_per_thread, opts.separate_tables)),
+            || Ok(run_rusqlite(n, opts.rows_per_thread, opts.separate_tables)),
+            || run_fsqlite(n, opts.rows_per_thread, opts.separate_tables),
+        )?;
+        let report = build_thread_report(n, &null, &claim);
+        let contract = report
+            .median_ci_contract
+            .as_ref()
+            .expect("current report always carries median-CI evidence");
 
         println!(
             "{n:>7} | {fs_wps:>11.0} | {cs_wps:>10.0} | {throughput_ratio:>16.2}x | {fs_wps_p95:>15.0} | {fs_wps_p99:>15.0} | {sqlite_wps_p95:>14.0} | {sqlite_wps_p99:>14.0} | {fs_ms_p50:>14.2} | {fs_ms_p95:>14.2} | {fs_ms_p99:>14.2} | {sqlite_ms_p50:>13.2} | {sqlite_ms_p95:>13.2} | {sqlite_ms_p99:>13.2} | {time_ratio:>10.2}x | {fs_failed:>14} | {sqlite_failed:>13}",
@@ -1113,6 +1422,38 @@ fn run() -> Result<(), String> {
             fs_failed = report.fsqlite_failed_rows,
             sqlite_failed = report.sqlite_failed_rows
         );
+        println!(
+            "case={} threads={n} synchronous=NORMAL null_c_c ratio_median={:.6} ci95=[{:.6},{:.6}] cv_pct={:.3} mad={:.6} cv_gate=never",
+            workload_shape(opts.separate_tables),
+            contract.null_ratio_median,
+            contract.null_ratio_ci95_low,
+            contract.null_ratio_ci95_high,
+            contract.null_ratio_cv_pct,
+            contract.null_ratio_mad,
+        );
+        println!(
+            "case={} threads={n} synchronous=NORMAL claim_f_over_c ratio_median={:.6} ci95=[{:.6},{:.6}] cv_pct={:.3} mad={:.6} fsqlite_p50_wps={:.3} sqlite_p50_wps={:.3} fsqlite_failed={} sqlite_failed={}",
+            workload_shape(opts.separate_tables),
+            contract.claim_ratio_median,
+            contract.claim_ratio_ci95_low,
+            contract.claim_ratio_ci95_high,
+            contract.claim_ratio_cv_pct,
+            contract.claim_ratio_mad,
+            report.fsqlite_wps_p50,
+            report.sqlite_wps_p50,
+            report.fsqlite_failed_rows,
+            report.sqlite_failed_rows,
+        );
+        println!(
+            "case={} threads={n} median_ci_gate={} rule=claim_ci95_beyond_2x_null_radius cv_gate={} null_radius={:.6} claim_margin={:.3} min_decidable_gain={:.6} max_decidable_regression={:.6}",
+            workload_shape(opts.separate_tables),
+            contract.verdict,
+            contract.cv_gate,
+            contract.null_radius,
+            contract.claim_margin,
+            contract.min_decidable_gain,
+            contract.max_decidable_regression,
+        );
         thread_results.push(report);
     }
 
@@ -1127,7 +1468,7 @@ fn run() -> Result<(), String> {
     );
 
     let full_report = MtMvccBenchReport {
-        schema_version: REPORT_SCHEMA_V3,
+        schema_version: REPORT_SCHEMA_V4,
         workload_shape,
         rows_per_thread: opts.rows_per_thread,
         iterations: opts.iters,
@@ -1143,7 +1484,12 @@ fn run() -> Result<(), String> {
         write_markdown_summary(path, &full_report)?;
         eprintln!("mt-mvcc-bench: wrote markdown summary {}", path.display());
     }
-    if full_report.pass_over_pass_gate.status != "failed" {
+    let invalid_failed_rows = full_report.thread_results.iter().any(|row| {
+        row.median_ci_contract
+            .as_ref()
+            .is_some_and(|contract| contract.verdict == "INVALID_FAILED_ROWS")
+    });
+    if !invalid_failed_rows {
         write_json_report(&opts.history_json, &full_report)?;
         eprintln!(
             "mt-mvcc-bench: updated pass-over-pass history {}",
@@ -1151,8 +1497,8 @@ fn run() -> Result<(), String> {
         );
     }
     if !full_report.pass_over_pass_gate.regressions.is_empty() {
-        return Err(format!(
-            "pass-over-pass ratio gate failed: {}",
+        eprintln!(
+            "mt-mvcc-bench: historical ratio warning (provenance only; median-CI is the decision gate): {}",
             full_report
                 .pass_over_pass_gate
                 .regressions
@@ -1166,7 +1512,12 @@ fn run() -> Result<(), String> {
                 ))
                 .collect::<Vec<_>>()
                 .join(", ")
-        ));
+        );
+    }
+    if invalid_failed_rows {
+        return Err(
+            "median-CI evidence invalid because at least one arm reported failed rows".to_owned(),
+        );
     }
 
     Ok(())
@@ -1176,20 +1527,26 @@ fn run() -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn sample_stats(elapsed_ms: u64, total_rows: usize, failed_rows: usize) -> RunStats {
-        RunStats::new(vec![RunResult {
+    fn sample_result(elapsed_ms: u64, total_rows: usize, failed_rows: usize) -> RunResult {
+        RunResult {
             best_elapsed: Duration::from_millis(elapsed_ms),
             total_rows,
             failed_rows,
-        }])
+        }
     }
 
     #[test]
     fn thread_report_computes_expected_ratios() {
-        let fsqlite = sample_stats(200, 1000, 3);
-        let sqlite = sample_stats(100, 1000, 1);
+        let null = paired_run_stats(
+            vec![sample_result(100, 1000, 0)],
+            vec![sample_result(100, 1000, 0)],
+        );
+        let claim = paired_run_stats(
+            vec![sample_result(100, 1000, 1)],
+            vec![sample_result(200, 1000, 3)],
+        );
 
-        let report = build_thread_report(4, &fsqlite, &sqlite);
+        let report = build_thread_report(4, &null, &claim);
 
         assert_eq!(report.threads, 4);
         assert!((report.fsqlite_wps_p50 - 5000.0).abs() < 0.01);
@@ -1203,7 +1560,7 @@ mod tests {
     #[test]
     fn markdown_summary_renders_thread_rows() {
         let report = MtMvccBenchReport {
-            schema_version: REPORT_SCHEMA_V3,
+            schema_version: REPORT_SCHEMA_V4,
             workload_shape: "shared_table",
             rows_per_thread: 250,
             iterations: 1,
@@ -1225,6 +1582,7 @@ mod tests {
                 time_ratio: 9.10,
                 fsqlite_failed_rows: 0,
                 sqlite_failed_rows: 0,
+                median_ci_contract: None,
             }],
             pass_over_pass_gate: PassOverPassGateReport {
                 schema_version: PASS_OVER_PASS_SCHEMA_V1,
@@ -1240,7 +1598,7 @@ mod tests {
 
         assert!(rendered.contains("# mt-mvcc-bench Summary"));
         assert!(rendered.contains("- Workload shape: `shared_table`"));
-        assert!(rendered.contains("| 8 | 6090 | 55406 | 0.11x |"));
+        assert!(rendered.contains("| 8 | 6090 | 55406 | 0.110x | unavailable |"));
         assert!(rendered.contains("Pass-over-pass gate"));
     }
 
@@ -1316,6 +1674,7 @@ mod tests {
                 time_ratio: 0.0,
                 fsqlite_failed_rows: 0,
                 sqlite_failed_rows: 0,
+                median_ci_contract: None,
             }],
         };
         let current = vec![ThreadComparisonReport {
@@ -1336,6 +1695,7 @@ mod tests {
             time_ratio: 0.0,
             fsqlite_failed_rows: 0,
             sqlite_failed_rows: 0,
+            median_ci_contract: None,
         }];
 
         let gate = build_pass_over_pass_gate(
@@ -1389,6 +1749,7 @@ mod tests {
                 time_ratio: 0.0,
                 fsqlite_failed_rows: 0,
                 sqlite_failed_rows: 0,
+                median_ci_contract: None,
             }],
         };
         let current = vec![ThreadComparisonReport {
@@ -1409,6 +1770,7 @@ mod tests {
             time_ratio: 0.0,
             fsqlite_failed_rows: 0,
             sqlite_failed_rows: 0,
+            median_ci_contract: None,
         }];
 
         let gate = build_pass_over_pass_gate(
@@ -1421,6 +1783,33 @@ mod tests {
 
         assert_eq!(gate.status, "no_prior_report");
         assert!(gate.regressions.is_empty());
+    }
+
+    #[test]
+    fn median_ci_contract_ignores_cv_as_a_gate() {
+        let null = paired_run_stats(
+            (0..21).map(|_| sample_result(100, 1000, 0)).collect(),
+            (0..21).map(|_| sample_result(100, 1000, 0)).collect(),
+        );
+        let claim = paired_run_stats(
+            (0..21).map(|_| sample_result(100, 1000, 0)).collect(),
+            (0..21)
+                .map(|round| {
+                    if round == 0 {
+                        sample_result(1, 1000, 0)
+                    } else {
+                        sample_result(50, 1000, 0)
+                    }
+                })
+                .collect(),
+        );
+
+        let contract = median_ci_contract(&null, &claim);
+
+        assert!(contract.claim_ratio_cv_pct > 5.0);
+        assert_eq!(contract.cv_gate, "never");
+        assert_eq!(contract.verdict, "FSQLITE_FASTER");
+        assert!(contract.claim_ratio_ci95_low > contract.min_decidable_gain);
     }
 
     #[test]

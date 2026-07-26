@@ -500,6 +500,16 @@ fn bench_env_flag(name: &str) -> bool {
 /// NORMAL is the explicit default. FULL is available as a separate, labelled
 /// experiment. Silently allowing C SQLite to inherit FULL while FrankenSQLite
 /// receives NORMAL makes the comparison non-citable (bd-x5gzk).
+///
+/// Why this exists at all: `synchronous` is a PER-CONNECTION pragma, so the
+/// setup connection's NORMAL never reaches the writer connections. A C SQLite
+/// writer that never sets it inherits the compiled default
+/// SQLITE_DEFAULT_SYNCHRONOUS=2 (FULL) and pays a real WAL fsync per commit,
+/// while FrankenSQLite's NORMAL maps to WalCommitSyncPolicy::Deferred and pays
+/// none. FULL is also the durability-serious comparison, and was used to probe
+/// whether group-commit coalescing engages under a per-commit fsync: it does
+/// not for this workload shape, because each writer issues exactly one commit
+/// so commits never co-occur in the consolidator's FILLING window (bd-6hgad).
 fn concurrent_sync_mode() -> &'static str {
     match std::env::var("FSQLITE_BENCH_CONCURRENT_SYNC") {
         Ok(value) if value.eq_ignore_ascii_case("normal") => "NORMAL",
@@ -7467,11 +7477,18 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
         &format!(
             "Each writer inserts {} rows into non-overlapping key ranges on the same \
              file-backed WAL database. Both engines spawn N OS threads each owning its \
-             own connection; C SQLite uses WAL + busy_timeout, FrankenSQLite uses the \
+             own connection, and both writer connections run at `synchronous=NORMAL` so \
+             the two engines are compared at matched durability (set \
+             `FSQLITE_BENCH_CONCURRENT_SYNC=full` to match them at FULL instead). \
+             C SQLite uses WAL + busy_timeout, FrankenSQLite uses the \
              MVCC page-lock table via `PRAGMA fsqlite.concurrent_mode=ON` + \
              `BEGIN CONCURRENT`. Every scored worker connection proves its effective \
              PRAGMAs, thread identity, CPU affinity, completed-row count, and an untimed \
-             database count/sum oracle. Setup and postflight work are outside the timer.",
+             database count/sum oracle. Setup and postflight work are outside the timer. \
+             This mirrors the standalone `mt_mvcc_bench` harness. NOTE: this file-backed \
+             section is disk-noise-bound on shared hosts (C medians have been observed \
+             spreading 95-138 ms at 2 writers, CV up to 104%); cite `mt_mvcc_bench` for \
+             concurrent-writer speed claims, not these rows (bd-x5gzk).",
             CONCURRENT_ROWS_PER_THREAD
         ),
     );
@@ -7486,7 +7503,6 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
             total_rows,
             |phase, sample_index| run_csqlite_concurrent_sample(n_threads, phase, sample_index),
         );
-
         let profile_scope = if profile_concurrent_enabled {
             let previous_hot_path_profile_enabled = hot_path_profile_enabled();
             set_hot_path_profile_enabled(true);

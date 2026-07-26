@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [features]
 default = ["native", "linux-asupersync-uring"]
+bench-internals = []
 native = [
     "fsqlite-types/native",
     "fsqlite-vfs/native",
@@ -85,6 +86,7 @@ asupersync = { workspace = true }
 asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
 rusqlite = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 tempfile = { workspace = true }
 proptest = { workspace = true }

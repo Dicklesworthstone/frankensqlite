@@ -11,6 +11,7 @@ rust-version.workspace = true
 default = ["native"]
 native = ["fsqlite-pager/native"]
 wasm = ["fsqlite-pager/wasm"]
+bench-internals = []
 
 [dependencies]
 fsqlite-types = { path = "../fsqlite-types", version = "0.1.19", default-features = false }

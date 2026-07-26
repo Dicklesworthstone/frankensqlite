@@ -394,6 +394,38 @@ const MAX_TRIGGER_DEPTH: usize = 8;
 const MAX_FK_CASCADE_DEPTH: usize = 50;
 
 static FSQLITE_HOT_PATH_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Opt-in for the per-column INSERT preserialize sub-timers.
+///
+/// The insert preserialize path times up to seven nested regions per row
+/// (`row_build`, `preserialize`, `cell_build`, `eval`, `affinity`, `layout`,
+/// `encode`). One region is `Instant::now()` + `elapsed()` (a second clock read)
+/// + an `AtomicU64::fetch_add`, measured at ~48-56 ns on this hardware.
+///
+/// This does NOT affect benchmark wall-clock: `profile_fsqlite_insert_*` runs a
+/// separate pass on its own connection, so the timed rows never have profiling
+/// enabled (measured: `small_3col` 10K is 9.65 ms unprofiled vs 9.40 ms under
+/// deep profiling — no inflation). What it affects is *attribution fidelity*,
+/// because each counter largely measures its own clock pair:
+///
+/// - `small_3col` enters this path and reports `row_build_ns` = 674 ns/row
+///   against a structural 12 timed regions/row ≈ 600 ns of pure clock cost.
+/// - `tiny_1col` (`CREATE TABLE bench (id INTEGER PRIMARY KEY)`) never enters
+///   this path at all — it takes the `can_use_prebuilt_constant_record` branch,
+///   so all five sub-counters read 0 — yet still reports `row_build_ns` of
+///   48.7 ns/row at 100 rows and 48.6 ns/row at 10 000 rows. Invariant across a
+///   100x row-count change, and equal to one timed region. Real work scales with
+///   the row; a timer artifact is constant at the clock cost.
+///
+/// So the component attribution cannot locate a hot spot at these row sizes, and
+/// a conclusion drawn from it ("no single fat component" in the small-N write
+/// rows) is unsupported by the instrument that produced it (bd-he3ua).
+///
+/// So the sub-timers are OFF unless `FSQLITE_DML_PROFILE_DEEP` is set, leaving
+/// one timed region per row (~55 ns, ~6.5% of a ~850 ns row) in the default
+/// profile. Deep mode is for wide/large rows where ~360 ns/row amortizes; its
+/// component attribution is not trustworthy for rows under ~2 us.
+static FSQLITE_DML_PROFILE_DEEP_ENABLED: OnceLock<bool> = OnceLock::new();
 #[cfg(test)]
 thread_local! {
     // Thread-local override for hot-path profiling. When `Some(true)`, profiling
@@ -776,6 +808,14 @@ static FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_TIME_NS: AtomicU64 =
 static FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_FLUSHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_DIRTY_FLUSHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_FLUSH_TIME_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "bench-internals")]
+static FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_FOR_BENCH: AtomicBool = AtomicBool::new(true);
+#[cfg(feature = "bench-internals")]
+static FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_HITS_FOR_BENCH: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "bench-internals")]
+static FSQLITE_PREPARED_DIRECT_UPDATE_LAZY_SCRATCH_FOR_BENCH: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "bench-internals")]
+static FSQLITE_PREPARED_DIRECT_UPDATE_LAZY_SCRATCH_HITS_FOR_BENCH: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_START_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_START_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_START_TIME_NS: AtomicU64 = AtomicU64::new(0);
@@ -1111,6 +1151,83 @@ pub fn set_hot_path_profile_enabled(enabled: bool) {
         set_vdbe_metrics_enabled(enabled);
         fsqlite_pager::set_pager_commit_profile_enabled(enabled);
     }
+}
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn set_prepared_direct_update_fixed_real_for_bench(enabled: bool) {
+    FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_FOR_BENCH.store(enabled, AtomicOrdering::Relaxed);
+}
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn reset_prepared_direct_update_fixed_real_hits_for_bench() {
+    FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_HITS_FOR_BENCH.store(0, AtomicOrdering::Relaxed);
+}
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn prepared_direct_update_fixed_real_hits_for_bench() -> u64 {
+    FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_HITS_FOR_BENCH.load(AtomicOrdering::Relaxed)
+}
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn set_prepared_direct_update_lazy_scratch_for_bench(enabled: bool) {
+    FSQLITE_PREPARED_DIRECT_UPDATE_LAZY_SCRATCH_FOR_BENCH.store(enabled, AtomicOrdering::Relaxed);
+}
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn reset_prepared_direct_update_lazy_scratch_hits_for_bench() {
+    FSQLITE_PREPARED_DIRECT_UPDATE_LAZY_SCRATCH_HITS_FOR_BENCH.store(0, AtomicOrdering::Relaxed);
+}
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn prepared_direct_update_lazy_scratch_hits_for_bench() -> u64 {
+    FSQLITE_PREPARED_DIRECT_UPDATE_LAZY_SCRATCH_HITS_FOR_BENCH.load(AtomicOrdering::Relaxed)
+}
+
+#[inline]
+fn prepared_direct_update_fixed_real_for_bench_enabled() -> bool {
+    #[cfg(feature = "bench-internals")]
+    {
+        FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_FOR_BENCH.load(AtomicOrdering::Relaxed)
+    }
+    #[cfg(not(feature = "bench-internals"))]
+    {
+        true
+    }
+}
+
+#[inline]
+fn prepared_direct_update_lazy_scratch_for_bench_enabled() -> bool {
+    #[cfg(feature = "bench-internals")]
+    {
+        FSQLITE_PREPARED_DIRECT_UPDATE_LAZY_SCRATCH_FOR_BENCH.load(AtomicOrdering::Relaxed)
+    }
+    #[cfg(not(feature = "bench-internals"))]
+    {
+        false
+    }
+}
+
+/// Whether the per-column INSERT preserialize sub-timers are armed.
+///
+/// Cached in a `OnceLock` rather than read per call: every other env read on a
+/// hot path in this workspace is already behind one, and an uncached
+/// `std::env::var` here would itself be a per-row cost on the path this flag
+/// exists to keep cheap.
+#[inline]
+fn dml_profile_deep_enabled() -> bool {
+    *FSQLITE_DML_PROFILE_DEEP_ENABLED.get_or_init(|| {
+        std::env::var("FSQLITE_DML_PROFILE_DEEP")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 #[inline]
@@ -20956,7 +21073,11 @@ impl Connection {
                     let mut record_scratch =
                         self.prepared_direct_insert_record_scratch.borrow_mut();
                     let mut text_scratch = self.prepared_direct_insert_text_scratch.borrow_mut();
-                    let preserialize_start = profile_enabled.then(Instant::now);
+                    // Deep-only: `row_build_ns` below already brackets this
+                    // region, so timing it again in the default profile doubles
+                    // the per-row clock cost without adding attribution (bd-he3ua).
+                    let preserialize_start =
+                        (profile_enabled && dml_profile_deep_enabled()).then(Instant::now);
                     let preserialize_result =
                         Self::try_serialize_prepared_direct_simple_insert_record(
                             table_name,
@@ -21288,15 +21409,19 @@ impl Connection {
             return Ok(0);
         };
 
-        if let Some((affected, abandon_memdb)) = self
-            .try_execute_prepared_direct_simple_update_active_leaf_patch_run(
-                execution_cx,
-                direct,
-                params,
-                rowid,
-            )
-            .await?
+        if prepared_direct_update_fixed_real_for_bench_enabled()
+            && let Some((affected, abandon_memdb)) = self
+                .try_execute_prepared_direct_simple_update_active_leaf_patch_run(
+                    execution_cx,
+                    direct,
+                    params,
+                    rowid,
+                )
+                .await?
         {
+            #[cfg(feature = "bench-internals")]
+            FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_HITS_FOR_BENCH
+                .fetch_add(1, AtomicOrdering::Relaxed);
             if abandon_memdb {
                 self.clear_prepared_direct_insert_append_hint();
                 self.abandon_exact_memdb_row_mirror();
@@ -21309,7 +21434,12 @@ impl Connection {
 
         // Dedicated Vec scratch so `parse_record_into` can reuse Text/Blob
         // backing storage across row iterations.
-        let mut new_values = self.prepared_direct_update_row_scratch.borrow_mut();
+        let lazy_scratch = prepared_direct_update_lazy_scratch_for_bench_enabled();
+        let mut new_values = if lazy_scratch {
+            None
+        } else {
+            Some(self.prepared_direct_update_row_scratch.borrow_mut())
+        };
         let mut payload_buf = self.prepared_direct_insert_cell_scratch.borrow_mut();
         payload_buf.clear();
 
@@ -21340,7 +21470,7 @@ impl Connection {
                     direct,
                     params,
                     rowid,
-                    &mut new_values,
+                    new_values.as_deref_mut(),
                     &mut payload_buf,
                     &mut cursor,
                 )
@@ -21366,7 +21496,7 @@ impl Connection {
                 direct,
                 params,
                 rowid,
-                &mut new_values,
+                new_values.as_deref_mut(),
                 &mut payload_buf,
                 &mut cursor,
             )
@@ -21394,7 +21524,7 @@ impl Connection {
         direct: &PreparedDirectSimpleUpdate,
         params: Option<&[SqliteValue]>,
         rowid: i64,
-        new_values: &mut Vec<SqliteValue>,
+        new_values: Option<&mut Vec<SqliteValue>>,
         payload_buf: &mut Vec<u8>,
         cursor: &mut fsqlite_btree::BtCursor<P>,
     ) -> Result<(usize, bool)> {
@@ -21417,6 +21547,7 @@ impl Connection {
             self.retained_autocommit_count_sum_cache_tracks_root(direct.root_page);
         let can_skip_old_payload_decode = !cache_tracks_root && direct.assigns_all_non_ipk_columns;
         if !cache_tracks_root
+            && prepared_direct_update_fixed_real_for_bench_enabled()
             && let Some(outcome) = self
                 .try_execute_prepared_direct_simple_update_fixed_width_real(
                     execution_cx,
@@ -21428,8 +21559,24 @@ impl Connection {
                 )
                 .await?
         {
+            #[cfg(feature = "bench-internals")]
+            {
+                FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_HITS_FOR_BENCH
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                if prepared_direct_update_lazy_scratch_for_bench_enabled() {
+                    FSQLITE_PREPARED_DIRECT_UPDATE_LAZY_SCRATCH_HITS_FOR_BENCH
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            }
             return Ok(outcome);
         }
+        let mut lazy_new_values;
+        let new_values = if let Some(new_values) = new_values {
+            new_values
+        } else {
+            lazy_new_values = self.prepared_direct_update_row_scratch.borrow_mut();
+            &mut *lazy_new_values
+        };
         let old_cached_sum_value = if can_skip_old_payload_decode {
             new_values.clear();
             new_values.resize(direct.columns.len(), SqliteValue::Null);
@@ -22654,7 +22801,10 @@ impl Connection {
                 direct.columns.len()
             )));
         }
-        let cell_build_start = profile_enabled.then(Instant::now);
+        // Per-column sub-timers only under deep mode: at ~48-52 ns per timed
+        // region they otherwise dominate the counters they feed (bd-he3ua).
+        let deep_profile = profile_enabled && dml_profile_deep_enabled();
+        let cell_build_start = deep_profile.then(Instant::now);
         text_scratch.clear();
         let mut param_one_integer_buffer = itoa::Buffer::new();
         let cached_param_one_integer_text = match params.and_then(|values| values.first()) {
@@ -22677,13 +22827,13 @@ impl Connection {
         {
             let is_rowid_alias = column.is_ipk || direct.rowid_alias_col_idx == Some(col_idx);
             if is_rowid_alias {
-                let eval_start = profile_enabled.then(Instant::now);
+                let eval_start = deep_profile.then(Instant::now);
                 let raw_value = Self::eval_prepared_direct_simple_insert_expr(expr, params, None)?;
                 if let Some(elapsed_ns) = hot_path_elapsed_ns(eval_start) {
                     eval_time_ns = eval_time_ns.saturating_add(elapsed_ns);
                 }
                 explicit_rowid = Self::coerce_insert_rowid_value(&raw_value)?;
-                let layout_start = profile_enabled.then(Instant::now);
+                let layout_start = deep_profile.then(Instant::now);
                 let cell =
                     Self::prepared_direct_insert_record_cell(PreparedDirectInsertRecordValue::Null);
                 header_content_size += varint_len(cell.serial_type);
@@ -22695,7 +22845,7 @@ impl Connection {
                 continue;
             }
 
-            let eval_start = profile_enabled.then(Instant::now);
+            let eval_start = deep_profile.then(Instant::now);
             let raw_value = Self::try_eval_prepared_direct_insert_record_value(
                 expr,
                 params,
@@ -22712,7 +22862,7 @@ impl Connection {
                 });
             }
             let affinity = Self::type_affinity_for_direct_insert(column.affinity);
-            let affinity_start = profile_enabled.then(Instant::now);
+            let affinity_start = deep_profile.then(Instant::now);
             let value = Self::apply_prepared_direct_insert_record_affinity(
                 raw_value,
                 affinity,
@@ -22728,7 +22878,7 @@ impl Connection {
             if let Some(elapsed_ns) = affinity_elapsed_ns {
                 affinity_time_ns = affinity_time_ns.saturating_add(elapsed_ns);
             }
-            let layout_start = profile_enabled.then(Instant::now);
+            let layout_start = deep_profile.then(Instant::now);
             let cell = Self::prepared_direct_insert_record_cell(value);
             header_content_size += varint_len(cell.serial_type);
             body_size += cell.payload_len;
@@ -22739,7 +22889,7 @@ impl Connection {
         }
 
         let cell_build_elapsed_ns = hot_path_elapsed_ns(cell_build_start);
-        if profile_enabled {
+        if deep_profile {
             record_hot_path_elapsed_ns(
                 &FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_EVAL_TIME_NS,
                 Some(eval_time_ns),
@@ -22757,7 +22907,7 @@ impl Connection {
             &FSQLITE_PREPARED_DIRECT_INSERT_PRESERIALIZE_CELL_TIME_NS,
             cell_build_elapsed_ns,
         );
-        let encode_start = profile_enabled.then(Instant::now);
+        let encode_start = deep_profile.then(Instant::now);
         Self::serialize_prepared_direct_insert_record_cells_into(
             cells.as_slice(),
             header_content_size,

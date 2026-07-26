@@ -1,13 +1,20 @@
 # FrankenSQLite Performance Optimization Plan
 
 > Profile-driven plan to close the single-threaded performance gap against C SQLite.
-> Current state: 13-250x slower depending on workload. Target: <5x for common patterns.
+> Current measured state: the July 22, 2026 full-quick matrix reports a
+> `0.31327x` F/C geomean (about 3.19x faster overall; 78 faster / 2 comparable /
+> 13 C-faster scenarios). The remaining category gap is `write_single` at
+> `1.376x` F/C. Evidence:
+> `tests/artifacts/perf/cod-fullquick-refresh-20260722T1800Z/full-quick.json`.
 
 ## Executive Summary
 
-The benchmark reveals FrankenSQLite is 13-250x slower than C SQLite for single-threaded
-operations. Root cause analysis identifies **five dominant bottlenecks** that together
-account for >95% of the gap:
+The original March 2026 version of this plan began from a 13-250x deficit.
+That headline is historical, not a description of the current engine. The
+July 22 matrix above reverses the overall comparison while isolating the
+remaining work in single-row writes—especially prepared DELETE. The five
+items below are retained as the original hypotheses; their percentage
+estimates have not been re-measured against the current matrix:
 
 1. **Statement re-parsing** (est. 30-40% of gap): SQL is tokenized + parsed even on cache hits due to full AST cloning
 2. **Bytecode re-compilation** (est. 20-25%): VDBE programs cloned from cache; no plan cache exists

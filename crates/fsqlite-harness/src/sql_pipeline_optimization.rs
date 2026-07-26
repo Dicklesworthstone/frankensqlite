@@ -656,6 +656,7 @@ impl fmt::Display for CandidateDecision {
 pub enum CandidatePreflightVerdict {
     Allowed,
     Blocked,
+    RequiresNullControl,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -699,6 +700,7 @@ pub struct CandidateRecord {
     pub ledger_entry: String,
     pub evidence_refs: Vec<String>,
     pub retry_condition: String,
+    pub null_control_recorded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -712,7 +714,7 @@ pub struct CandidatePreflightReport {
 impl CandidatePreflightReport {
     #[must_use]
     pub fn blocks_source_mutation(&self) -> bool {
-        self.verdict == CandidatePreflightVerdict::Blocked
+        self.verdict != CandidatePreflightVerdict::Allowed
     }
 }
 
@@ -737,8 +739,16 @@ impl CandidateRegistry {
             .cloned()
             .collect();
 
+        let rejected_without_null_control = matched_records
+            .iter()
+            .filter(|record| {
+                record.decision == CandidateDecision::Rejected && !record.null_control_recorded
+            })
+            .count();
         let verdict = if matched_records.is_empty() {
             CandidatePreflightVerdict::Allowed
+        } else if rejected_without_null_control > 0 {
+            CandidatePreflightVerdict::RequiresNullControl
         } else {
             CandidatePreflightVerdict::Blocked
         };
@@ -749,6 +759,14 @@ impl CandidateRegistry {
                 requested_key.direction,
                 requested_key.benchmark_name,
                 requested_key.source_surface
+            )
+        } else if rejected_without_null_control > 0 {
+            format!(
+                "bead_id={SQL_PIPELINE_CANDIDATE_PREFLIGHT_BEAD_ID} verdict=requires-null-control operation={} direction={} matches={} rejected_without_null_control={} action=rerun_exact_candidate_with_same_invocation_A_A_before_new_source_mutation",
+                requested_key.operation,
+                requested_key.direction,
+                matched_records.len(),
+                rejected_without_null_control
             )
         } else {
             let evidence = matched_records
@@ -905,6 +923,7 @@ fn build_candidate_record_from_ledger_entry(
     evidence_refs.sort();
     evidence_refs.dedup();
     let retry_condition = extract_retry_condition(body);
+    let null_control_recorded = entry_records_null_control(&body_text);
 
     Some(CandidateRecord {
         key: CandidateKey::new("VDBE", operation, direction, benchmark_name, source_surface),
@@ -913,6 +932,33 @@ fn build_candidate_record_from_ledger_entry(
         ledger_entry,
         evidence_refs,
         retry_condition,
+        null_control_recorded,
+    })
+}
+
+fn entry_records_null_control(body: &str) -> bool {
+    let normalized = body.to_ascii_lowercase();
+    if normalized.contains("no null control")
+        || normalized.contains("without a null control")
+        || normalized.contains("null control was not")
+        || normalized.contains("null control: none")
+        || normalized.contains("null control unavailable")
+        || normalized.contains("no a/a")
+        || normalized.contains("without an a/a")
+        || normalized.contains("a/a was not")
+    {
+        return false;
+    }
+
+    normalized.lines().any(|line| {
+        line.contains("null_a_a")
+            || line.contains("paired(base, base)")
+            || line.contains("paired(baseline, baseline)")
+            || (line.contains("null control")
+                && (line.contains("ratio")
+                    || line.contains("median")
+                    || line.contains('=')
+                    || line.contains(':')))
     })
 }
 
@@ -1281,6 +1327,7 @@ mod tests {
   `crates/fsqlite-vdbe/src/engine.rs`. The candidate removed only the existing
   `Opcode::ZeroOrNull` arm from `try_execute_hot_opcode`.
 - Evidence: benchmark artifact `tests/artifacts/perf/zeroornull.json`.
+- A/A null control: baseline/baseline ratio median 1.001, CI95 [0.997, 1.004].
 - Result: rejected. Removing the hot arm regressed every measured stream length.
 - Do not retry `Opcode::ZeroOrNull` hot-dispatch removal as a standalone patch.
 ";
@@ -1303,6 +1350,8 @@ mod tests {
             report.matched_records[0].decision,
             CandidateDecision::Rejected
         );
+        assert!(report.matched_records[0].null_control_recorded);
+        assert_eq!(report.verdict, CandidatePreflightVerdict::Blocked);
         assert!(
             report.matched_records[0]
                 .evidence_refs
@@ -1310,6 +1359,38 @@ mod tests {
                 .any(|reference| reference.contains("zeroornull.json")),
             "bead_id={SQL_PIPELINE_CANDIDATE_PREFLIGHT_BEAD_ID} expected artifact evidence"
         );
+    }
+
+    #[test]
+    fn candidate_preflight_requires_null_control_for_rejected_duplicate() {
+        let ledger = r"
+## 2026-05-25 - VDBE `Opcode::ZeroOrNull` hot-dispatch removal
+
+- Target: `vdbe_pipeline_execute_zeroornull`.
+- Evidence: benchmark artifact `tests/artifacts/perf/zeroornull.json`.
+- Result: rejected as within noise. No null control was recorded.
+- Do not retry until the harness can distinguish a sub-5% effect from noise.
+";
+        let registry = parse_candidate_registry_from_negative_results_ledger(
+            "docs/progress/perf-negative-results.md",
+            ledger,
+        );
+        let request = CandidateKey::new(
+            "vdbe",
+            "zero-or-null",
+            CandidateDirection::HotDispatchRemoval,
+            "vdbe_pipeline_execute_zeroornull",
+            "unknown",
+        );
+        let report = registry.preflight(&request);
+
+        assert!(report.blocks_source_mutation());
+        assert_eq!(
+            report.verdict,
+            CandidatePreflightVerdict::RequiresNullControl
+        );
+        assert!(!report.matched_records[0].null_control_recorded);
+        assert!(report.summary.contains("rejected_without_null_control=1"));
     }
 
     #[test]
@@ -1342,6 +1423,7 @@ mod tests {
         let report = registry.preflight(&request);
 
         assert!(report.blocks_source_mutation());
+        assert_eq!(report.verdict, CandidatePreflightVerdict::Blocked);
         assert_eq!(
             report.matched_records[0].decision,
             CandidateDecision::NonCandidate
