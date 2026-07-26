@@ -724,6 +724,14 @@ static FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_TIME_NS: AtomicU64 =
 static FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_FLUSHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_DIRTY_FLUSHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_FLUSH_TIME_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "bench-internals")]
+static FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_FOR_BENCH: AtomicBool = AtomicBool::new(true);
+#[cfg(feature = "bench-internals")]
+static FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_HITS_FOR_BENCH: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "bench-internals")]
+static FSQLITE_PREPARED_DIRECT_UPDATE_LAZY_SCRATCH_FOR_BENCH: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "bench-internals")]
+static FSQLITE_PREPARED_DIRECT_UPDATE_LAZY_SCRATCH_HITS_FOR_BENCH: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_START_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_START_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_DIRECT_DELETE_LEAF_RUN_START_TIME_NS: AtomicU64 = AtomicU64::new(0);
@@ -1058,6 +1066,72 @@ pub fn set_hot_path_profile_enabled(enabled: bool) {
         set_record_profile_enabled(enabled);
         set_vdbe_metrics_enabled(enabled);
         fsqlite_pager::set_pager_commit_profile_enabled(enabled);
+    }
+}
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn set_prepared_direct_update_fixed_real_for_bench(enabled: bool) {
+    FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_FOR_BENCH
+        .store(enabled, AtomicOrdering::Relaxed);
+}
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn reset_prepared_direct_update_fixed_real_hits_for_bench() {
+    FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_HITS_FOR_BENCH
+        .store(0, AtomicOrdering::Relaxed);
+}
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn prepared_direct_update_fixed_real_hits_for_bench() -> u64 {
+    FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_HITS_FOR_BENCH.load(AtomicOrdering::Relaxed)
+}
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn set_prepared_direct_update_lazy_scratch_for_bench(enabled: bool) {
+    FSQLITE_PREPARED_DIRECT_UPDATE_LAZY_SCRATCH_FOR_BENCH
+        .store(enabled, AtomicOrdering::Relaxed);
+}
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn reset_prepared_direct_update_lazy_scratch_hits_for_bench() {
+    FSQLITE_PREPARED_DIRECT_UPDATE_LAZY_SCRATCH_HITS_FOR_BENCH
+        .store(0, AtomicOrdering::Relaxed);
+}
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn prepared_direct_update_lazy_scratch_hits_for_bench() -> u64 {
+    FSQLITE_PREPARED_DIRECT_UPDATE_LAZY_SCRATCH_HITS_FOR_BENCH.load(AtomicOrdering::Relaxed)
+}
+
+#[inline]
+fn prepared_direct_update_fixed_real_for_bench_enabled() -> bool {
+    #[cfg(feature = "bench-internals")]
+    {
+        FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_FOR_BENCH.load(AtomicOrdering::Relaxed)
+    }
+    #[cfg(not(feature = "bench-internals"))]
+    {
+        true
+    }
+}
+
+#[inline]
+fn prepared_direct_update_lazy_scratch_for_bench_enabled() -> bool {
+    #[cfg(feature = "bench-internals")]
+    {
+        FSQLITE_PREPARED_DIRECT_UPDATE_LAZY_SCRATCH_FOR_BENCH.load(AtomicOrdering::Relaxed)
+    }
+    #[cfg(not(feature = "bench-internals"))]
+    {
+        false
     }
 }
 
@@ -21133,15 +21207,19 @@ impl Connection {
             return Ok(0);
         };
 
-        if let Some((affected, abandon_memdb)) = self
-            .try_execute_prepared_direct_simple_update_active_leaf_patch_run(
-                execution_cx,
-                direct,
-                params,
-                rowid,
-            )
-            .await?
+        if prepared_direct_update_fixed_real_for_bench_enabled()
+            && let Some((affected, abandon_memdb)) = self
+                .try_execute_prepared_direct_simple_update_active_leaf_patch_run(
+                    execution_cx,
+                    direct,
+                    params,
+                    rowid,
+                )
+                .await?
         {
+            #[cfg(feature = "bench-internals")]
+            FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_HITS_FOR_BENCH
+                .fetch_add(1, AtomicOrdering::Relaxed);
             if abandon_memdb {
                 self.clear_prepared_direct_insert_append_hint();
                 self.abandon_exact_memdb_row_mirror();
@@ -21154,7 +21232,12 @@ impl Connection {
 
         // Dedicated Vec scratch so `parse_record_into` can reuse Text/Blob
         // backing storage across row iterations.
-        let mut new_values = self.prepared_direct_update_row_scratch.borrow_mut();
+        let lazy_scratch = prepared_direct_update_lazy_scratch_for_bench_enabled();
+        let mut new_values = if lazy_scratch {
+            None
+        } else {
+            Some(self.prepared_direct_update_row_scratch.borrow_mut())
+        };
         let mut payload_buf = self.prepared_direct_insert_cell_scratch.borrow_mut();
         payload_buf.clear();
 
@@ -21185,7 +21268,7 @@ impl Connection {
                     direct,
                     params,
                     rowid,
-                    &mut new_values,
+                    new_values.as_deref_mut(),
                     &mut payload_buf,
                     &mut cursor,
                 )
@@ -21211,7 +21294,7 @@ impl Connection {
                 direct,
                 params,
                 rowid,
-                &mut new_values,
+                new_values.as_deref_mut(),
                 &mut payload_buf,
                 &mut cursor,
             )
@@ -21239,7 +21322,7 @@ impl Connection {
         direct: &PreparedDirectSimpleUpdate,
         params: Option<&[SqliteValue]>,
         rowid: i64,
-        new_values: &mut Vec<SqliteValue>,
+        new_values: Option<&mut Vec<SqliteValue>>,
         payload_buf: &mut Vec<u8>,
         cursor: &mut fsqlite_btree::BtCursor<P>,
     ) -> Result<(usize, bool)> {
@@ -21262,6 +21345,7 @@ impl Connection {
             self.retained_autocommit_count_sum_cache_tracks_root(direct.root_page);
         let can_skip_old_payload_decode = !cache_tracks_root && direct.assigns_all_non_ipk_columns;
         if !cache_tracks_root
+            && prepared_direct_update_fixed_real_for_bench_enabled()
             && let Some(outcome) = self.try_execute_prepared_direct_simple_update_fixed_width_real(
                 execution_cx,
                 direct,
@@ -21272,8 +21356,24 @@ impl Connection {
             )
             .await?
         {
+            #[cfg(feature = "bench-internals")]
+            {
+                FSQLITE_PREPARED_DIRECT_UPDATE_FIXED_REAL_HITS_FOR_BENCH
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                if prepared_direct_update_lazy_scratch_for_bench_enabled() {
+                    FSQLITE_PREPARED_DIRECT_UPDATE_LAZY_SCRATCH_HITS_FOR_BENCH
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            }
             return Ok(outcome);
         }
+        let mut lazy_new_values;
+        let new_values = if let Some(new_values) = new_values {
+            new_values
+        } else {
+            lazy_new_values = self.prepared_direct_update_row_scratch.borrow_mut();
+            &mut *lazy_new_values
+        };
         let old_cached_sum_value = if can_skip_old_payload_decode {
             new_values.clear();
             new_values.resize(direct.columns.len(), SqliteValue::Null);
