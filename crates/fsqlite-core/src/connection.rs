@@ -402,14 +402,24 @@ static FSQLITE_HOT_PATH_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
 /// `encode`). One region is `Instant::now()` + `elapsed()` (a second clock read)
 /// + an `AtomicU64::fetch_add`, measured at ~48-56 ns on this hardware.
 ///
-/// `tiny_1col` (`CREATE TABLE bench (id INTEGER PRIMARY KEY)`) takes the
-/// `is_rowid_alias` branch, which skips the affinity region: six regions,
-/// measured at ~289-305 ns/row. That row's *entire* reported `row_build_ns` is
-/// ~139 ns/row, so the observer is ~2.1x the quantity it reports and ~35% of the
-/// row's unprofiled ~850 ns. Because the regions nest, the outer counters absorb
-/// the inner counters' clock cost — which is why `row_build_ns` ranked as the
-/// largest component of the small-N write gap and why that profile concluded
-/// "no single fat component" (bd-he3ua).
+/// This does NOT affect benchmark wall-clock: `profile_fsqlite_insert_*` runs a
+/// separate pass on its own connection, so the timed rows never have profiling
+/// enabled (measured: `small_3col` 10K is 9.65 ms unprofiled vs 9.40 ms under
+/// deep profiling — no inflation). What it affects is *attribution fidelity*,
+/// because each counter largely measures its own clock pair:
+///
+/// - `small_3col` enters this path and reports `row_build_ns` = 674 ns/row
+///   against a structural 12 timed regions/row ≈ 600 ns of pure clock cost.
+/// - `tiny_1col` (`CREATE TABLE bench (id INTEGER PRIMARY KEY)`) never enters
+///   this path at all — it takes the `can_use_prebuilt_constant_record` branch,
+///   so all five sub-counters read 0 — yet still reports `row_build_ns` of
+///   48.7 ns/row at 100 rows and 48.6 ns/row at 10 000 rows. Invariant across a
+///   100x row-count change, and equal to one timed region. Real work scales with
+///   the row; a timer artifact is constant at the clock cost.
+///
+/// So the component attribution cannot locate a hot spot at these row sizes, and
+/// a conclusion drawn from it ("no single fat component" in the small-N write
+/// rows) is unsupported by the instrument that produced it (bd-he3ua).
 ///
 /// So the sub-timers are OFF unless `FSQLITE_DML_PROFILE_DEEP` is set, leaving
 /// one timed region per row (~55 ns, ~6.5% of a ~850 ns row) in the default
@@ -22494,8 +22504,8 @@ impl Connection {
                 direct.columns.len()
             )));
         }
-        // Per-column sub-timers only under deep mode: at ~48-56 ns per timed
-        // region they otherwise cost more than the row they measure (bd-he3ua).
+        // Per-column sub-timers only under deep mode: at ~48-52 ns per timed
+        // region they otherwise dominate the counters they feed (bd-he3ua).
         let deep_profile = profile_enabled && dml_profile_deep_enabled();
         let cell_build_start = deep_profile.then(Instant::now);
         text_scratch.clear();
