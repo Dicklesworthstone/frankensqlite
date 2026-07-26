@@ -108,11 +108,40 @@ mix.
 ### Is `main` affected?
 
 Not directly testable through `br`, which is sync while `main` is async. What is
-known: `v0.1.18` is an ancestor of `main` and all four candidate fixes above are
-ancestors of `main`, so `main` inherits them. However **6 btree commits landed
-on `main` after `v0.1.18`** (async migration), and none has been exercised
-against this reproducer. Treat `main` as un-verified rather than known-good
-until the engine-level reproducer in bd-nhc6g exists.
+known, in increasing order of strength:
+
+1. `v0.1.18` is an ancestor of `main`, and all four candidate fixes are
+   ancestors of `main`, so `main` inherits them.
+2. Of the 6 btree commits that landed after `v0.1.18`, only one (`d4c5b9a9`,
+   the async-migration sweep) touches the guard code at all.
+3. That commit is a **purely mechanical async-ification** of it — `fn` →
+   `async fn`, `.await` added at call sites, tests reindented. The guards are
+   unchanged, and their fail-closed tests survive verbatim, including
+   *"insert balance must fail closed on a rootless path"* and
+   *"delete balance must fail closed on a rootless path"*.
+
+So the protection is intact on `main` by inspection. That is **not** the same as
+proven clean: the async migration could introduce different defects, and there
+may be other mutation paths reachable from the seek cache that were never
+guarded. Treat `main` as un-verified-but-protected until the engine-level
+reproducer in bd-nhc6g exists.
+
+### Root cause (documented in-tree)
+
+The mechanism is written down in `crates/fsqlite-btree/src/cursor.rs` (~11057,
+added by `c57499fb`): the table seek-cache fast path rebuilds the cursor stack
+as just the landing leaf **with no path from the root**. Mutating from such a
+rootless stack silently disabled `balance_for_delete` (depth one was treated as
+"the leaf IS the root"), the pre-delete anchor capture, and separator repair —
+so a leaf drained to zero cells stays referenced by its parent interior page,
+"a shape stock SQLite rejects as `database disk image is malformed`". The
+comment names the `INSERT OR REPLACE` conflict path as the way in, which is
+exactly what br's merge upserts drive.
+
+That accounts for every observation here: interior **root** page damage,
+out-of-order cells, the descent-vs-scan disagreement, and the exact error
+string — and it ties this defect to **bd-kwei8**, whose own description instead
+attributes the class to MVCC WAL publication.
 
 ## Why the statement stream is a dead end
 
