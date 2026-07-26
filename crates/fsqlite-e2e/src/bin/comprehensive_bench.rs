@@ -50,8 +50,8 @@ const ROW_COUNTS_QUICK: &[usize] = &[100, 1_000, 10_000];
 const CONCURRENT_THREAD_COUNTS: &[usize] = &[2, 4, 8];
 const CONCURRENT_ROWS_PER_THREAD: usize = 1_000;
 const CONCURRENT_RANGE_SIZE: i64 = 1_000_000;
-const JSON_REPORT_SCHEMA_V5: &str = "fsqlite-e2e.comprehensive-bench-report.v5";
-const BENCHMARK_PROVENANCE_SCHEMA_V2: &str = "fsqlite-e2e.benchmark-provenance.v2";
+const JSON_REPORT_SCHEMA_V6: &str = "fsqlite-e2e.comprehensive-bench-report.v6";
+const BENCHMARK_PROVENANCE_SCHEMA_V3: &str = "fsqlite-e2e.benchmark-provenance.v3";
 const CI_REGRESSION_GATE_SCHEMA_V2: &str = "fsqlite-e2e.comprehensive-bench-ci-regression-gate.v2";
 const CI_REGRESSION_GATE_BEAD_ID: &str = "bd-m4tju";
 const CI_REGRESSION_BASELINE_BEAD_ID: &str = "bd-0winn";
@@ -66,7 +66,7 @@ const CONCURRENT_WRITERS_SECTION_TITLE: &str =
     "Concurrent Writers — C SQLite WAL vs FrankenSQLite MVCC";
 const DEFAULT_BENCH_PAGE_SIZE_BYTES: u32 = 4096;
 #[cfg(feature = "bridge-experiment")]
-const BRIDGE_REPORT_SCHEMA_V1: &str = "fsqlite-e2e.bridge-experiment.v1";
+const BRIDGE_REPORT_SCHEMA_V2: &str = "fsqlite-e2e.bridge-experiment.v2";
 #[cfg(feature = "bridge-experiment")]
 const BRIDGE_INSERT_SQL: &str = "INSERT INTO bridge_probe(id, value) VALUES (?1, ?2)";
 #[cfg(feature = "bridge-experiment")]
@@ -700,6 +700,13 @@ fn normalize_fsqlite_value(value: &fsqlite::SqliteValue) -> String {
     }
 }
 
+fn normalize_effective_pragma_value(pragma: &str, value: String) -> Result<String, String> {
+    if !pragma.eq_ignore_ascii_case("synchronous") {
+        return Ok(value);
+    }
+    normalized_synchronous(&value)
+}
+
 fn query_effective_csqlite_pragmas(
     conn: &rusqlite::Connection,
 ) -> Result<BTreeMap<String, String>, String> {
@@ -709,6 +716,8 @@ fn query_effective_csqlite_pragmas(
         let value = conn
             .query_row(&sql, [], |row| row.get_ref(0).map(normalize_csqlite_value))
             .map_err(|error| format!("C SQLite `{sql}` failed: {error}"))?;
+        let value = normalize_effective_pragma_value(pragma, value)
+            .map_err(|error| format!("C SQLite `{sql}` returned invalid value: {error}"))?;
         values.insert(pragma.to_owned(), value);
     }
     Ok(values)
@@ -728,7 +737,9 @@ fn query_effective_fsqlite_pragmas(
         let value = row
             .get(0)
             .ok_or_else(|| format!("FrankenSQLite `{sql}` returned no first column"))?;
-        values.insert(pragma.to_owned(), normalize_fsqlite_value(value));
+        let value = normalize_effective_pragma_value(pragma, normalize_fsqlite_value(value))
+            .map_err(|error| format!("FrankenSQLite `{sql}` returned invalid value: {error}"))?;
+        values.insert(pragma.to_owned(), value);
     }
     Ok(values)
 }
@@ -940,13 +951,13 @@ fn probe_execution_routing() -> JsonExecutionRouting {
     let delete = fs_prepare(&conn, "DELETE FROM routing_probe WHERE id = ?1");
     fs_stmt_execute_with_params(&delete, &[fsqlite::SqliteValue::Integer(4)]);
 
-    let fallback_counts = Arc::new(Mutex::new(BTreeMap::new()));
+    let routing_decision_counts = Arc::new(Mutex::new(BTreeMap::new()));
     let subscriber = tracing_subscriber::registry()
         .with(
             tracing_subscriber::filter::Targets::new()
                 .with_target("fsqlite.fallback_decision", tracing::Level::DEBUG),
         )
-        .with(FallbackDecisionLayer(Arc::clone(&fallback_counts)));
+        .with(FallbackDecisionLayer(Arc::clone(&routing_decision_counts)));
     {
         let _subscriber_guard = tracing::subscriber::set_default(subscriber);
         let rows = fsqlite_e2e::block_on(
@@ -958,7 +969,7 @@ fn probe_execution_routing() -> JsonExecutionRouting {
 
     let profile = hot_path_profile_snapshot();
     set_hot_path_profile_enabled(previous_profile_enabled);
-    let select_fallback_decisions = fallback_counts
+    let select_routing_decisions = routing_decision_counts
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
@@ -1009,9 +1020,15 @@ fn probe_execution_routing() -> JsonExecutionRouting {
             profile.prepared_insert_instrumented_lane_hits
         ));
     }
-    if profile.prepared_update_delete_fast_lane_hits != 2 {
+    if profile.prepared_direct_insert_executions != 4 {
         probe_errors.push(format!(
-            "routing probe expected 2 prepared UPDATE/DELETE fast-lane hits, observed {}",
+            "routing probe expected 4 prepared direct INSERT executions, observed {}",
+            profile.prepared_direct_insert_executions
+        ));
+    }
+    if profile.prepared_update_delete_fast_lane_hits != 0 {
+        probe_errors.push(format!(
+            "routing probe observed {} prepared UPDATE/DELETE fused-lane hits; direct autocommit DML must return before that lane",
             profile.prepared_update_delete_fast_lane_hits
         ));
     }
@@ -1021,15 +1038,42 @@ fn probe_execution_routing() -> JsonExecutionRouting {
             profile.prepared_update_delete_instrumented_lane_hits
         ));
     }
+    if profile.prepared_direct_update_executions != 1 {
+        probe_errors.push(format!(
+            "routing probe expected 1 prepared direct UPDATE execution, observed {}",
+            profile.prepared_direct_update_executions
+        ));
+    }
+    if profile.prepared_direct_delete_executions != 1 {
+        probe_errors.push(format!(
+            "routing probe expected 1 prepared direct DELETE execution, observed {}",
+            profile.prepared_direct_delete_executions
+        ));
+    }
+    if profile.prepared_update_delete_dml_direct_handoff_runs != 0 {
+        probe_errors.push(format!(
+            "routing probe observed {} prepared UPDATE/DELETE VDBE direct-handoff runs",
+            profile.prepared_update_delete_dml_direct_handoff_runs
+        ));
+    }
+    if profile.prepared_table_dml_affected_only_runs != 0 {
+        probe_errors.push(format!(
+            "routing probe observed {} generic prepared affected-only DML runs",
+            profile.prepared_table_dml_affected_only_runs
+        ));
+    }
     if prepared_dml_fallbacks.values().any(|count| *count != 0) {
         probe_errors.push(format!(
             "routing probe observed prepared DML fallbacks: {prepared_dml_fallbacks:?}"
         ));
     }
-    let expected_fallbacks = BTreeMap::from([("group_by_fallback".to_owned(), 1_u64)]);
-    if select_fallback_decisions != expected_fallbacks {
+    let expected_routing_decisions = BTreeMap::from([
+        ("group_by_fallback".to_owned(), 1_u64),
+        ("valid_btree_page".to_owned(), 1_u64),
+    ]);
+    if select_routing_decisions != expected_routing_decisions {
         probe_errors.push(format!(
-            "routing probe expected fallback decisions {expected_fallbacks:?}, observed {select_fallback_decisions:?}"
+            "routing probe expected decisions {expected_routing_decisions:?}, observed {select_routing_decisions:?}"
         ));
     }
     if timed_execution_instrumented {
@@ -1052,11 +1096,17 @@ fn probe_execution_routing() -> JsonExecutionRouting {
         parser_slow_path_executions: profile.parser.slow_path_executions,
         prepared_insert_fast_lane_hits: profile.prepared_insert_fast_lane_hits,
         prepared_insert_instrumented_lane_hits: profile.prepared_insert_instrumented_lane_hits,
+        prepared_direct_insert_executions: profile.prepared_direct_insert_executions,
         prepared_update_delete_fast_lane_hits: profile.prepared_update_delete_fast_lane_hits,
         prepared_update_delete_instrumented_lane_hits: profile
             .prepared_update_delete_instrumented_lane_hits,
+        prepared_direct_update_executions: profile.prepared_direct_update_executions,
+        prepared_direct_delete_executions: profile.prepared_direct_delete_executions,
+        prepared_update_delete_dml_direct_handoff_runs: profile
+            .prepared_update_delete_dml_direct_handoff_runs,
+        prepared_table_dml_affected_only_runs: profile.prepared_table_dml_affected_only_runs,
         prepared_dml_fallbacks,
-        select_fallback_decisions,
+        select_routing_decisions,
         probe_errors,
     }
 }
@@ -1253,10 +1303,15 @@ struct JsonExecutionRouting {
     parser_slow_path_executions: u64,
     prepared_insert_fast_lane_hits: u64,
     prepared_insert_instrumented_lane_hits: u64,
+    prepared_direct_insert_executions: u64,
     prepared_update_delete_fast_lane_hits: u64,
     prepared_update_delete_instrumented_lane_hits: u64,
+    prepared_direct_update_executions: u64,
+    prepared_direct_delete_executions: u64,
+    prepared_update_delete_dml_direct_handoff_runs: u64,
+    prepared_table_dml_affected_only_runs: u64,
     prepared_dml_fallbacks: BTreeMap<String, u64>,
-    select_fallback_decisions: BTreeMap<String, u64>,
+    select_routing_decisions: BTreeMap<String, u64>,
     probe_errors: Vec<String>,
 }
 
@@ -2463,6 +2518,8 @@ fn canonical_profile_environment(
         ),
         ("CARGO_BUILD_RUSTC_WRAPPER".to_owned(), String::new()),
         ("CARGO_BUILD_RUSTFLAGS".to_owned(), String::new()),
+        ("RUSTC_WORKSPACE_WRAPPER".to_owned(), String::new()),
+        ("RUSTC_WRAPPER".to_owned(), String::new()),
         (format!("{prefix}_CODEGEN_UNITS"), "1".to_owned()),
         (format!("{prefix}_DEBUG"), "false".to_owned()),
         (format!("{prefix}_DEBUG_ASSERTIONS"), "false".to_owned()),
@@ -2475,6 +2532,14 @@ fn canonical_profile_environment(
         (format!("{prefix}_SPLIT_DEBUGINFO"), "off".to_owned()),
         (format!("{prefix}_STRIP"), "true".to_owned()),
     ]))
+}
+
+const fn compiled_panic_strategy() -> &'static str {
+    if cfg!(panic = "abort") {
+        "abort"
+    } else {
+        "unwind"
+    }
 }
 
 fn canonical_native_environment() -> BTreeMap<String, String> {
@@ -2735,7 +2800,10 @@ impl JsonBenchmarkProvenance {
             debug_assertions: cfg!(debug_assertions),
             target: build_target,
             host: env!("FSQLITE_BENCH_BUILD_HOST").to_owned(),
-            panic_strategy: env!("FSQLITE_BENCH_BUILD_PANIC").to_owned(),
+            // Cargo build scripts are host executables and compile with unwind
+            // even when the benchmark target uses panic=abort. Only the target
+            // crate's cfg can attest the binary's effective panic strategy.
+            panic_strategy: compiled_panic_strategy().to_owned(),
             panic_abort: cfg!(panic = "abort"),
             package_features,
             encoded_rustflags_hex: env!("FSQLITE_BENCH_BUILD_RUSTFLAGS_HEX").to_owned(),
@@ -2856,7 +2924,7 @@ impl JsonBenchmarkProvenance {
         let citable = validation_errors.is_empty();
 
         Self {
-            schema_version: BENCHMARK_PROVENANCE_SCHEMA_V2.to_owned(),
+            schema_version: BENCHMARK_PROVENANCE_SCHEMA_V3.to_owned(),
             citable,
             status: if citable {
                 "verified_citable".to_owned()
@@ -3213,7 +3281,7 @@ fn build_json_report(
         .collect();
 
     JsonBenchmarkReport {
-        schema_version: JSON_REPORT_SCHEMA_V5.to_owned(),
+        schema_version: JSON_REPORT_SCHEMA_V6.to_owned(),
         generated_at_utc: chrono_stamp(),
         total_elapsed_ms: u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX),
         config,
@@ -3229,7 +3297,7 @@ fn build_json_report(
 fn benchmark_json_schema() -> serde_json::Value {
     serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/comprehensive-bench-report.v5.json",
+        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/comprehensive-bench-report.v6.json",
         "title": "FrankenSQLite comprehensive benchmark JSON report",
         "type": "object",
         "additionalProperties": false,
@@ -3246,7 +3314,7 @@ fn benchmark_json_schema() -> serde_json::Value {
         ],
         "properties": {
             "schema_version": {
-                "const": JSON_REPORT_SCHEMA_V5
+                "const": JSON_REPORT_SCHEMA_V6
             },
             "generated_at_utc": {
                 "type": "string"
@@ -3338,7 +3406,7 @@ fn benchmark_json_schema() -> serde_json::Value {
                     "execution_routing"
                 ],
                 "properties": {
-                    "schema_version": {"const": BENCHMARK_PROVENANCE_SCHEMA_V2},
+                    "schema_version": {"const": BENCHMARK_PROVENANCE_SCHEMA_V3},
                     "citable": {"const": false},
                     "status": {
                         "enum": [
@@ -3522,9 +3590,14 @@ fn benchmark_json_schema() -> serde_json::Value {
                             "parser_fast_path_executions", "parser_slow_path_executions",
                             "prepared_insert_fast_lane_hits",
                             "prepared_insert_instrumented_lane_hits",
+                            "prepared_direct_insert_executions",
                             "prepared_update_delete_fast_lane_hits",
                             "prepared_update_delete_instrumented_lane_hits",
-                            "prepared_dml_fallbacks", "select_fallback_decisions",
+                            "prepared_direct_update_executions",
+                            "prepared_direct_delete_executions",
+                            "prepared_update_delete_dml_direct_handoff_runs",
+                            "prepared_table_dml_affected_only_runs",
+                            "prepared_dml_fallbacks", "select_routing_decisions",
                             "probe_errors"
                         ],
                         "properties": {
@@ -3539,13 +3612,24 @@ fn benchmark_json_schema() -> serde_json::Value {
                             "parser_slow_path_executions": {"type": "integer", "minimum": 0},
                             "prepared_insert_fast_lane_hits": {"type": "integer", "minimum": 0},
                             "prepared_insert_instrumented_lane_hits": {"type": "integer", "minimum": 0},
+                            "prepared_direct_insert_executions": {"type": "integer", "minimum": 0},
                             "prepared_update_delete_fast_lane_hits": {"type": "integer", "minimum": 0},
                             "prepared_update_delete_instrumented_lane_hits": {"type": "integer", "minimum": 0},
+                            "prepared_direct_update_executions": {"type": "integer", "minimum": 0},
+                            "prepared_direct_delete_executions": {"type": "integer", "minimum": 0},
+                            "prepared_update_delete_dml_direct_handoff_runs": {
+                                "type": "integer",
+                                "minimum": 0
+                            },
+                            "prepared_table_dml_affected_only_runs": {
+                                "type": "integer",
+                                "minimum": 0
+                            },
                             "prepared_dml_fallbacks": {
                                 "type": "object",
                                 "additionalProperties": {"type": "integer", "minimum": 0}
                             },
-                            "select_fallback_decisions": {
+                            "select_routing_decisions": {
                                 "type": "object",
                                 "additionalProperties": {"type": "integer", "minimum": 0}
                             },
@@ -4078,7 +4162,7 @@ fn bridge_json_schema() -> serde_json::Value {
     let environment = comprehensive["properties"]["environment"].clone();
     serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/bridge-experiment.v1.json",
+        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/bridge-experiment.v2.json",
         "title": "FrankenSQLite async bridge experiment report",
         "type": "object",
         "additionalProperties": false,
@@ -4089,7 +4173,7 @@ fn bridge_json_schema() -> serde_json::Value {
             "arm_statistics", "paired_comparisons", "ready_runtime_entry_regression"
         ],
         "properties": {
-            "schema_version": {"const": BRIDGE_REPORT_SCHEMA_V1},
+            "schema_version": {"const": BRIDGE_REPORT_SCHEMA_V2},
             "generated_at_utc": {"type": "string"},
             "provenance": {
                 "allOf": [
@@ -5146,8 +5230,8 @@ fn print_usage() {
   GATE0_RECEIPTS=$(mktemp -d /data/tmp/fsqlite-gate0-receipts.XXXXXX)
   GATE0_NONCE=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \\n')
   GATE0_HOST=$(rustc -vV | sed -n 's/^host: //p')
-  CARGO_ENCODED_RUSTFLAGS= CARGO_BUILD_RUSTFLAGS= CARGO_BUILD_RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER= CARGO_PROFILE_RELEASE_PERF_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_PERF_DEBUG=false CARGO_PROFILE_RELEASE_PERF_DEBUG_ASSERTIONS=false CARGO_PROFILE_RELEASE_PERF_INCREMENTAL=false CARGO_PROFILE_RELEASE_PERF_LTO=true CARGO_PROFILE_RELEASE_PERF_OPT_LEVEL=3 CARGO_PROFILE_RELEASE_PERF_OVERFLOW_CHECKS=false CARGO_PROFILE_RELEASE_PERF_PANIC=abort CARGO_PROFILE_RELEASE_PERF_RPATH=false CARGO_PROFILE_RELEASE_PERF_SPLIT_DEBUGINFO=off CARGO_PROFILE_RELEASE_PERF_STRIP=true LIBSQLITE3_FLAGS=-DSQLITE_ENABLE_MATH_FUNCTIONS FSQLITE_BENCH_PROFILE_NAME=release-perf FSQLITE_BENCH_BUILD_NONCE=\"$GATE0_NONCE\" cargo build --locked -vv --color never --message-format=json-render-diagnostics --target-dir \"$GATE0_TARGET\" --profile release-perf --target \"$GATE0_HOST\" -p fsqlite-e2e --features bridge-experiment --bin comprehensive-bench > \"$GATE0_RECEIPTS/gate0-build-events.jsonl\" 2> \"$GATE0_RECEIPTS/gate0-build-vv.log\"
-  BENCH_BIN=$(jq -r 'select(.reason == \"compiler-artifact\" and .target.name == \"comprehensive-bench\") | .executable // empty' \"$GATE0_RECEIPTS/gate0-build-events.jsonl\" | tail -n 1)
+  env -i HOME=\"$HOME\" USER=\"$USER\" LOGNAME=\"$USER\" PATH=\"$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin\" LC_ALL=C CARGO_ENCODED_RUSTFLAGS= CARGO_BUILD_RUSTFLAGS= CARGO_BUILD_RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER= RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= CARGO_PROFILE_RELEASE_PERF_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_PERF_DEBUG=false CARGO_PROFILE_RELEASE_PERF_DEBUG_ASSERTIONS=false CARGO_PROFILE_RELEASE_PERF_INCREMENTAL=false CARGO_PROFILE_RELEASE_PERF_LTO=true CARGO_PROFILE_RELEASE_PERF_OPT_LEVEL=3 CARGO_PROFILE_RELEASE_PERF_OVERFLOW_CHECKS=false CARGO_PROFILE_RELEASE_PERF_PANIC=abort CARGO_PROFILE_RELEASE_PERF_RPATH=false CARGO_PROFILE_RELEASE_PERF_SPLIT_DEBUGINFO=off CARGO_PROFILE_RELEASE_PERF_STRIP=true LIBSQLITE3_FLAGS=-DSQLITE_ENABLE_MATH_FUNCTIONS FSQLITE_BENCH_PROFILE_NAME=release-perf FSQLITE_BENCH_BUILD_NONCE=\"$GATE0_NONCE\" cargo build --locked -vv --color never --message-format=json-render-diagnostics --target-dir \"$GATE0_TARGET\" --profile release-perf --target \"$GATE0_HOST\" -p fsqlite-e2e --features bridge-experiment --bin comprehensive-bench > \"$GATE0_RECEIPTS/gate0-build-events.jsonl\" 2> \"$GATE0_RECEIPTS/gate0-build-vv.log\"
+  BENCH_BIN=$(jq -Rr 'fromjson? | select(.reason == \"compiler-artifact\" and .target.name == \"comprehensive-bench\" and (.target.kind | index(\"bin\"))) | .executable // empty' \"$GATE0_RECEIPTS/gate0-build-events.jsonl\" | tail -n 1)
   test -n \"$BENCH_BIN\" && FSQLITE_BENCH_BUILD_LOG_PATH=\"$GATE0_RECEIPTS/gate0-build-vv.log\" FSQLITE_BENCH_EXPECTED_CPU_AFFINITY=2-3 FSQLITE_BENCH_MAX_LOAD_1M=1 taskset -c 2,3 \"$BENCH_BIN\" --bridge-experiment --allow-unverified-provenance --json-out \"$GATE0_RECEIPTS/bridge-diagnostic.json\"
 
 Flags:
@@ -6524,7 +6608,7 @@ fn concurrent_expected_cpu_affinity() -> Result<String, String> {
 }
 
 fn normalized_synchronous(value: &str) -> Result<String, String> {
-    match value.to_ascii_lowercase().as_str() {
+    match value.trim().to_ascii_lowercase().as_str() {
         "0" | "off" => Ok("off".to_owned()),
         "1" | "normal" => Ok("normal".to_owned()),
         "2" | "full" => Ok("full".to_owned()),
@@ -7674,7 +7758,7 @@ mod tests {
 
     fn sample_provenance() -> JsonBenchmarkProvenance {
         JsonBenchmarkProvenance {
-            schema_version: BENCHMARK_PROVENANCE_SCHEMA_V2.to_owned(),
+            schema_version: BENCHMARK_PROVENANCE_SCHEMA_V3.to_owned(),
             citable: false,
             status: "unverified".to_owned(),
             validation_errors: vec![
@@ -7756,19 +7840,19 @@ mod tests {
                 effective_profiles: BTreeMap::from([
                     (
                         "memory.csqlite".to_owned(),
-                        BTreeMap::from([("synchronous".to_owned(), "1".to_owned())]),
+                        BTreeMap::from([("synchronous".to_owned(), "normal".to_owned())]),
                     ),
                     (
                         "memory.fsqlite".to_owned(),
-                        BTreeMap::from([("synchronous".to_owned(), "1".to_owned())]),
+                        BTreeMap::from([("synchronous".to_owned(), "normal".to_owned())]),
                     ),
                     (
                         "file.csqlite".to_owned(),
-                        BTreeMap::from([("synchronous".to_owned(), "1".to_owned())]),
+                        BTreeMap::from([("synchronous".to_owned(), "normal".to_owned())]),
                     ),
                     (
                         "file.fsqlite".to_owned(),
-                        BTreeMap::from([("synchronous".to_owned(), "1".to_owned())]),
+                        BTreeMap::from([("synchronous".to_owned(), "normal".to_owned())]),
                     ),
                 ]),
             },
@@ -7781,10 +7865,18 @@ mod tests {
                 parser_slow_path_executions: 1,
                 prepared_insert_fast_lane_hits: 4,
                 prepared_insert_instrumented_lane_hits: 0,
-                prepared_update_delete_fast_lane_hits: 2,
+                prepared_direct_insert_executions: 4,
+                prepared_update_delete_fast_lane_hits: 0,
                 prepared_update_delete_instrumented_lane_hits: 0,
+                prepared_direct_update_executions: 1,
+                prepared_direct_delete_executions: 1,
+                prepared_update_delete_dml_direct_handoff_runs: 0,
+                prepared_table_dml_affected_only_runs: 0,
                 prepared_dml_fallbacks: BTreeMap::new(),
-                select_fallback_decisions: BTreeMap::from([("group_by_fallback".to_owned(), 1)]),
+                select_routing_decisions: BTreeMap::from([
+                    ("group_by_fallback".to_owned(), 1),
+                    ("valid_btree_page".to_owned(), 1),
+                ]),
                 probe_errors: Vec::new(),
             },
         }
@@ -7796,6 +7888,48 @@ mod tests {
             FSQLITE_BENCHMARK_PRAGMAS.iter().any(|pragma| pragma
                 .eq_ignore_ascii_case("PRAGMA fsqlite_capture_time_travel_snapshots=false;")),
             "comprehensive-bench should profile benchmark workloads, not optional time-travel snapshot cloning"
+        );
+    }
+
+    #[test]
+    fn effective_synchronous_pragma_values_have_one_canonical_representation() {
+        for (left, right, expected) in [
+            ("0", "OFF", "off"),
+            ("1", "normal", "normal"),
+            ("2", "FULL", "full"),
+            ("3", "extra", "extra"),
+        ] {
+            assert_eq!(
+                normalize_effective_pragma_value("synchronous", left.to_owned())
+                    .expect("numeric synchronous value must normalize"),
+                expected
+            );
+            assert_eq!(
+                normalize_effective_pragma_value("SYNCHRONOUS", right.to_owned())
+                    .expect("named synchronous value must normalize"),
+                expected
+            );
+        }
+        assert_eq!(
+            normalize_effective_pragma_value("page_size", "4096".to_owned())
+                .expect("unrelated pragma must pass through"),
+            "4096"
+        );
+        assert!(
+            normalize_effective_pragma_value("synchronous", "unknown".to_owned()).is_err(),
+            "unknown durability values must fail closed"
+        );
+    }
+
+    #[test]
+    fn compiled_panic_strategy_matches_the_benchmark_target_cfg() {
+        assert_eq!(
+            compiled_panic_strategy(),
+            if cfg!(panic = "abort") {
+                "abort"
+            } else {
+                "unwind"
+            }
         );
     }
 
@@ -8123,7 +8257,7 @@ mod tests {
             sample_provenance(),
         );
 
-        assert_eq!(json.schema_version, JSON_REPORT_SCHEMA_V5);
+        assert_eq!(json.schema_version, JSON_REPORT_SCHEMA_V6);
         assert_eq!(json.environment.git_head_unix_ts, Some(1_700_000_000));
         assert_eq!(json.environment.git_dirty, Some(false));
         assert_eq!(
@@ -8370,7 +8504,7 @@ mod tests {
 
         let written = std::fs::read_to_string(report_path).expect("JSON report should be written");
         assert!(
-            written.contains(JSON_REPORT_SCHEMA_V5),
+            written.contains(JSON_REPORT_SCHEMA_V6),
             "written JSON should include the benchmark schema version"
         );
     }
@@ -8436,7 +8570,7 @@ mod tests {
             .expect("HTML report should be written");
         let html = std::fs::read_to_string(html_path).expect("HTML report should be readable");
         assert!(html.contains("benchmark-provenance"));
-        assert!(html.contains(BENCHMARK_PROVENANCE_SCHEMA_V2));
+        assert!(html.contains(BENCHMARK_PROVENANCE_SCHEMA_V3));
         assert!(html.contains("NON-CITABLE DIAGNOSTIC"));
         assert!(html.contains("generic comprehensive measurements are diagnostic-only"));
     }
@@ -8521,7 +8655,7 @@ mod tests {
 
         assert_eq!(
             schema["properties"]["schema_version"]["const"],
-            JSON_REPORT_SCHEMA_V5
+            JSON_REPORT_SCHEMA_V6
         );
         assert_eq!(
             schema["properties"]["ci_regression_gate"]["properties"]["bead_id"]["const"],
@@ -8572,6 +8706,20 @@ mod tests {
     fn build_identity_validation_rejects_profile_misrepresentation() {
         let canonical = sample_provenance().build;
         assert_eq!(validate_build_identity(&canonical), Vec::<String>::new());
+        let canonical_environment =
+            canonical_profile_environment("release-perf").expect("test profile is canonical");
+        assert_eq!(
+            canonical_environment
+                .get("RUSTC_WRAPPER")
+                .map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            canonical_environment
+                .get("RUSTC_WORKSPACE_WRAPPER")
+                .map(String::as_str),
+            Some("")
+        );
 
         let mut profile_mismatch = canonical.clone();
         profile_mismatch.declared_profile = "release".to_owned();
@@ -8612,6 +8760,17 @@ mod tests {
             validate_build_identity(&rustflags_override)
                 .iter()
                 .any(|error| error.contains("require empty encoded rustflags"))
+        );
+
+        let mut wrapper_environment = canonical_environment;
+        wrapper_environment.insert("RUSTC_WRAPPER".to_owned(), "sccache".to_owned());
+        let mut wrapper_override = canonical.clone();
+        wrapper_override.profile_override_environment_hex =
+            encode_build_environment(&wrapper_environment);
+        assert!(
+            validate_build_identity(&wrapper_override)
+                .iter()
+                .any(|error| error.contains("does not exactly force the canonical"))
         );
 
         let mut environment_override = canonical;
@@ -8846,7 +9005,7 @@ mod tests {
         bridge_provenance.validation_errors =
             vec!["test fixture models the diagnostic-only bridge contract".to_owned()];
         let report = JsonBridgeReport {
-            schema_version: BRIDGE_REPORT_SCHEMA_V1.to_owned(),
+            schema_version: BRIDGE_REPORT_SCHEMA_V2.to_owned(),
             generated_at_utc: "2026-07-26T00:00:01Z".to_owned(),
             provenance: bridge_provenance,
             environment: DetectedEnvironment {
@@ -12851,7 +13010,7 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
     }
 
     let report = JsonBridgeReport {
-        schema_version: BRIDGE_REPORT_SCHEMA_V1.to_owned(),
+        schema_version: BRIDGE_REPORT_SCHEMA_V2.to_owned(),
         generated_at_utc: chrono_stamp(),
         provenance,
         environment,

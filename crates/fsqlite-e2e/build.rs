@@ -234,10 +234,6 @@ fn main() {
         "FSQLITE_BENCH_BUILD_HOST",
         env::var("HOST").unwrap_or_else(|_| "unknown".to_owned()),
     );
-    emit(
-        "FSQLITE_BENCH_BUILD_PANIC",
-        env::var("CARGO_CFG_PANIC").unwrap_or_else(|_| "unknown".to_owned()),
-    );
     emit("FSQLITE_BENCH_BUILD_FEATURES", features.join(","));
     emit(
         "FSQLITE_BENCH_BUILD_RUSTFLAGS_HEX",
