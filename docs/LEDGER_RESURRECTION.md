@@ -78,6 +78,33 @@ rate and must not be reported as a yield.** Flags identify entries to *read*; th
 Reporting pass-1 or pass-2 numbers as a resurrection yield would have overstated this repo's void
 rate by 46× and sent the fleet chasing entries that are already correctly closed.
 
+## Third failure class discovered during the rerun: baseline drift
+
+The literal VOID audit above asks whether an entry's own harness could detect its
+candidate. The campaign uncovered a separate failure mode while those reruns
+were building: a sound measurement can still become stale when its baseline
+later regresses.
+
+`bd-zavyn` reproduced the README's cited `write_bulk` result on its cited
+`140e77df` source snapshot (`n=22`, geomean `0.8754x`, within 1.1% of the
+published `0.866x`), then ran the same release-perf binary target and
+`--quick --filter insert` shape at `ef1e39c9`. The latter measured `n=22`,
+geomean `2.5898x`; that is a **2.96x degradation** across the committed
+`140e77df..ef1e39c9` range. Tight small-row CVs and a clean historical
+worktree ruled out host noise, the harness, and the current feature-gated
+uncommitted rerun code.
+
+This does not change the hand-verified 10/583 literal null-control VOID count.
+It adds a third audit class: **baseline-drift provisional**. Any performance
+decision whose evidence predates or falls inside a confirmed regression window
+must be re-decided after the regression is fixed, even if its original
+reachability and statistics were sound. The concrete retry predicate is:
+`bd-zavyn` closed with the culprit fixed, a post-fix profile still attributes
+the target surface, and the exact candidate clears the same-invocation A/A
+median-CI gate on the repaired lineage. Until then, the five queue reruns below
+are useful for harness calibration and relative direction only; their
+write-side verdicts cannot close the post-fix frontier.
+
 ---
 
 ## The VOID queue (10 genuine entries)
