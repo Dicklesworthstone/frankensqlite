@@ -5,6 +5,7 @@
 //! concurrency invariants from frankensqlite#70.
 
 #![allow(clippy::struct_excessive_bools, clippy::too_many_lines)]
+#![recursion_limit = "512"]
 
 use std::env;
 use std::fs::{self, File};

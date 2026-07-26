@@ -6,6 +6,8 @@
 **Audit tooling:** three mechanical extraction passes, then hand-verification of every
 entry that survived to a verdict. Scripts are scratch-only; every VOID verdict below was
 read by a human-equivalent pass, not emitted by regex.
+**Corrected remeasurement:** 2026-07-26, Lane M (`cod`), exact-ELF
+same-invocation A/A plus A/B contracts.
 
 ---
 
@@ -39,6 +41,34 @@ these five/six are null results."*
 target for it. The transferable artifact from this repo is not a resurrection yield — it is
 **AUDIT v2's dispatch-counter reachability proof**, which is cheaper and stronger than
 sampled self-time and which the other ten repos should copy. See "Method worth porting" below.
+
+---
+
+## Six-class hand-adjudication contract
+
+The fleet correction supersedes the original regex labels. Mechanical matching
+only builds a reading queue; a human-equivalent pass assigns one of these
+classes after reading the row and its cited evidence:
+
+- `VALID-PROFILE`: a pre-edit rejection names a non-zero-self-time frame and
+  computes its Amdahl ceiling.
+- `VALID-MECHANISM`: even without A/A, a counted mechanism proves that no work
+  was removed (instructions, cycles, syscalls, allocations, faults, or an
+  equivalent exact dispatch count).
+- `VALID-AB`: the A/B effect lies inside a recorded same-invocation A/A null.
+- `VOID-CV`: the row was killed only by a CV threshold.
+- `VOID-ZEROSELF`: the benchmark's target frame had approximately zero
+  self-time; an exact zero dispatch count is a stronger instance of this class.
+- `VOID-NONULL`: a near-parity wall ratio has neither an A/A null nor a counted
+  mechanism.
+
+Applied honestly to the hand-read queue, all ten original genuine VOID entries
+were `VOID-NONULL`: none had an A/A null or counted mechanism. No genuine queue
+row was void solely because of CV, and none was promoted to
+`VALID-MECHANISM` without a count. Screens, summaries, correctness failures,
+and architecture decisions remain excluded from the performance-verdict
+denominator rather than being forced into a class. The resulting entry-level
+audit remains **10 / 583 = 1.7% VOID**.
 
 ---
 
@@ -135,16 +165,31 @@ finding, not a lever — resolved separately in commit `ffda8070`.
 
 ## Re-run status
 
-**#1 (L18529, seek-cache MRU short-circuit) is the only entry in this queue whose re-run is
-justified on evidence rather than on completeness**, and it is queued behind the structural
-lane's profiling build. Honest constraint, recorded rather than papered over: the original
-measurement cost **24 m 18 s + 23 m 31 s of cold remote build** per arm because RCH invalidated
-the target graph on each sync. Re-running five entries at that cost is not achievable in one
-session, and re-running them *without* the §2 null control would reproduce the exact defect this
-audit exists to catch. The remaining nine are ledgered as a standing queue with their recipes.
+The top five were re-run on 2026-07-26. The release-perf executable reported
+SHA-256
+`bbbbe7c56ed067aa07ca47d9a403875ed91d111232c600cf08ba96f05fe9cc64`
+(25,949,584 bytes) from worker `vmi1153651`. Its source identity was:
+`pipeline_stage_bench.rs` `7c1bf644…`, `cursor.rs` `44708dee…`,
+`value.rs` `88e7bbff…`, and `connection.rs` `5aa035df…`. Every timed case
+used four independent fixtures (A/A plus A/B), 41 paired rounds, min-of-three,
+10,000 median-bootstrap resamples, exact output checksums, and a counted
+candidate dispatch. CV was printed but never gated.
 
-**No entry in this queue has been re-won yet.** Yield so far: 583 audited / 10 void / 1 queued
-for re-run / 0 re-won. That number will be updated in place, not restated elsewhere.
+| Queue | Corrected class | Counted mechanism | Claim median, 95% CI | A/A 95% CI | Result |
+|---:|---|---:|---|---|---|
+| 1 seek-cache MRU | `VALID-AB` | 488,064 hits | `1.007533 [0.970819, 1.057989]` | `[0.969946, 1.055463]` | `INCONCLUSIVE` |
+| 2 DELETE search hint | `VOID-ZEROSELF` | **0 hits** | not interpreted | not published | `INVALID` |
+| 3 SmallText traits | `VALID-AB` | 4,975,104 hits | `1.026980 [0.986791, 1.084763]` | `[0.993031, 1.036486]` | `INCONCLUSIVE` |
+| 4 fixed-width REAL | `VALID-AB` | 503,808 hits | `0.978947 [0.956454, 1.021725]` | `[0.956153, 1.028183]` | `INCONCLUSIVE` |
+| 5 lazy decoded scratch | `VALID-AB` | 15,744 hits | `0.991003 [0.938007, 1.078962]` | `[0.987739, 1.011725]` | `INCONCLUSIVE` |
+
+The corrected yield is therefore **583 audited / 10 originally VOID / 5
+re-run / 0 re-won**. Four rows are no longer evidentially void, but none clears
+the keep/reject band; the DELETE row is confirmed unreachable by a stronger
+zero-dispatch proof. Exact commands, full hashes, decision thresholds, and
+per-row retry predicates are in
+`docs/progress/perf-negative-results.md` under the dated top-five
+resurrection entry.
 
 ---
 

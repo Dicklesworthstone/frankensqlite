@@ -48,6 +48,149 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-07-26 - AUDIT: top-five VOID resurrection queue gets exact-dispatch and A/A adjudication
+
+- Scope: the hand-read six-class audit in `docs/LEDGER_RESURRECTION.md`
+  classified the ten genuine source rows as `VOID-NONULL`; the top five were
+  selected in their documented order. The required negative-evidence grep was
+  therefore the queue itself plus the original rows at ledger lines 18,529,
+  13,625, 11,422, 7,626, and 10,126. No new lever was proposed.
+- Contract: `pipeline_stage_bench --features bench-internals` ran independent
+  A/A and A/B file-backed fixtures, 41 paired rounds, min-of-three inner
+  replicates, 10,000 median-bootstrap resamples, output checksums, and exact
+  candidate-branch counters. Its decision band was `1 ± 2 * max distance of
+  the A/A CI from 1`, with a 1% minimum. The full claim CI, not its point
+  median, had to clear that band. `cv_gate=never`.
+- Build/run: the combined strict-remote build command was
+  `RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=3600
+  RCH_WORKER=vmi1153651 RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec
+  -- cargo bench --profile release-perf -j7 -p fsqlite-e2e --bench
+  pipeline_stage_bench --features bench-internals --
+  --ledger-resurrection-all`. Worker `vmi1153651`; the release-perf ELF
+  reported SHA-256
+  `bbbbe7c56ed067aa07ca47d9a403875ed91d111232c600cf08ba96f05fe9cc64`,
+  25,949,584 bytes. After the second case proved unreachable and stopped the
+  first combined runner, cases 3-5 executed that preserved exact ELF directly
+  on the same worker. From the remote repository root it reported these source
+  identities:
+  `pipeline_stage_bench.rs`
+  `7c1bf644489b67b9d26992bd989e5144de61711a7b74988b701c1c28ced86ee0`
+  (63,240 bytes), `cursor.rs`
+  `44708dee681345743a9001d1d71ec98ca70217a2863ed95f5cff911ddda81fb7`
+  (893,330 bytes), `value.rs`
+  `88e7bbffb4270e5b979aea5b9645bea07d144935580bb8bfca177e2ab5ad6df3`
+  (130,075 bytes), and `connection.rs`
+  `5aa035dfa56ef3ccc7b91083c3a124651f0a059a220388407a35afc6a1121820`
+  (8,654,968 bytes).
+
+  | queue / candidate | exact hits | A/A median, 95% CI | A/B median, 95% CI | decisive band | six-class result |
+  |---|---:|---|---|---|---|
+  | 1 table seek-cache MRU short-circuit | 488,064 | `1.008096 [0.969946, 1.055463]` | `1.007533 [0.970819, 1.057989]` | `<0.889074` or `>1.110926` | `VALID-AB`, `INCONCLUSIVE` |
+  | 2 same-leaf DELETE search hint | **0** | not published | not interpreted | exact reachability required first | `VOID-ZEROSELF`, `INVALID` |
+  | 3 SmallText direct traits | 4,975,104 | `1.021957 [0.993031, 1.036486]` | `1.026980 [0.986791, 1.084763]` | `<0.927028` or `>1.072972` | `VALID-AB`, `INCONCLUSIVE` |
+  | 4 fixed-width REAL update | 503,808 | `1.000416 [0.956153, 1.028183]` | `0.978947 [0.956454, 1.021725]` | `<0.912307` or `>1.087693` | `VALID-AB`, `INCONCLUSIVE` |
+  | 5 lazy decoded scratch | 15,744 | `1.002169 [0.987739, 1.011725]` | `0.991003 [0.938007, 1.078962]` | `<0.975477` or `>1.024523` | `VALID-AB`, `INCONCLUSIVE` |
+
+- Adjudication: no candidate was re-won. Four original `VOID-NONULL` rows are
+  now valid A/B evidence but remain inconclusive; their entire claim intervals
+  overlap the measured null-derived bands. The DELETE row is confirmed
+  unreachable: an exact zero dispatch count is stronger than sampled
+  approximately-zero self-time, so its timing is not interpreted. Candidate
+  4's claim CV was 252.982%; it is recorded as diagnostic provenance and did
+  not decide the row.
+- Retry predicates:
+  1. Seek-cache MRU: retry only after a mechanism/profile change predicts an
+     effect larger than the current 11.09% gain band, or on a host/run design
+     that demonstrates an A/A radius at or below 0.5%; require the full claim
+     CI above the recomputed band.
+  2. DELETE search hint: do not time it again until a pre-timing probe records
+     a non-zero `delete_leaf_search_hint` exact dispatch count for the named
+     fixture; then rerun the complete A/A+A/B contract.
+  3. SmallText traits: retry only after a counted instruction/allocation
+     reduction is added or a profile attributes enough self-time to predict
+     more than the measured 7.30% gain band; retain the 4,975,104-hit
+     reachability proof.
+  4. Fixed-width REAL: retry after the confirmed write baseline regression is
+     fixed and a quieter fixture brings the null radius below 1%; preserve
+     fixed-width-hit counting and exact value/checksum restoration.
+  5. Lazy scratch: retry only after a counted allocation/decode reduction is
+     demonstrated and the full claim CI can clear the recomputed band; preserve
+     the one-row transaction shape and non-zero lazy-scratch count.
+- Harness follow-up: the queue runner now reports zero dispatch as structured
+  `reachability_gate=INVALID`, continues later candidates, and exits 2 after
+  the combined invocation. It also resolves source identities from
+  `CARGO_MANIFEST_DIR`, so Cargo's launch directory cannot silently produce
+  `unavailable` hashes.
+
+## 2026-07-26 - MEASURE: concurrent writers at matched `synchronous=NORMAL` with same-invocation C/C null controls
+
+- Allocation: Lane M was directed to remeasure concurrent writers after
+  adjudicating `bd-minmax-prefix-seek-4fuo6`. The mandatory negative-evidence
+  grep found the 2026-07-23 `bd-x5gzk` entry below: do **not** use
+  `comprehensive_bench --filter concurrent`, whose file-WAL C arm has already
+  failed three attempts with irreducible run-to-run noise. This measurement
+  therefore used the focused `mt-mvcc-bench`.
+- Contract: each thread-count row used 21 paired rounds and four independent
+  fresh file-backed databases per round: C null A, C null B, C baseline, and
+  FrankenSQLite candidate. Odd rounds reverse execution order. Every worker
+  connection in both engines explicitly used `journal_mode=WAL`,
+  `synchronous=NORMAL`, and `busy_timeout=5000`; inserts were prepared; table
+  shape, row count, and non-overlapping rowid ranges were matched. The report
+  used 10,000 bootstrap resamples of the median per-round ratio. CV and MAD
+  were printed but `cv_gate=never`. The decision threshold was the claim CI
+  beyond twice the same-row C/C 95%-CI radius, with a 1% minimum effect.
+- Command, shared table:
+  `RCH_WORKER=vmi1149989 RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch
+  exec -- cargo run --profile release-perf -j7 -p fsqlite-e2e --bin
+  mt-mvcc-bench -- --rows-per-thread=1000 --threads=1,2,4,8 --iters=21
+  --json-output=/tmp/frankensqlite-mt-shared-20260725.json
+  --summary-md=/tmp/frankensqlite-mt-shared-20260725.md
+  --history-json=/tmp/frankensqlite-mt-shared-history-20260725.json`.
+  Worker `vmi1149989`, exit 0. The program's first stdout line identified ELF
+  SHA-256
+  `cd51cf5b7e20761de32b38a1933a230ea493ab52a86a681419064b4573e79386`,
+  19,249,488 bytes. Benchmark-source SHA-256 was
+  `76f6cffe86676b2cff4b5da4daea2acb3afb37a7bb8e4303ecef225453e78f77`
+  (65,768 bytes).
+
+  | threads | C/C null median, 95% CI | F/C claim median, 95% CI | F/C marginal p50 writes/s | failures F/C | verdict |
+  |---:|---|---|---:|---:|---|
+  | 1 | `1.069254 [0.944104, 1.132008]` | `0.812434 [0.796425, 0.917790]` | `225,560 / 283,075` | `0 / 0` | `INCONCLUSIVE` |
+  | 2 | `1.177248 [0.916400, 1.233933]` | `0.566566 [0.478737, 0.658484]` | `165,483 / 287,230` | `0 / 0` | `INCONCLUSIVE` |
+  | 4 | `0.996769 [0.906437, 1.057966]` | `1.065671 [0.877737, 1.271667]` | `188,692 / 175,909` | `0 / 0` | `INCONCLUSIVE` |
+  | 8 | `1.008665 [0.986537, 1.288017]` | `1.869339 [1.798963, 1.991750]` | `166,672 / 94,160` | `0 / 0` | `FSQLITE_FASTER` |
+
+- Command, separate table per writer: the same command plus
+  `--separate-tables`, with separate `/tmp/frankensqlite-mt-separate-*`
+  output paths. Worker `vmi1149989`, exit 0. The program identified ELF
+  SHA-256
+  `0a5f7554ad90f7fc8326f003404f2d00f42cd814e7630cc160e52f8af9908789`,
+  19,249,488 bytes, and the same benchmark-source SHA-256
+  `76f6cffe86676b2cff4b5da4daea2acb3afb37a7bb8e4303ecef225453e78f77`.
+
+  | threads | C/C null median, 95% CI | F/C claim median, 95% CI | F/C marginal p50 writes/s | failures F/C | verdict |
+  |---:|---|---|---:|---:|---|
+  | 1 | `1.023313 [0.822642, 1.267544]` | `0.809914 [0.726962, 0.879560]` | `207,567 / 244,237` | `0 / 0` | `INCONCLUSIVE` |
+  | 2 | `1.017204 [0.862429, 1.100505]` | `0.553239 [0.488900, 0.707912]` | `164,789 / 271,822` | `0 / 0` | `FSQLITE_SLOWER` |
+  | 4 | `0.991678 [0.950798, 1.011827]` | `1.016963 [0.793856, 1.153680]` | `198,425 / 176,200` | `0 / 0` | `INCONCLUSIVE` |
+  | 8 | `0.990736 [0.672570, 1.266288]` | `2.965575 [2.625840, 3.289043]` | `244,465 / 73,614` | `0 / 0` | `FSQLITE_FASTER` |
+
+- Adjudication: high CVs did not kill any row. The same-invocation null
+  controls instead prevented raw low-thread ratios from becoming false speed
+  claims. The exact-binary conclusions are: a shared-table 8-thread win, a
+  separate-table 8-thread win, a separate-table 2-thread regression, and five
+  inconclusive rows. These replace the uncited historical `40.99x`
+  separate-table and three-iteration `2.57x / 1.79x` shared-table README
+  claims. The remote `/tmp` JSON/Markdown outputs are worker-local; the exact
+  stdout evidence is preserved in this repository-resident entry.
+- Retry predicate: remeasure after any engine, durability, transaction-loop,
+  or harness change, or when a dedicated host can shrink the relevant C/C null
+  radius. Keep the exact same per-connection `NORMAL` setting, fresh
+  four-fixture pairing, self-reported ELF/source identities, counted failures,
+  and median-CI decision. Reopen an inconclusive row only if its new claim CI
+  clears twice its own same-invocation null radius. Do not use CV, historical
+  pass-over-pass drift, or a near-1.0 marginal ratio as a verdict.
+
 ## 2026-07-11 - SURFACE: prepared ORDER BY/LIMIT bypasses the assigned runtime/storage lane
 
 - Target at `d9e9b811`: find one fresh, output-identical lever in B-tree,

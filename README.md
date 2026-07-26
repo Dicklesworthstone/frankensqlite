@@ -1224,15 +1224,16 @@ The human-readable scope lock for that contract lives in
 > | `tests/artifacts/perf/may8-current-gap-audit-20260508T2330Z/` | **missing from the repo** |
 > | source snapshot `140e77df` | **not a reachable git object** |
 >
-> So the concurrent-writer headline figures (including `40.99x`) currently cite
-> evidence that is not in the repository and cannot be reproduced by a reader.
-> That is a pre-existing documentation gap, not a consequence of the async
-> migration, but it has the same effect: the numbers are unverifiable as
-> published.
+> The former concurrent-writer headline figures (including `40.99x`) cited
+> evidence that is not in the repository and could not be reproduced by a
+> reader. The 2026-07-26 exact-binary matrices below replace those claims.
 >
 > Until `bd-dqdoe` produces a citation-grade artifact on a verified-quiet host,
-> treat this whole section as **historical and unverified**: accurate at most
-> for the commit it names, not for `main`. Releases are held on this.
+> treat the full-quick matrix and every pre-2026-07-26 row in this section as
+> **historical and unverified**: accurate at most for the commit it names, not
+> for `main`. The concurrent-writer subsection below is a 2026-07-26
+> exact-binary remeasurement and states its narrower scope explicitly.
+> Releases remain held on the broader re-verification.
 
 ### Workloads That Benefit Most from MVCC
 
@@ -1247,11 +1248,13 @@ statements are prepared once for both engines before timed samples, and private
 Time ratios report FrankenSQLite time divided by C SQLite time, so values
 **below `1.0x` are faster for FrankenSQLite**.
 
-Standalone concurrent-writer scaling is measured by `mt-mvcc-bench` in
-`tests/artifacts/perf/may8-current-gap-audit-20260508T2330Z/`
-(`mt-mvcc-separate-tables.json` and `mt-mvcc-shared-table.stdout`). That harness
-reports throughput as FrankenSQLite writes/sec divided by C SQLite writes/sec,
-so values **above `1.0x` are faster for FrankenSQLite**.
+Standalone concurrent-writer scaling is measured by `mt-mvcc-bench`. The
+current citation-grade rows are recorded in
+`docs/progress/perf-negative-results.md` under the dated 2026-07-26 matched-sync
+entry. That harness reports paired throughput as FrankenSQLite writes/sec
+divided by C SQLite writes/sec, so values **above `1.0x` favor
+FrankenSQLite**—but only a median-CI verdict outside the same-invocation A/A
+null envelope is called faster or slower.
 
 #### Full-quick matrix headline (93 scenarios)
 
@@ -1298,85 +1301,51 @@ Per-category geomean F/C time ratio:
 
 #### Concurrent writers (the headline MVCC win)
 
-`mt-mvcc-bench --separate-tables` (250 rows/thread, 3 iters), the workload
-where each writer commits to its own table:
+The 2026-07-26 Lane-M remeasurement used 1,000 rows/thread, 21 paired rounds,
+10,000 bootstrap resamples, a fresh file-backed database for every arm, and
+explicit `synchronous=NORMAL` on every worker connection in both engines.
+Each thread-count row interleaved an independent C/C null control and the C/F
+claim in the same invocation. CV and MAD were recorded but never gated a
+verdict. All rows completed with zero failed writes.
 
-| Threads | F writes/sec | C writes/sec | Throughput F/C | Reading |
+The exact shared-table ELF was
+`cd51cf5b7e20761de32b38a1933a230ea493ab52a86a681419064b4573e79386`
+(19,249,488 bytes); the exact separate-table ELF was
+`0a5f7554ad90f7fc8326f003404f2d00f42cd814e7630cc160e52f8af9908789`
+(19,249,488 bytes). Both invocations reported benchmark-source SHA-256
+`76f6cffe86676b2cff4b5da4daea2acb3afb37a7bb8e4303ecef225453e78f77`.
+Full commands, null intervals, claim intervals, worker identity, and retry
+predicates are durable in `docs/progress/perf-negative-results.md`
+(2026-07-26 matched-sync entry).
+
+Paired ratios below are medians of each round's F/C throughput ratio. The F and
+C writes/sec columns are marginal medians, so dividing them need not reproduce
+the paired-ratio median.
+
+Shared table, disjoint rowid ranges:
+
+| Threads | F writes/sec | C writes/sec | Paired F/C median (95% CI) | Median-CI verdict |
 |---:|---:|---:|---:|---|
-| 1 | `264 918` | `623 830` | `0.42x` | C SQLite faster (per-row ceremony tax) |
-| 2 | `443 227` | `294 386` | `1.51x` | F faster |
-| 4 | `841 940` | `109 961` | `7.66x` | F much faster |
-| 8 | `1 022 049` | `24 936` | **`40.99x`** | F throughput crushes C — C SQLite serialises all 8 writers |
+| 1 | `225 560` | `283 075` | `0.812x` (`0.796–0.918`) | Inconclusive inside C/C null envelope |
+| 2 | `165 483` | `287 230` | `0.567x` (`0.479–0.658`) | Inconclusive inside 2× C/C null radius |
+| 4 | `188 692` | `175 909` | `1.066x` (`0.878–1.272`) | Inconclusive |
+| 8 | `166 672` | `94 160` | **`1.869x`** (`1.799–1.992`) | **FrankenSQLite faster** |
 
-> ⚠ **These separate-tables numbers are due for re-measurement and should be
-> quoted with that caveat.** Two reasons, neither of which is a claim that they
-> are wrong. First, they come from the same 2026-05-08 run as the shared-table
-> table below — and when that companion table was re-measured on 2026-07-25 at
-> matched durability it was off by roughly 3.7× at one thread, in the
-> *conservative* direction. A stale run is not selectively stale. Second, the
-> artifact directory cited above for both tables is not in the repository:
-> `.gitignore` excludes `tests/artifacts/perf/**/*`, so the path has never
-> resolved for anyone who did not run the benchmark themselves. Re-measurement
-> is tracked in `bd-wvtbc`; the citation problem in `bd-oyaig`.
+Separate table per writer:
 
-`mt-mvcc-bench` shared-table (1 000 rows/thread, all writers writing the
-same table, non-overlapping rowid ranges). Re-measured 2026-07-25 at **matched
-durability** — both engines' writer connections at `synchronous=NORMAL` — from
-source snapshot `140e77df`, which is the last commit whose `mt_mvcc_bench` is
-free of the harness `block_on` bridge (see the note below). `taskset -c 4-11`,
-3 iterations, `0` failed rows on both engines. Reproduce with:
-
-```bash
-git worktree add /tmp/fsq-140e77df 140e77df
-cd /tmp/fsq-140e77df && CARGO_TARGET_DIR=/tmp/fsq-140e77df/target \
-  cargo build --profile release-perf -p fsqlite-e2e --bin mt-mvcc-bench
-taskset -c 4-11 ./target/release-perf/mt-mvcc-bench \
-  --rows-per-thread=1000 --threads=1,2 --iters=3
-```
-
-| Threads | F writes/sec | C writes/sec | Throughput F/C | Reading |
+| Threads | F writes/sec | C writes/sec | Paired F/C median (95% CI) | Median-CI verdict |
 |---:|---:|---:|---:|---|
-| 1 | `92 615` | `36 011` | **`2.57x`** | F faster |
-| 2 | `94 936` | `53 176` | **`1.79x`** | F faster |
-| 4 | — | — | *unmeasured* | needs a quieter host — see below |
-| 8 | — | — | *unmeasured* | needs a quieter host — see below |
+| 1 | `207 567` | `244 237` | `0.810x` (`0.727–0.880`) | Inconclusive inside C/C null envelope |
+| 2 | `164 789` | `271 822` | **`0.553x`** (`0.489–0.708`) | **FrankenSQLite slower** |
+| 4 | `198 425` | `176 200` | `1.017x` (`0.794–1.154`) | Inconclusive |
+| 8 | `244 465` | `73 614` | **`2.966x`** (`2.626–3.289`) | **FrankenSQLite faster** |
 
-The 1-thread ratio is corroborated by an independent run recorded in
-`.bench-history/mt-mvcc-bench.latest.json` (2026-07-23, same shape, different
-binary): `2.579x` there versus `2.57x` here, agreeing to 0.3 %.
-
-**These numbers replace an earlier table that reported `0.69x / 0.78x / 0.85x /
-3.42x`** — i.e. FrankenSQLite *slower* at 1, 2 and 4 threads. That table was
-measured 2026-05-08 and understated FrankenSQLite by roughly 3.7× at one
-thread; the engine improved substantially in the interval. It also cited an
-artifact directory that is not in the repository, because `.gitignore` excludes
-`tests/artifacts/perf/**/*` — which is why the rows above cite a commit and a
-runnable command instead of a path.
-
-The 4- and 8-thread rows are deliberately left unmeasured rather than filled in.
-`mt_mvcc_bench`'s own pass-over-pass gate rejected our 4-thread sample (`2.62x →
-2.09x`, a 20 % drop) because the host was running competing builds, and a
-high-thread-count row cannot be trusted when the bench cannot get its threads'
-worth of free cores. A run taken under load 12 produced `1.45x` at 4 threads and
-`1.83x` at 8 — low thread counts unaffected, high thread counts collapsing,
-which is the signature of CPU contention rather than an engine property. Those
-rows will be published when a quiet host is available.
-
-> **Why `140e77df` and not `main`:** since commit `a0ab400a`, the test harnesses
-> bridge the now-async engine into their synchronous drivers with a per-call
-> `block_on`, including one **per row** in `mt_mvcc_bench`'s writer loop. That
-> bridge costs ~333 ns per call (measured on an already-ready future), and
-> because the C SQLite side is synchronous it pays nothing, so the cost does
-> **not** cancel in a cross-engine ratio. Publishing a `main` concurrent number
-> today would understate FrankenSQLite by that harness tax. The fix is to hoist
-> `block_on` to transaction granularity; until then `140e77df` is the newest
-> commit that measures the engine rather than the harness.
-
-A May 12, 2026 follow-up `mt-mvcc-bench --rows-per-thread=1000 --threads=16
---iters=3` shared-table recheck at commit `27d5f71d` is recorded in
-`tests/artifacts/perf/codex-mt-shared-16-recheck-27d5f71d-20260512T2032Z-iters3/mt-shared-16.json`.
-It reported `226 150` FrankenSQLite writes/sec, `29 997` C SQLite writes/sec,
-`7.54x` throughput F/C, and `0` failed rows for both engines.
+These rows supersede the uncited historical `40.99x` separate-table claim and
+the three-iteration `2.57x / 1.79x` shared-table claim. They are
+**exact-binary evidence, not an unrestricted claim about future `main`**:
+re-run after engine or harness changes, and do not turn an inconclusive raw
+ratio into a speed claim. The pass-over-pass history file is diagnostic only;
+the same-invocation median-CI contract is the decision gate.
 
 #### Mixed OLTP
 
@@ -1423,8 +1392,8 @@ MVCC adds memory overhead proportional to the number of concurrent active versio
 |--------|---------------------|
 | Full-quick matrix headline | `78 / 2 / 13` faster/comparable/slower across 93 scenarios; geomean `0.31327x` F/C (`cod-fullquick-refresh-20260722T1800Z/full-quick.json`, July 22, 2026) |
 | Small-N write throughput (1 writer) | Corrected matrix shows the gap is dominated by prepared-DML DELETE rows; raw worst row `3.319x` F/C, stable 10 000-row / 500-delete row `1.847x` F/C |
-| Single-row INSERT throughput (8 writers, separate tables) | `mt-mvcc-bench --separate-tables`: `40.99x` F/C throughput at 250 rows/thread |
-| Single-row INSERT throughput (8 writers, shared table) | `mt-mvcc-bench` shared-table: `3.42x` F/C throughput at 1 000 rows/thread |
+| Single-row INSERT throughput (8 writers, separate tables) | `mt-mvcc-bench --separate-tables`: paired median `2.966x` F/C, 95% CI `2.626–3.289`, at 1 000 rows/thread (2026-07-26 ledger entry) |
+| Single-row INSERT throughput (8 writers, shared table) | `mt-mvcc-bench`: paired median `1.869x` F/C, 95% CI `1.799–1.992`, at 1 000 rows/thread (2026-07-26 ledger entry) |
 | Point SELECT by rowid | `read_single` geomean `0.235x` F/C across 33 scenarios (≈ 4.26× faster) |
 | Aggregate / scan reads | `read_aggregate` geomean `0.099x` F/C across 25 scenarios (≈ 10.1× faster) |
 | Mixed OLTP (80 % reads / 20 % writes) | `0.289x` F/C on the 5 000-op / 5 000-row scenario (≈ 3.46× faster) |

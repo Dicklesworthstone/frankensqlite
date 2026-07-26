@@ -14,7 +14,10 @@ host the C-side 2-writer median has been observed spreading 95-138 ms (CV up to
 104 % at 8 writers), which is larger than the effects being compared. Use
 `crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs` (IMPL-4a) for every published
 concurrent-writer number: 1/2/4/8/16-thread reports, separate-table mode,
-startup diagnostics, higher iteration counts, and pass-over-pass history gates.
+startup diagnostics, higher iteration counts, executable self-identification,
+same-invocation C/C null controls, and bootstrap median-CI decisions.
+Pass-over-pass history, CV, and MAD are diagnostics only; none can veto or
+create a verdict.
 See `docs/progress/perf-negative-results.md` (2026-07-23 / 2026-07-25, bd-x5gzk)
 for the full evidence and the retry predicate.
 
@@ -68,6 +71,19 @@ against a matched rusqlite WAL-mode workload.
 The numbers it reports are directly comparable because both sides run
 the same count of OS threads performing the same count of transactions.
 
+Since 2026-07-26, one thread-count measurement consists of four independent
+fresh-database arms per paired round: C null A, C null B, C baseline, and
+FrankenSQLite candidate. Odd rounds reverse the execution order. The report
+bootstraps the median of the per-round ratios 10,000 times and calls a result
+only when the claim interval clears twice the measured C/C null radius, with a
+minimum 1% effect. A high CV is printed as provenance and is never a gate.
+
+The benchmark program's first stdout line reports the SHA-256, byte length, and
+path of the executable that is actually running. The next identity line reports
+the benchmark source SHA-256. Record both with every published row; a Cargo
+target path or Git HEAD inferred by the launching shell is not a substitute for
+the running ELF's identity.
+
 ## When to use which bench
 
 | Use case | Use |
@@ -96,6 +112,27 @@ was found in 2026-07-23 (bd-x5gzk). Both writer arms now set
 `synchronous=NORMAL` explicitly. `FSQLITE_BENCH_CONCURRENT_SYNC=normal|full`
 forces both engines to the named level together; it must never be used to change
 only one side.
+
+## Current reference invocation
+
+The 2026-07-26 Lane-M reference run used:
+
+```bash
+RCH_WORKER=vmi1149989 RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR \
+  rch exec -- cargo run --profile release-perf -j7 -p fsqlite-e2e \
+  --bin mt-mvcc-bench -- --rows-per-thread=1000 \
+  --threads=1,2,4,8 --iters=21
+
+RCH_WORKER=vmi1149989 RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR \
+  rch exec -- cargo run --profile release-perf -j7 -p fsqlite-e2e \
+  --bin mt-mvcc-bench -- --rows-per-thread=1000 \
+  --threads=1,2,4,8 --iters=21 --separate-tables
+```
+
+The complete null and claim intervals, exact ELF identities, verdicts, and
+retry predicates are recorded in
+`docs/progress/perf-negative-results.md` under the 2026-07-26 matched-sync
+entry. The README reproduces only the compact result tables.
 
 ## Related
 

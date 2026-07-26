@@ -23,13 +23,11 @@
 
 use std::hint::black_box;
 
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group};
 use fsqlite_parser::Parser;
 use fsqlite_types::SqliteValue;
 use tempfile::NamedTempFile;
 
-#[cfg(feature = "bench-internals")]
-use std::time::Instant;
 #[cfg(feature = "bench-internals")]
 use fsqlite_btree::cursor::{
     delete_leaf_search_hint_hits_for_bench, reset_delete_leaf_search_hint_hits_for_bench,
@@ -52,6 +50,8 @@ use fsqlite_types::value::{
 };
 #[cfg(feature = "bench-internals")]
 use sha2::{Digest, Sha256};
+#[cfg(feature = "bench-internals")]
+use std::time::Instant;
 
 fn criterion_config() -> Criterion {
     Criterion::default().configure_from_args()
@@ -77,7 +77,6 @@ const CONTRACT_BOOTSTRAP_REPS: usize = 10_000;
 const CONTRACT_CHECKSUM_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 #[cfg(feature = "bench-internals")]
 const CONTRACT_CHECKSUM_PRIME: u64 = 0x0000_0100_0000_01b3;
-
 
 type MaterializedRow = (i64, i64, String);
 
@@ -734,7 +733,6 @@ fn setup_fsqlite_real_file_backed() -> (fsqlite::Connection, NamedTempFile) {
     (connection, database)
 }
 
-
 criterion_group! {
     name = pipeline_stages;
     config = criterion_config();
@@ -787,7 +785,8 @@ fn contract_self_identity() -> String {
 
 #[cfg(feature = "bench-internals")]
 fn contract_source_identity(path: &str) -> String {
-    let Ok(bytes) = std::fs::read(path) else {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let Ok(bytes) = std::fs::read(repo_root.join(path)) else {
         return format!("unavailable:{path}");
     };
     let digest = Sha256::digest(&bytes);
@@ -902,7 +901,7 @@ fn contract_median_f64(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
     let upper = values.len() / 2;
     if values.len() % 2 == 0 {
-        (values[upper - 1] + values[upper]) / 2.0
+        f64::midpoint(values[upper - 1], values[upper])
     } else {
         values[upper]
     }
@@ -1249,6 +1248,29 @@ fn contract_micros_per_query(nanos: u128) -> f64 {
 }
 
 #[cfg(feature = "bench-internals")]
+fn contract_median_ci_verdict(
+    null_ci95: (f64, f64),
+    claim_ci95: (f64, f64),
+) -> (&'static str, f64, f64, f64) {
+    let null_radius = (null_ci95.0 - 1.0).abs().max((null_ci95.1 - 1.0).abs());
+    let min_decidable_gain = 2.0_f64.mul_add(null_radius, 1.0).max(1.01);
+    let max_decidable_regression = 2.0_f64.mul_add(-null_radius, 1.0).min(0.99);
+    let verdict = if claim_ci95.0 > min_decidable_gain {
+        "KEEP"
+    } else if claim_ci95.1 < max_decidable_regression {
+        "REJECT"
+    } else {
+        "INCONCLUSIVE"
+    };
+    (
+        verdict,
+        null_radius,
+        min_decidable_gain,
+        max_decidable_regression,
+    )
+}
+
+#[cfg(feature = "bench-internals")]
 fn contract_report(null: &ContractPairedStats, claim: &ContractPairedStats) {
     assert_eq!(
         null.checksum_a, null.checksum_b,
@@ -1258,24 +1280,13 @@ fn contract_report(null: &ContractPairedStats, claim: &ContractPairedStats) {
         claim.checksum_a, claim.checksum_b,
         "A/B output checksum mismatch"
     );
-    let null_radius = (null.ratio_ci95.0 - 1.0)
-        .abs()
-        .max((null.ratio_ci95.1 - 1.0).abs());
+    let (verdict, null_radius, min_decidable_gain, max_decidable_regression) =
+        contract_median_ci_verdict(null.ratio_ci95, claim.ratio_ci95);
     let claim_effect = (claim.ratio_p50 - 1.0).abs();
     let margin = if null_radius == 0.0 {
         f64::INFINITY
     } else {
         claim_effect / null_radius
-    };
-    let outside_null_ci =
-        claim.ratio_p50 < null.ratio_ci95.0 || claim.ratio_p50 > null.ratio_ci95.1;
-    let decisive = outside_null_ci && margin >= 2.0 && claim_effect >= 0.01;
-    let verdict = if !decisive {
-        "INCONCLUSIVE"
-    } else if claim.ratio_p50 > 1.0 {
-        "KEEP"
-    } else {
-        "REJECT"
     };
 
     println!(
@@ -1304,13 +1315,24 @@ fn contract_report(null: &ContractPairedStats, claim: &ContractPairedStats) {
     );
     println!(
         "median_ci_gate={verdict} rule=null_ci95_2x_margin cv_gate=never null_radius={null_radius:.6} claim_margin={margin:.3} min_decidable_gain={:.6} max_decidable_regression={:.6}",
-        1.0 + 2.0 * null_radius,
-        1.0 - 2.0 * null_radius
+        min_decidable_gain, max_decidable_regression
     );
 }
 
 #[cfg(feature = "bench-internals")]
-fn run_seek_cache_resurrection_contract() {
+fn contract_report_reachability(candidate_hits: u64, mechanism: &str) -> bool {
+    if candidate_hits == 0 {
+        println!(
+            "reachability_gate=INVALID exact_dispatch_count=0 mechanism={mechanism} timing_not_interpretable=true"
+        );
+        false
+    } else {
+        true
+    }
+}
+
+#[cfg(feature = "bench-internals")]
+fn run_seek_cache_resurrection_contract() -> bool {
     println!("bench_elf_sha256={}", contract_self_identity());
     contract_report_source_identities();
     println!(
@@ -1340,16 +1362,16 @@ fn run_seek_cache_resurrection_contract() {
     let candidate_hits = table_seek_mru_short_circuit_hits_for_bench();
     set_table_seek_mru_short_circuit_for_bench(false);
 
-    assert!(
-        candidate_hits > 0,
-        "candidate branch must execute before its timing can be interpreted"
-    );
+    if !contract_report_reachability(candidate_hits, "table_seek_mru_short_circuit") {
+        return false;
+    }
     contract_report(&null, &claim);
     println!("candidate_short_circuit_hits={candidate_hits}");
+    true
 }
 
 #[cfg(feature = "bench-internals")]
-fn run_delete_search_hint_resurrection_contract() {
+fn run_delete_search_hint_resurrection_contract() -> bool {
     println!("bench_elf_sha256={}", contract_self_identity());
     contract_report_source_identities();
     println!(
@@ -1379,16 +1401,16 @@ fn run_delete_search_hint_resurrection_contract() {
     let candidate_hits = delete_leaf_search_hint_hits_for_bench();
     set_delete_leaf_search_hint_for_bench(false);
 
-    assert!(
-        candidate_hits > 0,
-        "DELETE search-hint candidate must execute before its timing can be interpreted"
-    );
+    if !contract_report_reachability(candidate_hits, "delete_leaf_search_hint") {
+        return false;
+    }
     contract_report(&null, &claim);
     println!("candidate_search_hint_hits={candidate_hits}");
+    true
 }
 
 #[cfg(feature = "bench-internals")]
-fn run_small_text_traits_resurrection_contract() {
+fn run_small_text_traits_resurrection_contract() -> bool {
     println!("bench_elf_sha256={}", contract_self_identity());
     contract_report_source_identities();
     println!(
@@ -1418,16 +1440,16 @@ fn run_small_text_traits_resurrection_contract() {
     let candidate_hits = small_text_direct_trait_hits_for_bench();
     set_small_text_direct_traits_for_bench(false);
 
-    assert!(
-        candidate_hits > 0,
-        "SmallText trait candidate must execute before its timing can be interpreted"
-    );
+    if !contract_report_reachability(candidate_hits, "small_text_direct_traits") {
+        return false;
+    }
     contract_report(&null, &claim);
     println!("candidate_direct_trait_hits={candidate_hits}");
+    true
 }
 
 #[cfg(feature = "bench-internals")]
-fn run_fixed_real_update_resurrection_contract() {
+fn run_fixed_real_update_resurrection_contract() -> bool {
     println!("bench_elf_sha256={}", contract_self_identity());
     contract_report_source_identities();
     println!(
@@ -1459,16 +1481,16 @@ fn run_fixed_real_update_resurrection_contract() {
     set_prepared_direct_update_fixed_real_for_bench(true);
     set_prepared_direct_update_lazy_scratch_for_bench(false);
 
-    assert!(
-        candidate_hits > 0,
-        "fixed-width REAL candidate must execute before its timing can be interpreted"
-    );
+    if !contract_report_reachability(candidate_hits, "prepared_direct_update_fixed_real") {
+        return false;
+    }
     contract_report(&null, &claim);
     println!("candidate_fixed_real_hits={candidate_hits}");
+    true
 }
 
 #[cfg(feature = "bench-internals")]
-fn run_lazy_update_scratch_resurrection_contract() {
+fn run_lazy_update_scratch_resurrection_contract() -> bool {
     println!("bench_elf_sha256={}", contract_self_identity());
     contract_report_source_identities();
     println!(
@@ -1500,22 +1522,67 @@ fn run_lazy_update_scratch_resurrection_contract() {
     set_prepared_direct_update_fixed_real_for_bench(true);
     set_prepared_direct_update_lazy_scratch_for_bench(false);
 
-    assert!(
-        candidate_hits > 0,
-        "lazy decoded-scratch candidate must execute before its timing can be interpreted"
-    );
+    if !contract_report_reachability(candidate_hits, "prepared_direct_update_lazy_scratch") {
+        return false;
+    }
     contract_report(&null, &claim);
     println!("candidate_lazy_scratch_hits={candidate_hits}");
+    true
 }
 
+#[cfg(all(test, feature = "bench-internals"))]
+mod contract_tests {
+    #[allow(unused_imports)]
+    use super::contract_median_ci_verdict;
+
+    #[test]
+    fn median_ci_contract_requires_the_entire_claim_interval_to_clear_null() {
+        let (keep, _, min_gain, _) = contract_median_ci_verdict((0.98, 1.02), (1.05, 1.08));
+        assert_eq!(keep, "KEEP");
+        assert!((min_gain - 1.04).abs() < f64::EPSILON);
+
+        let (overlap, _, _, _) = contract_median_ci_verdict((0.98, 1.02), (1.03, 1.08));
+        assert_eq!(overlap, "INCONCLUSIVE");
+
+        let (reject, _, _, max_regression) = contract_median_ci_verdict((0.98, 1.02), (0.90, 0.95));
+        assert_eq!(reject, "REJECT");
+        assert!((max_regression - 0.96).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn median_ci_contract_enforces_the_one_percent_floor() {
+        let (verdict, _, min_gain, _) = contract_median_ci_verdict((1.0, 1.0), (1.005, 1.02));
+        assert_eq!(verdict, "INCONCLUSIVE");
+        assert!((min_gain - 1.01).abs() < f64::EPSILON);
+    }
+}
 
 fn main() {
+    #[cfg(feature = "bench-internals")]
+    if std::env::var_os("FSQLITE_LEDGER_RESURRECTION_ALL").is_some()
+        || std::env::args_os().any(|argument| argument == "--ledger-resurrection-all")
+    {
+        let reachability = [
+            run_seek_cache_resurrection_contract(),
+            run_delete_search_hint_resurrection_contract(),
+            run_small_text_traits_resurrection_contract(),
+            run_fixed_real_update_resurrection_contract(),
+            run_lazy_update_scratch_resurrection_contract(),
+        ];
+        if !reachability.into_iter().all(std::convert::identity) {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     #[cfg(feature = "bench-internals")]
     if std::env::var_os("FSQLITE_LEDGER_RESURRECTION_LAZY_UPDATE_SCRATCH").is_some()
         || std::env::args_os()
             .any(|argument| argument == "--ledger-resurrection-lazy-update-scratch")
     {
-        run_lazy_update_scratch_resurrection_contract();
+        if !run_lazy_update_scratch_resurrection_contract() {
+            std::process::exit(2);
+        }
         return;
     }
 
@@ -1523,7 +1590,9 @@ fn main() {
     if std::env::var_os("FSQLITE_LEDGER_RESURRECTION_FIXED_REAL_UPDATE").is_some()
         || std::env::args_os().any(|argument| argument == "--ledger-resurrection-fixed-real-update")
     {
-        run_fixed_real_update_resurrection_contract();
+        if !run_fixed_real_update_resurrection_contract() {
+            std::process::exit(2);
+        }
         return;
     }
 
@@ -1531,7 +1600,9 @@ fn main() {
     if std::env::var_os("FSQLITE_LEDGER_RESURRECTION_SMALL_TEXT").is_some()
         || std::env::args_os().any(|argument| argument == "--ledger-resurrection-smalltext")
     {
-        run_small_text_traits_resurrection_contract();
+        if !run_small_text_traits_resurrection_contract() {
+            std::process::exit(2);
+        }
         return;
     }
 
@@ -1539,7 +1610,9 @@ fn main() {
     if std::env::var_os("FSQLITE_LEDGER_RESURRECTION_DELETE").is_some()
         || std::env::args_os().any(|argument| argument == "--ledger-resurrection-delete")
     {
-        run_delete_search_hint_resurrection_contract();
+        if !run_delete_search_hint_resurrection_contract() {
+            std::process::exit(2);
+        }
         return;
     }
 
@@ -1547,11 +1620,12 @@ fn main() {
     if std::env::var_os("FSQLITE_LEDGER_RESURRECTION").is_some()
         || std::env::args_os().any(|argument| argument == "--ledger-resurrection")
     {
-        run_seek_cache_resurrection_contract();
+        if !run_seek_cache_resurrection_contract() {
+            std::process::exit(2);
+        }
         return;
     }
 
     pipeline_stages();
     Criterion::default().configure_from_args().final_summary();
 }
-
