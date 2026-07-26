@@ -120,6 +120,21 @@ are provenance only and must never gate the verdict.
   `unix_fallbacks_total` fell 7520 -> 133 (the path was genuinely being taken)
   while `read_samples_total` / `write_samples_total` stayed at `0` (no operation
   ever succeeded through it).
+- **Revert verified on a third binary**, so the sequence is a controlled triple
+  rather than a broken-then-assumed-fixed pair. Reverted CLI SHA-256
+  `7556a865e0b09a6552fd0fe1194419dfeded731c...` (341,178,832 bytes, built
+  2026-07-26 13:56:18 -0400) runs the identical failing repro to completion:
+  `PRAGMA page_size` -> `4096`, `journal_mode` -> `wal`, `SELECT count(*)` -> `1`,
+  zero errors.
+
+  | binary | outcome | `unix_fallbacks_total` | `read/write_samples_total` |
+  |---|---|---:|---:|
+  | `8ea1d0a1…` (original) | works | 7520 | 0 |
+  | `5f08e322…` (candidate fix) | **broken**: driver error, then `no such table` | 133 | 0 |
+  | `7556a865…` (reverted) | works | 134 | 0 |
+
+  The reverted arm reproduces the original 100%-fallback behaviour exactly, so
+  the revert restores the prior state rather than merely compiling.
 - **Therefore the gate is load-bearing, not an oversight.** The ambient `Cx`
   inside a short-lived `block_on` belongs to a runtime that is torn down when
   that call returns, and the *shared* io_uring driver needs a spawner that
