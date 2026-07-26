@@ -3461,12 +3461,30 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
         let total_rows = n_threads * CONCURRENT_ROWS_PER_THREAD;
         eprint!("  Benchmarking {n_threads} concurrent writers ({total_rows} total rows)... ");
 
+        // Built ONCE per thread count and reused across every warmup and timed
+        // iteration of both arms. It used to be constructed inside each `measure`
+        // closure, which put a full runtime build plus `n_threads` OS-thread spawns
+        // inside the timed region on all 12 iterations of both engines. A 2026-05-06
+        // profile attributed roughly HALF of all concurrent-filter samples to
+        // `Runtime::with_config_and_platform` / `pthread_create`; the fix was proposed
+        // then, measured at 1.02x, and rejected with no A/A null control — a
+        // VOID-NONULL row that could not distinguish the lever from the harness.
+        //
+        // Both arms paid it, so it was a shared additive constant, and a shared
+        // additive constant biases a RATIO toward 1.0 — it compressed the engine
+        // difference this section exists to measure. Hoisting it is a measurement
+        // correctness fix, not a performance lever: it changes what the timed region
+        // contains, so numbers before and after are not comparable.
+        //
+        // The tempfile and schema deliberately stay inside the closure: each iteration
+        // needs a fresh empty table, or rows accumulate across samples.
+        let runtime = RuntimeBuilder::new()
+            .blocking_threads(n_threads, n_threads)
+            .build()
+            .expect("comprehensive benchmark runtime should build");
+
         // C SQLite: file-backed WAL with multiple connections.
         let cs = measure(&format!("cs_concurrent_{n_threads}t"), total_rows, || {
-            let runtime = RuntimeBuilder::new()
-                .blocking_threads(n_threads, n_threads)
-                .build()
-                .expect("comprehensive benchmark runtime should build");
             let tmp = tempfile::NamedTempFile::new().unwrap();
             let path = tmp.path().to_str().unwrap().to_owned();
             {
@@ -3550,10 +3568,8 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
             None
         };
         let fs = measure(&format!("fs_concurrent_{n_threads}t"), total_rows, || {
-            let runtime = RuntimeBuilder::new()
-                .blocking_threads(n_threads, n_threads)
-                .build()
-                .expect("comprehensive benchmark runtime should build");
+            // Reuses the runtime hoisted above the C arm, for the same reason and
+            // so both engines are measured over an identical timed region.
             let tmp = tempfile::NamedTempFile::new().unwrap();
             let path = tmp.path().to_str().unwrap().to_owned();
             {
