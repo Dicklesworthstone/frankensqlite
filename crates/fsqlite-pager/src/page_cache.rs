@@ -2744,33 +2744,6 @@ impl ShardedPageCache {
         }
     }
 
-    fn mark_page_clean(&self, page_no: PageNumber) {
-        if self.use_fast_path.load(Ordering::Relaxed)
-            && let Some(ref fast) = self.fast_array
-        {
-            let idx = FastPageArray::pgno_to_idx(page_no);
-            if let Some(Some(entry)) = fast.lock().pages.get(idx) {
-                entry.mark_clean();
-            }
-            return;
-        }
-
-        if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
-            let guard = self.flat_slots.slots[slot_idx].data.lock();
-            if self.flat_slots.slots[slot_idx].pgno.load(Ordering::Acquire) == page_no.get()
-                && let Some(ref entry) = *guard
-            {
-                entry.mark_clean();
-                return;
-            }
-        }
-
-        let idx = self.shard_index(page_no);
-        if let Some(entry) = self.shards[idx].lock().pages.get(&page_no) {
-            entry.mark_clean();
-        }
-    }
-
     fn mark_page_clean_if_generation(&self, page_no: PageNumber, generation: u64) {
         if self.use_fast_path.load(Ordering::Relaxed)
             && let Some(ref fast) = self.fast_array
@@ -2903,6 +2876,20 @@ impl ShardedPageCache {
     ///
     /// Returns `true` if the miss-fill was admitted.
     fn insert_tiered_if_absent(&self, page_no: PageNumber, buf: PageBuf) -> bool {
+        if self.use_fast_path.load(Ordering::Acquire)
+            && let Some(ref fast) = self.fast_array
+        {
+            // Fast-path reads never consult the flat/sharded tiers. Keep the
+            // absence check and insertion under the same array lock so a
+            // newer writer image that arrives during VFS I/O wins atomically
+            // over this stale miss-fill (GH #197).
+            let mut fast = fast.lock();
+            if fast.contains(page_no) {
+                return false;
+            }
+            return fast.insert(page_no, buf);
+        }
+
         let shard_idx = self.shard_index(page_no);
         let mut shard = self.shards[shard_idx].lock();
         if shard.pages.contains_key(&page_no) || self.flat_slots.contains_stable(page_no) {
@@ -3172,14 +3159,24 @@ impl ShardedPageCache {
                         });
                     }
 
-                    let result = callback.take().expect("page callback used once")(buf.as_slice());
                     if self.insert_tiered_if_absent(page_no, buf) {
                         self.note_page_access_without_metrics(page_no);
                         self.record_eviction_admit(page_no);
                     }
                     leader.finish();
                     tracing::debug!(page = page_no.get(), "page-cache read complete");
-                    return Ok(result);
+
+                    // The VFS image can become stale while the async read is
+                    // in flight. If a writer installed a newer resident page,
+                    // `insert_tiered_if_absent` deliberately rejected this
+                    // miss-fill. Resolve the callback from the authoritative
+                    // cache image after that race, never from the unadmitted
+                    // buffer that just came back from storage.
+                    if let Some(result) = self.with_page(page_no, |data| {
+                        callback.take().expect("page callback used once")(data)
+                    }) {
+                        return Ok(result);
+                    }
                 }
             }
         }
@@ -3250,11 +3247,25 @@ impl ShardedPageCache {
 
     /// Directly insert an existing `PageBuf` into the cache.
     pub fn insert_buffer(&self, page_no: PageNumber, buf: PageBuf) {
+        self.insert_buffer_with_post_install(page_no, buf, || {});
+    }
+
+    #[inline]
+    fn insert_buffer_with_post_install(
+        &self,
+        page_no: PageNumber,
+        buf: PageBuf,
+        post_install: impl FnOnce(),
+    ) {
         // Fast path (bd-fzr07)
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
                 let admitted_new = fast.lock().insert(page_no, buf);
-                self.mark_page_clean(page_no);
+                // `FastPageArray::insert` constructs a clean entry. Do not
+                // reacquire the array lock to mark by page number: a newer
+                // dirty replacement may have won between those two critical
+                // sections, and cleaning it would silently lose dirty state.
+                post_install();
                 if admitted_new {
                     self.record_eviction_admit(page_no);
                 } else {
@@ -3265,7 +3276,10 @@ impl ShardedPageCache {
         }
         // Flat slots first; overflow to shard.
         let admitted_new = self.insert_tiered(page_no, buf, false);
-        self.mark_page_clean(page_no);
+        // `insert_tiered(..., false)` atomically installs the clean state with
+        // the buffer. As above, a later page-number-only clean operation would
+        // be allowed to target a different, newer cache image.
+        post_install();
         if admitted_new {
             self.record_eviction_admit(page_no);
         } else {
@@ -4281,10 +4295,15 @@ mod tests {
         (cx, file)
     }
 
-    #[derive(Clone, Copy)]
     enum ControlledReadMode {
         Delayed,
         FirstPendingThenReady,
+        PublishReplacement {
+            cache: Arc<ShardedPageCache>,
+            page_no: PageNumber,
+            replacement_byte: u8,
+            dirty: bool,
+        },
     }
 
     struct ControlledReadFile {
@@ -4310,6 +4329,25 @@ mod tests {
             }
         }
 
+        fn publishing_replacement(
+            bytes: Vec<u8>,
+            cache: Arc<ShardedPageCache>,
+            page_no: PageNumber,
+            replacement_byte: u8,
+            dirty: bool,
+        ) -> Self {
+            Self {
+                bytes: bytes.into(),
+                read_calls: AtomicUsize::new(0),
+                mode: ControlledReadMode::PublishReplacement {
+                    cache,
+                    page_no,
+                    replacement_byte,
+                    dirty,
+                },
+            }
+        }
+
         fn read_calls(&self) -> usize {
             self.read_calls.load(Ordering::Acquire)
         }
@@ -4322,7 +4360,7 @@ mod tests {
 
         async fn read(&self, _cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
             let read_index = self.read_calls.fetch_add(1, Ordering::AcqRel);
-            match self.mode {
+            match &self.mode {
                 ControlledReadMode::Delayed => {
                     asupersync::runtime::spawn_blocking_io(|| {
                         std::thread::sleep(Duration::from_millis(50));
@@ -4338,7 +4376,8 @@ mod tests {
                 ControlledReadMode::FirstPendingThenReady if read_index == 0 => {
                     std::future::pending::<()>().await;
                 }
-                ControlledReadMode::FirstPendingThenReady => {}
+                ControlledReadMode::FirstPendingThenReady
+                | ControlledReadMode::PublishReplacement { .. } => {}
             }
 
             let offset = usize::try_from(offset).map_err(|_| {
@@ -4350,6 +4389,28 @@ mod tests {
                 buf[..copied].copy_from_slice(&self.bytes[offset..offset + copied]);
             }
             buf[copied..].fill(0);
+
+            if read_index == 0
+                && let ControlledReadMode::PublishReplacement {
+                    cache,
+                    page_no,
+                    replacement_byte,
+                    dirty,
+                } = &self.mode
+            {
+                if *dirty {
+                    cache
+                        .insert_fresh(*page_no, |bytes| bytes.fill(*replacement_byte))
+                        .expect("install controlled dirty replacement");
+                } else {
+                    let mut replacement = cache
+                        .pool()
+                        .acquire()
+                        .expect("acquire controlled clean replacement");
+                    replacement.as_mut_slice().fill(*replacement_byte);
+                    cache.insert_buffer(*page_no, replacement);
+                }
+            }
             Ok(copied)
         }
 
@@ -5570,46 +5631,33 @@ mod tests {
     /// not overwrite the newer resident image the writer installed while the
     /// miss I/O was in flight.
     ///
-    /// The interleaving is forced deterministically: the miss path reads the
-    /// stale bytes from the VFS, then — before it re-acquires the cache to
-    /// install them — the `f` callback plays the role of the racing writer
-    /// and installs fresh bytes for the same page. The resident entry must
-    /// keep the fresh bytes.
+    /// The controlled VFS publishes the replacement after copying its stale
+    /// bytes into the miss buffer but before the read future returns. The
+    /// miss-fill therefore loses an actual post-I/O admission race rather than
+    /// relying on the caller callback, which runs only after cache admission.
     #[test]
     fn gh_197_late_miss_fill_does_not_overwrite_newer_resident_page() {
         run_async_test(|| async {
             let cx = Cx::new();
-            let vfs = MemoryVfs::new();
-            let (file, _) = vfs
-                .open(
-                    &cx,
-                    Some(Path::new("/gh-197.db")),
-                    VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB,
-                )
-                .expect("open db file");
-
             let page_size = PageSize::DEFAULT.as_usize();
             let page_no = PageNumber::new(7).unwrap();
-            let offset = page_offset(page_no, PageSize::DEFAULT);
-
-            // Backing store holds the stale image 0x11.
-            file.write(&cx, &vec![0x11_u8; page_size], offset)
-                .await
-                .expect("seed stale page");
-
-            let cache = ShardedPageCache::new(PageSize::DEFAULT);
-
-            // Miss path: while the stale read result is still un-cached, a
-            // writer installs the fresh image 0x22 for the same page.
+            let mut stale_file = vec![0_u8; page_size * usize::try_from(page_no.get()).unwrap()];
+            let page_offset = usize::try_from(page_offset(page_no, PageSize::DEFAULT)).unwrap();
+            stale_file[page_offset..page_offset + page_size].fill(0x11);
+            let cache = Arc::new(ShardedPageCache::new(PageSize::DEFAULT));
+            let file = ControlledReadFile::publishing_replacement(
+                stale_file,
+                Arc::clone(&cache),
+                page_no,
+                0x22,
+                false,
+            );
             cache
-                .read_page(&cx, &file, page_no, |stale| {
+                .read_page(&cx, &file, page_no, |authoritative| {
                     assert!(
-                        stale.iter().all(|&b| b == 0x11),
-                        "miss I/O must observe the stale backing bytes"
+                        authoritative.iter().all(|&byte| byte == 0x22),
+                        "the caller must observe the newer resident image, not stale VFS bytes"
                     );
-                    let mut fresh = cache.pool().acquire().expect("acquire fresh buf");
-                    fresh.as_mut_slice().fill(0x22);
-                    cache.insert_buffer(page_no, fresh);
                 })
                 .await
                 .expect("miss read");
@@ -5622,6 +5670,188 @@ mod tests {
                 "newer resident image must win over the stale late miss-fill (GH #197)"
             );
         });
+    }
+
+    #[test]
+    fn gh_197_late_miss_fill_preserves_dirty_resident_page() {
+        run_async_test(|| async {
+            let cx = Cx::new();
+            let page_size = PageSize::DEFAULT.as_usize();
+            let page_no = PageNumber::new(7).unwrap();
+            let mut stale_file = vec![0_u8; page_size * usize::try_from(page_no.get()).unwrap()];
+            let page_offset = usize::try_from(page_offset(page_no, PageSize::DEFAULT)).unwrap();
+            stale_file[page_offset..page_offset + page_size].fill(0x11);
+            let cache = Arc::new(ShardedPageCache::new(PageSize::DEFAULT));
+            let file = ControlledReadFile::publishing_replacement(
+                stale_file,
+                Arc::clone(&cache),
+                page_no,
+                0xD3,
+                true,
+            );
+            cache
+                .read_page(&cx, &file, page_no, |authoritative| {
+                    assert!(
+                        authoritative.iter().all(|&byte| byte == 0xD3),
+                        "the caller must observe the dirty resident image, not stale VFS bytes"
+                    );
+                })
+                .await
+                .expect("tiered miss read");
+
+            let resident = cache
+                .get_copy(page_no)
+                .expect("dirty tiered page must remain resident");
+            assert!(
+                resident.iter().all(|&byte| byte == 0xD3),
+                "stale miss-fill must never replace a dirty tiered image"
+            );
+            assert!(
+                cache
+                    .page_snapshots()
+                    .iter()
+                    .any(|snapshot| snapshot.page_no == page_no && snapshot.dirty),
+                "the winning tiered writer image must retain its dirty state"
+            );
+        });
+    }
+
+    #[test]
+    fn gh_197_fast_array_late_miss_fill_does_not_overwrite_newer_resident_page() {
+        run_async_test(|| async {
+            let cx = Cx::new();
+            let page_size = PageSize::DEFAULT.as_usize();
+            let page_no = PageNumber::new(7).unwrap();
+            let mut stale_file = vec![0_u8; page_size * usize::try_from(page_no.get()).unwrap()];
+            let page_offset = usize::try_from(page_offset(page_no, PageSize::DEFAULT)).unwrap();
+            stale_file[page_offset..page_offset + page_size].fill(0x11);
+            let cache = Arc::new(ShardedPageCache::new_single_connection(PageSize::DEFAULT));
+            let file = ControlledReadFile::publishing_replacement(
+                stale_file,
+                Arc::clone(&cache),
+                page_no,
+                0x22,
+                false,
+            );
+            cache
+                .read_page(&cx, &file, page_no, |authoritative| {
+                    assert!(
+                        authoritative.iter().all(|&byte| byte == 0x22),
+                        "the caller must observe the newer resident image, not stale VFS bytes"
+                    );
+                })
+                .await
+                .expect("fast miss read");
+
+            let resident = cache
+                .get_copy(page_no)
+                .expect("fast-array page must remain resident after the race");
+            assert!(
+                resident.iter().all(|&byte| byte == 0x22),
+                "newer fast-array image must win over the stale late miss-fill (GH #197)"
+            );
+        });
+    }
+
+    #[test]
+    fn gh_197_fast_array_late_miss_fill_preserves_dirty_resident_page() {
+        run_async_test(|| async {
+            let cx = Cx::new();
+            let page_size = PageSize::DEFAULT.as_usize();
+            let page_no = PageNumber::new(7).unwrap();
+            let mut stale_file = vec![0_u8; page_size * usize::try_from(page_no.get()).unwrap()];
+            let page_offset = usize::try_from(page_offset(page_no, PageSize::DEFAULT)).unwrap();
+            stale_file[page_offset..page_offset + page_size].fill(0x11);
+            let cache = Arc::new(ShardedPageCache::new_single_connection(PageSize::DEFAULT));
+            let file = ControlledReadFile::publishing_replacement(
+                stale_file,
+                Arc::clone(&cache),
+                page_no,
+                0xD4,
+                true,
+            );
+            cache
+                .read_page(&cx, &file, page_no, |authoritative| {
+                    assert!(
+                        authoritative.iter().all(|&byte| byte == 0xD4),
+                        "the caller must observe the dirty resident image, not stale VFS bytes"
+                    );
+                })
+                .await
+                .expect("fast miss read");
+
+            let resident = cache
+                .get_copy(page_no)
+                .expect("dirty fast-array page must remain resident");
+            assert!(
+                resident.iter().all(|&byte| byte == 0xD4),
+                "stale miss-fill must never replace a dirty resident image"
+            );
+            assert!(
+                cache
+                    .page_snapshots()
+                    .iter()
+                    .any(|snapshot| snapshot.page_no == page_no && snapshot.dirty),
+                "the winning writer image must retain its dirty state"
+            );
+        });
+    }
+
+    fn assert_clean_install_cannot_clear_newer_dirty_image(cache: Arc<ShardedPageCache>) {
+        let page_no = PageNumber::new(7).unwrap();
+        let clean_installed = Arc::new(std::sync::Barrier::new(2));
+        let allow_clean_inserter_to_return = Arc::new(std::sync::Barrier::new(2));
+
+        let clean_cache = Arc::clone(&cache);
+        let clean_installed_worker = Arc::clone(&clean_installed);
+        let allow_return_worker = Arc::clone(&allow_clean_inserter_to_return);
+        let clean_inserter = std::thread::spawn(move || {
+            let mut clean = clean_cache.pool().acquire().expect("acquire clean page");
+            clean.as_mut_slice().fill(0xC1);
+            clean_cache.insert_buffer_with_post_install(page_no, clean, || {
+                clean_installed_worker.wait();
+                allow_return_worker.wait();
+            });
+        });
+
+        // Freeze the clean inserter immediately after its atomic install. A
+        // newer writer now replaces that image and marks the replacement
+        // dirty before the older call is allowed to finish.
+        clean_installed.wait();
+        cache
+            .insert_fresh(page_no, |bytes| bytes.fill(0xD2))
+            .expect("install newer dirty page");
+        allow_clean_inserter_to_return.wait();
+        clean_inserter.join().expect("clean inserter thread");
+
+        let resident = cache
+            .get_copy(page_no)
+            .expect("newer dirty page must remain resident");
+        assert!(
+            resident.iter().all(|&byte| byte == 0xD2),
+            "newer cache image must remain authoritative"
+        );
+        assert!(
+            cache
+                .page_snapshots()
+                .iter()
+                .any(|snapshot| snapshot.page_no == page_no && snapshot.dirty),
+            "the older clean insertion must not clear the replacement's dirty state"
+        );
+    }
+
+    #[test]
+    fn clean_fast_array_insert_cannot_clear_newer_dirty_replacement() {
+        assert_clean_install_cannot_clear_newer_dirty_image(Arc::new(
+            ShardedPageCache::new_single_connection(PageSize::DEFAULT),
+        ));
+    }
+
+    #[test]
+    fn clean_tiered_insert_cannot_clear_newer_dirty_replacement() {
+        assert_clean_install_cannot_clear_newer_dirty_image(Arc::new(ShardedPageCache::new(
+            PageSize::DEFAULT,
+        )));
     }
 
     #[test]
