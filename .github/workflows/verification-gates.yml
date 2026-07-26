@@ -12,6 +12,14 @@ on:
       - "conformance/backlog_quality_gate_baseline.json"
       - "Cargo.toml"
       - "Cargo.lock"
+      # Verification is a correctness gate for the whole engine. Keep broad
+      # source/test/script coverage so a storage-layer regression cannot skip
+      # the workflow merely because its crate was absent from the historical
+      # hand-maintained allowlist (bd-ohk1x).
+      - "crates/**"
+      - "tests/**"
+      - "benches/**"
+      - "scripts/**"
       - "corpus_manifest.toml"
       - "docs/contracts/corpus_manifest.toml"
       - "crates/fsqlite-core/**"
@@ -821,6 +829,14 @@ jobs:
           cargo test -p fsqlite-e2e --test golden_integrity -- checksums_sha256 --nocapture
           # If golden .db files are present, verify their hashes match
           cargo test -p fsqlite-e2e --test golden_integrity -- golden_checksum_file_matches_actual_hashes --nocapture
+
+      - name: Persisted seek-cache corruption oracle (bd-105ga)
+        run: |
+          set -euo pipefail
+          echo "=== Executing persisted seek-cache corruption oracle ==="
+          # This runs the integration-test binary and its independent C SQLite
+          # integrity_check oracle; it is not a compile-only or --lib receipt.
+          cargo test --locked -p fsqlite-e2e --test bd_105ga_replace_conflict_guard -- --nocapture
 
       - name: E2E smoke test (deterministic workload + integrity check)
         run: |
