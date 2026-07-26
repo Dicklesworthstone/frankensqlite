@@ -381,7 +381,7 @@ where
 /// below the observed 2 MiB test-thread stack boundary: compiler changes can
 /// grow these frames, and the limit must fire before the process aborts. The
 /// regression test exercises this boundary on an explicit 1 MiB stack.
-const MAX_TRIGGER_DEPTH: usize = 8;
+const MAX_TRIGGER_DEPTH: usize = 4000; // TEMP-MEASUREMENT (bd-wymdl): restore after measuring
 
 /// Maximum depth for FK CASCADE propagation.
 ///
@@ -404,6 +404,66 @@ thread_local! {
     static FSQLITE_HOT_PATH_PROFILE_THREAD_OVERRIDE: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
 
+    // bd-wymdl (defect 4a) diagnostic: one stack-address sample per pushed
+    // trigger frame. Successive deltas are the *measured* per-level native
+    // stack cost of trigger recursion. Only recorded while a probe is armed,
+    // so ordinary tests pay a single `Cell` read per frame push.
+    static TRIGGER_STACK_PROBE: RefCell<Option<Vec<usize>>> = const { RefCell::new(None) };
+
+    // bd-wymdl (defect 4a) diagnostic: override `MAX_TRIGGER_DEPTH` on the
+    // current thread so the depth sweep can locate the largest limit that
+    // still produces a clean `FrankenError` (rather than a stack-overflow
+    // abort) on a pinned stack, without a recompile per candidate value.
+    static TRIGGER_DEPTH_LIMIT_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Effective trigger-recursion depth limit.
+///
+/// Always `MAX_TRIGGER_DEPTH` outside `cfg(test)`; the test-only thread-local
+/// override exists so the bd-wymdl stack-depth sweep can bisect the limit.
+#[inline]
+fn trigger_depth_limit() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = TRIGGER_DEPTH_LIMIT_OVERRIDE.with(std::cell::Cell::get) {
+        return limit;
+    }
+    MAX_TRIGGER_DEPTH
+}
+
+/// Override the trigger depth limit on the current thread (test-only).
+#[cfg(test)]
+fn set_trigger_depth_limit_override(limit: Option<usize>) {
+    TRIGGER_DEPTH_LIMIT_OVERRIDE.with(|cell| cell.set(limit));
+}
+
+/// Arm the trigger-recursion stack probe on the current thread (test-only).
+#[cfg(test)]
+fn arm_trigger_stack_probe() {
+    TRIGGER_STACK_PROBE.with(|probe| *probe.borrow_mut() = Some(Vec::new()));
+}
+
+/// Disarm the probe and return the recorded stack addresses (test-only).
+#[cfg(test)]
+fn take_trigger_stack_probe() -> Vec<usize> {
+    TRIGGER_STACK_PROBE.with(|probe| probe.borrow_mut().take().unwrap_or_default())
+}
+
+/// Record the current native stack depth, if the probe is armed (test-only).
+///
+/// `#[inline(never)]` keeps the sampled local at a fixed offset from the
+/// caller's stack pointer, so deltas between successive recursion levels are
+/// exactly the per-level stack cost.
+#[cfg(test)]
+#[inline(never)]
+fn record_trigger_stack_probe() {
+    let marker: usize = 0;
+    let addr = std::ptr::from_ref(&marker) as usize;
+    TRIGGER_STACK_PROBE.with(|probe| {
+        if let Some(samples) = probe.borrow_mut().as_mut() {
+            samples.push(addr);
+        }
+    });
 }
 
 thread_local! {
@@ -9024,6 +9084,18 @@ pub struct Connection {
     /// Has the LAB_UNSAFE startup warning been emitted on this
     /// connection yet? We warn exactly once per activation.
     write_merge_lab_unsafe_warned: Cell<bool>,
+    /// Has this connection already warned that an enabled tracing subscriber is
+    /// suppressing the fused prepared-DML fast lane?
+    ///
+    /// The fast lane is gated on `tracing::enabled!` for `fsqlite.statement` /
+    /// `fsqlite.statement_reuse`, because the instrumented lane is what emits
+    /// those per-statement events -- the fast lane skips the code that produces
+    /// them. That trade-off is defensible, but it must not be SILENT: a
+    /// production subscriber turning on broad DEBUG/INFO logging otherwise
+    /// deoptimizes DML with no indication, and the effect is easy to mistake
+    /// for an engine regression. Warn exactly once per connection, matching the
+    /// `write_merge_lab_unsafe_warned` idiom above.
+    fused_lane_tracing_suppression_warned: Cell<bool>,
     /// Anytime-valid e-process that gates the SSI skip path. Always
     /// present on every connection; consulted only when
     /// `write_merge_mode` is `LabUnsafe`. The `RefCell` allows mutation
@@ -9963,6 +10035,7 @@ impl Connection {
             concurrent_mode_default: RefCell::new(true),
             write_merge_mode: Cell::new(WriteMergeMode::Safe),
             write_merge_lab_unsafe_warned: Cell::new(false),
+            fused_lane_tracing_suppression_warned: Cell::new(false),
             ssi_e_process_gate: RefCell::new(SsiEProcessGate::new(SsiEProcessConfig::default())),
             fused_entry_control_mode: Cell::new(FusedEntryControlMode::Auto),
             vectorized_makerecord_enabled: Cell::new(true),
@@ -10391,6 +10464,7 @@ impl Connection {
             concurrent_mode_default: RefCell::new(true),
             write_merge_mode: Cell::new(WriteMergeMode::Safe),
             write_merge_lab_unsafe_warned: Cell::new(false),
+            fused_lane_tracing_suppression_warned: Cell::new(false),
             ssi_e_process_gate: RefCell::new(SsiEProcessGate::new(SsiEProcessConfig::default())),
             fused_entry_control_mode: Cell::new(FusedEntryControlMode::Auto),
             vectorized_makerecord_enabled: Cell::new(true),
@@ -19780,6 +19854,23 @@ impl Connection {
             FSQLITE_PREPARED_INSERT_INSTRUMENTED_LANE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
         }
         let fused_control_mode = self.fused_entry_control_mode.get();
+        // The fast lane was suppressed by an active tracing subscriber rather
+        // than by an explicit operator choice. Say so once, loudly: otherwise a
+        // production deployment that enables broad DEBUG/INFO logging silently
+        // loses the fused prepared-DML lane and the slowdown looks like an
+        // engine regression. `ForcedFallback` is deliberate and stays quiet.
+        if fused_control_mode != FusedEntryControlMode::ForcedFallback
+            && !self.fused_lane_tracing_suppression_warned.replace(true)
+        {
+            tracing::warn!(
+                target: "fsqlite::fused_entry",
+                statement_trace_enabled,
+                statement_reuse_enabled,
+                "tracing is enabled for fsqlite.statement/fsqlite.statement_reuse, so the fused \
+                 prepared-DML fast lane is disabled on this connection and DML takes the slower \
+                 instrumented path; raise those targets above DEBUG/INFO to restore it"
+            );
+        }
         tracing::debug!(
             target: "fsqlite::fused_entry",
             entry_path = "conservative",
@@ -45071,6 +45162,8 @@ impl Connection {
     }
 
     fn push_trigger_frame(&self, frame: TriggerFrame) -> TriggerFrameGuard<'_> {
+        #[cfg(test)]
+        record_trigger_stack_probe();
         self.trigger_frame_stack.borrow_mut().push(frame);
         TriggerFrameGuard {
             stack: &self.trigger_frame_stack,
@@ -46059,7 +46152,7 @@ impl Connection {
         // SQLite uses SQLITE_MAX_TRIGGER_DEPTH=1000, but each Rust recursion
         // level is heavier on the call stack than C. MAX_TRIGGER_DEPTH keeps a
         // conservative safety margin below the regression-tested thread stack.
-        if self.trigger_frame_stack.borrow().len() >= MAX_TRIGGER_DEPTH {
+        if self.trigger_frame_stack.borrow().len() >= trigger_depth_limit() {
             return Err(FrankenError::Internal(
                 "too many levels of trigger recursion".to_owned(),
             ));
@@ -46131,7 +46224,7 @@ impl Connection {
         new_values: Option<&[SqliteValue]>,
     ) -> Result<()> {
         // F-PGM.11: Enforce trigger recursion depth limit (see fire_before_triggers).
-        if self.trigger_frame_stack.borrow().len() >= MAX_TRIGGER_DEPTH {
+        if self.trigger_frame_stack.borrow().len() >= trigger_depth_limit() {
             return Err(FrankenError::Internal(
                 "too many levels of trigger recursion".to_owned(),
             ));
@@ -46510,7 +46603,7 @@ impl Connection {
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
     ) -> Result<()> {
-        if self.trigger_frame_stack.borrow().len() >= MAX_TRIGGER_DEPTH {
+        if self.trigger_frame_stack.borrow().len() >= trigger_depth_limit() {
             return Err(FrankenError::Internal(
                 "too many levels of trigger recursion".to_owned(),
             ));
@@ -96093,11 +96186,13 @@ mod tests {
         FSQLITE_JOIN_EXPR_FALLBACK_SCANS, FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS,
         FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS, FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS,
         FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS, InProcessPageLockTable, IoPollStrategy,
-        PagerBackend, PagerPublishedSnapshot, Row, RuntimeConfig, RuntimeContext, SchemaEpoch,
-        SharedRuntimeState, SimplePager, Snapshot, init_global_runtime,
-        is_implicit_autoindex_entry, is_sqlite_master_entry_missing, join_hidden_rowid_projection,
+        MAX_TRIGGER_DEPTH, PagerBackend, PagerPublishedSnapshot, Row, RuntimeConfig,
+        RuntimeContext, SchemaEpoch, SharedRuntimeState, SimplePager, Snapshot,
+        arm_trigger_stack_probe, init_global_runtime, is_implicit_autoindex_entry,
+        is_sqlite_master_entry_missing, join_hidden_rowid_projection,
         join_table_supports_hidden_rowid, lock_unpoisoned, memdb_row_matches_like_fast_path,
-        statement_contains_rewritable_subquery, wal_file_present_with_vfs, wal_path_for_db_path,
+        set_trigger_depth_limit_override, statement_contains_rewritable_subquery,
+        take_trigger_stack_probe, wal_file_present_with_vfs, wal_path_for_db_path,
     };
     use crate::region::RegionKind;
     use fsqlite_ast::{JoinKind, SortDirection, Statement};
@@ -117441,6 +117536,218 @@ mod tests {
                 .join()
                 .expect("trigger-depth regression thread panicked");
         });
+    }
+
+    /// Build the two-table ping-pong trigger chain used by the depth
+    /// diagnostics, bounded by a `WHEN` clause so the chain terminates at
+    /// `depth` frames without relying on `MAX_TRIGGER_DEPTH`.
+    async fn build_bounded_trigger_chain(depth: usize) -> Connection {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("PRAGMA recursive_triggers = ON;")
+            .await
+            .unwrap();
+        conn.execute("CREATE TABLE a (n INTEGER);").await.unwrap();
+        conn.execute("CREATE TABLE b (n INTEGER);").await.unwrap();
+        conn.execute("INSERT INTO a VALUES (0);").await.unwrap();
+        conn.execute("INSERT INTO b VALUES (0);").await.unwrap();
+        conn.execute(&format!(
+            "CREATE TRIGGER trg_a AFTER UPDATE ON a WHEN NEW.n < {depth} \
+             BEGIN UPDATE b SET n = NEW.n + 1; END;"
+        ))
+        .await
+        .unwrap();
+        conn.execute(&format!(
+            "CREATE TRIGGER trg_b AFTER UPDATE ON b WHEN NEW.n < {depth} \
+             BEGIN UPDATE a SET n = NEW.n + 1; END;"
+        ))
+        .await
+        .unwrap();
+        conn
+    }
+
+    /// Drive a probe workload, optionally without the TRACE-level test
+    /// subscriber that `asupersync::test_utils::run_test` installs globally.
+    /// The subscriber changes which branches of the statement dispatcher are
+    /// live, so it materially changes measured frame sizes.
+    fn block_on_probe<F, Fut>(quiet: bool, make: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        if quiet {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("probe runtime should build");
+            runtime.block_on(make());
+        } else {
+            asupersync::test_utils::run_test(make);
+        }
+    }
+
+    fn probe_quiet() -> bool {
+        std::env::var("FSQLITE_PROBE_QUIET").is_ok_and(|value| value == "1")
+    }
+
+    /// bd-wymdl diagnostic: measure the native stack cost of one level of
+    /// trigger recursion by sampling the stack pointer at every pushed
+    /// trigger frame.
+    ///
+    /// `cargo test -p fsqlite-core --lib diag_trigger_stack_bytes_per_level -- --ignored --nocapture`
+    #[test]
+    #[ignore = "diagnostic measurement, not a regression assertion"]
+    fn diag_trigger_stack_bytes_per_level() {
+        const PROBE_DEPTH: usize = 40;
+        let quiet = probe_quiet();
+        let handle = std::thread::Builder::new()
+            .name("trigger-stack-probe".to_owned())
+            .stack_size(512 * 1024 * 1024)
+            .spawn(move || {
+                let base_marker: usize = 0;
+                let thread_base = std::ptr::from_ref(&base_marker) as usize;
+                arm_trigger_stack_probe();
+                block_on_probe(quiet, || async {
+                    let conn = build_bounded_trigger_chain(PROBE_DEPTH).await;
+                    conn.execute("UPDATE a SET n = 1;").await.unwrap();
+                });
+                (thread_base, take_trigger_stack_probe())
+            })
+            .expect("spawn trigger stack probe thread");
+        let (thread_base, samples) = handle.join().expect("probe thread panicked");
+        assert!(
+            samples.len() >= 8,
+            "probe recorded too few trigger levels: {}",
+            samples.len()
+        );
+        let deltas: Vec<usize> = samples
+            .windows(2)
+            .map(|w| w[0].saturating_sub(w[1]))
+            .collect();
+        // Skip the first few levels: entry into the recursion is not yet in
+        // steady state (the outermost DML frame differs from the trigger-body
+        // frames).
+        let steady = &deltas[2..];
+        let total: usize = steady.iter().sum();
+        let mean = total / steady.len();
+        let min = *steady.iter().min().unwrap();
+        let max = *steady.iter().max().unwrap();
+        println!("=== bd-wymdl trigger recursion stack measurement (raw Connection API) ===");
+        println!("tracing subscriber installed: {}", !quiet);
+        println!("levels sampled: {}", samples.len());
+        println!(
+            "base stack consumed before first trigger frame: {} bytes",
+            thread_base.saturating_sub(samples[0])
+        );
+        println!("per-level deltas (bytes): {deltas:?}");
+        println!("steady-state per level: mean={mean} min={min} max={max}");
+        for stack_mib in [1_usize, 2, 4, 8, 16] {
+            let budget = stack_mib * 1024 * 1024;
+            let base = thread_base.saturating_sub(samples[0]);
+            let usable = budget.saturating_sub(base);
+            println!(
+                "  {stack_mib:>2} MiB stack -> predicted max depth ~= {} levels",
+                usable / mean.max(1)
+            );
+        }
+    }
+
+    /// bd-wymdl diagnostic: run a bounded trigger chain on a pinned stack and
+    /// report survival. Driven by `FSQLITE_PROBE_STACK_MIB` /
+    /// `FSQLITE_PROBE_DEPTH`; a stack overflow aborts the process, so this is
+    /// invoked out-of-process by the measurement sweep.
+    #[test]
+    #[ignore = "diagnostic measurement, not a regression assertion"]
+    fn diag_trigger_depth_survival() {
+        let stack_mib: usize = std::env::var("FSQLITE_PROBE_STACK_MIB")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1);
+        let depth: usize = std::env::var("FSQLITE_PROBE_DEPTH")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8);
+        let quiet = probe_quiet();
+        std::thread::Builder::new()
+            .name("trigger-depth-survival".to_owned())
+            .stack_size(stack_mib * 1024 * 1024)
+            .spawn(move || {
+                block_on_probe(quiet, || async {
+                    let conn = build_bounded_trigger_chain(depth).await;
+                    conn.execute("UPDATE a SET n = 1;").await.unwrap();
+                    let rows = conn.query("SELECT n FROM a;").await.unwrap();
+                    println!(
+                        "PROBE_RESULT stack_mib={stack_mib} depth={depth} a={:?}",
+                        row_values(&rows[0])[0]
+                    );
+                });
+            })
+            .expect("spawn trigger depth survival thread")
+            .join()
+            .expect("survival thread panicked");
+        println!("PROBE_SURVIVED stack_mib={stack_mib} depth={depth}");
+    }
+
+    /// bd-wymdl diagnostic: run the *exact* `test_recursive_trigger_depth_limit`
+    /// workload (unbounded ping-pong triggers, no `WHEN` clause) on a pinned
+    /// stack with an overridden depth limit, and report whether the limit fired
+    /// as a clean error. A stack overflow aborts the process instead, so the
+    /// sweep drives this out-of-process, one candidate limit per run.
+    ///
+    /// `FSQLITE_PROBE_STACK_MIB=1 FSQLITE_PROBE_LIMIT=8 <test-bin> \
+    ///  connection::tests::diag_trigger_limit_fires_before_abort --ignored --exact`
+    #[test]
+    #[ignore = "diagnostic measurement, not a regression assertion"]
+    fn diag_trigger_limit_fires_before_abort() {
+        let stack_mib: usize = std::env::var("FSQLITE_PROBE_STACK_MIB")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1);
+        let limit: usize = std::env::var("FSQLITE_PROBE_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(MAX_TRIGGER_DEPTH);
+        let quiet = probe_quiet();
+        std::thread::Builder::new()
+            .name("trigger-limit-probe".to_owned())
+            .stack_size(stack_mib * 1024 * 1024)
+            .spawn(move || {
+                set_trigger_depth_limit_override(Some(limit));
+                block_on_probe(quiet, || async {
+                    let conn = Connection::open(":memory:").await.unwrap();
+                    conn.execute("PRAGMA recursive_triggers = ON;")
+                        .await
+                        .unwrap();
+                    conn.execute("CREATE TABLE a (n INTEGER);").await.unwrap();
+                    conn.execute("CREATE TABLE b (n INTEGER);").await.unwrap();
+                    conn.execute("INSERT INTO a VALUES (0);").await.unwrap();
+                    conn.execute("INSERT INTO b VALUES (0);").await.unwrap();
+                    conn.execute(
+                        "CREATE TRIGGER trg_a AFTER UPDATE ON a \
+                         BEGIN UPDATE b SET n = NEW.n + 1; END;",
+                    )
+                    .await
+                    .unwrap();
+                    conn.execute(
+                        "CREATE TRIGGER trg_b AFTER UPDATE ON b \
+                         BEGIN UPDATE a SET n = NEW.n + 1; END;",
+                    )
+                    .await
+                    .unwrap();
+                    let err = conn
+                        .execute("UPDATE a SET n = 1;")
+                        .await
+                        .expect_err("depth limit should fire");
+                    let message = format!("{err}");
+                    assert!(
+                        message.contains("too many levels of trigger recursion"),
+                        "unexpected error: {message}"
+                    );
+                });
+                set_trigger_depth_limit_override(None);
+            })
+            .expect("spawn trigger limit probe thread")
+            .join()
+            .expect("limit probe thread panicked");
+        println!("PROBE_LIMIT_CLEAN stack_mib={stack_mib} limit={limit}");
     }
 
     #[test]
