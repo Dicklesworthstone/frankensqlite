@@ -352,6 +352,7 @@ impl KeyManager {
         let nonce = &wrapped[..NONCE_SIZE];
         let ct = &wrapped[NONCE_SIZE..];
         let cipher = XChaCha20Poly1305::new(kek.into());
+        // chacha20poly1305 0.10 consumes a borrowed GenericArray nonce.
         let xnonce = XNonce::from_slice(nonce);
         let plaintext = cipher
             .decrypt(xnonce, ct)
