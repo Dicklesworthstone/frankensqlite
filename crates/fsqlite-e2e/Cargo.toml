@@ -53,6 +53,9 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 # feature-clean: neither `src/` nor `benches/` uses `test_utils`.
 asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
+# Gunzip for the checksum-pinned bd-105ga corruption-regression corpus
+# (fixtures/bd105ga/); only tests/bd_105ga_replay_regression.rs uses it.
+flate2 = "1.1"
 jsonschema = { version = "0.48.5", default-features = false }
 fsqlite-ext-session = { workspace = true }
 fsqlite-mvcc = { workspace = true }
