@@ -8,8 +8,13 @@ on:
     inputs:
       tag:
         description: "Tag to publish, for example v0.1.3"
-        required: true
+        required: false
         type: string
+      revoke_compromised_token:
+        description: "Revoke the configured crates.io token without publishing"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -17,7 +22,7 @@ permissions:
 jobs:
   publish-crates:
     name: Publish fsqlite crates to crates.io
-    if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && !contains(github.event.inputs.tag || github.ref_name, '-') && github.repository_owner == 'Dicklesworthstone'
+    if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && github.event.inputs.revoke_compromised_token != 'true' && !contains(github.event.inputs.tag || github.ref_name, '-') && github.repository_owner == 'Dicklesworthstone'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -145,7 +150,9 @@ jobs:
 
             echo "Publishing ${crate} (${RELEASE_VERSION})"
             set +e
-            publish_output="$(cargo publish -p "${crate}" --locked --token "${CARGO_REGISTRY_TOKEN}" 2>&1)"
+            # Cargo reads CARGO_REGISTRY_TOKEN directly. Never pass the token
+            # on argv, where local process inspection can expose it.
+            publish_output="$(cargo publish -p "${crate}" --locked 2>&1)"
             publish_status=$?
             set -e
             echo "${publish_output}"
@@ -158,3 +165,70 @@ jobs:
             fi
             sleep 30
           done
+
+  revoke-compromised-token:
+    name: Revoke configured crates.io token
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.revoke_compromised_token == 'true' && github.repository_owner == 'Dicklesworthstone'
+    runs-on: [self-hosted, linux, x64, hfdt-fsqlite-release]
+    timeout-minutes: 5
+    steps:
+      - name: Revoke token and prove it no longer authenticates
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          set +x
+
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "CARGO_REGISTRY_TOKEN is required for revocation." >&2
+            exit 1
+          fi
+
+          revoke_code="$(
+            printf \
+              'header = "Authorization: %s"\nuser-agent = "frankensqlite-release-security-remediation/1.0 (+https://github.com/Dicklesworthstone/frankensqlite)"\n' \
+              "${CARGO_REGISTRY_TOKEN}" |
+              curl \
+                --config - \
+                --proto '=https' \
+                --tlsv1.2 \
+                --silent \
+                --show-error \
+                --output "${RUNNER_TEMP}/crates-token-revoke.json" \
+                --write-out '%{http_code}' \
+                --request DELETE \
+                https://crates.io/api/v1/tokens/current
+          )"
+          if [[ "${revoke_code}" != "204" ]]; then
+            echo "crates.io token revocation failed with HTTP ${revoke_code}." >&2
+            error_detail="$(
+              sed -n 's/.*"detail":"\([^"]*\)".*/\1/p' \
+                "${RUNNER_TEMP}/crates-token-revoke.json" |
+                head -n 1
+            )"
+            echo "crates.io detail: ${error_detail:-unavailable}" >&2
+            exit 1
+          fi
+
+          verify_code="$(
+            printf \
+              'header = "Authorization: %s"\nuser-agent = "frankensqlite-release-security-remediation/1.0 (+https://github.com/Dicklesworthstone/frankensqlite)"\n' \
+              "${CARGO_REGISTRY_TOKEN}" |
+              curl \
+                --config - \
+                --proto '=https' \
+                --tlsv1.2 \
+                --silent \
+                --show-error \
+                --output "${RUNNER_TEMP}/crates-token-revoke-verify.json" \
+                --write-out '%{http_code}' \
+                --request DELETE \
+                https://crates.io/api/v1/tokens/current
+          )"
+          if [[ "${verify_code}" != "403" ]]; then
+            echo "Revoked crates.io token unexpectedly authenticated (HTTP ${verify_code})." >&2
+            exit 1
+          fi
+
+          echo "Configured crates.io token revoked; repeat authentication returned HTTP 403."
