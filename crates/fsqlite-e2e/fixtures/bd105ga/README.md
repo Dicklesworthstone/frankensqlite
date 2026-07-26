@@ -41,6 +41,28 @@ a while: `br list --limit 1` (it does a real 3,215-row export flush and leaves
 the file `ok`) and plain `br sync --merge` without `--force` (it halts on
 semantic conflicts before writing anything).
 
+### Controlled A/B across engine versions
+
+`br` compiles unmodified against both engines (both are the sync API), so the
+only variable is the linked engine — same input, same `.beads/`, same command,
+same host. Point `[patch.crates-io]` at a tag worktree to reproduce:
+
+| Engine | Merge outcome | DB size after | `integrity_check` |
+|---|---|---|---|
+| fsqlite **0.1.12** | **aborts** mid-merge with the malformed-image error above | 19 MB → 25 MB (partial) | **corrupt** |
+| fsqlite **v0.1.19** tag | **completes**: *"Base snapshot updated. JSONL exported."* | 19 MB → 34 MB | **ok** |
+
+v0.1.19 is not merely avoiding the fault — it finishes strictly more work than
+the run that corrupts, and 8 issue rows carry fresh `updated_at` timestamps
+afterwards, so this is not a short-circuit.
+
+**This does not prove the balance defect is repaired.** The v0.1.19 diff
+contains no `fsqlite-btree` changes at all, so the likelier reading is that a
+DML-lowering or execution change stopped *reaching* the faulty balance path —
+masked rather than fixed, and able to resurface under a different write shape.
+Supportable wording is "v0.1.19 passes the bd-105ga reproducer", not
+"v0.1.19 fixes the corruption".
+
 ## Why the statement stream is a dead end
 
 `corrupting-stream.sqllog.gz` is an **open-only** capture — br's open-time
