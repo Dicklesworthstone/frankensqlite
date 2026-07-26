@@ -18,7 +18,9 @@ jobs:
   publish-crates:
     name: Publish fsqlite crates to crates.io
     if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && !contains(github.event.inputs.tag || github.ref_name, '-') && github.repository_owner == 'Dicklesworthstone'
-    runs-on: ubuntu-latest
+    # Continuity lane for the v0.1.19 publish while the account's hosted-runner
+    # queue is saturated. The runner is ephemeral and container-isolated.
+    runs-on: [self-hosted, linux, x64, hfdt-fsqlite-release]
     timeout-minutes: 45
     steps:
       - name: Checkout
