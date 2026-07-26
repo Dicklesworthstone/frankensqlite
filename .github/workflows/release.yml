@@ -202,6 +202,12 @@ jobs:
           )"
           if [[ "${revoke_code}" != "204" ]]; then
             echo "crates.io token revocation failed with HTTP ${revoke_code}." >&2
+            error_detail="$(
+              sed -n 's/.*"detail":"\([^"]*\)".*/\1/p' \
+                "${RUNNER_TEMP}/crates-token-revoke.json" |
+                head -n 1
+            )"
+            echo "crates.io detail: ${error_detail:-unavailable}" >&2
             exit 1
           fi
 
