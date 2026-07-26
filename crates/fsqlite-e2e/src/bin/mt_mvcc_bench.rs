@@ -884,6 +884,43 @@ fn worker_insert_sql(tid: usize, separate_tables: bool) -> String {
     }
 }
 
+/// Read an effective PRAGMA back and require it to be one of `expected`.
+///
+/// `PRAGMA <name>=<value>` returning `Ok` proves only that the statement executed,
+/// not that the setting took effect — PRAGMAs can be silently clamped, ignored, or
+/// applied to a different scope than intended. The published paired ratios are only
+/// meaningful if both arms actually ran at the same durability, so this asserts the
+/// post-state rather than trusting the write.
+fn verify_effective_fsqlite_pragma(
+    conn: &fsqlite::Connection,
+    name: &str,
+    expected: &[&str],
+) -> Result<(), String> {
+    let sql = format!("PRAGMA {name};");
+    let rows = fsqlite_e2e::block_on(conn.query(&sql))
+        .map_err(|error| format!("fsqlite `{sql}` failed: {error}"))?;
+    let row = rows
+        .first()
+        .ok_or_else(|| format!("fsqlite `{sql}` returned no row"))?;
+    let value = row
+        .get(0)
+        .ok_or_else(|| format!("fsqlite `{sql}` returned no first column"))?;
+    let actual = match value {
+        fsqlite::SqliteValue::Null => "null".to_owned(),
+        fsqlite::SqliteValue::Integer(value) => value.to_string(),
+        fsqlite::SqliteValue::Float(value) => value.to_string(),
+        fsqlite::SqliteValue::Text(value) => value.as_ref().to_ascii_lowercase(),
+        fsqlite::SqliteValue::Blob(value) => format!("blob:{}", value.len()),
+    };
+    if expected.iter().any(|candidate| *candidate == actual) {
+        return Ok(());
+    }
+    Err(format!(
+        "fsqlite effective `{name}` is `{actual}`, expected one of {expected:?}; \
+         publishing a paired ratio from mismatched settings is exactly the bd-x5gzk failure"
+    ))
+}
+
 fn prepare_fsqlite_schema(path: &str, threads: usize, separate_tables: bool) -> Result<(), String> {
     let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.to_owned()))
         .map_err(|error| format!("fsqlite open (init): {error}"))?;
@@ -893,8 +930,17 @@ fn prepare_fsqlite_schema(path: &str, threads: usize, separate_tables: bool) -> 
         "PRAGMA synchronous=NORMAL;",
         "PRAGMA cache_size=-64000;",
     ] {
-        let _ = fsqlite_e2e::block_on(conn.execute(pragma));
+        // The C arm applies its four schema PRAGMAs through
+        // `execute_batch(..).expect(..)` in `run_sqlite`, so it aborts when they do
+        // not take. Discarding the result here left the two arms of a *paired*
+        // benchmark on different error-handling discipline — the same shape that let
+        // bd-x5gzk's C-FULL vs F-NORMAL asymmetry run undetected for the life of a
+        // published section.
+        fsqlite_e2e::block_on(conn.execute(pragma))
+            .map_err(|error| format!("fsqlite schema pragma `{pragma}`: {error}"))?;
     }
+    verify_effective_fsqlite_pragma(&conn, "journal_mode", &["wal"])?;
+    verify_effective_fsqlite_pragma(&conn, "synchronous", &["normal", "1"])?;
     for tid in 0..worker_table_count(threads, separate_tables) {
         let table_name = worker_table_name(tid, separate_tables);
         let create_sql = create_table_sql(&table_name);
@@ -937,10 +983,17 @@ fn open_fsqlite_worker(path: &str) -> Result<(fsqlite::Connection, bool), String
     // omission on the C side of `comprehensive_bench::bench_concurrent_writers`
     // silently compared C-FULL against F-NORMAL for the life of that section
     // (bd-x5gzk); see docs/bench-methodology-concurrent-writers.md.
-    let _ = fsqlite_e2e::block_on(conn.execute("PRAGMA synchronous=NORMAL;"));
+    fsqlite_e2e::block_on(conn.execute("PRAGMA synchronous=NORMAL;"))
+        .map_err(|error| format!("fsqlite worker `PRAGMA synchronous=NORMAL`: {error}"))?;
+    // Prove the pin took. The comment above says this line exists so matched
+    // durability is stated rather than left "to agree with C SQLite by coincidence
+    // of defaults" — discarding the result reinstated exactly that coincidence,
+    // because a failed pin was indistinguishable from a successful one.
+    verify_effective_fsqlite_pragma(&conn, "synchronous", &["normal", "1"])?;
     let concurrent_ok =
         fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")).is_ok();
-    let _ = fsqlite_e2e::block_on(conn.execute("PRAGMA busy_timeout=5000;"));
+    fsqlite_e2e::block_on(conn.execute("PRAGMA busy_timeout=5000;"))
+        .map_err(|error| format!("fsqlite worker `PRAGMA busy_timeout=5000`: {error}"))?;
     Ok((conn, concurrent_ok))
 }
 

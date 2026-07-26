@@ -1066,6 +1066,28 @@ impl IoUringFile {
             record_io_uring_read_unix_fallback();
             return self.inner.read(cx, buf, offset).await;
         }
+        // DO NOT "fix" this by falling back to `NativeCx::current()`.
+        //
+        // That looks correct — `page_cache.rs:3421` resolves its native context as
+        // `Cx::current().or_else(|| cx.attached_native_cx())`, and this gate fails on
+        // every production call because nothing on the `Connection::open` -> `execute`
+        // path attaches a native `Cx` (measured: 100% unix fallback, bd-fo6xw). It was
+        // tried on 2026-07-26 and it breaks the engine:
+        //
+        //     cannot start tracked shared io_uring write: cannot start shared io_uring
+        //     driver: [ASUP-E001] runtime is no longer available — the runtime behind
+        //     this handle was dropped or shut down
+        //
+        // followed by `no such table` on every subsequent statement. The reason is that
+        // the ambient `Cx` inside a short-lived `block_on` belongs to a runtime that is
+        // torn down when that call returns, and the *shared* io_uring driver needs a
+        // spawner that outlives the operation. `page_cache.rs` gets away with it because
+        // it spawns a task on that same runtime and joins it before returning.
+        //
+        // The attached context is therefore a deliberate contract, not an oversight: it
+        // is how a caller states "here is a runtime whose lifetime I guarantee". The
+        // real defect is upstream — the sync bridge gives every operation its own
+        // runtime, so no such guarantee exists. See bd-fo6xw and bd-zavyn.
         let Some(native_cx) = cx.attached_native_cx() else {
             record_io_uring_read_unix_fallback();
             return self.inner.read(cx, buf, offset).await;
@@ -1185,6 +1207,7 @@ impl IoUringFile {
             record_io_uring_write_unix_fallback();
             return self.inner.write(cx, buf, offset).await;
         }
+        // See `read_data_path`: do not substitute `NativeCx::current()` here.
         let Some(native_cx) = cx.attached_native_cx() else {
             record_io_uring_write_unix_fallback();
             return self.inner.write(cx, buf, offset).await;
@@ -1315,6 +1338,7 @@ impl IoUringFile {
             record_io_uring_write_unix_fallback();
             return self.inner.write_tracked(cx, buf, offset, completion).await;
         }
+        // See `read_data_path`: do not substitute `NativeCx::current()` here.
         let Some(native_cx) = cx.attached_native_cx() else {
             record_io_uring_write_unix_fallback();
             return self.inner.write_tracked(cx, buf, offset, completion).await;

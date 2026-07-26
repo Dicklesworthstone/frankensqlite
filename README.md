@@ -1198,9 +1198,59 @@ The human-readable scope lock for that contract lives in
 > runs moved 1.005x. The primary scorecard metric
 > (`per_category_weighted.score`) moved 0.4004 -> 0.8319.
 >
-> The cause is **not yet attributed**. That comparison spans 194 commits, so it
-> establishes that a regression exists on the FrankenSQLite side, not that the
-> async migration caused it. Attribution work is tracked in `bd-dqdoe`.
+> **Attribution has since advanced, and it points largely at the instrument.**
+> Two independent methods converge on `a0ab400a`
+> (*"refactor(e2e,harness): bridge the async engine into the sync test drivers
+> via a harness-owned runtime"*), which wrapped 221 call sites — 49 of them in
+> `comprehensive_bench.rs` — in a per-operation `block_on`:
+>
+> 1. A cohort walk (`bd-zavyn`) found the INSERT-path delta is **flat at
+>    ~660–1000 ns/row across a 10x range of record width and a 100x range of row
+>    count**. A genuine engine regression scales with serialization work; this
+>    does not. A standalone probe measured `block_on` on an *already-ready*
+>    future at **333 ns**, and the benchmark performs exactly one `block_on` per
+>    row.
+> 2. A three-cohort ABBA matrix (36 processes, all six permutations twice,
+>    pinned CPU) measured `a0ab400a` vs `c967eaeb` at difference-in-differences
+>    **2.685x** (95% CI `2.646–2.724`), with the subsequent merge adding only
+>    **1.003x** (`0.989–1.017`). Artifacts:
+>    `tests/artifacts/perf/gate0-boundary-three-cohort-c967eaeb-a0ab400a-13ec577f-20260726T0542Z-trj/`
+>    and `tests/artifacts/perf/gate0-boundary-abba-c967eaeb-13ec577f-20260726T0531Z-trj/`.
+>
+> A same-source three-arm experiment (source `413ed24c`, 48 samples/arm, 2,496
+> retained raw samples,
+> `tests/artifacts/perf/gate0-bridge-413ed24c-20260726T0806Z-trj/SUMMARY.md`)
+> isolates the mechanism with the engine held constant: per-operation `block_on`
+> versus a single top-level runtime entry costs **2.2003x** on prepared INSERT
+> (+621.7 ns/op) and **1.4866x** raw (+441.9 ns/op) under `release-perf`. The
+> optional worker facade was tested as a remedy and **rejected at 9.5134x**.
+>
+> Consequently **no write-side number from `comprehensive_bench` at or after
+> `a0ab400a` is comparable to any number taken before it**, and none should be
+> published until the `block_on` hoist lands. How much of the 1.895x is
+> instrument versus engine is still open; that residual is what `bd-dqdoe`
+> now tracks.
+>
+> Two further caveats that affect what any of these numbers mean:
+>
+> - **The shipped profile is unmeasured.** Benchmarks build `release-perf`
+>   (`opt-level=3`), while the released binary is `opt-level="z"` + lto +
+>   codegen-units=1 + panic=abort. The same experiment measured `release` as
+>   **1.72–1.83x slower** than `release-perf` for roughly 31% size reduction.
+> - **The io_uring fast path is never reached at runtime, for the same underlying
+>   reason.** On a file-backed database opened through the normal `Connection`
+>   API, `PRAGMA fsqlite.io_uring_stats` reports `read_samples_total = 0`,
+>   `write_samples_total = 0`, `unix_fallbacks_total = 7520` — every I/O takes the
+>   Unix fallback (`bd-fo6xw`, measured 2026-07-26; see
+>   `docs/progress/perf-negative-results.md`). This is not a stray gate that can be
+>   deleted: the shared io_uring driver needs a spawner that outlives the
+>   operation, and a per-operation `block_on` tears its runtime down on return, so
+>   forcing the path on makes writes fail outright (tried and reverted the same
+>   day; the refutation is in the ledger and inline at `uring.rs`). Until a runtime
+>   spans at least a transaction, io_uring cannot engage — so any statement about
+>   this engine's I/O behaviour currently describes the fallback path, which per
+>   page costs a thread-pool hop, a zeroed page allocation, and a second full-page
+>   copy.
 >
 > Separately, three defects were found in the benchmark harness itself, which
 > affect published numbers in *both* directions and must be fixed before any

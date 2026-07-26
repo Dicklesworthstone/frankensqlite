@@ -48,6 +48,127 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-07-26 - MEASURE: the io_uring data path is unreachable in production (100% unix fallback)
+
+- Scope: `IoUringFile::{read,write,write_tracked}` on Linux file-backed databases
+  opened through the normal `fsqlite::Connection` API. Not a timing measurement —
+  a structural counter reading, so host load does not affect the verdict.
+- Files: `crates/fsqlite-vfs/src/uring.rs` (gates at `:1069`, `:1188`, `:1318`),
+  `crates/fsqlite-types/src/cx.rs:917` (`attached_native_cx`),
+  `crates/fsqlite-vfs/src/unix.rs:1971-1986` and `:88-101` (the fallback path).
+- Instrument: `PRAGMA fsqlite.io_uring_stats` (`connection.rs:51712`, behind
+  `diagnostic-pragmas`, which `native` -> `default` already enables). No new code
+  was needed to take this measurement; the counter already existed.
+- Binary self-report (bd-8wumh contract): debug `fsqlite-cli`, SHA-256
+  `8ea1d0a198e9ec474d86b9f0aee4269a20c70d687431afa699a2b3e342926e2c`,
+  342,159,600 bytes, built 2026-07-26 13:36:10 -0400.
+- Method: 20,000-row file-backed WAL database (`page_size` 4096; 4.1 MB db +
+  4.2 MB wal) populated in one process, then read from a COLD second process
+  (`PRAGMA wal_checkpoint(TRUNCATE)` followed by two full table scans) so every
+  page read is a genuine buffer-pool miss.
+- Result:
+
+  | counter | value |
+  |---|---:|
+  | `read_samples_total` | `0` |
+  | `write_samples_total` | `0` |
+  | `unix_fallbacks_total` | `7520` |
+
+  Zero io_uring operations. This is an absolute, not a ratio.
+- Mechanism: the three data-path methods gate on `cx.attached_native_cx()` alone.
+  That accessor reads only the attached field and never consults ambient
+  `asupersync::Cx::current()`. Nothing on the `Connection::open` -> `execute`
+  path calls `set_native_cx` on a connection root/op `Cx` — the only
+  `connection.rs` sites are a background task (`:73826`) and a test (`:97020`).
+  `create_child` does propagate it (`cx.rs:1199-1202`), but there is nothing to
+  propagate. One layer up, `page_cache.rs:3421-3422` already resolves the native
+  context as `Cx::current().or_else(|| cx.attached_native_cx())`.
+- Inside the regression window: at control `b612eb7b` the read gate was
+  `if self.has_uring_data_path()` with fallback only on I/O error, and no
+  native-cx requirement. `uring.rs` existed and `IoUringVfs` was already selected
+  for file opens at the control (11 references in `connection.rs`), so the VFS
+  selection is not new; the always-failing gate is.
+- Cost paid on every fallback, per page read: `Arc::clone` -> `spawn_blocking_io`
+  (thread-pool hop + reschedule) -> `vec![0u8; page_size]` in `read_owned_at`
+  (allocation **plus** a zero-fill memset) -> `pread` -> `buf.copy_from_slice`
+  (a second full-page memcpy). Three full-page memory traversals where the
+  pre-async path did one `pread` into the caller's buffer. Writes are symmetric
+  (`buf.to_vec()` at `unix.rs:2018`). The owned-buffer shape is forced by
+  `spawn_blocking_io` requiring `'static`, so removing it is a design change and
+  not a local edit. `UnixFile` also does not override `write_page_batch`, so
+  pager batch writes take the default sequential loop
+  (`fsqlite-vfs/src/traits.rs:1012-1023`).
+- NOT established: any share of the `bd-dqdoe` 1.895x. Two gates exist at HEAD —
+  `runtime.is_available()` (`:1065`) and the native-cx gate (`:1069`) — and
+  `unix_fallbacks_total` does not distinguish which fired. No timing claim is
+  made here; the measuring host was loaded and is non-citable for latency.
+- **REJECTED FIX (same day, by measurement):** substituting
+  `NativeCx::current().or_else(|| cx.attached_native_cx())` at all three gates —
+  mirroring `page_cache.rs:3421` — **breaks the engine**. Rebuilt CLI SHA-256
+  `5f08e3223009e733246bc5220a63f4a671122ab169a7b62f3878cd22f4ca0711`
+  (341,195,032 bytes, built 2026-07-26 13:46:52 -0400). A three-statement
+  workload (`CREATE TABLE` + one `INSERT` + `SELECT`) fails with:
+
+  ```
+  cannot start tracked shared io_uring write: cannot start shared io_uring driver:
+  [ASUP-E001] runtime is no longer available — the runtime behind this handle was
+  dropped or shut down; spawn before shutdown begins, or hold a strong runtime
+  reference for the spawner's lifetime
+  ```
+
+  followed by `no such table: t` on every subsequent statement.
+  `unix_fallbacks_total` fell 7520 -> 133 (the path was genuinely being taken)
+  while `read_samples_total` / `write_samples_total` stayed at `0` (no operation
+  ever succeeded through it).
+- **Therefore the gate is load-bearing, not an oversight.** The ambient `Cx`
+  inside a short-lived `block_on` belongs to a runtime that is torn down when
+  that call returns, and the *shared* io_uring driver needs a spawner that
+  outlives the operation. `page_cache.rs` can use `Cx::current()` because it
+  spawns a task on that same runtime and joins it before returning; the VFS data
+  path cannot. `attached_native_cx()` is how a caller declares "here is a runtime
+  whose lifetime I guarantee." Reverted, with this reasoning recorded inline at
+  `uring.rs:1069` so the next reader does not re-attempt it.
+- **Root cause is upstream, and it is the same one as `bd-zavyn`.** io_uring is
+  unreachable in production because the sync bridge gives *every operation its
+  own runtime*, so no caller can ever offer the lifetime guarantee the driver
+  needs. That is the same per-operation `block_on` architecture that inflates the
+  benchmark timings. One cause, two symptoms: measured harness overhead, and a
+  fast path that can never engage.
+- Retry condition: only after the sync bridge is restructured so a runtime spans
+  at least a transaction (the `bd-zavyn` hoist) **and** a durable native `Cx` is
+  attached to the connection at open time. Re-measure `read_samples_total` before
+  claiming any io_uring benefit. Do not re-try the `Cx::current()` substitution on
+  its own — it is refuted.
+- Follow-ups filed: the PRAGMA surfaces only `unix_fallbacks_total` while the
+  struct also carries `read_unix_fallbacks_total` / `write_unix_fallbacks_total`
+  (`fsqlite-observability/src/lib.rs:144`, `:146`); and `comprehensive-bench`
+  resolves `native` + `linux-asupersync-uring` through `fsqlite-harness` feature
+  unification, so it can assert a fallback-rate receipt per run rather than
+  relying on a separate probe.
+- Tracking: `bd-fo6xw`, referenced from `bd-dqdoe`.
+
+## 2026-07-26 - CORRECTION: comprehensive-bench DOES build with native + linux-asupersync-uring
+
+- `bd-dqdoe` lists "the suite does not exercise the default native/linux-uring
+  feature config" as a benchmark-methodology defect. That is not what the
+  resolved feature graph does.
+- `crates/fsqlite-e2e/Cargo.toml:29` declares
+  `fsqlite = { default-features = false, features = ["json","fts5","rtree"] }`,
+  which on its own would exclude `native` and `linux-asupersync-uring`. But
+  `fsqlite-e2e` depends on `fsqlite-harness`, which takes `fsqlite` with default
+  features, and Cargo features are additive across the graph.
+- Verified with `cargo tree -p fsqlite-e2e -e features -i fsqlite`: both
+  `fsqlite feature "native"` and `fsqlite feature "linux-asupersync-uring"`
+  resolve ON via `fsqlite feature "default"` <- `fsqlite-harness`.
+- Consequence, and why this matters rather than being pedantry: `native` also
+  enables `diagnostic-pragmas`, so `PRAGMA fsqlite.io_uring_stats` is available
+  inside `comprehensive-bench` itself. The uring fallback rate can therefore be
+  recorded as a per-run provenance receipt instead of being probed out-of-band.
+- Retry condition: none — this is a correction to a stated defect, not a rejected
+  optimization. If the feature declaration on `fsqlite-e2e` is ever tightened, or
+  the `fsqlite-harness` dependency is dropped, re-check the resolved graph before
+  assuming either configuration.
+
 ## 2026-07-26 - AUDIT: top-five VOID resurrection queue gets exact-dispatch and A/A adjudication
 
 - Scope: the hand-read six-class audit in `docs/LEDGER_RESURRECTION.md`
