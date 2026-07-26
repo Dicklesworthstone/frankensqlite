@@ -18,6 +18,11 @@ bridge-experiment = ["fsqlite/async-api"]
 tui = ["dep:ftui"]
 pgo = []
 linux-asupersync-uring = ["fsqlite-vfs/linux-asupersync-uring", "fsqlite-core/linux-asupersync-uring", "fsqlite/linux-asupersync-uring"]
+bench-internals = [
+    "fsqlite-btree/bench-internals",
+    "fsqlite-core/bench-internals",
+    "fsqlite-types/bench-internals",
+]
 
 [dependencies]
 asupersync = { workspace = true }

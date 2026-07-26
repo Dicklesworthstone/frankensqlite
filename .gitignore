@@ -378,3 +378,7 @@ claude-upgrade-progress.json
 # `zz_<subject>_probe.rs`), so thirty of them sat in `git status` indefinitely.
 # No `zz_` file has ever been tracked here.
 **/zz_*.rs
+# RCH must see Cargo's locally discovered integration-test entrypoints while
+# remote-only validation is in progress. Keep these untracked; this exception
+# is temporary and is not part of the campaign commit.
+!crates/fsqlite/tests/zz_*.rs

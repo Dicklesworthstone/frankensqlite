@@ -18,7 +18,9 @@ Before mutating SQL-pipeline/VDBE source for a T6.2 optimization candidate,
 run the machine-readable duplicate gate against this ledger. A blocked result
 means the candidate already has a rejected or non-candidate record and the agent
 must not start source edits until a broader retry condition from the matched
-entry is satisfied.
+entry is satisfied. A `requires-null-control` result means the matched REJECT
+does not record an A/A null control; rerun that exact candidate under the
+measurement contract below before proposing a new source mutation.
 
 Example:
 
@@ -31,10 +33,20 @@ cargo run -p fsqlite-harness --bin sql_pipeline_candidate_preflight -- \
 ```
 
 Use `--json` for artifact capture. Exit code `0` means no matching no-retry
-record was found. Exit code `2` means the candidate is blocked. When adding a
-new kept, rejected, or non-candidate record, include the date, benchmark or
-artifact path, Beads comment or issue reference, touched source surface, and the
-retry condition so this preflight can emit actionable evidence.
+record was found. Exit code `2` means the candidate is either blocked or
+requires a corrected null-control rerun; inspect the emitted verdict. When
+adding a new kept, rejected, or non-candidate record, include the date,
+benchmark or artifact path, Beads comment or issue reference, touched source
+surface, A/A result, and the concrete retry condition so this preflight can
+emit actionable evidence.
+
+For new candidate measurements and ledger resurrections, the benchmark program
+must print its own executable SHA-256 (plus byte length and path) as its first
+stdout line. One invocation must then interleave independent A/A baseline
+fixtures and A/B baseline-candidate fixtures. Decide KEEP/REJECT only when the
+candidate median ratio clears the A/A median bootstrap-CI radius by at least
+2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
+are provenance only and must never gate the verdict.
 
 ## 2026-07-26 - ATTRIBUTION HOLD: the current/control slowdown is not an async-only experiment
 
@@ -17968,6 +17980,50 @@ test is on the executed path, not merely linked into it.
 - NET: the 3rd shipped byte-exact codegen win this session, extending the MIN/MAX-via-index family to
   the composite `WHERE a=?` prefix. Diagnostic retained: minmax_prefix_profile.rs.
 
+### 2026-07-25 contract remeasurement — CONFIRMED KEEP at 580.90× MAX / 630.95× MIN
+
+- Allocation adjudication: the Lane-M addendum described
+  `bd-minmax-prefix-seek-4fuo6` as an unclaimed ~800× target, but the tracker,
+  live code, and entry above show that it shipped in `69b7a5d6` on 2026-07-12.
+  This run therefore remeasured the shipped path rather than duplicating the
+  production edit.
+- Command: `RCH_WORKER=vmi1149989 RCH_REQUIRE_REMOTE=1 env -u
+  CARGO_TARGET_DIR rch exec -- cargo bench --profile release-perf -j7 -p
+  fsqlite --bench minmax_prefix_contract_bench`. The pinned worker admitted
+  seven slots and completed with exit 0. The program's first stdout line
+  self-reported ELF SHA-256
+  `86dcef9cfe33453cd9887e1bc25882d6bf9bfebccd8f75aa9004b791654251bb`
+  and length `20,320,976` bytes. Frozen source SHA-256 was
+  `a576bd0c5827d4f56c2224f431dd3200d20d316a6669225f61c59b1aa0b599c2`
+  for `crates/fsqlite/tests/minmax_prefix_profile.rs` and
+  `41cbbdba27a9c970d5156e6cb9268e9e481c1792d594b10daea9f071e65be2f6`
+  for `crates/fsqlite-vdbe/src/codegen.rs`. The optional in-program source
+  lookup reported `unavailable` because RCH launched the ELF outside the
+  source root; the hashes above were taken from the frozen synced worktree
+  immediately after the invocation.
+- Contract: four independent 20,000-row in-memory fixtures, 20 groups,
+  41 interleaved rounds, min-of-3 sampling, at least 2 ms per arm, and 10,000
+  bootstrap resamples of the per-round median ratio. Each claim used a
+  same-invocation baseline/baseline null before scan/seek. CV and MAD were
+  printed as provenance only; `cv_gate=never`.
+- MAX gate: `NOT INDEXED` scan p50 `4,244.792 us`, composite-index seek p50
+  `7.864 us`; median scan/seek ratio `580.898657×`, bootstrap 95% CI
+  `[564.480228, 631.714692]`. Its A/A ratio median was `1.001640`, 95% CI
+  `[0.986116, 1.014937]` (CV `7.268%`, MAD `0.026828`). `SeekLE` opcode gate
+  passed and both arms returned checksum `d8683176eb525bb9`.
+- MIN gate: `NOT INDEXED` scan p50 `3,897.738 us`, composite-index seek p50
+  `6.195 us`; median scan/seek ratio `630.947384×`, bootstrap 95% CI
+  `[594.184013, 651.490126]`. Its A/A ratio median was `1.011398`, 95% CI
+  `[0.999017, 1.021636]` (CV `9.359%`, MAD `0.029507`). `SeekGE` opcode gate
+  passed and both arms returned checksum `0fefd7e52260439d`.
+- Verdict: both are `CONFIRMED_KEEP` under the campaign rule: each claim CI
+  lies wholly above parity, exceeds twice its own A/A 95%-CI radius, and is
+  well above the 1% minimum effect. Retry only after a change to MIN/MAX
+  codegen, partial-prefix B-tree positioning, or index comparison semantics;
+  require the same opcode/checksum gates and a same-invocation median-CI
+  decision. Never reopen this shipped lever merely because CV exceeds a
+  threshold.
+
 ## 2026-07-11 - NEGATIVE: partial-key SeekLE/SeekGT is O(block) (forward walk), not O(log n) — a codegen value-sentinel fix is byte-exact-UNSAFE; the real fix is a chartered btree biased seek (bd-seek-partial-key-oblock-kwdxa)
 
 - Result type: NEGATIVE / root-caused, no clean one-pass fix. Found while benching the just-shipped
@@ -20183,6 +20239,34 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   ("1.30x faster in the full-quick mix") is both unfair AND unreliable — replace
   it with a caveat that defers to the mt-mvcc-bench section rather than any
   comprehensive_bench concurrent number.
+- LANDED (2026-07-25, commit on `main`): all three surviving items are now done.
+  (b) `bench_concurrent_writers`' C writer connections set
+  `PRAGMA synchronous=NORMAL` alongside `journal_mode=WAL` +
+  `busy_timeout=5000`, with an inline comment stating that `synchronous` is
+  per-connection so the setup connection's NORMAL does not carry. The
+  `FSQLITE_BENCH_CONCURRENT_SYNC` override survives and now selects WHICH matched
+  level (`normal`/`full`) both engines run at rather than repairing an unmatched
+  default. The section's report description states the matched-durability
+  contract and carries the disk-noise warning inline, so the caveat travels with
+  every generated HTML/JSON report instead of living only in the README.
+  (c)+(d) README's `concurrent_writers` category row is reduced to "do not cite"
+  and is followed by a blockquote naming BOTH defects (unmatched sync in the
+  measured artifact, plus irreducible file-WAL disk noise), stating explicitly
+  that no corrected ratio is published because none can be reliably measured from
+  this section, and deferring the concurrent-writer claim to `mt-mvcc-bench`.
+- DO NOT RETRY (this is the point of the entry): re-running
+  `comprehensive_bench --filter concurrent` to "get the fair number" is a known
+  dead end on a shared host. It has now been attempted at debug quality, at
+  release-perf quality on a quiet host (load 8, taskset, zero competing builds),
+  and across three configs; the C-side run-to-run spread (95-138 ms at 2w) is
+  larger than the ~20-28 % fsync effect, and one =NORMAL run came out SLOWER than
+  its =FULL counterpart — impossible from sync mode alone, hence noise. The
+  landed fix makes the DEFAULT comparison honest; it does not make this section
+  precise, and no amount of re-running will. Retry predicate: a dedicated
+  quiet-disk host (or tmpfs-backed WAL, which changes the workload) AND a
+  higher-iteration harness — at which point `mt_mvcc_bench` is the better vehicle
+  anyway. For the group-commit angle see bd-6hgad (closed wontfix) and bd-acuhw
+  (OLTP-shaped concurrent section, the only shape that can coalesce).
 
 ## 2026-07-23 - PROFILE + DIRECTION (bd-smxhz): concurrent-writer separate-tables scaling collapses under disk contention; root cause is a FrankenSQLite-specific per-commit file-open storm; lever = VFS fd caching
 

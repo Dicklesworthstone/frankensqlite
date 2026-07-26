@@ -87,6 +87,67 @@ fn default_read_witness_cap() -> usize {
     })
 }
 
+#[cfg(feature = "bench-internals")]
+static TABLE_SEEK_MRU_SHORT_CIRCUIT_FOR_BENCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "bench-internals")]
+static TABLE_SEEK_MRU_SHORT_CIRCUIT_HITS_FOR_BENCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "bench-internals")]
+static DELETE_LEAF_SEARCH_HINT_FOR_BENCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "bench-internals")]
+static DELETE_LEAF_SEARCH_HINT_HITS_FOR_BENCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Select the ledger-resurrection implementation of the table-seek LRU refresh.
+///
+/// This switch exists only in `bench-internals` builds so one benchmark ELF can
+/// interleave the historical baseline and candidate without adding a branch to
+/// production cursor code.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn set_table_seek_mru_short_circuit_for_bench(enabled: bool) {
+    TABLE_SEEK_MRU_SHORT_CIRCUIT_FOR_BENCH.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Reset the exact candidate-path counter used by the resurrection benchmark.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn reset_table_seek_mru_short_circuit_hits_for_bench() {
+    TABLE_SEEK_MRU_SHORT_CIRCUIT_HITS_FOR_BENCH.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Return the exact number of candidate short-circuit executions.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn table_seek_mru_short_circuit_hits_for_bench() -> u64 {
+    TABLE_SEEK_MRU_SHORT_CIRCUIT_HITS_FOR_BENCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Select the historical same-leaf DELETE search-hint candidate.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn set_delete_leaf_search_hint_for_bench(enabled: bool) {
+    DELETE_LEAF_SEARCH_HINT_FOR_BENCH.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Reset the exact execution counter for the DELETE search-hint candidate.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn reset_delete_leaf_search_hint_hits_for_bench() {
+    DELETE_LEAF_SEARCH_HINT_HITS_FOR_BENCH.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Return the exact number of DELETE searches that used the candidate hint.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn delete_leaf_search_hint_hits_for_bench() -> u64 {
+    DELETE_LEAF_SEARCH_HINT_HITS_FOR_BENCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// OPT-3: throttled cancellation check for cursor ops.
 ///
 /// The full `Cx::checkpoint()` path walks e-process oracle consultation +
@@ -1596,6 +1657,21 @@ impl TableLeafDeleteRun {
     fn search_table_leaf(&self, cx: &Cx, target: i64) -> Result<Option<u16>> {
         let mut lo = 0u16;
         let mut hi = self.entry.header.cell_count;
+        #[cfg(feature = "bench-internals")]
+        if DELETE_LEAF_SEARCH_HINT_FOR_BENCH.load(std::sync::atomic::Ordering::Relaxed)
+            && self.entry.cell_idx < hi
+        {
+            let hinted_idx = self.entry.cell_idx;
+            let hinted_rowid =
+                TableLeafPayloadPatchRun::table_leaf_rowid_at(&self.entry, hinted_idx)?;
+            DELETE_LEAF_SEARCH_HINT_HITS_FOR_BENCH
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match hinted_rowid.cmp(&target) {
+                std::cmp::Ordering::Equal => return Ok(Some(hinted_idx)),
+                std::cmp::Ordering::Less => lo = hinted_idx + 1,
+                std::cmp::Ordering::Greater => hi = hinted_idx,
+            }
+        }
         while lo < hi {
             observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
@@ -2247,6 +2323,16 @@ impl<P> BtCursor<P> {
             page_no,
             cell_idx,
         };
+
+        #[cfg(feature = "bench-internals")]
+        if TABLE_SEEK_MRU_SHORT_CIRCUIT_FOR_BENCH.load(std::sync::atomic::Ordering::Relaxed)
+            && self.seek_cache[0].is_some_and(|cached| cached.page_no == page_no)
+        {
+            TABLE_SEEK_MRU_SHORT_CIRCUIT_HITS_FOR_BENCH
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.seek_cache[0] = Some(entry);
+            return;
+        }
 
         let mut refreshed = [None; TABLE_SEEK_CACHE_SLOTS];
         refreshed[0] = Some(entry);

@@ -169,6 +169,35 @@ fn value_preserves_reusable_heap_storage(value: &SqliteValue) -> bool {
 /// with common cache line fractions and matches Arc<str>'s pointer size.
 const SMALL_TEXT_INLINE_CAP: usize = 23;
 
+#[cfg(feature = "bench-internals")]
+static SMALL_TEXT_DIRECT_TRAITS_FOR_BENCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "bench-internals")]
+static SMALL_TEXT_DIRECT_TRAIT_HITS_FOR_BENCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Select the historical direct-byte `SmallText` trait candidate.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn set_small_text_direct_traits_for_bench(enabled: bool) {
+    SMALL_TEXT_DIRECT_TRAITS_FOR_BENCH.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Reset the exact trait-call counter for the direct-byte candidate.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn reset_small_text_direct_trait_hits_for_bench() {
+    SMALL_TEXT_DIRECT_TRAIT_HITS_FOR_BENCH.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Return the exact number of candidate direct-byte trait calls.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn small_text_direct_trait_hits_for_bench() -> u64 {
+    SMALL_TEXT_DIRECT_TRAIT_HITS_FOR_BENCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A small-string-optimized text value.
 ///
 /// Stores strings ≤ 23 bytes inline without heap allocation. Longer strings
@@ -411,6 +440,12 @@ impl fmt::Display for SmallText {
 impl PartialEq for SmallText {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
+        #[cfg(feature = "bench-internals")]
+        if SMALL_TEXT_DIRECT_TRAITS_FOR_BENCH.load(std::sync::atomic::Ordering::Relaxed) {
+            SMALL_TEXT_DIRECT_TRAIT_HITS_FOR_BENCH
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return self.as_bytes_direct() == other.as_bytes_direct();
+        }
         self.as_str() == other.as_str()
     }
 }
@@ -427,6 +462,12 @@ impl PartialOrd for SmallText {
 impl Ord for SmallText {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
+        #[cfg(feature = "bench-internals")]
+        if SMALL_TEXT_DIRECT_TRAITS_FOR_BENCH.load(std::sync::atomic::Ordering::Relaxed) {
+            SMALL_TEXT_DIRECT_TRAIT_HITS_FOR_BENCH
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return self.as_bytes_direct().cmp(other.as_bytes_direct());
+        }
         self.as_str().cmp(other.as_str())
     }
 }
@@ -434,6 +475,14 @@ impl Ord for SmallText {
 impl Hash for SmallText {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
+        #[cfg(feature = "bench-internals")]
+        if SMALL_TEXT_DIRECT_TRAITS_FOR_BENCH.load(std::sync::atomic::Ordering::Relaxed) {
+            SMALL_TEXT_DIRECT_TRAIT_HITS_FOR_BENCH
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state.write(self.as_bytes_direct());
+            state.write_u8(0xff);
+            return;
+        }
         self.as_str().hash(state);
     }
 }

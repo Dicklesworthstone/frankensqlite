@@ -2,4 +2,5 @@ tmp_golden/
 .rch-correctness-target/
 .rch-retained-dml-target/
 .beads/
+.beads.recovery_*/
 .git/
