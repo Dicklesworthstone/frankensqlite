@@ -3052,6 +3052,191 @@ fn cte_queries_match_rusqlite() {
 }
 
 #[test]
+fn repeated_cte_insert_select_matches_rusqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(
+            "CREATE TABLE cte_insert_target (
+                id INTEGER PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
+        )
+        .await;
+        let statement = "
+            WITH incoming(value) AS (
+                SELECT 'alpha'
+                UNION ALL
+                SELECT 'beta'
+            )
+            INSERT INTO cte_insert_target(value)
+            SELECT value FROM incoming;
+        ";
+
+        harness.execute_script(statement).await;
+        harness.execute_script(statement).await;
+        harness
+            .assert_queries_match(
+                "repeated CTE INSERT SELECT",
+                &[QueryCase {
+                    name: "accumulated inserted rows",
+                    sql: "SELECT id, value FROM cte_insert_target ORDER BY id",
+                }],
+            )
+            .await;
+    });
+}
+
+#[test]
+fn repeated_nested_cte_insert_matches_rusqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(
+            "CREATE TABLE nested_cte_insert_target (
+                id INTEGER PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
+        )
+        .await;
+        let statement = "
+            WITH base(value) AS (VALUES ('red'), ('blue')),
+                 nested(value) AS (SELECT value || '-x' FROM base)
+            INSERT INTO nested_cte_insert_target(value)
+            SELECT value FROM nested;
+        ";
+
+        harness.execute_script(statement).await;
+        harness.execute_script(statement).await;
+        harness
+            .assert_queries_match(
+                "repeated nested CTE INSERT",
+                &[QueryCase {
+                    name: "accumulated nested CTE rows",
+                    sql: "SELECT id, value FROM nested_cte_insert_target ORDER BY id",
+                }],
+            )
+            .await;
+    });
+}
+
+#[test]
+fn repeated_nested_cte_update_matches_rusqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(
+            "CREATE TABLE nested_cte_update_target (
+                id INTEGER PRIMARY KEY,
+                qty INTEGER NOT NULL
+            );
+            INSERT INTO nested_cte_update_target VALUES (1, 10), (2, 20);",
+        )
+        .await;
+        let statement = "
+            WITH base(id) AS (VALUES (1), (2)),
+                 nested(id) AS (SELECT id FROM base)
+            UPDATE nested_cte_update_target
+            SET qty = qty + 5
+            WHERE id IN (SELECT id FROM nested);
+        ";
+
+        harness.execute_script(statement).await;
+        harness.execute_script(statement).await;
+        harness
+            .assert_queries_match(
+                "repeated nested CTE UPDATE",
+                &[QueryCase {
+                    name: "twice updated rows",
+                    sql: "SELECT id, qty FROM nested_cte_update_target ORDER BY id",
+                }],
+            )
+            .await;
+    });
+}
+
+#[test]
+fn repeated_nested_cte_delete_matches_rusqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(
+            "CREATE TABLE nested_cte_delete_target (
+                id INTEGER PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO nested_cte_delete_target VALUES
+                (1, 'a'), (2, 'b'), (3, 'c'),
+                (4, 'd'), (5, 'e'), (6, 'f');",
+        )
+        .await;
+        let statement = "
+            WITH base(id) AS (VALUES (2), (5)),
+                 nested(id) AS (SELECT id FROM base WHERE id > 0)
+            DELETE FROM nested_cte_delete_target
+            WHERE id IN (SELECT id FROM nested);
+        ";
+
+        harness.execute_script(statement).await;
+        harness.execute_script(statement).await;
+        harness
+            .assert_queries_match(
+                "repeated nested CTE DELETE",
+                &[QueryCase {
+                    name: "remaining rows after repeated delete",
+                    sql: "SELECT id, value FROM nested_cte_delete_target ORDER BY id",
+                }],
+            )
+            .await;
+    });
+}
+
+#[test]
+fn failed_cte_dml_restores_compiled_cache_eligibility() {
+    asupersync::test_utils::run_test(|| async {
+        let harness = CoreSqlConformanceHarness::new(
+            "CREATE TABLE cte_error_target (
+                id INTEGER PRIMARY KEY,
+                value TEXT NOT NULL UNIQUE
+            );
+            INSERT INTO cte_error_target VALUES (1, 'duplicate');",
+        )
+        .await;
+        let failing_statement = "
+            WITH base(value) AS (VALUES ('duplicate')),
+                 nested(value) AS (SELECT value FROM base)
+            INSERT INTO cte_error_target(value)
+            SELECT value FROM nested;
+        ";
+
+        for _ in 0..2 {
+            let franken_error = harness
+                .franken
+                .execute_batch(failing_statement)
+                .await
+                .is_err();
+            let sqlite_error = harness.sqlite.execute_batch(failing_statement).is_err();
+            assert!(
+                sqlite_error,
+                "rusqlite should reject the duplicate CTE insert"
+            );
+            assert_eq!(
+                franken_error, sqlite_error,
+                "failed repeated CTE DML should match rusqlite"
+            );
+        }
+
+        harness.franken.clear_compilation_reuse_caches();
+        let cache_probe = [QueryCase {
+            name: "ordinary SELECT after failed CTE DML",
+            sql: "SELECT value FROM cte_error_target WHERE id = 1",
+        }];
+        harness
+            .assert_queries_match("post-error cache restoration", &cache_probe)
+            .await;
+        harness
+            .assert_queries_match("post-error cache restoration", &cache_probe)
+            .await;
+        assert!(
+            harness.franken.compiled_cache_len() > 0,
+            "ordinary statements should remain eligible for compiled caching"
+        );
+    });
+}
+
+#[test]
 fn values_clause_edges_match_rusqlite() {
     asupersync::test_utils::run_test(|| async {
         let harness = CoreSqlConformanceHarness::new(SUBQUERY_SETUP).await;

@@ -23967,13 +23967,15 @@ impl Connection {
         self.clear_compilation_reuse_caches();
     }
 
-    // DO NOT DELETE AS DEAD CODE -- this is a lost call site, not vestigial.
+    // DO NOT DELETE AS DEAD CODE -- this helper remains useful for synchronous
+    // scopes even though the asynchronous CTE materialization paths use
+    // `BoolCellRestoreGuard` directly across await points.
     //
     // `bypass_compiled_cache` is still *consumed* by `compile_with_cache`,
-    // which skips the compiled-program cache and recompiles when it is set.
-    // This helper is the only thing that can set it, and it currently has zero
-    // callers, so the bypass branch is unreachable in practice and the compiled
-    // cache is always consulted.
+    // which skips the compiled-program cache and recompiles when it is set. The
+    // CTE execution paths set it with an RAII guard so programs bound to
+    // dynamically allocated temp-table root pages are neither looked up nor
+    // inserted.
     //
     // That matters because CTE and view materialization allocate temp tables in
     // `MemDatabase` with *dynamic* root pages. A cached program compiled against
@@ -61396,6 +61398,7 @@ impl Connection {
         delete: &fsqlite_ast::DeleteStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        let _compiled_cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
         if let Some(target_schema) = self.attached_target_schema(&delete.table.name)? {
             self.reject_attached_target_write_in_explicit_transaction(
                 "DELETE",
@@ -61439,7 +61442,6 @@ impl Connection {
             .await?;
         let mut stripped = delete.clone();
         stripped.with = None;
-        let _compiled_cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
         self.execute_statement(&Statement::Delete(stripped), params)
             .await
     }
@@ -61451,6 +61453,7 @@ impl Connection {
         update: &fsqlite_ast::UpdateStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        let _compiled_cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
         if let Some(target_schema) = self.attached_target_schema(&update.table.name)? {
             self.reject_attached_target_write_in_explicit_transaction(
                 "UPDATE",
@@ -61518,7 +61521,6 @@ impl Connection {
             .await?;
         let mut stripped = update.clone();
         stripped.with = None;
-        let _compiled_cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
         self.execute_statement(&Statement::Update(stripped), params)
             .await
     }
@@ -61530,6 +61532,7 @@ impl Connection {
         insert: &fsqlite_ast::InsertStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        let _compiled_cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
         if let Some(target_schema) = self.attached_target_schema(&insert.table)? {
             self.reject_attached_target_write_in_explicit_transaction(
                 "INSERT",
@@ -61611,8 +61614,6 @@ impl Connection {
             self.set_statement_change_count(outcome.changes);
             Ok(outcome.returning_rows)
         } else {
-            let _compiled_cache_guard =
-                BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
             self.execute_statement(&Statement::Insert(stripped), params)
                 .await
         }
