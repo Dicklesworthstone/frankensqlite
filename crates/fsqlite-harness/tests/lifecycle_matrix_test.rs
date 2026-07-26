@@ -1022,8 +1022,12 @@ fn multiple_tables_in_single_transaction_persist_atomically() {
             conn.execute("CREATE TABLE t1 (x INTEGER)")
                 .await
                 .expect("ddl1");
-            conn.execute("CREATE TABLE t2 (y TEXT)").await.expect("ddl2");
-            conn.execute("CREATE TABLE t3 (z REAL)").await.expect("ddl3");
+            conn.execute("CREATE TABLE t2 (y TEXT)")
+                .await
+                .expect("ddl2");
+            conn.execute("CREATE TABLE t3 (z REAL)")
+                .await
+                .expect("ddl3");
             conn.execute("INSERT INTO t1 VALUES (1)").await.expect("i1");
             conn.execute("INSERT INTO t2 VALUES ('hello')")
                 .await

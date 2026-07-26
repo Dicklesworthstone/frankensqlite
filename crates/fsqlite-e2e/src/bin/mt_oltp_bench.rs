@@ -322,7 +322,9 @@ fn run_fsqlite_iter(
             for _ in 0..ops_per_thread {
                 let id = (lcg_next(&mut rng_state) % seed_rows as u64 + 1) as i64;
                 let t = Instant::now();
-                let _ = stmt.query_with_params(&[fsqlite::SqliteValue::Integer(id)]);
+                let _ = fsqlite_e2e::block_on(
+                    stmt.query_with_params(&[fsqlite::SqliteValue::Integer(id)]),
+                );
                 latencies.push(t.elapsed().as_nanos() as u64);
             }
 

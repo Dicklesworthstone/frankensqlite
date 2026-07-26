@@ -3076,9 +3076,9 @@ mod tests {
     #[test]
     fn prepared_op_executor_reuses_insert_shape() {
         let conn = crate::block_on(Connection::open(":memory:")).unwrap();
-        crate::block_on(conn.execute(
-            "CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT, num REAL);",
-        ))
+        crate::block_on(
+            conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT, num REAL);"),
+        )
         .unwrap();
 
         let mut executor = PreparedOpExecutor::new(&conn);

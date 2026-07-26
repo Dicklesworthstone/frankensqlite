@@ -1212,11 +1212,12 @@ struct JsonBridgeSample {
     elapsed_ns: u64,
     runtime_entries_total: usize,
     runtime_entries_inside_timed_region: usize,
-    caller_future_awaits_inside_timed_region: usize,
+    caller_future_completions_inside_timed_region: usize,
     engine_dml_future_calls_inside_timed_region: usize,
     worker_commands_total: usize,
     worker_commands_inside_timed_region: usize,
     worker_open_handshakes_total: usize,
+    oracle_kind: String,
     checksum_count: i64,
     checksum_sum: i64,
 }
@@ -1258,6 +1259,7 @@ struct JsonBridgeReadyRegression {
     interpretation: String,
     points: usize,
     paired_blocks: usize,
+    bootstrap_clusters: usize,
     intercept_ns: f64,
     slope_ns_per_additional_runtime_entry: f64,
     bootstrap_slope_ci95_low: f64,
@@ -1276,6 +1278,8 @@ struct JsonBridgeConfig {
     warmup_policy: String,
     timed_region: String,
     arm_contracts: BTreeMap<String, String>,
+    affinity_policy: String,
+    max_load_average_1m: Option<f64>,
 }
 
 #[cfg(feature = "bridge-experiment")]
@@ -1840,7 +1844,7 @@ fn capture_cargo_feature_graph(
         "-p",
         "fsqlite-e2e",
         "-e",
-        "features",
+        "features,no-dev",
         "--no-default-features",
         "--target",
         target,
@@ -1898,7 +1902,7 @@ impl JsonBenchmarkProvenance {
             .map(str::as_bytes)
             .map(sha256_bytes);
         let cargo_feature_graph_command = format!(
-            "cargo tree --locked --offline -p fsqlite-e2e -e features \
+            "cargo tree --locked --offline -p fsqlite-e2e -e features,no-dev \
              --no-default-features --target {}{}",
             build_target,
             if package_features.is_empty() {
@@ -1911,6 +1915,7 @@ impl JsonBenchmarkProvenance {
             "FSQLITE_BENCH_CONCURRENT_SYNC",
             "FSQLITE_BENCH_EXPECTED_CPU_AFFINITY",
             "FSQLITE_BENCH_LAB_UNSAFE",
+            "FSQLITE_BENCH_MAX_LOAD_1M",
             "FSQLITE_BENCH_PAGE_SIZE",
             "FSQLITE_BENCH_PROFILE_CONCURRENT",
             "FSQLITE_BENCH_PROFILE_DML",
@@ -2877,11 +2882,269 @@ fn benchmark_json_schema() -> serde_json::Value {
     })
 }
 
+#[cfg(feature = "bridge-experiment")]
+#[allow(clippy::too_many_lines)]
+fn bridge_json_schema() -> serde_json::Value {
+    let comprehensive = benchmark_json_schema();
+    let provenance = comprehensive["properties"]["provenance"].clone();
+    let environment = comprehensive["properties"]["environment"].clone();
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/bridge-experiment.v1.json",
+        "title": "FrankenSQLite async bridge experiment report",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "schema_version", "generated_at_utc", "provenance", "environment",
+            "host_state_before", "host_state_after", "config", "raw_samples",
+            "arm_statistics", "paired_comparisons", "ready_runtime_entry_regression"
+        ],
+        "properties": {
+            "schema_version": {"const": BRIDGE_REPORT_SCHEMA_V1},
+            "generated_at_utc": {"type": "string"},
+            "provenance": provenance,
+            "environment": environment,
+            "host_state_before": {"$ref": "#/$defs/host_state"},
+            "host_state_after": {"$ref": "#/$defs/host_state"},
+            "config": {"$ref": "#/$defs/config"},
+            "raw_samples": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"$ref": "#/$defs/sample"}
+            },
+            "arm_statistics": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"$ref": "#/$defs/arm_statistics"}
+            },
+            "paired_comparisons": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"$ref": "#/$defs/paired_comparison"}
+            },
+            "ready_runtime_entry_regression": {"$ref": "#/$defs/ready_regression"}
+        },
+        "$defs": {
+            "arm": {
+                "enum": [
+                    "per_operation_block_on",
+                    "inside_existing_runtime",
+                    "worker_sync_facade"
+                ]
+            },
+            "workload": {
+                "enum": [
+                    "ready_future",
+                    "prepared_insert",
+                    "raw_execute_with_params"
+                ]
+            },
+            "host_state": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "captured_at_utc", "load_average_1m", "load_average_5m",
+                    "load_average_15m", "available_parallelism", "cpu_affinity",
+                    "scaling_governors", "energy_performance_preferences",
+                    "boost_controls", "numa_nodes_online", "memory_available_gb"
+                ],
+                "properties": {
+                    "captured_at_utc": {"type": "string"},
+                    "load_average_1m": {"type": ["number", "null"], "minimum": 0},
+                    "load_average_5m": {"type": ["number", "null"], "minimum": 0},
+                    "load_average_15m": {"type": ["number", "null"], "minimum": 0},
+                    "available_parallelism": {"type": ["integer", "null"], "minimum": 1},
+                    "cpu_affinity": {"type": ["string", "null"]},
+                    "scaling_governors": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "energy_performance_preferences": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "boost_controls": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"}
+                    },
+                    "numa_nodes_online": {"type": ["string", "null"]},
+                    "memory_available_gb": {"type": ["number", "null"], "minimum": 0}
+                }
+            },
+            "config": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "samples_per_arm", "raw_insert_operations",
+                    "ready_operation_counts", "order_seed", "ordering_policy",
+                    "warmup_policy", "timed_region", "arm_contracts",
+                    "affinity_policy", "max_load_average_1m"
+                ],
+                "properties": {
+                    "samples_per_arm": {"type": "integer", "minimum": 32},
+                    "raw_insert_operations": {"type": "integer", "minimum": 1},
+                    "ready_operation_counts": {
+                        "type": "array",
+                        "minItems": 2,
+                        "items": {"type": "integer", "minimum": 1}
+                    },
+                    "order_seed": {"type": "integer", "minimum": 0},
+                    "ordering_policy": {"type": "string"},
+                    "warmup_policy": {"type": "string"},
+                    "timed_region": {"type": "string"},
+                    "arm_contracts": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                            "per_operation_block_on",
+                            "inside_existing_runtime",
+                            "worker_sync_facade"
+                        ],
+                        "properties": {
+                            "per_operation_block_on": {"type": "string"},
+                            "inside_existing_runtime": {"type": "string"},
+                            "worker_sync_facade": {"type": "string"}
+                        }
+                    },
+                    "affinity_policy": {"type": "string"},
+                    "max_load_average_1m": {
+                        "type": ["number", "null"],
+                        "minimum": 0
+                    }
+                }
+            },
+            "sample": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "workload", "operation_count", "block_index", "order_slot",
+                    "arm", "elapsed_ns", "runtime_entries_total",
+                    "runtime_entries_inside_timed_region",
+                    "caller_future_completions_inside_timed_region",
+                    "engine_dml_future_calls_inside_timed_region",
+                    "worker_commands_total", "worker_commands_inside_timed_region",
+                    "worker_open_handshakes_total", "oracle_kind",
+                    "checksum_count", "checksum_sum"
+                ],
+                "properties": {
+                    "workload": {"$ref": "#/$defs/workload"},
+                    "operation_count": {"type": "integer", "minimum": 1},
+                    "block_index": {"type": "integer", "minimum": 0},
+                    "order_slot": {"type": "integer", "minimum": 0},
+                    "arm": {"$ref": "#/$defs/arm"},
+                    "elapsed_ns": {"type": "integer", "minimum": 0},
+                    "runtime_entries_total": {"type": "integer", "minimum": 0},
+                    "runtime_entries_inside_timed_region": {
+                        "type": "integer", "minimum": 0
+                    },
+                    "caller_future_completions_inside_timed_region": {
+                        "type": "integer", "minimum": 0
+                    },
+                    "engine_dml_future_calls_inside_timed_region": {
+                        "type": "integer", "minimum": 0
+                    },
+                    "worker_commands_total": {"type": "integer", "minimum": 0},
+                    "worker_commands_inside_timed_region": {
+                        "type": "integer", "minimum": 0
+                    },
+                    "worker_open_handshakes_total": {
+                        "type": "integer", "minimum": 0
+                    },
+                    "oracle_kind": {"type": "string"},
+                    "checksum_count": {"type": "integer"},
+                    "checksum_sum": {"type": "integer"}
+                }
+            },
+            "arm_statistics": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "workload", "operation_count", "arm", "samples",
+                    "median_ns", "mean_ns", "p95_ns", "stddev_ns", "cv_pct",
+                    "median_ns_per_operation"
+                ],
+                "properties": {
+                    "workload": {"$ref": "#/$defs/workload"},
+                    "operation_count": {"type": "integer", "minimum": 1},
+                    "arm": {"$ref": "#/$defs/arm"},
+                    "samples": {"type": "integer", "minimum": 1},
+                    "median_ns": {"type": "number", "minimum": 0},
+                    "mean_ns": {"type": "number", "minimum": 0},
+                    "p95_ns": {"type": "number", "minimum": 0},
+                    "stddev_ns": {"type": "number", "minimum": 0},
+                    "cv_pct": {"type": "number", "minimum": 0},
+                    "median_ns_per_operation": {"type": "number", "minimum": 0}
+                }
+            },
+            "paired_comparison": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "workload", "operation_count", "numerator", "denominator",
+                    "paired_blocks", "median_ratio", "geomean_ratio",
+                    "bootstrap_mean_ratio_ci95_low",
+                    "bootstrap_mean_ratio_ci95_high"
+                ],
+                "properties": {
+                    "workload": {"$ref": "#/$defs/workload"},
+                    "operation_count": {"type": "integer", "minimum": 1},
+                    "numerator": {"$ref": "#/$defs/arm"},
+                    "denominator": {"$ref": "#/$defs/arm"},
+                    "paired_blocks": {"type": "integer", "minimum": 1},
+                    "median_ratio": {"type": "number", "exclusiveMinimum": 0},
+                    "geomean_ratio": {"type": "number", "exclusiveMinimum": 0},
+                    "bootstrap_mean_ratio_ci95_low": {
+                        "type": "number", "exclusiveMinimum": 0
+                    },
+                    "bootstrap_mean_ratio_ci95_high": {
+                        "type": "number", "exclusiveMinimum": 0
+                    }
+                }
+            },
+            "ready_regression": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "predictor", "response", "interpretation", "points",
+                    "paired_blocks", "bootstrap_clusters", "intercept_ns",
+                    "slope_ns_per_additional_runtime_entry",
+                    "bootstrap_slope_ci95_low", "bootstrap_slope_ci95_high",
+                    "r_squared"
+                ],
+                "properties": {
+                    "predictor": {"type": "string"},
+                    "response": {"type": "string"},
+                    "interpretation": {"type": "string"},
+                    "points": {"type": "integer", "minimum": 2},
+                    "paired_blocks": {"type": "integer", "minimum": 2},
+                    "bootstrap_clusters": {"type": "integer", "minimum": 1},
+                    "intercept_ns": {"type": "number"},
+                    "slope_ns_per_additional_runtime_entry": {"type": "number"},
+                    "bootstrap_slope_ci95_low": {"type": "number"},
+                    "bootstrap_slope_ci95_high": {"type": "number"},
+                    "r_squared": {"type": "number"}
+                }
+            }
+        }
+    })
+}
+
 fn print_benchmark_json_schema() {
     match serde_json::to_string_pretty(&benchmark_json_schema()) {
         Ok(json) => println!("{json}"),
         Err(err) => {
             eprintln!("ERROR: Could not serialize benchmark JSON schema: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn print_bridge_json_schema() {
+    match serde_json::to_string_pretty(&bridge_json_schema()) {
+        Ok(json) => println!("{json}"),
+        Err(err) => {
+            eprintln!("ERROR: Could not serialize bridge JSON schema: {err}");
             std::process::exit(1);
         }
     }
@@ -3553,7 +3816,7 @@ fn print_usage() {
   cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --json-out report.json --no-html
   cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --json-stdout --no-html
   cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --print-json-schema
-  FSQLITE_BENCH_EXPECTED_CPU_AFFINITY=2-3 FSQLITE_BENCH_PROFILE_NAME=release-perf taskset -c 2,3 cargo run --profile release-perf -p fsqlite-e2e --features bridge-experiment --bin comprehensive-bench -- --bridge-experiment --json-out bridge.json
+  FSQLITE_BENCH_EXPECTED_CPU_AFFINITY=2-3 FSQLITE_BENCH_MAX_LOAD_1M=4 FSQLITE_BENCH_PROFILE_NAME=release-perf taskset -c 2,3 cargo run --profile release-perf -p fsqlite-e2e --features bridge-experiment --bin comprehensive-bench -- --bridge-experiment --json-out bridge.json
 
 Flags:
   --quick              Run the reduced benchmark matrix.
@@ -3567,7 +3830,8 @@ Flags:
   --allow-unverified-provenance
                        Emit explicitly non-citable artifacts when provenance validation fails.
   --bridge-experiment  Run the standalone three-arm async bridge experiment.
-  --bridge-samples <n> Samples per bridge arm; even and at least 20 (default: 20).
+  --bridge-samples <n> Samples per bridge arm; multiple of 16 and at least 32
+                       (default: 64).
   --bridge-operations <n>
                        Timed insert operations per sample (default: 1000).
   --bridge-seed <n>    Deterministic ABBA ordering/bootstrap seed.
@@ -3587,7 +3851,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
         print_json_schema: false,
         allow_unverified_provenance: false,
         bridge_experiment: false,
-        bridge_samples: 20,
+        bridge_samples: 64,
         bridge_operations: 1_000,
         bridge_seed: 0x4653_514c_4954_4530,
     };
@@ -3680,8 +3944,8 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
     }
 
     if options.bridge_experiment {
-        if options.bridge_samples < 20 || options.bridge_samples % 2 != 0 {
-            return Err("--bridge-samples must be even and at least 20".to_owned());
+        if options.bridge_samples < 32 || options.bridge_samples % 16 != 0 {
+            return Err("--bridge-samples must be a multiple of 16 and at least 32".to_owned());
         }
         if options.bridge_operations == 0 {
             return Err("--bridge-operations must be greater than zero".to_owned());
@@ -4810,13 +5074,11 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
             let path = tmp.path().to_str().unwrap().to_owned();
             {
                 let setup = rusqlite::Connection::open(&path).unwrap();
+                apply_pragmas_csqlite(&setup);
                 setup
                     .execute_batch(
-                        "PRAGMA page_size = 4096;\
-                         PRAGMA journal_mode = WAL;\
-                         PRAGMA synchronous = NORMAL;\
-                         PRAGMA cache_size = -64000;\
-                         CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER);",
+                        "CREATE TABLE bench \
+                         (id INTEGER PRIMARY KEY, name TEXT, score INTEGER);",
                     )
                     .unwrap();
             }
@@ -4831,8 +5093,11 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                         // worker error cannot strand the rest at the barrier.
                         bar.wait();
                         let conn = rusqlite::Connection::open(&p).unwrap();
-                        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
-                            .unwrap();
+                        // `cache_size` is connection-local, so configuring only
+                        // the setup connection would silently give C SQLite a
+                        // different scored workload than FrankenSQLite.
+                        apply_pragmas_csqlite(&conn);
+                        conn.execute_batch("PRAGMA busy_timeout=5000;").unwrap();
                         let mode = concurrent_sync_mode();
                         conn.execute_batch(&format!("PRAGMA synchronous={mode};"))
                             .unwrap();
@@ -4884,7 +5149,11 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
             let tmp = tempfile::NamedTempFile::new().unwrap();
             let path = tmp.path().to_str().unwrap().to_owned();
             {
-                let setup = fsqlite_e2e::block_on(fsqlite::Connection::open(&path)).unwrap();
+                let setup = fsqlite_e2e::block_on(fsqlite::Connection::open_with_page_size(
+                    &path,
+                    benchmark_page_size_bytes(),
+                ))
+                .unwrap();
                 apply_pragmas_fsqlite(&setup);
                 fs_execute(
                     &setup,
@@ -5340,7 +5609,7 @@ mod tests {
                 print_json_schema: false,
                 allow_unverified_provenance: false,
                 bridge_experiment: false,
-                bridge_samples: 20,
+                bridge_samples: 64,
                 bridge_operations: 1_000,
                 bridge_seed: 0x4653_514c_4954_4530,
             }
@@ -5930,11 +6199,12 @@ mod tests {
             elapsed_ns,
             runtime_entries_total: 0,
             runtime_entries_inside_timed_region: 0,
-            caller_future_awaits_inside_timed_region: 0,
+            caller_future_completions_inside_timed_region: 0,
             engine_dml_future_calls_inside_timed_region: 0,
             worker_commands_total: 0,
             worker_commands_inside_timed_region: 0,
             worker_open_handshakes_total: 0,
+            oracle_kind: "test_fixture".to_owned(),
             checksum_count: checksum.0,
             checksum_sum: checksum.1,
         }
@@ -5960,6 +6230,78 @@ mod tests {
                     2
                 );
             }
+        }
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
+    fn bridge_ready_count_orders_balance_position_and_predecessor() {
+        let operation_counts = [1_usize, 10, 100, 1_000];
+        let mut rng = StdRng::seed_from_u64(17);
+        let orders = bridge_balanced_ready_count_orders(&operation_counts, 16, &mut rng)
+            .expect("two complete Williams cycles should be valid");
+        assert_eq!(orders.len(), 16);
+
+        let mut position_counts = BTreeMap::new();
+        let mut predecessor_counts = BTreeMap::new();
+        for order in &orders {
+            assert_eq!(order.len(), operation_counts.len());
+            for (position, operation_count) in order.iter().copied().enumerate() {
+                *position_counts
+                    .entry((operation_count, position))
+                    .or_insert(0_usize) += 1;
+            }
+            for pair in order.windows(2) {
+                assert_ne!(pair[0], pair[1]);
+                *predecessor_counts
+                    .entry((pair[0], pair[1]))
+                    .or_insert(0_usize) += 1;
+            }
+        }
+
+        for operation_count in operation_counts {
+            for position in 0..operation_counts.len() {
+                assert_eq!(position_counts[&(operation_count, position)], 4);
+            }
+            for successor in operation_counts {
+                if successor != operation_count {
+                    assert_eq!(predecessor_counts[&(operation_count, successor)], 4);
+                }
+            }
+        }
+
+        assert!(
+            bridge_balanced_ready_count_orders(&operation_counts, 10, &mut rng).is_err(),
+            "an incomplete Williams cycle must fail instead of silently biasing positions"
+        );
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
+    fn bridge_affinity_parser_and_sample_policy_fail_closed() {
+        assert_eq!(bridge_cpu_affinity_cardinality("2").unwrap(), 1);
+        assert_eq!(bridge_cpu_affinity_cardinality("2-3").unwrap(), 2);
+        assert_eq!(bridge_cpu_affinity_cardinality("2,4").unwrap(), 2);
+        assert!(bridge_cpu_affinity_cardinality("").is_err());
+        assert!(bridge_cpu_affinity_cardinality("3-2").is_err());
+        assert!(bridge_cpu_affinity_cardinality("2-3,3-4").is_err());
+
+        let valid = vec![
+            "comprehensive-bench".to_owned(),
+            "--bridge-experiment".to_owned(),
+            "--bridge-samples".to_owned(),
+            "32".to_owned(),
+        ];
+        assert_eq!(parse_cli_args(&valid).unwrap().bridge_samples, 32);
+
+        for invalid in ["20", "40", "30"] {
+            let args = vec![
+                "comprehensive-bench".to_owned(),
+                "--bridge-experiment".to_owned(),
+                "--bridge-samples".to_owned(),
+                invalid.to_owned(),
+            ];
+            assert!(parse_cli_args(&args).is_err());
         }
     }
 
@@ -6046,6 +6388,7 @@ mod tests {
         let regression = bridge_ready_regression(&samples, 123).expect("fixture should regress");
         assert_eq!(regression.points, 40);
         assert_eq!(regression.paired_blocks, 10);
+        assert_eq!(regression.bootstrap_clusters, 5);
         assert!(regression.intercept_ns.abs() < 1.0e-9);
         assert!((regression.slope_ns_per_additional_runtime_entry - 5.0).abs() < 1.0e-9);
         assert!((regression.bootstrap_slope_ci95_low - 5.0).abs() < 1.0e-9);
@@ -6058,13 +6401,19 @@ mod tests {
     fn bridge_ready_samples_count_exact_runtime_entries_and_future_calls() {
         let per_operation =
             bridge_sample_ready_per_operation(3, 0, 0).expect("ready sample should run");
-        assert_eq!(per_operation.runtime_entries_total, 3);
+        assert_eq!(
+            per_operation.runtime_entries_total, 4,
+            "one untimed sentinel probe plus three timed entries"
+        );
         assert_eq!(per_operation.runtime_entries_inside_timed_region, 3);
-        assert_eq!(per_operation.caller_future_awaits_inside_timed_region, 3);
+        assert_eq!(
+            per_operation.caller_future_completions_inside_timed_region,
+            3
+        );
         assert_eq!(per_operation.engine_dml_future_calls_inside_timed_region, 0);
         assert_eq!(
             (per_operation.checksum_count, per_operation.checksum_sum),
-            (3, 3)
+            (3, 0)
         );
 
         let runtime = RuntimeBuilder::current_thread()
@@ -6074,15 +6423,41 @@ mod tests {
             bridge_sample_ready_single_runtime(&runtime, 3, 0, 1).expect("ready sample should run");
         assert_eq!(single_runtime.runtime_entries_total, 1);
         assert_eq!(single_runtime.runtime_entries_inside_timed_region, 0);
-        assert_eq!(single_runtime.caller_future_awaits_inside_timed_region, 3);
+        assert_eq!(
+            single_runtime.caller_future_completions_inside_timed_region,
+            3
+        );
         assert_eq!(
             single_runtime.engine_dml_future_calls_inside_timed_region,
             0
         );
         assert_eq!(
             (single_runtime.checksum_count, single_runtime.checksum_sum),
-            (3, 3)
+            (3, 0)
         );
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
+    fn bridge_worker_sample_accounts_for_every_command_and_checks_rows() {
+        let sample = bridge_sample_insert_worker(3, 7, 2).expect("worker sample should run");
+        assert_eq!(sample.workload, BridgeWorkload::RawExecuteWithParams);
+        assert_eq!(sample.arm, BridgeArm::WorkerSyncFacade);
+        assert_eq!(sample.operation_count, 3);
+        assert_eq!(sample.block_index, 7);
+        assert_eq!(sample.order_slot, 2);
+        assert_eq!(sample.runtime_entries_total, 0);
+        assert_eq!(sample.runtime_entries_inside_timed_region, 0);
+        assert_eq!(sample.caller_future_completions_inside_timed_region, 0);
+        assert_eq!(sample.engine_dml_future_calls_inside_timed_region, 3);
+        assert_eq!(sample.worker_commands_inside_timed_region, 3);
+        assert_eq!(sample.worker_open_handshakes_total, 1);
+        assert_eq!(sample.worker_commands_total, bridge_pragmas().len() + 7 + 3);
+        assert_eq!(
+            sample.oracle_kind,
+            "untimed_database_count_and_sum_query"
+        );
+        assert_eq!((sample.checksum_count, sample.checksum_sum), (3, 3));
     }
 }
 
@@ -7809,6 +8184,137 @@ fn capture_bridge_host_state() -> JsonBridgeHostState {
 }
 
 #[cfg(feature = "bridge-experiment")]
+fn bridge_cpu_affinity_cardinality(value: &str) -> Result<usize, String> {
+    let mut count = 0_usize;
+    let mut previous_end = None;
+    for segment in value.split(',') {
+        if segment.is_empty() {
+            return Err("CPU affinity contains an empty segment".to_owned());
+        }
+        let (start, end) = match segment.split_once('-') {
+            Some((start, end)) => (
+                start
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid CPU affinity start `{start}`"))?,
+                end.parse::<usize>()
+                    .map_err(|_| format!("invalid CPU affinity end `{end}`"))?,
+            ),
+            None => {
+                let cpu = segment
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid CPU affinity CPU `{segment}`"))?;
+                (cpu, cpu)
+            }
+        };
+        if start > end {
+            return Err(format!(
+                "CPU affinity range starts after it ends: `{segment}`"
+            ));
+        }
+        if previous_end.is_some_and(|previous| start <= previous) {
+            return Err("CPU affinity ranges overlap or are not increasing".to_owned());
+        }
+        count = count
+            .checked_add(end - start + 1)
+            .ok_or_else(|| "CPU affinity cardinality overflowed usize".to_owned())?;
+        previous_end = Some(end);
+    }
+    if count == 0 {
+        Err("CPU affinity selects no CPUs".to_owned())
+    } else {
+        Ok(count)
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_max_load_average_1m() -> Result<f64, String> {
+    let raw = std::env::var("FSQLITE_BENCH_MAX_LOAD_1M").map_err(|error| match error {
+        std::env::VarError::NotPresent => {
+            "citable bridge runs require FSQLITE_BENCH_MAX_LOAD_1M".to_owned()
+        }
+        other => format!("could not read FSQLITE_BENCH_MAX_LOAD_1M: {other}"),
+    })?;
+    let maximum = raw
+        .parse::<f64>()
+        .map_err(|_| format!("FSQLITE_BENCH_MAX_LOAD_1M must be a finite number, got `{raw}`"))?;
+    if maximum.is_finite() && maximum >= 0.0 {
+        Ok(maximum)
+    } else {
+        Err(format!(
+            "FSQLITE_BENCH_MAX_LOAD_1M must be finite and nonnegative, got `{raw}`"
+        ))
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_validate_host_state(
+    provenance: &mut JsonBenchmarkProvenance,
+    expected_affinity: Option<&str>,
+    max_load_average_1m: Option<f64>,
+    state: &JsonBridgeHostState,
+    phase: &str,
+) {
+    match (expected_affinity, state.cpu_affinity.as_deref()) {
+        (Some(expected), Some(observed)) if expected == observed => {
+            match bridge_cpu_affinity_cardinality(observed) {
+                Ok(1 | 2) => {}
+                Ok(count) => provenance.add_validation_error(format!(
+                    "{phase} bridge CPU affinity selects {count} CPUs; citable causal runs require exactly one or two"
+                )),
+                Err(error) => provenance
+                    .add_validation_error(format!("{phase} bridge CPU affinity is invalid: {error}")),
+            }
+        }
+        (Some(expected), observed) => provenance.add_validation_error(format!(
+            "{phase} bridge CPU affinity mismatch: expected `{expected}`, observed {observed:?}"
+        )),
+        (None, _) => provenance.add_validation_error(
+            "citable bridge runs require FSQLITE_BENCH_EXPECTED_CPU_AFFINITY".to_owned(),
+        ),
+    }
+    match (max_load_average_1m, state.load_average_1m) {
+        (Some(maximum), Some(observed)) if observed <= maximum => {}
+        (Some(maximum), Some(observed)) => provenance.add_validation_error(format!(
+            "{phase} host load average {observed:.3} exceeds declared maximum {maximum:.3}"
+        )),
+        (Some(_), None) => provenance
+            .add_validation_error(format!("{phase} host load average could not be captured")),
+        (None, _) => provenance
+            .add_validation_error("citable bridge runs require FSQLITE_BENCH_MAX_LOAD_1M"),
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_validate_host_stability(
+    provenance: &mut JsonBenchmarkProvenance,
+    before: &JsonBridgeHostState,
+    after: &JsonBridgeHostState,
+) {
+    for (name, changed) in [
+        ("CPU affinity", before.cpu_affinity != after.cpu_affinity),
+        (
+            "CPU scaling governors",
+            before.scaling_governors != after.scaling_governors,
+        ),
+        (
+            "energy performance preferences",
+            before.energy_performance_preferences != after.energy_performance_preferences,
+        ),
+        (
+            "CPU boost controls",
+            before.boost_controls != after.boost_controls,
+        ),
+        ("NUMA online set", before.numa_nodes_online != after.numa_nodes_online),
+    ] {
+        if changed {
+            provenance.add_validation_error(format!(
+                "bridge host state changed during measurement: {name}"
+            ));
+        }
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
 fn bridge_result<T>(result: Result<T, fsqlite::FrankenError>, context: &str) -> Result<T, String> {
     result.map_err(|error| format!("{context}: {error}"))
 }
@@ -7893,25 +8399,23 @@ fn bridge_sample_ready_per_operation(
     block_index: usize,
     order_slot: usize,
 ) -> Result<JsonBridgeSample, String> {
-    let expected = bridge_expected_checksum(operation_count)?;
     let mut runtime_entries = 0_usize;
-    let mut observed_count = 0_i64;
-    let mut observed_sum = 0_i64;
-    let start = Instant::now();
-    for value in 0..operation_count {
-        let value =
-            i64::try_from(value).map_err(|_| "ready-future value exceeds i64::MAX".to_owned())?;
-        let observed = bridge_block_on(&mut runtime_entries, std::future::ready(value));
-        std::hint::black_box(observed);
-        observed_count = observed_count.saturating_add(1);
-        observed_sum = observed_sum.wrapping_add(observed);
-    }
-    let elapsed = start.elapsed();
-    if (observed_count, observed_sum) != expected {
+    let sentinel = bridge_block_on(&mut runtime_entries, std::future::ready(0x4653_514c_i64));
+    if sentinel != 0x4653_514c {
         return Err(format!(
-            "per-operation ready control expected checksum {expected:?}, got ({observed_count}, {observed_sum})"
+            "per-operation ready control preflight returned {sentinel}"
         ));
     }
+    let entries_before_timing = runtime_entries;
+    let start = Instant::now();
+    for _ in 0..operation_count {
+        let future = std::hint::black_box(std::future::ready(()));
+        std::hint::black_box(bridge_block_on(&mut runtime_entries, future));
+    }
+    let elapsed = start.elapsed();
+    let timed_runtime_entries = runtime_entries.saturating_sub(entries_before_timing);
+    let completion_count = i64::try_from(operation_count)
+        .map_err(|_| "ready-future operation count exceeds i64::MAX".to_owned())?;
 
     Ok(JsonBridgeSample {
         workload: BridgeWorkload::ReadyFuture,
@@ -7921,14 +8425,15 @@ fn bridge_sample_ready_per_operation(
         arm: BridgeArm::PerOperationBlockOn,
         elapsed_ns: bridge_elapsed_ns(elapsed),
         runtime_entries_total: runtime_entries,
-        runtime_entries_inside_timed_region: runtime_entries,
-        caller_future_awaits_inside_timed_region: operation_count,
+        runtime_entries_inside_timed_region: timed_runtime_entries,
+        caller_future_completions_inside_timed_region: operation_count,
         engine_dml_future_calls_inside_timed_region: 0,
         worker_commands_total: 0,
         worker_commands_inside_timed_region: 0,
         worker_open_handshakes_total: 0,
-        checksum_count: observed_count,
-        checksum_sum: observed_sum,
+        oracle_kind: "untimed_ready_sentinel_plus_control_flow_completion_count".to_owned(),
+        checksum_count: completion_count,
+        checksum_sum: 0,
     })
 }
 
@@ -7939,26 +8444,22 @@ fn bridge_sample_ready_single_runtime(
     block_index: usize,
     order_slot: usize,
 ) -> Result<JsonBridgeSample, String> {
-    let expected = bridge_expected_checksum(operation_count)?;
-    let (elapsed, observed_count, observed_sum) = runtime.block_on(async {
-        let mut observed_count = 0_i64;
-        let mut observed_sum = 0_i64;
-        let start = Instant::now();
-        for value in 0..operation_count {
-            let value = i64::try_from(value)
-                .map_err(|_| "ready-future value exceeds i64::MAX".to_owned())?;
-            let observed = std::future::ready(value).await;
-            std::hint::black_box(observed);
-            observed_count = observed_count.saturating_add(1);
-            observed_sum = observed_sum.wrapping_add(observed);
+    let elapsed = runtime.block_on(async {
+        let sentinel = std::future::ready(0x4653_514c_i64).await;
+        if sentinel != 0x4653_514c {
+            return Err(format!(
+                "existing-runtime ready control preflight returned {sentinel}"
+            ));
         }
-        Ok::<_, String>((start.elapsed(), observed_count, observed_sum))
+        let start = Instant::now();
+        for _ in 0..operation_count {
+            let future = std::hint::black_box(std::future::ready(()));
+            std::hint::black_box(future.await);
+        }
+        Ok::<_, String>(start.elapsed())
     })?;
-    if (observed_count, observed_sum) != expected {
-        return Err(format!(
-            "existing-runtime ready control expected checksum {expected:?}, got ({observed_count}, {observed_sum})"
-        ));
-    }
+    let completion_count = i64::try_from(operation_count)
+        .map_err(|_| "ready-future operation count exceeds i64::MAX".to_owned())?;
 
     Ok(JsonBridgeSample {
         workload: BridgeWorkload::ReadyFuture,
@@ -7969,13 +8470,14 @@ fn bridge_sample_ready_single_runtime(
         elapsed_ns: bridge_elapsed_ns(elapsed),
         runtime_entries_total: 1,
         runtime_entries_inside_timed_region: 0,
-        caller_future_awaits_inside_timed_region: operation_count,
+        caller_future_completions_inside_timed_region: operation_count,
         engine_dml_future_calls_inside_timed_region: 0,
         worker_commands_total: 0,
         worker_commands_inside_timed_region: 0,
         worker_open_handshakes_total: 0,
-        checksum_count: observed_count,
-        checksum_sum: observed_sum,
+        oracle_kind: "untimed_ready_sentinel_plus_control_flow_completion_count".to_owned(),
+        checksum_count: completion_count,
+        checksum_sum: 0,
     })
 }
 
@@ -8144,11 +8646,12 @@ fn bridge_sample_insert_per_operation(
         elapsed_ns: bridge_elapsed_ns(elapsed),
         runtime_entries_total: runtime_entries,
         runtime_entries_inside_timed_region: operation_count,
-        caller_future_awaits_inside_timed_region: operation_count,
+        caller_future_completions_inside_timed_region: operation_count,
         engine_dml_future_calls_inside_timed_region: operation_count,
         worker_commands_total: 0,
         worker_commands_inside_timed_region: 0,
         worker_open_handshakes_total: 0,
+        oracle_kind: "untimed_database_count_and_sum_query".to_owned(),
         checksum_count: checksum.0,
         checksum_sum: checksum.1,
     })
@@ -8299,11 +8802,12 @@ fn bridge_sample_insert_single_runtime(
         elapsed_ns: bridge_elapsed_ns(elapsed),
         runtime_entries_total: 1,
         runtime_entries_inside_timed_region: 0,
-        caller_future_awaits_inside_timed_region: operation_count,
+        caller_future_completions_inside_timed_region: operation_count,
         engine_dml_future_calls_inside_timed_region: operation_count,
         worker_commands_total: 0,
         worker_commands_inside_timed_region: 0,
         worker_open_handshakes_total: 0,
+        oracle_kind: "untimed_database_count_and_sum_query".to_owned(),
         checksum_count: checksum.0,
         checksum_sum: checksum.1,
     })
@@ -8402,11 +8906,12 @@ fn bridge_sample_insert_worker(
         elapsed_ns: bridge_elapsed_ns(elapsed),
         runtime_entries_total: 0,
         runtime_entries_inside_timed_region: 0,
-        caller_future_awaits_inside_timed_region: 0,
+        caller_future_completions_inside_timed_region: 0,
         engine_dml_future_calls_inside_timed_region: operation_count,
         worker_commands_total: worker_commands,
         worker_commands_inside_timed_region: timed_worker_commands,
         worker_open_handshakes_total: 1,
+        oracle_kind: "untimed_database_count_and_sum_query".to_owned(),
         checksum_count: checksum.0,
         checksum_sum: checksum.1,
     })
@@ -8665,13 +9170,23 @@ fn bridge_ready_regression(
 
     const RESAMPLES: usize = 10_000;
     let blocks = points_by_block.values().collect::<Vec<_>>();
+    if blocks.len() % 2 != 0 {
+        return Err(
+            "ready-future regression requires adjacent forward/reverse block pairs".to_owned(),
+        );
+    }
+    let bootstrap_clusters = blocks.chunks_exact(2).collect::<Vec<_>>();
     let mut rng = StdRng::seed_from_u64(seed);
     let mut bootstrap_slopes = Vec::with_capacity(RESAMPLES);
     for _ in 0..RESAMPLES {
         let mut resampled_points =
             Vec::with_capacity(blocks.len().saturating_mul(expected_points_per_block));
-        for _ in 0..blocks.len() {
-            resampled_points.extend_from_slice(blocks[rng.random_range(0..blocks.len())]);
+        for _ in 0..bootstrap_clusters.len() {
+            let cluster =
+                bootstrap_clusters[rng.random_range(0..bootstrap_clusters.len())];
+            for block in cluster {
+                resampled_points.extend_from_slice(block);
+            }
         }
         bootstrap_slopes.push(bridge_linear_fit(&resampled_points)?.1);
     }
@@ -8687,6 +9202,7 @@ fn bridge_ready_regression(
                 .to_owned(),
         points: points.len(),
         paired_blocks: blocks.len(),
+        bootstrap_clusters: bootstrap_clusters.len(),
         intercept_ns: intercept,
         slope_ns_per_additional_runtime_entry: slope,
         bootstrap_slope_ci95_low: bridge_percentile(&bootstrap_slopes, 2.5),
@@ -8733,12 +9249,18 @@ fn bridge_balanced_ready_count_orders(
     operation_counts: &[usize],
     block_count: usize,
     rng: &mut StdRng,
-) -> Vec<Vec<usize>> {
-    assert!(
-        !operation_counts.is_empty(),
-        "ready operation-count matrix must not be empty"
-    );
+) -> Result<Vec<Vec<usize>>, String> {
+    if operation_counts.is_empty() {
+        return Err("ready operation-count matrix must not be empty".to_owned());
+    }
     let width = operation_counts.len();
+    let cycle_blocks = width.saturating_mul(2);
+    if block_count == 0 || block_count % cycle_blocks != 0 {
+        return Err(format!(
+            "ready count ordering requires a whole balanced Williams cycle: \
+             block_count={block_count}, required multiple={cycle_blocks}"
+        ));
+    }
     let mut orders = Vec::with_capacity(block_count);
     while orders.len() < block_count {
         let mut labels = operation_counts.to_vec();
@@ -8769,7 +9291,7 @@ fn bridge_balanced_ready_count_orders(
             }
         }
     }
-    orders
+    Ok(orders)
 }
 
 #[cfg(feature = "bridge-experiment")]
@@ -8792,7 +9314,7 @@ fn bridge_collect_samples(
         options.bridge_samples
     );
     let ready_count_orders =
-        bridge_balanced_ready_count_orders(ready_operation_counts, block_count, &mut rng);
+        bridge_balanced_ready_count_orders(ready_operation_counts, block_count, &mut rng)?;
     for (block_index, ready_order) in ready_count_orders.iter().enumerate() {
         for (count_slot, &operation_count) in ready_order.iter().enumerate() {
             for (arm_slot, arm) in bridge_two_arm_order(&mut rng).into_iter().enumerate() {
@@ -8937,9 +9459,10 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
         .build()
         .map_err(|error| format!("could not build bridge experiment runtime: {error}"))?;
 
-    let mut ready_operation_counts = vec![1, 10, 100, 1_000, options.bridge_operations];
-    ready_operation_counts.sort_unstable();
-    ready_operation_counts.dedup();
+    // Fixed width keeps every allowed sample count on complete Williams
+    // cycles, so count order and first-order carryover remain exactly
+    // balanced rather than changing with the DML operation count.
+    let ready_operation_counts = vec![1, 10, 100, 1_000];
 
     let mut provenance = JsonBenchmarkProvenance::capture(
         args.to_vec(),
@@ -8955,19 +9478,23 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
             "bridge artifact was not built with the fsqlite-e2e bridge-experiment feature",
         );
     }
-    match std::env::var("FSQLITE_BENCH_EXPECTED_CPU_AFFINITY") {
-        Ok(expected) if provenance.cpu_affinity.as_deref() == Some(expected.as_str()) => {}
-        Ok(expected) => provenance.add_validation_error(format!(
-            "bridge CPU affinity mismatch: expected `{expected}`, observed {:?}",
-            provenance.cpu_affinity
-        )),
-        Err(std::env::VarError::NotPresent) => provenance.add_validation_error(
-            "citable bridge runs require FSQLITE_BENCH_EXPECTED_CPU_AFFINITY to match taskset/cpuset isolation",
-        ),
-        Err(error) => provenance.add_validation_error(format!(
-            "could not read FSQLITE_BENCH_EXPECTED_CPU_AFFINITY: {error}"
-        )),
-    }
+    let expected_affinity = std::env::var("FSQLITE_BENCH_EXPECTED_CPU_AFFINITY").ok();
+    let max_load_average_1m = match bridge_max_load_average_1m() {
+        Ok(maximum) => Some(maximum),
+        Err(error) => {
+            provenance.add_validation_error(error);
+            None
+        }
+    };
+    let environment = DetectedEnvironment::detect(&provenance);
+    let host_state_before = capture_bridge_host_state();
+    bridge_validate_host_state(
+        &mut provenance,
+        expected_affinity.as_deref(),
+        max_load_average_1m,
+        &host_state_before,
+        "pre-measurement",
+    );
     if !provenance.citable {
         if options.allow_unverified_provenance {
             provenance.mark_explicit_override();
@@ -8979,10 +9506,16 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
         }
     }
 
-    let environment = DetectedEnvironment::detect(&provenance);
-    let host_state_before = capture_bridge_host_state();
     let samples = bridge_collect_samples(&runtime, options, &ready_operation_counts)?;
     let host_state_after = capture_bridge_host_state();
+    bridge_validate_host_state(
+        &mut provenance,
+        expected_affinity.as_deref(),
+        max_load_average_1m,
+        &host_state_after,
+        "post-measurement",
+    );
+    bridge_validate_host_stability(&mut provenance, &host_state_before, &host_state_after);
     let statistics = bridge_arm_statistics(&samples);
     let comparisons = bridge_build_comparisons(
         &samples,
@@ -9039,9 +9572,13 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
                 (
                     BridgeArm::WorkerSyncFacade.id().to_owned(),
                     "public AsyncConnection synchronous facade: each timed call clones SQL and parameters, allocates a response channel, crosses the worker channel, schedules the worker, and drives the engine future with futures-lite::block_on"
-                        .to_owned(),
+                    .to_owned(),
                 ),
             ]),
+            affinity_policy:
+                "expected affinity must exactly match /proc/self/status and select exactly one or two CPUs"
+                    .to_owned(),
+            max_load_average_1m,
         },
         raw_samples: samples,
         arm_statistics: statistics,
@@ -9127,7 +9664,19 @@ fn main() {
         }
     };
     if options.print_json_schema {
-        print_benchmark_json_schema();
+        if options.bridge_experiment {
+            #[cfg(feature = "bridge-experiment")]
+            print_bridge_json_schema();
+            #[cfg(not(feature = "bridge-experiment"))]
+            {
+                eprintln!(
+                    "ERROR: bridge schema requires rebuilding with `--features bridge-experiment`"
+                );
+                std::process::exit(1);
+            }
+        } else {
+            print_benchmark_json_schema();
+        }
         return;
     }
     if options.bridge_experiment {
