@@ -469,6 +469,12 @@ are provenance only and must never gate the verdict.
   worker approach only after removing or amortizing its measured cloning,
   channel, scheduling, and secondary-executor costs. Decide the release profile
   with a citable size/throughput Pareto matrix, not this diagnostic alone.
+- README publication hold: exact ratios from this artifact were removed from
+  `README.md` on 2026-07-26 because the artifact's own contract says that every
+  report is non-citable. The README now links the diagnostic evidence without
+  publishing its magnitudes or treating it as causal attribution. Restore
+  numeric claims only after Gate 0 passes the isolated-cpuset, full-dynticks,
+  IRQ, watchdog, host-load, I/O-pressure, and symmetric-work-receipt gates.
 
 ## 2026-07-26 - REJECTED ATTRIBUTION: boxed WAL futures are not yet a measured root cause
 
