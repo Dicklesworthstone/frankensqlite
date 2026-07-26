@@ -1262,15 +1262,69 @@ where each writer commits to its own table:
 | 4 | `841 940` | `109 961` | `7.66x` | F much faster |
 | 8 | `1 022 049` | `24 936` | **`40.99x`** | F throughput crushes C — C SQLite serialises all 8 writers |
 
-`mt-mvcc-bench` shared-table (1 000 rows/thread, all writers writing the
-same table, non-overlapping rowid ranges):
+> ⚠ **These separate-tables numbers are due for re-measurement and should be
+> quoted with that caveat.** Two reasons, neither of which is a claim that they
+> are wrong. First, they come from the same 2026-05-08 run as the shared-table
+> table below — and when that companion table was re-measured on 2026-07-25 at
+> matched durability it was off by roughly 3.7× at one thread, in the
+> *conservative* direction. A stale run is not selectively stale. Second, the
+> artifact directory cited above for both tables is not in the repository:
+> `.gitignore` excludes `tests/artifacts/perf/**/*`, so the path has never
+> resolved for anyone who did not run the benchmark themselves. Re-measurement
+> is tracked in `bd-wvtbc`; the citation problem in `bd-oyaig`.
 
-| Threads | F writes/sec | C writes/sec | Throughput F/C |
-|---:|---:|---:|---:|
-| 1 | `635 710` | `922 272` | `0.69x` |
-| 2 | `463 398` | `593 580` | `0.78x` |
-| 4 | `345 783` | `406 326` | `0.85x` |
-| 8 | `337 917` | `98 915` | **`3.42x`** |
+`mt-mvcc-bench` shared-table (1 000 rows/thread, all writers writing the
+same table, non-overlapping rowid ranges). Re-measured 2026-07-25 at **matched
+durability** — both engines' writer connections at `synchronous=NORMAL` — from
+source snapshot `140e77df`, which is the last commit whose `mt_mvcc_bench` is
+free of the harness `block_on` bridge (see the note below). `taskset -c 4-11`,
+3 iterations, `0` failed rows on both engines. Reproduce with:
+
+```bash
+git worktree add /tmp/fsq-140e77df 140e77df
+cd /tmp/fsq-140e77df && CARGO_TARGET_DIR=/tmp/fsq-140e77df/target \
+  cargo build --profile release-perf -p fsqlite-e2e --bin mt-mvcc-bench
+taskset -c 4-11 ./target/release-perf/mt-mvcc-bench \
+  --rows-per-thread=1000 --threads=1,2 --iters=3
+```
+
+| Threads | F writes/sec | C writes/sec | Throughput F/C | Reading |
+|---:|---:|---:|---:|---|
+| 1 | `92 615` | `36 011` | **`2.57x`** | F faster |
+| 2 | `94 936` | `53 176` | **`1.79x`** | F faster |
+| 4 | — | — | *unmeasured* | needs a quieter host — see below |
+| 8 | — | — | *unmeasured* | needs a quieter host — see below |
+
+The 1-thread ratio is corroborated by an independent run recorded in
+`.bench-history/mt-mvcc-bench.latest.json` (2026-07-23, same shape, different
+binary): `2.579x` there versus `2.57x` here, agreeing to 0.3 %.
+
+**These numbers replace an earlier table that reported `0.69x / 0.78x / 0.85x /
+3.42x`** — i.e. FrankenSQLite *slower* at 1, 2 and 4 threads. That table was
+measured 2026-05-08 and understated FrankenSQLite by roughly 3.7× at one
+thread; the engine improved substantially in the interval. It also cited an
+artifact directory that is not in the repository, because `.gitignore` excludes
+`tests/artifacts/perf/**/*` — which is why the rows above cite a commit and a
+runnable command instead of a path.
+
+The 4- and 8-thread rows are deliberately left unmeasured rather than filled in.
+`mt_mvcc_bench`'s own pass-over-pass gate rejected our 4-thread sample (`2.62x →
+2.09x`, a 20 % drop) because the host was running competing builds, and a
+high-thread-count row cannot be trusted when the bench cannot get its threads'
+worth of free cores. A run taken under load 12 produced `1.45x` at 4 threads and
+`1.83x` at 8 — low thread counts unaffected, high thread counts collapsing,
+which is the signature of CPU contention rather than an engine property. Those
+rows will be published when a quiet host is available.
+
+> **Why `140e77df` and not `main`:** since commit `a0ab400a`, the test harnesses
+> bridge the now-async engine into their synchronous drivers with a per-call
+> `block_on`, including one **per row** in `mt_mvcc_bench`'s writer loop. That
+> bridge costs ~333 ns per call (measured on an already-ready future), and
+> because the C SQLite side is synchronous it pays nothing, so the cost does
+> **not** cancel in a cross-engine ratio. Publishing a `main` concurrent number
+> today would understate FrankenSQLite by that harness tax. The fix is to hoist
+> `block_on` to transaction granularity; until then `140e77df` is the newest
+> commit that measures the engine rather than the harness.
 
 A May 12, 2026 follow-up `mt-mvcc-bench --rows-per-thread=1000 --threads=16
 --iters=3` shared-table recheck at commit `27d5f71d` is recorded in
