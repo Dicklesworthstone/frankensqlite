@@ -1227,8 +1227,28 @@ Per-category geomean F/C time ratio:
 | mixed | 1 | `0.289x` | ≈ 3.46× faster |
 | read_single | 33 | `0.235x` | ≈ 4.26× faster |
 | write_bulk | 22 | `0.866x` | ≈ 1.15× faster |
-| concurrent_writers | 3 | `0.769x` | ⚠ not a fair comparison — this full-quick section runs C SQLite at `synchronous=FULL` (a WAL fsync per commit) vs FrankenSQLite at `NORMAL` (no per-commit fsync), and the file-backed rows are too disk-noisy to A/B reliably (bd-x5gzk). Use the fair `mt-mvcc-bench` rows below for the concurrent-writer result. |
+| concurrent_writers | 3 | `0.769x` | ⚠ do not cite — see the note below. Use the `mt-mvcc-bench` rows for the concurrent-writer result. |
 | **write_single** | **9** | **`1.376x`** | **The remaining gap (corrected prepared-DML DELETE tail)** |
+
+> **The 3 `concurrent_writers` rows above are not a usable comparison, and they
+> are included in the aggregate table's 93 scenarios.** Two independent defects:
+> (1) *unmatched durability* — when this artifact was measured, the section's C
+> SQLite writer connections never set `synchronous`, so they inherited the
+> compiled default `FULL` (a real WAL fsync per commit) while FrankenSQLite's
+> writers ran at `NORMAL` (`WalCommitSyncPolicy::Deferred`, no per-commit fsync).
+> `synchronous` is per-connection, so the setup connection's `NORMAL` never
+> reached them. This has since been fixed in `comprehensive_bench.rs` — both
+> engines' writer connections now set `synchronous=NORMAL` — but the numbers
+> above predate the fix. (2) *irreducible disk noise* — even on a quiet host with
+> a `release-perf` binary, this file-backed WAL section cannot resolve the effect:
+> repeat runs put the C 2-writer median anywhere from 95 ms to 138 ms (CV up to
+> 104 % at 8 writers), a spread larger than the ~20-28 % fsync component being
+> measured. FrankenSQLite's side is stable across runs; C's is not. No corrected
+> ratio is published here because no reliable one can be measured from this
+> section — the concurrent-writer claim rests on `mt-mvcc-bench` below, which
+> runs both engines at `synchronous=NORMAL` and uses higher iteration counts.
+> Evidence and the refuted estimates are in `docs/progress/perf-negative-results.md`
+> (2026-07-23, bd-x5gzk).
 
 #### Concurrent writers (the headline MVCC win)
 

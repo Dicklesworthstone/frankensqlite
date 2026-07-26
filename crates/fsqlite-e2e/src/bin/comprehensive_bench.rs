@@ -421,15 +421,16 @@ fn bench_env_flag(name: &str) -> bool {
 
 /// Optional symmetric `synchronous` override for the concurrent-writer section.
 ///
-/// Returns `None` (env unset) to preserve the historical concurrent baseline
-/// exactly: C writer connections inherit the compiled default and FrankenSQLite
-/// writers keep `apply_pragmas_fsqlite`'s NORMAL. When
-/// `FSQLITE_BENCH_CONCURRENT_SYNC` is set to `normal`/`full`, BOTH engines'
-/// writer connections are forced to that identical mode — used to (a) audit the
-/// fairness of the default (is C implicitly at FULL while F is at NORMAL?) and
-/// (b) probe whether group-commit coalescing engages under real per-commit
-/// fsync. Never defaults anything on; the baseline is unchanged unless the
-/// operator opts in.
+/// Returns `None` (env unset) for the default run, where BOTH engines' writer
+/// connections are already at NORMAL: C sets it explicitly (it would otherwise
+/// inherit the compiled FULL default — see the writer setup below) and
+/// FrankenSQLite gets it from `apply_pragmas_fsqlite`. When
+/// `FSQLITE_BENCH_CONCURRENT_SYNC` is set to `normal`/`full`, both are forced to
+/// that identical mode instead — `full` gives the durability-serious comparison
+/// (a real WAL fsync per commit on both sides) and was used to probe whether
+/// group-commit coalescing engages under per-commit fsync (it does not for this
+/// workload shape; see bd-6hgad). The comparison is matched either way; the
+/// override only chooses which durability level both engines are matched at.
 fn concurrent_sync_override() -> Option<&'static str> {
     match std::env::var("FSQLITE_BENCH_CONCURRENT_SYNC") {
         Ok(value) if value.eq_ignore_ascii_case("normal") => Some("NORMAL"),
@@ -3441,10 +3442,16 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
         &format!(
             "Each writer inserts {} rows into non-overlapping key ranges on the same \
              file-backed WAL database. Both engines spawn N OS threads each owning its \
-             own connection; C SQLite uses WAL + busy_timeout, FrankenSQLite uses the \
+             own connection, and both writer connections run at `synchronous=NORMAL` so \
+             the two engines are compared at matched durability (set \
+             `FSQLITE_BENCH_CONCURRENT_SYNC=full` to match them at FULL instead). \
+             C SQLite uses WAL + busy_timeout, FrankenSQLite uses the \
              MVCC page-lock table via `PRAGMA fsqlite.concurrent_mode=ON` + \
              `BEGIN CONCURRENT` (falling back to plain BEGIN if the pragma is declined). \
-             This mirrors the standalone `mt_mvcc_bench` harness.",
+             This mirrors the standalone `mt_mvcc_bench` harness. NOTE: this file-backed \
+             section is disk-noise-bound on shared hosts (C medians have been observed \
+             spreading 95-138 ms at 2 writers, CV up to 104%); cite `mt_mvcc_bench` for \
+             concurrent-writer speed claims, not these rows (bd-x5gzk).",
             CONCURRENT_ROWS_PER_THREAD
         ),
     );
@@ -3485,8 +3492,19 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                         // worker error cannot strand the rest at the barrier.
                         bar.wait();
                         let conn = rusqlite::Connection::open(&p).unwrap();
-                        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
-                            .unwrap();
+                        // `synchronous` is PER-CONNECTION: the setup connection's
+                        // NORMAL does not carry here. Without this pragma these
+                        // writers silently inherit the compiled default
+                        // (SQLITE_DEFAULT_SYNCHRONOUS=2, FULL) and race
+                        // FrankenSQLite's NORMAL at unmatched durability — C pays a
+                        // real WAL fsync per commit that F does not, which flatters
+                        // FrankenSQLite by an unquantified amount (bd-x5gzk). Match
+                        // `mt_mvcc_bench` and the FrankenSQLite arm below.
+                        conn.execute_batch(
+                            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; \
+                             PRAGMA busy_timeout=5000;",
+                        )
+                        .unwrap();
                         if let Some(mode) = concurrent_sync_override() {
                             conn.execute_batch(&format!("PRAGMA synchronous={mode};"))
                                 .unwrap();

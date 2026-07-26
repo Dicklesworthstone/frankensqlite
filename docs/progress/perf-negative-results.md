@@ -20010,6 +20010,34 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   ("1.30x faster in the full-quick mix") is both unfair AND unreliable — replace
   it with a caveat that defers to the mt-mvcc-bench section rather than any
   comprehensive_bench concurrent number.
+- LANDED (2026-07-25, commit on `main`): all three surviving items are now done.
+  (b) `bench_concurrent_writers`' C writer connections set
+  `PRAGMA synchronous=NORMAL` alongside `journal_mode=WAL` +
+  `busy_timeout=5000`, with an inline comment stating that `synchronous` is
+  per-connection so the setup connection's NORMAL does not carry. The
+  `FSQLITE_BENCH_CONCURRENT_SYNC` override survives and now selects WHICH matched
+  level (`normal`/`full`) both engines run at rather than repairing an unmatched
+  default. The section's report description states the matched-durability
+  contract and carries the disk-noise warning inline, so the caveat travels with
+  every generated HTML/JSON report instead of living only in the README.
+  (c)+(d) README's `concurrent_writers` category row is reduced to "do not cite"
+  and is followed by a blockquote naming BOTH defects (unmatched sync in the
+  measured artifact, plus irreducible file-WAL disk noise), stating explicitly
+  that no corrected ratio is published because none can be reliably measured from
+  this section, and deferring the concurrent-writer claim to `mt-mvcc-bench`.
+- DO NOT RETRY (this is the point of the entry): re-running
+  `comprehensive_bench --filter concurrent` to "get the fair number" is a known
+  dead end on a shared host. It has now been attempted at debug quality, at
+  release-perf quality on a quiet host (load 8, taskset, zero competing builds),
+  and across three configs; the C-side run-to-run spread (95-138 ms at 2w) is
+  larger than the ~20-28 % fsync effect, and one =NORMAL run came out SLOWER than
+  its =FULL counterpart — impossible from sync mode alone, hence noise. The
+  landed fix makes the DEFAULT comparison honest; it does not make this section
+  precise, and no amount of re-running will. Retry predicate: a dedicated
+  quiet-disk host (or tmpfs-backed WAL, which changes the workload) AND a
+  higher-iteration harness — at which point `mt_mvcc_bench` is the better vehicle
+  anyway. For the group-commit angle see bd-6hgad (closed wontfix) and bd-acuhw
+  (OLTP-shaped concurrent section, the only shape that can coalesce).
 
 ## 2026-07-23 - PROFILE + DIRECTION (bd-smxhz): concurrent-writer separate-tables scaling collapses under disk contention; root cause is a FrankenSQLite-specific per-commit file-open storm; lever = VFS fd caching
 

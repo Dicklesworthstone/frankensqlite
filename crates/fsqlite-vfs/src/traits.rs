@@ -781,6 +781,7 @@ impl VfsWriteCompletion {
     /// backend still owns the completion instant, while the outer operation
     /// can never truthfully report full-write success.
     #[doc(hidden)]
+    #[must_use]
     pub fn error_mapped_child(&self) -> Self {
         Self {
             inner: Arc::new(Mutex::new(VfsWriteCompletionInner {

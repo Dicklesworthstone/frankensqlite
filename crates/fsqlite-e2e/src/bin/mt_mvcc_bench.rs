@@ -687,6 +687,16 @@ fn percentile_value(mut values: Vec<f64>, percentile: f64) -> f64 {
 fn open_fsqlite_worker(path: &str) -> Result<(fsqlite::Connection, bool), String> {
     let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.to_owned()))
         .map_err(|error| format!("fsqlite open (worker): {error}"))?;
+    // `synchronous` is PER-CONNECTION: `prepare_fsqlite_schema`'s NORMAL does not
+    // carry to worker connections, so state it here. FrankenSQLite's default is
+    // already NORMAL (`WalCommitSyncPolicy::Deferred`) and the rusqlite worker
+    // sets NORMAL explicitly, so this is a no-op today — it pins the matched
+    // durability the published concurrent-writer numbers depend on, rather than
+    // leaving it to agree with C SQLite by coincidence of defaults. The same
+    // omission on the C side of `comprehensive_bench::bench_concurrent_writers`
+    // silently compared C-FULL against F-NORMAL for the life of that section
+    // (bd-x5gzk); see docs/bench-methodology-concurrent-writers.md.
+    let _ = fsqlite_e2e::block_on(conn.execute("PRAGMA synchronous=NORMAL;"));
     let concurrent_ok =
         fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")).is_ok();
     let _ = fsqlite_e2e::block_on(conn.execute("PRAGMA busy_timeout=5000;"));

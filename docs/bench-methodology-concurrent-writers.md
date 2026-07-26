@@ -3,14 +3,20 @@
 ## TL;DR
 
 `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs::bench_concurrent_writers`
-now runs FrankenSQLite and C SQLite with the same shape: N OS threads, one
-connection per thread, one shared file-backed WAL database, and disjoint rowid
-ranges. Current full-matrix concurrent rows are therefore valid multi-writer
-MVCC measurements.
+runs FrankenSQLite and C SQLite with the same shape: N OS threads, one
+connection per thread, one shared file-backed WAL database, disjoint rowid
+ranges, and — since 2026-07-25 — the same `synchronous=NORMAL` durability on
+both engines' writer connections.
 
-Use `crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs` (IMPL-4a) when you want the
-standalone scale harness: 1/2/4/8/16-thread reports, separate-table mode,
-startup diagnostics, and pass-over-pass history gates.
+**Do not cite its rows for concurrent-writer speed claims.** Even with the shape
+and durability matched, the section is file-WAL disk-noise-bound: on a shared
+host the C-side 2-writer median has been observed spreading 95-138 ms (CV up to
+104 % at 8 writers), which is larger than the effects being compared. Use
+`crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs` (IMPL-4a) for every published
+concurrent-writer number: 1/2/4/8/16-thread reports, separate-table mode,
+startup diagnostics, higher iteration counts, and pass-over-pass history gates.
+See `docs/progress/perf-negative-results.md` (2026-07-23 / 2026-07-25, bd-x5gzk)
+for the full evidence and the retry predicate.
 
 ## Background
 
@@ -67,7 +73,7 @@ the same count of OS threads performing the same count of transactions.
 | Use case | Use |
 |---|---|
 | Single-connection latency | `comprehensive_bench::bench_*` (all but concurrent_writers) |
-| Full-matrix concurrent row | `comprehensive_bench::bench_concurrent_writers` |
+| Full-matrix concurrent row (smoke only — do not cite) | `comprehensive_bench::bench_concurrent_writers` |
 | Real multi-thread MVCC throughput | `mt_mvcc_bench` (IMPL-4a) |
 | Cross-process conflict | `swarm_multiprocess` / `swarm_peer_visibility` |
 
@@ -78,6 +84,18 @@ file-backed database for shared-table mode, disjoint rowid ranges, prepared
 statements on both engines, and transaction-level retry for transient MVCC
 errors. If you change its workload shape, update this document and the README
 performance artifact citations in the same commit.
+
+**Matched durability is an invariant, not a detail.** `synchronous` is a
+*per-connection* pragma — the setup connection's setting does NOT carry to the
+worker connections. A C SQLite connection that never sets it inherits the
+compiled default `SQLITE_DEFAULT_SYNCHRONOUS=2` (`FULL`), i.e. a real WAL fsync
+on every commit, while FrankenSQLite's `NORMAL` maps to
+`WalCommitSyncPolicy::Deferred` and does no per-commit fsync at all. That
+asymmetry silently flattered FrankenSQLite for the life of the section until it
+was found in 2026-07-23 (bd-x5gzk). Both writer arms now set
+`synchronous=NORMAL` explicitly. `FSQLITE_BENCH_CONCURRENT_SYNC=normal|full`
+forces both engines to the named level together; it must never be used to change
+only one side.
 
 ## Related
 
