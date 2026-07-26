@@ -35808,6 +35808,16 @@ impl Connection {
             }
         }
         // INDEXED BY <name> must reference an existing index on the named table.
+        self.validate_select_index_hints(select)?;
+        Ok(())
+    }
+
+    /// `INDEXED BY <name>` must reference an existing index on the named
+    /// table. Shared by statement execution and `EXPLAIN` / `EXPLAIN QUERY
+    /// PLAN` (hfdt-3b8zl): the plan surfaces must refuse a missing forced
+    /// index exactly like execution would, instead of silently describing a
+    /// plan that ignores the hint.
+    fn validate_select_index_hints(&self, select: &SelectStatement) -> Result<()> {
         if let SelectCore::Select {
             from: Some(from), ..
         } = &select.body.select
@@ -70801,6 +70811,14 @@ impl Connection {
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         let _ = params; // reserved for future use
+
+        // hfdt-3b8zl: C SQLite fails `EXPLAIN [QUERY PLAN]` at prepare time
+        // when the inner SELECT names a missing `INDEXED BY` index; the plan
+        // surfaces must refuse exactly like executing the statement would
+        // instead of silently describing a plan that ignores the hint.
+        if let Statement::Select(select) = stmt {
+            self.validate_select_index_hints(select)?;
+        }
 
         if query_plan {
             return Ok(self.execute_explain_query_plan(stmt).await);
@@ -218741,6 +218759,45 @@ mod pager_routing_tests {
             })
             .collect::<Vec<_>>()
             .join(";")
+    }
+
+    /// hfdt-3b8zl: `EXPLAIN` / `EXPLAIN QUERY PLAN` must refuse a SELECT whose
+    /// `INDEXED BY` names a missing index — exactly like executing it — instead
+    /// of silently describing a plan that ignores the hint. C SQLite fails both
+    /// plan surfaces at prepare time with `no such index`.
+    #[test]
+    fn eqp_and_explain_refuse_missing_indexed_by_target() {
+        let conn = bd_2dgf5_conn();
+
+        for sql in [
+            "EXPLAIN QUERY PLAN SELECT id FROM t INDEXED BY idx_missing WHERE k = 1;",
+            "EXPLAIN SELECT id FROM t INDEXED BY idx_missing WHERE k = 1;",
+        ] {
+            let error = conn
+                .query(sql)
+                .expect_err("a missing INDEXED BY target must refuse on plan surfaces");
+            assert!(
+                error.to_string().contains("no such index: idx_missing"),
+                "unexpected error for `{sql}`: {error}"
+            );
+        }
+
+        // Positive control: an existing forced index still plans and is named.
+        let named = eqp_details(&conn, "SELECT id FROM t INDEXED BY idx_t_k WHERE k = 1");
+        assert!(
+            named.contains("idx_t_k"),
+            "EQP with an existing INDEXED BY target must name the index; got {named:?}"
+        );
+
+        // Dropping the index flips the same plan query to the execution refusal.
+        conn.execute("DROP INDEX idx_t_k;").unwrap();
+        let dropped = conn
+            .query("EXPLAIN QUERY PLAN SELECT id FROM t INDEXED BY idx_t_k WHERE k = 1;")
+            .expect_err("EQP naming a dropped index must refuse");
+        assert!(
+            dropped.to_string().contains("no such index: idx_t_k"),
+            "unexpected error after DROP INDEX: {dropped}"
+        );
     }
 
     /// bd-2dgf5 proof (a): `EXPLAIN QUERY PLAN` parity with C SQLite 3.x.

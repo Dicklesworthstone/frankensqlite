@@ -150,6 +150,22 @@ fn indexed_by_nonexistent_index_errors() {
     });
 }
 
+/// hfdt-3b8zl: both engines refuse `EXPLAIN [QUERY PLAN]` when the inner
+/// SELECT names a missing `INDEXED BY` index — C SQLite fails at prepare
+/// time, so the plan surfaces must not silently describe a hint-ignoring
+/// plan.
+#[test]
+fn explain_query_plan_missing_indexed_by_errors() {
+    scenario(
+        &T,
+        &[
+            "EXPLAIN QUERY PLAN SELECT id FROM t INDEXED BY no_such_index WHERE a = 20",
+            "EXPLAIN SELECT id FROM t INDEXED BY no_such_index WHERE a = 20",
+        ],
+        "explain_query_plan_missing_indexed_by_errors",
+    );
+}
+
 #[test]
 fn indexed_by_in_update_and_delete() {
     asupersync::test_utils::run_test(|| async {
