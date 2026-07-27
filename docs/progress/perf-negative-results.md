@@ -48,6 +48,54 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-07-27 - ATTRIBUTED: the ~1.29x engine residual is per-statement async machinery (~700ns/row) + commit-path inflation, partially offset by a faster row-build pipeline; fast lanes are NOT disengaged
+
+- Target: mechanism attribution for the post-hoist ~1.29x write residual
+  (paired sub-phase profile, not a blind fix — per the standing rejection on
+  WAL boxing). Method: `FSQLITE_BENCH_PROFILE_INSERT=1` on both arms of the
+  same shape (`--quick --filter insert`, `release-perf`, `taskset -c 4-11`,
+  host csd): baseline `c967eaeb` (tightest buildable pre-async boundary,
+  worktree `/data/projects/frankensqlite-wt-crimson-base`, ELF prefix
+  `5de121c7dd86eee2…`) vs hoisted `19e35b81` (ELF prefix `4ea129dd…`).
+  Artifacts: `profile-base.out` / `profile-hoist.out` in the session
+  scratchpad; the paired table is reproduced in bd-dqdoe.
+- Findings, hoisted/baseline:
+  1. **Fast lanes are intact in BOTH arms** — every scenario reports
+     `direct_insert=10000 fast=10000 slow=0`. The residual is not lane
+     routing and not the TRACE/fast-lane test-fidelity issue.
+  2. **Narrow rows carry a fixed per-statement cost**: tiny_1col insert body
+     `7.21ms -> 14.38ms` and `7.54ms -> 14.32ms` per 10k rows (**+~700
+     ns/row, 1.9-2.0x**); small_3col `~1.10-1.13x`; the cost shrinks as row
+     width grows. These scenarios are `:memory:`, so this is engine-internal
+     per-`execute` async machinery (future construction/poll through
+     connection->VDBE->pager layers), not VFS I/O. Corroboration: the
+     bd-h9o9r clippy sweep measured the per-statement futures at
+     **16-50 KB each** (`large_futures`, connection.rs); materializing a
+     state machine that size per row is the right order of magnitude for
+     ~700 ns.
+  3. **Commit path inflated ~1.3-1.4x on page-heavy shapes**:
+     `pager_mem_flush_ns` 1.8-2.0x, `pager_c_metadata_ns` ~3x,
+     `pager_unlock_ns` ~4x, `pager_publish_ns` 1.4-3.9x,
+     `commit_roundtrip_ns` 1.9x (tiny shape); large_10col `btree_insert_ns`
+     4.0x inside a commit that is 1.4x overall.
+  4. **The same window contains a large engine WIN**: the preserialization
+     pipeline was removed (`preserialize_ns` 27.1ms -> 0 on large_10col;
+     `row_build_ns` 0.31x), making wide-row inserts 0.61-0.77x — FASTER
+     post-async. "The async migration made writes slower" is therefore
+     wrong as a uniform claim: it made narrow-row statement dispatch and
+     commit slower while making wide-row serialization much faster.
+- Result: the actionable residual mechanisms, in order of leverage on the
+  benchmark shape: (a) per-statement future materialization cost (~700
+  ns/row floor on every INSERT regardless of width) — the fix direction is
+  shrinking/splitting the hot statement future (boxing cold branches,
+  narrowing the always-constructed state machine), now evidence-backed
+  where the earlier WAL-boxing hypothesis was not; (b) commit-path
+  regressions concentrated in pager mem-flush/metadata/unlock/publish.
+  Filed as the follow-on engine bead (see bd-dqdoe comments 2026-07-27).
+- Caveats: single pass per arm, load ~4-8, directional; the sub-phase
+  profiler is env-gated eprintln instrumentation outside the scored rows.
+  Re-run under Gate 0 pairing for citable magnitudes.
+
 ## 2026-07-27 - RESOLVED: comprehensive-bench block_on hoist lands; write_bulk 2.59x -> 1.13x (instrument), engine residual ~1.29x vs pre-async baseline
 
 - Target: the bd-zavyn instrument drift — every timed FrankenSQLite body in
