@@ -1069,8 +1069,6 @@ fn run_fsqlite(
             } else {
                 tid as i64 * ROWID_BASE_STRIDE
             };
-            let mut failed = 0usize;
-
             // Prepare the INSERT once per transaction attempt; bind params per
             // iteration. This matches the rusqlite reference loop (L412-446
             // below) so both sides parse+plan the insert a single time and
@@ -1084,78 +1082,103 @@ fn run_fsqlite(
 
             // Single transaction spanning all rows; retry on transient
             // conflicts by rolling back and reopening the transaction.
+            //
+            // bd-mnlk2 / bd-zavyn: each transaction attempt runs inside ONE
+            // runtime entry. The previous shape entered the harness runtime
+            // once per BEGIN/prepare/row/COMMIT, putting a ~333 ns bridge
+            // tax on every FrankenSQLite row while the rusqlite arm paid
+            // nothing, so published F/C ratios from this binary
+            // under-reported FrankenSQLite. The transient-retry backoff
+            // sleeps *outside* the entered runtime (Gate 0 requirement:
+            // never hold a sync sleep inside a current-thread runtime that
+            // owns engine progress).
+            enum TxnRetry {
+                Begin,
+                Insert(i64),
+                Commit,
+            }
+            let begin_sql = if concurrent_ok {
+                "BEGIN CONCURRENT"
+            } else {
+                "BEGIN"
+            };
             let mut retry_budget = FsqliteRetryBudget::new();
-            'outer: loop {
-                let begin_sql = if concurrent_ok {
-                    "BEGIN CONCURRENT"
-                } else {
-                    "BEGIN"
-                };
-                if let Err(e) = fsqlite_e2e::block_on(conn.execute(begin_sql)) {
-                    if e.is_transient()
-                        && let Some(wait) = retry_budget.next_wait(tid)
-                    {
-                        thread::sleep(wait);
-                        continue;
-                    }
-                    return Err(format!(
-                        "[fsqlite t{tid}] BEGIN failed after {} retries: {e}",
-                        retry_budget.attempts()
-                    ));
-                }
-
-                let stmt = match fsqlite_e2e::block_on(conn.prepare(&insert_sql)) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
-                        return Err(format!("[fsqlite t{tid}] prepare failed: {e}"));
-                    }
-                };
-
-                #[allow(clippy::cast_possible_wrap)]
-                for i in 0..rows_per_thread as i64 {
-                    let id = base + i;
-                    let payload = format!("tid{tid}_i{i}");
-                    let params = [
-                        fsqlite::SqliteValue::Integer(id),
-                        fsqlite::SqliteValue::Text(payload.into()),
-                    ];
-                    match fsqlite_e2e::block_on(stmt.execute_with_params(&params)) {
-                        Ok(_) => {}
-                        Err(e) if e.is_transient() => {
-                            let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
-                            if let Some(wait) = retry_budget.next_wait(tid) {
-                                thread::sleep(wait);
-                                continue 'outer;
-                            }
-                            return Err(format!(
-                                "[fsqlite t{tid}] INSERT {id} exhausted retry budget after {} retries: {e}",
-                                retry_budget.attempts()
-                            ));
-                        }
-                        Err(e) => {
-                            eprintln!("[fsqlite t{tid}] INSERT {id} failed: {e}");
-                            failed += 1;
-                        }
-                    }
-                }
-
-                match fsqlite_e2e::block_on(conn.execute("COMMIT")) {
-                    Ok(_) => break 'outer,
-                    Err(e) if e.is_transient() => {
-                        let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
-                        if let Some(wait) = retry_budget.next_wait(tid) {
-                            thread::sleep(wait);
-                            continue;
+            let mut failed = 0usize;
+            loop {
+                let outcome = fsqlite_e2e::block_on(async {
+                    if let Err(e) = conn.execute(begin_sql).await {
+                        if e.is_transient() {
+                            return Ok(Some((TxnRetry::Begin, e.to_string())));
                         }
                         return Err(format!(
-                            "[fsqlite t{tid}] COMMIT exhausted retry budget after {} retries: {e}",
+                            "[fsqlite t{tid}] BEGIN failed after {} retries: {e}",
                             retry_budget.attempts()
                         ));
                     }
-                    Err(e) => {
-                        let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
-                        return Err(format!("[fsqlite t{tid}] COMMIT failed: {e}"));
+
+                    let stmt = match conn.prepare(&insert_sql).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = conn.execute("ROLLBACK").await;
+                            return Err(format!("[fsqlite t{tid}] prepare failed: {e}"));
+                        }
+                    };
+
+                    #[allow(clippy::cast_possible_wrap)]
+                    for i in 0..rows_per_thread as i64 {
+                        let id = base + i;
+                        let payload = format!("tid{tid}_i{i}");
+                        let params = [
+                            fsqlite::SqliteValue::Integer(id),
+                            fsqlite::SqliteValue::Text(payload.into()),
+                        ];
+                        match stmt.execute_with_params(&params).await {
+                            Ok(_) => {}
+                            Err(e) if e.is_transient() => {
+                                let _ = conn.execute("ROLLBACK").await;
+                                return Ok(Some((TxnRetry::Insert(id), e.to_string())));
+                            }
+                            Err(e) => {
+                                eprintln!("[fsqlite t{tid}] INSERT {id} failed: {e}");
+                                failed += 1;
+                            }
+                        }
+                    }
+
+                    match conn.execute("COMMIT").await {
+                        Ok(_) => Ok(None),
+                        Err(e) if e.is_transient() => {
+                            let _ = conn.execute("ROLLBACK").await;
+                            Ok(Some((TxnRetry::Commit, e.to_string())))
+                        }
+                        Err(e) => {
+                            let _ = conn.execute("ROLLBACK").await;
+                            Err(format!("[fsqlite t{tid}] COMMIT failed: {e}"))
+                        }
+                    }
+                })?;
+
+                match outcome {
+                    None => break,
+                    Some((what, error)) => {
+                        if let Some(wait) = retry_budget.next_wait(tid) {
+                            thread::sleep(wait);
+                        } else {
+                            return Err(match what {
+                                TxnRetry::Begin => format!(
+                                    "[fsqlite t{tid}] BEGIN failed after {} retries: {error}",
+                                    retry_budget.attempts()
+                                ),
+                                TxnRetry::Insert(id) => format!(
+                                    "[fsqlite t{tid}] INSERT {id} exhausted retry budget after {} retries: {error}",
+                                    retry_budget.attempts()
+                                ),
+                                TxnRetry::Commit => format!(
+                                    "[fsqlite t{tid}] COMMIT exhausted retry budget after {} retries: {error}",
+                                    retry_budget.attempts()
+                                ),
+                            });
+                        }
                     }
                 }
             }

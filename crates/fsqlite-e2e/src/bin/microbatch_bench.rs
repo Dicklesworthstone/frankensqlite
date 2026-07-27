@@ -62,13 +62,19 @@ fn measure(cfg: Config, rows: usize) -> (Vec<u64>, u64) {
         fsqlite_e2e::block_on(conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY)")).unwrap();
         fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
         let stmt = fsqlite_e2e::block_on(conn.prepare("INSERT INTO bench VALUES (?1)")).unwrap();
+        // bd-mnlk2 / bd-zavyn: one runtime entry for the whole timed
+        // insert+commit window, so the sample measures the engine rather
+        // than a ~333 ns bridge entry per row.
         let start = Instant::now();
-        #[allow(clippy::cast_possible_wrap)]
-        for i in 0..rows as i64 {
-            fsqlite_e2e::block_on(stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)]))
-                .unwrap();
-        }
-        fsqlite_e2e::block_on(conn.execute("COMMIT")).unwrap();
+        fsqlite_e2e::block_on(async {
+            #[allow(clippy::cast_possible_wrap)]
+            for i in 0..rows as i64 {
+                stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
+                    .await
+                    .unwrap();
+            }
+            conn.execute("COMMIT").await.unwrap();
+        });
         let elapsed = start.elapsed();
         drop(stmt);
         if cfg.enabled {

@@ -275,16 +275,21 @@ fn run_fsqlite(n_threads: usize, rows: i64, reads_per_thread: usize) -> EngineMe
                 fsqlite_e2e::block_on(conn.prepare("SELECT payload FROM bench WHERE id = ?1"))
                     .expect("prepare select");
             barrier.wait();
-            let mut state = 0x0102_0304_0506_0708_u64 ^ (tid as u64).wrapping_mul(0x9e37);
-            for _ in 0..reads_per_thread {
-                state = state
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1_442_695_040_888_963_407);
-                #[allow(clippy::cast_possible_wrap)]
-                let id = ((state % rows as u64) + 1) as i64;
-                let params = [fsqlite::SqliteValue::Integer(id)];
-                let _ = fsqlite_e2e::block_on(stmt.query_with_params(&params)).expect("query");
-            }
+            // bd-mnlk2 / bd-zavyn: one runtime entry for the whole read
+            // loop; the rusqlite arm pays no bridge, so per-read entries
+            // inflated only the FrankenSQLite side of the ratio.
+            fsqlite_e2e::block_on(async {
+                let mut state = 0x0102_0304_0506_0708_u64 ^ (tid as u64).wrapping_mul(0x9e37);
+                for _ in 0..reads_per_thread {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    #[allow(clippy::cast_possible_wrap)]
+                    let id = ((state % rows as u64) + 1) as i64;
+                    let params = [fsqlite::SqliteValue::Integer(id)];
+                    let _ = stmt.query_with_params(&params).await.expect("query");
+                }
+            });
         }));
     }
     for h in handles {

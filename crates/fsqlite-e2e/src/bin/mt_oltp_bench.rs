@@ -1277,12 +1277,29 @@ fn query_rusqlite_database_state(conn: &rusqlite::Connection) -> Result<Database
     .map_err(|error| format!("C SQLite postflight query failed: {error}"))
 }
 
-fn rollback_fsqlite(conn: &fsqlite::Connection, context: &str) -> Result<(), String> {
-    fsqlite_e2e::block_on(conn.execute("ROLLBACK"))
+async fn rollback_fsqlite(conn: &fsqlite::Connection, context: &str) -> Result<(), String> {
+    conn.execute("ROLLBACK")
+        .await
         .map(|_| ())
         .map_err(|error| format!("{context}; rollback failed: {error}"))
 }
 
+/// Outcome of a single write-transaction attempt (bd-mnlk2 / bd-zavyn).
+enum WriteAttempt {
+    Committed,
+    /// A transient BEGIN/INSERT/COMMIT failure that already rolled back
+    /// (where required) inside the runtime entry; the caller backs off
+    /// outside the runtime and retries.
+    Retry,
+}
+
+/// bd-mnlk2 / bd-zavyn: one runtime entry per transaction attempt. The
+/// previous shape entered the harness runtime for every
+/// BEGIN/INSERT/COMMIT/ROLLBACK (3+ entries of ~333 ns per written row,
+/// FrankenSQLite side only), so the per-operation latency samples measured
+/// the bridge as well as the engine. The retry backoff sleeps *outside* the
+/// entered runtime (Gate 0 requirement: never hold a sync sleep inside a
+/// current-thread runtime that owns engine progress).
 fn execute_fsqlite_write(
     conn: &fsqlite::Connection,
     stmt: &fsqlite::PreparedStatement<'_>,
@@ -1290,63 +1307,72 @@ fn execute_fsqlite_write(
     payload: &fsqlite::SqliteValue,
 ) -> Result<(), String> {
     for attempt in 1..=MAX_RETRIES {
-        match fsqlite_e2e::block_on(conn.execute("BEGIN CONCURRENT")) {
-            Ok(_) => {}
-            Err(error) if error.is_transient() && attempt < MAX_RETRIES => {
-                thread::sleep(RETRY_SLEEP);
-                continue;
+        let outcome = fsqlite_e2e::block_on(async {
+            match conn.execute("BEGIN CONCURRENT").await {
+                Ok(_) => {}
+                Err(error) if error.is_transient() && attempt < MAX_RETRIES => {
+                    return Ok(WriteAttempt::Retry);
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "BEGIN CONCURRENT failed for row {id} after {attempt} attempt(s): {error}"
+                    ));
+                }
             }
-            Err(error) => {
-                return Err(format!(
-                    "BEGIN CONCURRENT failed for row {id} after {attempt} attempt(s): {error}"
-                ));
-            }
-        }
 
-        match fsqlite_e2e::block_on(
-            stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(id), payload.clone()]),
-        ) {
-            Ok(1) => {}
-            Ok(affected) => {
-                rollback_fsqlite(
-                    conn,
-                    &format!("insert for row {id} affected {affected} rows, expected one"),
-                )?;
-                return Err(format!(
-                    "insert for row {id} affected {affected} rows, expected one"
-                ));
+            match stmt
+                .execute_with_params(&[fsqlite::SqliteValue::Integer(id), payload.clone()])
+                .await
+            {
+                Ok(1) => {}
+                Ok(affected) => {
+                    rollback_fsqlite(
+                        conn,
+                        &format!("insert for row {id} affected {affected} rows, expected one"),
+                    )
+                    .await?;
+                    return Err(format!(
+                        "insert for row {id} affected {affected} rows, expected one"
+                    ));
+                }
+                Err(error) if error.is_transient() && attempt < MAX_RETRIES => {
+                    rollback_fsqlite(
+                        conn,
+                        &format!("transient insert failure for row {id}: {error}"),
+                    )
+                    .await?;
+                    return Ok(WriteAttempt::Retry);
+                }
+                Err(error) => {
+                    rollback_fsqlite(conn, &format!("insert failed for row {id}: {error}")).await?;
+                    return Err(format!(
+                        "insert failed for row {id} after {attempt} attempt(s): {error}"
+                    ));
+                }
             }
-            Err(error) if error.is_transient() && attempt < MAX_RETRIES => {
-                rollback_fsqlite(
-                    conn,
-                    &format!("transient insert failure for row {id}: {error}"),
-                )?;
-                thread::sleep(RETRY_SLEEP);
-                continue;
-            }
-            Err(error) => {
-                rollback_fsqlite(conn, &format!("insert failed for row {id}: {error}"))?;
-                return Err(format!(
-                    "insert failed for row {id} after {attempt} attempt(s): {error}"
-                ));
-            }
-        }
 
-        match fsqlite_e2e::block_on(conn.execute("COMMIT")) {
-            Ok(_) => return Ok(()),
-            Err(error) if error.is_transient() && attempt < MAX_RETRIES => {
-                rollback_fsqlite(
-                    conn,
-                    &format!("transient commit failure for row {id}: {error}"),
-                )?;
-                thread::sleep(RETRY_SLEEP);
+            match conn.execute("COMMIT").await {
+                Ok(_) => Ok(WriteAttempt::Committed),
+                Err(error) if error.is_transient() && attempt < MAX_RETRIES => {
+                    rollback_fsqlite(
+                        conn,
+                        &format!("transient commit failure for row {id}: {error}"),
+                    )
+                    .await?;
+                    Ok(WriteAttempt::Retry)
+                }
+                Err(error) => {
+                    rollback_fsqlite(conn, &format!("commit failed for row {id}: {error}")).await?;
+                    Err(format!(
+                        "commit failed for row {id} after {attempt} attempt(s): {error}"
+                    ))
+                }
             }
-            Err(error) => {
-                rollback_fsqlite(conn, &format!("commit failed for row {id}: {error}"))?;
-                return Err(format!(
-                    "commit failed for row {id} after {attempt} attempt(s): {error}"
-                ));
-            }
+        })?;
+
+        match outcome {
+            WriteAttempt::Committed => return Ok(()),
+            WriteAttempt::Retry => thread::sleep(RETRY_SLEEP),
         }
     }
     Err(format!(
@@ -1571,56 +1597,68 @@ fn run_fsqlite_iter(
                         "FrankenSQLite reader-overlap readiness counter overflowed".to_owned()
                     );
                 }
-                #[allow(clippy::cast_possible_wrap)]
-                while wait_for_active_writer_operation(
-                    &gate,
-                    key,
-                    &active_writer_operations,
-                    &writers_remaining,
-                )? {
-                    gate.ensure_running(key)?;
-                    if completed_ops >= MAX_READER_OPS_PER_THREAD {
-                        return Err(format!(
-                            "FrankenSQLite reader {rid} exceeded the fail-closed cap of {MAX_READER_OPS_PER_THREAD} operations while writers were still active"
-                        ));
+                // bd-mnlk2 / bd-zavyn: the entire admission-gated read loop
+                // runs inside ONE runtime entry, so each latency sample
+                // brackets the engine query alone rather than a ~333 ns
+                // bridge entry per read (the C SQLite reader arm pays no
+                // bridge). The sync gate waits block this thread exactly as
+                // they did outside the runtime: nothing else is scheduled on
+                // this per-thread runtime.
+                fsqlite_e2e::block_on(async {
+                    while wait_for_active_writer_operation(
+                        &gate,
+                        key,
+                        &active_writer_operations,
+                        &writers_remaining,
+                    )? {
+                        gate.ensure_running(key)?;
+                        if completed_ops >= MAX_READER_OPS_PER_THREAD {
+                            return Err(format!(
+                                "FrankenSQLite reader {rid} exceeded the fail-closed cap of {MAX_READER_OPS_PER_THREAD} operations while writers were still active"
+                            ));
+                        }
+                        #[allow(clippy::cast_possible_wrap)]
+                        let id = (lcg_next(&mut rng_state) % seed_rows as u64 + 1) as i64;
+                        let operation_started = Instant::now();
+                        let row = stmt
+                            .query_row_with_params(&[fsqlite::SqliteValue::Integer(id)])
+                            .await
+                            .map_err(|error| {
+                                format!(
+                                    "FrankenSQLite reader {rid} query for row {id} failed: {error}"
+                                )
+                            })?;
+                        let query_finished = Instant::now();
+                        let payload = row
+                            .get(0)
+                            .and_then(fsqlite::SqliteValue::as_text)
+                            .ok_or_else(|| {
+                                format!(
+                                    "FrankenSQLite reader {rid} row {id} payload was not TEXT"
+                                )
+                            })?;
+                        if payload != expected_payload {
+                            return Err(format!(
+                                "FrankenSQLite reader {rid} row {id} payload mismatch"
+                            ));
+                        }
+                        consumed_read_payload_bytes = consumed_read_payload_bytes
+                            .checked_add(payload.len() as u64)
+                            .ok_or_else(|| "read payload byte receipt overflow".to_owned())?;
+                        let operation_finished = Instant::now();
+                        completed_ops += 1;
+                        latencies.push(
+                            operation_finished
+                                .duration_since(operation_started)
+                                .as_nanos() as u64,
+                        );
+                        operation_intervals.push(TimedOperationInterval {
+                            started_at: operation_started,
+                            finished_at: query_finished,
+                        });
                     }
-                    let id = (lcg_next(&mut rng_state) % seed_rows as u64 + 1) as i64;
-                    let operation_started = Instant::now();
-                    let row = fsqlite_e2e::block_on(
-                        stmt.query_row_with_params(&[fsqlite::SqliteValue::Integer(id)]),
-                    )
-                    .map_err(|error| {
-                        format!("FrankenSQLite reader {rid} query for row {id} failed: {error}")
-                    })?;
-                    let query_finished = Instant::now();
-                    let payload = row
-                        .get(0)
-                        .and_then(fsqlite::SqliteValue::as_text)
-                        .ok_or_else(|| {
-                            format!(
-                                "FrankenSQLite reader {rid} row {id} payload was not TEXT"
-                            )
-                        })?;
-                    if payload != expected_payload {
-                        return Err(format!(
-                            "FrankenSQLite reader {rid} row {id} payload mismatch"
-                        ));
-                    }
-                    consumed_read_payload_bytes = consumed_read_payload_bytes
-                        .checked_add(payload.len() as u64)
-                        .ok_or_else(|| "read payload byte receipt overflow".to_owned())?;
-                    let operation_finished = Instant::now();
-                    completed_ops += 1;
-                    latencies.push(
-                        operation_finished
-                            .duration_since(operation_started)
-                            .as_nanos() as u64,
-                    );
-                    operation_intervals.push(TimedOperationInterval {
-                        started_at: operation_started,
-                        finished_at: query_finished,
-                    });
-                }
+                    Ok::<(), String>(())
+                })?;
                 let finished_at = Instant::now();
                 let elapsed = finished_at.duration_since(started);
                 #[allow(clippy::cast_precision_loss)]
