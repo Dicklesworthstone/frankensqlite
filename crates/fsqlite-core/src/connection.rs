@@ -2304,7 +2304,8 @@ impl ConnectionMemoryStats {
 ///
 /// Precommit refusals, validation failures, races, and rollback-complete faults
 /// are returned as [`Err`](Result::Err) by
-/// [`Connection::publish_database_image`].
+/// [`Connection::publish_database_image`] and
+/// [`Connection::publish_database_image_from_receipt`].
 #[must_use = "a publication outcome must be classified before deciding whether retry is safe"]
 pub enum DatabaseImagePublication {
     /// The image committed and this live connection was rebound successfully.
@@ -10349,13 +10350,79 @@ impl Connection {
         validate: F,
     ) -> Result<DatabaseImagePublication>
     where
-        F: FnOnce(&Connection) -> Result<()>,
+        F: FnOnce(&Self) -> Result<()>,
+    {
+        self.publish_database_image_inner(source, candidate_path.as_ref(), None, validate)
+    }
+
+    /// Durably publish an already-receipted private database image.
+    ///
+    /// This is the race-hardened counterpart to
+    /// [`Self::publish_database_image`]. `expected_candidate` must describe the
+    /// exact, self-contained candidate generation that the caller finished
+    /// constructing. Before quiescence can flush retained source work or
+    /// checkpoint a source WAL, this method inspects `candidate_path` and
+    /// requires exact receipt equality. It repeats that equality check after
+    /// source quiescence and immediately before source-derived change-counter
+    /// repair. Path replacement, same-file content mutation, or any other
+    /// candidate drift therefore returns a precommit
+    /// [`FrankenError::BusySnapshot`] without repairing the candidate or
+    /// publishing source bytes.
+    ///
+    /// All validation, durable publication, rollback, rebind, and terminal
+    /// outcome semantics are otherwise identical to
+    /// [`Self::publish_database_image`].
+    pub fn publish_database_image_from_receipt<F>(
+        &self,
+        source: &DatabaseImageReceipt,
+        expected_candidate: &DatabaseImageReceipt,
+        candidate_path: impl AsRef<Path>,
+        validate: F,
+    ) -> Result<DatabaseImagePublication>
+    where
+        F: FnOnce(&Self) -> Result<()>,
+    {
+        self.publish_database_image_inner(
+            source,
+            candidate_path.as_ref(),
+            Some(expected_candidate),
+            validate,
+        )
+    }
+
+    fn publish_database_image_inner<F>(
+        &self,
+        source: &DatabaseImageReceipt,
+        candidate_path: &Path,
+        expected_candidate: Option<&DatabaseImageReceipt>,
+        validate: F,
+    ) -> Result<DatabaseImagePublication>
+    where
+        F: FnOnce(&Self) -> Result<()>,
     {
         if !self.pager.is_file_backed() {
             return Err(FrankenError::Unsupported);
         }
 
         let cx = self.op_cx()?;
+        if let Some(expected_candidate) = expected_candidate {
+            let observed_candidate = self
+                .pager
+                .inspect_self_contained_database_image(&cx, candidate_path)?;
+            if observed_candidate != *expected_candidate {
+                return Err(FrankenError::BusySnapshot {
+                    conflicting_pages:
+                        "database candidate image changed after its publication receipt was captured"
+                            .to_owned(),
+                });
+            }
+            if observed_candidate.identity() == source.identity() {
+                return Err(FrankenError::CannotOpen {
+                    path: candidate_path.to_owned(),
+                });
+            }
+        }
+
         self.quiesce_database_image_publication_state(&cx)?;
         if self.pager.journal_mode() == JournalMode::Wal {
             self.pager.checkpoint(&cx, CheckpointMode::Truncate)?;
@@ -10370,10 +10437,18 @@ impl Connection {
             });
         }
 
-        let candidate_path = candidate_path.as_ref();
         let provisional_candidate = self
             .pager
             .inspect_self_contained_database_image(&cx, candidate_path)?;
+        if let Some(expected_candidate) = expected_candidate
+            && provisional_candidate != *expected_candidate
+        {
+            return Err(FrankenError::BusySnapshot {
+                conflicting_pages:
+                    "database candidate image changed after its publication receipt was captured"
+                        .to_owned(),
+            });
+        }
         if provisional_candidate.identity() == source.identity() {
             return Err(FrankenError::CannotOpen {
                 path: candidate_path.to_owned(),
@@ -42597,7 +42672,7 @@ impl Connection {
         validate: F,
     ) -> Result<()>
     where
-        F: FnOnce(&Connection) -> Result<()>,
+        F: FnOnce(&Self) -> Result<()>,
     {
         let image_path_text = image_path
             .to_str()
@@ -111363,6 +111438,16 @@ mod tests {
     }
 
     #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    fn capture_database_image_publication_candidate_receipt(
+        path: &Path,
+    ) -> super::DatabaseImageReceipt {
+        let candidate = Connection::open_existing(path.to_string_lossy().into_owned()).unwrap();
+        let receipt = candidate.capture_database_image_receipt().unwrap();
+        candidate.close().unwrap();
+        receipt
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
     fn assert_live_replacement_items(conn: &Connection, expected_rows: i64) {
         let rows = conn
             .query("SELECT id, value FROM replacement_items ORDER BY id;")
@@ -111411,20 +111496,27 @@ mod tests {
         let source_identity = conn.file_identity().unwrap().unwrap();
         let source_receipt = conn.capture_database_image_receipt().unwrap();
         create_database_image_publication_candidate(&candidate_path, "delete");
+        let candidate_receipt =
+            capture_database_image_publication_candidate_receipt(&candidate_path);
 
         let publication = conn
-            .publish_database_image(&source_receipt, &candidate_path, |candidate| {
-                let rows = candidate.query("SELECT id FROM replacement_items ORDER BY id;")?;
-                if rows.len() != 2
-                    || rows[0].values()[0] != SqliteValue::Integer(10)
-                    || rows[1].values()[0] != SqliteValue::Integer(20)
-                {
-                    return Err(FrankenError::Internal(
-                        "candidate semantic row validation failed".to_owned(),
-                    ));
-                }
-                Ok(())
-            })
+            .publish_database_image_from_receipt(
+                &source_receipt,
+                &candidate_receipt,
+                &candidate_path,
+                |candidate| {
+                    let rows = candidate.query("SELECT id FROM replacement_items ORDER BY id;")?;
+                    if rows.len() != 2
+                        || rows[0].values()[0] != SqliteValue::Integer(10)
+                        || rows[1].values()[0] != SqliteValue::Integer(20)
+                    {
+                        return Err(FrankenError::Internal(
+                            "candidate semantic row validation failed".to_owned(),
+                        ));
+                    }
+                    Ok(())
+                },
+            )
             .unwrap();
         assert!(publication.connection_is_usable());
         let published = publication.receipt();
@@ -111710,6 +111802,140 @@ mod tests {
         assert_stock_database_image(&displaced_path, 2);
         let rows = conn.query("SELECT COUNT(*) FROM source_items;").unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        conn.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn receipted_database_image_publication_rejects_preflight_path_replacement() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir
+            .path()
+            .join("receipted-image-publication-path-source.db");
+        let candidate_path = dir
+            .path()
+            .join("receipted-image-publication-path-candidate.db");
+        let displaced_path = dir
+            .path()
+            .join("receipted-image-publication-path-displaced.db");
+        let conn = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = conn.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        let expected_candidate =
+            capture_database_image_publication_candidate_receipt(&candidate_path);
+        let source_before = std::fs::read(&source_path).unwrap();
+
+        fsqlite_vfs::host_fs::rename(&candidate_path, &displaced_path).unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        let replacement_identity =
+            fsqlite_vfs::FileIdentity::from_file(&std::fs::File::open(&candidate_path).unwrap())
+                .unwrap()
+                .unwrap();
+        assert_ne!(
+            replacement_identity,
+            expected_candidate.identity(),
+            "test precondition requires a different candidate filesystem object"
+        );
+        let replacement_before = std::fs::read(&candidate_path).unwrap();
+        let validator_called = std::cell::Cell::new(false);
+
+        let error = match conn.publish_database_image_from_receipt(
+            &source_receipt,
+            &expected_candidate,
+            &candidate_path,
+            |_| {
+                validator_called.set(true);
+                Ok(())
+            },
+        ) {
+            Ok(_) => panic!("candidate path replacement must refuse before publication"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, FrankenError::BusySnapshot { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("candidate image changed after its publication receipt"),
+            "{error}"
+        );
+        assert!(!validator_called.get());
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_before);
+        assert_eq!(
+            std::fs::read(&candidate_path).unwrap(),
+            replacement_before,
+            "receipt mismatch must precede source-derived candidate repair"
+        );
+        assert_stock_database_image(&candidate_path, 2);
+        assert_stock_database_image(&displaced_path, 2);
+        conn.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn receipted_database_image_publication_rejects_preflight_same_inode_mutation() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir
+            .path()
+            .join("receipted-image-publication-mutation-source.db");
+        let candidate_path = dir
+            .path()
+            .join("receipted-image-publication-mutation-candidate.db");
+        let conn = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = conn.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        let expected_candidate =
+            capture_database_image_publication_candidate_receipt(&candidate_path);
+        let source_before = std::fs::read(&source_path).unwrap();
+
+        let writer = rusqlite::Connection::open(&candidate_path).unwrap();
+        writer
+            .execute(
+                "INSERT INTO replacement_items VALUES (30,'preflight-mutation');",
+                [],
+            )
+            .unwrap();
+        drop(writer);
+        let mutated_identity =
+            fsqlite_vfs::FileIdentity::from_file(&std::fs::File::open(&candidate_path).unwrap())
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            mutated_identity,
+            expected_candidate.identity(),
+            "test mutation must retain the candidate inode"
+        );
+        let mutated_before = std::fs::read(&candidate_path).unwrap();
+        let validator_called = std::cell::Cell::new(false);
+
+        let error = match conn.publish_database_image_from_receipt(
+            &source_receipt,
+            &expected_candidate,
+            &candidate_path,
+            |_| {
+                validator_called.set(true);
+                Ok(())
+            },
+        ) {
+            Ok(_) => panic!("same-inode candidate mutation must refuse before publication"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, FrankenError::BusySnapshot { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("candidate image changed after its publication receipt"),
+            "{error}"
+        );
+        assert!(!validator_called.get());
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_before);
+        assert_eq!(
+            std::fs::read(&candidate_path).unwrap(),
+            mutated_before,
+            "receipt mismatch must precede source-derived candidate repair"
+        );
+        assert_stock_database_image(&candidate_path, 3);
         conn.close().unwrap();
     }
 
