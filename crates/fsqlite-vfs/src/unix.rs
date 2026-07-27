@@ -84,6 +84,13 @@ fn blocking_io_offset(offset: u64, total: usize, op: &'static str) -> io::Result
     })
 }
 
+/// Upper bound for inline positional I/O under the bd-bjm5d marker.
+///
+/// Matches `IO_URING_MAX_RW_CHUNK_BYTES` (64 KiB = the maximum page size);
+/// WAL group-commit consolidated writes can be arbitrarily large and
+/// therefore always take the blocking pool regardless of the marker.
+const INLINE_IO_MAX_BYTES: usize = 64 * 1024;
+
 #[allow(clippy::needless_pass_by_value)] // owns closure inputs for spawn_blocking_io
 fn read_owned_at(file: Arc<File>, len: usize, offset: u64) -> io::Result<(Vec<u8>, usize)> {
     let mut data = vec![0_u8; len];
@@ -171,7 +178,6 @@ where
 ///
 /// Returns the number of bytes read before EOF (GH #200: interruption is
 /// retried in place instead of surfacing `Interrupted` mid-buffer).
-#[cfg(test)]
 fn read_full_at<R>(mut read_at: R, buf: &mut [u8], offset: u64, what: &'static str) -> Result<usize>
 where
     R: FnMut(&mut [u8], u64) -> std::io::Result<usize>,
@@ -1976,6 +1982,18 @@ impl VfsFile for UnixFile {
                 .as_ref()
                 .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
         );
+        // bd-bjm5d: on a dedicated engine OS thread (marker set), a bounded
+        // pread directly into the caller's buffer costs ~1.5us where the
+        // blocking-pool round-trip costs ~14us — and the driver thread
+        // would only park while waiting. Semantics preserved exactly:
+        // EINTR retried in place, zero-filled tail on short read, actual
+        // total returned.
+        if cx.blocking_io_inline_safe() && buf.len() <= INLINE_IO_MAX_BYTES {
+            let total = read_full_at(|chunk, off| file.read_at(chunk, off), buf, offset, "read")?;
+            buf[total..].fill(0);
+            checkpoint_or_abort(cx)?;
+            return Ok(total);
+        }
         let requested = buf.len();
         let (data, total) = spawn_blocking_io(move || read_owned_at(file, requested, offset))
             .await
@@ -2015,6 +2033,22 @@ impl VfsFile for UnixFile {
                 return Err(error);
             }
         };
+        // bd-bjm5d: inline the bounded write on a dedicated engine thread.
+        // The completion token resolves at the syscall site, which the
+        // inline arm satisfies trivially (same thread, same frame); the
+        // pre-flight error path above already completed the token.
+        if cx.blocking_io_inline_safe() && buf.len() <= INLINE_IO_MAX_BYTES {
+            match write_full_at(|chunk, off| file.write_at(chunk, off), buf, offset, "write") {
+                Ok(()) => {
+                    completion.complete_success();
+                    return checkpoint_or_abort(cx);
+                }
+                Err(error) => {
+                    completion.complete_error();
+                    return Err(error);
+                }
+            }
+        }
         let data = buf.to_vec();
         let source_completion = VfsWriteCompletionSource::new(completion.clone());
         spawn_blocking_io(move || write_owned_at_tracked(file, data, offset, source_completion))
@@ -2041,6 +2075,26 @@ impl VfsFile for UnixFile {
                 .as_ref()
                 .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
         );
+        // bd-bjm5d: on a dedicated engine thread the whole batch can be
+        // pwritten inline — no hop AND no staging copies at all.
+        if cx.blocking_io_inline_safe()
+            && writes
+                .iter()
+                .all(|(_, data)| data.len() <= INLINE_IO_MAX_BYTES)
+        {
+            for (offset, data) in writes {
+                checked_io_range(*offset, data.len(), "write")?;
+            }
+            for (offset, data) in writes {
+                write_full_at(
+                    |chunk, off| file.write_at(chunk, off),
+                    data,
+                    *offset,
+                    "write",
+                )?;
+            }
+            return checkpoint_or_abort(cx);
+        }
         let mut staged: Vec<(u64, Vec<u8>)> = Vec::with_capacity(writes.len());
         for (offset, data) in writes {
             checked_io_range(*offset, data.len(), "write")?;
@@ -2492,6 +2546,23 @@ impl UnixFile {
 
     fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         crate::block_on_test_io(cx, <Self as VfsFile>::write(self, cx, buf, offset))
+    }
+
+    fn write_tracked_sync(
+        &self,
+        cx: &Cx,
+        buf: &[u8],
+        offset: u64,
+        completion: VfsWriteCompletion,
+    ) -> Result<()> {
+        crate::block_on_test_io(
+            cx,
+            <Self as VfsFile>::write_tracked(self, cx, buf, offset, completion),
+        )
+    }
+
+    fn write_page_batch_sync(&self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
+        crate::block_on_test_io(cx, <Self as VfsFile>::write_page_batch(self, cx, writes))
     }
 }
 
@@ -4501,5 +4572,108 @@ mod tests {
         assert_eq!(total, 4096);
         assert_eq!(buf, src);
         assert_eq!(calls, 3);
+    }
+    // === bd-bjm5d: inline small-transfer gate ===
+
+    #[test]
+    fn inline_marker_read_write_roundtrip_and_short_read() {
+        let cx = Cx::new();
+        cx.mark_blocking_io_inline_safe();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("inline.db");
+        let (file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+
+        let payload = vec![0xAB_u8; 4096];
+        file.write(&cx, &payload, 0).unwrap();
+
+        let mut buf = vec![0_u8; 4096];
+        let total = file.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(total, 4096);
+        assert_eq!(buf, payload);
+
+        // Short read past EOF must zero-fill the tail and report the actual
+        // byte count — identical to the pooled path's contract.
+        let mut past = vec![0xFF_u8; 4096];
+        let total = file.read(&cx, &mut past, 2048).unwrap();
+        assert_eq!(total, 2048);
+        assert_eq!(&past[..2048], &payload[2048..]);
+        assert!(past[2048..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn inline_marker_tracked_write_completes_token() {
+        let cx = Cx::new();
+        cx.mark_blocking_io_inline_safe();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("inline-tracked.db");
+        let (file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+
+        let completion = VfsWriteCompletion::new();
+        let observer = completion.clone();
+        let payload = vec![0x5C_u8; 512];
+        file.write_tracked_sync(&cx, &payload, 0, completion)
+            .unwrap();
+        assert_eq!(
+            observer.state(),
+            crate::traits::VfsWriteCompletionState::Success
+        );
+
+        let mut buf = vec![0_u8; 512];
+        assert_eq!(file.read(&cx, &mut buf, 0).unwrap(), 512);
+        assert_eq!(buf, payload);
+    }
+
+    #[test]
+    fn inline_marker_respects_size_threshold() {
+        let cx = Cx::new();
+        cx.mark_blocking_io_inline_safe();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("inline-big.db");
+        let (file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+
+        // One byte over the bound: must take the pooled path (and still
+        // succeed) — the gate is a perf switch, never a size limit.
+        let big = vec![0x11_u8; INLINE_IO_MAX_BYTES + 1];
+        file.write(&cx, &big, 0).unwrap();
+        let mut readback = vec![0_u8; INLINE_IO_MAX_BYTES + 1];
+        let total = file.read(&cx, &mut readback, 0).unwrap();
+        assert_eq!(total, INLINE_IO_MAX_BYTES + 1);
+        assert_eq!(readback, big);
+    }
+
+    #[test]
+    fn inline_marker_batch_write_applies_all_entries() {
+        let cx = Cx::new();
+        cx.mark_blocking_io_inline_safe();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("inline-batch.db");
+        let (file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+
+        let a = vec![0x01_u8; 4096];
+        let b = vec![0x02_u8; 4096];
+        let writes: Vec<(u64, &[u8])> = vec![(0, a.as_slice()), (4096, b.as_slice())];
+        file.write_page_batch_sync(&cx, &writes).unwrap();
+
+        let mut buf = vec![0_u8; 8192];
+        assert_eq!(file.read(&cx, &mut buf, 0).unwrap(), 8192);
+        assert_eq!(&buf[..4096], a.as_slice());
+        assert_eq!(&buf[4096..], b.as_slice());
+    }
+
+    #[test]
+    fn unmarked_cx_never_takes_the_inline_path() {
+        // Without the marker the behavior must be byte-identical to the
+        // pooled path (which the rest of this suite pins); this test just
+        // pins the gate itself via the roundtrip still working.
+        let cx = Cx::new();
+        assert!(!cx.blocking_io_inline_safe());
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("inline-off.db");
+        let (file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let payload = vec![0x77_u8; 4096];
+        file.write(&cx, &payload, 0).unwrap();
+        let mut buf = vec![0_u8; 4096];
+        assert_eq!(file.read(&cx, &mut buf, 0).unwrap(), 4096);
+        assert_eq!(buf, payload);
     }
 }

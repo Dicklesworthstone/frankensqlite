@@ -442,6 +442,13 @@ struct CxInner {
     attached_native_cx: Mutex<Option<NativeCx>>,
     #[cfg(feature = "native")]
     fallback_native_cx: std::sync::OnceLock<NativeCx>,
+    // bd-bjm5d: set only on the root Cx of a dedicated engine OS thread
+    // that owns its Connection exclusively and is not a shared scheduler
+    // worker. Grants VFS backends permission to issue bounded EINTR-safe
+    // positional I/O inline instead of hopping to the blocking pool.
+    // Deliberately NOT feature-gated: this is an OS-thread-ownership
+    // property, not an asupersync property.
+    blocking_io_inline_safe: AtomicBool,
     // Deterministic clock: milliseconds since epoch for tests.
     unix_millis: AtomicU64,
 }
@@ -461,6 +468,7 @@ impl CxInner {
             attached_native_cx: Mutex::new(None),
             #[cfg(feature = "native")]
             fallback_native_cx: std::sync::OnceLock::new(),
+            blocking_io_inline_safe: AtomicBool::new(false),
             unix_millis: AtomicU64::new(0),
         }
     }
@@ -939,6 +947,23 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
+    /// Mark this context as running on a dedicated engine OS thread where
+    /// bounded blocking I/O may be issued inline (bd-bjm5d). Irreversible
+    /// for the lifetime of this context; shared through [`Cx::clone`] and
+    /// propagated to children by [`Cx::create_child`].
+    pub fn mark_blocking_io_inline_safe(&self) {
+        self.inner
+            .blocking_io_inline_safe
+            .store(true, Ordering::Release);
+    }
+
+    /// Whether bounded, page-sized positional I/O may be issued inline on
+    /// the calling thread instead of via the blocking pool (bd-bjm5d).
+    #[must_use]
+    pub fn blocking_io_inline_safe(&self) -> bool {
+        self.inner.blocking_io_inline_safe.load(Ordering::Acquire)
+    }
+
     /// Remove the currently attached native context shim.
     #[cfg(not(feature = "native"))]
     pub fn clear_native_cx(&self) {}
@@ -1195,6 +1220,12 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         child.policy_id = self.policy_id;
         if let Some(oracle) = self.inner.eprocess_oracle.get().cloned() {
             child.set_eprocess_oracle(oracle);
+        }
+        // bd-bjm5d: inline-safety is a property of the owning OS thread,
+        // not of the native runtime handle, so it propagates to every
+        // child created on this thread.
+        if self.blocking_io_inline_safe() {
+            child.mark_blocking_io_inline_safe();
         }
         #[cfg(feature = "native")]
         if let Some(native_cx) = self.attached_native_cx() {
@@ -2685,5 +2716,39 @@ mod tests {
         assert_eq!(cx.trace_id(), 0);
         assert_eq!(cx.decision_id(), 0);
         assert_eq!(cx.policy_id(), 0);
+    }
+    // === bd-bjm5d: blocking_io_inline_safe marker ===
+
+    #[test]
+    fn blocking_io_inline_safe_defaults_false() {
+        let cx = Cx::new();
+        assert!(!cx.blocking_io_inline_safe());
+    }
+
+    #[test]
+    fn blocking_io_inline_safe_shared_through_clone() {
+        let cx = Cx::new();
+        let clone = cx.clone();
+        cx.mark_blocking_io_inline_safe();
+        assert!(clone.blocking_io_inline_safe());
+    }
+
+    #[test]
+    fn blocking_io_inline_safe_inherited_by_create_child() {
+        let cx = Cx::new();
+        cx.mark_blocking_io_inline_safe();
+        let child = cx.create_child();
+        assert!(child.blocking_io_inline_safe());
+    }
+
+    #[test]
+    fn blocking_io_inline_safe_not_invented_by_child_of_unset_parent() {
+        let cx = Cx::new();
+        let child = cx.create_child();
+        assert!(!child.blocking_io_inline_safe());
+        // Marking the child later must not leak back to the parent: the
+        // child has its own CxInner.
+        child.mark_blocking_io_inline_safe();
+        assert!(!cx.blocking_io_inline_safe());
     }
 }

@@ -301,6 +301,15 @@ fn spawn_worker_thread(
         .spawn(
             move || match future::block_on(Connection::open_with_env(path, env)) {
                 Ok(conn) => {
+                    // bd-bjm5d: this thread is a dedicated engine OS thread —
+                    // it runs a bare single-future executor
+                    // (futures_lite::block_on) that owns exactly one
+                    // Connection and serializes its command stream, so a
+                    // bounded inline pread/pwrite can stall nothing but this
+                    // connection's own next command. This is the ONLY
+                    // permitted set site (enforced by
+                    // blocking_io_inline_marker_has_exactly_one_set_site).
+                    conn.root_cx().mark_blocking_io_inline_safe();
                     let _ = open_tx.send(Ok(()));
                     worker_loop(conn, cmd_rx);
                 }
