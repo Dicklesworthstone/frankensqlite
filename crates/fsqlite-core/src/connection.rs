@@ -102,7 +102,7 @@ use fsqlite_func::{
 };
 #[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_pager::ConnectionPagerOpenMode;
-use fsqlite_pager::pager::DatabaseImageReceipt;
+pub use fsqlite_pager::pager::DatabaseImageReceipt;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 use fsqlite_pager::{
     CheckpointMode, JournalMode, PageCacheMetricsSnapshot, PageCachePageSnapshot,
@@ -2295,6 +2295,60 @@ impl ConnectionMemoryStats {
     }
 }
 
+/// Terminal outcome of a successful durable database-image publication.
+///
+/// Both variants mean the candidate image crossed the publication commit
+/// point. Callers must never retry either outcome as though publication had
+/// failed. The variants distinguish whether this live [`Connection`] was
+/// rebound to the committed image or permanently poisoned after rebind failed.
+///
+/// Precommit refusals, validation failures, races, and rollback-complete faults
+/// are returned as [`Err`](Result::Err) by
+/// [`Connection::publish_database_image`].
+#[must_use = "a publication outcome must be classified before deciding whether retry is safe"]
+pub enum DatabaseImagePublication {
+    /// The image committed and this live connection was rebound successfully.
+    Rebound {
+        /// Exact receipt of the counter-repaired, validated candidate bytes.
+        receipt: DatabaseImageReceipt,
+    },
+    /// The image committed, but this live connection could not be rebound and
+    /// has been permanently poisoned against later operations.
+    CommittedConnectionPoisoned {
+        /// Exact receipt of the committed candidate bytes.
+        receipt: DatabaseImageReceipt,
+        /// Diagnostic detail from the failed mandatory rebind.
+        detail: String,
+    },
+}
+
+impl DatabaseImagePublication {
+    /// Exact receipt of the image that crossed the durable commit point.
+    #[must_use]
+    pub const fn receipt(&self) -> &DatabaseImageReceipt {
+        match self {
+            Self::Rebound { receipt } | Self::CommittedConnectionPoisoned { receipt, .. } => {
+                receipt
+            }
+        }
+    }
+
+    /// Whether the publishing connection is usable for subsequent operations.
+    #[must_use]
+    pub const fn connection_is_usable(&self) -> bool {
+        matches!(self, Self::Rebound { .. })
+    }
+
+    /// Rebind failure detail when the committed connection was poisoned.
+    #[must_use]
+    pub fn poison_detail(&self) -> Option<&str> {
+        match self {
+            Self::Rebound { .. } => None,
+            Self::CommittedConnectionPoisoned { detail, .. } => Some(detail),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Storage backend abstraction
 // ---------------------------------------------------------------------------
@@ -2447,6 +2501,22 @@ impl PagerBackend {
             Self::Unix(p) => p.inspect_database_image(cx, path),
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.inspect_database_image(cx, path),
+        }
+    }
+
+    fn inspect_self_contained_database_image(
+        &self,
+        cx: &Cx,
+        path: &Path,
+    ) -> Result<DatabaseImageReceipt> {
+        match self {
+            Self::Memory(p) => p.inspect_self_contained_database_image(cx, path),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.inspect_self_contained_database_image(cx, path),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.inspect_self_contained_database_image(cx, path),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.inspect_self_contained_database_image(cx, path),
         }
     }
 
@@ -8945,6 +9015,9 @@ pub struct Connection {
     /// then reports "table already exists" non-transiently. This flag, set
     /// before the rollback-recovery reload, forces the full sqlite_master scan
     /// so the connection-local schema is reconstructed from committed state.
+    /// Whole-image publication also arms it because two independently built
+    /// images may have equal schema cookies while containing different schemas
+    /// and root-page bindings.
     force_full_schema_reload_once: Cell<bool>,
     /// File change counter (offset 24 in the database header).  Incremented
     /// on every transaction that modifies the database (DML or DDL).
@@ -9072,25 +9145,25 @@ pub struct Connection {
     /// Guards idempotent shutdown so explicit `close()` and `Drop` do not
     /// double-run rollback/checkpoint logic.
     closed: RefCell<bool>,
-    /// Permanent fail-closed marker installed when an in-place VACUUM has
-    /// durably published its new main-database image but this live connection
-    /// could not rebuild its schema/cache bindings to that committed image.
+    /// Permanent fail-closed marker installed when a full-image publication
+    /// durably replaces the main-database image but this live connection
+    /// cannot rebuild its schema/cache bindings to that committed image.
     /// Returning the post-commit reload error without poisoning would leave
     /// stale root-page mappings available to later statements.
-    post_vacuum_rebind_failure: RefCell<Option<String>>,
+    post_image_publication_rebind_failure: RefCell<Option<String>>,
     /// One-shot test hook that fails an in-place VACUUM after the rebuilt
     /// image has reopened and passed both integrity checks but before it is
     /// published over the source database.
     #[cfg(test)]
     fail_vacuum_rebuild_validation_once: Cell<bool>,
-    /// One-shot injection after durable VACUUM publication but before the
+    /// One-shot injection after durable full-image publication but before the
     /// masked connection rebind begins.
     #[cfg(test)]
-    cancel_vacuum_after_publish_once: Cell<bool>,
-    /// One-shot injection proving a post-publication reload failure poisons
-    /// the old connection while leaving the committed image reopenable.
+    cancel_image_publication_after_publish_once: Cell<bool>,
+    /// One-shot injection proving a post-publication reload failure poisons the
+    /// old connection while leaving the committed image reopenable.
     #[cfg(test)]
-    fail_vacuum_rebind_once: Cell<bool>,
+    fail_image_publication_rebind_once: Cell<bool>,
     // ── Cx capability context (bd-2g5.6) ──────────────────────────────────────
     /// Root capability context for this connection. All per-operation contexts
     /// are derived from this via `op_cx()`, inheriting the connection's trace ID.
@@ -9666,13 +9739,13 @@ impl Connection {
             last_local_commit_seq: RefCell::new(None),
             pending_local_live_vtab_preserve_once: Cell::new(false),
             closed: RefCell::new(false),
-            post_vacuum_rebind_failure: RefCell::new(None),
+            post_image_publication_rebind_failure: RefCell::new(None),
             #[cfg(test)]
             fail_vacuum_rebuild_validation_once: Cell::new(false),
             #[cfg(test)]
-            cancel_vacuum_after_publish_once: Cell::new(false),
+            cancel_image_publication_after_publish_once: Cell::new(false),
             #[cfg(test)]
-            fail_vacuum_rebind_once: Cell::new(false),
+            fail_image_publication_rebind_once: Cell::new(false),
             root_cx,
             eprocess_oracle,
             statement_count_since_oracle_refresh: Cell::new(0),
@@ -10079,13 +10152,13 @@ impl Connection {
             last_local_commit_seq: RefCell::new(None),
             pending_local_live_vtab_preserve_once: Cell::new(false),
             closed: RefCell::new(false),
-            post_vacuum_rebind_failure: RefCell::new(None),
+            post_image_publication_rebind_failure: RefCell::new(None),
             #[cfg(test)]
             fail_vacuum_rebuild_validation_once: Cell::new(false),
             #[cfg(test)]
-            cancel_vacuum_after_publish_once: Cell::new(false),
+            cancel_image_publication_after_publish_once: Cell::new(false),
             #[cfg(test)]
-            fail_vacuum_rebind_once: Cell::new(false),
+            fail_image_publication_rebind_once: Cell::new(false),
             // Cx capability context (bd-2g5.6)
             root_cx,
             eprocess_oracle,
@@ -10210,6 +10283,169 @@ impl Connection {
         self.pager.export_bytes(&cx)
     }
 
+    /// Capture an identity- and content-bound receipt for the current durable
+    /// main-database image.
+    ///
+    /// Capture is the first half of full-image publication. Callers must retain
+    /// the returned receipt while constructing a private replacement image and
+    /// pass the same receipt to [`Self::publish_database_image`]. Publication
+    /// then performs a full-image compare-and-swap against this exact source
+    /// generation. A peer commit, journal-mode transition, or any other source
+    /// change after capture causes publication to fail before it can commit.
+    ///
+    /// The connection must be file-backed and outside every explicit
+    /// transaction or savepoint. In WAL mode this method checkpoints and
+    /// truncates the WAL before capturing the receipt so the token describes a
+    /// self-contained main-file generation.
+    pub fn capture_database_image_receipt(&self) -> Result<DatabaseImageReceipt> {
+        if !self.pager.is_file_backed() {
+            return Err(FrankenError::Unsupported);
+        }
+        let cx = self.op_cx()?;
+        self.quiesce_database_image_publication_state(&cx)?;
+        if self.pager.journal_mode() == JournalMode::Wal {
+            self.pager.checkpoint(&cx, CheckpointMode::Truncate)?;
+        }
+        self.pager.capture_vacuum_source_image(&cx)
+    }
+
+    /// Durably replace this connection's database with a private validated
+    /// SQLite image while preserving the already-open main-file identity.
+    ///
+    /// `source` must be a receipt returned by
+    /// [`Self::capture_database_image_receipt`] before the candidate was built.
+    /// `candidate_path` must name a distinct, self-contained SQLite main file
+    /// with no rollback-journal, WAL, SHM, or WAL-FEC companions. The method:
+    ///
+    /// 1. proves the durable source still equals `source`;
+    /// 2. binds the candidate by file identity and full-image digest;
+    /// 3. installs source-derived change-counter provenance on the candidate;
+    /// 4. opens that exact candidate identity, runs `quick_check` and
+    ///    `integrity_check`, and invokes the required caller validation;
+    /// 5. proves the candidate is byte-for-byte unchanged after validation;
+    /// 6. publishes through the pager's durable rollback-journal protocol with
+    ///    a final source CAS and candidate receipt check; and
+    /// 7. performs a cancellation-masked live-connection rebind.
+    ///
+    /// The validator runs before any source byte is changed. It should perform
+    /// application-specific semantic checks and return an error on any
+    /// mismatch. If publication fails before its durable commit point, the
+    /// pager synchronously restores the exact source image. If publication
+    /// commits but the mandatory rebind fails, this method returns
+    /// [`DatabaseImagePublication::CommittedConnectionPoisoned`] and
+    /// permanently poisons this connection so stale schema/root-page bindings
+    /// cannot be reused; a fresh connection can open the committed image.
+    /// Both publication outcome variants mean the image committed and must not
+    /// be retried. Only `Err` means publication did not commit.
+    ///
+    /// The candidate file remains caller-owned and is never removed by this
+    /// method. The returned outcome's receipt describes the exact candidate
+    /// content that was published (its file identity remains the candidate's,
+    /// while the live main file retains the source identity).
+    pub fn publish_database_image<F>(
+        &self,
+        source: &DatabaseImageReceipt,
+        candidate_path: impl AsRef<Path>,
+        validate: F,
+    ) -> Result<DatabaseImagePublication>
+    where
+        F: FnOnce(&Connection) -> Result<()>,
+    {
+        if !self.pager.is_file_backed() {
+            return Err(FrankenError::Unsupported);
+        }
+
+        let cx = self.op_cx()?;
+        self.quiesce_database_image_publication_state(&cx)?;
+        if self.pager.journal_mode() == JournalMode::Wal {
+            self.pager.checkpoint(&cx, CheckpointMode::Truncate)?;
+        }
+
+        let current_source = self.pager.capture_vacuum_source_image(&cx)?;
+        if current_source != *source {
+            return Err(FrankenError::BusySnapshot {
+                conflicting_pages:
+                    "database source image changed after its publication receipt was captured"
+                        .to_owned(),
+            });
+        }
+
+        let candidate_path = candidate_path.as_ref();
+        let provisional_candidate = self
+            .pager
+            .inspect_self_contained_database_image(&cx, candidate_path)?;
+        if provisional_candidate.identity() == source.identity() {
+            return Err(FrankenError::CannotOpen {
+                path: candidate_path.to_owned(),
+            });
+        }
+
+        let expected_change_counter = source.header().change_counter.wrapping_add(1).max(1);
+        let repaired_candidate = self.pager.restore_vacuum_candidate_change_counter(
+            &cx,
+            candidate_path,
+            &provisional_candidate,
+            expected_change_counter,
+        )?;
+        let repaired_candidate_check = self
+            .pager
+            .inspect_self_contained_database_image(&cx, candidate_path)?;
+        if repaired_candidate_check != repaired_candidate {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "database candidate changed across source-derived change-counter repair"
+                    .to_owned(),
+            });
+        }
+
+        self.validate_database_image(candidate_path, repaired_candidate.identity(), validate)?;
+        let validated_candidate = self
+            .pager
+            .inspect_self_contained_database_image(&cx, candidate_path)?;
+        if validated_candidate != repaired_candidate {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "database candidate identity or content changed during semantic validation"
+                    .to_owned(),
+            });
+        }
+        if validated_candidate.header().change_counter != expected_change_counter
+            || validated_candidate.header().version_valid_for != expected_change_counter
+        {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "database candidate lost source-derived change-counter provenance: change_counter={}, version_valid_for={}, expected={expected_change_counter}",
+                    validated_candidate.header().change_counter,
+                    validated_candidate.header().version_valid_for
+                ),
+            });
+        }
+
+        let restore_hydrated_rows = self.memdb_rows_loaded.get();
+        self.pager.publish_validated_database_image(
+            &cx,
+            candidate_path,
+            source,
+            &validated_candidate,
+        )?;
+
+        #[cfg(test)]
+        if self
+            .cancel_image_publication_after_publish_once
+            .replace(false)
+        {
+            cx.cancel();
+        }
+
+        match self.rebind_after_committed_image_publication(&cx, restore_hydrated_rows) {
+            Ok(()) => Ok(DatabaseImagePublication::Rebound {
+                receipt: validated_candidate,
+            }),
+            Err(error) => Ok(DatabaseImagePublication::CommittedConnectionPoisoned {
+                receipt: validated_candidate,
+                detail: error.to_string(),
+            }),
+        }
+    }
+
     fn current_database_header(&self, cx: &Cx) -> Result<DatabaseHeader> {
         let mut txn = self.begin_pager_txn_with_busy_timeout(
             &self.pager,
@@ -10275,9 +10511,13 @@ impl Connection {
 
     /// Return the background-runtime health for this connection's database.
     pub fn background_status(&self) -> Result<()> {
-        if let Some(detail) = self.post_vacuum_rebind_failure.borrow().as_deref() {
+        if let Some(detail) = self
+            .post_image_publication_rebind_failure
+            .borrow()
+            .as_deref()
+        {
             return Err(FrankenError::Internal(format!(
-                "connection is unusable after a committed VACUUM image could not be rebound: {detail}"
+                "connection is unusable after a committed database image could not be rebound: {detail}"
             )));
         }
         self._shared_mvcc_state.background_status()
@@ -10427,6 +10667,17 @@ impl Connection {
         self.invalidate_cached_read_snapshot(cx);
         self.invalidate_cached_write_txn(cx);
         Ok(())
+    }
+
+    fn quiesce_database_image_publication_state(&self, cx: &Cx) -> Result<()> {
+        if self.local_transaction_scope_is_active() {
+            return Err(FrankenError::Busy);
+        }
+        match self.live_vtab_transactions.try_borrow() {
+            Ok(transactions) if transactions.is_empty() => {}
+            Ok(_) | Err(_) => return Err(FrankenError::Busy),
+        }
+        self.quiesce_pager_export_state(cx)
     }
 
     fn current_last_insert_rowid(&self) -> i64 {
@@ -42339,34 +42590,39 @@ impl Connection {
             .map(|_| ())
     }
 
-    fn validate_vacuum_rebuild(
+    fn validate_database_image<F>(
         &self,
-        rebuild_target: &crate::vacuum::VacuumTargetReservation,
-    ) -> Result<()> {
-        let rebuild_path_text =
-            rebuild_target
-                .path()
-                .to_str()
-                .ok_or_else(|| FrankenError::CannotOpen {
-                    path: rebuild_target.path().to_owned(),
-                })?;
+        image_path: &Path,
+        expected_identity: FileIdentity,
+        validate: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&Connection) -> Result<()>,
+    {
+        let image_path_text = image_path
+            .to_str()
+            .ok_or_else(|| FrankenError::CannotOpen {
+                path: image_path.to_owned(),
+            })?;
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         let validation_conn = Self::open_schema_only_with_expected_identity(
-            rebuild_path_text.to_owned(),
-            rebuild_target.identity(),
+            image_path_text.to_owned(),
+            expected_identity,
         )
         .map_err(|err| {
             FrankenError::Internal(format!(
-                "VACUUM rebuilt image failed identity-bound pre-publication schema reload: {err}"
+                "database candidate failed identity-bound pre-publication schema reload: {err}"
             ))
         })?;
         #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
-        let validation_conn =
-            Self::open_schema_only(rebuild_path_text.to_owned()).map_err(|err| {
+        let validation_conn = {
+            let _ = expected_identity;
+            Self::open_schema_only(image_path_text.to_owned()).map_err(|err| {
                 FrankenError::Internal(format!(
-                    "VACUUM rebuilt image failed pre-publication schema reload: {err}"
+                    "database candidate failed pre-publication schema reload: {err}"
                 ))
-            })?;
+            })?
+        };
 
         let validation_result = (|| {
             for pragma in ["quick_check", "integrity_check"] {
@@ -42388,17 +42644,34 @@ impl Connection {
                         .join("; ");
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
-                            "VACUUM rebuilt image failed pre-publication {pragma}: {details}"
+                            "database candidate failed pre-publication {pragma}: {details}"
                         ),
                     });
                 }
             }
-            Ok(())
+            validate(&validation_conn)
         })();
         let close_result = validation_conn.close();
-        validation_result?;
-        close_result?;
+        match (validation_result, close_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(validation_error), Ok(())) => Err(validation_error),
+            (Ok(()), Err(close_error)) => Err(close_error),
+            (Err(validation_error), Err(close_error)) => {
+                tracing::warn!(
+                    error = %close_error,
+                    image = %image_path.display(),
+                    "database candidate validation failed and its validation connection also failed to close"
+                );
+                Err(validation_error)
+            }
+        }
+    }
 
+    fn validate_vacuum_rebuild(
+        &self,
+        rebuild_target: &crate::vacuum::VacuumTargetReservation,
+    ) -> Result<()> {
+        self.validate_database_image(rebuild_target.path(), rebuild_target.identity(), |_| Ok(()))?;
         #[cfg(test)]
         if self.fail_vacuum_rebuild_validation_once.replace(false) {
             return Err(FrankenError::Internal(
@@ -42409,12 +42682,12 @@ impl Connection {
         Ok(())
     }
 
-    /// Rebind every connection-local cache and schema mapping after the new
-    /// VACUUM image is already durable. Cancellation is masked because the
-    /// operation is no longer optional: exposing stale root-page bindings
+    /// Rebind every connection-local cache and schema mapping after a new
+    /// full-database image is already durable. Cancellation is masked because
+    /// the operation is no longer optional: exposing stale root-page bindings
     /// after publication is more dangerous than delaying cancellation until
     /// the connection is coherent again.
-    fn rebind_after_committed_vacuum(
+    fn rebind_after_committed_image_publication(
         &self,
         parent_cx: &Cx,
         restore_hydrated_rows: bool,
@@ -42426,22 +42699,29 @@ impl Connection {
         self.invalidate_cached_write_txn(&rebind_cx);
 
         #[cfg(test)]
-        let rebind_result = if self.fail_vacuum_rebind_once.replace(false) {
+        let rebind_result = if self.fail_image_publication_rebind_once.replace(false) {
             Err(FrankenError::Internal(
-                "injected post-publication VACUUM rebind failure".to_owned(),
+                "injected post-publication database-image rebind failure".to_owned(),
             ))
         } else {
+            // The replacement may legitimately carry the same schema cookie as
+            // the source while naming different sqlite_master objects. Image
+            // publication therefore cannot use the cookie-equality fast path:
+            // rebuild every schema/root-page binding from the committed image.
+            self.force_full_schema_reload_once.set(true);
             self.reload_memdb_from_pager_with_mode(&rebind_cx, restore_hydrated_rows)
         };
         #[cfg(not(test))]
-        let rebind_result =
-            self.reload_memdb_from_pager_with_mode(&rebind_cx, restore_hydrated_rows);
+        let rebind_result = {
+            self.force_full_schema_reload_once.set(true);
+            self.reload_memdb_from_pager_with_mode(&rebind_cx, restore_hydrated_rows)
+        };
 
         if let Err(error) = rebind_result {
             let detail = error.to_string();
-            *self.post_vacuum_rebind_failure.borrow_mut() = Some(detail.clone());
+            *self.post_image_publication_rebind_failure.borrow_mut() = Some(detail.clone());
             return Err(FrankenError::Internal(format!(
-                "VACUUM committed successfully, but the live connection could not be rebound and has been poisoned: {detail}"
+                "database image committed successfully, but the live connection could not be rebound and has been poisoned: {detail}"
             )));
         }
         Ok(())
@@ -42676,7 +42956,10 @@ impl Connection {
             )?;
 
             #[cfg(test)]
-            if self.cancel_vacuum_after_publish_once.replace(false) {
+            if self
+                .cancel_image_publication_after_publish_once
+                .replace(false)
+            {
                 cx.cancel();
             }
 
@@ -42695,7 +42978,7 @@ impl Connection {
                 ),
             }
             drop(_cleanup_mask);
-            self.rebind_after_committed_vacuum(&cx, restore_hydrated_rows)?;
+            self.rebind_after_committed_image_publication(&cx, restore_hydrated_rows)?;
             return Ok(());
         }
 
@@ -93732,17 +94015,18 @@ pub(crate) fn fsqlite_core_test_serializer() -> std::sync::MutexGuard<'static, (
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundPagerPublication, CommitSeq, Connection, ConnectionEnv, DifferentialEvent,
-        FSQLITE_GROUP_BY_MEM_SCAN_FAST_PATH_HITS, FSQLITE_GROUP_BY_PROJECTION_PRUNE_HITS,
-        FSQLITE_GROUP_BY_STREAMING_FAST_PATH_HITS, FSQLITE_JOIN_EXPR_BINDING_HITS,
-        FSQLITE_JOIN_EXPR_FALLBACK_SCANS, FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS,
-        FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS, FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS,
-        FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS, InProcessPageLockTable, IoPollStrategy,
-        PagerBackend, PagerPublishedSnapshot, Row, RuntimeConfig, RuntimeContext, SchemaEpoch,
-        SharedRuntimeState, SimplePager, Snapshot, init_global_runtime,
-        is_implicit_autoindex_entry, is_sqlite_master_entry_missing, join_hidden_rowid_projection,
-        join_table_supports_hidden_rowid, lock_unpoisoned, memdb_row_matches_like_fast_path,
-        statement_contains_rewritable_subquery, wal_file_present_with_vfs, wal_path_for_db_path,
+        BoundPagerPublication, CommitSeq, Connection, ConnectionEnv, DatabaseImagePublication,
+        DifferentialEvent, FSQLITE_GROUP_BY_MEM_SCAN_FAST_PATH_HITS,
+        FSQLITE_GROUP_BY_PROJECTION_PRUNE_HITS, FSQLITE_GROUP_BY_STREAMING_FAST_PATH_HITS,
+        FSQLITE_JOIN_EXPR_BINDING_HITS, FSQLITE_JOIN_EXPR_FALLBACK_SCANS,
+        FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS, FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS,
+        FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS, FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS,
+        InProcessPageLockTable, IoPollStrategy, PagerBackend, PagerPublishedSnapshot, Row,
+        RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState, SimplePager, Snapshot,
+        init_global_runtime, is_implicit_autoindex_entry, is_sqlite_master_entry_missing,
+        join_hidden_rowid_projection, join_table_supports_hidden_rowid, lock_unpoisoned,
+        memdb_row_matches_like_fast_path, statement_contains_rewritable_subquery,
+        wal_file_present_with_vfs, wal_path_for_db_path,
     };
     use crate::region::RegionKind;
     use fsqlite_ast::{JoinKind, SortDirection, Statement};
@@ -93752,6 +94036,10 @@ mod tests {
         ColumnContext as VtabColumnContext, ErasedVtabInstance, IndexInfo as VtabIndexInfo,
         TransactionalVtabState, VirtualTable, VirtualTableCursor, VtabModuleFactory,
         module_factory_from,
+    };
+    #[cfg(all(feature = "native", unix))]
+    use fsqlite_pager::fault_hooks::{
+        FaultHookArm, FaultInjectionSessionLock, arm_vacuum_after_target_page, take_records,
     };
     use fsqlite_pager::{PageCacheQueueKind, TransactionHandle, TransactionMode};
     use fsqlite_types::cx::Cx;
@@ -93770,6 +94058,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::Ordering as AtomicOrdering;
+
+    #[cfg(all(feature = "native", unix))]
+    static IMAGE_PUBLICATION_FAULT_LOCK: FaultInjectionSessionLock =
+        FaultInjectionSessionLock::new();
 
     impl Connection {
         pub(crate) fn open_in_memory() -> std::result::Result<Self, FrankenError> {
@@ -111007,6 +111299,622 @@ mod tests {
         assert_eq!(rows.len(), 2);
     }
 
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    fn publication_sidecar(path: &Path, suffix: &str) -> PathBuf {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        PathBuf::from(sidecar)
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    fn open_database_image_publication_source(path: &Path, journal_mode: &str) -> Connection {
+        let conn = Connection::open(path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+        conn.execute(&format!("PRAGMA journal_mode='{journal_mode}';"))
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE source_items(
+                id INTEGER PRIMARY KEY,
+                value TEXT NOT NULL UNIQUE
+            );",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO source_items VALUES (1,'source-alpha');")
+            .unwrap();
+        conn
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    fn create_database_image_publication_candidate(path: &Path, journal_mode: &str) {
+        let sqlite = rusqlite::Connection::open(path).unwrap();
+        let selected_mode: String = sqlite
+            .query_row(&format!("PRAGMA journal_mode={journal_mode};"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(selected_mode.eq_ignore_ascii_case(journal_mode));
+        sqlite
+            .execute_batch(
+                "PRAGMA synchronous=FULL;
+                 CREATE TABLE replacement_items(
+                    id INTEGER PRIMARY KEY,
+                    value TEXT NOT NULL UNIQUE
+                 );
+                 INSERT INTO replacement_items
+                    VALUES (10,'candidate-alpha'),(20,'candidate-beta');",
+            )
+            .unwrap();
+        if journal_mode.eq_ignore_ascii_case("wal") {
+            let checkpoint: (i64, i64, i64) = sqlite
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap();
+            assert_eq!(checkpoint.0, 0, "candidate WAL checkpoint stayed busy");
+        }
+        drop(sqlite);
+
+        for suffix in ["-journal", "-wal", "-shm", "-wal-fec"] {
+            assert!(
+                !publication_sidecar(path, suffix).exists(),
+                "closed candidate retained forbidden sidecar {suffix}"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    fn assert_live_replacement_items(conn: &Connection, expected_rows: i64) {
+        let rows = conn
+            .query("SELECT id, value FROM replacement_items ORDER BY id;")
+            .unwrap();
+        assert_eq!(
+            i64::try_from(rows.len()).unwrap(),
+            expected_rows,
+            "live connection did not bind the published replacement rows"
+        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(10));
+        assert_eq!(
+            rows[0].values()[1],
+            SqliteValue::Text("candidate-alpha".into())
+        );
+        assert!(
+            conn.query("SELECT * FROM source_items;").is_err(),
+            "live connection retained a stale source schema after publication"
+        );
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    fn assert_stock_database_image(path: &Path, expected_rows: i64) {
+        let sqlite = rusqlite::Connection::open(path).unwrap();
+        for pragma in ["quick_check", "integrity_check"] {
+            let result: String = sqlite
+                .query_row(&format!("PRAGMA {pragma};"), [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(result, "ok", "stock SQLite {pragma} rejected image");
+        }
+        let rows: i64 = sqlite
+            .query_row("SELECT COUNT(*) FROM replacement_items;", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, expected_rows);
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[test]
+    fn database_image_publication_preserves_identity_and_rebinds_live_connection() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("image-publication-source.db");
+        let candidate_path = dir.path().join("image-publication-candidate.db");
+        let conn = open_database_image_publication_source(&source_path, "delete");
+        let source_identity = conn.file_identity().unwrap().unwrap();
+        let source_receipt = conn.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+
+        let publication = conn
+            .publish_database_image(&source_receipt, &candidate_path, |candidate| {
+                let rows = candidate.query("SELECT id FROM replacement_items ORDER BY id;")?;
+                if rows.len() != 2
+                    || rows[0].values()[0] != SqliteValue::Integer(10)
+                    || rows[1].values()[0] != SqliteValue::Integer(20)
+                {
+                    return Err(FrankenError::Internal(
+                        "candidate semantic row validation failed".to_owned(),
+                    ));
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(publication.connection_is_usable());
+        let published = publication.receipt();
+
+        let expected_counter = source_receipt
+            .header()
+            .change_counter
+            .wrapping_add(1)
+            .max(1);
+        assert_eq!(published.header().change_counter, expected_counter);
+        assert_eq!(published.header().version_valid_for, expected_counter);
+        assert_eq!(conn.file_identity().unwrap(), Some(source_identity));
+        assert_eq!(
+            std::fs::read(&source_path).unwrap(),
+            std::fs::read(&candidate_path).unwrap(),
+            "publication must install the exact counter-repaired candidate bytes"
+        );
+        assert_live_replacement_items(&conn, 2);
+        conn.execute("INSERT INTO replacement_items VALUES (30,'live-after-rebind');")
+            .unwrap();
+        conn.close().unwrap();
+        assert_stock_database_image(&source_path, 3);
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[test]
+    fn database_image_capture_and_publication_refuse_active_transaction() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("image-publication-active-source.db");
+        let candidate_path = dir.path().join("image-publication-active-candidate.db");
+        let conn = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = conn.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        let source_before = std::fs::read(&source_path).unwrap();
+        let candidate_before = std::fs::read(&candidate_path).unwrap();
+
+        conn.execute("BEGIN IMMEDIATE;").unwrap();
+        assert!(matches!(
+            conn.capture_database_image_receipt(),
+            Err(FrankenError::Busy)
+        ));
+        let validator_called = std::cell::Cell::new(false);
+        let error = match conn.publish_database_image(&source_receipt, &candidate_path, |_| {
+            validator_called.set(true);
+            Ok(())
+        }) {
+            Ok(_) => panic!("active transaction must refuse full-image publication"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, FrankenError::Busy));
+        assert!(!validator_called.get());
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_before);
+        assert_eq!(std::fs::read(&candidate_path).unwrap(), candidate_before);
+        conn.execute("ROLLBACK;").unwrap();
+        conn.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[test]
+    fn database_image_publication_rejects_companion_before_repair_or_validation() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("image-publication-sidecar-source.db");
+        let candidate_path = dir.path().join("image-publication-sidecar-candidate.db");
+        let conn = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = conn.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        let source_before = std::fs::read(&source_path).unwrap();
+        let candidate_before = std::fs::read(&candidate_path).unwrap();
+        std::fs::write(
+            publication_sidecar(&candidate_path, "-wal"),
+            b"companion-present",
+        )
+        .unwrap();
+
+        let validator_called = std::cell::Cell::new(false);
+        let error = match conn.publish_database_image(&source_receipt, &candidate_path, |_| {
+            validator_called.set(true);
+            Ok(())
+        }) {
+            Ok(_) => panic!("candidate with a recovery companion must be refused"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, FrankenError::DatabaseCorrupt { .. }));
+        assert!(
+            error.to_string().contains("not self-contained"),
+            "unexpected companion refusal: {error}"
+        );
+        assert!(!validator_called.get());
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_before);
+        assert_eq!(std::fs::read(&candidate_path).unwrap(), candidate_before);
+        conn.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[test]
+    fn database_image_publication_source_cas_rejects_peer_commit_before_validation() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("image-publication-raced-source.db");
+        let candidate_path = dir.path().join("image-publication-raced-candidate.db");
+        let source_text = source_path.to_string_lossy().into_owned();
+        let conn = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = conn.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        let candidate_before = std::fs::read(&candidate_path).unwrap();
+
+        let peer = Connection::open_existing(source_text).unwrap();
+        peer.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+        peer.execute("INSERT INTO source_items VALUES (2,'peer-commit');")
+            .unwrap();
+        peer.close().unwrap();
+
+        let validator_called = std::cell::Cell::new(false);
+        let error = match conn.publish_database_image(&source_receipt, &candidate_path, |_| {
+            validator_called.set(true);
+            Ok(())
+        }) {
+            Ok(_) => panic!("stale source receipt must reject publication"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, FrankenError::BusySnapshot { .. }));
+        assert!(!validator_called.get());
+        assert_eq!(
+            std::fs::read(&candidate_path).unwrap(),
+            candidate_before,
+            "stale-source refusal must precede candidate counter repair"
+        );
+        let rows = conn.query("SELECT COUNT(*) FROM source_items;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+        conn.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[test]
+    fn database_image_publication_source_cas_rejects_peer_commit_during_validation() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir
+            .path()
+            .join("image-publication-validation-race-source.db");
+        let candidate_path = dir
+            .path()
+            .join("image-publication-validation-race-candidate.db");
+        let source_text = source_path.to_string_lossy().into_owned();
+        let conn = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = conn.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+
+        let peer_path = source_text.clone();
+        let error = match conn.publish_database_image(&source_receipt, &candidate_path, move |_| {
+            let peer = Connection::open_existing(peer_path)?;
+            peer.execute("PRAGMA fsqlite.concurrent_mode=OFF;")?;
+            peer.execute("INSERT INTO source_items VALUES (2,'validation-peer-commit');")?;
+            peer.close()?;
+            Ok(())
+        }) {
+            Ok(_) => panic!("final source CAS must reject a commit during validation"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, FrankenError::BusySnapshot { .. }));
+
+        let sqlite = rusqlite::Connection::open(&source_path).unwrap();
+        let source_rows: i64 = sqlite
+            .query_row("SELECT COUNT(*) FROM source_items;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            source_rows, 2,
+            "failed publication must preserve the peer's winning source generation"
+        );
+        assert_stock_database_image(&candidate_path, 2);
+        conn.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[test]
+    fn database_image_publication_caller_validation_refusal_precedes_source_mutation() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("image-publication-refusal-source.db");
+        let candidate_path = dir.path().join("image-publication-refusal-candidate.db");
+        let conn = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = conn.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        let source_before = std::fs::read(&source_path).unwrap();
+
+        let error =
+            match conn.publish_database_image(&source_receipt, &candidate_path, |candidate| {
+                let rows = candidate.query("SELECT COUNT(*) FROM replacement_items;")?;
+                assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+                Err(FrankenError::Internal(
+                    "application semantic validation refused candidate".to_owned(),
+                ))
+            }) {
+                Ok(_) => panic!("caller validation refusal must stop publication"),
+                Err(error) => error,
+            };
+        assert!(
+            error
+                .to_string()
+                .contains("application semantic validation refused candidate"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_before);
+        let rows = conn.query("SELECT COUNT(*) FROM source_items;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_stock_database_image(&candidate_path, 2);
+        conn.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn database_image_publication_rejects_candidate_mutation_during_validation() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("image-publication-mutation-source.db");
+        let candidate_path = dir.path().join("image-publication-mutation-candidate.db");
+        let conn = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = conn.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        let source_before = std::fs::read(&source_path).unwrap();
+
+        let raced_candidate = candidate_path.clone();
+        let error = match conn.publish_database_image(&source_receipt, &candidate_path, move |_| {
+            let writer = rusqlite::Connection::open(&raced_candidate)
+                .map_err(|err| FrankenError::Internal(err.to_string()))?;
+            writer
+                .execute(
+                    "INSERT INTO replacement_items VALUES (30,'validator-race');",
+                    [],
+                )
+                .map_err(|err| FrankenError::Internal(err.to_string()))?;
+            drop(writer);
+            Ok(())
+        }) {
+            Ok(_) => panic!("candidate mutation must invalidate its validation receipt"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, FrankenError::DatabaseCorrupt { .. }));
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_before);
+        let sqlite = rusqlite::Connection::open(&candidate_path).unwrap();
+        let candidate_rows: i64 = sqlite
+            .query_row("SELECT COUNT(*) FROM replacement_items;", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(candidate_rows, 3);
+        let rows = conn.query("SELECT COUNT(*) FROM source_items;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        conn.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn database_image_publication_rejects_path_replacement_and_preserves_replacement() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("image-publication-path-source.db");
+        let candidate_path = dir.path().join("image-publication-path-candidate.db");
+        let displaced_path = dir.path().join("image-publication-path-displaced.db");
+        let conn = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = conn.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        let source_before = std::fs::read(&source_path).unwrap();
+        let raced_candidate = candidate_path.clone();
+        let raced_displaced = displaced_path.clone();
+
+        match conn.publish_database_image(&source_receipt, &candidate_path, move |_| {
+            fsqlite_vfs::host_fs::rename(&raced_candidate, &raced_displaced)?;
+            fsqlite_vfs::host_fs::write(&raced_candidate, b"replacement-sentinel")?;
+            Ok(())
+        }) {
+            Ok(_) => panic!("candidate pathname replacement must reject publication"),
+            Err(_) => {}
+        }
+
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_before);
+        assert_eq!(
+            std::fs::read(&candidate_path).unwrap(),
+            b"replacement-sentinel"
+        );
+        assert_stock_database_image(&displaced_path, 2);
+        let rows = conn.query("SELECT COUNT(*) FROM source_items;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        conn.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn database_image_publication_runs_integrity_validation_before_source_mutation() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("image-publication-invalid-source.db");
+        let candidate_path = dir.path().join("image-publication-invalid-candidate.db");
+        let conn = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = conn.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        let source_before = std::fs::read(&source_path).unwrap();
+        let mut corrupted = std::fs::read(&candidate_path).unwrap();
+        let second_page_offset = usize::try_from(source_receipt.header().page_size.get()).unwrap();
+        assert!(corrupted.len() > second_page_offset);
+        corrupted[second_page_offset] = 0xFF;
+        std::fs::write(&candidate_path, corrupted).unwrap();
+
+        let validator_called = std::cell::Cell::new(false);
+        match conn.publish_database_image(&source_receipt, &candidate_path, |_| {
+            validator_called.set(true);
+            Ok(())
+        }) {
+            Ok(_) => panic!("structurally corrupt candidate must fail built-in validation"),
+            Err(_) => {}
+        }
+        assert!(
+            !validator_called.get(),
+            "caller validation must not run after built-in integrity refusal"
+        );
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_before);
+        let rows = conn.query("SELECT COUNT(*) FROM source_items;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        conn.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[test]
+    fn database_image_publication_supports_self_contained_wal_candidate() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("image-publication-wal-source.db");
+        let candidate_path = dir.path().join("image-publication-wal-candidate.db");
+        let conn = open_database_image_publication_source(&source_path, "wal");
+        let source_identity = conn.file_identity().unwrap().unwrap();
+        let source_receipt = conn.capture_database_image_receipt().unwrap();
+        assert_eq!(source_receipt.header().write_version, 2);
+        assert_eq!(source_receipt.header().read_version, 2);
+        create_database_image_publication_candidate(&candidate_path, "wal");
+
+        let publication = conn
+            .publish_database_image(&source_receipt, &candidate_path, |candidate| {
+                let rows = candidate.query("SELECT COUNT(*) FROM replacement_items;")?;
+                if rows[0].values()[0] != SqliteValue::Integer(2) {
+                    return Err(FrankenError::Internal(
+                        "WAL candidate row validation failed".to_owned(),
+                    ));
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            &publication,
+            DatabaseImagePublication::Rebound { .. }
+        ));
+        let published = publication.receipt();
+        assert_eq!(published.header().write_version, 2);
+        assert_eq!(published.header().read_version, 2);
+        assert_eq!(conn.file_identity().unwrap(), Some(source_identity));
+        assert_live_replacement_items(&conn, 2);
+        conn.execute("INSERT INTO replacement_items VALUES (30,'wal-live');")
+            .unwrap();
+        conn.close().unwrap();
+        assert_stock_database_image(&source_path, 3);
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[test]
+    fn database_image_publication_masks_postcommit_cancellation_for_mandatory_rebind() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("image-publication-cancel-source.db");
+        let candidate_path = dir.path().join("image-publication-cancel-candidate.db");
+        let conn = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = conn.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        conn.cancel_image_publication_after_publish_once.set(true);
+
+        let publication = conn
+            .publish_database_image(&source_receipt, &candidate_path, |_| Ok(()))
+            .expect("post-commit cancellation must not skip live rebind");
+        assert!(matches!(
+            &publication,
+            DatabaseImagePublication::Rebound { .. }
+        ));
+        {
+            let _inspection_mask = conn.root_cx().masked();
+            assert_live_replacement_items(&conn, 2);
+            assert!(
+                conn.post_image_publication_rebind_failure
+                    .borrow()
+                    .is_none()
+            );
+        }
+        drop(conn);
+        assert_stock_database_image(&source_path, 2);
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[test]
+    fn database_image_publication_rebind_failure_poison_is_fail_closed() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("image-publication-poison-source.db");
+        let candidate_path = dir.path().join("image-publication-poison-candidate.db");
+        let source_text = source_path.to_string_lossy().into_owned();
+        let conn = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = conn.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        conn.fail_image_publication_rebind_once.set(true);
+
+        let publication = conn
+            .publish_database_image(&source_receipt, &candidate_path, |_| Ok(()))
+            .expect("post-commit rebind failure is a committed outcome, not a retryable error");
+        assert!(!publication.connection_is_usable());
+        let detail = publication
+            .poison_detail()
+            .expect("poisoned committed outcome carries diagnostic detail");
+        assert!(
+            detail.contains("database image committed successfully"),
+            "{detail}"
+        );
+        assert!(matches!(
+            &publication,
+            DatabaseImagePublication::CommittedConnectionPoisoned { .. }
+        ));
+        let subsequent = conn
+            .query("SELECT COUNT(*) FROM replacement_items;")
+            .expect_err("poisoned connection must reject later statements");
+        assert!(
+            subsequent
+                .to_string()
+                .contains("connection is unusable after a committed database image"),
+            "{subsequent}"
+        );
+        drop(conn);
+
+        assert_stock_database_image(&source_path, 2);
+        let reopened = Connection::open_existing(source_text).unwrap();
+        assert_live_replacement_items(&reopened, 2);
+        reopened.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn database_image_publication_fault_rolls_back_exact_source_then_cleanly_retries() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let fault_session = IMAGE_PUBLICATION_FAULT_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("image-publication-fault-source.db");
+        let candidate_path = dir.path().join("image-publication-fault-candidate.db");
+        let conn = open_database_image_publication_source(&source_path, "delete");
+        let source_identity = conn.file_identity().unwrap().unwrap();
+        let source_receipt = conn.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        let source_before = std::fs::read(&source_path).unwrap();
+
+        arm_vacuum_after_target_page(FaultHookArm::new(
+            "connection-image-publication",
+            "partial-target-write",
+            "full-image-rollback",
+        ));
+        let error = match conn.publish_database_image(&source_receipt, &candidate_path, |_| Ok(()))
+        {
+            Ok(_) => panic!("injected partial publication must roll back"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("vacuum_after_target_page"),
+            "{error}"
+        );
+        let records = take_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].point, "vacuum_after_target_page");
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_before);
+        assert_eq!(conn.file_identity().unwrap(), Some(source_identity));
+        let rows = conn.query("SELECT COUNT(*) FROM source_items;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        drop(fault_session);
+
+        let publication = conn
+            .publish_database_image(&source_receipt, &candidate_path, |_| Ok(()))
+            .expect("clean retry after exact rollback must publish");
+        assert!(matches!(
+            &publication,
+            DatabaseImagePublication::Rebound { .. }
+        ));
+        assert_eq!(conn.file_identity().unwrap(), Some(source_identity));
+        assert_live_replacement_items(&conn, 2);
+        conn.close().unwrap();
+        assert_stock_database_image(&source_path, 2);
+    }
+
     // ── VACUUM / ANALYZE / REINDEX coverage ──
 
     const LEGACY_RESERVED_INDEX_NAME: &str = "sqlite_autoindex_link_table_v23_1";
@@ -111401,7 +112309,7 @@ mod tests {
             .unwrap();
         conn.execute("INSERT INTO items VALUES (1,'alpha'),(2,'beta');")
             .unwrap();
-        conn.cancel_vacuum_after_publish_once.set(true);
+        conn.cancel_image_publication_after_publish_once.set(true);
 
         conn.execute("VACUUM;")
             .expect("post-publication cancellation must not interrupt mandatory rebind");
@@ -111417,7 +112325,11 @@ mod tests {
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
             assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
-            assert!(conn.post_vacuum_rebind_failure.borrow().is_none());
+            assert!(
+                conn.post_image_publication_rebind_failure
+                    .borrow()
+                    .is_none()
+            );
         }
         drop(conn);
 
@@ -111451,14 +112363,14 @@ mod tests {
             .unwrap();
         conn.execute("INSERT INTO items VALUES (1,'alpha'),(2,'beta');")
             .unwrap();
-        conn.fail_vacuum_rebind_once.set(true);
+        conn.fail_image_publication_rebind_once.set(true);
 
         let error = conn
             .execute("VACUUM;")
             .expect_err("injected committed-image rebind failure must poison the old connection");
         let message = error.to_string();
         assert!(
-            message.contains("VACUUM committed successfully"),
+            message.contains("database image committed successfully"),
             "{message}"
         );
         assert!(message.contains("poisoned"), "{message}");
@@ -111468,7 +112380,7 @@ mod tests {
         assert!(
             subsequent
                 .to_string()
-                .contains("connection is unusable after a committed VACUUM image"),
+                .contains("connection is unusable after a committed database image"),
             "{subsequent}"
         );
         drop(conn);

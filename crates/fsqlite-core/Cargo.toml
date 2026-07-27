@@ -84,6 +84,7 @@ asupersync = { workspace = true }
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
+fsqlite-pager = { version = "0.1.19", path = "../fsqlite-pager", default-features = false, features = ["fault-injection"] }
 rusqlite = { workspace = true }
 tracing = { workspace = true }
 tempfile = { workspace = true }

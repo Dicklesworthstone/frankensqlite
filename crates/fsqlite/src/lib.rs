@@ -4,8 +4,9 @@
 //! phases it also re-exports selected internal crates for integration tests.
 
 pub use fsqlite_core::connection::{
-    Connection, ConnectionEnv, IoPollStrategy, PreparedStatement, Row, RuntimeConfig,
-    RuntimeContext, TraceEvent, TraceMask, init_global_runtime,
+    Connection, ConnectionEnv, DatabaseImagePublication, DatabaseImageReceipt, IoPollStrategy,
+    PreparedStatement, Row, RuntimeConfig, RuntimeContext, TraceEvent, TraceMask,
+    init_global_runtime,
 };
 pub use fsqlite_error::FrankenError;
 pub use fsqlite_types::SqliteValue;
@@ -40,8 +41,8 @@ pub mod migrate;
 )]
 mod tests {
     use super::{
-        Connection, ConnectionEnv, FileIdentity, IoPollStrategy, RuntimeConfig, RuntimeContext,
-        init_global_runtime,
+        Connection, ConnectionEnv, DatabaseImagePublication, DatabaseImageReceipt, FileIdentity,
+        IoPollStrategy, RuntimeConfig, RuntimeContext, init_global_runtime,
     };
     use fsqlite_ast::{CreateTableBody, Statement};
     use fsqlite_error::FrankenError;
@@ -117,6 +118,17 @@ mod tests {
     fn test_connection_open_and_path() {
         let conn = Connection::open(":memory:").expect("in-memory connection should open");
         assert_eq!(conn.path(), ":memory:");
+    }
+
+    #[test]
+    fn database_image_publication_types_are_exposed_through_the_public_facade() {
+        let conn = Connection::open(":memory:").expect("in-memory connection should open");
+        let receipt: Result<DatabaseImageReceipt, FrankenError> =
+            conn.capture_database_image_receipt();
+        assert!(matches!(receipt, Err(FrankenError::Unsupported)));
+        assert!(
+            std::any::type_name::<DatabaseImagePublication>().ends_with("DatabaseImagePublication")
+        );
     }
 
     #[test]
