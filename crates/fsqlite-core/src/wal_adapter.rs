@@ -2483,14 +2483,15 @@ where
             let latest_is_expected = latest
                 .as_ref()
                 .is_some_and(|(_, record)| record == expected);
-            let mut sidecar_changed = safe_end != original_size;
-            if remove_expected_orphan
+            let sidecar_changed = if remove_expected_orphan
                 && let Some((record_start, _)) = latest.as_ref()
                 && latest_is_expected
             {
                 file.truncate(cx, *record_start)?;
-                sidecar_changed = true;
-            }
+                true
+            } else {
+                safe_end != original_size
+            };
             if sync && (latest_is_expected || sidecar_changed) {
                 file.sync(cx, SyncFlags::NORMAL)?;
             }

@@ -7,6 +7,13 @@
 // (statement dispatch → DML → triggers → nested statement execution); the
 // default limit overflows while type-checking them here too.
 #![recursion_limit = "512"]
+// bd-h9o9r: this crate drives fsqlite-core's deliberately non-`Send`,
+// deeply nested engine futures (the same nesting behind the
+// `recursion_limit` above); `future_not_send` and `large_futures`
+// contradict that design — see fsqlite-core/src/lib.rs for the full
+// rationale, including why boxing was rejected by the perf ledger.
+#![allow(clippy::future_not_send)]
+#![allow(clippy::large_futures)]
 
 pub use fsqlite_core::connection::{
     Connection, ConnectionEnv, IoPollStrategy, PreparedStatement, Row, RuntimeConfig,

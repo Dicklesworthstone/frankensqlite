@@ -621,6 +621,9 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
         self.inner.file_identity()
     }
 
+    // bd-h9o9r: the desugared form is deliberate — it declares an explicit
+    // `+ Send` bound that `async fn` sugar cannot express.
+    #[allow(clippy::manual_async_fn)]
     fn read<'a>(
         &'a self,
         cx: &'a Cx,
@@ -636,6 +639,9 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
         }
     }
 
+    // bd-h9o9r: the desugared form is deliberate — it declares an explicit
+    // `+ Send` bound that `async fn` sugar cannot express.
+    #[allow(clippy::manual_async_fn)]
     fn write<'a>(
         &'a self,
         cx: &'a Cx,
@@ -660,6 +666,9 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
         }
     }
 
+    // bd-h9o9r: the desugared form is deliberate — it declares an explicit
+    // `+ Send` bound that `async fn` sugar cannot express.
+    #[allow(clippy::manual_async_fn)]
     fn write_tracked<'a>(
         &'a self,
         cx: &'a Cx,

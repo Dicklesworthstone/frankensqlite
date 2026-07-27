@@ -11326,6 +11326,7 @@ impl Connection {
 
     // Delegates to the attached connection's own statement execution, which can
     // route back here, so the future is boxed to break the recursive type.
+    #[allow(clippy::type_complexity)]
     fn maybe_execute_attached_target_statement<'a>(
         &'a self,
         statement: &'a Statement,
@@ -47548,9 +47549,17 @@ impl Connection {
     }
 
     /// Restore a snapshot, replacing the current database + schema state.
-    async fn restore_snapshot(&self, cx: &Cx, snap: &DbSnapshot) -> Result<()> {
+    ///
+    /// Desugared ready-future form: the body is synchronous
+    /// (`clippy::unused_async`), but callers await it uniformly with the
+    /// genuinely async restore paths.
+    fn restore_snapshot(
+        &self,
+        cx: &Cx,
+        snap: &DbSnapshot,
+    ) -> impl std::future::Future<Output = Result<()>> {
         self.restore_snapshot_state(snap);
-        self.restore_live_vtab_registry_to(cx, snap.live_vtab_registry_undo_len)
+        std::future::ready(self.restore_live_vtab_registry_to(cx, snap.live_vtab_registry_undo_len))
     }
 
     /// Restore the MemDatabase and connection-local schema state in a snapshot.
@@ -50080,6 +50089,10 @@ impl Connection {
     /// every page's structural integrity but skips the ownership HashMap
     /// and orphan detection — this is the `quick_check` path.
     #[allow(clippy::too_many_arguments)]
+    // bd-h9o9r: `txn` is not used mutably today, but the signature is shared
+    // by the recursive walk and its seven call sites in integrity checking;
+    // loosening it ripples through the whole family for zero behavior gain.
+    #[allow(clippy::needless_pass_by_ref_mut)]
     async fn walk_integrity_btree_pages(
         cx: &Cx,
         txn: &mut TransactionKind,

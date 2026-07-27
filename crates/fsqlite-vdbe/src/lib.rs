@@ -4,6 +4,13 @@
 // label resolution, register allocation, coroutine mechanism, and disassembly.
 // The foundational types (Opcode, VdbeOp, P4) live in fsqlite-types.
 
+// bd-h9o9r: the engine's futures are deliberately not `Send` — execution is
+// strictly sequential per connection on a current-thread runtime, with
+// RefCell-based state throughout. Requiring `Send` futures contradicts that
+// design, so the lint is noise here (same rationale as fsqlite-pager); the
+// held-across-await sites each carry their own audit tags.
+#![allow(clippy::future_not_send)]
+
 use hashbrown::{HashMap, HashSet};
 
 use fsqlite_error::{FrankenError, Result};

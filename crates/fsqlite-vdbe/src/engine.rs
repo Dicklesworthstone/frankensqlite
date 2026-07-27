@@ -2003,6 +2003,11 @@ impl SharedTxnPageIo {
             })
     }
 
+    // bd-h9o9r: a RefCell borrow (or sync mutex guard) is held across an
+    // await in this function's body. The engine executes strictly
+    // sequentially per connection, but the reachable-reentrancy audit and
+    // borrow-scope repair belong to the Phase-C reconstruction.
+    #[allow(clippy::await_holding_refcell_ref, clippy::await_holding_lock)]
     async fn write_page_tier0_already_owned(
         &self,
         cx: &Cx,
@@ -2055,6 +2060,11 @@ impl SharedTxnPageIo {
         Ok(())
     }
 
+    // bd-h9o9r: a RefCell borrow (or sync mutex guard) is held across an
+    // await in this function's body. The engine executes strictly
+    // sequentially per connection, but the reachable-reentrancy audit and
+    // borrow-scope repair belong to the Phase-C reconstruction.
+    #[allow(clippy::await_holding_refcell_ref, clippy::await_holding_lock)]
     async fn write_page_tier1_first_touch(
         &self,
         cx: &Cx,
@@ -2232,6 +2242,11 @@ impl SharedTxnPageIo {
         Ok(())
     }
 
+    // bd-h9o9r: a RefCell borrow (or sync mutex guard) is held across an
+    // await in this function's body. The engine executes strictly
+    // sequentially per connection, but the reachable-reentrancy audit and
+    // borrow-scope repair belong to the Phase-C reconstruction.
+    #[allow(clippy::await_holding_refcell_ref, clippy::await_holding_lock)]
     async fn write_page_tier2_commit_surface_rare(
         &self,
         cx: &Cx,
@@ -2465,6 +2480,11 @@ impl SharedTxnPageIo {
         Ok(())
     }
 
+    // bd-h9o9r: a RefCell borrow (or sync mutex guard) is held across an
+    // await in this function's body. The engine executes strictly
+    // sequentially per connection, but the reachable-reentrancy audit and
+    // borrow-scope repair belong to the Phase-C reconstruction.
+    #[allow(clippy::await_holding_refcell_ref, clippy::await_holding_lock)]
     async fn write_page_internal(
         &self,
         cx: &Cx,
@@ -2809,6 +2829,11 @@ fn track_concurrent_conflict_only_page(
 }
 
 impl PageReader for SharedTxnPageIo {
+    // bd-h9o9r: a RefCell borrow (or sync mutex guard) is held across an
+    // await in this function's body. The engine executes strictly
+    // sequentially per connection, but the reachable-reentrancy audit and
+    // borrow-scope repair belong to the Phase-C reconstruction.
+    #[allow(clippy::await_holding_refcell_ref, clippy::await_holding_lock)]
     async fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
         if let Some(ctx) = self.concurrent_context() {
             // Read-own-writes visibility: if this txn already wrote the page,
@@ -2870,6 +2895,11 @@ impl PageReader for SharedTxnPageIo {
 
     // bd-perf: Override to avoid Vec<u8> round-trip (read_page returns Vec,
     // default read_page_data wraps in PageData — wasteful 4KB alloc+copy).
+    // bd-h9o9r: a RefCell borrow (or sync mutex guard) is held across an
+    // await in this function's body. The engine executes strictly
+    // sequentially per connection, but the reachable-reentrancy audit and
+    // borrow-scope repair belong to the Phase-C reconstruction.
+    #[allow(clippy::await_holding_refcell_ref, clippy::await_holding_lock)]
     async fn read_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
         if let Some(ctx) = self.concurrent_context() {
             let has_staged_write = {
@@ -2899,6 +2929,11 @@ impl PageReader for SharedTxnPageIo {
         self.txn.borrow().get_page(cx, page_no).await
     }
 
+    // bd-h9o9r: a RefCell borrow (or sync mutex guard) is held across an
+    // await in this function's body. The engine executes strictly
+    // sequentially per connection, but the reachable-reentrancy audit and
+    // borrow-scope repair belong to the Phase-C reconstruction.
+    #[allow(clippy::await_holding_refcell_ref, clippy::await_holding_lock)]
     async fn read_btree_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
         if let Some(ctx) = self.concurrent_context() {
             let has_staged_write = {
@@ -2979,6 +3014,11 @@ impl PageWriter for SharedTxnPageIo {
             .try_mutate_staged_page_data(page_no, f)
     }
 
+    // bd-h9o9r: a RefCell borrow (or sync mutex guard) is held across an
+    // await in this function's body. The engine executes strictly
+    // sequentially per connection, but the reachable-reentrancy audit and
+    // borrow-scope repair belong to the Phase-C reconstruction.
+    #[allow(clippy::await_holding_refcell_ref, clippy::await_holding_lock)]
     async fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
         let concurrent = self.concurrent_context();
         let page_one_tracking_required = self
@@ -3031,6 +3071,11 @@ impl PageWriter for SharedTxnPageIo {
         Ok(page_no)
     }
 
+    // bd-h9o9r: a RefCell borrow (or sync mutex guard) is held across an
+    // await in this function's body. The engine executes strictly
+    // sequentially per connection, but the reachable-reentrancy audit and
+    // borrow-scope repair belong to the Phase-C reconstruction.
+    #[allow(clippy::await_holding_refcell_ref, clippy::await_holding_lock)]
     async fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
         let concurrent = self.concurrent_context();
         let page_one_tracking_required = self
@@ -3371,23 +3416,34 @@ impl PageReader for TimeTravelPageIo {
     }
 }
 
+// Desugared RPITIT form: `clippy::unused_async` ignores allow attributes on
+// async-trait impl methods, and these read-only stubs answer synchronously.
 impl PageWriter for TimeTravelPageIo {
-    async fn write_page(&mut self, _cx: &Cx, _page_no: PageNumber, _data: &[u8]) -> Result<()> {
-        Err(FrankenError::Internal(
+    fn write_page(
+        &mut self,
+        _cx: &Cx,
+        _page_no: PageNumber,
+        _data: &[u8],
+    ) -> impl std::future::Future<Output = Result<()>> {
+        std::future::ready(Err(FrankenError::Internal(
             "time-travel cursors are read-only: write_page not permitted".to_owned(),
-        ))
+        )))
     }
 
-    async fn allocate_page(&mut self, _cx: &Cx) -> Result<PageNumber> {
-        Err(FrankenError::Internal(
+    fn allocate_page(&mut self, _cx: &Cx) -> impl std::future::Future<Output = Result<PageNumber>> {
+        std::future::ready(Err(FrankenError::Internal(
             "time-travel cursors are read-only: allocate_page not permitted".to_owned(),
-        ))
+        )))
     }
 
-    async fn free_page(&mut self, _cx: &Cx, _page_no: PageNumber) -> Result<()> {
-        Err(FrankenError::Internal(
+    fn free_page(
+        &mut self,
+        _cx: &Cx,
+        _page_no: PageNumber,
+    ) -> impl std::future::Future<Output = Result<()>> {
+        std::future::ready(Err(FrankenError::Internal(
             "time-travel cursors are read-only: free_page not permitted".to_owned(),
-        ))
+        )))
     }
 
     fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
