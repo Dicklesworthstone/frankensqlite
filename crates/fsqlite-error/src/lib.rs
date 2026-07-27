@@ -213,6 +213,11 @@ pub enum FrankenError {
     #[error("expression tree too deep (max {max})")]
     ExpressionTooDeep { max: usize },
 
+    /// A SQL trigger or foreign-key action exceeded the shared trigger-program
+    /// recursion limit.
+    #[error("too many levels of trigger recursion")]
+    TriggerRecursionDepthExceeded,
+
     /// Too many attached databases.
     #[error("too many attached databases (max {max})")]
     TooManyAttached { max: usize },
@@ -418,6 +423,7 @@ impl FrankenError {
             | Self::TooManyColumns { .. }
             | Self::SqlTooLong { .. }
             | Self::ExpressionTooDeep { .. }
+            | Self::TriggerRecursionDepthExceeded
             | Self::TooManyAttached { .. }
             | Self::TooManyArguments { .. }
             | Self::NotImplemented(_)
@@ -1246,6 +1252,14 @@ mod tests {
         assert_eq!(
             FrankenError::ExpressionTooDeep { max: 1 }.error_code(),
             ErrorCode::Error
+        );
+        assert_eq!(
+            FrankenError::TriggerRecursionDepthExceeded.error_code(),
+            ErrorCode::Error
+        );
+        assert_eq!(
+            FrankenError::TriggerRecursionDepthExceeded.to_string(),
+            "too many levels of trigger recursion"
         );
         assert_eq!(
             FrankenError::TooManyAttached { max: 1 }.error_code(),
