@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Dicklesworthstone/frankensqlite/actions"><img src="https://img.shields.io/github/actions/workflow/status/Dicklesworthstone/frankensqlite/ci.yml?branch=main&label=CI" alt="CI"></a>
+  <a href="https://github.com/Dicklesworthstone/frankensqlite/actions/workflows/verification-gates.yml"><img src="https://img.shields.io/github/actions/workflow/status/Dicklesworthstone/frankensqlite/verification-gates.yml?branch=main&label=CI" alt="CI"></a>
   <a href="https://github.com/Dicklesworthstone/frankensqlite/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg" alt="License: MIT+Rider"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-nightly%20%7C%20edition%202024-orange.svg" alt="Rust"></a>
   <a href="https://github.com/Dicklesworthstone/frankensqlite"><img src="https://img.shields.io/badge/unsafe-only%20in%20VFS%20%2B%20C%20ABI-blue.svg" alt="unsafe only in VFS + C ABI"></a>
