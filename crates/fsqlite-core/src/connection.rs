@@ -64262,10 +64262,55 @@ impl Connection {
 
         match stmt {
             Statement::Select(select) => {
-                if let Some(detail) = Self::planner_select_directive(select, &self.schema.borrow())
-                    .map(|directive| explain_query_plan_detail_from_directive(&directive))
-                {
-                    return vec![to_row(2, 0, 0, detail)];
+                // bd-jyyae: the planner directive records intent; codegen can
+                // decline the access path (`IN (SELECT ...)` compiles to a
+                // full scan probing an ephemeral membership index). A seek
+                // claim is rendered only when the emitted program actually
+                // performs it — an opcode fact, not planner intent — so EQP
+                // cannot diverge from execution. A scan claim cannot
+                // overstate and renders directly. A compile failure must NOT
+                // vouch for a seek claim either (bd-dqdoe msg 4166):
+                // "verification unavailable" falls through to the
+                // program-derived/source fallback, which only emits
+                // scan-shaped details.
+                let directive = {
+                    let schema = self.schema.borrow();
+                    Self::planner_select_directive(select, &schema)
+                };
+                if let Some(directive) = directive {
+                    let verified = match directive.access_kind {
+                        PlannerSelectAccessKind::FullTableScan => true,
+                        PlannerSelectAccessKind::RowidLookup => {
+                            match self.compile_table_select(select).await {
+                                Ok(program) => crate::explain::program_seeks_rowid_on_table(
+                                    &program,
+                                    &directive.table_name,
+                                ),
+                                Err(_) => false,
+                            }
+                        }
+                        PlannerSelectAccessKind::IndexEquality
+                        | PlannerSelectAccessKind::IndexRange => {
+                            match self.compile_table_select(select).await {
+                                Ok(program) => {
+                                    directive.index_name.as_deref().is_some_and(|index_name| {
+                                        crate::explain::program_seeks_named_index(
+                                            &program, index_name,
+                                        )
+                                    })
+                                }
+                                Err(_) => false,
+                            }
+                        }
+                    };
+                    if verified {
+                        return vec![to_row(
+                            2,
+                            0,
+                            0,
+                            explain_query_plan_detail_from_directive(&directive),
+                        )];
+                    }
                 }
 
                 let fallback_detail = first_source_eqp_detail_from_core(&select.body.select);
@@ -182346,6 +182391,36 @@ mod pager_routing_tests {
                      eqp={eqp:?} has_table_lookup={has_table_lookup}"
                     );
                 }
+            }
+        });
+    }
+
+    /// bd-jyyae: `IN (SELECT ...)` compiles to a full scan probing an
+    /// ephemeral membership index, but the planner directive still claimed
+    /// `SEARCH t USING INDEX idx_t_k (k=?)`. EQP must report what the
+    /// emitted program does, never what the planner intended.
+    #[test]
+    fn bd_jyyae_in_subquery_eqp_matches_emitted_program() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = bd_2dgf5_conn().await;
+            conn.execute("CREATE TABLE r (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO r VALUES (2);").await.unwrap();
+
+            for sql in [
+                "SELECT * FROM t WHERE k IN (SELECT id FROM r)",
+                "SELECT v FROM t WHERE k IN (SELECT id FROM r)",
+            ] {
+                let eqp = eqp_details(&conn, sql).await;
+                let ops = explain_opcodes(&conn, sql).await;
+                let has_seek = ops.iter().any(|op| op == "SeekGE");
+                assert_eq!(
+                    eqp.contains("SEARCH"),
+                    has_seek,
+                    "bd-jyyae: EQP claims an access path the program does not \
+                     perform for `{sql}`: eqp={eqp:?} has_seek={has_seek}"
+                );
             }
         });
     }
