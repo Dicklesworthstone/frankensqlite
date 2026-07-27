@@ -8,7 +8,7 @@ pub use fsqlite_core::connection::{
     PreparedStatement, Row, RuntimeConfig, RuntimeContext, TraceEvent, TraceMask,
     init_global_runtime,
 };
-pub use fsqlite_error::FrankenError;
+pub use fsqlite_error::{DatabaseImagePublicationErrorClass, FrankenError};
 pub use fsqlite_types::SqliteValue;
 pub use fsqlite_vfs;
 pub use fsqlite_vfs::FileIdentity;

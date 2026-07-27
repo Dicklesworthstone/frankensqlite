@@ -94106,7 +94106,7 @@ mod tests {
     use crate::region::RegionKind;
     use fsqlite_ast::{JoinKind, SortDirection, Statement};
     use fsqlite_btree::BtreeCursorOps;
-    use fsqlite_error::{FrankenError, Result};
+    use fsqlite_error::{DatabaseImagePublicationErrorClass, FrankenError, Result};
     use fsqlite_func::vtab::{
         ColumnContext as VtabColumnContext, ErasedVtabInstance, IndexInfo as VtabIndexInfo,
         TransactionalVtabState, VirtualTable, VirtualTableCursor, VtabModuleFactory,
@@ -111640,6 +111640,10 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(error, FrankenError::BusySnapshot { .. }));
+        assert_eq!(
+            error.database_image_publication_error_class(),
+            DatabaseImagePublicationErrorClass::SourceChanged
+        );
         assert!(!validator_called.get());
         assert_eq!(
             std::fs::read(&candidate_path).unwrap(),
@@ -112118,6 +112122,10 @@ mod tests {
         assert!(
             error.to_string().contains("vacuum_after_target_page"),
             "{error}"
+        );
+        assert_eq!(
+            error.database_image_publication_error_class(),
+            DatabaseImagePublicationErrorClass::PrecommitRolledBack
         );
         let records = take_records();
         assert_eq!(records.len(), 1);

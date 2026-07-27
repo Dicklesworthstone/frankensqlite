@@ -6708,9 +6708,16 @@ where
                         );
                         if let Err(truncate_err) = truncate_commit_result {
                             journal_is_recoverable = false;
-                            return Err(FrankenError::internal(format!(
-                                "VACUUM publication outcome is indeterminate after rollback-journal invalidation failure: invalidate={invalidate_err}; restore={restore_err}; truncate_commit={truncate_err}"
-                            )));
+                            return Err(
+                                FrankenError::DatabaseImagePublicationOutcomeIndeterminate {
+                                    detail: format!(
+                                        "rollback-journal invalidation failed and neither restoring \
+                                         the hot journal nor truncating it to commit succeeded: \
+                                         invalidate={invalidate_err}; restore={restore_err}; \
+                                         truncate_commit={truncate_err}"
+                                    ),
+                                },
+                            );
                         }
                     } else {
                         return Err(FrankenError::internal(format!(
@@ -6797,12 +6804,18 @@ where
                             return Err(publication_err);
                         }
                         Err(rollback_err) => {
-                            return Err(FrankenError::internal(format!(
-                                "VACUUM publication failed and rollback did not restore the source image: publication={publication_err}; rollback={rollback_err}; close={}",
-                                close_result
-                                    .err()
-                                    .map_or_else(|| "ok".to_owned(), |err| err.to_string())
-                            )));
+                            return Err(
+                                FrankenError::DatabaseImagePublicationOutcomeIndeterminate {
+                                    detail: format!(
+                                        "publication failed and rollback did not restore the source \
+                                         image: publication={publication_err}; \
+                                         rollback={rollback_err}; close={}",
+                                        close_result
+                                            .err()
+                                            .map_or_else(|| "ok".to_owned(), |err| err.to_string())
+                                    ),
+                                },
+                            );
                         }
                     }
                 }
@@ -6816,6 +6829,18 @@ where
                     }
                     return Err(match close_result {
                         Ok(()) => publication_err,
+                        Err(close_err)
+                            if publication_err.database_image_publication_error_class()
+                                == fsqlite_error::DatabaseImagePublicationErrorClass::OutcomeIndeterminate =>
+                        {
+                            FrankenError::DatabaseImagePublicationOutcomeIndeterminate {
+                                detail: format!(
+                                    "publication outcome was already indeterminate and \
+                                     rollback-journal close also failed: \
+                                     publication={publication_err}; close={close_err}"
+                                ),
+                            }
+                        }
                         Err(close_err) => FrankenError::internal(format!(
                             "VACUUM publication failed and rollback-journal close also failed: publication={publication_err}; close={close_err}"
                         )),
@@ -6872,6 +6897,19 @@ where
             }
             Err(publication_err) => match close_result {
                 Ok(()) => Err(publication_err),
+                Err(close_err)
+                    if publication_err.database_image_publication_error_class()
+                        == fsqlite_error::DatabaseImagePublicationErrorClass::OutcomeIndeterminate =>
+                {
+                    Err(
+                        FrankenError::DatabaseImagePublicationOutcomeIndeterminate {
+                            detail: format!(
+                                "publication outcome was already indeterminate and candidate close \
+                                 also failed: publication={publication_err}; close={close_err}"
+                            ),
+                        },
+                    )
+                }
                 Err(close_err) => Err(FrankenError::internal(format!(
                     "VACUUM publication failed and candidate close also failed: publication={publication_err}; close={close_err}"
                 ))),

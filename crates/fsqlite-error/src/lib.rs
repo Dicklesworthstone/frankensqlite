@@ -2,6 +2,33 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+/// Durable outcome class for a failed whole-database-image publication.
+///
+/// This classification is intentionally independent of [`FrankenError`]'s
+/// human-readable [`std::fmt::Display`] text. Call
+/// [`FrankenError::database_image_publication_error_class`] only on an error
+/// returned by a whole-image publication surface. Within that boundary, every
+/// failure has exactly one of these outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DatabaseImagePublicationErrorClass {
+    /// The source or guarded candidate generation changed before publication.
+    ///
+    /// No candidate bytes should be reused without rebuilding or revalidating
+    /// them against the winning source generation.
+    SourceChanged,
+    /// Publication either stopped before source mutation or synchronously
+    /// restored and verified the exact pre-publication source receipt.
+    ///
+    /// The failed candidate can be discarded without outcome reconciliation.
+    PrecommitRolledBack,
+    /// The publisher could not prove whether the source or candidate image is
+    /// durable.
+    ///
+    /// Callers must retain recovery artifacts and reconcile from fresh,
+    /// identity-bound handles before retrying or deleting the candidate.
+    OutcomeIndeterminate,
+}
+
 /// Primary error type for FrankenSQLite operations.
 ///
 /// Modeled after SQLite's error codes with Rust-idiomatic structure.
@@ -148,6 +175,11 @@ pub enum FrankenError {
     /// Transaction was rolled back due to constraint violation.
     #[error("transaction rolled back: {reason}")]
     TransactionRolledBack { reason: String },
+
+    /// Whole-image publication crossed a durability boundary but could not
+    /// prove either an exact rollback or a committed candidate.
+    #[error("database image publication outcome is indeterminate: {detail}")]
+    DatabaseImagePublicationOutcomeIndeterminate { detail: String },
 
     // === MVCC Errors ===
     /// Page-level write conflict (another transaction modified the same page).
@@ -441,7 +473,9 @@ impl FrankenError {
             Self::TypeMismatch { .. } => ErrorCode::Mismatch,
             Self::IntegerOverflow | Self::OutOfRange { .. } => ErrorCode::Range,
             Self::TooBig => ErrorCode::TooBig,
-            Self::Internal(_) => ErrorCode::Internal,
+            Self::Internal(_) | Self::DatabaseImagePublicationOutcomeIndeterminate { .. } => {
+                ErrorCode::Internal
+            }
             Self::Abort => ErrorCode::Abort,
             Self::AuthDenied => ErrorCode::Auth,
             Self::OutOfMemory | Self::PageBufferCapacityExhausted { .. } => ErrorCode::NoMem,
@@ -525,6 +559,35 @@ impl FrankenError {
         )
     }
 
+    /// Classify an error returned by whole-database-image publication.
+    ///
+    /// This method must only be called for an error returned by
+    /// `Connection::publish_database_image`,
+    /// `Connection::publish_database_image_from_receipt`, or the corresponding
+    /// pager publication primitive. Those surfaces enforce the invariant that:
+    ///
+    /// - [`Self::BusySnapshot`] means a guarded source or candidate generation
+    ///   changed before publication;
+    /// - [`Self::DatabaseImagePublicationOutcomeIndeterminate`] means neither
+    ///   exact rollback nor durable commit could be proven; and
+    /// - every other returned error happened before source mutation or after an
+    ///   exact, synchronously verified rollback.
+    ///
+    /// The result is a typed contract; callers must not parse [`Self`]'s
+    /// display text to decide whether cleanup or retry is safe.
+    #[must_use]
+    pub const fn database_image_publication_error_class(
+        &self,
+    ) -> DatabaseImagePublicationErrorClass {
+        match self {
+            Self::BusySnapshot { .. } => DatabaseImagePublicationErrorClass::SourceChanged,
+            Self::DatabaseImagePublicationOutcomeIndeterminate { .. } => {
+                DatabaseImagePublicationErrorClass::OutcomeIndeterminate
+            }
+            _ => DatabaseImagePublicationErrorClass::PrecommitRolledBack,
+        }
+    }
+
     /// Get the process exit code for this error (for CLI use).
     pub const fn exit_code(&self) -> i32 {
         self.error_code() as i32
@@ -602,6 +665,35 @@ mod tests {
             err.to_string(),
             "database disk image is malformed: invalid page header"
         );
+    }
+
+    #[test]
+    fn database_image_publication_error_class_is_typed_not_display_parsed() {
+        let source_changed = FrankenError::BusySnapshot {
+            conflicting_pages: "arbitrary generation mismatch detail".to_owned(),
+        };
+        let safe_failure = FrankenError::Internal(
+            "this wording deliberately says outcome is indeterminate but is not the typed variant"
+                .to_owned(),
+        );
+        let indeterminate = FrankenError::DatabaseImagePublicationOutcomeIndeterminate {
+            detail: "arbitrary durability detail with no magic phrase".to_owned(),
+        };
+
+        assert_eq!(
+            source_changed.database_image_publication_error_class(),
+            DatabaseImagePublicationErrorClass::SourceChanged
+        );
+        assert_eq!(
+            safe_failure.database_image_publication_error_class(),
+            DatabaseImagePublicationErrorClass::PrecommitRolledBack
+        );
+        assert_eq!(
+            indeterminate.database_image_publication_error_class(),
+            DatabaseImagePublicationErrorClass::OutcomeIndeterminate
+        );
+        assert_eq!(indeterminate.error_code(), ErrorCode::Internal);
+        assert!(!indeterminate.is_transient());
     }
 
     #[test]

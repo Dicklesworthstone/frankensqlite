@@ -9,11 +9,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[cfg(unix)]
+use std::collections::VecDeque;
+#[cfg(unix)]
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::io::{Seek, SeekFrom, Write};
 
-use fsqlite_error::{FrankenError, Result};
+use fsqlite_error::{DatabaseImagePublicationErrorClass, FrankenError, Result};
 use fsqlite_harness::fault_vfs::{
     FaultInjectingVfs, FaultKind, FaultMetricsSnapshot, FaultSpec, FaultTriggerRecord,
 };
@@ -685,6 +687,7 @@ impl VacuumFaultSpec {
 #[derive(Debug, Default)]
 struct VacuumFaultState {
     armed: Option<VacuumFaultSpec>,
+    queued: VecDeque<VacuumFaultSpec>,
     matching_operations_seen: usize,
     fired_label: Option<&'static str>,
     cancel_parent_after_source_write: Option<Cx>,
@@ -724,13 +727,24 @@ impl<V: Vfs> VacuumFaultVfs<V> {
     }
 
     fn arm(&self, spec: VacuumFaultSpec) {
-        assert!(spec.nth_match > 0, "fault match indices are one-based");
+        self.arm_plan([spec]);
+    }
+
+    fn arm_plan(&self, specs: impl IntoIterator<Item = VacuumFaultSpec>) {
+        let mut specs = specs.into_iter().collect::<VecDeque<_>>();
+        assert!(!specs.is_empty(), "fault plan must not be empty");
+        assert!(
+            specs.iter().all(|spec| spec.nth_match > 0),
+            "fault match indices are one-based"
+        );
+        let armed = specs.pop_front();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *state = VacuumFaultState {
-            armed: Some(spec),
+            armed,
+            queued: specs,
             matching_operations_seen: 0,
             fired_label: None,
             cancel_parent_after_source_write: None,
@@ -747,6 +761,7 @@ impl<V: Vfs> VacuumFaultVfs<V> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *state = VacuumFaultState {
             armed: None,
+            queued: VecDeque::new(),
             matching_operations_seen: 0,
             fired_label: None,
             cancel_parent_after_source_write: Some(parent_cx.clone()),
@@ -839,7 +854,7 @@ fn take_vacuum_fault(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let spec = state.armed?;
-    if state.fired_label.is_some() || spec.role != role || spec.operation != operation {
+    if spec.role != role || spec.operation != operation {
         return None;
     }
     state.matching_operations_seen = state.matching_operations_seen.saturating_add(1);
@@ -847,6 +862,12 @@ fn take_vacuum_fault(
         return None;
     }
     state.fired_label = Some(spec.label);
+    if let Some(next) = state.queued.pop_front() {
+        state.armed = Some(next);
+        state.matching_operations_seen = 0;
+    } else {
+        state.armed = None;
+    }
     Some((spec.effect, spec.label))
 }
 
@@ -1442,6 +1463,12 @@ fn vacuum_publication_precommit_fault_matrix_restores_exact_source_and_retries()
             "{}: injected diagnostic was lost: {error}",
             spec.label
         );
+        assert_eq!(
+            error.database_image_publication_error_class(),
+            DatabaseImagePublicationErrorClass::PrecommitRolledBack,
+            "{}: source-safe publication failure was not classified independently of display text",
+            spec.label
+        );
         let snapshot = vfs.snapshot();
         assert_eq!(snapshot.fired_label, Some(spec.label));
         assert_eq!(snapshot.matching_operations_seen, spec.nth_match);
@@ -1506,6 +1533,59 @@ fn vacuum_publication_precommit_fault_matrix_restores_exact_source_and_retries()
         );
         assert_both_engines_integrity(&fixture.source_path, VACUUM_CANDIDATE_ROW_COUNT, spec.label);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn vacuum_publication_indeterminate_commit_marker_failure_has_typed_class() {
+    const INVALIDATE_LABEL: &str = "journal-invalidation-sync-indeterminate";
+    const RESTORE_LABEL: &str = "journal-hot-header-restore-sync-indeterminate";
+    const TRUNCATE_LABEL: &str = "journal-truncate-commit-indeterminate";
+
+    let fixture = VacuumPublicationFixture::new();
+    let vfs = fixture.pager.vfs_handle();
+    vfs.arm_plan([
+        VacuumFaultSpec::error(
+            INVALIDATE_LABEL,
+            VacuumFileRole::Journal,
+            VacuumFaultOperation::DurableSync,
+            3,
+        ),
+        VacuumFaultSpec::error(
+            RESTORE_LABEL,
+            VacuumFileRole::Journal,
+            VacuumFaultOperation::DurableSync,
+            1,
+        ),
+        VacuumFaultSpec::error(
+            TRUNCATE_LABEL,
+            VacuumFileRole::Journal,
+            VacuumFaultOperation::Truncate,
+            1,
+        ),
+    ]);
+
+    let error = fixture
+        .pager
+        .publish_validated_database_image(
+            &fixture.cx,
+            &fixture.candidate_path,
+            &fixture.source_receipt,
+            &fixture.candidate_receipt,
+        )
+        .expect_err("three failed commit-marker decisions must be outcome-indeterminate");
+    assert_eq!(
+        error.database_image_publication_error_class(),
+        DatabaseImagePublicationErrorClass::OutcomeIndeterminate,
+        "{error}"
+    );
+    assert!(matches!(
+        error,
+        FrankenError::DatabaseImagePublicationOutcomeIndeterminate { .. }
+    ));
+    let snapshot = vfs.snapshot();
+    assert_eq!(snapshot.fired_label, Some(TRUNCATE_LABEL));
+    assert_eq!(snapshot.matching_operations_seen, 1);
 }
 
 #[cfg(unix)]
