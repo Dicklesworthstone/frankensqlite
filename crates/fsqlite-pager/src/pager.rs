@@ -12421,15 +12421,34 @@ where
             let cleanup_cx = cleanup_child_cx(cx);
             let _mask = cleanup_cx.masked();
             let saved_db_size = inner.db_size;
-            for (page_no, staged) in write_set {
-                let offset = u64::from(page_no.get() - 1) * u64::from(inner.page_size.get());
-                if let Err(e) = db_file
-                    .write(&cleanup_cx, staged.as_page_bytes(), offset)
-                    .await
-                {
-                    inner.db_size = saved_db_size;
-                    return Err(e);
-                }
+            // bd-trfah/bd-bjm5d: one batched VFS call instead of one write
+            // (and one blocking-pool hop on Unix) per page. The batch covers
+            // the ENTIRE write_set — not `journal_pages`, which deliberately
+            // excludes newly-allocated pages (they need no pre-image but
+            // must still be written) — sorted so the batch issues
+            // ascending-offset pwrites. Failure semantics are unchanged:
+            // `write_page_batch` short-circuits leaving earlier writes
+            // applied — exactly what the per-page loop did — and the hot
+            // journal already guarantees rollback, so `db_size` is simply
+            // restored on error and advanced only on success.
+            let page_size_bytes = u64::from(inner.page_size.get());
+            let mut db_write_pages: Vec<(PageNumber, &StagedPage)> =
+                write_set.iter().map(|(p, s)| (*p, s)).collect();
+            db_write_pages.sort_unstable_by_key(|(page_no, _)| page_no.get());
+            let mut batched_writes: SmallVec<[(u64, &[u8]); 8]> =
+                SmallVec::with_capacity(db_write_pages.len());
+            for &(page_no, staged) in &db_write_pages {
+                let offset = u64::from(page_no.get() - 1) * page_size_bytes;
+                batched_writes.push((offset, staged.as_page_bytes()));
+            }
+            if let Err(e) = db_file
+                .write_page_batch(&cleanup_cx, batched_writes.as_slice())
+                .await
+            {
+                inner.db_size = saved_db_size;
+                return Err(e);
+            }
+            for &(page_no, _) in &db_write_pages {
                 inner.db_size = inner.db_size.max(page_no.get());
             }
 

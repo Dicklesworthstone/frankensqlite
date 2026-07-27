@@ -1038,6 +1038,21 @@ impl VfsFile for IoUringFile {
         self.inner.shm_map(cx, region, size, extend)
     }
 
+    // bd-trfah/bd-bjm5d: forward the batch write to the wrapped UnixFile.
+    // Without this, the trait default loops `self.write`, which falls back
+    // per page through the uring gate — one blocking-pool hop per page —
+    // and the UnixFile single-hop batch override (4.9x on group-16 batches)
+    // is unreachable on Linux, where IoUringFile wraps every file-backed
+    // database. The uring data path has no batch submission today; when it
+    // grows one, this forward becomes the fallback arm.
+    fn write_page_batch<'a>(
+        &'a self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        self.inner.write_page_batch(cx, writes)
+    }
+
     fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
         self.inner.shm_lock(cx, offset, n, flags)
     }
