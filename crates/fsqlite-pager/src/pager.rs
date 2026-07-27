@@ -2155,7 +2155,7 @@ impl Drop for GroupCommitFlushObligation {
 }
 
 trait PendingGroupCommitRecoveryOperation: Send + Sync {
-    fn reconcile<'a>(&'a self) -> LocalPagerFuture<'a, GroupCommitFlushDurability>;
+    fn reconcile(&self) -> LocalPagerFuture<'_, GroupCommitFlushDurability>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2258,13 +2258,13 @@ impl<F: VfsFile + 'static> PendingGroupCommitRecovery<F> {
 }
 
 impl<F: VfsFile + 'static> PendingGroupCommitRecoveryOperation for PendingGroupCommitRecovery<F> {
-    fn reconcile<'a>(&'a self) -> LocalPagerFuture<'a, GroupCommitFlushDurability> {
+    fn reconcile(&self) -> LocalPagerFuture<'_, GroupCommitFlushDurability> {
         Box::pin(async move {
-            if let Some(resolution) = *self
+            let recorded_resolution = *self
                 .resolution
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-            {
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(resolution) = recorded_resolution {
                 return Ok(match resolution {
                     PendingGroupCommitRecoveryResolution::Authorized => {
                         GroupCommitFlushDurability::Durable
@@ -2323,7 +2323,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitRecoveryOperation for PendingGroupC
 }
 
 trait PendingExternalUnlockOperation: Send {
-    fn restore<'a>(&'a mut self) -> LocalPagerFuture<'a, ()>;
+    fn restore(&mut self) -> LocalPagerFuture<'_, ()>;
 
     /// Try the synchronous portion of restoration without waiting for the
     /// shared file handle. `Ok(false)` means the handle is still contended.
@@ -2382,7 +2382,7 @@ impl<F: VfsFile> SharedDbPendingExternalUnlock<F> {
 }
 
 impl<F: VfsFile + 'static> PendingExternalUnlockOperation for SharedDbPendingExternalUnlock<F> {
-    fn restore<'a>(&'a mut self) -> LocalPagerFuture<'a, ()> {
+    fn restore(&mut self) -> LocalPagerFuture<'_, ()> {
         Box::pin(async move {
             let restore_result = {
                 let _cleanup_mask = self.cleanup_cx.masked();
@@ -2518,6 +2518,10 @@ struct GroupCommitDbLockObligation<F: VfsFile + 'static> {
 }
 
 impl<F: VfsFile + 'static> GroupCommitDbLockObligation<F> {
+    // The obligation snapshot deliberately captures each coordination flag
+    // as its own argument; bundling them into a struct would only move the
+    // field list.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         queue: &Arc<GroupCommitQueue>,
         epoch: u64,
@@ -3596,7 +3600,7 @@ enum CommittedStateRefreshMode {
 impl<F: VfsFile> PagerInner<F> {
     /// Read a page through WAL (if present) → cache → disk and return an owned copy.
     async fn read_page_copy(
-        &mut self,
+        &self,
         cx: &Cx,
         cache: &ShardedPageCache,
         wal_backend: &SharedWalBackend,
@@ -4387,7 +4391,7 @@ async fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
 
 async fn ensure_page_one_in_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     cx: &Cx,
-    inner: &mut PagerInner<F>,
+    inner: &PagerInner<F>,
     cache: &ShardedPageCache,
     wal_backend: &SharedWalBackend,
     pool: &PageBufPool,
@@ -7077,6 +7081,10 @@ where
 {
     type Txn = SimpleTransaction<V>;
 
+    // bd-h9o9r: a sync mutex guard is held across an await in this
+    // function's body; reachable-deadlock audit and lock-scope repair
+    // belong to the Phase-C pager reconstruction.
+    #[allow(clippy::await_holding_lock)]
     fn begin<'a>(
         &'a self,
         cx: &'a Cx,
@@ -7309,7 +7317,7 @@ where
                     let busy = FrankenError::Busy;
                     return match release_snapshot_after_failed_begin(
                         cx,
-                        &mut inner,
+                        &inner,
                         active_transactions_before_begin,
                     )
                     .await
@@ -7334,7 +7342,7 @@ where
                 if let Err(err) = lock_result {
                     return match release_snapshot_after_failed_begin(
                         cx,
-                        &mut inner,
+                        &inner,
                         active_transactions_before_begin,
                     )
                     .await
@@ -7358,7 +7366,7 @@ where
                         eager_writer && release_single_writer_baton(&mut inner);
                     let cleanup_result = release_snapshot_after_failed_begin(
                         cx,
-                        &mut inner,
+                        &inner,
                         active_transactions_before_begin,
                     )
                     .await;
@@ -7442,6 +7450,10 @@ where
         inner.access_mode.is_readonly()
     }
 
+    // bd-h9o9r: a sync mutex guard is held across an await in this
+    // function's body; reachable-deadlock audit and lock-scope repair
+    // belong to the Phase-C pager reconstruction.
+    #[allow(clippy::await_holding_lock)]
     fn set_journal_mode<'a>(
         &'a self,
         cx: &'a Cx,
@@ -7582,6 +7594,10 @@ where
         Ok(())
     }
 
+    // bd-h9o9r: a sync mutex guard is held across an await in this
+    // function's body; reachable-deadlock audit and lock-scope repair
+    // belong to the Phase-C pager reconstruction.
+    #[allow(clippy::await_holding_lock)]
     async fn with_exclusive_maintenance<S, T>(
         &self,
         cx: &Cx,
@@ -7789,6 +7805,10 @@ where
     ///
     /// The VFS implementation determines whether a stable descriptor identity
     /// is available. The pager never re-resolves [`Self::db_path`] here.
+    // bd-h9o9r: a sync mutex guard is held across an await in this
+    // function's body; reachable-deadlock audit and lock-scope repair
+    // belong to the Phase-C pager reconstruction.
+    #[allow(clippy::await_holding_lock)]
     pub async fn file_identity(&self, cx: &Cx) -> Result<Option<FileIdentity>> {
         let inner = self
             .inner
@@ -8033,7 +8053,7 @@ where
     /// candidate. Publication later recomputes this logical digest under the
     /// same exclusive maintenance protocol and aborts if any page changed.
     pub async fn capture_vacuum_source_image(&self, cx: &Cx) -> Result<DatabaseImageReceipt> {
-        self.with_exclusive_maintenance(cx, &mut (), |_, cx, inner, _| {
+        self.with_exclusive_maintenance(cx, &mut (), |_, cx, inner, ()| {
             Box::pin(async move {
                 let db_file = shared_db_file_read(&inner.db_file, cx).await?;
                 database_image_receipt_for_open_file(cx, &*db_file, Some(inner.page_size)).await
@@ -8789,6 +8809,10 @@ where
     /// This is used by upper layers that need a coherent published visibility
     /// snapshot before starting a new transaction or deciding whether a
     /// connection-local execution image is stale.
+    // bd-h9o9r: a sync mutex guard is held across an await in this
+    // function's body; reachable-deadlock audit and lock-scope repair
+    // belong to the Phase-C pager reconstruction.
+    #[allow(clippy::await_holding_lock)]
     pub async fn refresh_published_snapshot(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
         let mut maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
@@ -9582,7 +9606,7 @@ where
 
         let journal_path = Self::journal_path(&db_path);
         if disposition == ReadWriteOpenDisposition::ExistingOnly
-            && with_main_shared_lock(cx, &mut db_file, &mut (), |cx, db_file, _| {
+            && with_main_shared_lock(cx, &mut db_file, &mut (), |cx, db_file, ()| {
                 Box::pin(async move { db_file.file_size(cx) })
             })
             .await?
@@ -9648,14 +9672,14 @@ where
                     |cx, db_file, state| {
                     let (vfs, journal_path, accept_non_hot, disposition, db_path) = state;
                     Box::pin(async move {
-                    if vfs.access(cx, &journal_path, AccessFlags::EXISTS)? {
+                    if vfs.access(cx, journal_path, AccessFlags::EXISTS)? {
                         if !*accept_non_hot {
                             return Ok(None);
                         }
                         match Self::verify_readonly_rollback_journal_state(
                             cx,
                             &*vfs,
-                            &journal_path,
+                            journal_path,
                         )
                         .await {
                             Ok(()) => {}
@@ -9912,11 +9936,11 @@ where
                         freelist_count,
                     ) = state;
                     Box::pin(async move {
-                        if vfs.access(cx, &journal_path, AccessFlags::EXISTS)? {
+                        if vfs.access(cx, journal_path, AccessFlags::EXISTS)? {
                             if !*accept_non_hot {
                                 return Err(FrankenError::BusyRecovery);
                             }
-                            Self::verify_readonly_rollback_journal_state(cx, &*vfs, &journal_path)
+                            Self::verify_readonly_rollback_journal_state(cx, &*vfs, journal_path)
                                 .await?;
                         }
                         if db_file.file_size(cx)? != *file_size {
@@ -10195,7 +10219,7 @@ where
             // Read-only and schema-only opens cannot replay. They may accept a
             // proven non-hot construction leftover, but they must never cache
             // a database image for which recovery is required or ambiguous.
-            Self::verify_readonly_rollback_journal_state(cx, &*vfs, &journal_path).await?;
+            Self::verify_readonly_rollback_journal_state(cx, &*vfs, journal_path).await?;
             let file_size = db_file.file_size(cx)?;
             if file_size == 0 {
                 return Err(FrankenError::CannotOpen {
@@ -11256,6 +11280,10 @@ impl<V: Vfs> SimpleTransaction<V> {
     /// fence and maintenance lease are acquired, then restored before return
     /// so ordinary transaction finalization still owns exactly one snapshot
     /// fence to release.
+    // bd-h9o9r: a sync mutex guard is held across an await in this
+    // function's body; reachable-deadlock audit and lock-scope repair
+    // belong to the Phase-C pager reconstruction.
+    #[allow(clippy::await_holding_lock)]
     async fn recover_pending_rollback_journal(&mut self, cx: &Cx) -> Result<bool> {
         if !self.is_writer || self.journal_mode == JournalMode::Wal {
             return Ok(false);
@@ -12465,7 +12493,7 @@ where
 
     async fn flush_write_set_to_db_file_batch<S: std::hash::BuildHasher>(
         cx: &Cx,
-        inner: &mut PagerInner<V::File>,
+        inner: &PagerInner<V::File>,
         write_set: &HashMap<PageNumber, StagedPage, S>,
         write_pages_sorted: &[PageNumber],
     ) -> Result<()> {
@@ -13866,6 +13894,10 @@ where
         Ok(())
     }
 
+    // bd-h9o9r: a sync mutex guard is held across an await in this
+    // function's body; reachable-deadlock audit and lock-scope repair
+    // belong to the Phase-C pager reconstruction.
+    #[allow(clippy::await_holding_lock)]
     async fn ensure_writer(&mut self, cx: &Cx) -> Result<()> {
         if self.read_only_pager {
             return Err(FrankenError::ReadOnly);
@@ -13977,7 +14009,7 @@ const fn retained_lock_level_after_txn_exit(
 
 async fn release_snapshot_after_failed_begin<F: VfsFile>(
     cx: &Cx,
-    inner: &mut PagerInner<F>,
+    inner: &PagerInner<F>,
     active_transactions_before_begin: u32,
 ) -> Result<()> {
     let cleanup_cx = cleanup_child_cx(cx);
@@ -13995,7 +14027,7 @@ async fn release_snapshot_after_failed_begin<F: VfsFile>(
 
 async fn release_retained_snapshot_after_txn_exit<F: VfsFile>(
     cx: &Cx,
-    inner: &mut PagerInner<F>,
+    inner: &PagerInner<F>,
 ) -> Result<()> {
     let cleanup_cx = cleanup_child_cx(cx);
     let _cleanup_mask = cleanup_cx.masked();
@@ -14013,6 +14045,10 @@ where
     V: Vfs + Send,
     V::File: Send + Sync + 'static,
 {
+    // bd-h9o9r: a sync mutex guard is held across an await in this
+    // function's body; reachable-deadlock audit and lock-scope repair
+    // belong to the Phase-C pager reconstruction.
+    #[allow(clippy::await_holding_lock)]
     fn get_page<'a>(
         &'a self,
         cx: &'a Cx,
@@ -14200,7 +14236,7 @@ where
                 }
             }
 
-            let mut inner = self
+            let inner = self
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
@@ -14521,6 +14557,10 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
+    // bd-h9o9r: a sync mutex guard is held across an await in this
+    // function's body; reachable-deadlock audit and lock-scope repair
+    // belong to the Phase-C pager reconstruction.
+    #[allow(clippy::await_holding_lock)]
     fn commit<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
         async move {
             if self.finished {
@@ -14546,7 +14586,7 @@ where
                 // be reused by other transactions.
                 return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
                 inner.active_transactions = inner.active_transactions.saturating_sub(1);
-                let _ = release_retained_snapshot_after_txn_exit(cx, &mut inner).await;
+                let _ = release_retained_snapshot_after_txn_exit(cx, &inner).await;
                 drop(inner);
                 self.committed = true;
                 self.maintenance_lease.take();
@@ -14585,7 +14625,7 @@ where
                 inner.active_transactions = inner.active_transactions.saturating_sub(1);
                 let notify_writer_idle = self.mode != TransactionMode::Concurrent
                     && release_single_writer_baton(&mut inner);
-                let _ = release_retained_snapshot_after_txn_exit(cx, &mut inner).await;
+                let _ = release_retained_snapshot_after_txn_exit(cx, &inner).await;
                 drop(inner);
                 if notify_writer_idle {
                     self.writer_idle.notify_one();
@@ -14710,7 +14750,7 @@ where
                 if must_write_page1 {
                     let mut page1 = match ensure_page_one_in_write_set(
                         cx,
-                        &mut inner,
+                        &inner,
                         &self.cache,
                         &self.wal_backend,
                         &self.pool,
@@ -14826,7 +14866,7 @@ where
                 let t_memory_flush_start = pager_commit_profile_start(pager_commit_profile_active);
                 let result = Self::flush_write_set_to_db_file_batch(
                     cx,
-                    &mut inner,
+                    &inner,
                     &self.write_set,
                     &self.write_pages_sorted,
                 )
@@ -14938,7 +14978,7 @@ where
                 // committed metadata even if this commit skipped page-plane publish.
                 self.publish_committed_snapshot_from_inner(&inner);
                 let t_unlock_start = pager_commit_profile_start(pager_commit_profile_active);
-                let _ = release_retained_snapshot_after_txn_exit(cx, &mut inner).await;
+                let _ = release_retained_snapshot_after_txn_exit(cx, &inner).await;
                 record_pager_commit_duration(&PAGER_COMMIT_UNLOCK_TIME_NS, t_unlock_start);
                 drop(inner);
                 if notify_writer_idle {
@@ -15093,6 +15133,10 @@ where
         }
     }
 
+    // bd-h9o9r: a sync mutex guard is held across an await in this
+    // function's body; reachable-deadlock audit and lock-scope repair
+    // belong to the Phase-C pager reconstruction.
+    #[allow(clippy::await_holding_lock)]
     fn commit_and_retain<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<bool>> + 'a {
         async move {
             // Only supported for in-memory pagers where we can skip I/O.
@@ -15211,7 +15255,7 @@ where
                 if must_write_page1 {
                     let mut page1 = match ensure_page_one_in_write_set(
                         cx,
-                        &mut inner,
+                        &inner,
                         &self.cache,
                         &self.wal_backend,
                         &self.pool,
@@ -15313,7 +15357,7 @@ where
                         // the whole staging map on every autocommit write.
                         if let Err(e) = Self::flush_write_set_to_db_file_batch(
                             cx,
-                            &mut inner,
+                            &inner,
                             &self.write_set,
                             &self.write_pages_sorted,
                         )
@@ -15565,6 +15609,10 @@ where
         Ok(self.write_page_requires_page_one_conflict_tracking_with_inner(&inner, page_no))
     }
 
+    // bd-h9o9r: a sync mutex guard is held across an await in this
+    // function's body; reachable-deadlock audit and lock-scope repair
+    // belong to the Phase-C pager reconstruction.
+    #[allow(clippy::await_holding_lock)]
     fn rollback<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
         async move {
             if self.finished {
@@ -15669,7 +15717,7 @@ where
                 }
             }
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
-            let _ = release_retained_snapshot_after_txn_exit(&cleanup_cx, &mut inner).await;
+            let _ = release_retained_snapshot_after_txn_exit(&cleanup_cx, &inner).await;
             drop(inner);
             if notify_writer_idle {
                 self.writer_idle.notify_one();
@@ -16229,6 +16277,10 @@ where
     /// to `FULL` so we never reset or truncate WAL based on incomplete reader
     /// visibility. For incremental, reader-aware checkpointing, use the
     /// lower-level WAL backend API.
+    // bd-h9o9r: a sync mutex guard is held across an await in this
+    // function's body; reachable-deadlock audit and lock-scope repair
+    // belong to the Phase-C pager reconstruction.
+    #[allow(clippy::await_holding_lock)]
     pub async fn checkpoint(
         &self,
         cx: &Cx,
@@ -16296,9 +16348,7 @@ where
             // sidecars; on Unix the default hook is the native lock protocol.
             let cross_process_fence_result =
                 shared_db_lock_external_maintenance(&inner.db_file, cx, true).await;
-            if let Err(err) = cross_process_fence_result {
-                return Err(err);
-            }
+            cross_process_fence_result?;
 
             inner.checkpoint_active = true;
             checkpoint_gate_state = (inner.active_transactions, inner.checkpoint_active);
@@ -16474,6 +16524,11 @@ where
 }
 
 #[cfg(test)]
+// bd-h9o9r: test bodies routinely hold the pager's sync mutex guards across
+// awaits; under the deterministic single-task test runtimes this cannot
+// deadlock, and per-site tags would add noise without audit value. The
+// production sites each carry an individual audit tag instead.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::traits::{MvccPager, TransactionHandle, TransactionMode};
@@ -20099,7 +20154,7 @@ mod tests {
                 );
                 preserved_zero_journal.close(&cx).unwrap();
                 pager
-                    .with_exclusive_maintenance(&cx, &mut (), |_, _, _, _| {
+                    .with_exclusive_maintenance(&cx, &mut (), |_, _, _, ()| {
                         Box::pin(async { Ok(()) })
                     })
                     .await
@@ -20146,7 +20201,7 @@ mod tests {
                 let nonzero_before = nonzero_prefix.clone();
                 assert!(
                     pager
-                        .with_exclusive_maintenance(&cx, &mut (), |_, _, _, _| {
+                        .with_exclusive_maintenance(&cx, &mut (), |_, _, _, ()| {
                             Box::pin(async { Ok(()) })
                         })
                         .await

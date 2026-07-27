@@ -833,7 +833,7 @@ mod tests {
 
     fn write_page_with_checksum(
         cx: &Cx,
-        file: &mut <MemoryVfs as Vfs>::File,
+        file: &<MemoryVfs as Vfs>::File,
         page_size: u32,
         page: PageNumber,
         fill: u8,
@@ -862,10 +862,10 @@ mod tests {
     fn verify_checksum_match() {
         let cx = test_cx();
         let vfs = MemoryVfs::new();
-        let mut file = open_db_file(&vfs, &cx);
+        let file = open_db_file(&vfs, &cx);
         let page_size = 4096u32;
         let page = PageNumber::new(1).unwrap();
-        let checksum = write_page_with_checksum(&cx, &mut file, page_size, page, 0xAB);
+        let checksum = write_page_with_checksum(&cx, &file, page_size, page, 0xAB);
         let expected = vec![ExpectedPageChecksum { page, checksum }];
         let verdict =
             verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected).expect("verify");
@@ -876,10 +876,10 @@ mod tests {
     fn test_checkpoint_mismatch_aborts_truncate() {
         let cx = test_cx();
         let vfs = MemoryVfs::new();
-        let mut file = open_db_file(&vfs, &cx);
+        let file = open_db_file(&vfs, &cx);
         let page_size = 4096u32;
         let page = PageNumber::new(1).unwrap();
-        let _expected = write_page_with_checksum(&cx, &mut file, page_size, page, 0x11);
+        let _expected = write_page_with_checksum(&cx, &file, page_size, page, 0x11);
         // Supply a deliberately-wrong "expected" checksum so the verifier
         // must report a mismatch even though the on-disk trailer is valid.
         let lied_expected = vec![ExpectedPageChecksum {

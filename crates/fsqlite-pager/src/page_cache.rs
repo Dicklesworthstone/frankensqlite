@@ -4414,8 +4414,16 @@ mod tests {
             Ok(copied)
         }
 
-        async fn write(&self, _cx: &Cx, _buf: &[u8], _offset: u64) -> Result<()> {
-            Err(FrankenError::Unsupported)
+        // Desugared RPITIT form: `clippy::unused_async` ignores allow
+        // attributes on async-trait impl methods, and this test file
+        // answers synchronously.
+        fn write(
+            &self,
+            _cx: &Cx,
+            _buf: &[u8],
+            _offset: u64,
+        ) -> impl std::future::Future<Output = Result<()>> {
+            std::future::ready(Err(FrankenError::Unsupported))
         }
 
         fn truncate(&mut self, _cx: &Cx, _size: u64) -> Result<()> {
@@ -4507,47 +4515,25 @@ mod tests {
             Ok(())
         }
 
-        async fn read(&self, _cx: &Cx, _buf: &mut [u8], _offset: u64) -> Result<usize> {
-            Err(FrankenError::Unsupported)
+        // Desugared RPITIT form: `clippy::unused_async` ignores allow
+        // attributes on async-trait impl methods, and both bodies below
+        // answer synchronously.
+        fn read(
+            &self,
+            _cx: &Cx,
+            _buf: &mut [u8],
+            _offset: u64,
+        ) -> impl std::future::Future<Output = Result<usize>> {
+            std::future::ready(Err(FrankenError::Unsupported))
         }
 
-        async fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-            self.write_calls.fetch_add(1, Ordering::AcqRel);
-            let native_cx = cx.attached_native_cx().ok_or_else(|| {
-                FrankenError::internal("writeback task did not receive its native asupersync Cx")
-            })?;
-            let (parent_task, parent_region) = self
-                .parent_task
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .ok_or_else(|| FrankenError::internal("writeback parent task was not recorded"))?;
-            self.observed_child_task
-                .store(native_cx.task_id() != parent_task, Ordering::Release);
-            self.observed_parent_region
-                .store(native_cx.region_id() == parent_region, Ordering::Release);
-
-            if self.fail_writes {
-                return Err(FrankenError::internal(
-                    "injected dirty page writeback failure",
-                ));
-            }
-
-            let offset = usize::try_from(offset)
-                .map_err(|_| FrankenError::internal("writeback offset does not fit usize"))?;
-            let end = offset
-                .checked_add(buf.len())
-                .ok_or_else(|| FrankenError::internal("writeback range overflow"))?;
-            let mut bytes = self
-                .bytes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if end > bytes.len() {
-                return Err(FrankenError::internal(
-                    "writeback extends past controlled file",
-                ));
-            }
-            bytes[offset..end].copy_from_slice(buf);
-            Ok(())
+        fn write(
+            &self,
+            cx: &Cx,
+            buf: &[u8],
+            offset: u64,
+        ) -> impl std::future::Future<Output = Result<()>> {
+            std::future::ready(self.write_sync(cx, buf, offset))
         }
 
         fn truncate(&mut self, _cx: &Cx, _size: u64) -> Result<()> {
@@ -4597,6 +4583,47 @@ mod tests {
         fn shm_barrier(&self) {}
 
         fn shm_unmap(&mut self, _cx: &Cx, _delete: bool) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl RegionWritebackFile {
+        fn write_sync(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+            self.write_calls.fetch_add(1, Ordering::AcqRel);
+            let native_cx = cx.attached_native_cx().ok_or_else(|| {
+                FrankenError::internal("writeback task did not receive its native asupersync Cx")
+            })?;
+            let (parent_task, parent_region) = self
+                .parent_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ok_or_else(|| FrankenError::internal("writeback parent task was not recorded"))?;
+            self.observed_child_task
+                .store(native_cx.task_id() != parent_task, Ordering::Release);
+            self.observed_parent_region
+                .store(native_cx.region_id() == parent_region, Ordering::Release);
+
+            if self.fail_writes {
+                return Err(FrankenError::internal(
+                    "injected dirty page writeback failure",
+                ));
+            }
+
+            let offset = usize::try_from(offset)
+                .map_err(|_| FrankenError::internal("writeback offset does not fit usize"))?;
+            let end = offset
+                .checked_add(buf.len())
+                .ok_or_else(|| FrankenError::internal("writeback range overflow"))?;
+            let mut bytes = self
+                .bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if end > bytes.len() {
+                return Err(FrankenError::internal(
+                    "writeback extends past controlled file",
+                ));
+            }
+            bytes[offset..end].copy_from_slice(buf);
             Ok(())
         }
     }

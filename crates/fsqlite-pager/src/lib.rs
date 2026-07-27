@@ -1,5 +1,17 @@
 #![cfg_attr(target_arch = "x86_64", allow(internal_features))]
 #![cfg_attr(target_arch = "x86_64", feature(core_intrinsics))]
+// bd-h9o9r: this crate's engine futures are deliberately not `Send` — pager
+// state is driven on a current-thread runtime and several futures hold
+// std::sync mutex guards across awaits (each such site carries its own
+// `#[allow(clippy::await_holding_lock)]` audit tag). Requiring `Send`
+// futures contradicts that design, so the lint is noise here; every other
+// workspace crate keeps it enabled.
+#![allow(clippy::future_not_send)]
+// bd-h9o9r: the `fn f<'a>(..) -> impl Future + 'a { async move { .. } }`
+// trait-impl shape predates async-fn-in-trait and appears at 36 sites with
+// large bodies. Converting them is pure whitespace churn in files under
+// active Phase-C reconstruction; new code should still prefer `async fn`.
+#![allow(clippy::manual_async_fn)]
 
 pub mod arc_cache;
 #[cfg(feature = "encryption")]

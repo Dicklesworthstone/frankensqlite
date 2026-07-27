@@ -10946,38 +10946,50 @@ mod tests {
         idx: Vec<Fts5IdxRow>,
     }
 
+    // The trait contract is async (real readers do I/O); this in-memory
+    // test reader answers synchronously. `clippy::unused_async` ignores
+    // allow attributes on async-trait impl methods, so the impls use the
+    // desugared RPITIT form with eagerly computed `ready` futures instead
+    // of `async fn`.
     impl Fts5OnDiskReader for SliceOnDiskReader {
-        async fn read_data_block(&mut self, id: i64) -> Result<Option<Vec<u8>>> {
-            Ok(self
+        fn read_data_block(
+            &mut self,
+            id: i64,
+        ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>>> {
+            std::future::ready(Ok(self
                 .data
                 .iter()
                 .find(|row| row.id == id)
-                .map(|row| row.block.clone()))
+                .map(|row| row.block.clone())))
         }
 
-        async fn idx_candidate_page(&mut self, segid: u32, term: &[u8]) -> Result<Option<u32>> {
-            Ok(self
+        fn idx_candidate_page(
+            &mut self,
+            segid: u32,
+            term: &[u8],
+        ) -> impl std::future::Future<Output = Result<Option<u32>>> {
+            std::future::ready(Ok(self
                 .idx
                 .iter()
                 .filter(|row| row.segid == segid && row.term.as_slice() <= term)
                 .max_by(|left, right| left.term.cmp(&right.term))
-                .map(|row| row.btree_page))
+                .map(|row| row.btree_page)))
         }
 
-        async fn read_docsize(
+        fn read_docsize(
             &mut self,
             _rowid: i64,
             _column_count: usize,
-        ) -> Result<Option<Fts5DocsizeRow>> {
-            Ok(None)
+        ) -> impl std::future::Future<Output = Result<Option<Fts5DocsizeRow>>> {
+            std::future::ready(Ok(None))
         }
 
-        async fn read_content(
+        fn read_content(
             &mut self,
             _rowid: i64,
             _column_count: usize,
-        ) -> Result<Option<Vec<String>>> {
-            Ok(None)
+        ) -> impl std::future::Future<Output = Result<Option<Vec<String>>>> {
+            std::future::ready(Ok(None))
         }
     }
 

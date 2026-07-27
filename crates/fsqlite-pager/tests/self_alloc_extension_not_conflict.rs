@@ -1,3 +1,8 @@
+// bd-h9o9r: integration tests are separate crates, so fsqlite-pager's
+// crate-level rationale applies here too — the pager's futures are
+// deliberately not `Send` (thread-local runtime design).
+#![allow(clippy::future_not_send)]
+
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
