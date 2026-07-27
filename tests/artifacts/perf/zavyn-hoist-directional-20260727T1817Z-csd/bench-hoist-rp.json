@@ -1,0 +1,1125 @@
+{
+  "schema_version": "fsqlite-e2e.comprehensive-bench-report.v6",
+  "generated_at_utc": "2026-07-27 18:17:23 UTC",
+  "total_elapsed_ms": 2576,
+  "config": {
+    "quick": true,
+    "filter": "insert",
+    "warmup_iterations": 2,
+    "min_iterations": 3,
+    "max_iterations": 10,
+    "target_duration_secs": 5,
+    "row_counts": [
+      100,
+      1000,
+      10000
+    ],
+    "html_output_path": null,
+    "json_output_path": "bench-hoist-rp.json",
+    "json_stdout": false
+  },
+  "environment": {
+    "os": "Ubuntu 25.10",
+    "arch": "x86_64",
+    "kernel_release": "6.17.0-35-generic",
+    "cpu_model": "AMD EPYC 7282 16-Core Processor",
+    "cpu_cores": 64,
+    "ram_gb": 251.6065902709961,
+    "active_toolchain": "nightly-x86_64-unknown-linux-gnu (default)",
+    "rust_version": "rustc 1.99.0-nightly (dc3f85158 2026-07-26)",
+    "cargo_version": "cargo 1.99.0-nightly (3efb1f477 2026-07-17)",
+    "git_commit_sha": "19e35b813470b52108bb47cade92be0e76832c33",
+    "git_branch": "main",
+    "git_head_unix_ts": 1785175910,
+    "git_dirty": true,
+    "benchmark_binary_modified_unix_ts": 1785176219,
+    "benchmark_binary_older_than_git_head": false,
+    "build_profile": "unspecified"
+  },
+  "provenance": {
+    "schema_version": "fsqlite-e2e.benchmark-provenance.v3",
+    "citable": false,
+    "status": "unverified_explicit_override",
+    "validation_errors": [
+      "benchmark binary was built from a dirty or unknown tree",
+      "build environment does not exactly force the canonical `release-perf` profile: expected {\"CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER\": \"\", \"CARGO_BUILD_RUSTC_WRAPPER\": \"\", \"CARGO_BUILD_RUSTFLAGS\": \"\", \"CARGO_PROFILE_RELEASE_PERF_CODEGEN_UNITS\": \"1\", \"CARGO_PROFILE_RELEASE_PERF_DEBUG\": \"false\", \"CARGO_PROFILE_RELEASE_PERF_DEBUG_ASSERTIONS\": \"false\", \"CARGO_PROFILE_RELEASE_PERF_INCREMENTAL\": \"false\", \"CARGO_PROFILE_RELEASE_PERF_LTO\": \"true\", \"CARGO_PROFILE_RELEASE_PERF_OPT_LEVEL\": \"3\", \"CARGO_PROFILE_RELEASE_PERF_OVERFLOW_CHECKS\": \"false\", \"CARGO_PROFILE_RELEASE_PERF_PANIC\": \"abort\", \"CARGO_PROFILE_RELEASE_PERF_RPATH\": \"false\", \"CARGO_PROFILE_RELEASE_PERF_SPLIT_DEBUGINFO\": \"off\", \"CARGO_PROFILE_RELEASE_PERF_STRIP\": \"true\", \"RUSTC_WORKSPACE_WRAPPER\": \"\", \"RUSTC_WRAPPER\": \"\"}, observed {}",
+      "build profile label missing; set FSQLITE_BENCH_PROFILE_NAME while building",
+      "citable builds require a 64-character lowercase hexadecimal build nonce, got `unknown`",
+      "citable builds require an absolute, nonempty, SHA-bound cargo -vv log whose explicit-target rustc invocations prove the nonce plus the required opt-level, codegen-units, debug-assertions, overflow-checks, LTO partition, and final panic/strip settings for the required Rust hot-path crate set and final benchmark binary; compiler identity and all other rustc flags remain outside this receipt's proof scope; observed (None, None, None, false)",
+      "declared profile `unspecified` does not match Cargo output profile `release-perf`",
+      "generic C-reference measurements do not receipt-bind sqlite_source_id(), compile_options, the SQLite amalgamation/library hash, or the resolved native C compiler path/version/hash",
+      "generic comprehensive measurements are diagnostic-only: engines run in unpaired C-first/FrankenSQLite-second adaptive blocks, scored rows lack complete work oracles, and host/topology state is not release-gated",
+      "verbose build log path was absent at end of measurement",
+      "verification checkout SHA does not match the binary build SHA",
+      "verification checkout dirty state changed or is no longer clean",
+      "verification checkout is dirty or unavailable"
+    ],
+    "build": {
+      "workspace_root": "/data/projects/frankensqlite",
+      "git_commit_sha": "19e35b813470b52108bb47cade92be0e76832c33",
+      "git_branch": "main",
+      "git_dirty": true,
+      "tracked_workspace_inputs_watched": "complete",
+      "cargo_profile_family": "release",
+      "selected_profile": "release-perf",
+      "declared_profile": "unspecified",
+      "build_nonce": "unknown",
+      "opt_level": "3",
+      "debuginfo": "false",
+      "debug_assertions": false,
+      "target": "x86_64-unknown-linux-gnu",
+      "host": "x86_64-unknown-linux-gnu",
+      "panic_strategy": "abort",
+      "panic_abort": true,
+      "package_features": [
+        "default"
+      ],
+      "encoded_rustflags_hex": "",
+      "encoded_rustflags_present": true,
+      "profile_override_environment_hex": "",
+      "native_override_environment_hex": "4c494253514c495445335f464c4147533d2d4453514c4954455f454e41424c455f4d4154485f46554e4354494f4e53",
+      "verbose_build_log_path": null,
+      "verbose_build_log_sha256": null,
+      "verbose_build_log_size_bytes": null,
+      "verbose_build_log_verified": false,
+      "profile_proof_scope": "selected profile bound from Cargo OUT_DIR; release fields forced through exact Cargo profile environment values; effective opt/debuginfo/panic cross-checked; explicitly present empty encoded rustflags and empty Cargo wrapper overrides required; the native override environment is constrained but the native compiler/source identity is not yet proven; tracked workspace inputs watched; a unique lowercase-hex build nonce binds the benchmark to a path- and SHA-bound cargo -vv log whose direct explicit-target rustc invocations prove only the required opt-level, codegen-units, debug-assertions, overflow-checks, LTO partition, and final panic/strip settings for the required Rust hot-path crate set and final benchmark binary, not compiler identity, other rustc flags, or every Cargo unit",
+      "rustc_version": "rustc 1.99.0-nightly (dc3f85158 2026-07-26) binary: rustc commit-hash: dc3f85158a955a87a6e4363af1fbe9cf2d063cce commit-date: 2026-07-26 host: x86_64-unknown-linux-gnu release: 1.99.0-nightly LLVM version: 22.1.8",
+      "cargo_version": "cargo 1.99.0-nightly (3efb1f477 2026-07-17)"
+    },
+    "runtime_source": {
+      "verification_root": "/data/projects/frankensqlite",
+      "git_commit_sha": "ac27f5bdf42634aeb6dc5e30dd2d65475f0395d8",
+      "git_branch": "main",
+      "git_dirty": true
+    },
+    "working_directory": "/data/tmp/claude-1000/-data-projects-frankensqlite/701d7987-9e84-4435-a469-dee35b25aa21/scratchpad",
+    "binary_path": "/data/tmp/cargo-target/release-perf/comprehensive-bench",
+    "binary_sha256": "4ea129ddafa436379e1400dd1d74bd6615087771feed01642f17b1c0a56f830f",
+    "binary_size_bytes": 21683408,
+    "binary_modified_unix_ts": 1785176219,
+    "binary_device_id": 66308,
+    "binary_inode": 49044721,
+    "cargo_lock_sha256": "08a0f12f525e47ccd608553d9b15bfae656169907423cafbd5d89657e1c4bbc4",
+    "cargo_feature_graph_sha256": "cabad4ac4ed19faa71d18c26dbc0150258e5258d9205252834762d22060bd4f2",
+    "cargo_feature_graph": "fsqlite-e2e v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-e2e)\n├── asupersync v0.3.9\n│   ├── aes-gcm feature \"default\"\n│   │   ├── aes-gcm v0.10.3\n│   │   │   ├── aead v0.5.2\n│   │   │   │   ├── generic-array v0.14.7\n│   │   │   │   │   └── typenum feature \"default\"\n│   │   │   │   │       └── typenum v1.20.0\n│   │   │   │   │   [build-dependencies]\n│   │   │   │   │   └── version_check feature \"default\"\n│   │   │   │   │       └── version_check v0.9.5\n│   │   │   │   └── crypto-common feature \"default\"\n│   │   │   │       └── crypto-common v0.1.7\n│   │   │   │           ├── generic-array feature \"default\"\n│   │   │   │           │   └── generic-array v0.14.7 (*)\n│   │   │   │           ├── generic-array feature \"more_lengths\"\n│   │   │   │           │   └── generic-array v0.14.7 (*)\n│   │   │   │           ├── typenum feature \"default\" (*)\n│   │   │   │           └── rand_core feature \"default\"\n│   │   │   │               └── rand_core v0.6.4\n│   │   │   │                   └── getrandom feature \"default\"\n│   │   │   │                       └── getrandom v0.2.17\n│   │   │   │                           ├── libc v0.2.186\n│   │   │   │                           └── cfg-if feature \"default\"\n│   │   │   │                               └── cfg-if v1.0.4\n│   │   │   ├── ghash v0.5.1\n│   │   │   │   ├── opaque-debug feature \"default\"\n│   │   │   │   │   └── opaque-debug v0.3.1\n│   │   │   │   └── polyval feature \"default\"\n│   │   │   │       └── polyval v0.6.2\n│   │   │   │           ├── universal-hash v0.5.1\n│   │   │   │           │   ├── subtle v2.6.1\n│   │   │   │           │   └── crypto-common feature \"default\" (*)\n│   │   │   │           ├── cfg-if feature \"default\" (*)\n│   │   │   │           ├── cpufeatures feature \"default\"\n│   │   │   │           │   └── cpufeatures v0.2.17\n│   │   │   │           └── opaque-debug feature \"default\" (*)\n│   │   │   ├── subtle v2.6.1\n│   │   │   ├── aes feature \"default\"\n│   │   │   │   └── aes v0.8.4\n│   │   │   │       ├── cfg-if feature \"default\" (*)\n│   │   │   │       ├── cipher feature \"default\"\n│   │   │   │       │   └── cipher v0.4.4\n│   │   │   │       │       ├── zeroize v1.8.2\n│   │   │   │       │       │   └── zeroize_derive feature \"default\"\n│   │   │   │       │       │       └── zeroize_derive v1.4.3 (proc-macro)\n│   │   │   │       │       │           ├── proc-macro2 feature \"default\"\n│   │   │   │       │       │           │   ├── proc-macro2 v1.0.106\n│   │   │   │       │       │           │   │   └── unicode-ident feature \"default\"\n│   │   │   │       │       │           │   │       └── unicode-ident v1.0.24\n│   │   │   │       │       │           │   └── proc-macro2 feature \"proc-macro\"\n│   │   │   │       │       │           │       └── proc-macro2 v1.0.106 (*)\n│   │   │   │       │       │           ├── quote feature \"default\"\n│   │   │   │       │       │           │   ├── quote v1.0.45\n│   │   │   │       │       │           │   │   └── proc-macro2 v1.0.106 (*)\n│   │   │   │       │       │           │   └── quote feature \"proc-macro\"\n│   │   │   │       │       │           │       ├── quote v1.0.45 (*)\n│   │   │   │       │       │           │       └── proc-macro2 feature \"proc-macro\" (*)\n│   │   │   │       │       │           ├── syn feature \"default\"\n│   │   │   │       │       │           │   ├── syn v2.0.117\n│   │   │   │       │       │           │   │   ├── proc-macro2 v1.0.106 (*)\n│   │   │   │       │       │           │   │   ├── quote v1.0.45 (*)\n│   │   │   │       │       │           │   │   └── unicode-ident feature \"default\" (*)\n│   │   │   │       │       │           │   ├── syn feature \"clone-impls\"\n│   │   │   │       │       │           │   │   └── syn v2.0.117 (*)\n│   │   │   │       │       │           │   ├── syn feature \"derive\"\n│   │   │   │       │       │           │   │   └── syn v2.0.117 (*)\n│   │   │   │       │       │           │   ├── syn feature \"parsing\"\n│   │   │   │       │       │           │   │   └── syn v2.0.117 (*)\n│   │   │   │       │       │           │   ├── syn feature \"printing\"\n│   │   │   │       │       │           │   │   └── syn v2.0.117 (*)\n│   │   │   │       │       │           │   └── syn feature \"proc-macro\"\n│   │   │   │       │       │           │       ├── syn v2.0.117 (*)\n│   │   │   │       │       │           │       ├── proc-macro2 feature \"proc-macro\" (*)\n│   │   │   │       │       │           │       └── quote feature \"proc-macro\" (*)\n│   │   │   │       │       │           ├── syn feature \"extra-traits\"\n│   │   │   │       │       │           │   └── syn v2.0.117 (*)\n│   │   │   │       │       │           ├── syn feature \"full\"\n│   │   │   │       │       │           │   └── syn v2.0.117 (*)\n│   │   │   │       │       │           └── syn feature \"visit\"\n│   │   │   │       │       │               └── syn v2.0.117 (*)\n│   │   │   │       │       ├── crypto-common feature \"default\" (*)\n│   │   │   │       │       └── inout feature \"default\"\n│   │   │   │       │           └── inout v0.1.4\n│   │   │   │       │               └── generic-array feature \"default\" (*)\n│   │   │   │       └── cpufeatures feature \"default\" (*)\n│   │   │   ├── cipher feature \"default\" (*)\n│   │   │   └── ctr feature \"default\"\n│   │   │       └── ctr v0.9.2\n│   │   │           └── cipher feature \"default\" (*)\n│   │   ├── aes-gcm feature \"aes\"\n│   │   │   └── aes-gcm v0.10.3 (*)\n│   │   ├── aes-gcm feature \"alloc\"\n│   │   │   ├── aes-gcm v0.10.3 (*)\n│   │   │   └── aead feature \"alloc\"\n│   │   │       └── aead v0.5.2 (*)\n│   │   └── aes-gcm feature \"getrandom\"\n│   │       ├── aes-gcm v0.10.3 (*)\n│   │       ├── aes-gcm feature \"rand_core\"\n│   │       │   ├── aes-gcm v0.10.3 (*)\n│   │       │   └── aead feature \"rand_core\"\n│   │       │       ├── aead v0.5.2 (*)\n│   │       │       └── crypto-common feature \"rand_core\"\n│   │       │           └── crypto-common v0.1.7 (*)\n│   │       └── aead feature \"getrandom\"\n│   │           ├── aead v0.5.2 (*)\n│   │           ├── aead feature \"rand_core\" (*)\n│   │           └── crypto-common feature \"getrandom\"\n│   │               ├── crypto-common v0.1.7 (*)\n│   │               ├── crypto-common feature \"rand_core\" (*)\n│   │               └── rand_core feature \"getrandom\"\n│   │                   └── rand_core v0.6.4 (*)\n│   ├── libc feature \"default\"\n│   │   ├── libc v0.2.186\n│   │   └── libc feature \"std\"\n│   │       └── libc v0.2.186\n│   ├── zeroize feature \"default\"\n│   │   ├── zeroize v1.8.2 (*)\n│   │   └── zeroize feature \"alloc\"\n│   │       └── zeroize v1.8.2 (*)\n│   ├── zeroize feature \"derive\"\n│   │   ├── zeroize v1.8.2 (*)\n│   │   └── zeroize feature \"zeroize_derive\"\n│   │       └── zeroize v1.8.2 (*)\n│   ├── subtle feature \"default\"\n│   │   ├── subtle v2.6.1\n│   │   ├── subtle feature \"i128\"\n│   │   │   └── subtle v2.6.1\n│   │   └── subtle feature \"std\"\n│   │       └── subtle v2.6.1\n│   ├── base64 feature \"default\"\n│   │   ├── base64 v0.22.1\n│   │   └── base64 feature \"std\"\n│   │       ├── base64 v0.22.1\n│   │       └── base64 feature \"alloc\"\n│   │           └── base64 v0.22.1\n│   ├── bincode-next feature \"default\"\n│   │   ├── bincode-next v3.1.1\n│   │   │   ├── rapidhash v4.4.1\n│   │   │   │   └── rustversion feature \"default\"\n│   │   │   │       └── rustversion v1.0.22 (proc-macro)\n│   │   │   ├── serde v1.0.228\n│   │   │   │   ├── serde_core feature \"result\"\n│   │   │   │   │   └── serde_core v1.0.228\n│   │   │   │   └── serde_derive feature \"default\"\n│   │   │   │       └── serde_derive v1.0.228 (proc-macro)\n│   │   │   │           ├── proc-macro2 feature \"proc-macro\" (*)\n│   │   │   │           ├── quote feature \"proc-macro\" (*)\n│   │   │   │           ├── syn feature \"clone-impls\" (*)\n│   │   │   │           ├── syn feature \"derive\" (*)\n│   │   │   │           ├── syn feature \"parsing\" (*)\n│   │   │   │           ├── syn feature \"printing\" (*)\n│   │   │   │           └── syn feature \"proc-macro\" (*)\n│   │   │   ├── bincode_derive-next feature \"default\"\n│   │   │   │   └── bincode_derive-next v3.1.1 (proc-macro)\n│   │   │   │       └── virtue-next feature \"default\"\n│   │   │   │           └── virtue-next v0.1.3\n│   │   │   ├── pastey feature \"default\"\n│   │   │   │   └── pastey v0.2.3 (proc-macro)\n│   │   │   └── unty-next feature \"default\"\n│   │   │       └── unty-next v0.1.2\n│   │   ├── bincode-next feature \"derive\"\n│   │   │   └── bincode-next v3.1.1 (*)\n│   │   ├── bincode-next feature \"simd\"\n│   │   │   └── bincode-next v3.1.1 (*)\n│   │   └── bincode-next feature \"std\"\n│   │       ├── bincode-next v3.1.1 (*)\n│   │       ├── bincode-next feature \"alloc\"\n│   │       │   ├── bincode-next v3.1.1 (*)\n│   │       │   └── serde feature \"alloc\"\n│   │       │       ├── serde v1.0.228 (*)\n│   │       │       └── serde_core feature \"alloc\"\n│   │       │           └── serde_core v1.0.228\n│   │       └── serde feature \"std\"\n│   │           ├── serde v1.0.228 (*)\n│   │           └── serde_core feature \"std\"\n│   │               └── serde_core v1.0.228\n│   ├── bincode-next feature \"serde\"\n│   │   └── bincode-next v3.1.1 (*)\n│   ├── serde feature \"default\"\n│   │   ├── serde v1.0.228 (*)\n│   │   └── serde feature \"std\" (*)\n│   ├── serde feature \"derive\"\n│   │   ├── serde v1.0.228 (*)\n│   │   └── serde feature \"serde_derive\"\n│   │       └── serde v1.0.228 (*)\n│   ├── chacha20poly1305 feature \"default\"\n│   │   ├── chacha20poly1305 v0.10.1\n│   │   │   ├── aead v0.5.2 (*)\n│   │   │   ├── zeroize v1.8.2 (*)\n│   │   │   ├── cipher feature \"default\" (*)\n│   │   │   ├── chacha20 feature \"default\"\n│   │   │   │   └── chacha20 v0.9.1\n│   │   │   │       ├── cfg-if feature \"default\" (*)\n│   │   │   │       ├── cipher feature \"default\" (*)\n│   │   │   │       └── cpufeatures feature \"default\" (*)\n│   │   │   ├── chacha20 feature \"zeroize\"\n│   │   │   │   ├── chacha20 v0.9.1 (*)\n│   │   │   │   └── cipher feature \"zeroize\"\n│   │   │   │       └── cipher v0.4.4 (*)\n│   │   │   └── poly1305 feature \"default\"\n│   │   │       └── poly1305 v0.8.0\n│   │   │           ├── universal-hash v0.5.1 (*)\n│   │   │           ├── cpufeatures feature \"default\" (*)\n│   │   │           └── opaque-debug feature \"default\" (*)\n│   │   ├── chacha20poly1305 feature \"alloc\"\n│   │   │   ├── chacha20poly1305 v0.10.1 (*)\n│   │   │   └── aead feature \"alloc\" (*)\n│   │   └── chacha20poly1305 feature \"getrandom\"\n│   │       ├── chacha20poly1305 v0.10.1 (*)\n│   │       ├── aead feature \"getrandom\" (*)\n│   │       └── chacha20poly1305 feature \"rand_core\"\n│   │           ├── chacha20poly1305 v0.10.1 (*)\n│   │           └── aead feature \"rand_core\" (*)\n│   ├── crc32fast feature \"default\"\n│   │   ├── crc32fast v1.5.0\n│   │   │   └── cfg-if feature \"default\" (*)\n│   │   └── crc32fast feature \"std\"\n│   │       └── crc32fast v1.5.0 (*)\n│   ├── crossbeam-deque feature \"default\"\n│   │   ├── crossbeam-deque v0.8.6\n│   │   │   ├── crossbeam-epoch v0.9.20\n│   │   │   │   └── crossbeam-utils v0.8.21\n│   │   │   └── crossbeam-utils v0.8.21\n│   │   └── crossbeam-deque feature \"std\"\n│   │       ├── crossbeam-deque v0.8.6 (*)\n│   │       ├── crossbeam-epoch feature \"std\"\n│   │       │   ├── crossbeam-epoch v0.9.20 (*)\n│   │       │   ├── crossbeam-epoch feature \"alloc\"\n│   │       │   │   └── crossbeam-epoch v0.9.20 (*)\n│   │       │   └── crossbeam-utils feature \"std\"\n│   │       │       └── crossbeam-utils v0.8.21\n│   │       └── crossbeam-utils feature \"std\" (*)\n│   ├── crossbeam-queue feature \"default\"\n│   │   ├── crossbeam-queue v0.3.12\n│   │   │   └── crossbeam-utils v0.8.21\n│   │   └── crossbeam-queue feature \"std\"\n│   │       ├── crossbeam-queue v0.3.12 (*)\n│   │       ├── crossbeam-utils feature \"std\" (*)\n│   │       └── crossbeam-queue feature \"alloc\"\n│   │           └── crossbeam-queue v0.3.12 (*)\n│   ├── franken-decision feature \"default\"\n│   │   └── franken-decision v0.3.9\n│   │       ├── serde feature \"default\" (*)\n│   │       ├── serde feature \"derive\" (*)\n│   │       ├── franken-evidence feature \"default\"\n│   │       │   └── franken-evidence v0.3.9\n│   │       │       ├── serde feature \"default\" (*)\n│   │       │       ├── serde feature \"derive\" (*)\n│   │       │       └── serde_json feature \"default\"\n│   │       │           ├── serde_json v1.0.150\n│   │       │           │   ├── memchr v2.8.2\n│   │       │           │   ├── serde_core v1.0.228\n│   │       │           │   ├── indexmap feature \"default\"\n│   │       │           │   │   ├── indexmap v2.14.0\n│   │       │           │   │   │   ├── equivalent v1.0.2\n│   │       │           │   │   │   └── hashbrown v0.17.1\n│   │       │           │   │   │       ├── equivalent v1.0.2\n│   │       │           │   │   │       ├── foldhash v0.2.0\n│   │       │           │   │   │       ├── serde_core v1.0.228\n│   │       │           │   │   │       └── allocator-api2 feature \"alloc\"\n│   │       │           │   │   │           └── allocator-api2 v0.2.21\n│   │       │           │   │   └── indexmap feature \"std\"\n│   │       │           │   │       └── indexmap v2.14.0 (*)\n│   │       │           │   ├── itoa feature \"default\"\n│   │       │           │   │   └── itoa v1.0.18\n│   │       │           │   └── zmij feature \"default\"\n│   │       │           │       └── zmij v1.0.21\n│   │       │           └── serde_json feature \"std\"\n│   │       │               ├── serde_json v1.0.150 (*)\n│   │       │               ├── serde_core feature \"std\" (*)\n│   │       │               └── memchr feature \"std\"\n│   │       │                   ├── memchr v2.8.2\n│   │       │                   └── memchr feature \"alloc\"\n│   │       │                       └── memchr v2.8.2\n│   │       └── franken-kernel feature \"default\"\n│   │           └── franken-kernel v0.3.9\n│   │               ├── serde feature \"default\" (*)\n│   │               └── serde feature \"derive\" (*)\n│   ├── franken-evidence feature \"default\" (*)\n│   ├── serde_json feature \"default\" (*)\n│   ├── hashbrown feature \"default\"\n│   │   ├── hashbrown v0.17.1 (*)\n│   │   ├── hashbrown feature \"allocator-api2\"\n│   │   │   └── hashbrown v0.17.1 (*)\n│   │   ├── hashbrown feature \"default-hasher\"\n│   │   │   └── hashbrown v0.17.1 (*)\n│   │   ├── hashbrown feature \"equivalent\"\n│   │   │   └── hashbrown v0.17.1 (*)\n│   │   ├── hashbrown feature \"inline-more\"\n│   │   │   └── hashbrown v0.17.1 (*)\n│   │   └── hashbrown feature \"raw-entry\"\n│   │       └── hashbrown v0.17.1 (*)\n│   ├── memchr feature \"default\"\n│   │   ├── memchr v2.8.2\n│   │   └── memchr feature \"std\" (*)\n│   ├── franken-kernel feature \"default\" (*)\n│   ├── futures-lite feature \"default\"\n│   │   ├── futures-lite v2.6.1\n│   │   │   ├── fastrand v2.4.1\n│   │   │   ├── futures-core v0.3.32\n│   │   │   ├── futures-io feature \"default\"\n│   │   │   │   ├── futures-io v0.3.32\n│   │   │   │   └── futures-io feature \"std\"\n│   │   │   │       └── futures-io v0.3.32\n│   │   │   ├── parking feature \"default\"\n│   │   │   │   └── parking v2.2.1\n│   │   │   └── pin-project-lite feature \"default\"\n│   │   │       └── pin-project-lite v0.2.17\n│   │   ├── futures-lite feature \"race\"\n│   │   │   ├── futures-lite v2.6.1 (*)\n│   │   │   └── futures-lite feature \"fastrand\"\n│   │   │       └── futures-lite v2.6.1 (*)\n│   │   └── futures-lite feature \"std\"\n│   │       ├── futures-lite v2.6.1 (*)\n│   │       ├── futures-lite feature \"alloc\"\n│   │       │   └── futures-lite v2.6.1 (*)\n│   │       ├── futures-lite feature \"fastrand\" (*)\n│   │       ├── futures-lite feature \"futures-io\"\n│   │       │   └── futures-lite v2.6.1 (*)\n│   │       ├── futures-lite feature \"parking\"\n│   │       │   └── futures-lite v2.6.1 (*)\n│   │       └── fastrand feature \"std\"\n│   │           ├── fastrand v2.4.1\n│   │           └── fastrand feature \"alloc\"\n│   │               └── fastrand v2.4.1\n│   ├── getrandom feature \"default\"\n│   │   └── getrandom v0.4.3\n│   │       ├── libc v0.2.186\n│   │       ├── cfg-if feature \"default\" (*)\n│   │       └── rand_core feature \"default\"\n│   │           └── rand_core v0.10.1\n│   ├── hex feature \"default\"\n│   │   ├── hex v0.4.3\n│   │   └── hex feature \"std\"\n│   │       ├── hex v0.4.3\n│   │       └── hex feature \"alloc\"\n│   │           └── hex v0.4.3\n│   ├── hkdf feature \"default\"\n│   │   └── hkdf v0.13.0\n│   │       └── hmac feature \"default\"\n│   │           └── hmac v0.13.0\n│   │               ├── digest feature \"default\"\n│   │               │   ├── digest v0.11.2\n│   │               │   │   ├── block-buffer feature \"default\"\n│   │               │   │   │   └── block-buffer v0.12.0\n│   │               │   │   │       └── hybrid-array feature \"default\"\n│   │               │   │   │           └── hybrid-array v0.4.10\n│   │               │   │   │               ├── typenum feature \"const-generics\"\n│   │               │   │   │               │   └── typenum v1.20.0\n│   │               │   │   │               └── typenum feature \"default\" (*)\n│   │               │   │   ├── const-oid feature \"default\"\n│   │               │   │   │   └── const-oid v0.10.2\n│   │               │   │   ├── crypto-common feature \"default\"\n│   │               │   │   │   └── crypto-common v0.2.2\n│   │               │   │   │       ├── getrandom feature \"default\" (*)\n│   │               │   │   │       ├── getrandom feature \"sys_rng\"\n│   │               │   │   │       │   └── getrandom v0.4.3 (*)\n│   │               │   │   │       ├── rand_core feature \"default\" (*)\n│   │               │   │   │       └── hybrid-array feature \"default\" (*)\n│   │               │   │   └── ctutils feature \"default\"\n│   │               │   │       └── ctutils v0.4.2\n│   │               │   │           └── cmov feature \"default\"\n│   │               │   │               └── cmov v0.5.3\n│   │               │   └── digest feature \"block-api\"\n│   │               │       └── digest v0.11.2 (*)\n│   │               └── digest feature \"mac\"\n│   │                   └── digest v0.11.2 (*)\n│   ├── hmac feature \"default\" (*)\n│   ├── nix feature \"default\"\n│   │   └── nix v0.31.3\n│   │       ├── cfg-if feature \"default\" (*)\n│   │       ├── libc feature \"default\" (*)\n│   │       ├── libc feature \"extra_traits\"\n│   │       │   └── libc v0.2.186\n│   │       ├── bitflags feature \"default\"\n│   │       │   └── bitflags v2.13.0\n│   │       │       └── serde_core v1.0.228\n│   │       └── memoffset feature \"default\"\n│   │           └── memoffset v0.9.1\n│   │               [build-dependencies]\n│   │               └── autocfg feature \"default\"\n│   │                   └── autocfg v1.5.0\n│   │       [build-dependencies]\n│   │       └── cfg_aliases feature \"default\"\n│   │           └── cfg_aliases v0.2.1\n│   ├── nix feature \"fs\"\n│   │   └── nix v0.31.3 (*)\n│   ├── nix feature \"net\"\n│   │   ├── nix v0.31.3 (*)\n│   │   └── nix feature \"socket\"\n│   │       ├── nix v0.31.3 (*)\n│   │       └── nix feature \"memoffset\"\n│   │           └── nix v0.31.3 (*)\n│   ├── nix feature \"poll\"\n│   │   └── nix v0.31.3 (*)\n│   ├── nix feature \"signal\"\n│   │   ├── nix v0.31.3 (*)\n│   │   └── nix feature \"process\"\n│   │       └── nix v0.31.3 (*)\n│   ├── nix feature \"socket\" (*)\n│   ├── nix feature \"uio\"\n│   │   └── nix v0.31.3 (*)\n│   ├── nix feature \"user\"\n│   │   ├── nix v0.31.3 (*)\n│   │   └── nix feature \"feature\"\n│   │       └── nix v0.31.3 (*)\n│   ├── nkeys feature \"default\"\n│   │   └── nkeys v0.4.5\n│   │       ├── ed25519 v2.2.3\n│   │       │   └── signature v2.2.0\n│   │       │       └── digest v0.10.7\n│   │       │           ├── subtle v2.6.1\n│   │       │           ├── crypto-common feature \"default\" (*)\n│   │       │           └── block-buffer feature \"default\"\n│   │       │               └── block-buffer v0.10.4\n│   │       │                   └── generic-array feature \"default\" (*)\n│   │       ├── data-encoding feature \"default\"\n│   │       │   ├── data-encoding v2.10.0\n│   │       │   └── data-encoding feature \"std\"\n│   │       │       ├── data-encoding v2.10.0\n│   │       │       └── data-encoding feature \"alloc\"\n│   │       │           └── data-encoding v2.10.0\n│   │       ├── ed25519-dalek feature \"digest\"\n│   │       │   ├── ed25519-dalek v2.2.0\n│   │       │   │   ├── ed25519 v2.2.3 (*)\n│   │       │   │   ├── sha2 v0.10.9\n│   │       │   │   │   ├── cfg-if feature \"default\" (*)\n│   │       │   │   │   ├── cpufeatures feature \"default\" (*)\n│   │       │   │   │   └── digest feature \"default\"\n│   │       │   │   │       ├── digest v0.10.7 (*)\n│   │       │   │   │       └── digest feature \"core-api\"\n│   │       │   │   │           ├── digest v0.10.7 (*)\n│   │       │   │   │           └── digest feature \"block-buffer\"\n│   │       │   │   │               └── digest v0.10.7 (*)\n│   │       │   │   ├── signature v2.2.0 (*)\n│   │       │   │   ├── subtle v2.6.1\n│   │       │   │   └── curve25519-dalek feature \"digest\"\n│   │       │   │       └── curve25519-dalek v4.1.3\n│   │       │   │           ├── digest v0.10.7 (*)\n│   │       │   │           ├── subtle v2.6.1\n│   │       │   │           ├── cfg-if feature \"default\" (*)\n│   │       │   │           ├── cpufeatures feature \"default\" (*)\n│   │       │   │           └── curve25519-dalek-derive feature \"default\"\n│   │       │   │               └── curve25519-dalek-derive v0.1.1 (proc-macro)\n│   │       │   │                   ├── proc-macro2 feature \"default\" (*)\n│   │       │   │                   ├── quote feature \"default\" (*)\n│   │       │   │                   ├── syn feature \"default\" (*)\n│   │       │   │                   └── syn feature \"full\" (*)\n│   │       │   │           [build-dependencies]\n│   │       │   │           └── rustc_version feature \"default\"\n│   │       │   │               └── rustc_version v0.4.1\n│   │       │   │                   └── semver feature \"default\"\n│   │       │   │                       ├── semver v1.0.28\n│   │       │   │                       └── semver feature \"std\"\n│   │       │   │                           └── semver v1.0.28\n│   │       │   ├── signature feature \"digest\"\n│   │       │   │   └── signature v2.2.0 (*)\n│   │       │   └── ed25519-dalek feature \"signature\"\n│   │       │       └── ed25519-dalek v2.2.0 (*)\n│   │       ├── log feature \"default\"\n│   │       │   └── log v0.4.29\n│   │       ├── rand feature \"default\"\n│   │       │   ├── rand v0.8.6\n│   │       │   │   ├── libc v0.2.186\n│   │       │   │   ├── rand_chacha v0.3.1\n│   │       │   │   │   ├── rand_core feature \"default\" (*)\n│   │       │   │   │   └── ppv-lite86 feature \"simd\"\n│   │       │   │   │       └── ppv-lite86 v0.2.21\n│   │       │   │   │           ├── zerocopy feature \"default\"\n│   │       │   │   │           │   └── zerocopy v0.8.48\n│   │       │   │   │           └── zerocopy feature \"simd\"\n│   │       │   │   │               └── zerocopy v0.8.48\n│   │       │   │   └── rand_core feature \"default\" (*)\n│   │       │   ├── rand feature \"std\"\n│   │       │   │   ├── rand v0.8.6 (*)\n│   │       │   │   ├── rand_core feature \"std\"\n│   │       │   │   │   ├── rand_core v0.6.4 (*)\n│   │       │   │   │   ├── rand_core feature \"alloc\"\n│   │       │   │   │   │   └── rand_core v0.6.4 (*)\n│   │       │   │   │   ├── rand_core feature \"getrandom\" (*)\n│   │       │   │   │   └── getrandom feature \"std\"\n│   │       │   │   │       └── getrandom v0.2.17 (*)\n│   │       │   │   ├── rand feature \"alloc\"\n│   │       │   │   │   ├── rand v0.8.6 (*)\n│   │       │   │   │   └── rand_core feature \"alloc\" (*)\n│   │       │   │   ├── rand feature \"getrandom\"\n│   │       │   │   │   ├── rand v0.8.6 (*)\n│   │       │   │   │   └── rand_core feature \"getrandom\" (*)\n│   │       │   │   ├── rand feature \"libc\"\n│   │       │   │   │   └── rand v0.8.6 (*)\n│   │       │   │   ├── rand feature \"rand_chacha\"\n│   │       │   │   │   └── rand v0.8.6 (*)\n│   │       │   │   └── rand_chacha feature \"std\"\n│   │       │   │       ├── rand_chacha v0.3.1 (*)\n│   │       │   │       └── ppv-lite86 feature \"std\"\n│   │       │   │           └── ppv-lite86 v0.2.21 (*)\n│   │       │   └── rand feature \"std_rng\"\n│   │       │       ├── rand v0.8.6 (*)\n│   │       │       └── rand feature \"rand_chacha\" (*)\n│   │       └── signatory feature \"default\"\n│   │           ├── signatory v0.27.1\n│   │           │   ├── rand_core feature \"default\" (*)\n│   │           │   ├── zeroize feature \"default\" (*)\n│   │           │   ├── signature feature \"default\"\n│   │           │   │   └── signature v2.2.0 (*)\n│   │           │   ├── pkcs8 feature \"alloc\"\n│   │           │   │   ├── pkcs8 v0.10.2\n│   │           │   │   │   ├── der feature \"default\"\n│   │           │   │   │   │   └── der v0.7.10\n│   │           │   │   │   │       ├── zeroize v1.8.2 (*)\n│   │           │   │   │   │       ├── const-oid feature \"default\"\n│   │           │   │   │   │       │   └── const-oid v0.9.6\n│   │           │   │   │   │       ├── pem-rfc7468 feature \"alloc\"\n│   │           │   │   │   │       │   ├── pem-rfc7468 v0.7.0\n│   │           │   │   │   │       │   │   └── base64ct feature \"default\"\n│   │           │   │   │   │       │   │       └── base64ct v1.8.3\n│   │           │   │   │   │       │   └── base64ct feature \"alloc\"\n│   │           │   │   │   │       │       └── base64ct v1.8.3\n│   │           │   │   │   │       └── pem-rfc7468 feature \"default\"\n│   │           │   │   │   │           └── pem-rfc7468 v0.7.0 (*)\n│   │           │   │   │   ├── der feature \"oid\"\n│   │           │   │   │   │   └── der v0.7.10 (*)\n│   │           │   │   │   └── spki feature \"default\"\n│   │           │   │   │       └── spki v0.7.3\n│   │           │   │   │           ├── der feature \"default\" (*)\n│   │           │   │   │           └── der feature \"oid\" (*)\n│   │           │   │   ├── der feature \"alloc\"\n│   │           │   │   │   ├── der v0.7.10 (*)\n│   │           │   │   │   └── zeroize feature \"alloc\" (*)\n│   │           │   │   ├── der feature \"zeroize\"\n│   │           │   │   │   └── der v0.7.10 (*)\n│   │           │   │   └── spki feature \"alloc\"\n│   │           │   │       ├── spki v0.7.3 (*)\n│   │           │   │       └── der feature \"alloc\" (*)\n│   │           │   ├── pkcs8 feature \"default\"\n│   │           │   │   └── pkcs8 v0.10.2 (*)\n│   │           │   └── pkcs8 feature \"pem\"\n│   │           │       ├── pkcs8 v0.10.2 (*)\n│   │           │       ├── pkcs8 feature \"alloc\" (*)\n│   │           │       ├── der feature \"pem\"\n│   │           │       │   ├── der v0.7.10 (*)\n│   │           │       │   ├── der feature \"alloc\" (*)\n│   │           │       │   └── der feature \"zeroize\" (*)\n│   │           │       └── spki feature \"pem\"\n│   │           │           ├── spki v0.7.3 (*)\n│   │           │           ├── der feature \"pem\" (*)\n│   │           │           └── spki feature \"alloc\" (*)\n│   │           └── signatory feature \"std\"\n│   │               ├── signatory v0.27.1 (*)\n│   │               ├── rand_core feature \"std\" (*)\n│   │               ├── signature feature \"std\"\n│   │               │   ├── signature v2.2.0 (*)\n│   │               │   └── signature feature \"alloc\"\n│   │               │       └── signature v2.2.0 (*)\n│   │               └── pkcs8 feature \"std\"\n│   │                   ├── pkcs8 v0.10.2 (*)\n│   │                   ├── pkcs8 feature \"alloc\" (*)\n│   │                   ├── der feature \"std\"\n│   │                   │   ├── der v0.7.10 (*)\n│   │                   │   └── der feature \"alloc\" (*)\n│   │                   └── spki feature \"std\"\n│   │                       ├── spki v0.7.3 (*)\n│   │                       ├── der feature \"std\" (*)\n│   │                       └── spki feature \"alloc\" (*)\n│   ├── parking_lot feature \"default\"\n│   │   └── parking_lot v0.12.5\n│   │       ├── lock_api feature \"default\"\n│   │       │   ├── lock_api v0.4.14\n│   │       │   │   └── scopeguard v1.2.0\n│   │       │   └── lock_api feature \"atomic_usize\"\n│   │       │       └── lock_api v0.4.14 (*)\n│   │       └── parking_lot_core feature \"default\"\n│   │           └── parking_lot_core v0.9.12\n│   │               ├── cfg-if feature \"default\" (*)\n│   │               ├── libc feature \"default\" (*)\n│   │               └── smallvec feature \"default\"\n│   │                   └── smallvec v1.15.2\n│   ├── smallvec feature \"default\" (*)\n│   ├── pin-project feature \"default\"\n│   │   └── pin-project v1.1.11\n│   │       └── pin-project-internal feature \"default\"\n│   │           └── pin-project-internal v1.1.11 (proc-macro)\n│   │               ├── proc-macro2 feature \"default\" (*)\n│   │               ├── quote feature \"default\" (*)\n│   │               ├── syn feature \"clone-impls\" (*)\n│   │               ├── syn feature \"full\" (*)\n│   │               ├── syn feature \"parsing\" (*)\n│   │               ├── syn feature \"printing\" (*)\n│   │               ├── syn feature \"proc-macro\" (*)\n│   │               └── syn feature \"visit-mut\"\n│   │                   └── syn v2.0.117 (*)\n│   ├── polling feature \"default\"\n│   │   └── polling v3.11.0\n│   │       ├── cfg-if feature \"default\" (*)\n│   │       ├── rustix feature \"event\"\n│   │       │   └── rustix v1.1.4\n│   │       │       ├── bitflags v2.13.0 (*)\n│   │       │       ├── linux-raw-sys feature \"auxvec\"\n│   │       │       │   └── linux-raw-sys v0.12.1\n│   │       │       ├── linux-raw-sys feature \"elf\"\n│   │       │       │   └── linux-raw-sys v0.12.1\n│   │       │       ├── linux-raw-sys feature \"errno\"\n│   │       │       │   └── linux-raw-sys v0.12.1\n│   │       │       ├── linux-raw-sys feature \"general\"\n│   │       │       │   └── linux-raw-sys v0.12.1\n│   │       │       ├── linux-raw-sys feature \"ioctl\"\n│   │       │       │   └── linux-raw-sys v0.12.1\n│   │       │       └── linux-raw-sys feature \"no_std\"\n│   │       │           └── linux-raw-sys v0.12.1\n│   │       ├── rustix feature \"fs\"\n│   │       │   └── rustix v1.1.4 (*)\n│   │       ├── rustix feature \"pipe\"\n│   │       │   └── rustix v1.1.4 (*)\n│   │       ├── rustix feature \"process\"\n│   │       │   ├── rustix v1.1.4 (*)\n│   │       │   └── linux-raw-sys feature \"prctl\"\n│   │       │       └── linux-raw-sys v0.12.1\n│   │       ├── rustix feature \"std\"\n│   │       │   ├── rustix v1.1.4 (*)\n│   │       │   ├── bitflags feature \"std\"\n│   │       │   │   └── bitflags v2.13.0 (*)\n│   │       │   └── rustix feature \"alloc\"\n│   │       │       └── rustix v1.1.4 (*)\n│   │       └── rustix feature \"time\"\n│   │           └── rustix v1.1.4 (*)\n│   ├── prost feature \"default\"\n│   │   ├── prost v0.14.3\n│   │   │   ├── bytes v1.11.1\n│   │   │   └── prost-derive feature \"default\"\n│   │   │       └── prost-derive v0.14.3 (proc-macro)\n│   │   │           ├── proc-macro2 feature \"default\" (*)\n│   │   │           ├── quote feature \"default\" (*)\n│   │   │           ├── syn feature \"default\" (*)\n│   │   │           ├── syn feature \"extra-traits\" (*)\n│   │   │           ├── anyhow feature \"default\"\n│   │   │           │   ├── anyhow v1.0.103\n│   │   │           │   └── anyhow feature \"std\"\n│   │   │           │       └── anyhow v1.0.103\n│   │   │           └── itertools feature \"default\"\n│   │   │               ├── itertools v0.13.0\n│   │   │               │   └── either v1.15.0\n│   │   │               └── itertools feature \"use_std\"\n│   │   │                   ├── itertools v0.13.0 (*)\n│   │   │                   ├── itertools feature \"use_alloc\"\n│   │   │                   │   └── itertools v0.13.0 (*)\n│   │   │                   └── either feature \"use_std\"\n│   │   │                       ├── either v1.15.0\n│   │   │                       └── either feature \"std\"\n│   │   │                           └── either v1.15.0\n│   │   ├── prost feature \"derive\"\n│   │   │   └── prost v0.14.3 (*)\n│   │   └── prost feature \"std\"\n│   │       └── prost v0.14.3 (*)\n│   ├── rmp-serde feature \"default\"\n│   │   └── rmp-serde v1.3.1\n│   │       ├── serde feature \"default\" (*)\n│   │       └── rmp feature \"default\"\n│   │           ├── rmp v0.8.15\n│   │           │   └── num-traits v0.2.19\n│   │           │       [build-dependencies]\n│   │           │       └── autocfg feature \"default\" (*)\n│   │           └── rmp feature \"std\"\n│   │               ├── rmp v0.8.15 (*)\n│   │               └── num-traits feature \"std\"\n│   │                   └── num-traits v0.2.19 (*)\n│   ├── semver feature \"default\"\n│   │   ├── semver v1.0.28\n│   │   │   └── serde_core v1.0.228\n│   │   └── semver feature \"std\"\n│   │       └── semver v1.0.28 (*)\n│   ├── semver feature \"serde\"\n│   │   └── semver v1.0.28 (*)\n│   ├── sha1 feature \"default\"\n│   │   ├── sha1 v0.11.0\n│   │   │   ├── cfg-if feature \"default\" (*)\n│   │   │   ├── digest feature \"default\" (*)\n│   │   │   └── cpufeatures feature \"default\"\n│   │   │       └── cpufeatures v0.3.0\n│   │   ├── sha1 feature \"alloc\"\n│   │   │   ├── sha1 v0.11.0 (*)\n│   │   │   └── digest feature \"alloc\"\n│   │   │       └── digest v0.11.2 (*)\n│   │   └── sha1 feature \"oid\"\n│   │       ├── sha1 v0.11.0 (*)\n│   │       └── digest feature \"oid\"\n│   │           └── digest v0.11.2 (*)\n│   ├── sha2 feature \"default\"\n│   │   ├── sha2 v0.11.0\n│   │   │   ├── cfg-if feature \"default\" (*)\n│   │   │   ├── digest feature \"default\" (*)\n│   │   │   └── cpufeatures feature \"default\" (*)\n│   │   ├── sha2 feature \"alloc\"\n│   │   │   ├── sha2 v0.11.0 (*)\n│   │   │   └── digest feature \"alloc\" (*)\n│   │   └── sha2 feature \"oid\"\n│   │       ├── sha2 v0.11.0 (*)\n│   │       └── digest feature \"oid\" (*)\n│   ├── signal-hook feature \"default\"\n│   │   ├── signal-hook v0.4.4\n│   │   │   ├── libc feature \"default\" (*)\n│   │   │   └── signal-hook-registry feature \"default\"\n│   │   │       └── signal-hook-registry v1.4.8\n│   │   │           ├── libc feature \"default\" (*)\n│   │   │           └── errno feature \"default\"\n│   │   │               ├── errno v0.3.14\n│   │   │               │   └── libc v0.2.186\n│   │   │               └── errno feature \"std\"\n│   │   │                   ├── errno v0.3.14 (*)\n│   │   │                   └── libc feature \"std\" (*)\n│   │   ├── signal-hook feature \"channel\"\n│   │   │   └── signal-hook v0.4.4 (*)\n│   │   └── signal-hook feature \"iterator\"\n│   │       ├── signal-hook v0.4.4 (*)\n│   │       └── signal-hook feature \"channel\" (*)\n│   ├── slab feature \"default\"\n│   │   ├── slab v0.4.12\n│   │   └── slab feature \"std\"\n│   │       └── slab v0.4.12\n│   ├── socket2 feature \"all\"\n│   │   └── socket2 v0.6.3\n│   │       └── libc feature \"default\" (*)\n│   ├── socket2 feature \"default\"\n│   │   └── socket2 v0.6.3 (*)\n│   ├── sysinfo feature \"default\"\n│   │   ├── sysinfo v0.39.5\n│   │   │   ├── libc feature \"default\" (*)\n│   │   │   └── memchr feature \"default\" (*)\n│   │   ├── sysinfo feature \"component\"\n│   │   │   └── sysinfo v0.39.5 (*)\n│   │   ├── sysinfo feature \"disk\"\n│   │   │   └── sysinfo v0.39.5 (*)\n│   │   ├── sysinfo feature \"network\"\n│   │   │   └── sysinfo v0.39.5 (*)\n│   │   ├── sysinfo feature \"system\"\n│   │   │   └── sysinfo v0.39.5 (*)\n│   │   └── sysinfo feature \"user\"\n│   │       └── sysinfo v0.39.5 (*)\n│   ├── tempfile feature \"default\"\n│   │   ├── tempfile v3.27.0\n│   │   │   ├── getrandom v0.4.3 (*)\n│   │   │   ├── fastrand feature \"default\"\n│   │   │   │   ├── fastrand v2.4.1\n│   │   │   │   └── fastrand feature \"std\" (*)\n│   │   │   ├── rustix feature \"default\"\n│   │   │   │   ├── rustix v1.1.4 (*)\n│   │   │   │   └── rustix feature \"std\" (*)\n│   │   │   ├── rustix feature \"fs\" (*)\n│   │   │   └── once_cell feature \"std\"\n│   │   │       ├── once_cell v1.21.4\n│   │   │       └── once_cell feature \"alloc\"\n│   │   │           ├── once_cell v1.21.4\n│   │   │           └── once_cell feature \"race\"\n│   │   │               └── once_cell v1.21.4\n│   │   └── tempfile feature \"getrandom\"\n│   │       └── tempfile v3.27.0 (*)\n│   ├── thiserror feature \"default\"\n│   │   ├── thiserror v2.0.18\n│   │   │   └── thiserror-impl feature \"default\"\n│   │   │       └── thiserror-impl v2.0.18 (proc-macro)\n│   │   │           ├── proc-macro2 feature \"default\" (*)\n│   │   │           ├── quote feature \"default\" (*)\n│   │   │           └── syn feature \"default\" (*)\n│   │   └── thiserror feature \"std\"\n│   │       └── thiserror v2.0.18 (*)\n│   ├── unicode-normalization feature \"default\"\n│   │   ├── unicode-normalization v0.1.25\n│   │   │   ├── tinyvec feature \"alloc\"\n│   │   │   │   ├── tinyvec v1.12.0\n│   │   │   │   │   └── tinyvec_macros feature \"default\"\n│   │   │   │   │       └── tinyvec_macros v0.1.1\n│   │   │   │   └── tinyvec feature \"tinyvec_macros\"\n│   │   │   │       └── tinyvec v1.12.0 (*)\n│   │   │   └── tinyvec feature \"default\"\n│   │   │       └── tinyvec v1.12.0 (*)\n│   │   └── unicode-normalization feature \"std\"\n│   │       └── unicode-normalization v0.1.25 (*)\n│   └── xattr feature \"default\"\n│       ├── xattr v1.6.1\n│       │   ├── rustix feature \"fs\" (*)\n│       │   └── rustix feature \"std\" (*)\n│       └── xattr feature \"unsupported\"\n│           └── xattr v1.6.1 (*)\n├── fsqlite-core v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-core)\n│   ├── asupersync v0.3.9 (*)\n│   ├── fsqlite-btree v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-btree)\n│   │   ├── fsqlite-pager v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-pager)\n│   │   │   ├── asupersync v0.3.9 (*)\n│   │   │   ├── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types)\n│   │   │   │   ├── asupersync v0.3.9 (*)\n│   │   │   │   ├── serde feature \"default\" (*)\n│   │   │   │   ├── serde feature \"derive\" (*)\n│   │   │   │   ├── serde feature \"rc\"\n│   │   │   │   │   ├── serde v1.0.228 (*)\n│   │   │   │   │   └── serde_core feature \"rc\"\n│   │   │   │   │       └── serde_core v1.0.228\n│   │   │   │   ├── memchr feature \"default\" (*)\n│   │   │   │   ├── bitflags feature \"default\" (*)\n│   │   │   │   ├── bitflags feature \"serde\"\n│   │   │   │   │   ├── bitflags v2.13.0 (*)\n│   │   │   │   │   └── bitflags feature \"serde_core\"\n│   │   │   │   │       └── bitflags v2.13.0 (*)\n│   │   │   │   ├── parking_lot feature \"default\" (*)\n│   │   │   │   ├── smallvec feature \"default\" (*)\n│   │   │   │   ├── blake3 feature \"default\"\n│   │   │   │   │   ├── blake3 v1.8.5\n│   │   │   │   │   │   ├── arrayvec v0.7.6\n│   │   │   │   │   │   ├── constant_time_eq v0.4.2\n│   │   │   │   │   │   ├── cfg-if feature \"default\" (*)\n│   │   │   │   │   │   ├── cpufeatures feature \"default\" (*)\n│   │   │   │   │   │   └── arrayref feature \"default\"\n│   │   │   │   │   │       └── arrayref v0.3.9\n│   │   │   │   │   │   [build-dependencies]\n│   │   │   │   │   │   └── cc feature \"default\"\n│   │   │   │   │   │       └── cc v1.2.60\n│   │   │   │   │   │           ├── find-msvc-tools feature \"default\"\n│   │   │   │   │   │           │   └── find-msvc-tools v0.1.9\n│   │   │   │   │   │           └── shlex feature \"default\"\n│   │   │   │   │   │               ├── shlex v1.3.0\n│   │   │   │   │   │               └── shlex feature \"std\"\n│   │   │   │   │   │                   └── shlex v1.3.0\n│   │   │   │   │   └── blake3 feature \"std\"\n│   │   │   │   │       ├── blake3 v1.8.5 (*)\n│   │   │   │   │       └── constant_time_eq feature \"std\"\n│   │   │   │   │           └── constant_time_eq v0.4.2\n│   │   │   │   ├── fsqlite-error feature \"default\"\n│   │   │   │   │   └── fsqlite-error v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-error)\n│   │   │   │   │       └── thiserror feature \"default\" (*)\n│   │   │   │   ├── simdutf8 feature \"default\"\n│   │   │   │   │   ├── simdutf8 v0.1.5\n│   │   │   │   │   └── simdutf8 feature \"std\"\n│   │   │   │   │       └── simdutf8 v0.1.5\n│   │   │   │   ├── tracing feature \"default\"\n│   │   │   │   │   ├── tracing v0.1.44\n│   │   │   │   │   │   ├── tracing-core v0.1.36\n│   │   │   │   │   │   │   └── once_cell feature \"default\"\n│   │   │   │   │   │   │       ├── once_cell v1.21.4\n│   │   │   │   │   │   │       └── once_cell feature \"std\" (*)\n│   │   │   │   │   │   ├── pin-project-lite feature \"default\" (*)\n│   │   │   │   │   │   └── tracing-attributes feature \"default\"\n│   │   │   │   │   │       └── tracing-attributes v0.1.31 (proc-macro)\n│   │   │   │   │   │           ├── proc-macro2 feature \"default\" (*)\n│   │   │   │   │   │           ├── quote feature \"default\" (*)\n│   │   │   │   │   │           ├── syn feature \"clone-impls\" (*)\n│   │   │   │   │   │           ├── syn feature \"extra-traits\" (*)\n│   │   │   │   │   │           ├── syn feature \"full\" (*)\n│   │   │   │   │   │           ├── syn feature \"parsing\" (*)\n│   │   │   │   │   │           ├── syn feature \"printing\" (*)\n│   │   │   │   │   │           ├── syn feature \"proc-macro\" (*)\n│   │   │   │   │   │           └── syn feature \"visit-mut\" (*)\n│   │   │   │   │   ├── tracing feature \"attributes\"\n│   │   │   │   │   │   ├── tracing v0.1.44 (*)\n│   │   │   │   │   │   └── tracing feature \"tracing-attributes\"\n│   │   │   │   │   │       └── tracing v0.1.44 (*)\n│   │   │   │   │   └── tracing feature \"std\"\n│   │   │   │   │       ├── tracing v0.1.44 (*)\n│   │   │   │   │       └── tracing-core feature \"std\"\n│   │   │   │   │           ├── tracing-core v0.1.36 (*)\n│   │   │   │   │           └── tracing-core feature \"once_cell\"\n│   │   │   │   │               └── tracing-core v0.1.36 (*)\n│   │   │   │   ├── xxhash-rust feature \"default\"\n│   │   │   │   │   └── xxhash-rust v0.8.15\n│   │   │   │   └── xxhash-rust feature \"xxh3\"\n│   │   │   │       └── xxhash-rust v0.8.15\n│   │   │   ├── fsqlite-vfs v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-vfs)\n│   │   │   │   ├── asupersync v0.3.9 (*)\n│   │   │   │   ├── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n│   │   │   │   ├── libc feature \"default\" (*)\n│   │   │   │   ├── nix feature \"fs\" (*)\n│   │   │   │   ├── nix feature \"process\" (*)\n│   │   │   │   ├── nix feature \"signal\" (*)\n│   │   │   │   ├── nix feature \"socket\" (*)\n│   │   │   │   ├── nix feature \"uio\" (*)\n│   │   │   │   ├── nix feature \"user\" (*)\n│   │   │   │   ├── smallvec feature \"default\" (*)\n│   │   │   │   ├── fsqlite-error feature \"default\" (*)\n│   │   │   │   ├── tracing feature \"default\" (*)\n│   │   │   │   ├── fsqlite-observability feature \"default\"\n│   │   │   │   │   └── fsqlite-observability v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-observability)\n│   │   │   │   │       ├── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n│   │   │   │   │       ├── serde feature \"default\" (*)\n│   │   │   │   │       ├── serde feature \"derive\" (*)\n│   │   │   │   │       ├── serde feature \"rc\" (*)\n│   │   │   │   │       ├── parking_lot feature \"default\" (*)\n│   │   │   │   │       └── tracing feature \"default\" (*)\n│   │   │   │   ├── advisory-lock feature \"default\"\n│   │   │   │   │   └── advisory-lock v0.3.0\n│   │   │   │   │       └── libc feature \"default\" (*)\n│   │   │   │   └── io-uring feature \"default\"\n│   │   │   │       └── io-uring v0.7.12\n│   │   │   │           ├── libc v0.2.186\n│   │   │   │           ├── cfg-if feature \"default\" (*)\n│   │   │   │           └── bitflags feature \"default\" (*)\n│   │   │   ├── fsqlite-wal v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-wal)\n│   │   │   │   ├── asupersync v0.3.9 (*)\n│   │   │   │   ├── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n│   │   │   │   ├── fsqlite-vfs v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-vfs) (*)\n│   │   │   │   ├── serde feature \"default\" (*)\n│   │   │   │   ├── serde feature \"derive\" (*)\n│   │   │   │   ├── serde feature \"rc\" (*)\n│   │   │   │   ├── parking_lot feature \"default\" (*)\n│   │   │   │   ├── blake3 feature \"default\" (*)\n│   │   │   │   ├── fsqlite-error feature \"default\" (*)\n│   │   │   │   ├── tracing feature \"default\" (*)\n│   │   │   │   ├── xxhash-rust feature \"default\" (*)\n│   │   │   │   ├── xxhash-rust feature \"xxh3\" (*)\n│   │   │   │   ├── crc32c feature \"default\"\n│   │   │   │   │   └── crc32c v0.6.8\n│   │   │   │   │       [build-dependencies]\n│   │   │   │   │       └── rustc_version feature \"default\" (*)\n│   │   │   │   └── rand feature \"default\"\n│   │   │   │       ├── rand v0.10.1\n│   │   │   │       │   ├── rand_core v0.10.1\n│   │   │   │       │   ├── getrandom feature \"default\" (*)\n│   │   │   │       │   └── chacha20 feature \"rng\"\n│   │   │   │       │       └── chacha20 v0.10.0\n│   │   │   │       │           ├── rand_core v0.10.1\n│   │   │   │       │           ├── cfg-if feature \"default\" (*)\n│   │   │   │       │           ├── cpufeatures feature \"default\" (*)\n│   │   │   │       │           ├── cipher feature \"default\"\n│   │   │   │       │           │   └── cipher v0.5.2\n│   │   │   │       │           │       ├── block-buffer feature \"default\" (*)\n│   │   │   │       │           │       ├── crypto-common feature \"default\" (*)\n│   │   │   │       │           │       └── inout feature \"default\"\n│   │   │   │       │           │           └── inout v0.2.2\n│   │   │   │       │           │               └── hybrid-array feature \"default\" (*)\n│   │   │   │       │           └── cipher feature \"stream-wrapper\"\n│   │   │   │       │               ├── cipher v0.5.2 (*)\n│   │   │   │       │               └── cipher feature \"block-buffer\"\n│   │   │   │       │                   └── cipher v0.5.2 (*)\n│   │   │   │       ├── rand feature \"std\"\n│   │   │   │       │   ├── rand v0.10.1 (*)\n│   │   │   │       │   ├── getrandom feature \"std\"\n│   │   │   │       │   │   └── getrandom v0.4.3 (*)\n│   │   │   │       │   └── rand feature \"alloc\"\n│   │   │   │       │       └── rand v0.10.1 (*)\n│   │   │   │       ├── rand feature \"std_rng\"\n│   │   │   │       │   └── rand v0.10.1 (*)\n│   │   │   │       ├── rand feature \"sys_rng\"\n│   │   │   │       │   ├── rand v0.10.1 (*)\n│   │   │   │       │   ├── getrandom feature \"sys_rng\" (*)\n│   │   │   │       │   └── rand feature \"getrandom\"\n│   │   │   │       │       └── rand v0.10.1 (*)\n│   │   │   │       └── rand feature \"thread_rng\"\n│   │   │   │           ├── rand v0.10.1 (*)\n│   │   │   │           ├── rand feature \"std\" (*)\n│   │   │   │           ├── rand feature \"std_rng\" (*)\n│   │   │   │           └── rand feature \"sys_rng\" (*)\n│   │   │   ├── hashbrown feature \"default\" (*)\n│   │   │   ├── hashbrown feature \"serde\"\n│   │   │   │   └── hashbrown v0.17.1 (*)\n│   │   │   ├── foldhash feature \"default\"\n│   │   │   │   ├── foldhash v0.2.0\n│   │   │   │   └── foldhash feature \"std\"\n│   │   │   │       └── foldhash v0.2.0\n│   │   │   ├── parking_lot feature \"default\" (*)\n│   │   │   ├── smallvec feature \"const_generics\"\n│   │   │   │   └── smallvec v1.15.2\n│   │   │   ├── smallvec feature \"const_new\"\n│   │   │   │   ├── smallvec v1.15.2\n│   │   │   │   └── smallvec feature \"const_generics\" (*)\n│   │   │   ├── smallvec feature \"default\" (*)\n│   │   │   ├── smallvec feature \"union\"\n│   │   │   │   └── smallvec v1.15.2\n│   │   │   ├── blake3 feature \"default\" (*)\n│   │   │   ├── fsqlite-error feature \"default\" (*)\n│   │   │   ├── tracing feature \"default\" (*)\n│   │   │   ├── xxhash-rust feature \"default\" (*)\n│   │   │   ├── xxhash-rust feature \"xxh3\" (*)\n│   │   │   ├── argon2 feature \"default\"\n│   │   │   │   ├── argon2 v0.5.3\n│   │   │   │   │   ├── blake2 v0.10.6\n│   │   │   │   │   │   ├── digest feature \"default\" (*)\n│   │   │   │   │   │   └── digest feature \"mac\"\n│   │   │   │   │   │       ├── digest v0.10.7 (*)\n│   │   │   │   │   │       └── digest feature \"subtle\"\n│   │   │   │   │   │           └── digest v0.10.7 (*)\n│   │   │   │   │   ├── cpufeatures feature \"default\" (*)\n│   │   │   │   │   ├── base64ct feature \"default\" (*)\n│   │   │   │   │   └── password-hash feature \"default\"\n│   │   │   │   │       ├── password-hash v0.5.0\n│   │   │   │   │       │   ├── rand_core v0.6.4 (*)\n│   │   │   │   │       │   ├── subtle v2.6.1\n│   │   │   │   │       │   └── base64ct feature \"default\" (*)\n│   │   │   │   │       └── password-hash feature \"rand_core\"\n│   │   │   │   │           └── password-hash v0.5.0 (*)\n│   │   │   │   ├── argon2 feature \"alloc\"\n│   │   │   │   │   ├── argon2 v0.5.3 (*)\n│   │   │   │   │   ├── argon2 feature \"password-hash\"\n│   │   │   │   │   │   └── argon2 v0.5.3 (*)\n│   │   │   │   │   └── password-hash feature \"alloc\"\n│   │   │   │   │       ├── password-hash v0.5.0 (*)\n│   │   │   │   │       └── base64ct feature \"alloc\" (*)\n│   │   │   │   ├── argon2 feature \"password-hash\" (*)\n│   │   │   │   └── argon2 feature \"rand\"\n│   │   │   │       ├── argon2 v0.5.3 (*)\n│   │   │   │       ├── argon2 feature \"password-hash\" (*)\n│   │   │   │       └── password-hash feature \"rand_core\" (*)\n│   │   │   ├── bumpalo feature \"collections\"\n│   │   │   │   └── bumpalo v3.20.3\n│   │   │   ├── bumpalo feature \"default\"\n│   │   │   │   └── bumpalo v3.20.3\n│   │   │   ├── chacha20poly1305 feature \"default\"\n│   │   │   │   ├── chacha20poly1305 v0.11.0\n│   │   │   │   │   ├── aead v0.6.1\n│   │   │   │   │   │   ├── crypto-common feature \"default\" (*)\n│   │   │   │   │   │   └── inout feature \"default\" (*)\n│   │   │   │   │   ├── chacha20 feature \"xchacha\"\n│   │   │   │   │   │   ├── chacha20 v0.10.0 (*)\n│   │   │   │   │   │   └── chacha20 feature \"cipher\"\n│   │   │   │   │   │       └── chacha20 v0.10.0 (*)\n│   │   │   │   │   ├── cipher feature \"default\" (*)\n│   │   │   │   │   └── poly1305 feature \"default\"\n│   │   │   │   │       └── poly1305 v0.9.1\n│   │   │   │   │           ├── cpufeatures feature \"default\" (*)\n│   │   │   │   │           └── universal-hash feature \"default\"\n│   │   │   │   │               └── universal-hash v0.6.1\n│   │   │   │   │                   ├── crypto-common feature \"default\" (*)\n│   │   │   │   │                   └── ctutils feature \"default\" (*)\n│   │   │   │   ├── chacha20poly1305 feature \"alloc\"\n│   │   │   │   │   ├── chacha20poly1305 v0.11.0 (*)\n│   │   │   │   │   └── aead feature \"alloc\"\n│   │   │   │   │       └── aead v0.6.1 (*)\n│   │   │   │   └── chacha20poly1305 feature \"getrandom\"\n│   │   │   │       ├── chacha20poly1305 v0.11.0 (*)\n│   │   │   │       └── aead feature \"getrandom\"\n│   │   │   │           ├── aead v0.6.1 (*)\n│   │   │   │           ├── crypto-common feature \"getrandom\"\n│   │   │   │           │   ├── crypto-common v0.2.2 (*)\n│   │   │   │           │   └── crypto-common feature \"rand_core\"\n│   │   │   │           │       └── crypto-common v0.2.2 (*)\n│   │   │   │           └── aead feature \"rand_core\"\n│   │   │   │               ├── aead v0.6.1 (*)\n│   │   │   │               └── crypto-common feature \"rand_core\" (*)\n│   │   │   ├── dashmap feature \"default\"\n│   │   │   │   └── dashmap v6.2.1\n│   │   │   │       ├── cfg-if feature \"default\" (*)\n│   │   │   │       ├── crossbeam-utils feature \"default\"\n│   │   │   │       │   ├── crossbeam-utils v0.8.21\n│   │   │   │       │   └── crossbeam-utils feature \"std\" (*)\n│   │   │   │       ├── lock_api feature \"default\" (*)\n│   │   │   │       ├── parking_lot_core feature \"default\" (*)\n│   │   │   │       ├── once_cell feature \"default\" (*)\n│   │   │   │       └── hashbrown feature \"raw\"\n│   │   │   │           └── hashbrown v0.14.5\n│   │   │   └── fsqlite-observability feature \"default\" (*)\n│   │   ├── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n│   │   ├── serde feature \"default\" (*)\n│   │   ├── serde feature \"derive\" (*)\n│   │   ├── serde feature \"rc\" (*)\n│   │   ├── hashbrown feature \"default\" (*)\n│   │   ├── hashbrown feature \"serde\" (*)\n│   │   ├── foldhash feature \"default\" (*)\n│   │   ├── smallvec feature \"default\" (*)\n│   │   ├── fsqlite-error feature \"default\" (*)\n│   │   ├── tracing feature \"default\" (*)\n│   │   ├── xxhash-rust feature \"default\" (*)\n│   │   ├── xxhash-rust feature \"xxh3\" (*)\n│   │   └── fsqlite-func feature \"default\"\n│   │       └── fsqlite-func v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-func)\n│   │           ├── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n│   │           ├── fsqlite-error feature \"default\" (*)\n│   │           ├── tracing feature \"default\" (*)\n│   │           └── chrono feature \"clock\"\n│   │               ├── chrono v0.4.44\n│   │               │   ├── num-traits v0.2.19 (*)\n│   │               │   ├── iana-time-zone feature \"default\"\n│   │               │   │   └── iana-time-zone v0.1.65\n│   │               │   └── iana-time-zone feature \"fallback\"\n│   │               │       └── iana-time-zone v0.1.65\n│   │               ├── chrono feature \"iana-time-zone\"\n│   │               │   └── chrono v0.4.44 (*)\n│   │               ├── chrono feature \"now\"\n│   │               │   ├── chrono v0.4.44 (*)\n│   │               │   └── chrono feature \"std\"\n│   │               │       ├── chrono v0.4.44 (*)\n│   │               │       └── chrono feature \"alloc\"\n│   │               │           └── chrono v0.4.44 (*)\n│   │               └── chrono feature \"winapi\"\n│   │                   ├── chrono v0.4.44 (*)\n│   │                   └── chrono feature \"windows-link\"\n│   │                       └── chrono v0.4.44 (*)\n│   ├── fsqlite-mvcc v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-mvcc)\n│   │   ├── asupersync v0.3.9 (*)\n│   │   ├── fsqlite-btree v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-btree) (*)\n│   │   ├── fsqlite-pager v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-pager) (*)\n│   │   ├── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n│   │   ├── fsqlite-vfs v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-vfs) (*)\n│   │   ├── fsqlite-wal v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-wal) (*)\n│   │   ├── serde feature \"default\" (*)\n│   │   ├── serde feature \"derive\" (*)\n│   │   ├── serde feature \"rc\" (*)\n│   │   ├── crossbeam-epoch feature \"default\"\n│   │   │   ├── crossbeam-epoch v0.9.20 (*)\n│   │   │   └── crossbeam-epoch feature \"std\" (*)\n│   │   ├── nix feature \"fs\" (*)\n│   │   ├── nix feature \"process\" (*)\n│   │   ├── nix feature \"signal\" (*)\n│   │   ├── nix feature \"socket\" (*)\n│   │   ├── nix feature \"uio\" (*)\n│   │   ├── nix feature \"user\" (*)\n│   │   ├── parking_lot feature \"default\" (*)\n│   │   ├── smallvec feature \"default\" (*)\n│   │   ├── thiserror feature \"default\" (*)\n│   │   ├── blake3 feature \"default\" (*)\n│   │   ├── fsqlite-error feature \"default\" (*)\n│   │   ├── tracing feature \"default\" (*)\n│   │   ├── xxhash-rust feature \"default\" (*)\n│   │   ├── xxhash-rust feature \"xxh3\" (*)\n│   │   ├── fsqlite-observability feature \"default\" (*)\n│   │   └── crc32c feature \"default\" (*)\n│   ├── fsqlite-pager v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-pager) (*)\n│   ├── fsqlite-planner v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-planner)\n│   │   ├── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n│   │   ├── serde feature \"default\" (*)\n│   │   ├── serde feature \"derive\" (*)\n│   │   ├── serde feature \"rc\" (*)\n│   │   ├── serde_json feature \"default\" (*)\n│   │   ├── serde_json feature \"preserve_order\"\n│   │   │   ├── serde_json v1.0.150 (*)\n│   │   │   ├── serde_json feature \"indexmap\"\n│   │   │   │   └── serde_json v1.0.150 (*)\n│   │   │   └── serde_json feature \"std\" (*)\n│   │   ├── blake3 feature \"default\" (*)\n│   │   ├── fsqlite-ast feature \"default\"\n│   │   │   └── fsqlite-ast v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-ast)\n│   │   │       └── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n│   │   ├── fsqlite-error feature \"default\" (*)\n│   │   ├── tracing feature \"default\" (*)\n│   │   ├── xxhash-rust feature \"default\" (*)\n│   │   ├── xxhash-rust feature \"xxh3\" (*)\n│   │   ├── fsqlite-parser feature \"default\"\n│   │   │   └── fsqlite-parser v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-parser)\n│   │   │       ├── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n│   │   │       ├── hashbrown feature \"default\" (*)\n│   │   │       ├── hashbrown feature \"serde\" (*)\n│   │   │       ├── memchr feature \"default\" (*)\n│   │   │       ├── fsqlite-ast feature \"default\" (*)\n│   │   │       ├── fsqlite-error feature \"default\" (*)\n│   │   │       └── tracing feature \"default\" (*)\n│   │   └── lru feature \"default\"\n│   │       ├── lru v0.18.0\n│   │       │   └── hashbrown feature \"default\" (*)\n│   │       └── lru feature \"hashbrown\"\n│   │           └── lru v0.18.0 (*)\n│   ├── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n│   ├── fsqlite-vdbe v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-vdbe)\n│   │   ├── asupersync v0.3.9 (*)\n│   │   ├── fsqlite-btree v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-btree) (*)\n│   │   ├── fsqlite-mvcc v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-mvcc) (*)\n│   │   ├── fsqlite-pager v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-pager) (*)\n│   │   ├── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n│   │   ├── fsqlite-wal v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-wal) (*)\n│   │   ├── crossbeam-deque feature \"default\" (*)\n│   │   ├── hashbrown feature \"default\" (*)\n│   │   ├── hashbrown feature \"serde\" (*)\n│   │   ├── smallvec feature \"default\" (*)\n│   │   ├── tempfile feature \"default\" (*)\n│   │   ├── fsqlite-ast feature \"default\" (*)\n│   │   ├── fsqlite-error feature \"default\" (*)\n│   │   ├── tracing feature \"default\" (*)\n│   │   ├── fsqlite-func feature \"default\" (*)\n│   │   └── fsqlite-parser feature \"default\" (*)\n│   ├── fsqlite-vfs v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-vfs) (*)\n│   ├── fsqlite-wal v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-wal) (*)\n│   ├── serde feature \"default\" (*)\n│   ├── serde feature \"derive\" (*)\n│   ├── serde feature \"rc\" (*)\n│   ├── serde_json feature \"default\" (*)\n│   ├── serde_json feature \"preserve_order\" (*)\n│   ├── hashbrown feature \"default\" (*)\n│   ├── hashbrown feature \"serde\" (*)\n│   ├── foldhash feature \"default\" (*)\n│   ├── itoa feature \"default\" (*)\n│   ├── smallvec feature \"default\" (*)\n│   ├── blake3 feature \"default\" (*)\n│   ├── fsqlite-ast feature \"default\" (*)\n│   ├── fsqlite-error feature \"default\" (*)\n│   ├── tracing feature \"default\" (*)\n│   ├── xxhash-rust feature \"default\" (*)\n│   ├── xxhash-rust feature \"xxh3\" (*)\n│   ├── fsqlite-func feature \"default\" (*)\n│   ├── fsqlite-observability feature \"default\" (*)\n│   ├── fsqlite-ext-fts5 feature \"default\"\n│   │   └── fsqlite-ext-fts5 v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-ext-fts5)\n│   │       ├── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n│   │       ├── smallvec feature \"default\" (*)\n│   │       ├── fsqlite-error feature \"default\" (*)\n│   │       ├── tracing feature \"default\" (*)\n│   │       └── fsqlite-func feature \"default\" (*)\n│   ├── fsqlite-ext-icu feature \"default\"\n│   │   └── fsqlite-ext-icu v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-ext-icu)\n│   │       ├── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n│   │       ├── fsqlite-error feature \"default\" (*)\n│   │       ├── tracing feature \"default\" (*)\n│   │       └── fsqlite-func feature \"default\" (*)\n│   ├── fsqlite-ext-json feature \"default\"\n│   │   └── fsqlite-ext-json v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-ext-json)\n│   │       ├── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n│   │       ├── serde_json feature \"default\" (*)\n│   │       ├── serde_json feature \"preserve_order\" (*)\n│   │       ├── fsqlite-error feature \"default\" (*)\n│   │       ├── fsqlite-func feature \"default\" (*)\n│   │       └── json5 feature \"default\"\n│   │           └── json5 v1.3.1\n│   │               ├── serde feature \"default\" (*)\n│   │               └── ucd-trie feature \"default\"\n│   │                   ├── ucd-trie v0.1.7\n│   │                   └── ucd-trie feature \"std\"\n│   │                       └── ucd-trie v0.1.7\n│   ├── fsqlite-ext-misc feature \"default\"\n│   │   └── fsqlite-ext-misc v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-ext-misc)\n│   │       ├── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n│   │       ├── fsqlite-error feature \"default\" (*)\n│   │       ├── tracing feature \"default\" (*)\n│   │       ├── fsqlite-func feature \"default\" (*)\n│   │       └── rand feature \"default\" (*)\n│   ├── fsqlite-ext-rtree feature \"default\"\n│   │   └── fsqlite-ext-rtree v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-ext-rtree)\n│   │       ├── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n│   │       ├── fsqlite-error feature \"default\" (*)\n│   │       └── fsqlite-func feature \"default\" (*)\n│   ├── fsqlite-parser feature \"default\" (*)\n│   ├── lru feature \"default\" (*)\n│   └── lazy_static feature \"default\"\n│       └── lazy_static v1.5.0\n├── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n├── fsqlite-vfs v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-vfs) (*)\n├── serde feature \"default\" (*)\n├── serde feature \"derive\" (*)\n├── serde feature \"rc\" (*)\n├── serde_json feature \"default\" (*)\n├── serde_json feature \"preserve_order\" (*)\n├── sha2 feature \"default\" (*)\n├── tempfile feature \"default\" (*)\n├── thiserror feature \"default\" (*)\n├── fsqlite feature \"fts5\"\n│   └── fsqlite v0.1.19 (/data/projects/frankensqlite/crates/fsqlite)\n│       ├── fsqlite-core v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-core) (*)\n│       ├── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n│       ├── fsqlite-vfs v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-vfs) (*)\n│       ├── fsqlite-error feature \"default\" (*)\n│       ├── tracing feature \"default\" (*)\n│       ├── fsqlite-ext-fts5 feature \"default\" (*)\n│       ├── fsqlite-ext-json feature \"default\" (*)\n│       ├── fsqlite-ext-rtree feature \"default\" (*)\n│       └── fsqlite-parser feature \"default\" (*)\n├── fsqlite feature \"json\"\n│   └── fsqlite v0.1.19 (/data/projects/frankensqlite/crates/fsqlite) (*)\n├── fsqlite feature \"rtree\"\n│   └── fsqlite v0.1.19 (/data/projects/frankensqlite/crates/fsqlite) (*)\n├── fsqlite-error feature \"default\" (*)\n├── tracing feature \"default\" (*)\n├── fsqlite-btree feature \"default\"\n│   ├── fsqlite-btree v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-btree) (*)\n│   └── fsqlite-btree feature \"native\"\n│       ├── fsqlite-btree v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-btree) (*)\n│       └── fsqlite-pager feature \"native\"\n│           ├── fsqlite-pager v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-pager) (*)\n│           ├── fsqlite-types feature \"native\"\n│           │   └── fsqlite-types v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-types) (*)\n│           ├── fsqlite-pager feature \"encryption\"\n│           │   └── fsqlite-pager v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-pager) (*)\n│           ├── fsqlite-vfs feature \"native\"\n│           │   ├── fsqlite-vfs v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-vfs) (*)\n│           │   ├── fsqlite-types feature \"native\" (*)\n│           │   └── fsqlite-vfs feature \"linux-asupersync-uring\"\n│           │       ├── fsqlite-vfs v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-vfs) (*)\n│           │       └── fsqlite-vfs feature \"native\" (*)\n│           └── fsqlite-wal feature \"native\"\n│               ├── fsqlite-wal v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-wal) (*)\n│               ├── fsqlite-types feature \"native\" (*)\n│               └── fsqlite-vfs feature \"native\" (*)\n├── fsqlite-wal feature \"default\"\n│   ├── fsqlite-wal v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-wal) (*)\n│   └── fsqlite-wal feature \"native\" (*)\n├── rand feature \"default\" (*)\n├── fsqlite-parser feature \"default\" (*)\n├── fsqlite-vdbe feature \"default\"\n│   ├── fsqlite-vdbe v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-vdbe) (*)\n│   └── fsqlite-vdbe feature \"native\"\n│       ├── fsqlite-vdbe v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-vdbe) (*)\n│       ├── fsqlite-btree feature \"native\" (*)\n│       ├── fsqlite-pager feature \"native\" (*)\n│       ├── fsqlite-wal feature \"native\" (*)\n│       └── fsqlite-mvcc feature \"native\"\n│           ├── fsqlite-mvcc v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-mvcc) (*)\n│           ├── fsqlite-btree feature \"native\" (*)\n│           ├── fsqlite-pager feature \"native\" (*)\n│           └── fsqlite-wal feature \"native\" (*)\n├── fsqlite-harness feature \"default\"\n│   └── fsqlite-harness v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-harness)\n│       ├── asupersync v0.3.9 (*)\n│       ├── serde feature \"default\" (*)\n│       ├── serde feature \"derive\" (*)\n│       ├── serde feature \"rc\" (*)\n│       ├── serde_json feature \"default\" (*)\n│       ├── serde_json feature \"preserve_order\" (*)\n│       ├── parking_lot feature \"default\" (*)\n│       ├── sha2 feature \"default\" (*)\n│       ├── fsqlite feature \"default\"\n│       │   ├── fsqlite v0.1.19 (/data/projects/frankensqlite/crates/fsqlite) (*)\n│       │   ├── fsqlite feature \"fts5\" (*)\n│       │   ├── fsqlite feature \"json\" (*)\n│       │   ├── fsqlite feature \"linux-asupersync-uring\"\n│       │   │   ├── fsqlite v0.1.19 (/data/projects/frankensqlite/crates/fsqlite) (*)\n│       │   │   ├── fsqlite feature \"native\"\n│       │   │   │   ├── fsqlite v0.1.19 (/data/projects/frankensqlite/crates/fsqlite) (*)\n│       │   │   │   ├── fsqlite-core feature \"native\"\n│       │   │   │   │   ├── fsqlite-core v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-core) (*)\n│       │   │   │   │   ├── fsqlite-core feature \"diagnostic-pragmas\"\n│       │   │   │   │   │   └── fsqlite-core v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-core) (*)\n│       │   │   │   │   ├── fsqlite-core feature \"extensions\"\n│       │   │   │   │   │   ├── fsqlite-core v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-core) (*)\n│       │   │   │   │   │   ├── fsqlite-core feature \"ext-fts5\"\n│       │   │   │   │   │   │   ├── fsqlite-core v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-core) (*)\n│       │   │   │   │   │   │   └── fsqlite-func feature \"ext-fts5\"\n│       │   │   │   │   │   │       └── fsqlite-func v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-func) (*)\n│       │   │   │   │   │   ├── fsqlite-core feature \"ext-icu\"\n│       │   │   │   │   │   │   ├── fsqlite-core v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-core) (*)\n│       │   │   │   │   │   │   └── fsqlite-func feature \"ext-icu\"\n│       │   │   │   │   │   │       └── fsqlite-func v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-func) (*)\n│       │   │   │   │   │   ├── fsqlite-core feature \"ext-json\"\n│       │   │   │   │   │   │   ├── fsqlite-core v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-core) (*)\n│       │   │   │   │   │   │   └── fsqlite-func feature \"ext-json\"\n│       │   │   │   │   │   │       └── fsqlite-func v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-func) (*)\n│       │   │   │   │   │   ├── fsqlite-core feature \"ext-misc\"\n│       │   │   │   │   │   │   └── fsqlite-core v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-core) (*)\n│       │   │   │   │   │   └── fsqlite-core feature \"ext-rtree\"\n│       │   │   │   │   │       ├── fsqlite-core v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-core) (*)\n│       │   │   │   │   │       ├── fsqlite-func feature \"ext-geopoly\"\n│       │   │   │   │   │       │   └── fsqlite-func v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-func) (*)\n│       │   │   │   │   │       └── fsqlite-func feature \"ext-rtree\"\n│       │   │   │   │   │           └── fsqlite-func v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-func) (*)\n│       │   │   │   │   ├── fsqlite-types feature \"native\" (*)\n│       │   │   │   │   ├── fsqlite-btree feature \"native\" (*)\n│       │   │   │   │   ├── fsqlite-pager feature \"native\" (*)\n│       │   │   │   │   ├── fsqlite-vfs feature \"native\" (*)\n│       │   │   │   │   ├── fsqlite-wal feature \"native\" (*)\n│       │   │   │   │   ├── fsqlite-mvcc feature \"native\" (*)\n│       │   │   │   │   ├── fsqlite-planner feature \"native\"\n│       │   │   │   │   │   ├── fsqlite-planner v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-planner) (*)\n│       │   │   │   │   │   └── fsqlite-planner feature \"decision-log-json\"\n│       │   │   │   │   │       └── fsqlite-planner v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-planner) (*)\n│       │   │   │   │   └── fsqlite-vdbe feature \"native\" (*)\n│       │   │   │   ├── fsqlite-types feature \"native\" (*)\n│       │   │   │   └── fsqlite-vfs feature \"native\" (*)\n│       │   │   ├── fsqlite-core feature \"linux-asupersync-uring\"\n│       │   │   │   ├── fsqlite-core v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-core) (*)\n│       │   │   │   ├── fsqlite-core feature \"native\" (*)\n│       │   │   │   └── fsqlite-vfs feature \"linux-asupersync-uring\" (*)\n│       │   │   └── fsqlite-vfs feature \"linux-asupersync-uring\" (*)\n│       │   ├── fsqlite feature \"native\" (*)\n│       │   └── fsqlite feature \"rtree\" (*)\n│       ├── fsqlite-ast feature \"default\" (*)\n│       ├── fsqlite-types feature \"native\" (*)\n│       ├── fsqlite-error feature \"default\" (*)\n│       ├── tracing feature \"default\" (*)\n│       ├── xxhash-rust feature \"default\" (*)\n│       ├── xxhash-rust feature \"xxh3\" (*)\n│       ├── fsqlite-vfs feature \"default\"\n│       │   ├── fsqlite-vfs v0.1.19 (/data/projects/frankensqlite/crates/fsqlite-vfs) (*)\n│       │   └── fsqlite-vfs feature \"linux-asupersync-uring\" (*)\n│       ├── fsqlite-parser feature \"default\" (*)\n│       ├── rusqlite feature \"backup\"\n│       │   └── rusqlite v0.40.1\n│       │       ├── bitflags feature \"default\" (*)\n│       │       ├── smallvec feature \"default\" (*)\n│       │       ├── fallible-iterator feature \"default\"\n│       │       │   ├── fallible-iterator v0.3.0\n│       │       │   └── fallible-iterator feature \"alloc\"\n│       │       │       └── fallible-iterator v0.3.0\n│       │       ├── fallible-streaming-iterator feature \"default\"\n│       │       │   └── fallible-streaming-iterator v0.1.9\n│       │       ├── hashlink feature \"default\"\n│       │       │   └── hashlink v0.12.0\n│       │       │       └── hashbrown feature \"default-hasher\" (*)\n│       │       └── libsqlite3-sys feature \"default\"\n│       │           ├── libsqlite3-sys v0.38.1\n│       │           │   [build-dependencies]\n│       │           │   ├── cc feature \"default\" (*)\n│       │           │   ├── pkg-config feature \"default\"\n│       │           │   │   └── pkg-config v0.3.33\n│       │           │   └── vcpkg feature \"default\"\n│       │           │       └── vcpkg v0.2.15\n│       │           └── libsqlite3-sys feature \"min_sqlite_version_3_34_1\"\n│       │               ├── libsqlite3-sys v0.38.1 (*)\n│       │               ├── libsqlite3-sys feature \"pkg-config\"\n│       │               │   └── libsqlite3-sys v0.38.1 (*)\n│       │               └── libsqlite3-sys feature \"vcpkg\"\n│       │                   └── libsqlite3-sys v0.38.1 (*)\n│       ├── rusqlite feature \"bundled\"\n│       │   ├── rusqlite v0.40.1 (*)\n│       │   ├── rusqlite feature \"modern_sqlite\"\n│       │   │   ├── rusqlite v0.40.1 (*)\n│       │   │   └── libsqlite3-sys feature \"bundled_bindings\"\n│       │   │       └── libsqlite3-sys v0.38.1 (*)\n│       │   └── libsqlite3-sys feature \"bundled\"\n│       │       ├── libsqlite3-sys v0.38.1 (*)\n│       │       ├── libsqlite3-sys feature \"bundled_bindings\" (*)\n│       │       └── libsqlite3-sys feature \"cc\"\n│       │           └── libsqlite3-sys v0.38.1 (*)\n│       ├── rusqlite feature \"default\"\n│       │   ├── rusqlite v0.40.1 (*)\n│       │   ├── rusqlite feature \"cache\"\n│       │   │   ├── rusqlite v0.40.1 (*)\n│       │   │   └── rusqlite feature \"hashlink\"\n│       │   │       └── rusqlite v0.40.1 (*)\n│       │   └── rusqlite feature \"ffi-sqlite-wasm-rs\"\n│       │       └── rusqlite v0.40.1 (*)\n│       └── toml feature \"default\"\n│           ├── toml v1.1.2+spec-1.1.0\n│           │   ├── winnow v1.0.2\n│           │   ├── serde_core feature \"alloc\" (*)\n│           │   ├── serde_spanned feature \"alloc\"\n│           │   │   ├── serde_spanned v1.1.1\n│           │   │   │   └── serde_core v1.0.228\n│           │   │   └── serde_core feature \"alloc\" (*)\n│           │   ├── toml_datetime feature \"alloc\"\n│           │   │   ├── toml_datetime v1.1.1+spec-1.1.0\n│           │   │   │   └── serde_core v1.0.228\n│           │   │   └── serde_core feature \"alloc\" (*)\n│           │   ├── toml_parser feature \"alloc\"\n│           │   │   └── toml_parser v1.1.2+spec-1.1.0\n│           │   │       └── winnow v1.0.2\n│           │   └── toml_writer feature \"alloc\"\n│           │       └── toml_writer v1.1.1+spec-1.1.0\n│           ├── toml feature \"display\"\n│           │   └── toml v1.1.2+spec-1.1.0 (*)\n│           ├── toml feature \"parse\"\n│           │   └── toml v1.1.2+spec-1.1.0 (*)\n│           ├── toml feature \"serde\"\n│           │   ├── toml v1.1.2+spec-1.1.0 (*)\n│           │   ├── serde_spanned feature \"serde\"\n│           │   │   └── serde_spanned v1.1.1 (*)\n│           │   └── toml_datetime feature \"serde\"\n│           │       └── toml_datetime v1.1.1+spec-1.1.0 (*)\n│           └── toml feature \"std\"\n│               ├── toml v1.1.2+spec-1.1.0 (*)\n│               ├── serde_core feature \"std\" (*)\n│               ├── serde_spanned feature \"std\"\n│               │   ├── serde_spanned v1.1.1 (*)\n│               │   ├── serde_core feature \"std\" (*)\n│               │   └── serde_spanned feature \"alloc\" (*)\n│               ├── toml_datetime feature \"std\"\n│               │   ├── toml_datetime v1.1.1+spec-1.1.0 (*)\n│               │   ├── serde_core feature \"std\" (*)\n│               │   └── toml_datetime feature \"alloc\" (*)\n│               ├── toml_parser feature \"std\"\n│               │   ├── toml_parser v1.1.2+spec-1.1.0 (*)\n│               │   └── toml_parser feature \"alloc\" (*)\n│               └── toml_writer feature \"std\"\n│                   ├── toml_writer v1.1.1+spec-1.1.0\n│                   └── toml_writer feature \"alloc\" (*)\n├── rusqlite feature \"backup\" (*)\n├── rusqlite feature \"bundled\" (*)\n├── rusqlite feature \"default\" (*)\n├── tracing-subscriber feature \"default\"\n│   ├── tracing-subscriber v0.3.23\n│   │   ├── tracing v0.1.44 (*)\n│   │   ├── tracing-core v0.1.36 (*)\n│   │   ├── serde feature \"default\" (*)\n│   │   ├── serde_json feature \"default\" (*)\n│   │   ├── smallvec feature \"default\" (*)\n│   │   ├── once_cell feature \"default\" (*)\n│   │   ├── matchers feature \"default\"\n│   │   │   └── matchers v0.2.0\n│   │   │       ├── regex-automata feature \"dfa-build\"\n│   │   │       │   ├── regex-automata v0.4.14\n│   │   │       │   │   └── regex-syntax v0.8.10\n│   │   │       │   ├── regex-automata feature \"dfa-search\"\n│   │   │       │   │   └── regex-automata v0.4.14 (*)\n│   │   │       │   └── regex-automata feature \"nfa-thompson\"\n│   │   │       │       ├── regex-automata v0.4.14 (*)\n│   │   │       │       └── regex-automata feature \"alloc\"\n│   │   │       │           └── regex-automata v0.4.14 (*)\n│   │   │       ├── regex-automata feature \"dfa-search\" (*)\n│   │   │       └── regex-automata feature \"syntax\"\n│   │   │           ├── regex-automata v0.4.14 (*)\n│   │   │           └── regex-automata feature \"alloc\" (*)\n│   │   ├── regex-automata feature \"std\"\n│   │   │   ├── regex-automata v0.4.14 (*)\n│   │   │   ├── regex-automata feature \"alloc\" (*)\n│   │   │   └── regex-syntax feature \"std\"\n│   │   │       └── regex-syntax v0.8.10\n│   │   ├── nu-ansi-term feature \"default\"\n│   │   │   ├── nu-ansi-term v0.50.3\n│   │   │   └── nu-ansi-term feature \"std\"\n│   │   │       └── nu-ansi-term v0.50.3\n│   │   ├── sharded-slab feature \"default\"\n│   │   │   └── sharded-slab v0.1.7\n│   │   │       └── lazy_static feature \"default\" (*)\n│   │   ├── thread_local feature \"default\"\n│   │   │   └── thread_local v1.1.9\n│   │   │       └── cfg-if feature \"default\" (*)\n│   │   ├── tracing-log feature \"log-tracer\"\n│   │   │   └── tracing-log v0.2.0\n│   │   │       ├── log feature \"default\" (*)\n│   │   │       ├── once_cell feature \"default\" (*)\n│   │   │       └── tracing-core feature \"default\"\n│   │   │           ├── tracing-core v0.1.36 (*)\n│   │   │           └── tracing-core feature \"std\" (*)\n│   │   ├── tracing-log feature \"std\"\n│   │   │   ├── tracing-log v0.2.0 (*)\n│   │   │   └── log feature \"std\"\n│   │   │       └── log v0.4.29\n│   │   └── tracing-serde feature \"default\"\n│   │       └── tracing-serde v0.2.0\n│   │           ├── serde feature \"default\" (*)\n│   │           └── tracing-core feature \"default\" (*)\n│   ├── tracing-subscriber feature \"ansi\"\n│   │   ├── tracing-subscriber v0.3.23 (*)\n│   │   ├── tracing-subscriber feature \"fmt\"\n│   │   │   ├── tracing-subscriber v0.3.23 (*)\n│   │   │   ├── tracing-subscriber feature \"registry\"\n│   │   │   │   ├── tracing-subscriber v0.3.23 (*)\n│   │   │   │   ├── tracing-subscriber feature \"sharded-slab\"\n│   │   │   │   │   └── tracing-subscriber v0.3.23 (*)\n│   │   │   │   ├── tracing-subscriber feature \"std\"\n│   │   │   │   │   ├── tracing-subscriber v0.3.23 (*)\n│   │   │   │   │   ├── tracing-core feature \"std\" (*)\n│   │   │   │   │   └── tracing-subscriber feature \"alloc\"\n│   │   │   │   │       └── tracing-subscriber v0.3.23 (*)\n│   │   │   │   └── tracing-subscriber feature \"thread_local\"\n│   │   │   │       └── tracing-subscriber v0.3.23 (*)\n│   │   │   └── tracing-subscriber feature \"std\" (*)\n│   │   └── tracing-subscriber feature \"nu-ansi-term\"\n│   │       └── tracing-subscriber v0.3.23 (*)\n│   ├── tracing-subscriber feature \"fmt\" (*)\n│   ├── tracing-subscriber feature \"smallvec\"\n│   │   └── tracing-subscriber v0.3.23 (*)\n│   ├── tracing-subscriber feature \"std\" (*)\n│   └── tracing-subscriber feature \"tracing-log\"\n│       └── tracing-subscriber v0.3.23 (*)\n├── tracing-subscriber feature \"env-filter\"\n│   ├── tracing-subscriber v0.3.23 (*)\n│   ├── tracing-subscriber feature \"matchers\"\n│   │   └── tracing-subscriber v0.3.23 (*)\n│   ├── tracing-subscriber feature \"once_cell\"\n│   │   └── tracing-subscriber v0.3.23 (*)\n│   ├── tracing-subscriber feature \"std\" (*)\n│   ├── tracing-subscriber feature \"thread_local\" (*)\n│   └── tracing-subscriber feature \"tracing\"\n│       └── tracing-subscriber v0.3.23 (*)\n└── tracing-subscriber feature \"json\"\n    ├── tracing-subscriber v0.3.23 (*)\n    ├── tracing-subscriber feature \"serde\"\n    │   └── tracing-subscriber v0.3.23 (*)\n    ├── tracing-subscriber feature \"serde_json\"\n    │   └── tracing-subscriber v0.3.23 (*)\n    └── tracing-subscriber feature \"tracing-serde\"\n        └── tracing-subscriber v0.3.23 (*)",
+    "cargo_feature_graph_command": "cargo tree --locked --offline -p fsqlite-e2e -e features,no-dev --no-default-features --target x86_64-unknown-linux-gnu --features default",
+    "command_line": [
+      "/data/tmp/cargo-target/release-perf/comprehensive-bench",
+      "--quick",
+      "--filter",
+      "insert",
+      "--no-html",
+      "--json-out",
+      "bench-hoist-rp.json",
+      "--allow-unverified-provenance"
+    ],
+    "benchmark_environment": {},
+    "cpu_affinity": "4-11",
+    "runtime_bridge": "scenario_scoped_thread_local_block_on",
+    "tracing": {
+      "rust_log": null,
+      "statement_debug_enabled": false,
+      "statement_reuse_info_enabled": false,
+      "fallback_decision_debug_enabled": false
+    },
+    "durability": {
+      "page_size_bytes": 4096,
+      "default_synchronous": "NORMAL",
+      "concurrent_synchronous_modes": [
+        "NORMAL"
+      ],
+      "csqlite_pragmas": [
+        "PRAGMA page_size = 4096;",
+        "PRAGMA journal_mode = WAL;",
+        "PRAGMA synchronous = NORMAL;",
+        "PRAGMA cache_size = -64000;"
+      ],
+      "fsqlite_pragmas": [
+        "PRAGMA page_size = 4096;",
+        "PRAGMA journal_mode = WAL;",
+        "PRAGMA synchronous = NORMAL;",
+        "PRAGMA cache_size = -64000;",
+        "PRAGMA fsqlite_capture_time_travel_snapshots=false;"
+      ],
+      "concurrent_mode_default": true,
+      "verified": true,
+      "matched": true,
+      "validation_errors": [],
+      "effective_profiles": {
+        "file.csqlite": {
+          "cache_size": "-64000",
+          "journal_mode": "wal",
+          "page_size": "4096",
+          "synchronous": "normal"
+        },
+        "file.fsqlite": {
+          "cache_size": "-64000",
+          "journal_mode": "wal",
+          "page_size": "4096",
+          "synchronous": "normal"
+        },
+        "memory.csqlite": {
+          "cache_size": "-64000",
+          "journal_mode": "memory",
+          "page_size": "4096",
+          "synchronous": "normal"
+        },
+        "memory.fsqlite": {
+          "cache_size": "-64000",
+          "journal_mode": "memory",
+          "page_size": "4096",
+          "synchronous": "normal"
+        }
+      }
+    },
+    "execution_routing": {
+      "probe_scope": "untimed surrogate INSERT/UPDATE/DELETE/GROUP BY probe; counters reset before the probe and excluded from score rows",
+      "timed_routes_verified": false,
+      "limitations": [
+        "probe health does not attest any scored statement, schema, prepared object, or dynamic dispatch decision"
+      ],
+      "timed_execution_instrumented": false,
+      "parser_fast_path_executions": 6,
+      "parser_slow_path_executions": 0,
+      "prepared_insert_fast_lane_hits": 4,
+      "prepared_insert_instrumented_lane_hits": 0,
+      "prepared_direct_insert_executions": 4,
+      "prepared_update_delete_fast_lane_hits": 0,
+      "prepared_update_delete_instrumented_lane_hits": 0,
+      "prepared_direct_update_executions": 1,
+      "prepared_direct_delete_executions": 1,
+      "prepared_update_delete_dml_direct_handoff_runs": 0,
+      "prepared_table_dml_affected_only_runs": 0,
+      "prepared_dml_fallbacks": {
+        "foreign_key": 0,
+        "live_vtab": 0,
+        "returning": 0,
+        "sqlite_sequence": 0,
+        "trigger": 0,
+        "without_rowid": 0
+      },
+      "select_routing_decisions": {
+        "group_by_fallback": 1,
+        "valid_btree_page": 1
+      },
+      "probe_errors": []
+    }
+  },
+  "summary": {
+    "total_scenarios": 25,
+    "franken_faster": 4,
+    "comparable": 6,
+    "csqlite_faster": 15,
+    "avg_ratio": 1.1406207787141507,
+    "average_ratio": 1.1406207787141507,
+    "geomean_ratio": 1.1259753229938751,
+    "median_ratio": 1.1088338574204903,
+    "p90_ratio": 1.459739965491399,
+    "p99_ratio": 1.5835001761516452,
+    "primary_metric": "per_category_weighted.score",
+    "per_category": {
+      "concurrent_writers": {
+        "n": 0,
+        "avg_ratio": null,
+        "geomean_ratio": null,
+        "median_ratio": null,
+        "p90_ratio": null,
+        "p99_ratio": null
+      },
+      "mixed": {
+        "n": 0,
+        "avg_ratio": null,
+        "geomean_ratio": null,
+        "median_ratio": null,
+        "p90_ratio": null,
+        "p99_ratio": null
+      },
+      "read_aggregate": {
+        "n": 0,
+        "avg_ratio": null,
+        "geomean_ratio": null,
+        "median_ratio": null,
+        "p90_ratio": null,
+        "p99_ratio": null
+      },
+      "read_single": {
+        "n": 0,
+        "avg_ratio": null,
+        "geomean_ratio": null,
+        "median_ratio": null,
+        "p90_ratio": null,
+        "p99_ratio": null
+      },
+      "write_bulk": {
+        "n": 22,
+        "avg_ratio": 1.1415115745410878,
+        "geomean_ratio": 1.1253043952068433,
+        "median_ratio": 1.1088338574204903,
+        "p90_ratio": 1.459739965491399,
+        "p99_ratio": 1.5835001761516452
+      },
+      "write_single": {
+        "n": 3,
+        "avg_ratio": 1.1340882759832784,
+        "geomean_ratio": 1.1309076983244477,
+        "median_ratio": 1.1123414901857211,
+        "p90_ratio": 1.2481017473691787,
+        "p99_ratio": 1.2481017473691787
+      }
+    },
+    "per_category_weighted": {
+      "primary": true,
+      "score": 1.1295042622473914,
+      "weights": {
+        "concurrent_writers": 0.05,
+        "mixed": 0.05,
+        "read_aggregate": 0.15,
+        "read_single": 0.35,
+        "write_bulk": 0.1,
+        "write_single": 0.3
+      },
+      "observed_weight": 0.4,
+      "missing_categories": [
+        "concurrent_writers",
+        "mixed",
+        "read_aggregate",
+        "read_single"
+      ]
+    }
+  },
+  "ci_regression_gate": {
+    "schema_version": "fsqlite-e2e.comprehensive-bench-ci-regression-gate.v2",
+    "bead_id": "bd-m4tju",
+    "depends_on_bead_id": "bd-0winn",
+    "status": "ineligible",
+    "eligible": false,
+    "ineligibility_reasons": [
+      "benchmark binary was built from a dirty or unknown tree",
+      "build environment does not exactly force the canonical `release-perf` profile: expected {\"CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER\": \"\", \"CARGO_BUILD_RUSTC_WRAPPER\": \"\", \"CARGO_BUILD_RUSTFLAGS\": \"\", \"CARGO_PROFILE_RELEASE_PERF_CODEGEN_UNITS\": \"1\", \"CARGO_PROFILE_RELEASE_PERF_DEBUG\": \"false\", \"CARGO_PROFILE_RELEASE_PERF_DEBUG_ASSERTIONS\": \"false\", \"CARGO_PROFILE_RELEASE_PERF_INCREMENTAL\": \"false\", \"CARGO_PROFILE_RELEASE_PERF_LTO\": \"true\", \"CARGO_PROFILE_RELEASE_PERF_OPT_LEVEL\": \"3\", \"CARGO_PROFILE_RELEASE_PERF_OVERFLOW_CHECKS\": \"false\", \"CARGO_PROFILE_RELEASE_PERF_PANIC\": \"abort\", \"CARGO_PROFILE_RELEASE_PERF_RPATH\": \"false\", \"CARGO_PROFILE_RELEASE_PERF_SPLIT_DEBUGINFO\": \"off\", \"CARGO_PROFILE_RELEASE_PERF_STRIP\": \"true\", \"RUSTC_WORKSPACE_WRAPPER\": \"\", \"RUSTC_WRAPPER\": \"\"}, observed {}",
+      "build profile label missing; set FSQLITE_BENCH_PROFILE_NAME while building",
+      "citable builds require a 64-character lowercase hexadecimal build nonce, got `unknown`",
+      "citable builds require an absolute, nonempty, SHA-bound cargo -vv log whose explicit-target rustc invocations prove the nonce plus the required opt-level, codegen-units, debug-assertions, overflow-checks, LTO partition, and final panic/strip settings for the required Rust hot-path crate set and final benchmark binary; compiler identity and all other rustc flags remain outside this receipt's proof scope; observed (None, None, None, false)",
+      "declared profile `unspecified` does not match Cargo output profile `release-perf`",
+      "generic C-reference measurements do not receipt-bind sqlite_source_id(), compile_options, the SQLite amalgamation/library hash, or the resolved native C compiler path/version/hash",
+      "generic comprehensive measurements are diagnostic-only: engines run in unpaired C-first/FrankenSQLite-second adaptive blocks, scored rows lack complete work oracles, and host/topology state is not release-gated",
+      "verbose build log path was absent at end of measurement",
+      "verification checkout SHA does not match the binary build SHA",
+      "verification checkout dirty state changed or is no longer clean",
+      "verification checkout is dirty or unavailable"
+    ],
+    "evaluation_result": "not_evaluated",
+    "thresholds": {
+      "avg_ratio_baseline": 2.74,
+      "avg_ratio_max": null,
+      "mt_p95_ratio_max": null,
+      "primary_score_max_regression_pct": 0.03,
+      "geomean_max_regression_pct": 0.05,
+      "per_category_geomean_max_regression_pct": 0.1,
+      "p90_max_regression_pct": 0.15,
+      "threshold_source": "bd-d4m5k rich scorecard: primary gate is per_category_weighted.score"
+    },
+    "observed": {
+      "avg_ratio": 1.1406207787141507,
+      "primary_score": 1.1295042622473914,
+      "geomean_ratio": 1.1259753229938751,
+      "median_ratio": 1.1088338574204903,
+      "p90_ratio": 1.459739965491399,
+      "max_mt_p95_ratio": null,
+      "max_mt_p95_scenario_id": null
+    }
+  },
+  "sections": [
+    {
+      "section_id": "insertthroughput-single-transaction-tiny-1col",
+      "title": "INSERTThroughput — Single Transaction — tiny_1col",
+      "description": "Record: 1 col (INTEGER PK only). All rows inserted in a single BEGIN..COMMIT.",
+      "rows": [
+        {
+          "scenario_id": "insertthroughput-single-transaction-tiny-1col__100-rows",
+          "scenario": "100 rows",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 0.09901399999999999,
+            "mean_ms": 0.101579,
+            "min_ms": 0.09669,
+            "p95_ms": 0.114623,
+            "p99_ms": 0.114623,
+            "stddev_ms": 0.0059240000000000004,
+            "cv_pct": 5.831914076728458,
+            "rows_per_sec": 1009958.187731028,
+            "us_per_row": 0.9901399999999999,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.14755500000000002,
+            "mean_ms": 0.149692,
+            "min_ms": 0.143938,
+            "p95_ms": 0.165188,
+            "p99_ms": 0.165188,
+            "stddev_ms": 0.0057799999999999995,
+            "cv_pct": 3.8612617908772675,
+            "rows_per_sec": 677713.3950052522,
+            "us_per_row": 1.4755500000000001,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.4902438039065182
+        },
+        {
+          "scenario_id": "insertthroughput-single-transaction-tiny-1col__1000-rows",
+          "scenario": "1000 rows",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 0.443726,
+            "mean_ms": 0.442685,
+            "min_ms": 0.433426,
+            "p95_ms": 0.461519,
+            "p99_ms": 0.461519,
+            "stddev_ms": 0.00729,
+            "cv_pct": 1.6467691473621198,
+            "rows_per_sec": 2253643.013932021,
+            "us_per_row": 0.443726,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.484611,
+            "mean_ms": 0.48327,
+            "min_ms": 0.461128,
+            "p95_ms": 0.509989,
+            "p99_ms": 0.509989,
+            "stddev_ms": 0.012306000000000001,
+            "cv_pct": 2.5464026320690296,
+            "rows_per_sec": 2063510.7333510795,
+            "us_per_row": 0.48461100000000007,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.0921401946246108
+        },
+        {
+          "scenario_id": "insertthroughput-single-transaction-tiny-1col__10000-rows",
+          "scenario": "10000 rows",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 3.949765,
+            "mean_ms": 3.946887,
+            "min_ms": 3.920702,
+            "p95_ms": 3.986685,
+            "p99_ms": 3.986685,
+            "stddev_ms": 0.021767,
+            "cv_pct": 0.5514979273538867,
+            "rows_per_sec": 2531796.195469857,
+            "us_per_row": 0.3949765,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 3.809936,
+            "mean_ms": 3.8068020000000002,
+            "min_ms": 3.748772,
+            "p95_ms": 3.86042,
+            "p99_ms": 3.86042,
+            "stddev_ms": 0.030840000000000003,
+            "cv_pct": 0.8101288167863735,
+            "rows_per_sec": 2624716.0057281805,
+            "us_per_row": 0.3809936,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 0.9645981469783645
+        }
+      ]
+    },
+    {
+      "section_id": "insertthroughput-single-transaction-small-3col",
+      "title": "INSERTThroughput — Single Transaction — small_3col",
+      "description": "Record: 3 cols (~30B: id, name, value). All rows inserted in a single BEGIN..COMMIT.",
+      "rows": [
+        {
+          "scenario_id": "insertthroughput-single-transaction-small-3col__100-rows",
+          "scenario": "100 rows",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 0.11475400000000001,
+            "mean_ms": 0.11611300000000001,
+            "min_ms": 0.112519,
+            "p95_ms": 0.127317,
+            "p99_ms": 0.127317,
+            "stddev_ms": 0.00415,
+            "cv_pct": 3.574104536098456,
+            "rows_per_sec": 871429.3183679872,
+            "us_per_row": 1.14754,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.167511,
+            "mean_ms": 0.170354,
+            "min_ms": 0.164135,
+            "p95_ms": 0.190244,
+            "p99_ms": 0.190244,
+            "stddev_ms": 0.007571,
+            "cv_pct": 4.444274862932482,
+            "rows_per_sec": 596975.7209974271,
+            "us_per_row": 1.6751099999999999,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.459739965491399
+        },
+        {
+          "scenario_id": "insertthroughput-single-transaction-small-3col__1000-rows",
+          "scenario": "1000 rows",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 0.5896570000000001,
+            "mean_ms": 0.588211,
+            "min_ms": 0.581591,
+            "p95_ms": 0.598042,
+            "p99_ms": 0.598042,
+            "stddev_ms": 0.00566,
+            "cv_pct": 0.9622397405012827,
+            "rows_per_sec": 1695901.176446646,
+            "us_per_row": 0.589657,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.665558,
+            "mean_ms": 0.659741,
+            "min_ms": 0.641293,
+            "p95_ms": 0.678813,
+            "p99_ms": 0.678813,
+            "stddev_ms": 0.011112,
+            "cv_pct": 1.684297322737256,
+            "rows_per_sec": 1502498.6552637035,
+            "us_per_row": 0.665558,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.128720595193477
+        },
+        {
+          "scenario_id": "insertthroughput-single-transaction-small-3col__10000-rows",
+          "scenario": "10000 rows",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 5.391837,
+            "mean_ms": 5.4166300000000005,
+            "min_ms": 5.335522,
+            "p95_ms": 5.612308,
+            "p99_ms": 5.612308,
+            "stddev_ms": 0.081034,
+            "cv_pct": 1.4960224346134037,
+            "rows_per_sec": 1854655.4727080956,
+            "us_per_row": 0.5391837,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 6.047197,
+            "mean_ms": 6.052853000000001,
+            "min_ms": 5.897338,
+            "p95_ms": 6.429587,
+            "p99_ms": 6.429587,
+            "stddev_ms": 0.150685,
+            "cv_pct": 2.4894871889338797,
+            "rows_per_sec": 1653658.7116311905,
+            "us_per_row": 0.6047197,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.1215467010593978
+        }
+      ]
+    },
+    {
+      "section_id": "insertthroughput-single-transaction-medium-6col",
+      "title": "INSERTThroughput — Single Transaction — medium_6col",
+      "description": "Record: 6 cols (~180B: id, name, email, bio, category, score). All rows inserted in a single BEGIN..COMMIT.",
+      "rows": [
+        {
+          "scenario_id": "insertthroughput-single-transaction-medium-6col__100-rows",
+          "scenario": "100 rows",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 0.158144,
+            "mean_ms": 0.157677,
+            "min_ms": 0.153726,
+            "p95_ms": 0.165668,
+            "p99_ms": 0.165668,
+            "stddev_ms": 0.00333,
+            "cv_pct": 2.1119123270990694,
+            "rows_per_sec": 632335.0870093079,
+            "us_per_row": 1.58144,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.20877800000000002,
+            "mean_ms": 0.21054299999999998,
+            "min_ms": 0.203329,
+            "p95_ms": 0.22566,
+            "p99_ms": 0.22566,
+            "stddev_ms": 0.006723,
+            "cv_pct": 3.193171941123666,
+            "rows_per_sec": 478977.67006102175,
+            "us_per_row": 2.0877800000000004,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.320176547956293
+        },
+        {
+          "scenario_id": "insertthroughput-single-transaction-medium-6col__1000-rows",
+          "scenario": "1000 rows",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 0.9341170000000001,
+            "mean_ms": 0.933419,
+            "min_ms": 0.926122,
+            "p95_ms": 0.945388,
+            "p99_ms": 0.945388,
+            "stddev_ms": 0.005623,
+            "cv_pct": 0.602408993174555,
+            "rows_per_sec": 1070529.708805214,
+            "us_per_row": 0.9341170000000001,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.8807889999999999,
+            "mean_ms": 0.882902,
+            "min_ms": 0.872182,
+            "p95_ms": 0.900825,
+            "p99_ms": 0.900825,
+            "stddev_ms": 0.009126,
+            "cv_pct": 1.0336368022725058,
+            "rows_per_sec": 1135345.6957341656,
+            "us_per_row": 0.8807889999999999,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 0.9429107916888355
+        },
+        {
+          "scenario_id": "insertthroughput-single-transaction-medium-6col__10000-rows",
+          "scenario": "10000 rows",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 8.593984,
+            "mean_ms": 8.584285000000001,
+            "min_ms": 8.528661,
+            "p95_ms": 8.634718,
+            "p99_ms": 8.634718,
+            "stddev_ms": 0.035454000000000006,
+            "cv_pct": 0.4130105186395838,
+            "rows_per_sec": 1163604.6797387567,
+            "us_per_row": 0.8593984,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 7.661198,
+            "mean_ms": 7.609576,
+            "min_ms": 7.410743,
+            "p95_ms": 7.770792,
+            "p99_ms": 7.770792,
+            "stddev_ms": 0.115495,
+            "cv_pct": 1.5177586766989384,
+            "rows_per_sec": 1305278.8871923164,
+            "us_per_row": 0.7661198,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 0.8914605845205203
+        }
+      ]
+    },
+    {
+      "section_id": "insertthroughput-single-transaction-large-10col",
+      "title": "INSERTThroughput — Single Transaction — large_10col",
+      "description": "Record: 10 cols (~600B: includes long text fields). All rows inserted in a single BEGIN..COMMIT.",
+      "rows": [
+        {
+          "scenario_id": "insertthroughput-single-transaction-large-10col__100-rows",
+          "scenario": "100 rows",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 0.240838,
+            "mean_ms": 0.252062,
+            "min_ms": 0.229397,
+            "p95_ms": 0.379085,
+            "p99_ms": 0.379085,
+            "stddev_ms": 0.042728,
+            "cv_pct": 16.951384976712077,
+            "rows_per_sec": 415216.8677700363,
+            "us_per_row": 2.4083799999999997,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.299137,
+            "mean_ms": 0.29824300000000004,
+            "min_ms": 0.289478,
+            "p95_ms": 0.305367,
+            "p99_ms": 0.305367,
+            "stddev_ms": 0.0048319999999999995,
+            "cv_pct": 1.6201553766559482,
+            "rows_per_sec": 334294.98858382617,
+            "us_per_row": 2.99137,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.2420672817412535
+        },
+        {
+          "scenario_id": "insertthroughput-single-transaction-large-10col__1000-rows",
+          "scenario": "1000 rows",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 1.560632,
+            "mean_ms": 1.5633730000000001,
+            "min_ms": 1.5488609999999998,
+            "p95_ms": 1.585429,
+            "p99_ms": 1.585429,
+            "stddev_ms": 0.011321000000000001,
+            "cv_pct": 0.7241394088294988,
+            "rows_per_sec": 640766.048626454,
+            "us_per_row": 1.5606319999999998,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 1.53261,
+            "mean_ms": 1.533134,
+            "min_ms": 1.525317,
+            "p95_ms": 1.5505339999999999,
+            "p99_ms": 1.5505339999999999,
+            "stddev_ms": 0.00874,
+            "cv_pct": 0.5700741096342524,
+            "rows_per_sec": 652481.7141999595,
+            "us_per_row": 1.5326099999999998,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 0.9820444537853895
+        },
+        {
+          "scenario_id": "insertthroughput-single-transaction-large-10col__10000-rows",
+          "scenario": "10000 rows",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 15.961105,
+            "mean_ms": 16.647955,
+            "min_ms": 15.631682000000001,
+            "p95_ms": 20.961925,
+            "p99_ms": 20.961925,
+            "stddev_ms": 1.551328,
+            "cv_pct": 9.318429801137738,
+            "rows_per_sec": 626523.0383485354,
+            "us_per_row": 1.5961105,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 18.762725,
+            "mean_ms": 19.891198999999997,
+            "min_ms": 18.109249000000002,
+            "p95_ms": 28.648781000000003,
+            "p99_ms": 28.648781000000003,
+            "stddev_ms": 3.051964,
+            "cv_pct": 15.3432882552731,
+            "rows_per_sec": 532971.6232583487,
+            "us_per_row": 1.8762725000000002,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.1755279474698024
+        }
+      ]
+    },
+    {
+      "section_id": "insertthroughput-transaction-strategy-comparison-small-3col",
+      "title": "INSERTThroughput — Transaction Strategy Comparison (small_3col)",
+      "description": "Compares autocommit, batched (1K/txn), and single-txn strategies.",
+      "rows": [
+        {
+          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__100-rows-autocommit",
+          "scenario": "100 rows / autocommit",
+          "category": "write_single",
+          "csqlite": {
+            "median_ms": 0.194521,
+            "mean_ms": 0.196573,
+            "min_ms": 0.190174,
+            "p95_ms": 0.211614,
+            "p99_ms": 0.211614,
+            "stddev_ms": 0.006148000000000001,
+            "cv_pct": 3.1275912765232254,
+            "rows_per_sec": 514083.3123415981,
+            "us_per_row": 1.9452099999999999,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.242782,
+            "mean_ms": 0.24459699999999998,
+            "min_ms": 0.237562,
+            "p95_ms": 0.25689799999999996,
+            "p99_ms": 0.25689799999999996,
+            "stddev_ms": 0.0064930000000000005,
+            "cv_pct": 2.6545705793611534,
+            "rows_per_sec": 411892.1501594022,
+            "us_per_row": 2.42782,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.2481017473691787
+        },
+        {
+          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__100-rows-batched-100-txn",
+          "scenario": "100 rows / batched (100/txn)",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 0.116377,
+            "mean_ms": 0.118429,
+            "min_ms": 0.11427200000000001,
+            "p95_ms": 0.12919,
+            "p99_ms": 0.12919,
+            "stddev_ms": 0.004704,
+            "cv_pct": 3.972000101326533,
+            "rows_per_sec": 859276.3174854137,
+            "us_per_row": 1.16377,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.184283,
+            "mean_ms": 0.18517699999999998,
+            "min_ms": 0.167671,
+            "p95_ms": 0.217465,
+            "p99_ms": 0.217465,
+            "stddev_ms": 0.01543,
+            "cv_pct": 8.332568299518838,
+            "rows_per_sec": 542643.6513406012,
+            "us_per_row": 1.8428300000000002,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.5835001761516452
+        },
+        {
+          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__100-rows-single-txn",
+          "scenario": "100 rows / single txn",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 0.116166,
+            "mean_ms": 0.117709,
+            "min_ms": 0.113641,
+            "p95_ms": 0.127357,
+            "p99_ms": 0.127357,
+            "stddev_ms": 0.004391999999999999,
+            "cv_pct": 3.7312355045068775,
+            "rows_per_sec": 860837.0779746225,
+            "us_per_row": 1.16166,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.165628,
+            "mean_ms": 0.16744,
+            "min_ms": 0.16375499999999998,
+            "p95_ms": 0.17805100000000001,
+            "p99_ms": 0.17805100000000001,
+            "stddev_ms": 0.004323,
+            "cv_pct": 2.581820353559484,
+            "rows_per_sec": 603762.648827493,
+            "us_per_row": 1.6562799999999998,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.4257872355078078
+        },
+        {
+          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__1000-rows-autocommit",
+          "scenario": "1000 rows / autocommit",
+          "category": "write_single",
+          "csqlite": {
+            "median_ms": 1.408509,
+            "mean_ms": 1.4123029999999999,
+            "min_ms": 1.4002439999999998,
+            "p95_ms": 1.451069,
+            "p99_ms": 1.451069,
+            "stddev_ms": 0.014328,
+            "cv_pct": 1.0145131745808087,
+            "rows_per_sec": 709970.6143162734,
+            "us_per_row": 1.408509,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 1.566743,
+            "mean_ms": 1.648418,
+            "min_ms": 1.5308570000000001,
+            "p95_ms": 2.065571,
+            "p99_ms": 2.065571,
+            "stddev_ms": 0.181865,
+            "cv_pct": 11.032699230413645,
+            "rows_per_sec": 638266.7738103825,
+            "us_per_row": 1.566743,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.1123414901857211
+        },
+        {
+          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__1000-rows-batched-1000-txn",
+          "scenario": "1000 rows / batched (1000/txn)",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 0.5994550000000001,
+            "mean_ms": 0.609046,
+            "min_ms": 0.586911,
+            "p95_ms": 0.6657390000000001,
+            "p99_ms": 0.6657390000000001,
+            "stddev_ms": 0.026316,
+            "cv_pct": 4.320855895942179,
+            "rows_per_sec": 1668181.9319214954,
+            "us_per_row": 0.5994550000000001,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.664696,
+            "mean_ms": 0.662576,
+            "min_ms": 0.643006,
+            "p95_ms": 0.6809459999999999,
+            "p99_ms": 0.6809459999999999,
+            "stddev_ms": 0.009566,
+            "cv_pct": 1.443758904638864,
+            "rows_per_sec": 1504447.145762875,
+            "us_per_row": 0.6646960000000001,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.1088338574204903
+        },
+        {
+          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__1000-rows-single-txn",
+          "scenario": "1000 rows / single txn",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 0.598132,
+            "mean_ms": 0.598012,
+            "min_ms": 0.579307,
+            "p95_ms": 0.611938,
+            "p99_ms": 0.611938,
+            "stddev_ms": 0.010934000000000001,
+            "cv_pct": 1.8283914035169861,
+            "rows_per_sec": 1671871.7607484634,
+            "us_per_row": 0.5981320000000001,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.661099,
+            "mean_ms": 0.6813910000000001,
+            "min_ms": 0.644749,
+            "p95_ms": 0.86031,
+            "p99_ms": 0.86031,
+            "stddev_ms": 0.061882,
+            "cv_pct": 9.081716664881103,
+            "rows_per_sec": 1512632.7524319354,
+            "us_per_row": 0.6610989999999999,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.1052727491590486
+        },
+        {
+          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__10000-rows-autocommit",
+          "scenario": "10000 rows / autocommit",
+          "category": "write_single",
+          "csqlite": {
+            "median_ms": 13.561511999999999,
+            "mean_ms": 13.564224,
+            "min_ms": 13.32939,
+            "p95_ms": 13.927032,
+            "p99_ms": 13.927032,
+            "stddev_ms": 0.195406,
+            "cv_pct": 1.4405984448502178,
+            "rows_per_sec": 737380.9056099349,
+            "us_per_row": 1.3561511999999998,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 14.128676,
+            "mean_ms": 14.123306000000001,
+            "min_ms": 14.070589,
+            "p95_ms": 14.175965,
+            "p99_ms": 14.175965,
+            "stddev_ms": 0.031466,
+            "cv_pct": 0.2227948612031772,
+            "rows_per_sec": 707780.4034857902,
+            "us_per_row": 1.4128676,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.0418215903949353
+        },
+        {
+          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__10000-rows-batched-1000-txn",
+          "scenario": "10000 rows / batched (1000/txn)",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 5.4113039999999994,
+            "mean_ms": 5.959542,
+            "min_ms": 5.3264059999999995,
+            "p95_ms": 8.085297,
+            "p99_ms": 8.085297,
+            "stddev_ms": 1.06477,
+            "cv_pct": 17.866641429827997,
+            "rows_per_sec": 1847983.4065873958,
+            "us_per_row": 0.5411303999999999,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 5.521879,
+            "mean_ms": 5.528848,
+            "min_ms": 5.462809,
+            "p95_ms": 5.630421,
+            "p99_ms": 5.630421,
+            "stddev_ms": 0.051288,
+            "cv_pct": 0.9276435163346867,
+            "rows_per_sec": 1810977.7486974995,
+            "us_per_row": 0.5521879000000001,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.0204340765183402
+        },
+        {
+          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__10000-rows-single-txn",
+          "scenario": "10000 rows / single txn",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 5.353927,
+            "mean_ms": 5.360412999999999,
+            "min_ms": 5.308303,
+            "p95_ms": 5.413468,
+            "p99_ms": 5.413468,
+            "stddev_ms": 0.031861,
+            "cv_pct": 0.5943758438015877,
+            "rows_per_sec": 1867787.8872834838,
+            "us_per_row": 0.5353926999999999,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 5.507713,
+            "mean_ms": 5.4679139999999995,
+            "min_ms": 5.224526,
+            "p95_ms": 5.718435,
+            "p99_ms": 5.718435,
+            "stddev_ms": 0.152481,
+            "cv_pct": 2.788650296987114,
+            "rows_per_sec": 1815635.636787901,
+            "us_per_row": 0.5507713,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.0287239628033777
+        }
+      ]
+    },
+    {
+      "section_id": "insertthroughput-record-size-comparison-10k-rows-single-txn",
+      "title": "INSERTThroughput — Record Size Comparison (10K rows, single txn)",
+      "description": "Fixed 10K rows in a single transaction, varying payload size.",
+      "rows": [
+        {
+          "scenario_id": "insertthroughput-record-size-comparison-10k-rows-single-txn__tiny-1col-1-col-integer-pk-only",
+          "scenario": "tiny_1col — 1 col (INTEGER PK only)",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 4.002263,
+            "mean_ms": 4.01855,
+            "min_ms": 3.9573000000000005,
+            "p95_ms": 4.17822,
+            "p99_ms": 4.17822,
+            "stddev_ms": 0.059476,
+            "cv_pct": 1.4800363315126104,
+            "rows_per_sec": 2498586.424730209,
+            "us_per_row": 0.4002263,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 3.575249,
+            "mean_ms": 3.7438599999999997,
+            "min_ms": 3.488708,
+            "p95_ms": 4.5961680000000005,
+            "p99_ms": 4.5961680000000005,
+            "stddev_ms": 0.389914,
+            "cv_pct": 10.414759098897928,
+            "rows_per_sec": 2797007.9846186936,
+            "us_per_row": 0.3575249,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 0.8933068616430254
+        },
+        {
+          "scenario_id": "insertthroughput-record-size-comparison-10k-rows-single-txn__small-3col-3-cols-30b-id-name-value",
+          "scenario": "small_3col — 3 cols (~30B: id, name, value)",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 5.380166,
+            "mean_ms": 5.390565,
+            "min_ms": 5.358306,
+            "p95_ms": 5.442070999999999,
+            "p99_ms": 5.442070999999999,
+            "stddev_ms": 0.030848,
+            "cv_pct": 0.572259123116037,
+            "rows_per_sec": 1858678.7099134116,
+            "us_per_row": 0.5380166,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 5.590117,
+            "mean_ms": 5.501146,
+            "min_ms": 5.287123,
+            "p95_ms": 5.730347,
+            "p99_ms": 5.730347,
+            "stddev_ms": 0.154692,
+            "cv_pct": 2.8119959004905524,
+            "rows_per_sec": 1788871.3241601202,
+            "us_per_row": 0.5590117,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.0390231453825032
+        },
+        {
+          "scenario_id": "insertthroughput-record-size-comparison-10k-rows-single-txn__medium-6col-6-cols-180b-id-name-email-bio-category-score",
+          "scenario": "medium_6col — 6 cols (~180B: id, name, email, bio, category, score)",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 8.670415,
+            "mean_ms": 8.671026,
+            "min_ms": 8.572743000000001,
+            "p95_ms": 8.853947,
+            "p99_ms": 8.853947,
+            "stddev_ms": 0.076436,
+            "cv_pct": 0.8815104463993074,
+            "rows_per_sec": 1153347.331125442,
+            "us_per_row": 0.8670415000000001,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 7.843006,
+            "mean_ms": 7.83879,
+            "min_ms": 7.516369,
+            "p95_ms": 8.215508999999999,
+            "p99_ms": 8.215508999999999,
+            "stddev_ms": 0.186603,
+            "cv_pct": 2.3805077059086925,
+            "rows_per_sec": 1275021.337482083,
+            "us_per_row": 0.7843005999999999,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 0.9045710038100829
+        },
+        {
+          "scenario_id": "insertthroughput-record-size-comparison-10k-rows-single-txn__large-10col-10-cols-600b-includes-long-text-fields",
+          "scenario": "large_10col — 10 cols (~600B: includes long text fields)",
+          "category": "write_bulk",
+          "csqlite": {
+            "median_ms": 15.604811999999999,
+            "mean_ms": 15.546323000000001,
+            "min_ms": 15.2108,
+            "p95_ms": 15.778876,
+            "p99_ms": 15.778876,
+            "stddev_ms": 0.187611,
+            "cv_pct": 1.2067869682110683,
+            "rows_per_sec": 640827.9702440504,
+            "us_per_row": 1.5604812,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 18.610682,
+            "mean_ms": 18.608268000000002,
+            "min_ms": 18.511278,
+            "p95_ms": 18.70589,
+            "p99_ms": 18.70589,
+            "stddev_ms": 0.068309,
+            "cv_pct": 0.36708951096362114,
+            "rows_per_sec": 537325.8218049182,
+            "us_per_row": 1.8610682,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.1926245570917484
+        }
+      ]
+    }
+  ]
+}

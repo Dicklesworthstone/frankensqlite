@@ -48,6 +48,47 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-07-27 - RESOLVED: comprehensive-bench block_on hoist lands; write_bulk 2.59x -> 1.13x (instrument), engine residual ~1.29x vs pre-async baseline
+
+- Target: the bd-zavyn instrument drift — every timed FrankenSQLite body in
+  `comprehensive_bench.rs` entered the harness runtime once per operation
+  since `a0ab400a`, so write-side rows measured ~333 ns of bridge per row on
+  the FrankenSQLite side only. Hoist landed at `19e35b81` (one runtime entry
+  per timed sample / transaction attempt; concurrent section attempt-scoped
+  with backoff outside the runtime; provenance design id
+  `scenario_scoped_thread_local_block_on` with the citable:false gate intact).
+  Executor and the other six bench bins were hoisted earlier
+  (`7547724b`, `5461fd2f`, `ee64b241`).
+- Evidence: same shape as the whole bd-zavyn chain (`--quick --filter insert`,
+  `release-perf`, `taskset -c 4-11`, same host csd). Hoisted binary ELF
+  SHA-256 `4ea129ddafa436379e1400dd1d74bd6615087771…` (21,683,408 bytes,
+  built 2026-07-27 14:16 from `19e35b81`); artifact
+  `tests/artifacts/perf/zavyn-hoist-directional-20260727T1817Z-csd/`
+  (`bench-hoist-rp.json` SHA-256 prefix `782e60fccdfa0561`). N-for-n:
+
+  | arm | write_bulk n=22 geomean | write_single n=3 geomean |
+  |---|---:|---:|
+  | `140e77df` pre-async baseline | 0.8754x | 0.9202x |
+  | `ef1e39c9` per-op bridge | 2.5898x | 2.0795x |
+  | `19e35b81` hoisted | **1.1253x** | **1.1309x** |
+
+  25 scenarios: 4 faster / 6 comparable / 15 slower, avg 1.14x; the tight
+  rows have CV 0.4-1.5% on both engines.
+- Result: the hoist removes ~2.3x of pure instrument distortion, confirming
+  the bd-zavyn attribution end-to-end. The residual engine-side cost of the
+  async migration on this shape is ~1.29x (1.1253/0.8754) — that residual,
+  not the retracted 2.96x, is what `bd-dqdoe` still owes an attribution for
+  (known candidates: single-entry runtime residual per the gate0-bridge
+  diagnostic, UnixFile fallback-path tax per bd-trfah/bd-fo6xw).
+- Caveats: host load 4-8 during the run and no cgroup isolation, so this is
+  a DIRECTIONAL receipt, not a citable magnitude; the artifact self-declares
+  non-citable via the unchanged Gate 0 validation errors. Env-gated
+  diagnostic profilers (`FSQLITE_BENCH_PROFILE_*`) remain per-op; they never
+  feed scored rows.
+- Retry/next: re-run under Gate 0's paired ABBA + provenance regime for a
+  citable magnitude; until then no README claim may cite these numbers
+  beyond "the per-operation bridge distortion is fixed".
+
 ## 2026-07-26 - MEASURE: the io_uring data path is unreachable in production (100% unix fallback)
 
 - Scope: `IoUringFile::{read,write,write_tracked}` on Linux file-backed databases
