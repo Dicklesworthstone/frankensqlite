@@ -21059,3 +21059,57 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   the independent remote correctness worker timed out. Resume in a quiescent
   remote window satisfying the predicate above, then choose a different alien
   primitive if the ownership representation still lacks profile attribution.
+
+## 2026-07-27 - KEEP (batched hop) + DEFER (inline lane): UnixFile per-page I/O tax is ~90% blocking-pool round-trip; write_page_batch now pays ONE hop per batch (4.9x); global inline pread/pwrite REJECTED by async-contract review
+
+- Target workload: every file-backed read/write. Per bd-fo6xw this path is
+  100% of production I/O (7520 unix fallbacks, 0 io_uring samples), so the
+  per-page cost multiplies into every write-side benchmark row and every cold
+  read. Filed as bd-trfah; also feeds bd-dqdoe attribution (step-4 bridge
+  controls).
+- Method: same-binary paired decomposition harness (final source + all three
+  JSON runs in `tests/artifacts/perf/vfs-tax-decomposition-20260727T0257Z-csd/`),
+  15 rotated-order rounds, fixed-seed LCG offsets, counting global allocator,
+  8 MiB page-cache-warm file, `taskset -c 56-63` on csd. Host loadavg 8-21:
+  absolute ns are inflated; the paired decomposition and ratios are the
+  claim, not absolute latency. NOT citable for README numbers.
+- Measured (medians, ns/op, pre-change): shipped read 15,594 vs inline
+  counterfactual 1,164 (13.4x); shipped write 18,881 vs 1,676 (11.3x); empty
+  `spawn_blocking_io` round-trip 14,049 with 4 allocs; `vec![0;4096]` +
+  full-page copy only 147. Model check: (shipped − inline) 14,430 ≈
+  (hop + alloc/copy) 14,196. **The bd-trfah title's "3 full-page traversals"
+  is real but immaterial (~1% of the tax); ~90% is the blocking-pool
+  round-trip itself.**
+- An inline (`≤64 KiB` on calling thread) prototype was built and validated —
+  shipped read collapsed to 1,232 ns/op (0.94x vs counterfactual, allocs/op
+  5.04 → 0.01) — then **withdrawn before landing** on RusticBasin's
+  async-contract objection (bd-trfah thread, 2026-07-27): on the raw async
+  `Connection` API engine futures run on shared asupersync scheduler workers,
+  and page I/O can block arbitrarily under reclaim/device stalls; inline
+  `truncate`/`sync` is pre-existing debt, not precedent. Global inline
+  blocking I/O is off-contract.
+- LANDED instead (`crates/fsqlite-vfs/src/unix.rs`, `write_page_batch`
+  override only; no trait changes): stage the pager batch and issue ONE
+  `spawn_blocking_io` hop that pwrites every page. Measured with the same
+  harness: **2,893 ns/op per page at group size 16 vs 14,313 ns/op for the
+  per-page pooled default — 4.9x on pager commit batches**, contract-safe.
+  Staging `to_vec` copies are ~1% of the former per-page cost.
+- DEFERRED (tracked in the bd-trfah thread + follow-up bead): the remaining
+  ~2x to the inline floor (1,516 ns/op) needs the actor-lane design
+  RusticBasin proposed — a Cx capability marker (e.g.
+  `blocking_io_inline_safe`) set only on `AsyncConnection`'s dedicated engine
+  OS thread, with UnixFile inlining EINTR-safe positional I/O only under that
+  marker. Requires three-arm measurement (fallback-thread vs actor-inline vs
+  pool/gateway) plus scheduler-latency proof under induced slow I/O.
+  Coordinate the exact Cx field with RusticBasin before edits.
+- Bridge controls for bd-dqdoe: per-op `block_on(async {})` on a persistent
+  runtime = 754 ns/op (consistent with bd-zavyn's ~333 ns instrument-drift
+  scale on a quieter host); fresh-runtime-per-op = 5.4 ms/op (production does
+  NOT do this — timing rules it out). The dominant engine-side per-I/O
+  mechanism is the per-page pool hop: now amortized for batch writes, still
+  present for single-page reads/writes pending the actor lane and the
+  bd-zavyn hoist.
+- Retry condition for global inline I/O: only with an explicit
+  scheduler-latency/cancellation gate under induced slow I/O proving
+  unrelated tasks are not stalled, or under the actor-lane capability marker
+  above. Do not re-attempt a bare inline fast path in `read`/`write_tracked`.

@@ -1,0 +1,15 @@
+[package]
+name = "vfs-tax"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fsqlite-vfs = { path = "/data/projects/frankensqlite/crates/fsqlite-vfs" }
+fsqlite-types = { path = "/data/projects/frankensqlite/crates/fsqlite-types" }
+asupersync = { version = "0.3.9", default-features = false }
+
+[profile.release]
+opt-level = 3
+debug = 1
+
+[workspace]

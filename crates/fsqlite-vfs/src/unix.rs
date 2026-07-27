@@ -2023,6 +2023,40 @@ impl VfsFile for UnixFile {
         checkpoint_or_abort(cx)
     }
 
+    async fn write_page_batch(&self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
+        // Pager commit batches are page-sized writes to one descriptor. The
+        // default trait loop pays a blocking-pool round-trip per page, which
+        // is ~90% of an 11-13x per-page write tax (bd-trfah decomposition,
+        // 2026-07-27). Stage the batch and issue ONE pool hop that pwrites
+        // every page, amortizing the hop without blocking a scheduler
+        // worker — inline syscalls on shared runtime workers are outside
+        // the async contract (bd-trfah thread). The staging copies are
+        // ~1% of the former per-page cost.
+        checkpoint_or_abort(cx)?;
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let file = Arc::clone(
+            self.file
+                .as_ref()
+                .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
+        );
+        let mut staged: Vec<(u64, Vec<u8>)> = Vec::with_capacity(writes.len());
+        for (offset, data) in writes {
+            checked_io_range(*offset, data.len(), "write")?;
+            staged.push((*offset, data.to_vec()));
+        }
+        spawn_blocking_io(move || {
+            for (offset, data) in staged {
+                write_owned_at(Arc::clone(&file), data, offset)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(FrankenError::Io)?;
+        checkpoint_or_abort(cx)
+    }
+
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
         self.file_ref().set_len(size).map_err(FrankenError::Io)?;
         Ok(())
