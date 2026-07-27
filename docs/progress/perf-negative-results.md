@@ -48,6 +48,53 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-07-27 - LANDED: io_uring reachable for the first time (bd-fo6xw) + inline-I/O marker with default-off gate (bd-bjm5d) + write_page_batch production wiring
+
+- Target: the three I/O-side residual mechanisms. All landed on main the
+  same day: `a14b1629` (IoUringFile write_page_batch forward + journal-mode
+  commit batching — without the forward, the landed 4.9x batch could never
+  fire on Linux because the trait default loops per-page through the uring
+  fallback), `1b63c0c3` (bd-bjm5d `blocking_io_inline_safe` CxInner marker +
+  UnixFile inline gate <=64 KiB, default OFF everywhere, single set site on
+  the AsyncConnection dedicated worker thread — design approved with
+  constraints by the async-contract owner, agent-mail 4363), `dc56e76f`
+  (bd-fo6xw mint-and-exit native-Cx spawner on RuntimeContext, attached to
+  the CONNECTION root Cx only when the context carries a runtime handle;
+  CLI opts in).
+- Evidence, bd-fo6xw functional receipt: staged CLI (built from
+  byte-identical sources to the landed files, ELF prefix `b0a662b1…`,
+  345,057,328 bytes) on the bd-fo6xw cold-reader repro:
+  `read_samples_total` **0 -> 110**, `write_samples_total` **0 -> 4**,
+  `unix_fallbacks_total` 41 — the io_uring data path engages in production
+  for the FIRST time since the async migration — while the exact refuted-fix
+  failure repro (CREATE+INSERT+SELECT, reopen, cross-process counts) runs
+  clean. Root cause was deeper than recorded: `block_on`'s ambient request
+  Cx carries NO spawn gateway in asupersync 0.3.9, so the 2026-07-26
+  substitution failed deterministically; only
+  `RuntimeHandle::try_spawn_with_cx` mints a gateway-carrying Cx
+  (root-region task). Probe artifacts: session scratchpad `asup-probe/`
+  (six lifecycle probes incl. runtime-drop-with-saved-clone and
+  post-shutdown graceful spawn failure).
+- Constraints preserved: default `Connection::open` path bit-for-bit
+  unchanged (`new_process_global` never mints);
+  `test_global_runtime_context_does_not_capture_ambient_native_cx` green;
+  attach is on the connection root Cx, so Phase-C's staged
+  `is_detached_for_dedicated_worker` predicate is untouched; no new
+  RuntimeContexts (SharedMvccKey stable). The parked-task shape was
+  REPLACED by mint-and-exit after the structured-lifecycle objection
+  (agent-mail 4363) — no task survives the mint instant.
+- Result: the UnixFile fallback tax now has three landed reducers (batch
+  hop amortization on journal commits, inline lane awaiting its dedicated
+  thread consumer, uring engagement on runtime-bearing opens). NOT yet
+  measured as end-to-end throughput: the comprehensive bench drives raw
+  `Connection` on `:memory:`, which exercises none of these. The bd-bjm5d
+  optimization stays PROVISIONAL until its three-arm ABBA measurement;
+  uring-arm timing claims need a Gate 0 paired run on a file-backed shape.
+- Retry/next: file-backed paired A/B (unix-fallback vs uring-engaged CLI
+  arm, and AsyncConnection inline arm) under Gate 0 pairing; wire a
+  checkpoint copy-back batch caller (cross-crate trait change, mapped in
+  bd-bjm5d's session notes).
+
 ## 2026-07-27 - ATTRIBUTED: the ~1.29x engine residual is per-statement async machinery (~700ns/row) + commit-path inflation, partially offset by a faster row-build pipeline; fast lanes are NOT disengaged
 
 - Target: mechanism attribution for the post-hoist ~1.29x write residual
