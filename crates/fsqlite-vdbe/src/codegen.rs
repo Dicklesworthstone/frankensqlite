@@ -2200,6 +2200,57 @@ pub fn codegen_select(
         }
     }
 
+    // bd-g5ys1: route `SELECT <cols> FROM t WHERE <indexed col> IN (SELECT ...)`
+    // (uncorrelated, single-key ascending index, matching collation) through a
+    // materialize-then-seek program instead of the full scan probing an
+    // ephemeral membership index. Same pre-directive routing rationale as the
+    // IN-list and COUNT(*) hooks above: the planner models IN as a scan (its
+    // IndexEquality directive carries no payload for an IN), so the directive
+    // arm declines and the shape previously fell to `codegen_select_full_scan`.
+    // The gate reuses `in_list_seek_allowed` (non-aggregate, no ORDER BY /
+    // LIMIT / DISTINCT / GROUP BY / HAVING, rowid table); the extractor
+    // enforces plain `IN` (not `NOT IN`), an uncorrelated subquery, index-hint
+    // honor, and operand/index collation equivalence. Control reaching here
+    // means the rowid/IN-list routes above did not fire. The `(key, i64::MIN)`
+    // seek-probe contract requires a single-key index, so composite matches
+    // (admitted by the extractor only for the COUNT merge path) are declined.
+    if in_list_seek_allowed {
+        let scan_ctx = ScanCtx {
+            cursor,
+            table,
+            table_alias,
+            schema: Some(schema),
+            register_base: None,
+            secondaries: &[],
+        };
+        if let Some((idx_schema, in_target)) = extract_count_indexed_in_target(
+            where_clause.as_deref(),
+            table,
+            table_alias,
+            schema,
+            &scan_ctx,
+            from_index_hint,
+        ) && idx_schema.key_term_count() == 1
+            && let CountIndexedInTarget::ProbeSource(probe_source)
+            | CountIndexedInTarget::MaterializedProbeSource(probe_source) = in_target
+        {
+            return codegen_select_index_in_subquery_scan(
+                b,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                columns,
+                out_regs,
+                out_col_count,
+                done_label,
+                end_label,
+                idx_schema,
+                &probe_source,
+            );
+        }
+    }
+
     // bd-zqkrp: route a composite equality-prefix + trailing-range seek (`WHERE a = v AND b <range>`
     // on `index(a, b)`) BEFORE the planner directive. The planner reports this as an IndexRange
     // directive, but the single-column `index_range` local below is None for this shape, so the
@@ -3708,6 +3759,192 @@ fn codegen_select_index_in_scan(
     }
 
     b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+/// Codegen for `SELECT <cols> FROM t WHERE <indexed col> IN (SELECT ...)`
+/// (uncorrelated) — bd-g5ys1.
+///
+/// Build phase: scan the subquery source once and materialize its non-NULL
+/// values into a deduplicated ephemeral index (`Found`-guarded `IdxInsert`;
+/// `IN` never matches NULL, and without the dedup guard a duplicate value in
+/// the subquery would emit each matching outer row twice). Drive phase: for
+/// each distinct value, `SeekGE` the outer index with a `(key, i64::MIN)`
+/// probe and walk the equal-key run, doing the table lookup and emitting
+/// `ResultRow` per matching row — the same value-then-rowid output order and
+/// run-walk contract as [`codegen_select_index_in_scan`], and the same
+/// build/drive shape as [`codegen_select_count_star_indexed_in_scan`]'s
+/// materialized arm with the count step replaced by row output. Non-covering
+/// (always looks the row up). The caller gates out ORDER BY / LIMIT /
+/// DISTINCT / GROUP BY / HAVING / WITHOUT ROWID; the extractor gates out
+/// `NOT IN`, correlated subqueries, index hints that exclude the index, and
+/// collation mismatches.
+#[allow(clippy::too_many_arguments)]
+fn codegen_select_index_in_subquery_scan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    idx_schema: &IndexSchema,
+    probe_source: &InProbeSource<'_>,
+) -> Result<(), CodegenError> {
+    let idx_cursor = cursor + 1;
+    let probe_cursor = cursor + 2;
+    let source_cursor = cursor + 3;
+    let key_collation = idx_schema
+        .key_term_collation(0)
+        .filter(|name| !name.eq_ignore_ascii_case("BINARY"))
+        .map_or(P4::None, |name| P4::Collation(name.to_owned()));
+
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        idx_schema.root_page,
+        0,
+        P4::Index(idx_schema.name.clone()),
+        0,
+    );
+    b.emit_op(
+        Opcode::OpenAutoindex,
+        probe_cursor,
+        1,
+        0,
+        key_collation.clone(),
+        0,
+    );
+    b.emit_op(
+        Opcode::OpenRead,
+        source_cursor,
+        probe_source.table.root_page,
+        0,
+        P4::Table(probe_source.table.name.clone()),
+        0,
+    );
+
+    let r_value = b.alloc_temp();
+    let r_key = b.alloc_temp();
+    let build_done = b.emit_label();
+    let build_start = b.current_addr();
+    b.emit_jump_to_label(Opcode::Rewind, source_cursor, 0, build_done, P4::None, 0);
+    let skip_source_row = probe_source.where_clause.map(|_| b.emit_label());
+    if let (Some(where_expr), Some(skip_label)) = (probe_source.where_clause, skip_source_row) {
+        emit_where_filter(
+            b,
+            where_expr,
+            source_cursor,
+            probe_source.table,
+            probe_source.table_alias,
+            schema,
+            skip_label,
+        );
+    }
+    let probe_scan = ScanCtx {
+        cursor: source_cursor,
+        table: probe_source.table,
+        table_alias: probe_source.table_alias,
+        schema: Some(schema),
+        register_base: None,
+        secondaries: &[],
+    };
+    emit_in_probe_value(b, source_cursor, probe_source, r_value, &probe_scan);
+    let skip_insert = b.emit_label();
+    let next_source = b.emit_label();
+    b.emit_jump_to_label(Opcode::IsNull, r_value, 0, next_source, P4::None, 0);
+    b.emit_op(Opcode::MakeRecord, r_value, 1, r_key, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Found, probe_cursor, r_key, skip_insert, P4::None, 0);
+    b.emit_op(Opcode::IdxInsert, probe_cursor, r_key, 0, P4::None, 0);
+    b.resolve_label(skip_insert);
+    b.resolve_label(next_source);
+    if let Some(skip_label) = skip_source_row {
+        b.resolve_label(skip_label);
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let build_loop_body = (build_start + 1) as i32;
+    b.emit_op(Opcode::Next, source_cursor, build_loop_body, 0, P4::None, 0);
+    b.resolve_label(build_done);
+    b.emit_op(Opcode::Close, source_cursor, 0, 0, P4::None, 0);
+    b.free_temp(r_key);
+    b.free_temp(r_value);
+
+    // `MakeRecord r_probe_value, 2` reads two consecutive registers, so
+    // `r_min_rowid` must be allocated immediately after `r_probe_value`.
+    let r_probe_value = b.alloc_reg();
+    let r_min_rowid = b.alloc_reg();
+    let r_probe_record = b.alloc_reg();
+    let r_current_key = b.alloc_reg();
+    let rowid_reg = b.alloc_reg();
+    b.emit_jump_to_label(Opcode::Rewind, probe_cursor, 0, done_label, P4::None, 0);
+    let probe_loop_top = b.current_addr();
+    b.emit_op(Opcode::Column, probe_cursor, 0, r_probe_value, P4::None, 0);
+    b.emit_op(Opcode::Int64, 0, r_min_rowid, 0, P4::Int64(i64::MIN), 0);
+    b.emit_op(
+        Opcode::MakeRecord,
+        r_probe_value,
+        2,
+        r_probe_record,
+        P4::None,
+        0,
+    );
+    let next_probe = b.emit_label();
+    b.emit_jump_to_label(
+        Opcode::SeekGE,
+        idx_cursor,
+        r_probe_record,
+        next_probe,
+        P4::None,
+        0,
+    );
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let run_top = b.current_addr() as i32;
+    b.emit_op(Opcode::Column, idx_cursor, 0, r_current_key, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::Ne,
+        r_probe_value,
+        r_current_key,
+        next_probe,
+        key_collation,
+        0,
+    );
+    let skip_output = b.emit_label();
+    b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::SeekRowid,
+        cursor,
+        rowid_reg,
+        skip_output,
+        P4::None,
+        0,
+    );
+    emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    b.resolve_label(skip_output);
+    b.emit_op(Opcode::Next, idx_cursor, run_top, 0, P4::None, 0);
+    b.resolve_label(next_probe);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let probe_loop_body = probe_loop_top as i32;
+    b.emit_op(Opcode::Next, probe_cursor, probe_loop_body, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, probe_cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
@@ -38751,6 +38988,88 @@ mod tests {
         assert!(
             !prog.ops().iter().any(|op| matches!(&op.p4, P4::Table(name) if op.opcode == Opcode::OpenRead && name == "t")),
             "count(*) with indexed IN-subquery should avoid reopening the base table"
+        );
+    }
+
+    /// bd-g5ys1: the non-aggregate indexed IN-subquery must drive the outer
+    /// index with per-value seeks instead of full-scanning the table with a
+    /// per-row membership probe.
+    #[test]
+    fn bd_g5ys1_nonaggregate_indexed_in_subquery_seeks_per_distinct_value() {
+        let where_expr = Expr::In {
+            expr: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+            set: InSet::Subquery(Box::new(SelectStatement {
+                with: None,
+                body: SelectBody {
+                    select: SelectCore::Select {
+                        distinct: Distinctness::All,
+                        columns: vec![ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::bare("b"), Span::ZERO),
+                            alias: None,
+                        }],
+                        from: Some(from_table("s")),
+                        where_clause: None,
+                        group_by: vec![],
+                        having: None,
+                        windows: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            })),
+            not: false,
+            span: Span::ZERO,
+        };
+        let stmt = simple_select(&["b"], "t", Some(Box::new(where_expr)));
+
+        let schema = test_schema_with_index_and_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| matches!(&op.p4, P4::Index(name) if op.opcode == Opcode::OpenRead && name == "idx_t_b")),
+            "indexed IN-subquery should open the outer index"
+        );
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenAutoindex),
+            "indexed IN-subquery should materialize the RHS probe set once"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Found),
+            "the probe-set build must dedup via Found so duplicate RHS values \
+             cannot emit duplicate outer rows"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
+            "indexed IN-subquery should seek into the outer index per probe value"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::IdxRowid)
+                && prog.ops().iter().any(|op| op.opcode == Opcode::SeekRowid),
+            "each index hit should look the row up in the base table"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::ResultRow),
+            "matching rows should be emitted"
+        );
+        // The outer table is opened for row lookups (cursor 0) but never
+        // scanned: every Rewind belongs to the probe/source cursors.
+        assert!(
+            prog.ops().iter().any(|op| matches!(&op.p4, P4::Table(name) if op.opcode == Opcode::OpenRead && name == "t")),
+            "the base table stays open for SeekRowid lookups"
+        );
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
+            "the outer table must not be full-scanned, got: {:?}",
+            prog.ops().iter().map(|op| op.opcode).collect::<Vec<_>>()
         );
     }
 
