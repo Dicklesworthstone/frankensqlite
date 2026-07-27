@@ -543,84 +543,107 @@ fn commit_mixed_transaction(
         rng.random::<u32>()
     );
 
+    // bd-mnlk2 / bd-zavyn: one runtime entry per transaction attempt (the
+    // deadline loop scores iterations/sec, so per-op entries inflated the
+    // denominator). retry_fsqlite's backoff sleep already sits outside the
+    // closure, i.e. outside the entered runtime.
     retry_fsqlite(config, counters, "mixed write transaction", || {
-        fsqlite_e2e::block_on(conn.begin_transaction())?;
-        let mut in_txn = true;
-        let result = (|| -> Result<(), FrankenError> {
-            let inserted = fsqlite_e2e::block_on(conn.execute_with_params(
-                "INSERT INTO swarm_rows \
-                 (id, owner, seq, payload, touched_by, generation, deleted) \
-                 VALUES (?1, ?2, ?3, ?4, ?2, 0, 0)",
-                &[
-                    SqliteValue::Integer(id),
-                    SqliteValue::Integer(i64::try_from(child.worker_id).unwrap_or(i64::MAX)),
-                    SqliteValue::Integer(seq),
-                    SqliteValue::Text(payload.clone().into()),
-                ],
-            ))?;
-            if inserted != 1 {
-                return Err(FrankenError::Internal(format!(
-                    "insert affected {inserted} rows for id={id}"
-                )));
-            }
-
-            let updated = fsqlite_e2e::block_on(conn.execute_with_params(
-                "UPDATE swarm_rows \
-                 SET payload = ?1, touched_by = ?2, generation = generation + 1 \
-                 WHERE id = ?3",
-                &[
-                    SqliteValue::Text(update_payload.clone().into()),
-                    SqliteValue::Integer(i64::try_from(child.worker_id).unwrap_or(i64::MAX)),
-                    SqliteValue::Integer(update_id),
-                ],
-            ))?;
-            if updated != 1 {
-                return Err(FrankenError::Internal(format!(
-                    "update affected {updated} rows for id={update_id}"
-                )));
-            }
-
-            if let Some(delete_id) = deleted_id {
-                let deleted = fsqlite_e2e::block_on(conn.execute_with_params(
-                    "DELETE FROM swarm_rows WHERE id = ?1 AND owner = ?2",
-                    &[
-                        SqliteValue::Integer(delete_id),
-                        SqliteValue::Integer(i64::try_from(child.worker_id).unwrap_or(i64::MAX)),
-                    ],
-                ))?;
-                if deleted != 1 {
+        fsqlite_e2e::block_on(async {
+            conn.begin_transaction().await?;
+            let mut in_txn = true;
+            let result = async {
+                let inserted = conn
+                    .execute_with_params(
+                        "INSERT INTO swarm_rows \
+                         (id, owner, seq, payload, touched_by, generation, deleted) \
+                         VALUES (?1, ?2, ?3, ?4, ?2, 0, 0)",
+                        &[
+                            SqliteValue::Integer(id),
+                            SqliteValue::Integer(
+                                i64::try_from(child.worker_id).unwrap_or(i64::MAX),
+                            ),
+                            SqliteValue::Integer(seq),
+                            SqliteValue::Text(payload.clone().into()),
+                        ],
+                    )
+                    .await?;
+                if inserted != 1 {
                     return Err(FrankenError::Internal(format!(
-                        "delete affected {deleted} rows for id={delete_id}"
+                        "insert affected {inserted} rows for id={id}"
                     )));
                 }
-            }
 
-            let progressed = fsqlite_e2e::block_on(conn.execute_with_params(
-                "UPDATE worker_progress \
-                 SET last_id = ?1, last_seq = ?2, payload = ?3, observed_epoch = ?2 \
-                 WHERE worker_id = ?4",
-                &[
-                    SqliteValue::Integer(id),
-                    SqliteValue::Integer(seq),
-                    SqliteValue::Text(payload.clone().into()),
-                    SqliteValue::Integer(i64::try_from(child.worker_id).unwrap_or(i64::MAX)),
-                ],
-            ))?;
-            if progressed != 1 {
-                return Err(FrankenError::Internal(format!(
-                    "progress update affected {progressed} rows for worker={}",
-                    child.worker_id
-                )));
-            }
+                let updated = conn
+                    .execute_with_params(
+                        "UPDATE swarm_rows \
+                         SET payload = ?1, touched_by = ?2, generation = generation + 1 \
+                         WHERE id = ?3",
+                        &[
+                            SqliteValue::Text(update_payload.clone().into()),
+                            SqliteValue::Integer(
+                                i64::try_from(child.worker_id).unwrap_or(i64::MAX),
+                            ),
+                            SqliteValue::Integer(update_id),
+                        ],
+                    )
+                    .await?;
+                if updated != 1 {
+                    return Err(FrankenError::Internal(format!(
+                        "update affected {updated} rows for id={update_id}"
+                    )));
+                }
 
-            fsqlite_e2e::block_on(conn.commit_transaction())?;
-            in_txn = false;
-            Ok(())
-        })();
-        if result.is_err() && in_txn {
-            drop(fsqlite_e2e::block_on(conn.rollback_transaction()));
-        }
-        result
+                if let Some(delete_id) = deleted_id {
+                    let deleted = conn
+                        .execute_with_params(
+                            "DELETE FROM swarm_rows WHERE id = ?1 AND owner = ?2",
+                            &[
+                                SqliteValue::Integer(delete_id),
+                                SqliteValue::Integer(
+                                    i64::try_from(child.worker_id).unwrap_or(i64::MAX),
+                                ),
+                            ],
+                        )
+                        .await?;
+                    if deleted != 1 {
+                        return Err(FrankenError::Internal(format!(
+                            "delete affected {deleted} rows for id={delete_id}"
+                        )));
+                    }
+                }
+
+                let progressed = conn
+                    .execute_with_params(
+                        "UPDATE worker_progress \
+                         SET last_id = ?1, last_seq = ?2, payload = ?3, observed_epoch = ?2 \
+                         WHERE worker_id = ?4",
+                        &[
+                            SqliteValue::Integer(id),
+                            SqliteValue::Integer(seq),
+                            SqliteValue::Text(payload.clone().into()),
+                            SqliteValue::Integer(
+                                i64::try_from(child.worker_id).unwrap_or(i64::MAX),
+                            ),
+                        ],
+                    )
+                    .await?;
+                if progressed != 1 {
+                    return Err(FrankenError::Internal(format!(
+                        "progress update affected {progressed} rows for worker={}",
+                        child.worker_id
+                    )));
+                }
+
+                conn.commit_transaction().await?;
+                in_txn = false;
+                Ok(())
+            }
+            .await;
+            if result.is_err() && in_txn {
+                drop(conn.rollback_transaction().await);
+            }
+            result
+        })
     })?;
     trace_swarm_post_commit_visibility(conn, config, child.worker_id, id, seq, &payload);
 
