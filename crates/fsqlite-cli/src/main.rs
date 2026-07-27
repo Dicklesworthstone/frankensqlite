@@ -2,6 +2,14 @@
 // `run_test`; the default 128 is not enough for the trait-solver queries those
 // generate. Harmless for the binary itself (the limit is a compiler budget).
 #![recursion_limit = "512"]
+// bd-h9o9r: the CLI drives fsqlite-core's deliberately non-`Send`, deeply
+// nested engine futures (the same nesting behind the recursion_limit
+// above); `future_not_send` and `large_futures` contradict that design —
+// see fsqlite-core/src/lib.rs for the full rationale, including why boxing
+// was rejected by the perf ledger. Pre-existing cache-masked redness (68
+// findings on untouched main), same family as the rest of the chain.
+#![allow(clippy::future_not_send)]
+#![allow(clippy::large_futures)]
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -264,13 +272,23 @@ where
         shell_options
     };
     let mut current_db_path = options.db_path.clone();
-    let mut connection = match Connection::open(&options.db_path).await {
-        Ok(connection) => connection,
-        Err(error) => {
-            let _ = writeln!(err, "error: {error}");
-            return 1;
-        }
-    };
+    // bd-fo6xw: the CLI owns the process runtime (built in main and alive
+    // for the whole session), so a RuntimeContext constructed HERE — inside
+    // that runtime — captures its strong handle, giving every operation an
+    // io_uring driver spawner that outlives the connection. The default
+    // process-global env deliberately has no runtime handle, so plain
+    // Connection::open keeps the Unix fallback; this is the opt-in surface.
+    let cli_runtime_env = fsqlite::ConnectionEnv::new(std::sync::Arc::new(
+        fsqlite::RuntimeContext::new(fsqlite::RuntimeConfig::default()),
+    ));
+    let mut connection =
+        match Connection::open_with_env(&options.db_path, cli_runtime_env.clone()).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                let _ = writeln!(err, "error: {error}");
+                return 1;
+            }
+        };
     let mut output_options = OutputOptions::default();
 
     if let Some(path) = options.init_path.as_deref() {

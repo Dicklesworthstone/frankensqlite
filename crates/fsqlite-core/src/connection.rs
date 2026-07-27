@@ -2206,6 +2206,16 @@ pub struct RuntimeContext {
     root_cx: Cx,
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     native_runtime_handle: Option<asupersync::runtime::RuntimeHandle>,
+    // bd-fo6xw: lazily-minted, gateway-carrying native Cx parked in the
+    // owning runtime's ROOT REGION, used solely as the shared io_uring
+    // driver's spawner. Populated only when `native_runtime_handle` is
+    // `Some` (never for `new_process_global`), so the default open path
+    // is bit-for-bit unchanged. This is a purpose-typed slot on the
+    // CONNECTION root Cx at open time — never on this context's own
+    // `root_cx` — so dedicated-worker detachment predicates and the
+    // ambient-capture invariant test are unaffected.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    io_native_cx: std::sync::OnceLock<Option<asupersync::Cx>>,
 }
 
 impl std::fmt::Debug for RuntimeContext {
@@ -2219,6 +2229,11 @@ impl std::fmt::Debug for RuntimeContext {
         debug.field(
             "has_native_runtime_handle",
             &self.native_runtime_handle.is_some(),
+        );
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        debug.field(
+            "has_io_native_cx",
+            &self.io_native_cx.get().is_some_and(Option::is_some),
         );
         debug.finish()
     }
@@ -2254,6 +2269,8 @@ impl RuntimeContext {
             root_cx: Self::detached_root_cx(),
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             native_runtime_handle: Self::current_native_runtime_handle(),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            io_native_cx: std::sync::OnceLock::new(),
         }
     }
 
@@ -2277,6 +2294,8 @@ impl RuntimeContext {
             root_cx: Self::detached_root_cx(),
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             native_runtime_handle: None,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            io_native_cx: std::sync::OnceLock::new(),
         }
     }
 
@@ -2293,12 +2312,56 @@ impl RuntimeContext {
             root_cx: Self::derived_root_cx(root_cx),
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             native_runtime_handle: Self::current_native_runtime_handle(),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            io_native_cx: std::sync::OnceLock::new(),
         }
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     fn native_runtime_handle(&self) -> Option<asupersync::runtime::RuntimeHandle> {
         self.native_runtime_handle.clone()
+    }
+
+    /// bd-fo6xw: a gateway-carrying native `Cx` whose spawner outlives every
+    /// operation on every connection using this context.
+    ///
+    /// `block_on`'s ambient request `Cx` carries no spawn gateway, so it can
+    /// never start the shared io_uring driver (the refuted 2026-07-26 fix
+    /// failed on exactly that, deterministically). The only public mint for
+    /// a gateway-carrying `Cx` is `RuntimeHandle::try_spawn_with_cx`, whose
+    /// task `Cx` lives in the runtime's ROOT REGION.
+    ///
+    /// MINT-AND-EXIT: the spawned task hands out a clone of its `Cx` and
+    /// returns immediately — no parked task exists afterwards (the
+    /// structured-lifecycle requirement from the bd-bjm5d/bd-fo6xw contract
+    /// review, agent-mail 4363, is satisfied by construction). The clone
+    /// remains a valid spawner because the gateway and pending-spawn
+    /// counter are `Arc`s into the runtime's root region, which stays open
+    /// for the runtime's lifetime; probe-verified against asupersync 0.3.9
+    /// (spawn works across separate `block_on` calls after the minting
+    /// task exited; runtime drop completes in nanoseconds; a saved clone
+    /// pins the runtime inner alive — plain `Arc` extension, released when
+    /// the last `Connection` drops).
+    ///
+    /// Lifetime proof: `Connection` pins `Arc<RuntimeContext>` (attach_env
+    /// + SharedMvccState), which pins the strong `RuntimeHandle`, which
+    /// pins `Arc<RuntimeInner>` — so the root region and gateway outlive
+    /// the connection. Returns `None` when this context has no runtime
+    /// handle (the process-global default), keeping that path unchanged.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    fn io_native_cx(&self) -> Option<asupersync::Cx> {
+        self.io_native_cx
+            .get_or_init(|| {
+                let handle = self.native_runtime_handle.as_ref()?;
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                handle
+                    .try_spawn_with_cx(move |cx: asupersync::Cx| async move {
+                        let _ = tx.send(cx.clone());
+                    })
+                    .ok()?;
+                rx.recv_timeout(std::time::Duration::from_secs(5)).ok()
+            })
+            .clone()
     }
 
     /// Return the stable runtime identity used to isolate per-database state.
@@ -10099,6 +10162,12 @@ impl Connection {
             EPROCESS_PRIORITY_THRESHOLD,
         ));
         root_cx.set_eprocess_oracle(Arc::clone(&eprocess_oracle));
+        // bd-fo6xw: give the io_uring data path a spawner that outlives the
+        // connection. No-op for the process-global default context.
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        if let Some(io_cx) = env.runtime().io_native_cx() {
+            root_cx.set_native_cx(io_cx);
+        }
 
         let collation_registry = Arc::new(Mutex::new(CollationRegistry::new()));
         let conn = Self {
@@ -10527,6 +10596,12 @@ impl Connection {
             EPROCESS_PRIORITY_THRESHOLD,
         ));
         root_cx.set_eprocess_oracle(Arc::clone(&eprocess_oracle));
+        // bd-fo6xw: give the io_uring data path a spawner that outlives the
+        // connection. No-op for the process-global default context.
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        if let Some(io_cx) = env.runtime().io_native_cx() {
+            root_cx.set_native_cx(io_cx);
+        }
 
         let eager_memdb_rows = pager_is_memory;
         let collation_registry = Arc::new(Mutex::new(CollationRegistry::new()));
