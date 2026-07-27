@@ -1,4 +1,11 @@
 #![recursion_limit = "256"]
+// bd-h9o9r / bd-zavyn: the hoisted timed bodies await fsqlite-core's
+// deliberately non-`Send`, deeply nested engine futures inside one runtime
+// entry per sample; `future_not_send` and `large_futures` contradict that
+// design (see fsqlite-core/src/lib.rs for the full rationale, including why
+// boxing was rejected by the perf ledger).
+#![allow(clippy::future_not_send)]
+#![allow(clippy::large_futures)]
 
 //! Comprehensive FrankenSQLite vs C SQLite benchmark.
 //!
@@ -489,6 +496,64 @@ fn fs_stmt_execute_with_params(
     })
 }
 
+/// Async twin of [`retry_on_busy`] for bodies that run inside a single
+/// hoisted runtime entry (bd-zavyn). Takes a future *factory* and rebuilds
+/// the future on every attempt — a completed future must never be
+/// re-polled. The backoff is a thread sleep: every caller is a
+/// single-connection section (`:memory:` or a private file), where the
+/// busy-like path is unreachable in practice; the multi-writer concurrent
+/// section uses attempt-scoped runtime entries with its backoff outside
+/// the runtime instead of this helper.
+async fn retry_on_busy_async<T, F, Fut>(mut op: F) -> Result<T, fsqlite::FrankenError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, fsqlite::FrankenError>>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) if is_busy_like(&e) && attempt < BENCH_BUSY_MAX_RETRIES => {
+                sleep_bench_busy_backoff(attempt, 0);
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Async twin of [`fs_execute`] (bd-zavyn: the timed loops enter the
+/// harness runtime once per sample and await instead of re-entering per
+/// operation — the per-op entry cost ~333 ns was inflating every
+/// FrankenSQLite write sample while the rusqlite arm paid nothing).
+async fn fs_execute_async(conn: &fsqlite::Connection, sql: &str) -> usize {
+    retry_on_busy_async(|| conn.execute(sql))
+        .await
+        .unwrap_or_else(|e| panic!("fsqlite execute failed after retries: {e} (sql={sql})"))
+}
+
+/// Async twin of [`fs_prepare`].
+async fn fs_prepare_async<'conn>(
+    conn: &'conn fsqlite::Connection,
+    sql: &str,
+) -> fsqlite::PreparedStatement<'conn> {
+    conn.prepare(sql)
+        .await
+        .unwrap_or_else(|e| panic!("fsqlite prepare failed: {e} (sql={sql})"))
+}
+
+/// Async twin of [`fs_stmt_execute_with_params`].
+async fn fs_stmt_execute_with_params_async(
+    stmt: &fsqlite::PreparedStatement<'_>,
+    params: &[fsqlite::SqliteValue],
+) -> usize {
+    retry_on_busy_async(|| stmt.execute_with_params(params))
+        .await
+        .unwrap_or_else(|e| {
+            panic!("fsqlite prepared execute_with_params failed after retries: {e}")
+        })
+}
+
 fn bench_env_flag(name: &str) -> bool {
     std::env::var(name)
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -630,6 +695,19 @@ fn open_fsqlite_memory_connection_for_benchmark() -> fsqlite::Connection {
     }
 }
 
+/// Async twin of [`open_fsqlite_memory_connection_for_benchmark`] for timed
+/// bodies that run inside one hoisted runtime entry (bd-zavyn).
+async fn open_fsqlite_memory_connection_for_benchmark_async() -> fsqlite::Connection {
+    let page_size = benchmark_page_size_bytes();
+    if page_size == DEFAULT_BENCH_PAGE_SIZE_BYTES {
+        fsqlite::Connection::open(":memory:").await.unwrap()
+    } else {
+        fsqlite::Connection::open_with_page_size(":memory:", page_size)
+            .await
+            .unwrap()
+    }
+}
+
 fn apply_pragmas_csqlite(conn: &rusqlite::Connection) {
     conn.execute_batch(&format!(
         "PRAGMA page_size = {};\
@@ -674,6 +752,31 @@ fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
         // Tight alpha so the gate opens reasonably fast on the short
         // benchmark runs. `alpha = 1e-3` matches the default.
         fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.ssi_e_process_alpha = 0.001;"))
+            .unwrap_or_else(|error| panic!("failed to set SSI e-process alpha: {error}"));
+    }
+}
+
+/// Async twin of [`apply_pragmas_fsqlite`] for timed bodies that run inside
+/// one hoisted runtime entry (bd-zavyn). Every PRAGMA result stays checked.
+async fn apply_pragmas_fsqlite_async(conn: &fsqlite::Connection) {
+    let page_size = format!("PRAGMA page_size = {};", benchmark_page_size_bytes());
+    conn.execute(&page_size).await.unwrap_or_else(|error| {
+        panic!("failed to configure FrankenSQLite with `{page_size}`: {error}")
+    });
+    for pragma in FSQLITE_BENCHMARK_PRAGMAS {
+        conn.execute(pragma).await.unwrap_or_else(|error| {
+            panic!("failed to configure FrankenSQLite with `{pragma}`: {error}")
+        });
+    }
+    if std::env::var("FSQLITE_BENCH_LAB_UNSAFE")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        conn.execute("PRAGMA fsqlite.write_merge = LAB_UNSAFE;")
+            .await
+            .unwrap_or_else(|error| panic!("failed to enable LAB_UNSAFE write merge: {error}"));
+        conn.execute("PRAGMA fsqlite.ssi_e_process_alpha = 0.001;")
+            .await
             .unwrap_or_else(|error| panic!("failed to set SSI e-process alpha: {error}"));
     }
 }
@@ -2685,7 +2788,13 @@ fn validate_build_identity(build: &JsonBuildIdentity) -> Vec<String> {
 
 fn measurement_design_validation_errors(runtime_bridge: &str) -> Vec<String> {
     match runtime_bridge {
-        "per_operation_thread_local_block_on" => vec![
+        // bd-zavyn: the timed FrankenSQLite bodies now enter the harness
+        // runtime once per sample / transaction attempt instead of once per
+        // operation, so samples measure the engine rather than ~333 ns of
+        // bridge entry per op. The design remains non-citable for the same
+        // reasons as before the hoist: pairing, work oracles, and host
+        // gating are unchanged (Gate 0 owns those).
+        "scenario_scoped_thread_local_block_on" | "per_operation_thread_local_block_on" => vec![
             "generic comprehensive measurements are diagnostic-only: engines run in unpaired C-first/FrankenSQLite-second adaptive blocks, scored rows lack complete work oracles, and host/topology state is not release-gated"
                 .to_owned(),
             "generic C-reference measurements do not receipt-bind sqlite_source_id(), compile_options, the SQLite amalgamation/library hash, or the resolved native C compiler path/version/hash"
@@ -3524,7 +3633,7 @@ fn benchmark_json_schema() -> serde_json::Value {
                     },
                     "cpu_affinity": {"type": ["string", "null"]},
                     "runtime_bridge": {
-                        "const": "per_operation_thread_local_block_on"
+                        "const": "scenario_scoped_thread_local_block_on"
                     },
                     "tracing": {
                         "type": "object",
@@ -3645,7 +3754,7 @@ fn benchmark_json_schema() -> serde_json::Value {
                         "if": {
                             "properties": {
                                 "runtime_bridge": {
-                                    "const": "per_operation_thread_local_block_on"
+                                    "const": "scenario_scoped_thread_local_block_on"
                                 }
                             },
                             "required": ["runtime_bridge"]
@@ -5469,16 +5578,23 @@ fn bench_insert_by_row_count(
         let fsqlite_m = {
             let create_sql = record_size.create_table_sql();
             measure(&format!("fsqlite_{count}"), count, || {
-                let conn = open_fsqlite_memory_connection_for_benchmark();
-                apply_pragmas_fsqlite(&conn);
-                fs_execute(&conn, create_sql);
-                fs_execute(&conn, "BEGIN");
-                #[allow(clippy::cast_possible_wrap)]
-                let stmt = fs_prepare(&conn, record_size.insert_sql_csqlite());
-                for i in 0..count as i64 {
-                    fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
-                }
-                fs_execute(&conn, "COMMIT");
+                // bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    let conn = open_fsqlite_memory_connection_for_benchmark_async().await;
+                    apply_pragmas_fsqlite_async(&conn).await;
+                    fs_execute_async(&conn, create_sql).await;
+                    fs_execute_async(&conn, "BEGIN").await;
+                    #[allow(clippy::cast_possible_wrap)]
+                    let stmt = fs_prepare_async(&conn, record_size.insert_sql_csqlite()).await;
+                    for i in 0..count as i64 {
+                        fs_stmt_execute_with_params_async(
+                            &stmt,
+                            &[fsqlite::SqliteValue::Integer(i)],
+                        )
+                        .await;
+                    }
+                    fs_execute_async(&conn, "COMMIT").await;
+                });
             })
         };
         if profile_insert_enabled {
@@ -5533,14 +5649,21 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
             let fs = {
                 let create_sql = record_size.create_table_sql();
                 measure(&format!("fs_auto_{count}"), count, || {
-                    let conn = open_fsqlite_memory_connection_for_benchmark();
-                    apply_pragmas_fsqlite(&conn);
-                    fs_execute(&conn, create_sql);
-                    let stmt = fs_prepare(&conn, record_size.insert_sql_csqlite());
-                    #[allow(clippy::cast_possible_wrap)]
-                    for i in 0..count as i64 {
-                        fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
-                    }
+                    // bd-zavyn: one runtime entry per timed sample.
+                    fsqlite_e2e::block_on(async {
+                        let conn = open_fsqlite_memory_connection_for_benchmark_async().await;
+                        apply_pragmas_fsqlite_async(&conn).await;
+                        fs_execute_async(&conn, create_sql).await;
+                        let stmt = fs_prepare_async(&conn, record_size.insert_sql_csqlite()).await;
+                        #[allow(clippy::cast_possible_wrap)]
+                        for i in 0..count as i64 {
+                            fs_stmt_execute_with_params_async(
+                                &stmt,
+                                &[fsqlite::SqliteValue::Integer(i)],
+                            )
+                            .await;
+                        }
+                    });
                 })
             };
 
@@ -5588,21 +5711,28 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
         let fs = {
             let create_sql = record_size.create_table_sql();
             measure(&format!("fs_batch_{count}"), count, || {
-                let conn = open_fsqlite_memory_connection_for_benchmark();
-                apply_pragmas_fsqlite(&conn);
-                fs_execute(&conn, create_sql);
-                let stmt = fs_prepare(&conn, record_size.insert_sql_csqlite());
-                let num_batches = count.div_ceil(batch_size);
-                #[allow(clippy::cast_possible_wrap)]
-                for batch in 0..num_batches {
-                    fs_execute(&conn, "BEGIN");
-                    let start = (batch * batch_size) as i64;
-                    let end = ((batch + 1) * batch_size).min(count) as i64;
-                    for i in start..end {
-                        fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
+                // bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    let conn = open_fsqlite_memory_connection_for_benchmark_async().await;
+                    apply_pragmas_fsqlite_async(&conn).await;
+                    fs_execute_async(&conn, create_sql).await;
+                    let stmt = fs_prepare_async(&conn, record_size.insert_sql_csqlite()).await;
+                    let num_batches = count.div_ceil(batch_size);
+                    #[allow(clippy::cast_possible_wrap)]
+                    for batch in 0..num_batches {
+                        fs_execute_async(&conn, "BEGIN").await;
+                        let start = (batch * batch_size) as i64;
+                        let end = ((batch + 1) * batch_size).min(count) as i64;
+                        for i in start..end {
+                            fs_stmt_execute_with_params_async(
+                                &stmt,
+                                &[fsqlite::SqliteValue::Integer(i)],
+                            )
+                            .await;
+                        }
+                        fs_execute_async(&conn, "COMMIT").await;
                     }
-                    fs_execute(&conn, "COMMIT");
-                }
+                });
             })
         };
 
@@ -5648,16 +5778,23 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
         let fs = {
             let create_sql = record_size.create_table_sql();
             measure(&format!("fs_txn_{count}"), count, || {
-                let conn = open_fsqlite_memory_connection_for_benchmark();
-                apply_pragmas_fsqlite(&conn);
-                fs_execute(&conn, create_sql);
-                fs_execute(&conn, "BEGIN");
-                #[allow(clippy::cast_possible_wrap)]
-                let stmt = fs_prepare(&conn, record_size.insert_sql_csqlite());
-                for i in 0..count as i64 {
-                    fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
-                }
-                fs_execute(&conn, "COMMIT");
+                // bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    let conn = open_fsqlite_memory_connection_for_benchmark_async().await;
+                    apply_pragmas_fsqlite_async(&conn).await;
+                    fs_execute_async(&conn, create_sql).await;
+                    fs_execute_async(&conn, "BEGIN").await;
+                    #[allow(clippy::cast_possible_wrap)]
+                    let stmt = fs_prepare_async(&conn, record_size.insert_sql_csqlite()).await;
+                    for i in 0..count as i64 {
+                        fs_stmt_execute_with_params_async(
+                            &stmt,
+                            &[fsqlite::SqliteValue::Integer(i)],
+                        )
+                        .await;
+                    }
+                    fs_execute_async(&conn, "COMMIT").await;
+                });
             })
         };
 
@@ -5715,16 +5852,23 @@ fn bench_insert_by_record_size(report: &mut BenchReport) {
         let fs = {
             let create_sql = record_size.create_table_sql();
             measure(&format!("fs_{}", record_size.name()), count, || {
-                let conn = open_fsqlite_memory_connection_for_benchmark();
-                apply_pragmas_fsqlite(&conn);
-                fs_execute(&conn, create_sql);
-                fs_execute(&conn, "BEGIN");
-                #[allow(clippy::cast_possible_wrap)]
-                let stmt = fs_prepare(&conn, record_size.insert_sql_csqlite());
-                for i in 0..count as i64 {
-                    fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
-                }
-                fs_execute(&conn, "COMMIT");
+                // bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    let conn = open_fsqlite_memory_connection_for_benchmark_async().await;
+                    apply_pragmas_fsqlite_async(&conn).await;
+                    fs_execute_async(&conn, create_sql).await;
+                    fs_execute_async(&conn, "BEGIN").await;
+                    #[allow(clippy::cast_possible_wrap)]
+                    let stmt = fs_prepare_async(&conn, record_size.insert_sql_csqlite()).await;
+                    for i in 0..count as i64 {
+                        fs_stmt_execute_with_params_async(
+                            &stmt,
+                            &[fsqlite::SqliteValue::Integer(i)],
+                        )
+                        .await;
+                    }
+                    fs_execute_async(&conn, "COMMIT").await;
+                });
             })
         };
         if profile_insert_enabled {
@@ -6876,6 +7020,22 @@ fn csqlite_concurrent_worker(
     failed.map_or(Ok(()), Err)
 }
 
+/// Outcome of one concurrent-transaction attempt (bd-zavyn).
+enum ConcurrentTxnAttempt {
+    Committed,
+    /// A transient BEGIN/INSERT/COMMIT failure that already rolled back
+    /// (where required) inside the runtime entry; the caller backs off
+    /// outside the runtime and retries.
+    Retry,
+}
+
+/// bd-zavyn: one runtime entry per transaction attempt. The previous shape
+/// entered the harness runtime for every BEGIN/prepare/row/COMMIT/ROLLBACK
+/// (`CONCURRENT_ROWS_PER_THREAD + 2` entries per attempt per thread, all
+/// inside the gate-released timed window, FrankenSQLite side only). The
+/// transient-retry backoff sleeps *outside* the entered runtime (Gate 0
+/// requirement: never hold a sync sleep inside a current-thread runtime
+/// that owns engine progress).
 fn execute_fsqlite_concurrent_transaction(
     conn: &fsqlite::Connection,
     worker_index: usize,
@@ -6885,76 +7045,81 @@ fn execute_fsqlite_concurrent_transaction(
     let mut retry_count = 0_u32;
     const TXN_MAX_RETRIES: u32 = 128;
     let jitter_salt = u64::try_from(worker_index).map_or(u64::MAX, |value| value.saturating_add(1));
-    'transaction: loop {
-        if let Err(error) = fsqlite_e2e::block_on(conn.execute("BEGIN CONCURRENT")) {
-            if error.is_transient() && retry_count < TXN_MAX_RETRIES {
-                sleep_bench_busy_backoff(retry_count, jitter_salt);
-                retry_count += 1;
-                continue;
-            }
-            return Err(format!(
-                "FrankenSQLite worker {worker_index} BEGIN CONCURRENT failed after {retry_count} retries: {error}"
-            ));
-        }
-        let statement = match fsqlite_e2e::block_on(
-            conn.prepare("INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7))"),
-        ) {
-            Ok(statement) => statement,
-            Err(error) => {
-                let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
+    loop {
+        let outcome = fsqlite_e2e::block_on(async {
+            if let Err(error) = conn.execute("BEGIN CONCURRENT").await {
+                if error.is_transient() && retry_count < TXN_MAX_RETRIES {
+                    return Ok(ConcurrentTxnAttempt::Retry);
+                }
                 return Err(format!(
-                    "FrankenSQLite worker {worker_index} prepare failed: {error}"
+                    "FrankenSQLite worker {worker_index} BEGIN CONCURRENT failed after {retry_count} retries: {error}"
                 ));
             }
-        };
-        #[allow(clippy::cast_possible_wrap)]
-        for row_index in 0..CONCURRENT_ROWS_PER_THREAD as i64 {
-            match fsqlite_e2e::block_on(
-                statement.execute_with_params(&[fsqlite::SqliteValue::Integer(base + row_index)]),
-            ) {
-                Ok(1) => {}
-                Ok(affected) => {
-                    let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
+            let statement = match conn
+                .prepare("INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7))")
+                .await
+            {
+                Ok(statement) => statement,
+                Err(error) => {
+                    let _ = conn.execute("ROLLBACK").await;
                     return Err(format!(
-                        "FrankenSQLite worker {worker_index} INSERT {row_index} affected {affected} rows"
+                        "FrankenSQLite worker {worker_index} prepare failed: {error}"
                     ));
                 }
-                Err(error) if error.is_transient() && retry_count < TXN_MAX_RETRIES => {
-                    fsqlite_e2e::block_on(conn.execute("ROLLBACK")).map_err(
-                        |rollback_error| {
+            };
+            #[allow(clippy::cast_possible_wrap)]
+            for row_index in 0..CONCURRENT_ROWS_PER_THREAD as i64 {
+                match statement
+                    .execute_with_params(&[fsqlite::SqliteValue::Integer(base + row_index)])
+                    .await
+                {
+                    Ok(1) => {}
+                    Ok(affected) => {
+                        let _ = conn.execute("ROLLBACK").await;
+                        return Err(format!(
+                            "FrankenSQLite worker {worker_index} INSERT {row_index} affected {affected} rows"
+                        ));
+                    }
+                    Err(error) if error.is_transient() && retry_count < TXN_MAX_RETRIES => {
+                        conn.execute("ROLLBACK").await.map_err(|rollback_error| {
                             format!(
                                 "FrankenSQLite worker {worker_index} rollback after INSERT retry failed: {rollback_error}"
                             )
-                        },
-                    )?;
-                    sleep_bench_busy_backoff(retry_count, jitter_salt);
-                    retry_count += 1;
-                    continue 'transaction;
+                        })?;
+                        return Ok(ConcurrentTxnAttempt::Retry);
+                    }
+                    Err(error) => {
+                        let _ = conn.execute("ROLLBACK").await;
+                        return Err(format!(
+                            "FrankenSQLite worker {worker_index} INSERT {row_index} failed after {retry_count} retries: {error}"
+                        ));
+                    }
+                }
+            }
+            match conn.execute("COMMIT").await {
+                Ok(_) => Ok(ConcurrentTxnAttempt::Committed),
+                Err(error) if error.is_transient() && retry_count < TXN_MAX_RETRIES => {
+                    conn.execute("ROLLBACK").await.map_err(|rollback_error| {
+                        format!(
+                            "FrankenSQLite worker {worker_index} rollback after COMMIT retry failed: {rollback_error}"
+                        )
+                    })?;
+                    Ok(ConcurrentTxnAttempt::Retry)
                 }
                 Err(error) => {
-                    let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
-                    return Err(format!(
-                        "FrankenSQLite worker {worker_index} INSERT {row_index} failed after {retry_count} retries: {error}"
-                    ));
+                    let _ = conn.execute("ROLLBACK").await;
+                    Err(format!(
+                        "FrankenSQLite worker {worker_index} COMMIT failed after {retry_count} retries: {error}"
+                    ))
                 }
             }
-        }
-        match fsqlite_e2e::block_on(conn.execute("COMMIT")) {
-            Ok(_) => return Ok(CONCURRENT_ROWS_PER_THREAD),
-            Err(error) if error.is_transient() && retry_count < TXN_MAX_RETRIES => {
-                fsqlite_e2e::block_on(conn.execute("ROLLBACK")).map_err(|rollback_error| {
-                    format!(
-                        "FrankenSQLite worker {worker_index} rollback after COMMIT retry failed: {rollback_error}"
-                    )
-                })?;
+        })?;
+
+        match outcome {
+            ConcurrentTxnAttempt::Committed => return Ok(CONCURRENT_ROWS_PER_THREAD),
+            ConcurrentTxnAttempt::Retry => {
                 sleep_bench_busy_backoff(retry_count, jitter_salt);
                 retry_count += 1;
-            }
-            Err(error) => {
-                let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
-                return Err(format!(
-                    "FrankenSQLite worker {worker_index} COMMIT failed after {retry_count} retries: {error}"
-                ));
             }
         }
     }
@@ -7820,7 +7985,7 @@ mod tests {
             command_line: vec!["comprehensive-bench".to_owned(), "--quick".to_owned()],
             benchmark_environment: BTreeMap::new(),
             cpu_affinity: Some("0-7".to_owned()),
-            runtime_bridge: "per_operation_thread_local_block_on".to_owned(),
+            runtime_bridge: "scenario_scoped_thread_local_block_on".to_owned(),
             tracing: JsonTracingIdentity {
                 rust_log: None,
                 statement_debug_enabled: false,
@@ -8911,7 +9076,7 @@ mod tests {
     #[test]
     fn generic_comprehensive_measurement_design_is_never_citable() {
         assert!(
-            measurement_design_validation_errors("per_operation_thread_local_block_on")
+            measurement_design_validation_errors("scenario_scoped_thread_local_block_on")
                 .iter()
                 .any(|error| error.contains("diagnostic-only"))
         );
@@ -10036,19 +10201,23 @@ fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
                 &format!("fs_update_{count}"),
                 update_count,
                 || {
-                    fs_execute(&conn, "BEGIN");
-                    #[allow(clippy::cast_possible_wrap)]
-                    for i in 0..update_count as i64 {
-                        let id = i * 10;
-                        fs_stmt_execute_with_params(
-                            &update,
-                            &[
-                                fsqlite::SqliteValue::Integer(id),
-                                fsqlite::SqliteValue::Float(999.99),
-                            ],
-                        );
-                    }
-                    fs_execute(&conn, "COMMIT");
+                    // bd-zavyn: one runtime entry per timed transaction.
+                    fsqlite_e2e::block_on(async {
+                        fs_execute_async(&conn, "BEGIN").await;
+                        #[allow(clippy::cast_possible_wrap)]
+                        for i in 0..update_count as i64 {
+                            let id = i * 10;
+                            fs_stmt_execute_with_params_async(
+                                &update,
+                                &[
+                                    fsqlite::SqliteValue::Integer(id),
+                                    fsqlite::SqliteValue::Float(999.99),
+                                ],
+                            )
+                            .await;
+                        }
+                        fs_execute_async(&conn, "COMMIT").await;
+                    });
                 },
                 || {
                     fs_execute(&conn, "BEGIN");
@@ -10147,13 +10316,20 @@ fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
                 &format!("fs_delete_{count}"),
                 delete_count,
                 || {
-                    fs_execute(&conn, "BEGIN");
-                    #[allow(clippy::cast_possible_wrap)]
-                    for i in 0..delete_count as i64 {
-                        let id = i * 20;
-                        fs_stmt_execute_with_params(&delete, &[fsqlite::SqliteValue::Integer(id)]);
-                    }
-                    fs_execute(&conn, "COMMIT");
+                    // bd-zavyn: one runtime entry per timed transaction.
+                    fsqlite_e2e::block_on(async {
+                        fs_execute_async(&conn, "BEGIN").await;
+                        #[allow(clippy::cast_possible_wrap)]
+                        for i in 0..delete_count as i64 {
+                            let id = i * 20;
+                            fs_stmt_execute_with_params_async(
+                                &delete,
+                                &[fsqlite::SqliteValue::Integer(id)],
+                            )
+                            .await;
+                        }
+                        fs_execute_async(&conn, "COMMIT").await;
+                    });
                 },
                 || {
                     fs_execute(&conn, "BEGIN");
@@ -10305,93 +10481,114 @@ fn bench_mixed_oltp(report: &mut BenchReport) {
     eprint!("  Benchmarking mixed OLTP FrankenSQLite... ");
 
     let fs = measure("fs_oltp", ops, || {
-        let conn = open_fsqlite_memory_connection_for_benchmark();
-        apply_pragmas_fsqlite(&conn);
-        fs_execute(
-            &conn,
-            "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
-        );
-        let seed_insert = fs_prepare(
-            &conn,
-            "INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))",
-        );
-        fs_execute(&conn, "BEGIN");
-        #[allow(clippy::cast_possible_wrap)]
-        for i in 1..=seed_rows as i64 {
-            fs_stmt_execute_with_params(&seed_insert, &[fsqlite::SqliteValue::Integer(i)]);
-        }
-        fs_execute(&conn, "COMMIT");
-
-        let mut rng = Rng64::new(42);
-        #[allow(clippy::cast_possible_wrap)]
-        let mut next_id = seed_rows as i64 + 1;
-        let select_pt = fs_prepare(&conn, "SELECT * FROM bench WHERE id = ?1");
-        let select_range = fs_prepare(
-            &conn,
-            "SELECT COUNT(*) FROM bench WHERE id >= ?1 AND id < ?2",
-        );
-        let select_agg = fs_prepare(&conn, "SELECT COUNT(*), SUM(score) FROM bench");
-        let insert = fs_prepare(
-            &conn,
-            "INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))",
-        );
-        let update = fs_prepare(&conn, "UPDATE bench SET score = ?2 WHERE id = ?1");
-        let delete = fs_prepare(&conn, "DELETE FROM bench WHERE id = ?1");
-
-        #[allow(clippy::cast_possible_wrap)]
-        for _ in 0..ops {
-            let roll = rng.next_usize(100);
-            if roll < 40 {
-                let id = (rng.next_usize(seed_rows) + 1) as i64;
-                std::hint::black_box(
-                    fsqlite_e2e::block_on(
-                        select_pt.query_with_params(&[fsqlite::SqliteValue::Integer(id)]),
-                    )
-                    .unwrap(),
-                );
-            } else if roll < 60 {
-                let start = (rng.next_usize(seed_rows.saturating_sub(50)) + 1) as i64;
-                std::hint::black_box(
-                    fsqlite_e2e::block_on(select_range.query_row_with_params(&[
-                        fsqlite::SqliteValue::Integer(start),
-                        fsqlite::SqliteValue::Integer(start + 50),
-                    ]))
-                    .unwrap(),
-                );
-            } else if roll < 80 {
-                std::hint::black_box(fsqlite_e2e::block_on(select_agg.query_row()).unwrap());
-            } else if roll < 95 {
-                std::hint::black_box(
-                    fsqlite_e2e::block_on(
-                        insert.execute_with_params(&[fsqlite::SqliteValue::Integer(next_id)]),
-                    )
-                    .unwrap(),
-                );
-                next_id += 1;
-            } else if roll < 98 {
-                let id = (rng.next_usize(seed_rows) + 1) as i64;
-                std::hint::black_box(
-                    fsqlite_e2e::block_on(update.execute_with_params(&[
-                        fsqlite::SqliteValue::Integer(id),
-                        fsqlite::SqliteValue::Integer(id * 99),
-                    ]))
-                    .unwrap(),
-                );
-            } else {
-                let id = (rng.next_usize(seed_rows) + 1) as i64;
-                std::hint::black_box(
-                    fsqlite_e2e::block_on(
-                        delete.execute_with_params(&[fsqlite::SqliteValue::Integer(id)]),
-                    )
-                    .unwrap(),
-                );
+        // bd-zavyn: one runtime entry per timed sample. This body previously
+        // re-entered the runtime once per seed row and once per operation
+        // (~10k entries per sample) — the largest single instrument
+        // distortion in the whole matrix.
+        fsqlite_e2e::block_on(async {
+            let conn = open_fsqlite_memory_connection_for_benchmark_async().await;
+            apply_pragmas_fsqlite_async(&conn).await;
+            fs_execute_async(
+                &conn,
+                "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
+            )
+            .await;
+            let seed_insert = fs_prepare_async(
+                &conn,
+                "INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))",
+            )
+            .await;
+            fs_execute_async(&conn, "BEGIN").await;
+            #[allow(clippy::cast_possible_wrap)]
+            for i in 1..=seed_rows as i64 {
+                fs_stmt_execute_with_params_async(
+                    &seed_insert,
+                    &[fsqlite::SqliteValue::Integer(i)],
+                )
+                .await;
             }
-        }
-        let final_state = fsqlite_e2e::block_on(
-            fs_prepare(&conn, "SELECT COUNT(*), COALESCE(SUM(score), 0) FROM bench").query_row(),
-        )
-        .unwrap();
-        std::hint::black_box(final_state);
+            fs_execute_async(&conn, "COMMIT").await;
+
+            let mut rng = Rng64::new(42);
+            #[allow(clippy::cast_possible_wrap)]
+            let mut next_id = seed_rows as i64 + 1;
+            let select_pt = fs_prepare_async(&conn, "SELECT * FROM bench WHERE id = ?1").await;
+            let select_range = fs_prepare_async(
+                &conn,
+                "SELECT COUNT(*) FROM bench WHERE id >= ?1 AND id < ?2",
+            )
+            .await;
+            let select_agg =
+                fs_prepare_async(&conn, "SELECT COUNT(*), SUM(score) FROM bench").await;
+            let insert = fs_prepare_async(
+                &conn,
+                "INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))",
+            )
+            .await;
+            let update = fs_prepare_async(&conn, "UPDATE bench SET score = ?2 WHERE id = ?1").await;
+            let delete = fs_prepare_async(&conn, "DELETE FROM bench WHERE id = ?1").await;
+
+            #[allow(clippy::cast_possible_wrap)]
+            for _ in 0..ops {
+                let roll = rng.next_usize(100);
+                if roll < 40 {
+                    let id = (rng.next_usize(seed_rows) + 1) as i64;
+                    std::hint::black_box(
+                        select_pt
+                            .query_with_params(&[fsqlite::SqliteValue::Integer(id)])
+                            .await
+                            .unwrap(),
+                    );
+                } else if roll < 60 {
+                    let start = (rng.next_usize(seed_rows.saturating_sub(50)) + 1) as i64;
+                    std::hint::black_box(
+                        select_range
+                            .query_row_with_params(&[
+                                fsqlite::SqliteValue::Integer(start),
+                                fsqlite::SqliteValue::Integer(start + 50),
+                            ])
+                            .await
+                            .unwrap(),
+                    );
+                } else if roll < 80 {
+                    std::hint::black_box(select_agg.query_row().await.unwrap());
+                } else if roll < 95 {
+                    std::hint::black_box(
+                        insert
+                            .execute_with_params(&[fsqlite::SqliteValue::Integer(next_id)])
+                            .await
+                            .unwrap(),
+                    );
+                    next_id += 1;
+                } else if roll < 98 {
+                    let id = (rng.next_usize(seed_rows) + 1) as i64;
+                    std::hint::black_box(
+                        update
+                            .execute_with_params(&[
+                                fsqlite::SqliteValue::Integer(id),
+                                fsqlite::SqliteValue::Integer(id * 99),
+                            ])
+                            .await
+                            .unwrap(),
+                    );
+                } else {
+                    let id = (rng.next_usize(seed_rows) + 1) as i64;
+                    std::hint::black_box(
+                        delete
+                            .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
+                            .await
+                            .unwrap(),
+                    );
+                }
+            }
+            let final_state =
+                fs_prepare_async(&conn, "SELECT COUNT(*), COALESCE(SUM(score), 0) FROM bench")
+                    .await
+                    .query_row()
+                    .await
+                    .unwrap();
+            std::hint::black_box(final_state);
+        });
     });
 
     eprintln!("F={}", format_duration(fs.median()));
@@ -13241,6 +13438,10 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // Without `bridge-experiment` the inner branch diverges (exit), which
+    // makes the `else` look redundant to clippy under that cfg only; with
+    // the feature it does not diverge, so the shape must stay.
+    #[allow(clippy::redundant_else)]
     if options.print_json_schema {
         if options.bridge_experiment {
             #[cfg(feature = "bridge-experiment")]
@@ -13289,7 +13490,7 @@ fn main() {
     };
     let artifact_requested = html_file.is_some() || json_file.is_some() || options.json_stdout;
     let mut provenance =
-        JsonBenchmarkProvenance::capture(args.clone(), "per_operation_thread_local_block_on");
+        JsonBenchmarkProvenance::capture(args.clone(), "scenario_scoped_thread_local_block_on");
     if artifact_requested && !provenance.citable {
         if options.allow_unverified_provenance {
             provenance.mark_explicit_override();
