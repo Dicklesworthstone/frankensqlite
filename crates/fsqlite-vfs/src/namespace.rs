@@ -232,12 +232,48 @@ impl DatabaseNamespaceBinding {
         }
     }
 
-    /// Open the stable main pathname without following its final symlink and
-    /// verify that it still names this binding's file identity.  The probe is
+    /// Verify that the stable main pathname (without following its final
+    /// symlink) still names this binding's file identity.  The probe is
     /// read-only and never creates database or companion files.
+    ///
+    /// bd-qduu1: on Unix this must NOT open (and then close) a descriptor
+    /// for the main database file. POSIX record locks are per-process,
+    /// per-file: closing ANY descriptor of a file releases ALL of this
+    /// process's `fcntl` locks on it, including the RESERVED byte that
+    /// gates cross-process WAL appends. This probe runs on every WAL
+    /// backend operation, so the open+close variant silently destroyed the
+    /// append gate the group-commit flush had just acquired — two
+    /// processes then derived the same WAL append offset and overwrote
+    /// each other's committed frames (read-your-own-write returned zero
+    /// rows) or tripped the parallel-WAL certificate cross-check. A path
+    /// stat creates no descriptor, so no lock is disturbed;
+    /// `symlink_metadata` preserves the `O_NOFOLLOW` property by
+    /// identifying a final-component symlink itself (rejected as
+    /// not-a-file) rather than its target.
     pub fn validate_path_identity(&self) -> Result<()> {
-        let file = open_identity_probe(&self.stable_path)?;
-        self.validate_identity(FileIdentity::from_file(&file)?)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let metadata = std::fs::symlink_metadata(&self.stable_path)
+                .map_err(|_| cannot_open(&self.stable_path))?;
+            if !metadata.is_file() {
+                return Err(cannot_open(&self.stable_path));
+            }
+            self.validate_identity(Some(FileIdentity::from_unix_parts(
+                metadata.dev(),
+                metadata.ino(),
+            )))
+        }
+
+        // Windows closes do not release byte-range locks held on other
+        // handles, and the robust 128-bit file identifier requires an open
+        // handle, so the handle-based probe remains correct there.
+        #[cfg(not(unix))]
+        {
+            let file = open_identity_probe(&self.stable_path)?;
+            self.validate_identity(FileIdentity::from_file(&file)?)
+        }
     }
 
     /// Complete reserved bootstrap by converting `use` to shared and then
@@ -518,6 +554,7 @@ pub fn cleanup_abandoned_private_database(
     Ok(true)
 }
 
+#[cfg(not(unix))]
 fn open_identity_probe(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
