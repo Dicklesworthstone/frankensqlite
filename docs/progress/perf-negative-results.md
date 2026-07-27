@@ -21113,3 +21113,43 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   scheduler-latency/cancellation gate under induced slow I/O proving
   unrelated tasks are not stalled, or under the actor-lane capability marker
   above. Do not re-attempt a bare inline fast path in `read`/`write_tracked`.
+
+## 2026-07-27 - NULL RESULT (honest A/B) + ATTRIBUTION: the two landed fixes do not move comprehensive-bench INSERT shapes; per-STATEMENT sync-bridge entry is the dominant quantified suspect for the remaining ~2.4x
+
+- Question: did 7547724b (bench runtime-entry hoist, bd-zavyn/bd-mnlk2) plus
+  a20b3144 (UnixFile write_page_batch single hop, bd-trfah) move the INSERT
+  suite? Interleaved ABBA-AB, 6 runs, `--quick --filter insert --no-html`,
+  `taskset -c 48-63` on csd (loadavg 9-13), same-day builds from clean
+  worktrees: pre 648460d3 sha256 `1c947f92…2bf4`, post a20b3144 sha256
+  `8d4c4495…ef8b`. Logs + runner:
+  `tests/artifacts/perf/prepost-insert-ab-20260727T1452Z-csd/`.
+- Result: average time ratio pre = 2.42x / 2.48x / 2.46x, post = 2.46x /
+  2.41x / 2.36x. **No material movement.** Expected in hindsight: the batch
+  fix fires on pager checkpoint batches (outside these timed windows) and
+  7547724b touched the oplog executor + four OTHER bins, not
+  comprehensive_bench's INSERT scenarios.
+- ATTRIBUTION (per-scenario gap vs the measured 754 ns/op persistent-runtime
+  `block_on` re-entry from `vfs-tax-decomposition-20260727T0257Z-csd`):
+  10K-row single-txn tiny gap 10.2 ms vs 10K x 754 ns = 7.5 ms (~74%);
+  1000-row batched gap 1.10 ms vs 0.75 ms (~68%); 100-row single-txn gap
+  165 us vs 75 us (~45%). The per-STATEMENT sync-bridge entry inside the
+  timed loop is the dominant quantified suspect for the large-N INSERT gap.
+  Per DustyOrchid's source proof (bd-dqdoe thread 2026-07-27): the bridge
+  re-enters a REUSED thread-local runtime — entry/task/waker scheduling per
+  op, not construction/teardown; my 5.4 ms/op fresh-runtime arm confirms
+  production cannot be doing that shape.
+- Consequence, and this is the important part: this cost is NOT purely
+  instrument. Any consumer of the synchronous API that drives one statement
+  per `block_on` pays it identically. Fix directions (both needed):
+  (a) bench/consumer side — one runtime entry per transaction/scenario
+  (CrimsonFinch's bd-zavyn hoist extended to comprehensive_bench's timed
+  loops); (b) product side — a sync facade that amortizes runtime entry
+  across statements (transaction-scoped entry), which is also the
+  precondition for io_uring per bd-fo6xw.
+- Residual after bridge subtraction (~2.7-4.6 ms at 10K rows, ~90 us at 100
+  rows) matches the known real-engine costs (bd-aoj0g O(n^2) secondary-index
+  cache locality; MVCC/COW write tax per the 2026-07-23 convergence entry).
+- Retry condition: re-run this exact A/B after a comprehensive_bench
+  timed-loop hoist lands, and separately after any product-side sync-facade
+  change; expect the 10K-row rows to move by several ms if the attribution
+  is right.
