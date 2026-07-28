@@ -587,7 +587,8 @@ impl fmt::Display for Expr {
                 expr, collation, ..
             } => {
                 write_operand(f, expr)?;
-                write!(f, " COLLATE {collation}")
+                f.write_str(" COLLATE ")?;
+                write_ident(f, collation)
             }
             Self::IsNull { expr, not, .. } => {
                 write_operand(f, expr)?;
@@ -1174,7 +1175,8 @@ impl fmt::Display for IndexedColumn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.expr)?;
         if let Some(ref col) = self.collation {
-            write!(f, " COLLATE {col}")?;
+            f.write_str(" COLLATE ")?;
+            write_ident(f, col)?;
         }
         if let Some(dir) = self.direction {
             write!(f, " {dir}")?;
@@ -1421,7 +1423,10 @@ impl fmt::Display for ColumnConstraintKind {
                     DefaultValue::ParenExpr(e) => write!(f, "({e})"),
                 }
             }
-            Self::Collate(name) => write!(f, "COLLATE {name}"),
+            Self::Collate(name) => {
+                f.write_str("COLLATE ")?;
+                write_ident(f, name)
+            }
             Self::ForeignKey(fk) => write!(f, "{fk}"),
             Self::Generated { expr, storage } => {
                 write!(f, "GENERATED ALWAYS AS ({expr})")?;
@@ -1865,6 +1870,36 @@ impl fmt::Display for Statement {
                     write!(f, "EXPLAIN {stmt}")
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hfdt_0117_bounded_collation_display_preserves_decoded_identifier_boundaries() {
+        for (collation, expected) in [
+            ("NOCASE", "account_name COLLATE NOCASE"),
+            ("NOCASE ", r#"account_name COLLATE "NOCASE ""#),
+            ("NOCASE--x", r#"account_name COLLATE "NOCASE--x""#),
+            ("NOCASE;/*x*/", r#"account_name COLLATE "NOCASE;/*x*/""#),
+            (
+                "NOCASE\"escaped",
+                r#"account_name COLLATE "NOCASE""escaped""#,
+            ),
+        ] {
+            let expression = Expr::Collate {
+                expr: Box::new(Expr::Column(ColumnRef::bare("account_name"), Span::ZERO)),
+                collation: collation.to_owned(),
+                span: Span::ZERO,
+            };
+            assert_eq!(
+                expression.to_string(),
+                expected,
+                "decoded collation identifiers must never become SQL syntax"
+            );
         }
     }
 }

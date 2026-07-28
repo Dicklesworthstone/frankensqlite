@@ -2589,6 +2589,8 @@ impl DatabaseBuilderReservation {
 }
 
 const BOUNDED_VALIDATION_MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+const BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES: usize = 65_536;
+const BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH: usize = 512;
 /// Maximum number of persisted `sqlite_schema` objects admitted by one full
 /// schema load.
 pub const SCHEMA_LOAD_MAX_OBJECTS: usize = 4096;
@@ -11446,6 +11448,10 @@ impl Connection {
     /// [`Self::capture_database_image_receipt`] must not be called from the
     /// callback: it requires a quiescent connection and exclusive maintenance,
     /// while this method deliberately holds an active read transaction.
+    ///
+    /// The continuous external-file snapshot fence is currently implemented
+    /// only on Linux and Windows. Other targets receive a typed
+    /// [`FrankenError::NotImplemented`] refusal before the image is opened.
     pub fn with_database_image_structure_from_receipt_with_bounded_ownership<F, T>(
         &self,
         expected: &DatabaseImageReceipt,
@@ -11462,6 +11468,7 @@ impl Connection {
                 value: "0".to_owned(),
             });
         }
+        Self::require_bounded_external_snapshot_platform()?;
         if !self.pager.is_file_backed() {
             return Err(FrankenError::Unsupported);
         }
@@ -11660,8 +11667,15 @@ impl Connection {
     /// freelist. Semantic validation supports ordinary ROWID tables and
     /// built-in `BINARY`, `NOCASE`, and `RTRIM` collations, including UNIQUE,
     /// partial, expression, DESC, and NULL-bearing indexes. WITHOUT ROWID,
-    /// virtual/generated-column, or custom-collation target schemas receive a
-    /// typed unsupported refusal rather than an incomplete proof.
+    /// virtual/generated-column, foreign-key, `CHECK`, `STRICT`, or
+    /// custom-collation target schemas receive a typed unsupported refusal
+    /// rather than an incomplete proof. Column `NOT NULL` constraints are
+    /// checked against every inflated table row.
+    ///
+    /// The continuous external-file snapshot fence is currently implemented
+    /// only on Linux and Windows. Other targets receive a typed
+    /// [`FrankenError::NotImplemented`] refusal before publication can inspect
+    /// or mutate either image.
     pub fn publish_database_image_from_receipt_with_bounded_validation<F>(
         &self,
         source: &DatabaseImageReceipt,
@@ -11679,6 +11693,7 @@ impl Connection {
                 value: "0".to_owned(),
             });
         }
+        Self::require_bounded_external_snapshot_platform()?;
         self.publish_database_image_inner(
             source,
             candidate_path.as_ref(),
@@ -44085,10 +44100,13 @@ impl Connection {
                     expected_identity,
                 )
             };
-            opened.map_err(|err| {
-                FrankenError::Internal(format!(
-                    "database candidate failed identity-bound pre-publication schema reload: {err}"
-                ))
+            opened.map_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    image = %image_path.display(),
+                    "database candidate failed identity-bound pre-publication schema reload"
+                );
+                error
             })?
         };
         #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
@@ -44097,10 +44115,13 @@ impl Connection {
             if bounded_validation_page_limit.is_some() {
                 return Err(FrankenError::Unsupported);
             }
-            Self::open_schema_only(image_path_text.to_owned()).map_err(|err| {
-                FrankenError::Internal(format!(
-                    "database candidate failed pre-publication schema reload: {err}"
-                ))
+            Self::open_schema_only(image_path_text.to_owned()).map_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    image = %image_path.display(),
+                    "database candidate failed pre-publication schema reload"
+                );
+                error
             })?
         };
 
@@ -49241,18 +49262,49 @@ impl Connection {
         ))
     }
 
+    fn require_bounded_external_snapshot_platform() -> Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            Err(FrankenError::NotImplemented(
+                "bounded external database-image snapshots require the Linux or Windows native lock fence"
+                    .to_owned(),
+            ))
+        }
+    }
+
     fn validate_bounded_collations_in_sql(sql: &str, object_name: &str) -> Result<()> {
-        let tokens = collect_unquoted_sql_tokens(sql);
-        for pair in tokens.windows(2) {
-            if pair[0].eq_ignore_ascii_case("collate")
-                && !matches!(
-                    pair[1].to_ascii_lowercase().as_str(),
-                    "binary" | "nocase" | "rtrim"
-                )
-            {
+        // Parse the expression instead of inferring COLLATE operands from a
+        // lossy token stream.  SQLite accepts delimited identifiers after
+        // COLLATE (`"name"`, `name`, and `[name]`); discarding quoted tokens
+        // makes a custom collation invisible precisely where bounded
+        // validation must fail closed.  Walking the AST also keeps string
+        // literals and comments from spoofing either the COLLATE keyword or
+        // its operand.
+        let expression =
+            fsqlite_parser::expr::parse_expr(sql).map_err(|error| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "index `{object_name}` has invalid expression during bounded collation validation: {error}"
+                ),
+            })?;
+        match first_unsupported_bounded_collation(&expression) {
+            Ok(None) => {}
+            Ok(Some(collation)) => {
                 return Err(Self::bounded_validation_refusal(format!(
-                    "`{object_name}` uses custom or unknown collation `{}`",
-                    pair[1]
+                    "`{object_name}` uses custom or unknown collation `{collation}`"
+                )));
+            }
+            Err(BoundedCollationTraversalLimit::Nodes) => {
+                return Err(Self::bounded_validation_refusal(format!(
+                    "`{object_name}` collation expression AST exceeds the fixed {BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES}-node proof limit"
+                )));
+            }
+            Err(BoundedCollationTraversalLimit::Depth) => {
+                return Err(Self::bounded_validation_refusal(format!(
+                    "`{object_name}` collation expression AST exceeds the fixed depth limit {BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH}"
                 )));
             }
         }
@@ -49285,6 +49337,29 @@ impl Connection {
                     table.name
                 )));
             }
+            if table.strict
+                || table
+                    .columns
+                    .iter()
+                    .any(|column| column.strict_type.is_some())
+            {
+                return Err(Self::bounded_validation_refusal(format!(
+                    "STRICT table `{}`",
+                    table.name
+                )));
+            }
+            if !table.check_constraints.is_empty() {
+                return Err(Self::bounded_validation_refusal(format!(
+                    "CHECK constraints on table `{}`",
+                    table.name
+                )));
+            }
+            if !table.foreign_keys.is_empty() {
+                return Err(Self::bounded_validation_refusal(format!(
+                    "FOREIGN KEY constraints on table `{}`",
+                    table.name
+                )));
+            }
             if let Some(column) = table
                 .columns
                 .iter()
@@ -49294,6 +49369,16 @@ impl Connection {
                     "generated column `{}.{}`",
                     table.name, column.name
                 )));
+            }
+            for column in &table.columns {
+                if let Some(collation) = column.collation.as_deref()
+                    && !is_bounded_builtin_collation(collation)
+                {
+                    return Err(Self::bounded_validation_refusal(format!(
+                        "column `{}.{}` uses custom or unknown collation `{collation}`",
+                        table.name, column.name
+                    )));
+                }
             }
             for index in &table.indexes {
                 if index.root_page <= 0 {
@@ -49332,10 +49417,7 @@ impl Connection {
                     });
                 }
                 for collation in index.key_collations.iter().flatten() {
-                    if !matches!(
-                        collation.to_ascii_lowercase().as_str(),
-                        "binary" | "nocase" | "rtrim"
-                    ) {
+                    if !is_bounded_builtin_collation(collation) {
                         return Err(Self::bounded_validation_refusal(format!(
                             "index `{}` uses custom or unknown collation `{collation}`",
                             index.name
@@ -49966,13 +50048,40 @@ impl Connection {
                     ),
                 });
             }
-            let _ = Self::inflate_table_row_values_for_integrity(
+            let inflated = Self::inflate_table_row_values_for_integrity(
                 table,
                 rowid,
                 &values,
                 rowid_alias_col_idx,
                 column_defaults,
             )?;
+            if !Self::inflated_row_satisfies_notnull(table, &inflated) {
+                let column =
+                    table
+                        .columns
+                        .iter()
+                        .zip(inflated.iter())
+                        .find_map(|(column, value)| {
+                            (column.notnull && !column.is_ipk && matches!(value, SqliteValue::Null))
+                                .then_some(column)
+                        });
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: column.map_or_else(
+                        || {
+                            format!(
+                                "table `{}` rowid {rowid} does not satisfy its NOT NULL constraints",
+                                table.name
+                            )
+                        },
+                        |column| {
+                            format!(
+                                "table `{}` rowid {rowid} stores NULL in NOT NULL column `{}`",
+                                table.name, column.name
+                            )
+                        },
+                    ),
+                });
+            }
             counters.table_rows_checked = counters.table_rows_checked.saturating_add(1);
             after = Some(rowid);
         }
@@ -71242,6 +71351,279 @@ fn render_create_index_terms_sql(index: &IndexSchema) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn is_bounded_builtin_collation(collation: &str) -> bool {
+    ["binary", "nocase", "rtrim"]
+        .iter()
+        .any(|builtin| collation.eq_ignore_ascii_case(builtin))
+}
+
+#[derive(Clone, Copy)]
+enum BoundedCollationAstNode<'a> {
+    Expr(&'a Expr),
+    Select(&'a SelectStatement),
+    SelectCore(&'a SelectCore),
+    From(&'a FromClause),
+    TableSource(&'a TableOrSubquery),
+    Window(&'a WindowSpec),
+    Frame(&'a FrameSpec),
+    FrameBound(&'a FrameBound),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedCollationTraversalLimit {
+    Nodes,
+    Depth,
+}
+
+fn first_unsupported_bounded_collation(
+    expression: &Expr,
+) -> std::result::Result<Option<&str>, BoundedCollationTraversalLimit> {
+    let mut pending = vec![(BoundedCollationAstNode::Expr(expression), 0_usize)];
+    let mut visited = 0_usize;
+
+    while let Some((node, depth)) = pending.pop() {
+        visited = visited.saturating_add(1);
+        if visited > BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES {
+            return Err(BoundedCollationTraversalLimit::Nodes);
+        }
+        if depth > BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH {
+            return Err(BoundedCollationTraversalLimit::Depth);
+        }
+        let child_depth = depth.saturating_add(1);
+
+        match node {
+            BoundedCollationAstNode::Expr(expr) => match expr {
+                Expr::Literal(_, _)
+                | Expr::Column(_, _)
+                | Expr::Raise { .. }
+                | Expr::Placeholder(_, _) => {}
+                Expr::BinaryOp { left, right, .. } => {
+                    pending.push((BoundedCollationAstNode::Expr(right), child_depth));
+                    pending.push((BoundedCollationAstNode::Expr(left), child_depth));
+                }
+                Expr::UnaryOp { expr, .. }
+                | Expr::IsNull { expr, .. }
+                | Expr::Cast { expr, .. } => {
+                    pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                }
+                Expr::Collate {
+                    expr, collation, ..
+                } => {
+                    if !is_bounded_builtin_collation(collation) {
+                        return Ok(Some(collation));
+                    }
+                    pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                }
+                Expr::Between {
+                    expr, low, high, ..
+                } => {
+                    pending.push((BoundedCollationAstNode::Expr(high), child_depth));
+                    pending.push((BoundedCollationAstNode::Expr(low), child_depth));
+                    pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                }
+                Expr::In { expr, set, .. } => {
+                    match set {
+                        InSet::List(expressions) => {
+                            for item in expressions.iter().rev() {
+                                pending.push((BoundedCollationAstNode::Expr(item), child_depth));
+                            }
+                        }
+                        InSet::Subquery(select) => {
+                            pending.push((BoundedCollationAstNode::Select(select), child_depth));
+                        }
+                        InSet::Table(_) => {}
+                    }
+                    pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                }
+                Expr::Like {
+                    expr,
+                    pattern,
+                    escape,
+                    ..
+                } => {
+                    if let Some(escape) = escape.as_deref() {
+                        pending.push((BoundedCollationAstNode::Expr(escape), child_depth));
+                    }
+                    pending.push((BoundedCollationAstNode::Expr(pattern), child_depth));
+                    pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                }
+                Expr::Case {
+                    operand,
+                    whens,
+                    else_expr,
+                    ..
+                } => {
+                    if let Some(else_expr) = else_expr.as_deref() {
+                        pending.push((BoundedCollationAstNode::Expr(else_expr), child_depth));
+                    }
+                    for (when, then) in whens.iter().rev() {
+                        pending.push((BoundedCollationAstNode::Expr(then), child_depth));
+                        pending.push((BoundedCollationAstNode::Expr(when), child_depth));
+                    }
+                    if let Some(operand) = operand.as_deref() {
+                        pending.push((BoundedCollationAstNode::Expr(operand), child_depth));
+                    }
+                }
+                Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+                    pending.push((BoundedCollationAstNode::Select(subquery), child_depth));
+                }
+                Expr::FunctionCall {
+                    args,
+                    order_by,
+                    filter,
+                    over,
+                    ..
+                } => {
+                    if let Some(window) = over.as_ref() {
+                        pending.push((BoundedCollationAstNode::Window(window), child_depth));
+                    }
+                    if let Some(filter) = filter.as_deref() {
+                        pending.push((BoundedCollationAstNode::Expr(filter), child_depth));
+                    }
+                    for term in order_by.iter().rev() {
+                        pending.push((BoundedCollationAstNode::Expr(&term.expr), child_depth));
+                    }
+                    if let FunctionArgs::List(expressions) = args {
+                        for argument in expressions.iter().rev() {
+                            pending.push((BoundedCollationAstNode::Expr(argument), child_depth));
+                        }
+                    }
+                }
+                Expr::JsonAccess { expr, path, .. } => {
+                    pending.push((BoundedCollationAstNode::Expr(path), child_depth));
+                    pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                }
+                Expr::RowValue(expressions, _) => {
+                    for item in expressions.iter().rev() {
+                        pending.push((BoundedCollationAstNode::Expr(item), child_depth));
+                    }
+                }
+            },
+            BoundedCollationAstNode::Select(select) => {
+                if let Some(limit) = select.limit.as_ref() {
+                    if let Some(offset) = limit.offset.as_ref() {
+                        pending.push((BoundedCollationAstNode::Expr(offset), child_depth));
+                    }
+                    pending.push((BoundedCollationAstNode::Expr(&limit.limit), child_depth));
+                }
+                for term in select.order_by.iter().rev() {
+                    pending.push((BoundedCollationAstNode::Expr(&term.expr), child_depth));
+                }
+                for (_, core) in select.body.compounds.iter().rev() {
+                    pending.push((BoundedCollationAstNode::SelectCore(core), child_depth));
+                }
+                pending.push((
+                    BoundedCollationAstNode::SelectCore(&select.body.select),
+                    child_depth,
+                ));
+                if let Some(with) = select.with.as_ref() {
+                    for cte in with.ctes.iter().rev() {
+                        pending.push((BoundedCollationAstNode::Select(&cte.query), child_depth));
+                    }
+                }
+            }
+            BoundedCollationAstNode::SelectCore(core) => match core {
+                SelectCore::Select {
+                    columns,
+                    from,
+                    where_clause,
+                    group_by,
+                    having,
+                    windows,
+                    ..
+                } => {
+                    for window in windows.iter().rev() {
+                        pending.push((BoundedCollationAstNode::Window(&window.spec), child_depth));
+                    }
+                    if let Some(having) = having.as_deref() {
+                        pending.push((BoundedCollationAstNode::Expr(having), child_depth));
+                    }
+                    for expression in group_by.iter().rev() {
+                        pending.push((BoundedCollationAstNode::Expr(expression), child_depth));
+                    }
+                    if let Some(predicate) = where_clause.as_deref() {
+                        pending.push((BoundedCollationAstNode::Expr(predicate), child_depth));
+                    }
+                    if let Some(from) = from.as_ref() {
+                        pending.push((BoundedCollationAstNode::From(from), child_depth));
+                    }
+                    for column in columns.iter().rev() {
+                        if let ResultColumn::Expr { expr, .. } = column {
+                            pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                        }
+                    }
+                }
+                SelectCore::Values(rows) => {
+                    for row in rows.iter().rev() {
+                        for expression in row.iter().rev() {
+                            pending.push((BoundedCollationAstNode::Expr(expression), child_depth));
+                        }
+                    }
+                }
+            },
+            BoundedCollationAstNode::From(from) => {
+                for join in from.joins.iter().rev() {
+                    if let Some(JoinConstraint::On(expression)) = &join.constraint {
+                        pending.push((BoundedCollationAstNode::Expr(expression), child_depth));
+                    }
+                    pending.push((
+                        BoundedCollationAstNode::TableSource(&join.table),
+                        child_depth,
+                    ));
+                }
+                pending.push((
+                    BoundedCollationAstNode::TableSource(&from.source),
+                    child_depth,
+                ));
+            }
+            BoundedCollationAstNode::TableSource(source) => match source {
+                TableOrSubquery::Table { .. } => {}
+                TableOrSubquery::Subquery { query, .. } => {
+                    pending.push((BoundedCollationAstNode::Select(query), child_depth));
+                }
+                TableOrSubquery::TableFunction { args, .. } => {
+                    for argument in args.iter().rev() {
+                        pending.push((BoundedCollationAstNode::Expr(argument), child_depth));
+                    }
+                }
+                TableOrSubquery::ParenJoin(from) => {
+                    pending.push((BoundedCollationAstNode::From(from), child_depth));
+                }
+            },
+            BoundedCollationAstNode::Window(window) => {
+                if let Some(frame) = window.frame.as_ref() {
+                    pending.push((BoundedCollationAstNode::Frame(frame), child_depth));
+                }
+                for term in window.order_by.iter().rev() {
+                    pending.push((BoundedCollationAstNode::Expr(&term.expr), child_depth));
+                }
+                for expression in window.partition_by.iter().rev() {
+                    pending.push((BoundedCollationAstNode::Expr(expression), child_depth));
+                }
+            }
+            BoundedCollationAstNode::Frame(frame) => {
+                if let Some(end) = frame.end.as_ref() {
+                    pending.push((BoundedCollationAstNode::FrameBound(end), child_depth));
+                }
+                pending.push((
+                    BoundedCollationAstNode::FrameBound(&frame.start),
+                    child_depth,
+                ));
+            }
+            BoundedCollationAstNode::FrameBound(bound) => match bound {
+                FrameBound::Preceding(expression) | FrameBound::Following(expression) => {
+                    pending.push((BoundedCollationAstNode::Expr(expression), child_depth));
+                }
+                FrameBound::UnboundedPreceding
+                | FrameBound::CurrentRow
+                | FrameBound::UnboundedFollowing => {}
+            },
+        }
+    }
+
+    Ok(None)
 }
 
 fn term_has_unquoted_collation_keyword(term: &str) -> bool {
@@ -114560,6 +114942,96 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    fn rewrite_stock_sqlite_schema_sql(
+        path: &Path,
+        object_type: &str,
+        object_name: &str,
+        replacement_sql: &str,
+    ) {
+        let sqlite = rusqlite::Connection::open(path).unwrap();
+        sqlite.execute_batch("PRAGMA writable_schema=ON;").unwrap();
+        let changed = sqlite
+            .execute(
+                "UPDATE sqlite_schema SET sql=?1 WHERE type=?2 AND name=?3;",
+                rusqlite::params![replacement_sql, object_type, object_name],
+            )
+            .unwrap();
+        assert_eq!(
+            changed, 1,
+            "schema mutation must target exactly one table named `{object_name}`"
+        );
+        let schema_version: i64 = sqlite
+            .query_row("PRAGMA schema_version;", [], |row| row.get(0))
+            .unwrap();
+        sqlite
+            .execute_batch(&format!(
+                "PRAGMA schema_version={}; PRAGMA writable_schema=OFF;",
+                schema_version.saturating_add(1)
+            ))
+            .unwrap();
+        drop(sqlite);
+        for suffix in ["-journal", "-wal", "-shm", "-wal-fec"] {
+            assert!(
+                !publication_sidecar(path, suffix).exists(),
+                "closed schema-mutated candidate retained forbidden sidecar {suffix}"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    fn assert_bounded_publication_shape_refusal_is_immutable(
+        source: &Connection,
+        source_receipt: &super::DatabaseImageReceipt,
+        source_path: &Path,
+        candidate_path: &Path,
+        expected_detail_fragments: &[&str],
+    ) {
+        let candidate_receipt =
+            inspect_database_image_publication_candidate_receipt(source, candidate_path);
+        let source_before = std::fs::read(source_path).unwrap();
+        let candidate_before = std::fs::read(candidate_path).unwrap();
+        let callback_called = std::cell::Cell::new(false);
+        let error = match source.publish_database_image_from_receipt_with_bounded_validation(
+            source_receipt,
+            &candidate_receipt,
+            candidate_path,
+            1,
+            |_, _| {
+                callback_called.set(true);
+                Ok(())
+            },
+        ) {
+            Ok(_) => panic!("bounded validation must refuse the unsupported candidate shape"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, FrankenError::NotImplemented(_)),
+            "unsupported bounded candidate shape must produce NotImplemented, got {error}"
+        );
+        let detail = error.to_string();
+        assert!(
+            expected_detail_fragments
+                .iter()
+                .all(|fragment| detail.contains(fragment)),
+            "bounded shape refusal `{detail}` did not contain every expected fragment {expected_detail_fragments:?}"
+        );
+        assert!(
+            !callback_called.get(),
+            "caller validation must not run after built-in shape refusal"
+        );
+        assert_eq!(
+            std::fs::read(source_path).unwrap(),
+            source_before,
+            "rejected bounded publication must leave source bytes unchanged"
+        );
+        assert_eq!(
+            std::fs::read(candidate_path).unwrap(),
+            candidate_before,
+            "rejected bounded publication must restore the exact candidate bytes"
+        );
+    }
+
     #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
     fn assert_live_replacement_items(conn: &Connection, expected_rows: i64) {
         let rows = conn
@@ -114654,7 +115126,504 @@ mod tests {
         assert_stock_database_image(&source_path, 3);
     }
 
-    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    fn assert_hfdt_0117_bounded_custom_collation_refused(
+        sql: &str,
+        expected_collation: &str,
+        context: &str,
+    ) {
+        let error = Connection::validate_bounded_collations_in_sql(sql, context)
+            .expect_err("bounded validation must reject every unsupported collation spelling");
+        assert!(
+            matches!(error, FrankenError::NotImplemented(_)),
+            "{context}: quoted custom collation must produce the typed bounded-shape refusal, got {error:?}"
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(expected_collation),
+            "{context}: refusal must identify decoded collation `{expected_collation}`; sql={sql:?}; error={rendered}"
+        );
+    }
+
+    #[test]
+    fn hfdt_0117_bounded_collation_ast_rejects_all_quoted_custom_expression_collations() {
+        for (quote_form, quoted_name, decoded_name) in [
+            (
+                "double_quote",
+                r#""tenant_custom_double""#,
+                "tenant_custom_double",
+            ),
+            (
+                "backtick",
+                "`tenant_custom_backtick`",
+                "tenant_custom_backtick",
+            ),
+            (
+                "bracket",
+                "[tenant_custom_bracket]",
+                "tenant_custom_bracket",
+            ),
+        ] {
+            let sql = format!("lower(account_name) COLLATE {quoted_name}");
+            let context = format!("hfdt_0117_expression_{quote_form}");
+            assert_hfdt_0117_bounded_custom_collation_refused(&sql, decoded_name, &context);
+        }
+    }
+
+    #[test]
+    fn hfdt_0117_bounded_collation_ast_rejects_all_quoted_custom_partial_predicates() {
+        for (quote_form, quoted_name, decoded_name) in [
+            (
+                "double_quote",
+                r#""tenant_predicate_double""#,
+                "tenant_predicate_double",
+            ),
+            (
+                "backtick",
+                "`tenant_predicate_backtick`",
+                "tenant_predicate_backtick",
+            ),
+            (
+                "bracket",
+                "[tenant_predicate_bracket]",
+                "tenant_predicate_bracket",
+            ),
+        ] {
+            let sql = format!("account_name COLLATE {quoted_name} = 'active'");
+            let context = format!("hfdt_0117_predicate_{quote_form}");
+            assert_hfdt_0117_bounded_custom_collation_refused(&sql, decoded_name, &context);
+        }
+
+        assert_hfdt_0117_bounded_custom_collation_refused(
+            r#"account_name COLLATE /* quoted built-in decoy: "NOCASE" */ "tenant_after_comment" = 'active'"#,
+            "tenant_after_comment",
+            "hfdt_0117_predicate_comment_cannot_hide_operand",
+        );
+    }
+
+    #[test]
+    fn hfdt_0117_bounded_collation_ast_preserves_quoted_builtins_and_ignores_spoofs() {
+        for sql in [
+            r#"lower(account_name) COLLATE "NOCASE""#,
+            "lower(account_name) COLLATE `binary`",
+            "lower(account_name) COLLATE [RTRIM]",
+            r#"account_name COLLATE "NOCASE" = 'active'"#,
+            "account_name COLLATE `BINARY` = 'active'",
+            "account_name COLLATE [rtrim] = 'active '",
+            r#"instr(account_name, 'COLLATE "tenant_in_string"') > 0"#,
+            r#"account_name = 'COLLATE `tenant_in_string`' /* COLLATE [tenant_in_comment] */"#,
+            r#""COLLATE" = 'quoted identifier is not the keyword'"#,
+            r#"account_name COLLATE /* COLLATE "tenant_in_comment" */ "NOCASE" = 'active'"#,
+            "-- COLLATE [tenant_in_line_comment]\naccount_name COLLATE `BINARY` = 'active'",
+        ] {
+            Connection::validate_bounded_collations_in_sql(
+                sql,
+                "hfdt_0117_builtin_or_spoof",
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "bounded AST validation must accept quoted built-ins and ignore string/comment/identifier decoys; sql={sql:?}; error={error}"
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn hfdt_0117_bounded_collation_ast_requires_strict_expression_eof() {
+        let error = Connection::validate_bounded_collations_in_sql(
+            r#"account_name COLLATE NOCASE; account_name COLLATE "tenant_after_semicolon""#,
+            "hfdt_0117_trailing_expression",
+        )
+        .expect_err("bounded collation validation must reject tokens after a terminator");
+        assert!(
+            matches!(error, FrankenError::DatabaseCorrupt { .. }),
+            "trailing expression syntax must be classified as malformed schema, got {error}"
+        );
+        assert!(
+            error.to_string().contains("after expression terminator"),
+            "strict EOF refusal must explain the trailing syntax: {error}"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn hfdt_0117_bounded_external_snapshot_platform_gate_accepts_implemented_targets() {
+        Connection::require_bounded_external_snapshot_platform()
+            .expect("Linux and Windows provide the native bounded snapshot lock fence");
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_external_snapshot_platform_gate_refuses_unimplemented_targets() {
+        let error = Connection::require_bounded_external_snapshot_platform()
+            .expect_err("unimplemented targets must fail closed before opening an image");
+        assert!(
+            matches!(
+                error,
+                FrankenError::NotImplemented(ref detail)
+                    if detail.contains("Linux or Windows native lock fence")
+            ),
+            "unexpected bounded external snapshot platform refusal: {error}"
+        );
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_rejects_implicit_custom_column_collation_immutably() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("bounded-column-collation-source.db");
+        let candidate_path = dir.path().join("bounded-column-collation-candidate.db");
+        let source = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = source.capture_database_image_receipt().unwrap();
+        {
+            let sqlite = rusqlite::Connection::open(&candidate_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     CREATE TABLE replacement_items(
+                         id INTEGER PRIMARY KEY,
+                         account_name TEXT
+                     );
+                     INSERT INTO replacement_items VALUES (10, 'candidate-alpha');",
+                )
+                .unwrap();
+        }
+        rewrite_stock_sqlite_schema_sql(
+            &candidate_path,
+            "table",
+            "replacement_items",
+            r#"CREATE TABLE replacement_items(
+                   id INTEGER PRIMARY KEY,
+                   account_name TEXT COLLATE "tenant_custom"
+               )"#,
+        );
+
+        assert_bounded_publication_shape_refusal_is_immutable(
+            &source,
+            &source_receipt,
+            &source_path,
+            &candidate_path,
+            &["column `replacement_items.account_name`", "tenant_custom"],
+        );
+        source.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_preserves_quoted_custom_expression_collations_on_reload() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("bounded-expression-collation-source.db");
+        let source = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = source.capture_database_image_receipt().unwrap();
+
+        for (case_name, quoted_collation, decoded_collation) in [
+            ("double_space", r#""NOCASE ""#, "NOCASE "),
+            (
+                "double_escaped_quote",
+                r#""NOCASE""escaped""#,
+                "NOCASE\"escaped",
+            ),
+            ("backtick_semicolon", "`NOCASE;--x`", "NOCASE;--x"),
+            ("bracket_comment", "[NOCASE/*x*/]", "NOCASE/*x*/"),
+        ] {
+            let candidate_path = dir
+                .path()
+                .join(format!("bounded-expression-collation-{case_name}.db"));
+            {
+                let sqlite = rusqlite::Connection::open(&candidate_path).unwrap();
+                sqlite
+                    .execute_batch(
+                        "PRAGMA journal_mode=DELETE;
+                         CREATE TABLE replacement_items(
+                             id INTEGER PRIMARY KEY,
+                             account_name TEXT
+                         );
+                         CREATE INDEX idx_accounts
+                           ON replacement_items(lower(account_name) COLLATE NOCASE);
+                         INSERT INTO replacement_items
+                           VALUES (10, 'Candidate-Alpha'), (20, 'candidate-beta');",
+                    )
+                    .unwrap();
+            }
+            rewrite_stock_sqlite_schema_sql(
+                &candidate_path,
+                "index",
+                "idx_accounts",
+                &format!(
+                    "CREATE INDEX idx_accounts
+                       ON replacement_items(lower(account_name) COLLATE {quoted_collation})"
+                ),
+            );
+
+            assert_bounded_publication_shape_refusal_is_immutable(
+                &source,
+                &source_receipt,
+                &source_path,
+                &candidate_path,
+                &["idx_accounts", decoded_collation],
+            );
+        }
+        source.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_detects_not_null_violation_immutably() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("bounded-not-null-source.db");
+        let candidate_path = dir.path().join("bounded-not-null-candidate.db");
+        let source = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = source.capture_database_image_receipt().unwrap();
+        {
+            let sqlite = rusqlite::Connection::open(&candidate_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     CREATE TABLE replacement_items(
+                         id INTEGER PRIMARY KEY,
+                         account_name TEXT
+                     );
+                     INSERT INTO replacement_items VALUES (10, NULL);",
+                )
+                .unwrap();
+        }
+        rewrite_stock_sqlite_schema_sql(
+            &candidate_path,
+            "table",
+            "replacement_items",
+            "CREATE TABLE replacement_items(
+                 id INTEGER PRIMARY KEY,
+                 account_name TEXT NOT NULL
+             )",
+        );
+
+        assert_bounded_publication_corruption_is_immutable(
+            &source,
+            &source_receipt,
+            &source_path,
+            &candidate_path,
+            &[
+                "table `replacement_items`",
+                "rowid 10",
+                "NOT NULL column `account_name`",
+            ],
+        );
+        source.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_refuses_unproven_check_semantics_immutably() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("bounded-check-source.db");
+        let candidate_path = dir.path().join("bounded-check-candidate.db");
+        let source = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = source.capture_database_image_receipt().unwrap();
+        {
+            let sqlite = rusqlite::Connection::open(&candidate_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     CREATE TABLE replacement_items(
+                         id INTEGER PRIMARY KEY,
+                         quantity INTEGER
+                     );
+                     INSERT INTO replacement_items VALUES (10, -1);",
+                )
+                .unwrap();
+        }
+        rewrite_stock_sqlite_schema_sql(
+            &candidate_path,
+            "table",
+            "replacement_items",
+            "CREATE TABLE replacement_items(
+                 id INTEGER PRIMARY KEY,
+                 quantity INTEGER CHECK(quantity > 0)
+             )",
+        );
+
+        assert_bounded_publication_shape_refusal_is_immutable(
+            &source,
+            &source_receipt,
+            &source_path,
+            &candidate_path,
+            &["CHECK constraints", "replacement_items"],
+        );
+        source.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_refuses_unproven_strict_semantics_immutably() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("bounded-strict-source.db");
+        let candidate_path = dir.path().join("bounded-strict-candidate.db");
+        let source = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = source.capture_database_image_receipt().unwrap();
+        {
+            let sqlite = rusqlite::Connection::open(&candidate_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     CREATE TABLE replacement_items(
+                         id INTEGER PRIMARY KEY,
+                         quantity INTEGER
+                     );
+                     INSERT INTO replacement_items VALUES (10, 'not-an-integer');",
+                )
+                .unwrap();
+        }
+        rewrite_stock_sqlite_schema_sql(
+            &candidate_path,
+            "table",
+            "replacement_items",
+            "CREATE TABLE replacement_items(
+                 id INTEGER PRIMARY KEY,
+                 quantity INTEGER
+             ) STRICT",
+        );
+
+        assert_bounded_publication_shape_refusal_is_immutable(
+            &source,
+            &source_receipt,
+            &source_path,
+            &candidate_path,
+            &["STRICT table", "replacement_items"],
+        );
+        source.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_refuses_unproven_foreign_key_semantics_immutably() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("bounded-foreign-key-source.db");
+        let candidate_path = dir.path().join("bounded-foreign-key-candidate.db");
+        let source = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = source.capture_database_image_receipt().unwrap();
+        {
+            let sqlite = rusqlite::Connection::open(&candidate_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     PRAGMA foreign_keys=OFF;
+                     CREATE TABLE parent_items(id INTEGER PRIMARY KEY);
+                     CREATE TABLE child_items(
+                         id INTEGER PRIMARY KEY,
+                         parent_id INTEGER REFERENCES parent_items(id)
+                     );
+                     INSERT INTO child_items VALUES (10, 999);",
+                )
+                .unwrap();
+        }
+
+        assert_bounded_publication_shape_refusal_is_immutable(
+            &source,
+            &source_receipt,
+            &source_path,
+            &candidate_path,
+            &["FOREIGN KEY constraints", "child_items"],
+        );
+        source.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_refuses_over_budget_flat_expression_immutably() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("bounded-expression-budget-source.db");
+        let candidate_path = dir.path().join("bounded-expression-budget-candidate.db");
+        let source = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = source.capture_database_image_receipt().unwrap();
+        let predicate = std::iter::repeat_n("id > 0", 600)
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        {
+            let sqlite = rusqlite::Connection::open(&candidate_path).unwrap();
+            sqlite
+                .execute_batch(&format!(
+                    "PRAGMA journal_mode=DELETE;
+                     CREATE TABLE replacement_items(
+                         id INTEGER PRIMARY KEY,
+                         account_name TEXT
+                     );
+                     INSERT INTO replacement_items VALUES (10, 'candidate-alpha');
+                     CREATE INDEX idx_deep_predicate
+                       ON replacement_items(account_name)
+                       WHERE {predicate};"
+                ))
+                .unwrap();
+        }
+
+        assert_bounded_publication_shape_refusal_is_immutable(
+            &source,
+            &source_receipt,
+            &source_path,
+            &candidate_path,
+            &["idx_deep_predicate", "fixed depth limit 512"],
+        );
+        source.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_validation_open_preserves_typed_schema_error() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("typed-schema-open-source.db");
+        let candidate_path = dir.path().join("typed-schema-open-candidate.db");
+        let source = open_database_image_publication_source(&source_path, "delete");
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        {
+            let sqlite = rusqlite::Connection::open(&candidate_path).unwrap();
+            sqlite.execute_batch("PRAGMA writable_schema=ON;").unwrap();
+            let changed = sqlite
+                .execute(
+                    "UPDATE sqlite_schema SET rootpage=-1
+                     WHERE type='table' AND name='replacement_items';",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(changed, 1);
+            sqlite.execute_batch("PRAGMA writable_schema=OFF;").unwrap();
+        }
+        let candidate_receipt =
+            inspect_database_image_publication_candidate_receipt(&source, &candidate_path);
+        let source_before = std::fs::read(&source_path).unwrap();
+        let candidate_before = std::fs::read(&candidate_path).unwrap();
+        let callback_called = std::cell::Cell::new(false);
+
+        let error = source
+            .validate_database_image(
+                &candidate_path,
+                candidate_receipt.identity(),
+                Some(1),
+                |_, _| {
+                    callback_called.set(true);
+                    Ok(())
+                },
+            )
+            .expect_err("malformed sqlite_schema metadata must fail validation open");
+        assert!(
+            !matches!(&error, FrankenError::Internal(_)),
+            "identity-bound validation open must preserve its typed error, got {error}"
+        );
+        assert!(
+            !callback_called.get(),
+            "caller validation must not run when schema loading fails"
+        );
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_before);
+        assert_eq!(std::fs::read(&candidate_path).unwrap(), candidate_before);
+        source.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
     #[test]
     fn hfdt_0117_database_image_publication_bounded_validation_scans_past_page_cap_without_retention()
      {
@@ -114763,12 +115732,12 @@ mod tests {
         assert_stock_database_image(&source_path, 66);
     }
 
-    #[cfg(all(feature = "native", unix))]
+    #[cfg(all(feature = "native", target_os = "linux"))]
     const HFDT_0117_ABA_WRITER_DB_ENV: &str = "FSQLITE_HFDT_0117_ABA_WRITER_DB";
-    #[cfg(all(feature = "native", unix))]
+    #[cfg(all(feature = "native", target_os = "linux"))]
     const HFDT_0117_ABA_WRITER_PHASE_ENV: &str = "FSQLITE_HFDT_0117_ABA_WRITER_PHASE";
 
-    #[cfg(all(feature = "native", unix))]
+    #[cfg(all(feature = "native", target_os = "linux"))]
     fn assert_stock_sqlite_aba_writer_is_refused(path: &Path, phase: &str) {
         let output = std::process::Command::new(
             std::env::current_exe().expect("resolve current Rust test binary for lock proof"),
@@ -114798,7 +115767,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "native", unix))]
+    #[cfg(all(feature = "native", target_os = "linux"))]
     #[test]
     #[ignore = "invoked as a separate process by the bounded snapshot lock test"]
     fn bounded_snapshot_aba_writer_subprocess_helper() {
@@ -114836,7 +115805,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "native", unix))]
+    #[cfg(all(feature = "native", target_os = "linux"))]
     #[test]
     fn hfdt_0117_bounded_publication_callback_shares_proven_snapshot_and_blocks_aba_writer_commit()
     {
@@ -114914,7 +115883,7 @@ mod tests {
         assert_stock_database_image(&source_path, 2);
     }
 
-    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
     #[test]
     fn hfdt_0117_bounded_source_structure_walks_without_rowid_pointer_maps_and_large_overflow_streaming()
      {
@@ -114980,7 +115949,7 @@ mod tests {
         source.close().unwrap();
     }
 
-    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
     #[test]
     fn hfdt_0117_bounded_source_structure_accounts_for_a_real_durable_freelist() {
         let _serial = super::fsqlite_core_test_serializer();
@@ -115030,7 +115999,7 @@ mod tests {
         source.close().unwrap();
     }
 
-    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
     #[test]
     fn hfdt_0117_bounded_publication_refuses_user_table_root_page_one_without_byte_mutation() {
         let _serial = super::fsqlite_core_test_serializer();
@@ -115064,7 +116033,7 @@ mod tests {
         source.close().unwrap();
     }
 
-    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
     #[test]
     fn hfdt_0117_bounded_publication_refuses_out_of_order_sqlite_schema_leaf_rowids() {
         let _serial = super::fsqlite_core_test_serializer();
@@ -115109,7 +116078,7 @@ mod tests {
         source.close().unwrap();
     }
 
-    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
     #[test]
     fn hfdt_0117_bounded_publication_refuses_out_of_order_user_table_leaf_rowids() {
         let _serial = super::fsqlite_core_test_serializer();
@@ -115161,7 +116130,7 @@ mod tests {
         source.close().unwrap();
     }
 
-    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
     #[test]
     fn hfdt_0117_bounded_publication_refuses_interior_table_separator_and_child_range_corruption() {
         let _serial = super::fsqlite_core_test_serializer();
@@ -139616,7 +140585,7 @@ fts5(title, body, content=docs, content_rowid=id)'
         assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
     }
 
-    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
     #[test]
     fn hfdt_0117_bounded_read_snapshot_configuration_refuses_unsafe_modes_and_preserves_default() {
         let _serial = super::fsqlite_core_test_serializer();
@@ -139696,7 +140665,7 @@ fts5(title, body, content=docs, content_rowid=id)'
         bounded.rollback_transaction().unwrap();
     }
 
-    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
     #[test]
     fn hfdt_0117_bounded_delete_snapshot_scans_past_cap_without_cache_publication_and_blocks_writer_commit()
      {
@@ -139791,7 +140760,7 @@ fts5(title, body, content=docs, content_rowid=id)'
         assert_eq!(latest.get(0), Some(&SqliteValue::Text("writer-new".into())));
     }
 
-    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
     #[test]
     fn hfdt_0117_bounded_snapshot_refuses_wal_even_after_truncate_then_accepts_delete_mode() {
         let _serial = super::fsqlite_core_test_serializer();
@@ -139892,7 +140861,7 @@ fts5(title, body, content=docs, content_rowid=id)'
         reader.rollback_transaction().unwrap();
     }
 
-    #[cfg(all(feature = "native", unix))]
+    #[cfg(all(feature = "native", target_os = "linux"))]
     #[test]
     fn hfdt_0117_bounded_direct_pager_refuses_existing_wal_without_trusting_cached_mode() {
         let _serial = super::fsqlite_core_test_serializer();
@@ -139935,7 +140904,7 @@ fts5(title, body, content=docs, content_rowid=id)'
         );
     }
 
-    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
     #[test]
     fn hfdt_0117_bounded_snapshot_revalidates_external_delete_to_wal_transition_on_each_begin() {
         let _serial = super::fsqlite_core_test_serializer();

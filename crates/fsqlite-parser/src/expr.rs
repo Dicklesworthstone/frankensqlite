@@ -1017,11 +1017,22 @@ impl Parser {
 pub fn parse_expr(sql: &str) -> Result<Expr, ParseError> {
     let mut parser = Parser::from_sql(sql);
     let expr = parser.parse_expr()?;
-    if !matches!(parser.peek_kind(), TokenKind::Eof | TokenKind::Semicolon) {
-        return Err(parser.err_here(format!(
-            "unexpected token after expression: {:?}",
-            parser.peek_kind()
-        )));
+    match parser.peek_kind() {
+        TokenKind::Eof => {}
+        TokenKind::Semicolon => {
+            let _ = parser.advance_token();
+            if !matches!(parser.peek_kind(), TokenKind::Eof) {
+                return Err(parser.err_here(format!(
+                    "unexpected token after expression terminator: {:?}",
+                    parser.peek_kind()
+                )));
+            }
+        }
+        unexpected => {
+            return Err(
+                parser.err_here(format!("unexpected token after expression: {unexpected:?}"))
+            );
+        }
     }
     Ok(expr)
 }
@@ -1472,6 +1483,30 @@ mod tests {
                 assert_eq!(collation, "NOCASE");
             }
             other => unreachable!("expected COLLATE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hfdt_0117_bounded_parse_expr_requires_eof_after_optional_terminator() {
+        for accepted in [
+            "name COLLATE NOCASE",
+            "name COLLATE NOCASE;",
+            "name COLLATE \"NOCASE;--still-an-identifier\";",
+        ] {
+            parse_expr(accepted).unwrap_or_else(|error| {
+                panic!("single complete expression must parse: sql={accepted:?}; error={error}")
+            });
+        }
+        for rejected in [
+            "name COLLATE NOCASE; name COLLATE BINARY",
+            "name COLLATE NOCASE;;",
+        ] {
+            let error = parse_expr(rejected)
+                .expect_err("expression parsing must reject every token after its terminator");
+            assert!(
+                error.message.contains("after expression terminator"),
+                "strict EOF diagnostic must identify trailing tokens: sql={rejected:?}; error={error}"
+            );
         }
     }
 
