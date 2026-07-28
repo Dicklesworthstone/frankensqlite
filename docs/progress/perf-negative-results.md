@@ -48,6 +48,34 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-07-28 - MEASURED: release-perf post-fix truth for the subquery section — fixes hold at full optimization; residual is a ~50-60µs FLAT parameterized-execution tax (bd-5zeai), not subquery logic
+
+- First release-perf (opt-level=3) run of the section post-fa85adfc/5d35b79e
+  (prior receipts raced debug F against rusqlite's always--O2 C). Artifact:
+  `tests/artifacts/perf/subq-releaseperf-20260728T0330Z-hz1/`.
+- The routing fixes hold: EXISTS F=60.7/65.8/94.9µs and IN F=58.3/71.9/72.4µs
+  at 100/1k/10k — flat across scale (was linear). In the SAME section F beats
+  C by 6-9x on scalar subqueries and 9-17x on CTE+JOIN.
+- KEY ATTRIBUTION: within the F column, parameterless prepared execution
+  (`stmt.query()`) costs 5.8-16µs while parameterized
+  (`query_row_with_params`) costs 58-95µs regardless of query shape or table
+  size — a ~50-60µs FLAT per-execution tax on the parameterized path (a
+  single-row indexed COUNT costs 6x more than materializing 100 rows). Filed
+  bd-5zeai with ordered hypotheses (params-gated fast-path bypasses at
+  :6952/:18422 are known instances; find the rest). The bridge entry
+  (~333ns, bd-zavyn) is NOT this.
+- Also confirmed at release: general recursive-CTE COUNT C=335.4µs vs
+  F=2.46ms (~7.3x) — bd-gpi5i's release-gate condition met; profiling now
+  warranted.
+- Fresh-eyes review of the fa85adfc/5d35b79e/1f0969b3 surface found no
+  defects in the landed code; two latent PRE-EXISTING correctness landmines
+  filed: bd-f8iph (compiled IN emitter silently yields NULL when probe
+  resolution and the complex emitter both fail, codegen.rs:27807 —
+  currently unreachable but the invariant is implicit across three files)
+  and bd-3ua5h (subquery-support routing never descends into nested
+  subquery bodies, so a nested broken-family correlated EXISTS reaches the
+  compiled path unchecked).
+
 ## 2026-07-28 - LANDED: bd-2dgf5 closed at 5d35b79e — the parameterized IN-subquery had the same routing disease (~32x recovered at 10k, scaling inversion gone); original aggregate-seek scope verified already fixed
 
 - Target: the second of the two subquery routing pathologies. Same disease
