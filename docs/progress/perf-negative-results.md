@@ -48,6 +48,36 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-07-28 - MEASURED(macOS): M4 Pro inversion decomposed — registry guard 1.4ms holds at 8 WRITERS (Linux-64w territory) drives conflict-backoff collapse; barrier hypothesis eliminated; padding flip suggestive-only, NOT landed
+
+- First real-Apple-silicon receipts (mac-mini-max M4 Pro; artifacts
+  `mseries-cacheline-ab-20260728T1935Z-mmmax`,
+  `macos-inversion-decomp-20260728T2145Z-mmmax`; beads bd-jyeus, bd-64uz9):
+  F is CI-gated SLOWER than C at 2-4 shared-table writers (0.24x/0.30x; 8w
+  0.66-0.85x INCONCLUSIVE), flat ~77-114k wps across 2-8w.
+- ELIMINATED by direct measurement (do not re-propose without new evidence):
+  (a) F_FULLFSYNC/checkpoint barriers — fs_usage counted ZERO F_FULLFSYNC and
+  112 total fsync-family lines over 3 paired rounds; synchronous=NORMAL is
+  correctly plumbed (apply_synchronous_to_pager -> Deferred); (b) blocking-
+  pool saturation — pool ~0.1% of thread-time, I/O leaves tiny.
+- MEASURED mechanism: worker round = ~30% condvar-blocked behind commit
+  serialization + ~28% engine work + ~23% retry-backoff SLEEP; registry
+  telemetry: holds ~9/round x mean 1,420us (max 4.5ms) at 8w. Root cause =
+  bd-i0tn6's guard-across-I/O, amplified on Darwin by spawn_blocking handoff
+  cost inside the guard + unpinned QoS (bd-y3dlq). bd-jyeus = macOS
+  acceptance harness for bd-i0tn6 S3.
+- PADDING (bd-64uz9): premise PROVEN on hardware (64B-spaced atomics
+  1.65-2.1x slower on M4, granule exactly 128B, x86 null control clean) but
+  the product-level flip (CommitSlot + striped counters to 128B) is
+  SUGGESTIVE-ONLY: interleaved A/B/A/B x3 won 3/3 pairs at mean +4.7%, cv
+  42-52%, sign-test p=0.125 -> NOT landed. RETRY: quiesced/QoS-pinned mini,
+  >=10 interleaved pairs, or Instruments HITM. Unpaired mac comparisons are
+  BANNED for receipts (C-arm drifted +33% run-to-run; interleave is a hard
+  requirement).
+- Infra: mac runs resolve their own dep graph (Cargo.lock drift on the mac
+  clone — note in provenance); `FSQLITE_BENCH_WAL_AUTOCHECKPOINT` knob
+  (e9fd9679) available for checkpoint-cadence isolation on other hosts.
+
 ## 2026-07-28 - ATTRIBUTED: general recursive-CTE frontier gap (bd-gpi5i) = ~135ns/AST-node boxed-future evaluation (~53%) + ~720ns/iter async loop plumbing (~47%); fix spec'd, perf-tooling attempts all failed (recorded)
 
 - Target row: "Recursive CTE general COUNT (1..1000)" — four release-perf runs
