@@ -48,6 +48,40 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-07-28 - ATTRIBUTED: the high-writer decline decomposed — registry guard held 0.7-7ms per commit (~80% of the decline); leaf-boundary conflicts ~20%; merge ladder found production-dormant
+
+- Three-receipt attribution of why F declines 150k→52k wps from 8→128
+  writers (all diagnostic-host; within-run gates + the SHAPE are the
+  evidence):
+  1. **Separate-tables split** (`septables-split-20260728T1605Z`): with
+     page conflicts impossible, F still declines 202k→71k (8→64w) —
+     ~80% of the decline is registry-side; the shared-leaf class costs
+     the residual ~20% (and separate-table 32w hits **12.37x over C**).
+  2. **Registry hold/wait counters**
+     (`registry-hold-decomposition-20260728T1620Z`, RusticBasin's core
+     shim 57dffe1a + mvcc counters c53aaf93 + bench dump): mean guard
+     hold **713-2,340µs at 64w, 2.4-6.9ms at 128w** (max single hold
+     60ms) — milliseconds of global mutex per commit because pager I/O +
+     validation run inside the guard; waits stay µs-scale at 64w
+     (convoying shows up as txn latency, not lock spin).
+  3. **Page 45 identified** (job-tmp replica + dbstat): a stride-boundary
+     bench LEAF — numerically-disjoint 1M strides are ADJACENT in key
+     order, so one leaf spans every junction, and the rightmost leaf
+     absorbs every above-max writer on a young tree. Leaf-level false
+     sharing from distinct-key inserts — the merge ladder's designed case.
+- **Merge-ladder wiring audit** (bd-p4dcv): the ladder is
+  production-dormant IN FULL — only abort/retry executes; intent log never
+  populated; `write_merge` is an SSI-skip switch whose documented OFF
+  doesn't parse; two latent bugs in the dormant path; README corrected to
+  say so (Current-Implementation-Status convention). Statement-rebase
+  design at the audited begin_concurrent.rs:2826 hook = bd-3d5y3.
+- Fix ladder now numbers-backed and beaded: bd-i0tn6 (write outside the
+  lock — PRIMARY, design review requested from RusticBasin + DustyOrchid),
+  bd-6a8a5 (group commit), bd-15hxt (SSI history windowing), bd-3d5y3
+  (rebase, secondary ~20%). Non-behavioral platform groundwork landed:
+  VendorCachePadded + layout tests (Apple-vendor-scoped, no call-site
+  flips) and FC slot-full telemetry (bb705aad).
+
 ## 2026-07-28 - MEASURED: COMPLETE 1-128 writer matrix (f1ab7663) — FSQLITE_FASTER at every gated arm incl. 64w 4.259x and 128w 4.082x, zero failed writes; hot page 45 identified; bd-5zeai controls confirm fast-path-presence 20.1x dominant
 
 - Follow-up to the truncated first attempt (below). With the bd-caa6u
