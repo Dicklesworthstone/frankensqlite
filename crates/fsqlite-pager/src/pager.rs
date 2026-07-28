@@ -2815,6 +2815,57 @@ fn load_freelist_from_committed_state<F: VfsFile>(
     Ok(normalize_freelist(&out, db_size))
 }
 
+fn preflight_distinct_write_set_projection<
+    S: std::hash::BuildHasher,
+    I: IntoIterator<Item = PageNumber>,
+>(
+    write_set: &HashMap<PageNumber, StagedPage, S>,
+    page_limit: Option<usize>,
+    page_size: usize,
+    write_set_telemetry: &WriteSetTelemetry,
+    projected_pages: I,
+) -> Result<()> {
+    let Some(page_limit) = page_limit else {
+        return Ok(());
+    };
+
+    let current_dirty_pages = write_set.len();
+    let mut projected_has_page_one = write_set.contains_key(&PageNumber::ONE);
+    let mut projected_has_non_page_one = current_dirty_pages > usize::from(projected_has_page_one);
+    let mut distinct_new_pages = HashSet::new();
+
+    for page_no in projected_pages {
+        projected_has_page_one |= page_no == PageNumber::ONE;
+        projected_has_non_page_one |= page_no != PageNumber::ONE;
+        if !write_set.contains_key(&page_no) {
+            distinct_new_pages.insert(page_no);
+        }
+    }
+
+    // A durable rollback-journal commit must eventually stage Page 1 for
+    // every non-Page-1 write. Count that mandatory slot even when the caller
+    // is preflighting only the other pages in a larger projection.
+    let mandatory_page_one_reservation =
+        usize::from(projected_has_non_page_one && !projected_has_page_one);
+    let attempted_dirty_pages = current_dirty_pages
+        .saturating_add(distinct_new_pages.len())
+        .saturating_add(mandatory_page_one_reservation);
+    if attempted_dirty_pages <= page_limit {
+        return Ok(());
+    }
+
+    write_set_telemetry.refuse();
+    Err(FrankenError::WriteSetLimitExceeded {
+        page_size,
+        page_limit,
+        byte_limit: page_limit.saturating_mul(page_size),
+        current_dirty_pages,
+        current_dirty_bytes: current_dirty_pages.saturating_mul(page_size),
+        attempted_dirty_pages,
+        attempted_dirty_bytes: attempted_dirty_pages.saturating_mul(page_size),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     cx: &Cx,
@@ -2824,6 +2875,8 @@ fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     pool: &PageBufPool,
     write_set: &mut HashMap<PageNumber, StagedPage, S>,
     write_pages_sorted: &mut Vec<PageNumber>,
+    schema_only_write_set_page_limit: Option<usize>,
+    write_set_telemetry: &WriteSetTelemetry,
     committed_db_size: u32,
     pending_free_pages: &[PageNumber],
 ) -> Result<()> {
@@ -2862,24 +2915,45 @@ fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     let total_free = durable_freelist.len() as u32;
 
     let (first_trunk, trunk_pages) = if durable_freelist.is_empty() {
-        (0u32, Vec::<u32>::new())
+        (0_u32, Vec::<PageNumber>::new())
     } else {
         let max_leaf_entries = (ps / 4).saturating_sub(2).max(1);
         let trunk_count = durable_freelist.len().div_ceil(max_leaf_entries + 1);
-        let trunks: Vec<u32> = durable_freelist
+        let trunks = durable_freelist
             .iter()
             .take(trunk_count)
-            .map(|p| p.get())
-            .collect();
-        (trunks[0], trunks)
+            .copied()
+            .collect::<Vec<_>>();
+        (trunks[0].get(), trunks)
     };
 
+    // Freelist projection synthesizes the trunk pages and Page 1 only at
+    // commit time. Prove the exact distinct union against the same finite
+    // write-set ceiling before acquiring a single page buffer or changing the
+    // live write set. Candidate de-duplication also handles trunk pages that
+    // are already staged by the transaction.
+    preflight_distinct_write_set_projection(
+        write_set,
+        schema_only_write_set_page_limit,
+        pool.page_size(),
+        write_set_telemetry,
+        trunk_pages
+            .iter()
+            .copied()
+            .chain(std::iter::once(PageNumber::ONE)),
+    )?;
+
+    // Build every fallible trunk buffer off to the side. Only after all
+    // allocations and the fallible Page-1 detach/read have succeeded do we
+    // publish the projection into the transaction write set. This keeps a
+    // capacity failure retryable without a partial trunk chain.
+    let mut staged_trunk_pages = Vec::with_capacity(trunk_pages.len());
     if !trunk_pages.is_empty() {
         let mut leaf_index = trunk_pages.len();
         let max_leaf_entries = (ps / 4).saturating_sub(2).max(1);
 
         for (idx, trunk_pg) in trunk_pages.iter().enumerate() {
-            let next = trunk_pages.get(idx + 1).copied().unwrap_or(0);
+            let next = trunk_pages.get(idx + 1).map_or(0, |page| page.get());
             let remaining = durable_freelist.len().saturating_sub(leaf_index);
             let take = remaining.min(max_leaf_entries);
 
@@ -2898,9 +2972,7 @@ fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
             }
             leaf_index += take;
 
-            if let Some(pg) = PageNumber::new(*trunk_pg) {
-                insert_staged_page(write_set, write_pages_sorted, pg, StagedPage::from_buf(buf));
-            }
+            staged_trunk_pages.push((*trunk_pg, StagedPage::from_buf(buf)));
         }
     }
 
@@ -2910,6 +2982,10 @@ fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
         let page1_bytes = page1.as_page_bytes_mut();
         page1_bytes[32..36].copy_from_slice(&first_trunk.to_be_bytes());
         page1_bytes[36..40].copy_from_slice(&total_free.to_be_bytes());
+    }
+
+    for (page_no, staged) in staged_trunk_pages {
+        insert_staged_page(write_set, write_pages_sorted, page_no, staged);
     }
     insert_staged_page(write_set, write_pages_sorted, PageNumber::ONE, page1);
 
@@ -10002,53 +10078,18 @@ impl<V: Vfs> SimpleTransaction<V> {
     }
 
     fn admit_distinct_write_set_page(&self, page_no: PageNumber) -> Result<()> {
-        let Some(page_limit) = self.schema_only_write_set_page_limit else {
-            return Ok(());
-        };
-        if self.write_set.contains_key(&page_no) {
-            return Ok(());
-        }
-        let current_dirty_pages = self.write_set.len();
-        // Every durable rollback-journal commit stages Page 1 to publish its
-        // change counter and page count. Reserve that mandatory slot as soon
-        // as the first non-Page-1 write is admitted, rather than accepting a
-        // statement that can only fail later on every COMMIT retry.
-        let mandatory_page_one_reservation = usize::from(
-            page_no != PageNumber::ONE && !self.write_set.contains_key(&PageNumber::ONE),
-        );
-        let attempted_dirty_pages = current_dirty_pages
-            .saturating_add(1)
-            .saturating_add(mandatory_page_one_reservation);
-        if attempted_dirty_pages <= page_limit {
-            return Ok(());
-        }
-        let page_size = self.pool.page_size();
-        self.write_set_telemetry.refuse();
-        Err(FrankenError::WriteSetLimitExceeded {
-            page_size,
-            page_limit,
-            byte_limit: page_limit.saturating_mul(page_size),
-            current_dirty_pages,
-            current_dirty_bytes: current_dirty_pages.saturating_mul(page_size),
-            attempted_dirty_pages,
-            attempted_dirty_bytes: attempted_dirty_pages.saturating_mul(page_size),
-        })
+        preflight_distinct_write_set_projection(
+            &self.write_set,
+            self.schema_only_write_set_page_limit,
+            self.pool.page_size(),
+            &self.write_set_telemetry,
+            std::iter::once(page_no),
+        )
     }
 
     fn observe_write_set(&self) {
         self.write_set_telemetry
             .observe(self.write_set.len(), self.pool.page_size());
-    }
-
-    fn refuse_bounded_write_set_freelist_projection(&self, freelist_dirty: bool) -> Result<()> {
-        if self.schema_only_write_set_page_limit.is_some() && freelist_dirty {
-            return Err(FrankenError::NotImplemented(
-                "bounded schema-only builder transactions require an insert-only fresh target; \
-                 commit-time freelist projection is unsupported"
-                    .to_owned(),
-            ));
-        }
-        Ok(())
     }
 
     /// Finish a locally failed rollback-journal commit through the same
@@ -10737,29 +10778,13 @@ impl<V: Vfs> SimpleTransaction<V> {
         // length and could therefore accept an aggregate projection above the
         // configured schema-builder cap. Prove the complete distinct-page
         // projection before materializing any page so refusal is atomic.
-        if let Some(page_limit) = self.schema_only_write_set_page_limit {
-            let current_dirty_pages = self.write_set.len();
-            let projected_has_page_one = self.write_set.contains_key(&PageNumber::ONE)
-                || overlay_page_nos.contains(&PageNumber::ONE);
-            let mandatory_page_one_reservation =
-                usize::from(!projected_has_page_one && !overlay_page_nos.is_empty());
-            let attempted_dirty_pages = current_dirty_pages
-                .saturating_add(overlay_page_nos.len())
-                .saturating_add(mandatory_page_one_reservation);
-            if attempted_dirty_pages > page_limit {
-                let page_size = self.pool.page_size();
-                self.write_set_telemetry.refuse();
-                return Err(FrankenError::WriteSetLimitExceeded {
-                    page_size,
-                    page_limit,
-                    byte_limit: page_limit.saturating_mul(page_size),
-                    current_dirty_pages,
-                    current_dirty_bytes: current_dirty_pages.saturating_mul(page_size),
-                    attempted_dirty_pages,
-                    attempted_dirty_bytes: attempted_dirty_pages.saturating_mul(page_size),
-                });
-            }
-        }
+        preflight_distinct_write_set_projection(
+            &self.write_set,
+            self.schema_only_write_set_page_limit,
+            self.pool.page_size(),
+            &self.write_set_telemetry,
+            overlay_page_nos.iter().copied(),
+        )?;
 
         let overlay_pages = {
             let txn_read_cache = self.txn_read_cache.borrow();
@@ -13251,11 +13276,6 @@ where
             let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
             pending_freed = std::mem::take(&mut self.freed_pages);
             self.freed_page_bounds = None;
-            if let Err(e) = self.refuse_bounded_write_set_freelist_projection(freelist_dirty) {
-                self.restore_pending_freed_pages(pending_freed);
-                return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
-                return Err(e);
-            }
             if freelist_dirty {
                 if let Err(e) = serialize_freelist_to_write_set(
                     cx,
@@ -13265,6 +13285,8 @@ where
                     &self.pool,
                     &mut self.write_set,
                     &mut self.write_pages_sorted,
+                    self.schema_only_write_set_page_limit,
+                    &self.write_set_telemetry,
                     committed_db_size,
                     &pending_free_pages,
                 ) {
@@ -13272,6 +13294,7 @@ where
                     return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                     return Err(e);
                 }
+                self.observe_write_set();
             }
 
             // D1-CRITICAL Fix: In WAL mode, page 1 must be written to WAL not
@@ -13692,11 +13715,6 @@ where
             // Match the normal commit path: capture semantic Page 1 intent
             // before freelist serialization can inject bookkeeping Page 1.
             let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
-            if let Err(e) = self.refuse_bounded_write_set_freelist_projection(freelist_dirty) {
-                self.restore_pending_freed_pages(pending_freed);
-                return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
-                return Err(e);
-            }
             if freelist_dirty {
                 if let Err(e) = serialize_freelist_to_write_set(
                     cx,
@@ -13706,6 +13724,8 @@ where
                     &self.pool,
                     &mut self.write_set,
                     &mut self.write_pages_sorted,
+                    self.schema_only_write_set_page_limit,
+                    &self.write_set_telemetry,
                     committed_db_size,
                     &pending_free_pages,
                 ) {
@@ -13713,6 +13733,7 @@ where
                     return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                     return Err(e);
                 }
+                self.observe_write_set();
             }
 
             // D1-CRITICAL Fix: In WAL mode, page 1 must be written to WAL not
@@ -17469,6 +17490,356 @@ mod tests {
         assert_eq!(stats.current_dirty_pages, 0);
         assert_eq!(stats.dirty_pages_high_water, 0);
         assert_eq!(stats.cap_refusals, 1);
+    }
+
+    #[test]
+    fn hfdt_0117_projection_preflight_counts_exact_union_and_page_one_reservation() {
+        let page_size = PageSize::DEFAULT.as_usize();
+        let page_two = PageNumber::new(2).unwrap();
+        let page_three = PageNumber::new(3).unwrap();
+        let empty_write_set = HashMap::<PageNumber, StagedPage>::new();
+        let telemetry = WriteSetTelemetry::default();
+
+        telemetry.begin(Some(1), page_size);
+        preflight_distinct_write_set_projection(
+            &empty_write_set,
+            Some(1),
+            page_size,
+            &telemetry,
+            [PageNumber::ONE],
+        )
+        .expect("a Page-1-only projection must fit an exact one-page ceiling");
+        assert_eq!(
+            telemetry.snapshot().unwrap().cap_refusals,
+            0,
+            "the exact Page-1 boundary must not record a refusal"
+        );
+
+        telemetry.begin(Some(2), page_size);
+        preflight_distinct_write_set_projection(
+            &empty_write_set,
+            Some(2),
+            page_size,
+            &telemetry,
+            [page_two],
+        )
+        .expect("a trunk-only candidate plus mandatory Page 1 must fit two pages");
+        telemetry.begin(Some(1), page_size);
+        let trunk_only_error = preflight_distinct_write_set_projection(
+            &empty_write_set,
+            Some(1),
+            page_size,
+            &telemetry,
+            [page_two],
+        )
+        .expect_err("a trunk-only candidate must reserve Page 1 before admission");
+        assert!(
+            matches!(
+                trunk_only_error,
+                FrankenError::WriteSetLimitExceeded {
+                    page_limit: 1,
+                    current_dirty_pages: 0,
+                    attempted_dirty_pages: 2,
+                    ..
+                }
+            ),
+            "trunk-only N+1 refusal must report the exact two-page projection, got \
+             {trunk_only_error}"
+        );
+
+        let mut staged_write_set = HashMap::new();
+        staged_write_set.insert(
+            page_two,
+            StagedPage::from_page_data(PageData::from_vec(sample_page(0xA2))),
+        );
+        let duplicate_union = [page_two, page_two, PageNumber::ONE, page_three, page_three];
+
+        telemetry.begin(Some(3), page_size);
+        preflight_distinct_write_set_projection(
+            &staged_write_set,
+            Some(3),
+            page_size,
+            &telemetry,
+            duplicate_union,
+        )
+        .expect("the exact three-page union at N must ignore duplicate candidates");
+
+        telemetry.begin(Some(2), page_size);
+        let union_error = preflight_distinct_write_set_projection(
+            &staged_write_set,
+            Some(2),
+            page_size,
+            &telemetry,
+            duplicate_union,
+        )
+        .expect_err("the same exact union must refuse at N-1");
+        assert!(
+            matches!(
+                union_error,
+                FrankenError::WriteSetLimitExceeded {
+                    page_limit: 2,
+                    current_dirty_pages: 1,
+                    attempted_dirty_pages: 3,
+                    ..
+                }
+            ),
+            "union/dedup refusal must count one staged page plus two distinct new pages, got \
+             {union_error}"
+        );
+        let refused = telemetry.snapshot().unwrap();
+        assert_eq!(refused.current_dirty_pages, 0);
+        assert_eq!(refused.dirty_pages_high_water, 0);
+        assert_eq!(refused.cap_refusals, 1);
+    }
+
+    #[test]
+    fn hfdt_0117_freelist_projection_allocation_failure_is_atomic_and_retryable() {
+        const DURABLE_FREELIST_PAGES: u32 = 1_024;
+
+        let (pager, _) = test_pager();
+        pager
+            .set_schema_only_write_set_page_limit(Some(3))
+            .expect("configure Page 1 plus two projected trunk pages");
+        let cx = Cx::new();
+        let mut transaction = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        transaction.pool = PageBufPool::new(PageSize::DEFAULT, 1);
+        insert_staged_page(
+            &mut transaction.write_set,
+            &mut transaction.write_pages_sorted,
+            PageNumber::ONE,
+            StagedPage::from_page_data(PageData::from_vec(sample_page(0x51))),
+        );
+        transaction.observe_write_set();
+
+        let page_one_before = transaction
+            .write_set
+            .get(&PageNumber::ONE)
+            .unwrap()
+            .as_page_bytes()
+            .to_vec();
+        let one_buffer_pool = transaction.pool.clone();
+        let committed_db_size = DURABLE_FREELIST_PAGES + 1;
+        {
+            let mut inner = transaction.inner.lock().unwrap();
+            inner.db_size = committed_db_size;
+            inner.next_page = committed_db_size + 1;
+            inner.freelist = (2..=committed_db_size)
+                .rev()
+                .filter_map(PageNumber::new)
+                .collect();
+
+            let error = serialize_freelist_to_write_set(
+                &cx,
+                &mut inner,
+                &transaction.cache,
+                &transaction.wal_backend,
+                &transaction.pool,
+                &mut transaction.write_set,
+                &mut transaction.write_pages_sorted,
+                transaction.schema_only_write_set_page_limit,
+                &transaction.write_set_telemetry,
+                committed_db_size,
+                &[],
+            )
+            .expect_err("a one-buffer pool cannot stage two freelist trunks");
+            assert!(
+                matches!(error, FrankenError::PageBufferCapacityExhausted { .. }),
+                "expected a physical pool refusal after successful bounded preflight, got {error}"
+            );
+        }
+
+        assert_eq!(
+            transaction.write_pages_sorted,
+            vec![PageNumber::ONE],
+            "a mid-projection allocation failure must not publish a partial trunk chain"
+        );
+        assert_eq!(
+            transaction
+                .write_set
+                .get(&PageNumber::ONE)
+                .unwrap()
+                .as_page_bytes(),
+            page_one_before,
+            "a failed projection must preserve the staged Page-1 bytes"
+        );
+        assert_eq!(one_buffer_pool.total_buffers(), 1);
+        assert_eq!(
+            one_buffer_pool.available(),
+            1,
+            "the staged scratch trunk must return to the bounded pool on failure"
+        );
+
+        {
+            let mut inner = transaction.inner.lock().unwrap();
+            let retry_error = serialize_freelist_to_write_set(
+                &cx,
+                &mut inner,
+                &transaction.cache,
+                &transaction.wal_backend,
+                &transaction.pool,
+                &mut transaction.write_set,
+                &mut transaction.write_pages_sorted,
+                transaction.schema_only_write_set_page_limit,
+                &transaction.write_set_telemetry,
+                committed_db_size,
+                &[],
+            )
+            .expect_err("retry under the unchanged physical ceiling must fail identically");
+            assert!(matches!(
+                retry_error,
+                FrankenError::PageBufferCapacityExhausted { .. }
+            ));
+        }
+        assert_eq!(one_buffer_pool.total_buffers(), 1);
+        assert_eq!(
+            one_buffer_pool.available(),
+            1,
+            "repeated projection failures must not leak a page buffer"
+        );
+        assert_eq!(transaction.write_pages_sorted, vec![PageNumber::ONE]);
+
+        transaction.pool = PageBufPool::new(PageSize::DEFAULT, 2);
+        {
+            let mut inner = transaction.inner.lock().unwrap();
+            serialize_freelist_to_write_set(
+                &cx,
+                &mut inner,
+                &transaction.cache,
+                &transaction.wal_backend,
+                &transaction.pool,
+                &mut transaction.write_set,
+                &mut transaction.write_pages_sorted,
+                transaction.schema_only_write_set_page_limit,
+                &transaction.write_set_telemetry,
+                committed_db_size,
+                &[],
+            )
+            .expect("the same projection must succeed once both bounded trunk buffers exist");
+        }
+        transaction.observe_write_set();
+        assert_eq!(transaction.write_set.len(), 3);
+        assert_eq!(
+            transaction.write_pages_sorted,
+            vec![
+                PageNumber::ONE,
+                PageNumber::new(DURABLE_FREELIST_PAGES).unwrap(),
+                PageNumber::new(DURABLE_FREELIST_PAGES + 1).unwrap(),
+            ]
+        );
+        let stats = transaction.write_set_telemetry.snapshot().unwrap();
+        assert_eq!(stats.current_dirty_pages, 3);
+        assert_eq!(stats.dirty_pages_high_water, 3);
+        assert_eq!(stats.cap_refusals, 0);
+
+        transaction
+            .rollback(&cx)
+            .expect("successful retry must remain rollback-safe");
+    }
+
+    #[test]
+    fn hfdt_0117_bounded_freelist_commit_refusal_preserves_state_for_logical_retry() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let page_size = PageSize::DEFAULT.as_usize();
+        let seeded_page = {
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page = seed.allocate_page(&cx).unwrap();
+            seed.write_page(&cx, page, &vec![0xD4; page_size]).unwrap();
+            seed.commit(&cx).unwrap();
+            page
+        };
+
+        pager
+            .set_schema_only_write_set_page_limit(Some(1))
+            .expect("configure a ceiling below Page 1 plus one freelist trunk");
+        let committed_freelist_before = pager.inner.lock().unwrap().freelist.clone();
+        let mut bounded = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        bounded.free_page(&cx, seeded_page).unwrap();
+        let freed_pages_before = bounded.freed_pages.clone();
+        let pool_total_before = bounded.pool.total_buffers();
+        let pool_available_before = bounded.pool.available();
+
+        for expected_refusals in 1..=2 {
+            let error = bounded
+                .commit(&cx)
+                .expect_err("the exact two-page freelist projection must refuse at one page");
+            assert!(
+                matches!(
+                    error,
+                    FrankenError::WriteSetLimitExceeded {
+                        page_limit: 1,
+                        current_dirty_pages: 0,
+                        attempted_dirty_pages: 2,
+                        ..
+                    }
+                ),
+                "bounded freelist refusal must identify Page 1 plus one trunk, got {error}"
+            );
+            assert!(bounded.write_set.is_empty());
+            assert!(bounded.write_pages_sorted.is_empty());
+            assert_eq!(bounded.freed_pages, freed_pages_before);
+            assert_eq!(
+                pager.inner.lock().unwrap().freelist,
+                committed_freelist_before,
+                "a refused projection must not publish freed pages into committed state"
+            );
+            assert_eq!(bounded.pool.total_buffers(), pool_total_before);
+            assert_eq!(
+                bounded.pool.available(),
+                pool_available_before,
+                "cap preflight must refuse before acquiring a page buffer"
+            );
+            let stats = pager.write_set_stats().unwrap();
+            assert_eq!(stats.current_dirty_pages, 0);
+            assert_eq!(stats.dirty_pages_high_water, 0);
+            assert_eq!(stats.cap_refusals, expected_refusals);
+        }
+
+        bounded
+            .rollback(&cx)
+            .expect("the repeatedly refused transaction must remain rollback-safe");
+        let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reader.get_page(&cx, seeded_page).unwrap().as_bytes()[0],
+            0xD4,
+            "rollback after bounded refusal must preserve the committed page image"
+        );
+        reader.rollback(&cx).unwrap();
+
+        pager
+            .set_schema_only_write_set_page_limit(Some(2))
+            .expect("raise the finite ceiling to the exact projected union");
+        let mut exact_boundary = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        exact_boundary.free_page(&cx, seeded_page).unwrap();
+        exact_boundary
+            .commit(&cx)
+            .expect("the logical retry must commit at the exact two-page boundary");
+        assert_eq!(
+            pager.inner.lock().unwrap().freelist,
+            vec![seeded_page],
+            "the successful retry must durably publish the freed page"
+        );
+        let trunk_projection_stats = pager.write_set_stats().unwrap();
+        assert_eq!(trunk_projection_stats.current_dirty_pages, 0);
+        assert_eq!(trunk_projection_stats.dirty_pages_high_water, 2);
+        assert_eq!(trunk_projection_stats.cap_refusals, 0);
+
+        // Consuming the only freelist page projects no trunk pages at commit:
+        // the live data page is already staged, and commit adds Page 1 only.
+        let mut page_one_only = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let reused = page_one_only.allocate_page(&cx).unwrap();
+        assert_eq!(reused, seeded_page);
+        page_one_only
+            .write_page(&cx, reused, &vec![0xE5; page_size])
+            .unwrap();
+        page_one_only
+            .commit(&cx)
+            .expect("one staged data page plus a Page-1-only projection must fit exactly");
+        assert!(pager.inner.lock().unwrap().freelist.is_empty());
+        let page_one_projection_stats = pager.write_set_stats().unwrap();
+        assert_eq!(page_one_projection_stats.current_dirty_pages, 0);
+        assert_eq!(page_one_projection_stats.dirty_pages_high_water, 2);
+        assert_eq!(page_one_projection_stats.cap_refusals, 0);
     }
 
     #[test]
@@ -27984,6 +28355,8 @@ mod tests {
                 &txn.pool,
                 &mut txn.write_set,
                 &mut txn.write_pages_sorted,
+                txn.schema_only_write_set_page_limit,
+                &txn.write_set_telemetry,
                 committed_db_size,
                 &pending_freed,
             )
@@ -28046,6 +28419,8 @@ mod tests {
                 &txn.pool,
                 &mut txn.write_set,
                 &mut txn.write_pages_sorted,
+                txn.schema_only_write_set_page_limit,
+                &txn.write_set_telemetry,
                 committed_db_size,
                 &pending_freed,
             )
