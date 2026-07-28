@@ -419,8 +419,8 @@ pub use cache_aligned::{
     CACHE_LINE_BYTES, CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, CacheAligned, RcriEntry,
     RcriOverflowError, RecentlyCommittedReadersIndex, SLOT_PAYLOAD_MASK, SLOT_TAG_MASK,
     SLOT_TAG_SHIFT, SharedTxnSlot, SlotAcquireError, TAG_CLAIMING, TAG_CLEANING, TxnSlotArray,
-    decode_payload, decode_tag, encode_claiming, encode_cleaning, is_sentinel, rcri_bloom,
-    slot_mode, slot_state,
+    VENDOR_CACHE_LINE_BYTES, VendorCachePadded, decode_payload, decode_tag, encode_claiming,
+    encode_cleaning, is_sentinel, rcri_bloom, slot_mode, slot_state,
 };
 pub use cell_delta_wal::{
     CELL_DELTA_CHECKSUM_SIZE, CELL_DELTA_FRAME_MARKER, CELL_DELTA_HEADER_SIZE,
@@ -481,7 +481,10 @@ pub use flat_combining::{
     FcHandle, FlatCombiner, FlatCombiningMetrics, MAX_FC_SHARDS, MAX_FC_THREADS, OP_ADD, OP_READ,
     ShardedFcHandle, ShardedFlatCombiner, flat_combining_metrics, reset_flat_combining_metrics,
 };
-pub use flat_combining_page_locks::{FcPageLockShard, MAX_FC_SLOTS};
+pub use flat_combining_page_locks::{
+    FcPageLockShard, FcSlotFullMetrics, MAX_FC_SLOTS, fc_slot_full_metrics,
+    reset_fc_slot_full_metrics,
+};
 pub use gc::{
     GC_F_MAX_HZ, GC_F_MIN_HZ, GC_PAGES_BUDGET, GC_TARGET_CHAIN_LENGTH, GC_VERSIONS_BUDGET,
     GcScheduler, GcTickResult, GcTodo, PruneResult, gc_tick, prune_page_chain,
