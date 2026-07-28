@@ -91,7 +91,23 @@ const ROWID_BASE_STRIDE: i64 = 1_000_000;
 const MAX_RETRIES: usize = 512;
 const RETRY_SLEEP_MS: u64 = 1;
 const MAX_RETRY_SLEEP_MS: u64 = 25;
+/// Base wall-clock retry budget for one whole-transaction attempt loop.
+/// Scaled up with offered work by [`fsqlite_retry_timeout`] — the fixed 5s
+/// was exceeded by queueing alone at 64 writers x 1000-row txns (bd-caa6u).
 const FSQLITE_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Pessimistic whole-run contention floor used to scale the retry budget:
+/// measured floors on the first 1-32 writer receipt were F >= 95k wps and
+/// C ~13k wps, so 10k wps bounds even a badly convoyed run from below.
+const RETRY_BUDGET_FLOOR_WPS: u64 = 10_000;
+
+/// Wall-clock retry budget for one transaction attempt loop, scaled with the
+/// total offered work so a txn that legitimately waits behind a 64/128-writer
+/// convoy tail is not misreported as exhausted (bd-caa6u).
+fn fsqlite_retry_timeout(threads: usize, rows_per_thread: usize) -> Duration {
+    let scaled_secs =
+        (threads as u64).saturating_mul(rows_per_thread as u64) / RETRY_BUDGET_FLOOR_WPS;
+    FSQLITE_RETRY_TIMEOUT + Duration::from_secs(scaled_secs)
+}
 const SHARED_INSERT_SQL: &str = "INSERT INTO bench (id, payload) VALUES (?1, ?2)";
 const STARTUP_COORDINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const PASS_OVER_PASS_SCHEMA_V1: &str = "fsqlite-e2e.mt_mvcc_bench.pass_over_pass.v1";
@@ -147,6 +163,9 @@ struct Options {
     history_json: PathBuf,
     apples_to_apples: bool,
     separate_tables: bool,
+    /// Fixed per-transaction retry budget override in seconds; when unset,
+    /// the budget scales with threads x rows (bd-caa6u).
+    retry_timeout_secs: Option<u64>,
 }
 
 impl Default for Options {
@@ -160,6 +179,7 @@ impl Default for Options {
             history_json: PathBuf::from(DEFAULT_HISTORY_JSON),
             apples_to_apples: false,
             separate_tables: false,
+            retry_timeout_secs: None,
         }
     }
 }
@@ -168,7 +188,7 @@ fn print_usage_and_exit(code: i32) -> ! {
     eprintln!(
         "usage: mt-mvcc-bench [--rows-per-thread=N] [--threads=N,N,...] [--iters=N] \\\n\
          [--json-output=PATH] [--summary-md=PATH] [--history-json=PATH] [--apples-to-apples] \\\n\
-         [--separate-tables]\n\
+         [--separate-tables] [--retry-timeout-secs=N]\n\
          \n\
          defaults: --rows-per-thread={DEFAULT_ROWS_PER_THREAD} \
          --threads=1,2,4,8,16 --iters={DEFAULT_ITERS}\n\
@@ -224,6 +244,11 @@ fn parse_args() -> Options {
                 opts.rows_per_thread = val.parse().unwrap_or_else(|_| {
                     print_usage_error(format!("invalid --rows-per-thread: {val}"))
                 });
+            }
+            "--retry-timeout-secs" => {
+                opts.retry_timeout_secs = Some(val.parse().unwrap_or_else(|_| {
+                    print_usage_error(format!("invalid --retry-timeout-secs: {val}"))
+                }));
             }
             "--threads" => {
                 opts.threads = val
@@ -436,13 +461,15 @@ struct HistoricalMtMvccBenchReport {
 struct FsqliteRetryBudget {
     attempts: usize,
     started: Instant,
+    timeout: Duration,
 }
 
 impl FsqliteRetryBudget {
-    fn new() -> Self {
+    fn new(timeout: Duration) -> Self {
         Self {
             attempts: 0,
             started: Instant::now(),
+            timeout,
         }
     }
 
@@ -451,7 +478,7 @@ impl FsqliteRetryBudget {
     }
 
     fn next_wait(&mut self, tid: usize) -> Option<Duration> {
-        if self.attempts >= MAX_RETRIES || self.started.elapsed() >= FSQLITE_RETRY_TIMEOUT {
+        if self.attempts >= MAX_RETRIES || self.started.elapsed() >= self.timeout {
             return None;
         }
         self.attempts += 1;
@@ -1007,6 +1034,7 @@ fn run_fsqlite(
     threads: usize,
     rows_per_thread: usize,
     separate_tables: bool,
+    retry_timeout: Duration,
 ) -> Result<RunResult, String> {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     let path = tmp
@@ -1108,7 +1136,7 @@ fn run_fsqlite(
             } else {
                 "BEGIN"
             };
-            let mut retry_budget = FsqliteRetryBudget::new();
+            let mut retry_budget = FsqliteRetryBudget::new(retry_timeout);
             let mut failed = 0usize;
             loop {
                 let outcome = fsqlite_e2e::block_on(async {
@@ -1170,20 +1198,29 @@ fn run_fsqlite(
                         if let Some(wait) = retry_budget.next_wait(tid) {
                             thread::sleep(wait);
                         } else {
-                            return Err(match what {
-                                TxnRetry::Begin => format!(
-                                    "[fsqlite t{tid}] BEGIN failed after {} retries: {error}",
-                                    retry_budget.attempts()
-                                ),
-                                TxnRetry::Insert(id) => format!(
-                                    "[fsqlite t{tid}] INSERT {id} exhausted retry budget after {} retries: {error}",
-                                    retry_budget.attempts()
-                                ),
-                                TxnRetry::Commit => format!(
-                                    "[fsqlite t{tid}] COMMIT exhausted retry budget after {} retries: {error}",
-                                    retry_budget.attempts()
-                                ),
-                            });
+                            // Budget exhaustion is a MEASUREMENT-ENVELOPE
+                            // event, not an engine correctness failure
+                            // (bd-caa6u): mirror the C arm — count the whole
+                            // transaction's rows as failed (which flags the
+                            // result row via fsqlite_failed) and keep the
+                            // run alive instead of killing every thread's
+                            // data. The stderr line keeps the distinction
+                            // auditable.
+                            let stage = match what {
+                                TxnRetry::Begin => "BEGIN".to_owned(),
+                                TxnRetry::Insert(id) => format!("INSERT {id}"),
+                                TxnRetry::Commit => "COMMIT".to_owned(),
+                            };
+                            eprintln!(
+                                "[fsqlite t{tid}] {stage} exhausted retry budget \
+                                 ({:?} wall clock, {} attempts): {error} — counting \
+                                 {rows_per_thread} rows failed and continuing",
+                                retry_budget.timeout,
+                                retry_budget.attempts()
+                            );
+                            let _ = fsqlite_e2e::block_on(conn.execute("ROLLBACK"));
+                            failed += rows_per_thread;
+                            break;
                         }
                     }
                 }
@@ -1477,7 +1514,13 @@ fn run() -> Result<(), String> {
             || Ok(run_rusqlite(n, opts.rows_per_thread, opts.separate_tables)),
             || Ok(run_rusqlite(n, opts.rows_per_thread, opts.separate_tables)),
             || Ok(run_rusqlite(n, opts.rows_per_thread, opts.separate_tables)),
-            || run_fsqlite(n, opts.rows_per_thread, opts.separate_tables),
+            || {
+                let retry_timeout = opts.retry_timeout_secs.map_or_else(
+                    || fsqlite_retry_timeout(n, opts.rows_per_thread),
+                    Duration::from_secs,
+                );
+                run_fsqlite(n, opts.rows_per_thread, opts.separate_tables, retry_timeout)
+            },
         )?;
         let report = build_thread_report(n, &null, &claim);
         let contract = report

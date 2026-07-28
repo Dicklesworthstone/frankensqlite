@@ -148,5 +148,9 @@ name = "mt-mvcc-bench"
 path = "src/bin/mt_mvcc_bench.rs"
 
 [[bin]]
+name = "param-tax-controls"
+path = "src/bin/param_tax_controls.rs"
+
+[[bin]]
 name = "mt-oltp-bench"
 path = "src/bin/mt_oltp_bench.rs"

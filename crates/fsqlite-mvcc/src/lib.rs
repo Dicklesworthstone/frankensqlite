@@ -397,10 +397,11 @@ mod metadata_publication_contract_tests {
 
 pub use begin_concurrent::{
     ConcurrentHandle, ConcurrentPageState, ConcurrentRegistry, ConcurrentSavepoint, FcwResult,
-    MAX_CONCURRENT_WRITERS, PreparedConcurrentCommit, SharedConcurrentHandle, SsiResult,
-    concurrent_abort, concurrent_clear_page_state, concurrent_commit, concurrent_commit_read_only,
-    concurrent_commit_with_ssi, concurrent_free_page, concurrent_has_page_state,
-    concurrent_is_metadata_exempt, concurrent_mark_metadata_exempt, concurrent_page_is_freed,
+    MAX_CONCURRENT_WRITERS, PreparedConcurrentCommit, RegistryCommitLockMetrics,
+    SharedConcurrentHandle, SsiResult, concurrent_abort, concurrent_clear_page_state,
+    concurrent_commit, concurrent_commit_read_only, concurrent_commit_with_ssi,
+    concurrent_free_page, concurrent_has_page_state, concurrent_is_metadata_exempt,
+    concurrent_mark_metadata_exempt, concurrent_page_is_freed,
     concurrent_page_is_synthetic_conflict_only, concurrent_page_read_state,
     concurrent_page_read_status, concurrent_page_state, concurrent_prepare_write_page,
     concurrent_read_page, concurrent_record_metadata_read, concurrent_restore_page_state,
@@ -409,6 +410,8 @@ pub use begin_concurrent::{
     concurrent_write_metadata_page, concurrent_write_page,
     finalize_prepared_concurrent_commit_with_ssi, is_concurrent_mode,
     prepare_concurrent_commit_fcw_only, prepare_concurrent_commit_with_ssi,
+    record_registry_commit_lock_hold, record_registry_commit_lock_wait,
+    registry_commit_lock_metrics, reset_registry_commit_lock_metrics,
     validate_first_committer_wins,
 };
 pub use bocpd::{BocpdConfig, BocpdMonitor, ConjugateModel, HazardFunction, RegimeStats};
