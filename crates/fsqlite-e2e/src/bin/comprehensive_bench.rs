@@ -593,7 +593,7 @@ fn collect_rusqlite_rows<P: rusqlite::Params>(
     stmt.query_map(params, move |row| {
         let mut values = Vec::with_capacity(col_count);
         for idx in 0..col_count {
-            let value = row.get(idx).unwrap_or(rusqlite::types::Value::Null);
+            let value = row.get(idx)?;
             values.push(value);
         }
         Ok(values)
@@ -781,6 +781,10 @@ async fn apply_pragmas_fsqlite_async(conn: &fsqlite::Connection) {
     }
 }
 
+/// Human/configuration normalization for PRAGMA readbacks.
+///
+/// Never use this representation as a query-result correctness oracle: it is
+/// deliberately case-folded and display-oriented.
 fn normalize_csqlite_value(value: rusqlite::types::ValueRef<'_>) -> String {
     match value {
         rusqlite::types::ValueRef::Null => "null".to_owned(),
@@ -793,6 +797,10 @@ fn normalize_csqlite_value(value: rusqlite::types::ValueRef<'_>) -> String {
     }
 }
 
+/// Human/configuration normalization for FrankenSQLite PRAGMA readbacks.
+///
+/// See [`normalize_csqlite_value`]; query-result validation uses the exact
+/// typed representation below.
 fn normalize_fsqlite_value(value: &fsqlite::SqliteValue) -> String {
     match value {
         fsqlite::SqliteValue::Null => "null".to_owned(),
@@ -803,9 +811,47 @@ fn normalize_fsqlite_value(value: &fsqlite::SqliteValue) -> String {
     }
 }
 
+/// Exact, typed representation used only by cross-engine correctness oracles.
+///
+/// The benchmark's configuration readbacks intentionally normalize textual
+/// spellings such as `FULL` and `full`; query-result validation must not. Keep
+/// SQLite storage classes, floating-point bit patterns, text bytes, and blob
+/// bytes distinct so the oracle cannot hide a wrong type or value behind a
+/// display-string collision.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CanonicalSqlValue {
+    Null,
+    Integer(i64),
+    Real(u64),
+    Text(Vec<u8>),
+    Blob(Vec<u8>),
+}
+
+fn canonical_csqlite_value(value: rusqlite::types::ValueRef<'_>) -> CanonicalSqlValue {
+    match value {
+        rusqlite::types::ValueRef::Null => CanonicalSqlValue::Null,
+        rusqlite::types::ValueRef::Integer(value) => CanonicalSqlValue::Integer(value),
+        rusqlite::types::ValueRef::Real(value) => CanonicalSqlValue::Real(value.to_bits()),
+        rusqlite::types::ValueRef::Text(value) => CanonicalSqlValue::Text(value.to_vec()),
+        rusqlite::types::ValueRef::Blob(value) => CanonicalSqlValue::Blob(value.to_vec()),
+    }
+}
+
+fn canonical_fsqlite_value(value: &fsqlite::SqliteValue) -> CanonicalSqlValue {
+    match value {
+        fsqlite::SqliteValue::Null => CanonicalSqlValue::Null,
+        fsqlite::SqliteValue::Integer(value) => CanonicalSqlValue::Integer(*value),
+        fsqlite::SqliteValue::Float(value) => CanonicalSqlValue::Real(value.to_bits()),
+        fsqlite::SqliteValue::Text(value) => {
+            CanonicalSqlValue::Text(value.as_ref().as_bytes().to_vec())
+        }
+        fsqlite::SqliteValue::Blob(value) => CanonicalSqlValue::Blob(value.to_vec()),
+    }
+}
+
 /// One-time cross-engine result-set oracle for multi-row benchmark queries
 /// (bd-czzlp): both engines run `sql` once, outside the timed loops, and the
-/// normalized results must match as multisets. Ordering is not compared
+/// exact typed results must match as multisets. Ordering is not compared
 /// because these shapes carry no ORDER BY.
 fn assert_result_set_oracle(
     cs_conn: &rusqlite::Connection,
@@ -817,21 +863,21 @@ fn assert_result_set_oracle(
         .prepare(sql)
         .unwrap_or_else(|e| panic!("{context}: C SQLite prepare failed: {e}"));
     let col_count = stmt.column_count();
-    let mut cs_rows: Vec<Vec<String>> = stmt
+    let mut cs_rows: Vec<Vec<CanonicalSqlValue>> = stmt
         .query_map([], |row| {
             let mut values = Vec::with_capacity(col_count);
             for idx in 0..col_count {
-                values.push(normalize_csqlite_value(row.get_ref(idx)?));
+                values.push(canonical_csqlite_value(row.get_ref(idx)?));
             }
             Ok(values)
         })
         .unwrap_or_else(|e| panic!("{context}: C SQLite query failed: {e}"))
         .collect::<Result<Vec<_>, _>>()
         .unwrap_or_else(|e| panic!("{context}: C SQLite row decode failed: {e}"));
-    let mut fs_rows: Vec<Vec<String>> = fsqlite_e2e::block_on(fs_conn.query(sql))
+    let mut fs_rows: Vec<Vec<CanonicalSqlValue>> = fsqlite_e2e::block_on(fs_conn.query(sql))
         .unwrap_or_else(|e| panic!("{context}: FrankenSQLite query failed: {e}"))
         .iter()
-        .map(|row| row.values().iter().map(normalize_fsqlite_value).collect())
+        .map(|row| row.values().iter().map(canonical_fsqlite_value).collect())
         .collect();
     assert_eq!(
         cs_rows.len(),
@@ -8095,6 +8141,110 @@ mod tests {
             FSQLITE_BENCHMARK_PRAGMAS.iter().any(|pragma| pragma
                 .eq_ignore_ascii_case("PRAGMA fsqlite_capture_time_travel_snapshots=false;")),
             "comprehensive-bench should profile benchmark workloads, not optional time-travel snapshot cloning"
+        );
+    }
+
+    #[test]
+    fn result_oracle_canonical_values_preserve_type_and_payload_identity() {
+        let integer = canonical_fsqlite_value(&fsqlite::SqliteValue::Integer(1));
+        let real = canonical_fsqlite_value(&fsqlite::SqliteValue::Float(1.0));
+        let null = canonical_fsqlite_value(&fsqlite::SqliteValue::Null);
+        let text_null = canonical_fsqlite_value(&fsqlite::SqliteValue::from("null"));
+        let uppercase = canonical_fsqlite_value(&fsqlite::SqliteValue::from("Case"));
+        let lowercase = canonical_fsqlite_value(&fsqlite::SqliteValue::from("case"));
+        let first_blob = canonical_fsqlite_value(&fsqlite::SqliteValue::from(vec![0x00, 0x01]));
+        let second_blob = canonical_fsqlite_value(&fsqlite::SqliteValue::from(vec![0x00, 0x02]));
+
+        assert_ne!(integer, real, "INTEGER 1 must not collapse into REAL 1.0");
+        assert_ne!(null, text_null, "NULL must not collapse into TEXT `null`");
+        assert_ne!(uppercase, lowercase, "TEXT comparison must preserve case");
+        assert_ne!(
+            first_blob, second_blob,
+            "equal-length BLOBs must retain their bytes"
+        );
+        assert_ne!(
+            canonical_fsqlite_value(&fsqlite::SqliteValue::Float(0.0)),
+            canonical_fsqlite_value(&fsqlite::SqliteValue::Float(-0.0)),
+            "the exact REAL oracle must retain the IEEE-754 sign bit"
+        );
+
+        assert_eq!(
+            canonical_csqlite_value(rusqlite::types::ValueRef::Integer(-7)),
+            canonical_fsqlite_value(&fsqlite::SqliteValue::Integer(-7))
+        );
+        assert_eq!(
+            canonical_csqlite_value(rusqlite::types::ValueRef::Real(1.25)),
+            canonical_fsqlite_value(&fsqlite::SqliteValue::Float(1.25))
+        );
+        assert_eq!(
+            canonical_csqlite_value(rusqlite::types::ValueRef::Text(b"exact text")),
+            canonical_fsqlite_value(&fsqlite::SqliteValue::from("exact text"))
+        );
+        assert_eq!(
+            canonical_csqlite_value(rusqlite::types::ValueRef::Blob(b"\x00\xff")),
+            canonical_fsqlite_value(&fsqlite::SqliteValue::from(vec![0x00, 0xff]))
+        );
+        assert_ne!(
+            canonical_csqlite_value(rusqlite::types::ValueRef::Text(b"\x80")),
+            canonical_csqlite_value(rusqlite::types::ValueRef::Blob(b"\x80")),
+            "invalid UTF-8 TEXT bytes must remain distinguishable from BLOB bytes"
+        );
+    }
+
+    #[test]
+    fn result_oracle_canonical_rows_preserve_column_boundaries() {
+        let left = vec![vec![
+            CanonicalSqlValue::Text(b"a".to_vec()),
+            CanonicalSqlValue::Text(b"bc".to_vec()),
+        ]];
+        let right = vec![vec![
+            CanonicalSqlValue::Text(b"ab".to_vec()),
+            CanonicalSqlValue::Text(b"c".to_vec()),
+        ]];
+        assert_ne!(
+            left, right,
+            "row values must not be flattened into a boundary-ambiguous string"
+        );
+    }
+
+    #[test]
+    fn result_oracle_end_to_end_rejects_case_fold_collision() {
+        let csqlite = rusqlite::Connection::open_in_memory().expect("open C SQLite oracle");
+        csqlite
+            .execute_batch(
+                "CREATE TABLE oracle_value(value TEXT); INSERT INTO oracle_value VALUES ('Case');",
+            )
+            .expect("populate C SQLite oracle");
+        let fsqlite = open_fsqlite_memory_connection_for_benchmark();
+        fs_execute(
+            &fsqlite,
+            "CREATE TABLE oracle_value(value TEXT); INSERT INTO oracle_value VALUES ('case');",
+        );
+
+        let comparison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_result_set_oracle(
+                &csqlite,
+                &fsqlite,
+                "SELECT value FROM oracle_value",
+                "case-sensitive typed oracle fixture",
+            );
+        }));
+        assert!(
+            comparison.is_err(),
+            "case-distinct query results must not pass the typed oracle"
+        );
+    }
+
+    #[test]
+    fn result_oracle_rusqlite_row_collection_surfaces_decode_failures() {
+        let connection = rusqlite::Connection::open_in_memory().expect("open C SQLite fixture");
+        let mut statement = connection
+            .prepare("SELECT CAST(x'80' AS TEXT)")
+            .expect("prepare invalid UTF-8 TEXT fixture");
+        let result = collect_rusqlite_rows(&mut statement, []);
+        assert!(
+            result.is_err(),
+            "invalid C SQLite TEXT must fail the sample instead of becoming NULL"
         );
     }
 
