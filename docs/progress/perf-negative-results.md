@@ -48,6 +48,34 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-07-28 - LANDED (be8e066d): bd-5zeai parameterized fast path (12.90us->1.01us, tax ELIMINATED to plumbing floor) + bd-gpi5i sync CTE frontier (1.59ms->1.01ms, residual documented)
+
+- bd-5zeai CLOSED: PreparedProbeRowidBound {None, LiteralExclusive,
+  Parameter} in SimpleCountIndexedRowidProbe; execute-time strict-Integer
+  resolution (Float/Text/Null -> general-path fallback = affinity-safe);
+  resolved-bound cache keys; both params branches of query_row_internal.
+  Receipt `param-fastpath-fix-20260728T2330Z-superserver`: control3
+  placeholder 12.90us -> 1.01us (20.1x -> 1.63x); residual 0.39us == the
+  independently measured params-plumbing floor (control2 0.40us) — the
+  fast-path-absence tax is GONE. rustc's field-type-change sweep found
+  exactly one dispatch site beyond the spec'd list (the deliberate
+  make-missed-sites-unrepresentable strategy worked).
+- bd-gpi5i PARTIAL (P1->P2): sync Direct-frontier lane (conservative node
+  set; async keeps Between/Case/Like/In/Cast/Collate/FunctionCall which are
+  affinity/collation/registry-aware). General COUNT 1.59ms -> 1.01ms
+  (6.4x -> 3.82x vs C; receipt
+  `cte-syncfrontier-fix-20260728T2255Z-superserver`). Residual ~750ns/iter
+  = frontier Vec/Row alloc traffic + final materialization + outer scan.
+  DO NOT retry via a COUNT closed-form specialization — it re-blinds the
+  bench row to the general path (bd-czzlp asymmetry is intentional); the
+  legitimate follow-up is allocation reduction in the general loop.
+- Landing discipline receipts: full lib suite 3432/24 with ALL 24
+  dispositioned via a stash/clean-HEAD rebuild (23 pre-existing in
+  RusticBasin's active correctness lane; 1 = pre-existing exact-counter
+  parallel flake, bd-zeqpr filed). En-route fix: eval_join_expr's
+  UnaryOp::Plus->NULL fallthrough NOT taken by the new sync evaluator
+  (copies the async arms; bd-g54oq still open for the join path itself).
+
 ## 2026-07-28 - MEASURED(macOS): M4 Pro inversion decomposed — registry guard 1.4ms holds at 8 WRITERS (Linux-64w territory) drives conflict-backoff collapse; barrier hypothesis eliminated; padding flip suggestive-only, NOT landed
 
 - First real-Apple-silicon receipts (mac-mini-max M4 Pro; artifacts
