@@ -72834,7 +72834,17 @@ fn in_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -> bo
         || in_subquery_references_view(sub, conn)
         || in_subquery_references_sqlite_schema(sub, conn)
         // frankensim-kl17o: see exists_subquery_supported_by_vdbe.
-        || select_contains_any_placeholder(sub)
+        //
+        // bd-2dgf5 carve-out: a non-correlated, probe-source-shaped IN
+        // subquery never goes through the prepare-time IN-rewrite fold — the
+        // VDBE consumes it via resolve_in_probe_source, evaluating the
+        // residual WHERE per execution (placeholders lower through emit_expr
+        // to Opcode::Variable and rebind fresh each run, exactly like the
+        // EXISTS semijoin carve-out at fa85adfc). Without this exception the
+        // parameterized variant fell to the interpreted outer full scan
+        // (~600x slower than C SQLite at 10k outer rows).
+        || (select_contains_any_placeholder(sub)
+            && (!in_subquery_matches_probe_source_shape(sub) || is_correlated_subquery(sub)))
     {
         return false;
     }
@@ -72874,6 +72884,44 @@ fn in_subquery_needs_eager_eval(sub: &SelectStatement) -> bool {
         } if !group_by.is_empty()
             || having.is_some()
             || !windows.is_empty()
+    )
+}
+
+/// Structural mirror of the VDBE's `resolve_in_probe_source` acceptance
+/// (crates/fsqlite-vdbe/src/codegen.rs) for `InSet::Subquery`, minus the
+/// schema lookup: a single plain base table, no joins, a single simple
+/// projection, and none of the features either probe path rejects. Used by
+/// the bd-2dgf5 kl17o carve-out — only shapes the compiled path consumes
+/// natively (residual WHERE evaluated per execution) may carry placeholders
+/// past the dispatch routing.
+fn in_subquery_matches_probe_source_shape(sub: &SelectStatement) -> bool {
+    if sub.with.is_some()
+        || !sub.body.compounds.is_empty()
+        || !sub.order_by.is_empty()
+        || sub.limit.is_some()
+    {
+        return false;
+    }
+    let SelectCore::Select {
+        columns,
+        from: Some(from),
+        group_by,
+        having,
+        windows,
+        ..
+    } = &sub.body.select
+    else {
+        return false;
+    };
+    if !group_by.is_empty() || having.is_some() || !windows.is_empty() {
+        return false;
+    }
+    if !from.joins.is_empty() || !matches!(&from.source, TableOrSubquery::Table { .. }) {
+        return false;
+    }
+    matches!(
+        columns.as_slice(),
+        [ResultColumn::Expr { .. } | ResultColumn::Star | ResultColumn::TableStar(_)]
     )
 }
 
@@ -102405,6 +102453,104 @@ mod tests {
                 assert_eq!(
                     ids, expected_ids,
                     "threshold {threshold} must select exactly the products whose category has id <= {threshold}"
+                );
+            }
+        });
+    }
+
+    /// bd-2dgf5: the parameterized IN-subquery twin of the EXISTS carve-out
+    /// (fa85adfc). Before the `in_subquery_supported_by_vdbe` exception, `?1`
+    /// inside the subquery forced deferred dispatch onto the interpreted
+    /// outer full scan (~600x slower than C SQLite at 10k rows).
+    #[test]
+    fn test_prepared_statement_in_subquery_with_placeholder_uses_compiled_path() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(
+                "CREATE TABLE products (id INTEGER PRIMARY KEY, category_id INTEGER NOT NULL);",
+            )
+            .await
+            .unwrap();
+            conn.execute("CREATE TABLE categories (id INTEGER PRIMARY KEY, name TEXT);")
+                .await
+                .unwrap();
+            conn.execute("CREATE INDEX idx_prod_cat ON products(category_id);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO categories VALUES (1, 'cat_1'), (2, 'cat_2'), (3, 'cat_3');")
+                .await
+                .unwrap();
+            conn.execute(
+                "INSERT INTO products VALUES (1, 1), (2, 2), (3, 3), (4, 1), (5, 4), (6, 2);",
+            )
+            .await
+            .unwrap();
+
+            let stmt = conn
+            .prepare(
+                "SELECT COUNT(*) FROM products WHERE category_id IN (SELECT id FROM categories WHERE id <= ?1)",
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                stmt.deferred_query_statement.is_none(),
+                "a placeholder inside a probe-source-shaped IN subquery must not force deferred dispatch"
+            );
+            assert!(
+                stmt.program
+                    .ops()
+                    .iter()
+                    .any(|op| op.opcode == Opcode::CountIndexEqRun),
+                "the parameterized IN probe must fuse duplicate-run counting exactly like the literal variant"
+            );
+            assert!(
+                stmt.program
+                    .ops()
+                    .iter()
+                    .any(|op| op.opcode == Opcode::Variable),
+                "the placeholder bound must lower to Opcode::Variable so it rebinds per execution"
+            );
+
+            for (threshold, expected) in [(2_i64, 4_i64), (1, 2), (3, 5), (0, 0)] {
+                let row = stmt
+                    .query_row_with_params(&[SqliteValue::Integer(threshold)])
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    row.values()[0],
+                    SqliteValue::Integer(expected),
+                    "threshold {threshold} must count products whose category_id is in the admitted category set"
+                );
+            }
+
+            // Non-aggregate variant: row-set parity across rebinds.
+            let list_stmt = conn
+            .prepare(
+                "SELECT id FROM products WHERE category_id IN (SELECT id FROM categories WHERE id <= ?1) ORDER BY id",
+            )
+            .await
+            .unwrap();
+            for (threshold, expected_ids) in [
+                (2_i64, vec![1_i64, 2, 4, 6]),
+                (1, vec![1, 4]),
+                (3, vec![1, 2, 3, 4, 6]),
+                (0, vec![]),
+            ] {
+                let rows = list_stmt
+                    .query_with_params(&[SqliteValue::Integer(threshold)])
+                    .await
+                    .unwrap();
+                let ids: Vec<i64> = rows
+                    .iter()
+                    .map(|row| match row.values()[0] {
+                        SqliteValue::Integer(id) => id,
+                        ref other => panic!("expected integer id, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    ids, expected_ids,
+                    "threshold {threshold} must select exactly the products in the admitted category set"
                 );
             }
         });
