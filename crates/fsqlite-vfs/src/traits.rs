@@ -877,46 +877,65 @@ impl std::future::Future for VfsWriteCompletionWait {
     fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.as_mut().get_mut();
         let completion_inner = Arc::clone(&this.completion.inner);
-        let mut inner = completion_inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if inner.state != VfsWriteCompletionState::Pending {
-            if let Some(waiter_id) = this.waiter_id.take()
-                && let Some(index) = inner
+        // Cloning and dropping a user-provided RawWaker can execute arbitrary
+        // code. Clone before taking the mutex, then carry every replaced or
+        // removed waker out of the critical section before destroying it.
+        let mut incoming_waker = Some(cx.waker().clone());
+        let (poll, retired_waker) = {
+            let mut inner = completion_inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if inner.state != VfsWriteCompletionState::Pending {
+                let retired_waker = this.waiter_id.take().and_then(|waiter_id| {
+                    inner
+                        .waiters
+                        .iter()
+                        .position(|(registered_id, _)| *registered_id == waiter_id)
+                        .map(|index| inner.waiters.swap_remove(index).1)
+                });
+                (Poll::Ready(inner.state), retired_waker)
+            } else if let Some(waiter_id) = this.waiter_id {
+                let (_, registered_waker) = inner
                     .waiters
-                    .iter()
-                    .position(|(registered_id, _)| *registered_id == waiter_id)
-            {
-                inner.waiters.swap_remove(index);
+                    .iter_mut()
+                    .find(|(registered_id, _)| *registered_id == waiter_id)
+                    .expect("pending completion waiter must remain registered");
+                let retired_waker = if registered_waker.will_wake(cx.waker()) {
+                    None
+                } else {
+                    Some(std::mem::replace(
+                        registered_waker,
+                        incoming_waker
+                            .take()
+                            .expect("incoming completion waker must be available"),
+                    ))
+                };
+                (Poll::Pending, retired_waker)
+            } else {
+                let waiter_id = loop {
+                    let candidate = inner.next_waiter_id;
+                    inner.next_waiter_id = inner.next_waiter_id.wrapping_add(1);
+                    if inner
+                        .waiters
+                        .iter()
+                        .all(|(registered_id, _)| *registered_id != candidate)
+                    {
+                        break candidate;
+                    }
+                };
+                inner.waiters.push((
+                    waiter_id,
+                    incoming_waker
+                        .take()
+                        .expect("incoming completion waker must be available"),
+                ));
+                this.waiter_id = Some(waiter_id);
+                (Poll::Pending, None)
             }
-            return Poll::Ready(inner.state);
-        }
-
-        if let Some(waiter_id) = this.waiter_id {
-            let (_, registered_waker) = inner
-                .waiters
-                .iter_mut()
-                .find(|(registered_id, _)| *registered_id == waiter_id)
-                .expect("pending completion waiter must remain registered");
-            if !registered_waker.will_wake(cx.waker()) {
-                registered_waker.clone_from(cx.waker());
-            }
-        } else {
-            let waiter_id = loop {
-                let candidate = inner.next_waiter_id;
-                inner.next_waiter_id = inner.next_waiter_id.wrapping_add(1);
-                if inner
-                    .waiters
-                    .iter()
-                    .all(|(registered_id, _)| *registered_id != candidate)
-                {
-                    break candidate;
-                }
-            };
-            inner.waiters.push((waiter_id, cx.waker().clone()));
-            this.waiter_id = Some(waiter_id);
-        }
-        Poll::Pending
+        };
+        drop(retired_waker);
+        drop(incoming_waker);
+        poll
     }
 }
 
@@ -925,18 +944,19 @@ impl Drop for VfsWriteCompletionWait {
         let Some(waiter_id) = self.waiter_id.take() else {
             return;
         };
-        let mut inner = self
-            .completion
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(index) = inner
-            .waiters
-            .iter()
-            .position(|(registered_id, _)| *registered_id == waiter_id)
-        {
-            inner.waiters.swap_remove(index);
-        }
+        let retired_waker = {
+            let mut inner = self
+                .completion
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner
+                .waiters
+                .iter()
+                .position(|(registered_id, _)| *registered_id == waiter_id)
+                .map(|index| inner.waiters.swap_remove(index).1)
+        };
+        drop(retired_waker);
     }
 }
 
@@ -1891,6 +1911,131 @@ mod tests {
             faulted_write.state(),
             VfsWriteCompletionState::Error,
             "a completed partial-write source must map to outer Error"
+        );
+    }
+
+    struct CompletionLockProbeWake {
+        completion: VfsWriteCompletion,
+        dropped_while_completion_locked: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl CompletionLockProbeWake {
+        fn record_if_completion_locked(&self) {
+            let completion_was_locked = matches!(
+                self.completion.inner.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            self.dropped_while_completion_locked
+                .fetch_or(completion_was_locked, Ordering::AcqRel);
+        }
+    }
+
+    impl std::task::Wake for CompletionLockProbeWake {
+        fn wake(self: Arc<Self>) {
+            self.record_if_completion_locked();
+        }
+    }
+
+    impl Drop for CompletionLockProbeWake {
+        fn drop(&mut self) {
+            self.record_if_completion_locked();
+        }
+    }
+
+    fn completion_lock_probe_waker(
+        completion: &VfsWriteCompletion,
+    ) -> (Waker, Arc<std::sync::atomic::AtomicBool>) {
+        let dropped_while_completion_locked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waker = Waker::from(Arc::new(CompletionLockProbeWake {
+            completion: completion.clone(),
+            dropped_while_completion_locked: Arc::clone(&dropped_while_completion_locked),
+        }));
+        (waker, dropped_while_completion_locked)
+    }
+
+    #[test]
+    fn write_completion_wait_never_drops_replaced_or_cancelled_wakers_under_lock() {
+        use std::future::Future as _;
+
+        // Re-polling with a different task waker replaces the registered one.
+        let replacement_completion = VfsWriteCompletion::new();
+        let mut replacement_waiter = Box::pin(replacement_completion.wait());
+        let (first_waker, replacement_lock_probe) =
+            completion_lock_probe_waker(&replacement_completion);
+        {
+            let mut first_cx = Context::from_waker(&first_waker);
+            assert!(matches!(
+                replacement_waiter.as_mut().poll(&mut first_cx),
+                Poll::Pending
+            ));
+        }
+        drop(first_waker);
+        {
+            let mut replacement_cx = Context::from_waker(Waker::noop());
+            assert!(matches!(
+                replacement_waiter.as_mut().poll(&mut replacement_cx),
+                Poll::Pending
+            ));
+        }
+        assert!(
+            !replacement_lock_probe.load(Ordering::Acquire),
+            "a replaced waker may re-enter the completion and must be dropped after unlock"
+        );
+        drop(replacement_waiter);
+
+        // Cancelling the wait future removes and destroys its registered waker.
+        let cancellation_completion = VfsWriteCompletion::new();
+        let mut cancellation_waiter = Box::pin(cancellation_completion.wait());
+        let (cancellation_waker, cancellation_lock_probe) =
+            completion_lock_probe_waker(&cancellation_completion);
+        {
+            let mut cancellation_cx = Context::from_waker(&cancellation_waker);
+            assert!(matches!(
+                cancellation_waiter.as_mut().poll(&mut cancellation_cx),
+                Poll::Pending
+            ));
+        }
+        drop(cancellation_waker);
+        drop(cancellation_waiter);
+        assert!(
+            !cancellation_lock_probe.load(Ordering::Acquire),
+            "a cancelled waiter's waker must be dropped after unlock"
+        );
+    }
+
+    #[test]
+    fn write_completion_terminal_poll_drops_stale_registered_waker_after_unlock() {
+        use std::future::Future as _;
+
+        let completion = VfsWriteCompletion::new();
+        let mut waiter = Box::pin(completion.wait());
+        let (registered_waker, lock_probe) = completion_lock_probe_waker(&completion);
+        {
+            let mut registered_cx = Context::from_waker(&registered_waker);
+            assert!(matches!(
+                waiter.as_mut().poll(&mut registered_cx),
+                Poll::Pending
+            ));
+        }
+        drop(registered_waker);
+
+        // Model a terminal publisher that won the state transition immediately
+        // before extracting this waiter. The normal completion path performs
+        // both under one lock, but terminal polling remains defensive against a
+        // stale registration and must preserve the same waker-drop rule.
+        completion
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state = VfsWriteCompletionState::Success;
+        let mut terminal_cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            waiter.as_mut().poll(&mut terminal_cx),
+            Poll::Ready(VfsWriteCompletionState::Success)
+        ));
+        assert!(
+            !lock_probe.load(Ordering::Acquire),
+            "terminal waiter removal must drop its waker after unlock"
         );
     }
 
