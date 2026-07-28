@@ -196,7 +196,8 @@ use fsqlite_mvcc::{
     concurrent_commit_read_only, concurrent_rollback_to_savepoint, concurrent_savepoint,
     concurrent_track_write_conflict_page, finalize_prepared_concurrent_commit_with_ssi,
     flat_combining_metrics, morsel_parallel_insert::MorselScheduler,
-    prepare_concurrent_commit_fcw_only, prepare_concurrent_commit_with_ssi, ssi_metrics_snapshot,
+    prepare_concurrent_commit_fcw_only, prepare_concurrent_commit_with_ssi,
+    record_registry_commit_lock_hold, record_registry_commit_lock_wait, ssi_metrics_snapshot,
 };
 // MVCC conflict observability (bd-t6sv2.1)
 #[cfg(feature = "diagnostic-pragmas")]
@@ -39283,7 +39284,7 @@ impl Connection {
         // `abort_current_concurrent_session` early-returns without re-locking;
         // we still drop the guard explicitly first to make that unambiguous.
         let mut commit_registry_guard = if ok && is_concurrent_txn && txn_has_pending_writes {
-            Some(lock_unpoisoned(&self.concurrent_registry))
+            Some(lock_registry_for_commit(&self.concurrent_registry))
         } else {
             None
         };
@@ -48684,7 +48685,7 @@ impl Connection {
             // `active_commit_seqs`, so holding the registry guard across them is
             // free of lock-order inversion.
             let mut commit_registry_guard = if is_concurrent_txn && txn_has_pending_writes {
-                Some(lock_unpoisoned(&self.concurrent_registry))
+                Some(lock_registry_for_commit(&self.concurrent_registry))
             } else {
                 None
             };
@@ -74223,6 +74224,50 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Registry guard for the validate → physical write → publish commit window.
+///
+/// The wait sample is recorded immediately after lock acquisition. The hold
+/// sample is recorded by `Drop`, so every exit path that releases the guard is
+/// accounted exactly once, including commit errors and early returns.
+struct TimedRegistryCommitGuard<'a> {
+    guard: std::sync::MutexGuard<'a, ConcurrentRegistry>,
+    acquired_at: Instant,
+}
+
+impl std::ops::Deref for TimedRegistryCommitGuard<'_> {
+    type Target = ConcurrentRegistry;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for TimedRegistryCommitGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for TimedRegistryCommitGuard<'_> {
+    fn drop(&mut self) {
+        let hold_ns = u64::try_from(self.acquired_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        record_registry_commit_lock_hold(hold_ns);
+    }
+}
+
+fn lock_registry_for_commit(registry: &Mutex<ConcurrentRegistry>) -> TimedRegistryCommitGuard<'_> {
+    let wait_started = Instant::now();
+    let guard = lock_unpoisoned(registry);
+    let wait_ns = u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    record_registry_commit_lock_wait(wait_ns);
+    TimedRegistryCommitGuard {
+        guard,
+        // Start the hold clock after publishing the wait sample so the two
+        // intervals remain disjoint.
+        acquired_at: Instant::now(),
+    }
 }
 
 fn mvcc_state_path_key(path: &str) -> String {
@@ -211171,6 +211216,68 @@ mod pager_routing_tests {
                 conn.transactional_live_vtab_registry_active(),
                 "a mutable active_txn borrow should conservatively report transactional live-vtab state"
             );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_commit_lock_metrics_cover_both_write_commit_windows() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("registry_commit_lock_metrics.db");
+            let db_path = db_path.to_string_lossy().into_owned();
+            let conn = Connection::open(&db_path).await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT);")
+                .await
+                .unwrap();
+
+            // DDL is an immediate file-backed autocommit write, so it exercises
+            // `resolve_autocommit_txn_with_capture_and_cx` rather than the
+            // explicit-COMMIT dispatcher below.
+            fsqlite_mvcc::reset_registry_commit_lock_metrics();
+            conn.execute("CREATE INDEX t_value_idx ON t(value);")
+                .await
+                .unwrap();
+            let autocommit = fsqlite_mvcc::registry_commit_lock_metrics();
+            assert!(
+                autocommit.holds_total >= 1,
+                "file-backed concurrent autocommit must record its registry lock acquisition: \
+                 {autocommit:?}"
+            );
+            assert!(
+                autocommit.hold_ns_total > 0,
+                "file-backed concurrent autocommit must record its registry lock hold: \
+                 {autocommit:?}"
+            );
+            assert!(autocommit.wait_ns_max <= autocommit.wait_ns_total);
+            assert!(autocommit.hold_ns_max <= autocommit.hold_ns_total);
+
+            // The high-writer benchmark uses explicit BEGIN CONCURRENT/COMMIT,
+            // which reaches a distinct commit critical section. Keep a
+            // separate receipt so wiring only the autocommit site cannot make
+            // this regression guard pass.
+            fsqlite_mvcc::reset_registry_commit_lock_metrics();
+            conn.execute("BEGIN CONCURRENT;").await.unwrap();
+            conn.execute("INSERT INTO t(id, value) VALUES (1, 'explicit');")
+                .await
+                .unwrap();
+            conn.execute("COMMIT;").await.unwrap();
+            let explicit = fsqlite_mvcc::registry_commit_lock_metrics();
+            assert!(
+                explicit.holds_total >= 1,
+                "explicit concurrent COMMIT must record its registry lock acquisition: \
+                 {explicit:?}"
+            );
+            assert!(
+                explicit.hold_ns_total > 0,
+                "explicit concurrent COMMIT must record its registry lock hold: {explicit:?}"
+            );
+            assert!(explicit.wait_ns_max <= explicit.wait_ns_total);
+            assert!(explicit.hold_ns_max <= explicit.hold_ns_total);
+
+            conn.close().await.unwrap();
         });
     }
 
