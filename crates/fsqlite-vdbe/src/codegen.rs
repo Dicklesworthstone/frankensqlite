@@ -16,6 +16,7 @@ use fsqlite_ast::{
     SelectStatement, SortDirection, Span, TableOrSubquery, TimeTravelClause, TimeTravelTarget,
     UpdateStatement, UpsertAction, UpsertClause, UpsertTarget,
 };
+use fsqlite_error::ErrorCode;
 use fsqlite_parser::expr::parse_expr as parse_sql_expr;
 use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4};
 use fsqlite_types::record::{PrecomputedRecordHeader, PrecomputedSerialTypeKind};
@@ -27790,11 +27791,11 @@ fn emit_in_probe_expr(
     ctx: Option<&ScanCtx<'_>>,
 ) {
     let Some(scan_ctx) = ctx else {
-        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+        emit_in_probe_codegen_failure(b, "missing scan context");
         return;
     };
     let Some(schema) = scan_ctx.schema else {
-        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+        emit_in_probe_codegen_failure(b, "missing schema");
         return;
     };
     let Some(probe_source) = resolve_in_probe_source(set, schema) else {
@@ -27804,7 +27805,7 @@ fn emit_in_probe_expr(
                 return;
             }
         }
-        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+        emit_in_probe_codegen_failure(b, "unsupported probe source");
         return;
     };
 
@@ -27930,6 +27931,20 @@ fn emit_in_probe_expr(
     b.free_temp(r_saw_null);
     b.free_temp(r_probe);
     b.free_temp(r_operand);
+}
+
+/// Fail closed when routing and expression lowering disagree about an `IN`
+/// probe. Returning SQL `NULL` here would silently turn an internal codegen
+/// defect into a query result.
+fn emit_in_probe_codegen_failure(b: &mut ProgramBuilder, reason: &str) {
+    b.emit_op(
+        Opcode::Halt,
+        ErrorCode::Internal as i32,
+        0,
+        0,
+        P4::Str(format!("IN probe codegen invariant failed: {reason}")),
+        0,
+    );
 }
 
 /// Handles literals, bind parameters, binary/unary operators, CASE, CAST,
@@ -36603,6 +36618,42 @@ mod tests {
         let set = InSet::Table(QualifiedName::bare("s"));
         let schema = test_schema_with_subquery_source();
         assert!(super::resolve_in_probe_source(&set, &schema).is_some());
+    }
+
+    #[test]
+    fn test_emit_in_probe_expr_fails_closed_when_probe_lowering_is_unsupported() {
+        let schema = test_schema_with_subquery_source();
+        let scan_ctx = ScanCtx {
+            cursor: 0,
+            table: &schema[0],
+            table_alias: None,
+            schema: Some(&schema),
+            register_base: None,
+            secondaries: &[],
+        };
+        let unsupported_subquery = select_sql("SELECT b, b FROM s");
+        let set = InSet::Subquery(Box::new(unsupported_subquery));
+        let operand = Expr::Column(ColumnRef::bare("a"), Span::ZERO);
+        let mut b = ProgramBuilder::new();
+        let result_reg = b.alloc_reg();
+
+        emit_in_probe_expr(&mut b, &operand, &set, false, result_reg, Some(&scan_ctx));
+
+        let program = b.finish().expect("error program should be valid VDBE");
+        assert_eq!(
+            program.ops(),
+            &[VdbeOp {
+                opcode: Opcode::Halt,
+                p1: ErrorCode::Internal as i32,
+                p2: 0,
+                p3: 0,
+                p4: P4::Str(
+                    "IN probe codegen invariant failed: unsupported probe source".to_owned()
+                ),
+                p5: 0,
+            }],
+            "an unsupported compiled IN probe must fail explicitly, never yield SQL NULL"
+        );
     }
 
     #[test]
