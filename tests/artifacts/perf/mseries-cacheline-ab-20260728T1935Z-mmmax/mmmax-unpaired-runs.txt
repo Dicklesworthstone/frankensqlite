@@ -1,0 +1,18 @@
+case=shared_table threads=2 synchronous=NORMAL null_c_c ratio_median=1.102214 ci95=[0.926074,1.322723] cv_pct=51.785 mad=0.364350 cv_gate=never
+case=shared_table threads=2 synchronous=NORMAL claim_f_over_c ratio_median=0.241152 ci95=[0.186778,0.266806] cv_pct=33.473 mad=0.054374 fsqlite_p50_wps=77419.853 sqlite_p50_wps=393813.815 fsqlite_failed=0 sqlite_failed=0
+case=shared_table threads=2 median_ci_gate=FSQLITE_SLOWER rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.322723 claim_margin=2.351 min_decidable_gain=1.645446 max_decidable_regression=0.354554
+case=shared_table threads=4 synchronous=NORMAL null_c_c ratio_median=1.083369 ci95=[0.933820,1.160618] cv_pct=19.867 mad=0.157756 cv_gate=never
+case=shared_table threads=4 synchronous=NORMAL claim_f_over_c ratio_median=0.300634 ci95=[0.255355,0.351647] cv_pct=34.533 mad=0.072274 fsqlite_p50_wps=80293.540 sqlite_p50_wps=292769.508 fsqlite_failed=0 sqlite_failed=0
+case=shared_table threads=4 median_ci_gate=FSQLITE_SLOWER rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.160618 claim_margin=4.354 min_decidable_gain=1.321235 max_decidable_regression=0.678765
+case=shared_table threads=8 synchronous=NORMAL null_c_c ratio_median=1.016431 ci95=[0.785357,1.170907] cv_pct=32.754 mad=0.297049 cv_gate=never
+case=shared_table threads=8 synchronous=NORMAL claim_f_over_c ratio_median=0.793010 ci95=[0.695430,0.928609] cv_pct=33.776 mad=0.136147 fsqlite_p50_wps=89825.822 sqlite_p50_wps=114967.926 fsqlite_failed=0 sqlite_failed=0
+case=shared_table threads=8 median_ci_gate=INCONCLUSIVE rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.214643 claim_margin=0.964 min_decidable_gain=1.429286 max_decidable_regression=0.570714
+case=shared_table threads=2 synchronous=NORMAL null_c_c ratio_median=0.979689 ci95=[0.886911,1.165622] cv_pct=40.761 mad=0.185933 cv_gate=never
+case=shared_table threads=2 synchronous=NORMAL claim_f_over_c ratio_median=0.171101 ci95=[0.142499,0.188167] cv_pct=22.567 mad=0.028602 fsqlite_p50_wps=88374.842 sqlite_p50_wps=522653.775 fsqlite_failed=0 sqlite_failed=0
+case=shared_table threads=2 median_ci_gate=FSQLITE_SLOWER rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.165622 claim_margin=5.005 min_decidable_gain=1.331244 max_decidable_regression=0.668756
+case=shared_table threads=4 synchronous=NORMAL null_c_c ratio_median=0.990914 ci95=[0.903090,1.067372] cv_pct=26.017 mad=0.101712 cv_gate=never
+case=shared_table threads=4 synchronous=NORMAL claim_f_over_c ratio_median=0.296273 ci95=[0.256114,0.387772] cv_pct=27.429 mad=0.081287 fsqlite_p50_wps=88608.869 sqlite_p50_wps=299270.536 fsqlite_failed=0 sqlite_failed=0
+case=shared_table threads=4 median_ci_gate=FSQLITE_SLOWER rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.096910 claim_margin=7.262 min_decidable_gain=1.193819 max_decidable_regression=0.806181
+case=shared_table threads=8 synchronous=NORMAL null_c_c ratio_median=1.218731 ci95=[0.708953,1.596916] cv_pct=45.178 mad=0.533318 cv_gate=never
+case=shared_table threads=8 synchronous=NORMAL claim_f_over_c ratio_median=0.811403 ci95=[0.629882,0.869906] cv_pct=31.095 mad=0.148185 fsqlite_p50_wps=102215.195 sqlite_p50_wps=122122.256 fsqlite_failed=0 sqlite_failed=0
+case=shared_table threads=8 median_ci_gate=INCONCLUSIVE rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.596916 claim_margin=0.316 min_decidable_gain=2.193831 max_decidable_regression=-0.193831

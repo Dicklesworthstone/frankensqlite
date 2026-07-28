@@ -1,0 +1,27 @@
+--- a/crates/fsqlite-mvcc/src/seqlock.rs
++++ b/crates/fsqlite-mvcc/src/seqlock.rs
+@@ -44,5 +44,5 @@
+ }
+
+-#[repr(align(64))]
++#[repr(align(128))]
+ struct CacheAlignedAtomicU64(AtomicU64);
+
+--- a/crates/fsqlite-mvcc/src/shared_lock_table.rs
++++ b/crates/fsqlite-mvcc/src/shared_lock_table.rs
+@@ -176,5 +176,5 @@
+ }
+
+-#[repr(align(64))]
++#[repr(align(128))]
+ struct CacheAlignedAtomicU32(AtomicU32);
+
+--- a/crates/fsqlite-mvcc/src/commit_combiner.rs
++++ b/crates/fsqlite-mvcc/src/commit_combiner.rs
+@@ -112,5 +112,5 @@
+ /// The state field encodes the slot state in the high bits and reserves
+ /// low bits for future extensions.
+-#[repr(align(64))]
++#[repr(align(128))]
+ struct CommitSlot {
+     /// Slot state: EMPTY, PENDING, or DONE.

@@ -33,7 +33,25 @@ x86 control (superserver-cacheline-run2.txt):
   exactly right: x86 shows zero effect, so 128B there would only waste cache.
 - What this does NOT yet prove: product-level impact. The in-memory flip
   candidates in fsqlite-mvcc (CommitSlot commit_combiner.rs:114, seqlock
-  telemetry stripes, shared_lock_table occupancy stripes, cell_visibility) are
-  ns-scale touches inside us-scale operations; the call-site flip lands only
-  if an mt_mvcc_bench A/B on this mini shows a gated win (next step).
+  telemetry stripes, shared_lock_table occupancy stripes) are ns-scale touches
+  inside us-scale operations; the call-site flip lands only if an
+  mt_mvcc_bench A/B on this mini shows a gated win.
   SharedTxnSlot / generic CacheAligned in shm remain untouchable (file format).
+
+## Product-level A/B (mt_mvcc_bench, same mini) — SUGGESTIVE-POSITIVE, NOT GATED
+Flip arm = flip128.patch (this dir): CommitSlot + both striped counters
+repr(align(64)) -> repr(align(128)); repo @688d3c6d; release-perf.
+- Unpaired pass (mmmax-unpaired-runs.txt): F wps 2w 77.4k->88.4k (+14.2%),
+  4w 80.3k->88.6k (+10.4%), 8w 89.8k->102.2k (+13.8%) — BUT the C arm
+  drifted +33% at 2w between the same two runs -> unpaired deltas untrusted.
+- Interleaved A/B/A/B x3 at threads=8 (mmmax-interleave.txt): flip wins all
+  three pairs, +1.3% / +7.8% / +5.1% (mean +4.7%); within-run cv 42-52%;
+  sign test 3/3 = p=0.125. VERDICT: plausible small positive, NOT
+  significance-gated; flip NOT landed (one-lever discipline, 4568).
+- RETRY CONDITION: quiesced mini + QoS pinning (bd-y3dlq) to cut the 42-52%
+  cv, >=10 interleaved pairs, or perf-c2c-equivalent HITM sampling on macOS
+  (Instruments). Note the run-to-run machine drift on this host (C arm
+  115k->161k wps across the session) — any future mac receipt needs
+  interleaving as a hard requirement.
+- Context that dwarfs this lever: in these same runs F is 0.66-0.85x C at
+  8 writers on macOS (bd-jyeus checkpoint-barrier investigation).
