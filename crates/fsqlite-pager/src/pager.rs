@@ -1623,7 +1623,17 @@ impl GroupCommitQueue {
             // ordered WAL residue. The recovery object first waits for both
             // source tokens, then validates the exact on-disk interval while
             // RESERVED remains held.
-            if claim.reconcile_durability().await? == GroupCommitFlushDurability::InDoubt {
+            let reconciliation = match claim.reconcile_durability().await {
+                Ok(reconciliation) => reconciliation,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "in-doubt group-commit recovery remains queued without a terminal verdict"
+                    );
+                    return Err(FrankenError::BusyRecovery);
+                }
+            };
+            if reconciliation == GroupCommitFlushDurability::InDoubt {
                 return Ok(false);
             }
         }
@@ -26968,6 +26978,119 @@ mod tests {
             observed_lock_level,
             observed_unlock_trace_ids,
         )
+    }
+
+    struct FailOncePendingRecovery {
+        calls: Arc<AtomicUsize>,
+        durable_io_completed: Arc<AtomicBool>,
+    }
+
+    impl PendingGroupCommitRecoveryOperation for FailOncePendingRecovery {
+        fn reconcile(&self) -> LocalPagerFuture<'_, GroupCommitFlushDurability> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+            if call == 0 {
+                return Box::pin(std::future::ready(Err(FrankenError::internal(
+                    "forced pending-unlock reconciliation failure",
+                ))));
+            }
+            self.durable_io_completed
+                .store(true, AtomicOrdering::Release);
+            Box::pin(std::future::ready(Ok(GroupCommitFlushDurability::Durable)))
+        }
+    }
+
+    #[test]
+    fn test_pending_unlock_reconciliation_error_requeues_without_unlock() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("reconciliation-error test runtime should build");
+        runtime.block_on(async {
+            let cx = Cx::new();
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let flush_epoch = begin_pending_unlock_test_epoch(&queue);
+            let (db_file, observed_lock_level, observed_unlock_trace_ids) =
+                pending_unlock_test_db_file(&cx, Path::new("/pending-unlock-reconcile-error.db"));
+            let flush_obligation = GroupCommitFlushObligation::new(&queue, flush_epoch);
+            let durability_started = flush_obligation.durability_started_signal();
+            let durable_io_completed = flush_obligation.durable_io_signal();
+            durability_started.store(true, AtomicOrdering::Release);
+            let reconcile_calls = Arc::new(AtomicUsize::new(0));
+            let mut db_lock_obligation = GroupCommitDbLockObligation::new(
+                &queue,
+                flush_epoch,
+                &db_file,
+                &cx,
+                LockLevel::Shared,
+                durability_started,
+                Arc::clone(&durable_io_completed),
+                flush_obligation.external_lock_state(),
+            );
+            db_lock_obligation.set_recovery(Arc::new(FailOncePendingRecovery {
+                calls: Arc::clone(&reconcile_calls),
+                durable_io_completed,
+            }));
+
+            drop(db_lock_obligation);
+            drop(flush_obligation);
+            let error = queue
+                .resolve_one_pending_external_unlock()
+                .await
+                .expect_err("a missing terminal durability verdict must fail closed");
+            assert!(
+                matches!(error, FrankenError::BusyRecovery),
+                "reconciliation errors must surface BusyRecovery, got {error}"
+            );
+            assert_eq!(reconcile_calls.load(AtomicOrdering::Relaxed), 1);
+            assert_eq!(
+                queue
+                    .pending_external_unlocks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                1,
+                "the failed claimant must requeue the exact cleanup obligation"
+            );
+            assert!(
+                observed_unlock_trace_ids.lock().unwrap().is_empty(),
+                "a reconciliation error cannot authorize an external unlock"
+            );
+            assert_eq!(
+                *observed_lock_level
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                LockLevel::Reserved,
+                "RESERVED must remain held without a terminal durability verdict"
+            );
+            assert!(
+                !queue
+                    .failed_epochs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&flush_epoch),
+                "a reconciliation error must not be reinterpreted as Abort"
+            );
+            assert!(queue.has_unresolved_in_doubt_epoch());
+
+            assert!(
+                queue.resolve_one_pending_external_unlock().await.unwrap(),
+                "the requeued obligation must remain available to a later reconciler"
+            );
+            assert_eq!(reconcile_calls.load(AtomicOrdering::Relaxed), 2);
+            assert_eq!(
+                observed_unlock_trace_ids.lock().unwrap().len(),
+                1,
+                "the later durable verdict permits exactly one unlock"
+            );
+            assert_eq!(
+                *observed_lock_level
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                LockLevel::Shared
+            );
+            assert!(queue.is_epoch_complete(flush_epoch));
+            assert!(!queue.has_unresolved_in_doubt_epoch());
+        });
     }
 
     #[test]
