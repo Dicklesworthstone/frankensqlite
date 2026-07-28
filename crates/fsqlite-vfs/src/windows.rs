@@ -1834,6 +1834,14 @@ impl VfsFile for WindowsFile {
         self.unlock(cx, prior_level)
     }
 
+    fn lock_external_bounded_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        self.lock_external_shared_snapshot(cx)
+    }
+
+    fn unlock_external_bounded_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        self.unlock_external_shared_snapshot(cx)
+    }
+
     fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
         if self.external_shared_snapshot_prior_level.is_some() {
             return Err(FrankenError::internal(

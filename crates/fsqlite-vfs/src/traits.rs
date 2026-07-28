@@ -771,6 +771,27 @@ pub trait VfsFile: Send + Sync {
         self.unlock(cx, LockLevel::None)
     }
 
+    /// Acquire a stock-visible SHARED fence suitable for a bounded snapshot.
+    ///
+    /// Unlike the ordinary transaction fence, this lock must survive an
+    /// unrelated descriptor for the same inode being closed by this process.
+    /// Backends must refuse when they cannot provide that stronger lifetime
+    /// guarantee; silently falling back to process-associated POSIX locks
+    /// would permit a writer to cross a supposedly continuous proof snapshot.
+    fn lock_external_bounded_shared_snapshot(&mut self, _cx: &Cx) -> Result<()> {
+        Err(FrankenError::NotImplemented(
+            "bounded snapshots require a descriptor-owned stock-visible SHARED fence".to_owned(),
+        ))
+    }
+
+    /// Release a fence acquired by
+    /// [`Self::lock_external_bounded_shared_snapshot`].
+    fn unlock_external_bounded_shared_snapshot(&mut self, _cx: &Cx) -> Result<()> {
+        Err(FrankenError::NotImplemented(
+            "bounded snapshots require a descriptor-owned stock-visible SHARED fence".to_owned(),
+        ))
+    }
+
     /// Acquire the cross-process fence for an operation that replaces the
     /// complete main-database image in place.
     ///

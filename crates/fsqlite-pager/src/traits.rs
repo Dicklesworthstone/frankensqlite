@@ -623,6 +623,17 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// at commit time.
     fn get_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData>;
 
+    /// Observe fixed-residency accounting for an opt-in bounded read snapshot.
+    ///
+    /// Ordinary transactions return `None`. Pager-backed bounded readers
+    /// override this so callers that already hold the transaction handle do
+    /// not need to re-borrow a connection-owned transaction container.
+    fn bounded_read_snapshot_stats(
+        &self,
+    ) -> Result<Option<crate::pager::BoundedReadSnapshotStats>> {
+        Ok(None)
+    }
+
     /// Hint that `page_no` is likely to be read soon.
     ///
     /// Implementations should keep this best-effort and non-blocking. It is
@@ -1221,6 +1232,23 @@ impl std::fmt::Debug for TransactionKind {
 }
 
 impl TransactionKind {
+    /// Observe an opt-in bounded read-only snapshot without exposing
+    /// backend-specific transaction internals.
+    pub fn bounded_read_snapshot_stats(
+        &self,
+    ) -> Result<Option<crate::pager::BoundedReadSnapshotStats>> {
+        match self {
+            Self::Memory(txn) => txn.bounded_read_snapshot_stats(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(txn) => txn.bounded_read_snapshot_stats(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(txn) => txn.bounded_read_snapshot_stats(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(txn) => txn.bounded_read_snapshot_stats(),
+            Self::Mock(_) | Self::MemoryMock(_) | Self::Drained => Ok(None),
+        }
+    }
+
     /// The pager's live free-page set for this transaction (see
     /// [`SimpleTransaction::live_freelist_pages`]). Used by `PRAGMA
     /// integrity_check` (GH#113) to validate page ownership against the
@@ -1368,6 +1396,12 @@ impl TransactionHandle for TransactionKind {
                  cursor tried to read pages while the transaction was extracted."
             ),
         }
+    }
+
+    fn bounded_read_snapshot_stats(
+        &self,
+    ) -> Result<Option<crate::pager::BoundedReadSnapshotStats>> {
+        TransactionKind::bounded_read_snapshot_stats(self)
     }
 
     fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {

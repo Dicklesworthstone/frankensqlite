@@ -5,6 +5,8 @@
 //! (`FrankenError::Busy`) instead of queue-and-wait semantics.
 
 pub mod attach;
+#[cfg(not(target_arch = "wasm32"))]
+mod bounded_validation;
 pub mod commit_marker;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod commit_repair;

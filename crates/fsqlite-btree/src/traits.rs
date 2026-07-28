@@ -196,6 +196,14 @@ pub trait BtreeCursorOps: sealed::Sealed {
         Ok((rowid, Cow::Owned(self.payload(cx)?)))
     }
 
+    /// Return the encoded payload size at the current cursor position without
+    /// materializing overflow payload bytes.
+    ///
+    /// Callers that enforce allocation ceilings must consult this value before
+    /// [`Self::payload`], [`Self::payload_into`], or
+    /// [`Self::rowid_and_payload_cow`].
+    fn payload_size(&self, cx: &Cx) -> Result<usize>;
+
     /// Read only a prefix of the payload at the current cursor position into
     /// the provided buffer, clearing it first.
     fn payload_prefix_into(
@@ -413,6 +421,13 @@ impl BtreeCursorOps for MockBtreeCursor {
         buf.clear();
         buf.extend_from_slice(&self.entries[self.pos].1);
         Ok(())
+    }
+
+    fn payload_size(&self, _cx: &Cx) -> Result<usize> {
+        if self.at_eof {
+            return Err(fsqlite_error::FrankenError::internal("cursor at EOF"));
+        }
+        Ok(self.entries[self.pos].1.len())
     }
 
     fn payload_prefix_into(

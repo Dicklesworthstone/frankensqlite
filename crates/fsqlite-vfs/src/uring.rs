@@ -878,6 +878,14 @@ impl VfsFile for IoUringFile {
         self.inner.unlock(cx, level)
     }
 
+    fn lock_external_bounded_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.lock_external_bounded_shared_snapshot(cx)
+    }
+
+    fn unlock_external_bounded_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.unlock_external_bounded_shared_snapshot(cx)
+    }
+
     fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
         self.inner.check_reserved_lock(cx)
     }

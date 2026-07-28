@@ -104,6 +104,7 @@ use fsqlite_func::{
 use fsqlite_pager::ConnectionPagerOpenMode;
 pub use fsqlite_pager::pager::DatabaseImageReceipt;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
+pub use fsqlite_pager::{BoundedReadSnapshotStats, WriteSetStats};
 use fsqlite_pager::{
     CheckpointMode, JournalMode, PageCacheMetricsSnapshot, PageCachePageSnapshot,
     PagerCommitProfileSnapshot, PagerPublishedSnapshot, SimplePager, TransactionKind,
@@ -120,7 +121,7 @@ use fsqlite_planner::{
 use fsqlite_types::DATABASE_HEADER_SIZE;
 use fsqlite_types::cx::{CancelReason, Cx};
 use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
-use fsqlite_types::limits::MAX_VARIABLE_NUMBER;
+use fsqlite_types::limits::{BTREE_MAX_DEPTH, MAX_VARIABLE_NUMBER};
 use fsqlite_types::opcode::{Opcode, P4};
 #[cfg(not(test))]
 use fsqlite_types::record::set_record_profile_enabled;
@@ -134,8 +135,8 @@ use fsqlite_types::record::{
     try_build_runtime_precomputed_record_header,
 };
 use fsqlite_types::serial_type::{
-    serial_type_for_blob, serial_type_for_integer, serial_type_for_text, serial_type_len,
-    varint_len, write_varint,
+    SerialTypeClass, classify_serial_type, read_varint, serial_type_for_blob,
+    serial_type_for_integer, serial_type_for_text, serial_type_len, varint_len, write_varint,
 };
 use fsqlite_types::sync_primitives::{Instant, SystemTime};
 use fsqlite_types::value::{
@@ -480,6 +481,116 @@ fn fire_concurrent_commit_window_hook() {
     };
     if let Some(hook) = hook {
         hook();
+    }
+}
+
+/// Test-only interposition immediately after reserved Page 1 bootstrap closes
+/// and before the identity-bound schema-only builder reopens the target.
+/// Taking (rather than cloning) the hook makes each installation single-shot.
+#[cfg(test)]
+static FSQLITE_RESERVED_BUILDER_AFTER_BOOTSTRAP_HOOK: Mutex<
+    Option<Box<dyn FnOnce() + Send + 'static>>,
+> = Mutex::new(None);
+
+/// Test-only failure interposition after a reserved pager has durably
+/// bootstrapped Page 1 but before its namespace lease is finalized. This
+/// forces the exact mutation-before-error boundary that must never be fed
+/// through the generic retry loop for side-effect-free connection opens.
+#[cfg(test)]
+static FSQLITE_RESERVED_BUILDER_AFTER_PAGER_OPEN_HOOK: Mutex<
+    Option<Box<dyn FnOnce() -> Result<()> + Send + 'static>>,
+> = Mutex::new(None);
+
+#[cfg(test)]
+fn set_reserved_builder_after_pager_open_hook(
+    hook: Option<Box<dyn FnOnce() -> Result<()> + Send + 'static>>,
+) {
+    *FSQLITE_RESERVED_BUILDER_AFTER_PAGER_OPEN_HOOK
+        .lock()
+        .expect("reserved-builder pager-open hook mutex poisoned") = hook;
+}
+
+#[cfg(test)]
+fn fire_reserved_builder_after_pager_open_hook() -> Result<()> {
+    let hook = FSQLITE_RESERVED_BUILDER_AFTER_PAGER_OPEN_HOOK
+        .lock()
+        .expect("reserved-builder pager-open hook mutex poisoned")
+        .take();
+    hook.map_or(Ok(()), |hook| hook())
+}
+
+#[cfg(test)]
+fn set_reserved_builder_after_bootstrap_hook(hook: Option<Box<dyn FnOnce() + Send + 'static>>) {
+    *FSQLITE_RESERVED_BUILDER_AFTER_BOOTSTRAP_HOOK
+        .lock()
+        .expect("reserved-builder hook mutex poisoned") = hook;
+}
+
+#[cfg(test)]
+fn fire_reserved_builder_after_bootstrap_hook() {
+    let hook = FSQLITE_RESERVED_BUILDER_AFTER_BOOTSTRAP_HOOK
+        .lock()
+        .expect("reserved-builder hook mutex poisoned")
+        .take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+struct ReservedBuilderAfterBootstrapHookReset;
+
+#[cfg(test)]
+impl Drop for ReservedBuilderAfterBootstrapHookReset {
+    fn drop(&mut self) {
+        set_reserved_builder_after_bootstrap_hook(None);
+    }
+}
+
+#[cfg(test)]
+struct ReservedBuilderAfterPagerOpenHookReset;
+
+#[cfg(test)]
+impl Drop for ReservedBuilderAfterPagerOpenHookReset {
+    fn drop(&mut self) {
+        set_reserved_builder_after_pager_open_hook(None);
+    }
+}
+
+/// Test-only one-shot interposition immediately after a bounded validation
+/// transaction acquires its external snapshot fence and before any structural
+/// page is inspected. A separate stock-SQLite process uses this point to prove
+/// both immediate lock visibility and continuity through the later callback.
+#[cfg(test)]
+static FSQLITE_BOUNDED_VALIDATION_AFTER_BEGIN_HOOK: Mutex<
+    Option<Box<dyn FnOnce() + Send + 'static>>,
+> = Mutex::new(None);
+
+#[cfg(test)]
+fn set_bounded_validation_after_begin_hook(hook: Option<Box<dyn FnOnce() + Send + 'static>>) {
+    *FSQLITE_BOUNDED_VALIDATION_AFTER_BEGIN_HOOK
+        .lock()
+        .expect("bounded-validation hook mutex poisoned") = hook;
+}
+
+#[cfg(test)]
+fn fire_bounded_validation_after_begin_hook() {
+    let hook = FSQLITE_BOUNDED_VALIDATION_AFTER_BEGIN_HOOK
+        .lock()
+        .expect("bounded-validation hook mutex poisoned")
+        .take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+struct BoundedValidationAfterBeginHookReset;
+
+#[cfg(test)]
+impl Drop for BoundedValidationAfterBeginHookReset {
+    fn drop(&mut self) {
+        set_bounded_validation_after_begin_hook(None);
     }
 }
 
@@ -2166,6 +2277,12 @@ pub struct ConnectionEnv {
     page_buffer_max: Option<usize>,
     /// Explicit MemoryVfs growth policy for `:memory:` / imported in-memory databases.
     memory_vfs_config: Option<MemoryVfsConfig>,
+    /// Explicit opt-in page ceiling for physically read-only snapshots.
+    /// `None` preserves the ordinary unbounded repeatable-read path.
+    bounded_read_snapshot_page_limit: Option<usize>,
+    /// Opt-in hard dirty-page ceiling for the dedicated identity-bound
+    /// schema-only read-write builder opener.
+    schema_only_write_set_page_limit: Option<usize>,
     /// Strict multi-process mode. When enabled, the connection refuses
     /// to silently proceed past ambiguous concurrency states (open-time
     /// freelist drift, F_SETLK timeout, WAL checkpoint contention).
@@ -2184,6 +2301,8 @@ impl ConnectionEnv {
             runtime,
             page_buffer_max: None,
             memory_vfs_config: None,
+            bounded_read_snapshot_page_limit: None,
+            schema_only_write_set_page_limit: None,
             strict_multi_process: false,
         }
     }
@@ -2242,6 +2361,83 @@ impl ConnectionEnv {
     pub fn memory_vfs_config(&self) -> Option<MemoryVfsConfig> {
         self.memory_vfs_config
     }
+
+    /// Opt physically read-only schema-only connections into bounded snapshot
+    /// reads.
+    ///
+    /// Page bodies bypass transaction, shared-cache, and published-page
+    /// retention while the rollback/DELETE journal SHARED fence preserves
+    /// snapshot stability. Live WAL state, including a WAL-mode database
+    /// whose sidecar was just truncated, is refused until stock-compatible WAL
+    /// reader-slot fencing is available. `None` restores the default behavior.
+    /// This bounds snapshot-owned retained page state; it does not resize the
+    /// connection's general page-buffer pool or discard cache state that
+    /// existed before the bounded transaction. A zero limit is rejected when
+    /// the environment is used to open a connection.
+    pub fn set_bounded_read_snapshot_page_limit(&mut self, page_limit: impl Into<Option<usize>>) {
+        self.bounded_read_snapshot_page_limit = page_limit.into();
+    }
+
+    /// Return the explicitly configured bounded read-snapshot page limit.
+    #[must_use]
+    pub fn bounded_read_snapshot_page_limit(&self) -> Option<usize> {
+        self.bounded_read_snapshot_page_limit
+    }
+
+    fn validated_bounded_read_snapshot_page_limit(&self) -> Result<Option<usize>> {
+        if self.bounded_read_snapshot_page_limit == Some(0) {
+            return Err(FrankenError::OutOfRange {
+                what: "bounded read snapshot page limit".to_owned(),
+                value: "0".to_owned(),
+            });
+        }
+        Ok(self.bounded_read_snapshot_page_limit)
+    }
+
+    fn reject_bounded_read_snapshot_for_writable_open(&self) -> Result<()> {
+        if self.validated_bounded_read_snapshot_page_limit()?.is_some() {
+            return Err(FrankenError::ReadOnly);
+        }
+        Ok(())
+    }
+
+    /// Set a hard distinct-dirty-page ceiling for schema-only RW builder
+    /// transactions.
+    ///
+    /// The setting is accepted only by
+    /// [`Connection::open_existing_schema_only_read_write_with_expected_identity_and_env`].
+    /// Every new-page admission is refused before the write set can cross the
+    /// ceiling. `None` disables the builder ceiling.
+    pub fn set_schema_only_write_set_page_limit(&mut self, page_limit: impl Into<Option<usize>>) {
+        self.schema_only_write_set_page_limit = page_limit.into();
+    }
+
+    /// Return the configured schema-only builder write-set page ceiling.
+    #[must_use]
+    pub fn schema_only_write_set_page_limit(&self) -> Option<usize> {
+        self.schema_only_write_set_page_limit
+    }
+
+    fn validated_schema_only_write_set_page_limit(&self) -> Result<Option<usize>> {
+        if self.schema_only_write_set_page_limit == Some(0) {
+            return Err(FrankenError::OutOfRange {
+                what: "schema-only write-set page limit".to_owned(),
+                value: "0".to_owned(),
+            });
+        }
+        Ok(self.schema_only_write_set_page_limit)
+    }
+
+    fn reject_schema_only_write_set_limit_for_general_open(&self) -> Result<()> {
+        if self.validated_schema_only_write_set_page_limit()?.is_some() {
+            return Err(FrankenError::NotImplemented(
+                "schema-only write-set limits are available only on the identity-bound \
+                 existing-file schema-only read-write opener"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for ConnectionEnv {
@@ -2250,6 +2446,8 @@ impl Default for ConnectionEnv {
             runtime: RuntimeContext::global(),
             page_buffer_max: None,
             memory_vfs_config: None,
+            bounded_read_snapshot_page_limit: None,
+            schema_only_write_set_page_limit: None,
             strict_multi_process: false,
         }
     }
@@ -2264,6 +2462,502 @@ pub struct ConnectionMemoryStats {
     pub page_cache: PageCacheMetricsSnapshot,
     /// MemoryVfs usage snapshot for `:memory:` databases, when available.
     pub memory_vfs: Option<MemoryVfsUsageSnapshot>,
+}
+
+/// Proof counters and fixed residency bounds from a bounded structural
+/// ownership walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundedDatabaseStructuralStats {
+    /// Pager-level zero-retention snapshot evidence.
+    pub pager: BoundedReadSnapshotStats,
+    /// Database pages declared by the validated main-file image.
+    pub database_pages: u32,
+    /// B-tree and overflow pages marked by the structural ownership oracle.
+    pub structural_pages_visited: u64,
+    /// Anonymous on-disk ownership bytes (exactly one byte per database page).
+    pub ownership_spool_bytes: u64,
+    /// Fixed resident window used to scan the ownership spool for orphans.
+    pub ownership_scan_window_bytes: usize,
+    /// Hard maximum record payload accepted by this bounded validator.
+    pub maximum_record_bytes: usize,
+}
+
+/// Proof counters from full target validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundedDatabaseValidationStats {
+    /// Exact structural ownership proof for the same pinned image.
+    pub structural: BoundedDatabaseStructuralStats,
+    /// Ordinary ROWID table rows recomputed for index concordance.
+    pub table_rows_checked: u64,
+    /// Persisted index entries scanned for ordering, uniqueness, and counts.
+    pub index_entries_checked: u64,
+    /// Exact full-key index probes made from recomputed table rows.
+    pub index_point_probes: u64,
+}
+
+/// Retained create-new authority for a schema-only database builder target.
+///
+/// The reservation owns the exact descriptor that atomically created
+/// [`Self::path`]. Keeping it alive prevents file-identity reuse while
+/// [`Connection::initialize_reserved_schema_only_builder`] binds pager
+/// initialization and the returned builder connection to [`Self::identity`].
+/// Existing paths are never opened or truncated by reservation.
+#[derive(Debug)]
+pub struct DatabaseBuilderReservation {
+    path: PathBuf,
+    identity: FileIdentity,
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    reservation: std::fs::File,
+}
+
+impl DatabaseBuilderReservation {
+    /// Absolute, stable pathname atomically reserved for the builder.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Stable identity of the retained create-new descriptor.
+    #[must_use]
+    pub const fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+
+    /// Fail-closed final validation of the caller's retained create-new
+    /// authority.
+    ///
+    /// Call this after the private build and immediately before releasing this
+    /// reservation. The check proves that the retained descriptor is still a
+    /// regular file with the reserved identity, that the final no-follow
+    /// pathname still resolves to that exact identity, and, on Unix, that no
+    /// hard-link alias was introduced. When `expected_len` is present, both
+    /// descriptor and pathname must also have that exact byte length.
+    pub fn revalidate_final_target(&self, expected_len: Option<u64>) -> Result<()> {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        {
+            self.validate_single_link_reservation(expected_len)
+        }
+        #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
+        {
+            let _ = expected_len;
+            Err(FrankenError::Unsupported)
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    fn validate_single_link_reservation(&self, expected_len: Option<u64>) -> Result<()> {
+        let metadata = self.reservation.metadata()?;
+        if !metadata.is_file()
+            || expected_len.is_some_and(|expected| metadata.len() != expected)
+            || FileIdentity::from_file(&self.reservation)? != Some(self.identity)
+        {
+            return Err(FrankenError::CannotOpen {
+                path: self.path.clone(),
+            });
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if metadata.nlink() != 1 {
+                return Err(FrankenError::CannotOpen {
+                    path: self.path.clone(),
+                });
+            }
+        }
+
+        let current = fsqlite_vfs::host_fs::open_existing_regular_file_no_follow(&self.path)?;
+        let current_metadata = current.metadata()?;
+        if !current_metadata.is_file()
+            || expected_len.is_some_and(|expected| current_metadata.len() != expected)
+            || FileIdentity::from_file(&current)? != Some(self.identity)
+        {
+            return Err(FrankenError::CannotOpen {
+                path: self.path.clone(),
+            });
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if current_metadata.nlink() != 1 {
+                return Err(FrankenError::CannotOpen {
+                    path: self.path.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+const BOUNDED_VALIDATION_MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum number of persisted `sqlite_schema` objects admitted by one full
+/// schema load.
+pub const SCHEMA_LOAD_MAX_OBJECTS: usize = 4096;
+/// Maximum encoded SQL bytes admitted for one persisted schema object.
+pub const SCHEMA_LOAD_MAX_SQL_BYTES_PER_OBJECT: usize = 1024 * 1024;
+/// Maximum encoded SQL bytes admitted across one full schema load.
+pub const SCHEMA_LOAD_MAX_TOTAL_SQL_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum encoded bytes admitted for any schema identifier.
+pub const SCHEMA_LOAD_MAX_IDENTIFIER_BYTES: usize = 4 * 1024;
+/// Maximum aggregate encoded `sqlite_schema` record bytes admitted by one full
+/// schema load.
+pub const SCHEMA_LOAD_MAX_METADATA_BYTES: usize = 32 * 1024 * 1024;
+
+const BOUNDED_VALIDATION_MAX_SCHEMA_TABLES: usize = SCHEMA_LOAD_MAX_OBJECTS;
+const SCHEMA_RECORD_COLUMN_COUNT: usize = 5;
+const SCHEMA_RECORD_MAX_HEADER_BYTES: usize = 9 * (SCHEMA_RECORD_COLUMN_COUNT + 1);
+
+/// Observed resource use from the most recent successful full
+/// `sqlite_schema` load.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaLoadStats {
+    /// Number of persisted schema objects admitted.
+    pub objects: usize,
+    /// Aggregate encoded SQL bytes admitted.
+    pub sql_bytes: usize,
+    /// Aggregate encoded `sqlite_schema` record bytes admitted.
+    pub metadata_bytes: usize,
+    /// Largest encoded SQL value admitted for one object.
+    pub largest_sql_bytes: usize,
+    /// Largest encoded identifier token admitted from catalog columns or SQL.
+    pub largest_identifier_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct SchemaLoadBudget {
+    stats: SchemaLoadStats,
+}
+
+impl SchemaLoadBudget {
+    fn refusal(dimension: &'static str, limit: usize, attempted: usize) -> FrankenError {
+        tracing::warn!(
+            target: "fsqlite.schema",
+            dimension,
+            limit,
+            attempted,
+            "refusing persisted schema at fixed ingress ceiling"
+        );
+        FrankenError::SchemaLoadLimitExceeded {
+            dimension,
+            limit,
+            attempted,
+        }
+    }
+
+    fn require_at_most(dimension: &'static str, attempted: usize, limit: usize) -> Result<()> {
+        if attempted > limit {
+            Err(Self::refusal(dimension, limit, attempted))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn preflight_record(&self, metadata_bytes: usize) -> Result<()> {
+        Self::require_at_most(
+            "schema_objects",
+            self.stats.objects.saturating_add(1),
+            SCHEMA_LOAD_MAX_OBJECTS,
+        )?;
+        Self::require_at_most(
+            "aggregate_schema_metadata_bytes",
+            self.stats.metadata_bytes.saturating_add(metadata_bytes),
+            SCHEMA_LOAD_MAX_METADATA_BYTES,
+        )
+    }
+
+    /// Admit the dimensions derivable from a record header. This runs before
+    /// the loader reads overflow payload bytes, decodes values, clones
+    /// metadata, or parses SQL.
+    fn admit_dimensions(
+        &mut self,
+        metadata_bytes: usize,
+        identifier_bytes: &[usize],
+        sql_bytes: usize,
+    ) -> Result<()> {
+        self.preflight_record(metadata_bytes)?;
+        let attempted_objects = self.stats.objects.saturating_add(1);
+        let attempted_metadata = self.stats.metadata_bytes.saturating_add(metadata_bytes);
+
+        Self::require_at_most(
+            "sql_bytes_per_object",
+            sql_bytes,
+            SCHEMA_LOAD_MAX_SQL_BYTES_PER_OBJECT,
+        )?;
+        let attempted_sql = self.stats.sql_bytes.saturating_add(sql_bytes);
+        Self::require_at_most(
+            "aggregate_sql_bytes",
+            attempted_sql,
+            SCHEMA_LOAD_MAX_TOTAL_SQL_BYTES,
+        )?;
+
+        let largest_identifier = identifier_bytes.iter().copied().max().unwrap_or(0);
+        Self::require_at_most(
+            "identifier_bytes",
+            largest_identifier,
+            SCHEMA_LOAD_MAX_IDENTIFIER_BYTES,
+        )?;
+
+        self.stats.objects = attempted_objects;
+        self.stats.metadata_bytes = attempted_metadata;
+        self.stats.sql_bytes = attempted_sql;
+        self.stats.largest_sql_bytes = self.stats.largest_sql_bytes.max(sql_bytes);
+        self.stats.largest_identifier_bytes =
+            self.stats.largest_identifier_bytes.max(largest_identifier);
+        Ok(())
+    }
+
+    /// Inspect identifier tokens in admitted SQL before handing the SQL to the
+    /// parser. String literals and comments are skipped, so large literal data
+    /// does not masquerade as a schema identifier.
+    fn admit_sql_identifiers(&mut self, sql: &[u8]) -> Result<()> {
+        let largest_identifier = largest_sql_identifier_bytes(sql);
+        Self::require_at_most(
+            "identifier_bytes",
+            largest_identifier,
+            SCHEMA_LOAD_MAX_IDENTIFIER_BYTES,
+        )?;
+        self.stats.largest_identifier_bytes =
+            self.stats.largest_identifier_bytes.max(largest_identifier);
+        Ok(())
+    }
+
+    const fn stats(&self) -> SchemaLoadStats {
+        self.stats
+    }
+}
+
+fn largest_sql_identifier_bytes(sql: &[u8]) -> usize {
+    const fn is_identifier_start(byte: u8) -> bool {
+        byte.is_ascii_alphabetic() || byte == b'_' || byte >= 0x80
+    }
+    const fn is_identifier_continue(byte: u8) -> bool {
+        is_identifier_start(byte) || byte.is_ascii_digit() || byte == b'$'
+    }
+
+    let mut largest = 0usize;
+    let mut cursor = 0usize;
+    while cursor < sql.len() {
+        match sql[cursor] {
+            b'\'' => {
+                cursor += 1;
+                while cursor < sql.len() {
+                    if sql[cursor] == b'\'' {
+                        if sql.get(cursor + 1) == Some(&b'\'') {
+                            cursor += 2;
+                        } else {
+                            cursor += 1;
+                            break;
+                        }
+                    } else {
+                        cursor += 1;
+                    }
+                }
+            }
+            b'-' if sql.get(cursor + 1) == Some(&b'-') => {
+                cursor += 2;
+                while cursor < sql.len() && !matches!(sql[cursor], b'\n' | b'\r') {
+                    cursor += 1;
+                }
+            }
+            b'/' if sql.get(cursor + 1) == Some(&b'*') => {
+                cursor += 2;
+                while cursor + 1 < sql.len() && !(sql[cursor] == b'*' && sql[cursor + 1] == b'/') {
+                    cursor += 1;
+                }
+                cursor = (cursor + 2).min(sql.len());
+            }
+            quote @ (b'"' | b'`') => {
+                cursor += 1;
+                let mut raw_bytes = 0usize;
+                while cursor < sql.len() {
+                    if sql[cursor] == quote {
+                        if sql.get(cursor + 1) == Some(&quote) {
+                            raw_bytes = raw_bytes.saturating_add(2);
+                            cursor += 2;
+                            continue;
+                        }
+                        cursor += 1;
+                        break;
+                    }
+                    raw_bytes = raw_bytes.saturating_add(1);
+                    cursor += 1;
+                }
+                largest = largest.max(raw_bytes);
+            }
+            b'[' => {
+                cursor += 1;
+                let start = cursor;
+                while cursor < sql.len() && sql[cursor] != b']' {
+                    cursor += 1;
+                }
+                largest = largest.max(cursor.saturating_sub(start));
+                cursor = (cursor + usize::from(cursor < sql.len())).min(sql.len());
+            }
+            byte if is_identifier_start(byte) => {
+                let start = cursor;
+                cursor += 1;
+                while cursor < sql.len() && is_identifier_continue(sql[cursor]) {
+                    cursor += 1;
+                }
+                largest = largest.max(cursor - start);
+            }
+            _ => cursor += 1,
+        }
+    }
+    largest
+}
+
+fn schema_record_header_size(prefix: &[u8], payload_size: usize, rowid: i64) -> Result<usize> {
+    let (header_size, _) = read_varint(prefix).ok_or_else(|| FrankenError::DatabaseCorrupt {
+        detail: format!("sqlite_master row {rowid} has a malformed record-header size"),
+    })?;
+    let header_size = usize::try_from(header_size).unwrap_or(usize::MAX);
+    if header_size > payload_size || header_size > SCHEMA_RECORD_MAX_HEADER_BYTES {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "sqlite_master row {rowid} record header is {header_size} bytes; \
+                 exactly five columns require at most {SCHEMA_RECORD_MAX_HEADER_BYTES}"
+            ),
+        });
+    }
+    Ok(header_size)
+}
+
+fn schema_record_offsets(
+    header: &[u8],
+    payload_size: usize,
+    rowid: i64,
+) -> Result<[ColumnOffset; SCHEMA_RECORD_COLUMN_COUNT]> {
+    const EMPTY_OFFSET: ColumnOffset = ColumnOffset {
+        serial_type: 0,
+        body_offset: 0,
+        value_len: 0,
+    };
+
+    let (header_size, header_varint_len) =
+        read_varint(header).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: format!("sqlite_master row {rowid} has a malformed record header"),
+        })?;
+    let header_size = usize::try_from(header_size).unwrap_or(usize::MAX);
+    if header_size != header.len() || header_size < header_varint_len {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!("sqlite_master row {rowid} has an inconsistent record header"),
+        });
+    }
+
+    let mut offsets = [EMPTY_OFFSET; SCHEMA_RECORD_COLUMN_COUNT];
+    let mut header_cursor = header_varint_len;
+    let mut body_cursor = header_size;
+    let mut column_count = 0usize;
+    while header_cursor < header_size {
+        if column_count == SCHEMA_RECORD_COLUMN_COUNT {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "sqlite_master row {rowid} has more than {SCHEMA_RECORD_COLUMN_COUNT} columns"
+                ),
+            });
+        }
+        let (serial_type, consumed) =
+            read_varint(&header[header_cursor..]).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!("sqlite_master row {rowid} has a malformed column serial type"),
+            })?;
+        header_cursor =
+            header_cursor
+                .checked_add(consumed)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!("sqlite_master row {rowid} record header overflowed"),
+                })?;
+        let value_len =
+            usize::try_from(serial_type_len(serial_type).unwrap_or(u64::MAX)).unwrap_or(usize::MAX);
+        let body_end =
+            body_cursor
+                .checked_add(value_len)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!("sqlite_master row {rowid} record body overflowed"),
+                })?;
+        if body_end > payload_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("sqlite_master row {rowid} record body exceeds its payload"),
+            });
+        }
+        offsets[column_count] = ColumnOffset {
+            serial_type,
+            body_offset: u32::try_from(body_cursor).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!("sqlite_master row {rowid} record offset exceeds u32"),
+            })?,
+            value_len: u32::try_from(value_len).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!("sqlite_master row {rowid} record value exceeds u32"),
+            })?,
+        };
+        body_cursor = body_end;
+        column_count += 1;
+    }
+    if column_count != SCHEMA_RECORD_COLUMN_COUNT || body_cursor != payload_size {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "sqlite_master row {rowid} has {column_count} columns or trailing bytes; expected exactly {SCHEMA_RECORD_COLUMN_COUNT} columns"
+            ),
+        });
+    }
+    Ok(offsets)
+}
+
+fn validate_schema_record_types(
+    offsets: &[ColumnOffset; SCHEMA_RECORD_COLUMN_COUNT],
+    rowid: i64,
+) -> Result<()> {
+    for (column, label) in [(0, "type"), (1, "name"), (2, "tbl_name")] {
+        if classify_serial_type(offsets[column].serial_type) != SerialTypeClass::Text {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("sqlite_master row {rowid} {label} column must be TEXT"),
+            });
+        }
+    }
+    if !matches!(
+        classify_serial_type(offsets[3].serial_type),
+        SerialTypeClass::Integer | SerialTypeClass::Zero | SerialTypeClass::One
+    ) {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!("sqlite_master row {rowid} rootpage column must be INTEGER"),
+        });
+    }
+    if !matches!(
+        classify_serial_type(offsets[4].serial_type),
+        SerialTypeClass::Text | SerialTypeClass::Null
+    ) {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!("sqlite_master row {rowid} sql column must be TEXT or NULL"),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedBtreeKind {
+    Table,
+    Index,
+}
+
+/// Constant-size ordering witness returned by a bounded table-B-tree subtree
+/// walk. Carrying only extrema keeps resident validation state proportional to
+/// the fixed recursion-depth bound rather than the database page count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoundedTableSubtreeBounds {
+    min_rowid: i64,
+    max_rowid: i64,
+}
+
+#[derive(Debug, Default)]
+struct BoundedValidationCounters {
+    table_rows_checked: u64,
+    index_entries_checked: u64,
+    index_point_probes: u64,
+}
+
+#[derive(Debug)]
+struct BoundedIndexValidationSpec {
+    column_positions: Vec<usize>,
+    key_expressions: Vec<Expr>,
+    predicate: Option<Expr>,
 }
 
 impl ConnectionMemoryStats {
@@ -2372,6 +3066,12 @@ pub enum PagerBackend {
     /// Windows filesystem VFS backend (file-backed databases on Windows).
     #[cfg(all(feature = "native", target_os = "windows"))]
     Windows(Arc<SimplePager<fsqlite_vfs::WindowsVfs>>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaOnlyOpenAccess {
+    ReadOnly,
+    ReadWriteExisting,
 }
 
 impl std::fmt::Debug for PagerBackend {
@@ -2544,6 +3244,49 @@ impl PagerBackend {
             Self::Windows(p) => {
                 p.restore_vacuum_candidate_change_counter(cx, path, expected, change_counter)
             }
+        }
+    }
+
+    fn restore_vacuum_candidate_header_counters(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        expected: &DatabaseImageReceipt,
+        change_counter: u32,
+        version_valid_for: u32,
+    ) -> Result<DatabaseImageReceipt> {
+        match self {
+            Self::Memory(p) => p.restore_vacuum_candidate_header_counters(
+                cx,
+                path,
+                expected,
+                change_counter,
+                version_valid_for,
+            ),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.restore_vacuum_candidate_header_counters(
+                cx,
+                path,
+                expected,
+                change_counter,
+                version_valid_for,
+            ),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.restore_vacuum_candidate_header_counters(
+                cx,
+                path,
+                expected,
+                change_counter,
+                version_valid_for,
+            ),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.restore_vacuum_candidate_header_counters(
+                cx,
+                path,
+                expected,
+                change_counter,
+                version_valid_for,
+            ),
         }
     }
 
@@ -2748,10 +3491,30 @@ impl PagerBackend {
         page_buffer_max: Option<usize>,
         memory_vfs_config: Option<MemoryVfsConfig>,
     ) -> Result<Self> {
-        Self::open_with_requested_page_size_and_page_buffer_max(
+        Self::open_reserved_with_requested_page_size_and_page_buffer_max(
             path,
             cx,
             PageSize::DEFAULT,
+            expected_identity,
+            page_buffer_max,
+            memory_vfs_config,
+        )
+    }
+
+    /// Initialize a retained caller-reserved empty identity using the exact
+    /// requested database page size.
+    fn open_reserved_with_requested_page_size_and_page_buffer_max(
+        path: &str,
+        cx: &Cx,
+        requested_page_size: PageSize,
+        expected_identity: FileIdentity,
+        page_buffer_max: Option<usize>,
+        memory_vfs_config: Option<MemoryVfsConfig>,
+    ) -> Result<Self> {
+        Self::open_with_requested_page_size_and_page_buffer_max(
+            path,
+            cx,
+            requested_page_size,
             Some(expected_identity),
             page_buffer_max,
             memory_vfs_config,
@@ -2929,12 +3692,16 @@ impl PagerBackend {
         expected_identity: Option<FileIdentity>,
         page_buffer_max: Option<usize>,
         memory_vfs_config: Option<MemoryVfsConfig>,
+        bounded_read_snapshot_page_limit: Option<usize>,
     ) -> Result<Self> {
         if path == ":memory:" {
             if expected_identity.is_some() {
                 return Err(FrankenError::CannotOpen {
                     path: PathBuf::from(path),
                 });
+            }
+            if bounded_read_snapshot_page_limit.is_some() {
+                return Err(FrankenError::Unsupported);
             }
             return Self::open_with_page_buffer_max(path, cx, page_buffer_max, memory_vfs_config);
         }
@@ -2951,6 +3718,7 @@ impl PagerBackend {
                 ConnectionPagerOpenMode::ReadOnly(expected_identity),
             )?;
             let _ = pager.enable_single_connection_cache_fast_path();
+            pager.set_bounded_read_snapshot_page_limit(bounded_read_snapshot_page_limit)?;
             Ok(Self::IoUring(Arc::new(pager)))
         }
         #[cfg(all(feature = "native", unix, not(target_os = "linux")))]
@@ -2966,6 +3734,7 @@ impl PagerBackend {
                 ConnectionPagerOpenMode::ReadOnly(expected_identity),
             )?;
             let _ = pager.enable_single_connection_cache_fast_path();
+            pager.set_bounded_read_snapshot_page_limit(bounded_read_snapshot_page_limit)?;
             Ok(Self::Unix(Arc::new(pager)))
         }
         #[cfg(all(feature = "native", target_os = "windows"))]
@@ -2981,11 +3750,12 @@ impl PagerBackend {
                 ConnectionPagerOpenMode::ReadOnly(expected_identity),
             )?;
             let _ = pager.enable_single_connection_cache_fast_path();
+            pager.set_bounded_read_snapshot_page_limit(bounded_read_snapshot_page_limit)?;
             Ok(Self::Windows(Arc::new(pager)))
         }
         #[cfg(any(not(feature = "native"), not(any(unix, target_os = "windows"))))]
         {
-            let _ = expected_identity;
+            let _ = (expected_identity, bounded_read_snapshot_page_limit);
             Err(FrankenError::NotImplemented(
                 "file-backed pager not available on this platform".to_owned(),
             ))
@@ -3002,6 +3772,30 @@ impl PagerBackend {
             Self::Unix(p) => Ok(p.begin(cx, mode)?.into()),
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => Ok(p.begin(cx, mode)?.into()),
+        }
+    }
+
+    fn set_schema_only_write_set_page_limit(&self, page_limit: Option<usize>) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.set_schema_only_write_set_page_limit(page_limit),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.set_schema_only_write_set_page_limit(page_limit),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.set_schema_only_write_set_page_limit(page_limit),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.set_schema_only_write_set_page_limit(page_limit),
+        }
+    }
+
+    fn write_set_stats(&self) -> Option<WriteSetStats> {
+        match self {
+            Self::Memory(p) => p.write_set_stats(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.write_set_stats(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.write_set_stats(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.write_set_stats(),
         }
     }
 
@@ -8870,6 +9664,10 @@ pub struct Connection {
     prepared_direct_insert_append_hint: RefCell<Option<PreparedDirectInsertAppendHint>>,
     /// Schema registry: table metadata used by the code generator.
     schema: RefCell<Vec<TableSchema>>,
+    /// Resource accounting from the most recent successful full persisted
+    /// schema load. Schema-cookie fast paths retain the prior successful
+    /// observation because they do not ingest new schema metadata.
+    schema_load_stats: Cell<SchemaLoadStats>,
     /// HashMap side-index for O(1) schema name lookup.
     ///
     /// Keyed by lowercased table name, value is the index into `schema`.
@@ -9476,6 +10274,196 @@ impl Connection {
         )
     }
 
+    /// Atomically reserve a new schema-only builder target.
+    ///
+    /// The final path component is created with create-new/no-follow
+    /// semantics and owner-only permissions on Unix. Existing regular files,
+    /// hard links, directories, FIFOs, and live or dangling symlinks are
+    /// refused without opening, truncating, replacing, or unlinking them. The
+    /// returned value retains the create-new descriptor and exposes its exact
+    /// stable identity for the paired
+    /// [`Self::initialize_reserved_schema_only_builder`] call.
+    pub fn reserve_schema_only_builder_target(
+        path: impl AsRef<Path>,
+    ) -> Result<DatabaseBuilderReservation> {
+        Self::reserve_schema_only_builder_target_with_env(path, &ConnectionEnv::default())
+    }
+
+    /// Environment-bound form of [`Self::reserve_schema_only_builder_target`].
+    pub fn reserve_schema_only_builder_target_with_env(
+        path: impl AsRef<Path>,
+        env: &ConnectionEnv,
+    ) -> Result<DatabaseBuilderReservation> {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        {
+            let requested = path.as_ref();
+            let requested_text = requested.to_str().ok_or_else(|| FrankenError::CannotOpen {
+                path: requested.to_owned(),
+            })?;
+            if requested_text.is_empty() || requested_text == ":memory:" {
+                return Err(FrankenError::CannotOpen {
+                    path: requested.to_owned(),
+                });
+            }
+            let cx = env
+                .runtime()
+                .root_cx
+                .create_child()
+                .with_trace_context(next_trace_id(), 0, 0);
+            let stable = PagerBackend::resolve_stable_database_path(requested_text, &cx)?;
+            let stable_path = PathBuf::from(stable);
+            let reservation = fsqlite_vfs::host_fs::reserve_new_file(&stable_path).map_err(
+                |error| match error {
+                    FrankenError::Io(io_error)
+                        if io_error.kind() == std::io::ErrorKind::AlreadyExists =>
+                    {
+                        FrankenError::CannotOpen {
+                            path: stable_path.clone(),
+                        }
+                    }
+                    other => other,
+                },
+            )?;
+            let metadata = reservation.metadata()?;
+            let Some(identity) = FileIdentity::from_file(&reservation)? else {
+                return Err(FrankenError::CannotOpen { path: stable_path });
+            };
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                if !metadata.is_file() || metadata.len() != 0 || metadata.nlink() != 1 {
+                    return Err(FrankenError::CannotOpen { path: stable_path });
+                }
+            }
+            #[cfg(not(unix))]
+            if !metadata.is_file() || metadata.len() != 0 {
+                return Err(FrankenError::CannotOpen { path: stable_path });
+            }
+            Ok(DatabaseBuilderReservation {
+                path: stable_path,
+                identity,
+                reservation,
+            })
+        }
+        #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
+        {
+            let _ = (path, env);
+            Err(FrankenError::Unsupported)
+        }
+    }
+
+    /// Initialize a reserved target and return its bounded schema-only builder.
+    ///
+    /// This is the only create path that accepts
+    /// [`ConnectionEnv::set_schema_only_write_set_page_limit`]. The limit is
+    /// mandatory and must admit at least Page 1. Initialization first
+    /// revalidates the retained descriptor, single-link status, empty length,
+    /// final no-follow pathname, and identity. The pager then bootstraps Page 1
+    /// under its reserved-exclusive namespace lease using `page_size_bytes`.
+    /// Finally, the exact same identity is reopened through the existing-file
+    /// schema-only RW path with the write-set cap installed before schema
+    /// loading. No unbound path open can mutate a replacement object.
+    ///
+    /// The caller should retain `reservation` for at least this call. Keeping
+    /// it for the whole private build additionally prevents identity reuse.
+    pub fn initialize_reserved_schema_only_builder(
+        reservation: &DatabaseBuilderReservation,
+        page_size_bytes: u32,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        env.reject_bounded_read_snapshot_for_writable_open()?;
+        let page_limit = env
+            .validated_schema_only_write_set_page_limit()?
+            .ok_or_else(|| {
+                FrankenError::NotImplemented(
+                    "reserved schema-only builder initialization requires an explicit write-set page limit"
+                        .to_owned(),
+                )
+            })?;
+        if page_limit == 0 {
+            return Err(FrankenError::OutOfRange {
+                what: "schema-only write-set page limit".to_owned(),
+                value: "0".to_owned(),
+            });
+        }
+        let requested_page_size =
+            PageSize::new(page_size_bytes).ok_or_else(|| FrankenError::OutOfRange {
+                what: "page_size".to_owned(),
+                value: page_size_bytes.to_string(),
+            })?;
+
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        {
+            reservation.revalidate_final_target(Some(0))?;
+            let path_text = reservation
+                .path
+                .to_str()
+                .ok_or_else(|| FrankenError::CannotOpen {
+                    path: reservation.path.clone(),
+                })?;
+            let bootstrap_cx =
+                env.runtime()
+                    .root_cx
+                    .create_child()
+                    .with_trace_context(next_trace_id(), 0, 0);
+            let stable = PagerBackend::resolve_stable_database_path(path_text, &bootstrap_cx)?;
+            if Path::new(&stable) != reservation.path.as_path() {
+                return Err(FrankenError::CannotOpen {
+                    path: reservation.path.clone(),
+                });
+            }
+            // Unlike ordinary existing-file opens, reserved bootstrap mutates
+            // the target by durably writing Page 1. A Busy/BusyRecovery after
+            // that write must propagate as the original error. Retrying the
+            // whole operation would re-enter the empty-file ingress against
+            // the now-initialized target and replace the actionable error
+            // with a misleading CannotOpen.
+            let bootstrap = {
+                let bootstrap =
+                    PagerBackend::open_reserved_with_requested_page_size_and_page_buffer_max(
+                        &stable,
+                        &bootstrap_cx,
+                        requested_page_size,
+                        reservation.identity,
+                        env.page_buffer_max(),
+                        env.memory_vfs_config(),
+                    )?;
+                #[cfg(test)]
+                fire_reserved_builder_after_pager_open_hook()?;
+                bootstrap
+            };
+            bootstrap.finish_namespace_bootstrap()?;
+            drop(bootstrap);
+
+            #[cfg(test)]
+            fire_reserved_builder_after_bootstrap_hook();
+
+            reservation.revalidate_final_target(Some(u64::from(page_size_bytes)))?;
+            let conn = Self::open_schema_only_with_optional_expected_identity_and_env(
+                stable,
+                Some(reservation.identity),
+                env,
+                SchemaOnlyOpenAccess::ReadWriteExisting,
+            )?;
+            if conn.file_identity()? != Some(reservation.identity)
+                || conn.pager.page_size() != requested_page_size
+                || conn
+                    .write_set_stats()?
+                    .is_none_or(|stats| stats.page_limit != page_limit)
+            {
+                return Err(FrankenError::CannotOpen {
+                    path: reservation.path.clone(),
+                });
+            }
+            Ok(conn)
+        }
+        #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
+        {
+            let _ = (reservation, requested_page_size, page_limit, env);
+            Err(FrankenError::Unsupported)
+        }
+    }
+
     /// Open a connection with strict multi-process refusal enabled.
     ///
     /// Convenience shortcut for callers (CI harnesses, multi-agent
@@ -9557,7 +10545,12 @@ impl Connection {
     /// Behaves like [`open_schema_only`](Self::open_schema_only) but allows
     /// specifying a custom [`ConnectionEnv`].
     pub fn open_schema_only_with_env(path: impl Into<String>, env: ConnectionEnv) -> Result<Self> {
-        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env)
+        Self::open_schema_only_with_optional_expected_identity_and_env(
+            path,
+            None,
+            env,
+            SchemaOnlyOpenAccess::ReadOnly,
+        )
     }
 
     /// Open an identity-bound schema-only connection with an explicit runtime
@@ -9574,6 +10567,40 @@ impl Connection {
             path,
             Some(expected_identity),
             env,
+            SchemaOnlyOpenAccess::ReadOnly,
+        )
+    }
+
+    /// Open an existing identity-bound file for schema-only reading and
+    /// writing with an explicit runtime environment.
+    ///
+    /// This is the writable counterpart to
+    /// [`Self::open_schema_only_with_expected_identity_and_env`]. It never
+    /// creates a file, verifies the exact already-open file identity before
+    /// inspecting database bytes or sidecars, retains the native namespace
+    /// admission lease through bootstrap, and deliberately leaves
+    /// `MemDatabase` rows unhydrated. The caller must retain the descriptor
+    /// used to derive `expected_identity` until this method returns.
+    ///
+    /// Bounded read-only snapshot configuration is rejected on this writable
+    /// opener. Callers may opt into a hard per-transaction pager write-set
+    /// ceiling through
+    /// [`ConnectionEnv::set_schema_only_write_set_page_limit`]. The ceiling
+    /// admits each distinct dirty page before allocation and exposes exact
+    /// current/high-water page and byte telemetry through
+    /// [`Self::write_set_stats`]. Bounded builder transactions are intentionally
+    /// DELETE-mode, insert-only fresh-target batches; commit-time freelist
+    /// projection is typed-refused.
+    pub fn open_existing_schema_only_read_write_with_expected_identity_and_env(
+        path: impl Into<String>,
+        expected_identity: FileIdentity,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        Self::open_schema_only_with_optional_expected_identity_and_env(
+            path,
+            Some(expected_identity),
+            env,
+            SchemaOnlyOpenAccess::ReadWriteExisting,
         )
     }
 
@@ -9581,13 +10608,33 @@ impl Connection {
         path: impl Into<String>,
         expected_identity: Option<FileIdentity>,
         env: ConnectionEnv,
+        access: SchemaOnlyOpenAccess,
     ) -> Result<Self> {
         let path = path.into();
-        if path.is_empty() || (expected_identity.is_some() && path == ":memory:") {
+        if path.is_empty()
+            || (expected_identity.is_some() && path == ":memory:")
+            || (access == SchemaOnlyOpenAccess::ReadWriteExisting && expected_identity.is_none())
+        {
             return Err(FrankenError::CannotOpen {
                 path: std::path::PathBuf::from(path),
             });
         }
+        let bounded_read_snapshot_page_limit = match access {
+            SchemaOnlyOpenAccess::ReadOnly => {
+                env.reject_schema_only_write_set_limit_for_general_open()?;
+                env.validated_bounded_read_snapshot_page_limit()?
+            }
+            SchemaOnlyOpenAccess::ReadWriteExisting => {
+                env.reject_bounded_read_snapshot_for_writable_open()?;
+                None
+            }
+        };
+        let schema_only_write_set_page_limit = match access {
+            SchemaOnlyOpenAccess::ReadOnly => None,
+            SchemaOnlyOpenAccess::ReadWriteExisting => {
+                env.validated_schema_only_write_set_page_limit()?
+            }
+        };
         let attach_env = env.clone();
 
         let bootstrap_cx =
@@ -9596,14 +10643,23 @@ impl Connection {
                 .create_child()
                 .with_trace_context(next_trace_id(), 0, 0);
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
-        let pager = retry_busy_connection_bootstrap(|| {
-            PagerBackend::open_readonly_with_page_buffer_max(
+        let pager = retry_busy_connection_bootstrap(|| match access {
+            SchemaOnlyOpenAccess::ReadOnly => PagerBackend::open_readonly_with_page_buffer_max(
                 &path,
                 &bootstrap_cx,
                 expected_identity,
                 env.page_buffer_max(),
                 env.memory_vfs_config(),
-            )
+                bounded_read_snapshot_page_limit,
+            ),
+            SchemaOnlyOpenAccess::ReadWriteExisting => {
+                PagerBackend::open_existing_with_page_buffer_max(
+                    &path,
+                    &bootstrap_cx,
+                    expected_identity,
+                    env.page_buffer_max(),
+                )
+            }
         })?;
         let shared_mvcc_state = shared_mvcc_state_for_path(&path, Arc::clone(env.runtime()))?;
         let initial_visible_commit_seq = pager.published_snapshot().visible_commit_seq;
@@ -9668,6 +10724,7 @@ impl Connection {
             pending_direct_delete_leaf_run_active: Cell::new(false),
             prepared_direct_insert_append_hint: RefCell::new(None),
             schema: RefCell::new(Vec::new()),
+            schema_load_stats: Cell::new(SchemaLoadStats::default()),
             schema_by_name: RefCell::new(HashMap::new()),
             temp_table_names: RefCell::new(HashSet::new()),
             shadowed_main_tables: RefCell::new(HashMap::new()),
@@ -9807,7 +10864,29 @@ impl Connection {
         conn.register_cache_pages_module();
         conn.bootstrap_journal_mode_from_storage(false)?;
         conn.bootstrap_pragma_state_from_storage();
-        conn.apply_current_journal_mode_to_pager_readonly()?;
+        if bounded_read_snapshot_page_limit.is_some()
+            && conn
+                .pragma_state
+                .borrow()
+                .journal_mode
+                .eq_ignore_ascii_case("wal")
+        {
+            return Err(FrankenError::NotImplemented(
+                "bounded read snapshots require a self-contained database in rollback/DELETE \
+                 journal mode until stock-compatible WAL reader-slot fencing is available"
+                    .to_owned(),
+            ));
+        }
+        match access {
+            SchemaOnlyOpenAccess::ReadOnly => {
+                conn.apply_current_journal_mode_to_pager_readonly()?;
+            }
+            SchemaOnlyOpenAccess::ReadWriteExisting => {
+                conn.apply_current_journal_mode_to_pager()?;
+            }
+        }
+        conn.pager
+            .set_schema_only_write_set_page_limit(schema_only_write_set_page_limit)?;
         conn.apply_current_synchronous_to_pager()?;
         let op_cx = conn.op_cx()?;
         // Explicitly load schema only — never hydrate row data.
@@ -9864,6 +10943,8 @@ impl Connection {
         expected_identity: FileIdentity,
         env: ConnectionEnv,
     ) -> Result<Self> {
+        env.reject_bounded_read_snapshot_for_writable_open()?;
+        env.reject_schema_only_write_set_limit_for_general_open()?;
         let path = path.into();
         if path.is_empty() || path == ":memory:" {
             return Err(FrankenError::CannotOpen {
@@ -9894,6 +10975,8 @@ impl Connection {
         expected_identity: Option<FileIdentity>,
         env: ConnectionEnv,
     ) -> Result<Self> {
+        env.reject_bounded_read_snapshot_for_writable_open()?;
+        env.reject_schema_only_write_set_limit_for_general_open()?;
         let path = path.into();
         if path.is_empty() || path == ":memory:" {
             return Err(FrankenError::CannotOpen {
@@ -9928,6 +11011,8 @@ impl Connection {
         page_size_bytes: u32,
         env: ConnectionEnv,
     ) -> Result<Self> {
+        env.reject_bounded_read_snapshot_for_writable_open()?;
+        env.reject_schema_only_write_set_limit_for_general_open()?;
         let path = path.into();
         if path.is_empty() {
             return Err(FrankenError::CannotOpen {
@@ -9972,6 +11057,8 @@ impl Connection {
     /// Import a self-contained SQLite database image into an in-memory connection
     /// using the supplied runtime environment.
     pub fn import_bytes_with_env(bytes: &[u8], env: ConnectionEnv) -> Result<Self> {
+        env.reject_bounded_read_snapshot_for_writable_open()?;
+        env.reject_schema_only_write_set_limit_for_general_open()?;
         if bytes.is_empty() {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: "database image is empty".to_owned(),
@@ -10079,6 +11166,7 @@ impl Connection {
             pending_direct_delete_leaf_run_active: Cell::new(false),
             prepared_direct_insert_append_hint: RefCell::new(None),
             schema: RefCell::new(Vec::new()),
+            schema_load_stats: Cell::new(SchemaLoadStats::default()),
             schema_by_name: RefCell::new(HashMap::new()),
             temp_table_names: RefCell::new(HashSet::new()),
             shadowed_main_tables: RefCell::new(HashMap::new()),
@@ -10310,6 +11398,157 @@ impl Connection {
         self.pager.capture_vacuum_source_image(&cx)
     }
 
+    /// Prove exact page ownership for an already-receipted self-contained
+    /// database image with fixed resident memory.
+    ///
+    /// This source-side gate walks every `sqlite_schema` table/index root,
+    /// including WITHOUT ROWID index B-trees, every overflow chain, the
+    /// durable freelist, and auto-vacuum pointer-map pages. An anonymous
+    /// one-byte-per-page disk bitmap detects duplicate ownership, cycles,
+    /// out-of-range references, and orphan pages without an O(database)
+    /// resident map. Virtual/rootless schema rows contribute no root of their
+    /// own; their ordinary on-disk shadow-table roots are still walked.
+    ///
+    /// The image must remain byte- and identity-equal to `expected` before,
+    /// during, and after the pinned validation transaction. This method does
+    /// not perform table/index semantic concordance and does not mutate either
+    /// the image or this connection.
+    pub fn validate_database_image_structure_from_receipt_with_bounded_ownership(
+        &self,
+        expected: &DatabaseImageReceipt,
+        image_path: impl AsRef<Path>,
+        validation_page_limit: usize,
+    ) -> Result<BoundedDatabaseStructuralStats> {
+        self.with_database_image_structure_from_receipt_with_bounded_ownership(
+            expected,
+            image_path,
+            validation_page_limit,
+            |_pinned_image, stats| Ok(stats),
+        )
+    }
+
+    /// Run caller work inside the same exact, structurally-proven bounded
+    /// source snapshot.
+    ///
+    /// This is the continuous-snapshot form of
+    /// [`Self::validate_database_image_structure_from_receipt_with_bounded_ownership`].
+    /// After the expected full-image receipt is checked and the exact file
+    /// identity is opened physically read-only, this method begins one
+    /// deferred transaction, proves complete structural page ownership, and
+    /// invokes `use_snapshot` **before** releasing that transaction's shared
+    /// lock. The callback must perform every plan read or logical-copy read
+    /// through `pinned_image`; opening the path separately would leave the
+    /// proven snapshot.
+    ///
+    /// The callback result is returned only after the transaction rolls back,
+    /// the identity-bound handle closes, and a final full-image receipt proves
+    /// the source remained exactly equal to `expected`. In particular,
+    /// [`Self::capture_database_image_receipt`] must not be called from the
+    /// callback: it requires a quiescent connection and exclusive maintenance,
+    /// while this method deliberately holds an active read transaction.
+    pub fn with_database_image_structure_from_receipt_with_bounded_ownership<F, T>(
+        &self,
+        expected: &DatabaseImageReceipt,
+        image_path: impl AsRef<Path>,
+        validation_page_limit: usize,
+        use_snapshot: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(&Self, BoundedDatabaseStructuralStats) -> Result<T>,
+    {
+        if validation_page_limit == 0 {
+            return Err(FrankenError::OutOfRange {
+                what: "database image structural validation page limit".to_owned(),
+                value: "0".to_owned(),
+            });
+        }
+        if !self.pager.is_file_backed() {
+            return Err(FrankenError::Unsupported);
+        }
+        let image_path = image_path.as_ref();
+        let cx = self.op_cx()?;
+        let before = self
+            .pager
+            .inspect_self_contained_database_image(&cx, image_path)?;
+        if before != *expected {
+            return Err(FrankenError::BusySnapshot {
+                conflicting_pages: "bounded structural source receipt changed before validation"
+                    .to_owned(),
+            });
+        }
+
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        let validation_conn = {
+            let path = image_path
+                .to_str()
+                .ok_or_else(|| FrankenError::CannotOpen {
+                    path: image_path.to_owned(),
+                })?;
+            let mut env = self.attach_env.clone();
+            env.set_page_buffer_max(validation_page_limit);
+            env.set_bounded_read_snapshot_page_limit(validation_page_limit);
+            env.set_strict_multi_process(true);
+            Self::open_schema_only_with_expected_identity_and_env(
+                path.to_owned(),
+                expected.identity(),
+                env,
+            )?
+        };
+        #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
+        {
+            let _ = (expected, image_path);
+            return Err(FrankenError::Unsupported);
+        }
+
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        {
+            let spool_parent = image_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            validation_conn.begin_deferred_transaction()?;
+            let validation_result = validation_conn
+                .validate_database_structure_bounded(spool_parent)
+                .and_then(|stats| use_snapshot(&validation_conn, stats));
+            let rollback_result = validation_conn.rollback_transaction();
+            let result = match (validation_result, rollback_result) {
+                (Ok(value), Ok(())) => Ok(value),
+                (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+                (Err(validation_error), Err(rollback_error)) => {
+                    tracing::warn!(
+                        error = %rollback_error,
+                        image = %image_path.display(),
+                        "bounded structural validation failed and rollback also failed"
+                    );
+                    Err(validation_error)
+                }
+            };
+            let close_result = validation_conn.close();
+            let value = match (result, close_result) {
+                (Ok(value), Ok(())) => value,
+                (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+                (Err(validation_error), Err(close_error)) => {
+                    tracing::warn!(
+                        error = %close_error,
+                        image = %image_path.display(),
+                        "bounded structural validation failed and close also failed"
+                    );
+                    return Err(validation_error);
+                }
+            };
+            let after = self
+                .pager
+                .inspect_self_contained_database_image(&cx, image_path)?;
+            if after != *expected {
+                return Err(FrankenError::BusySnapshot {
+                    conflicting_pages:
+                        "bounded structural source receipt changed during validation".to_owned(),
+                });
+            }
+            Ok(value)
+        }
+    }
+
     /// Durably replace this connection's database with a private validated
     /// SQLite image while preserving the already-open main-file identity.
     ///
@@ -10352,7 +11591,13 @@ impl Connection {
     where
         F: FnOnce(&Self) -> Result<()>,
     {
-        self.publish_database_image_inner(source, candidate_path.as_ref(), None, validate)
+        self.publish_database_image_inner(
+            source,
+            candidate_path.as_ref(),
+            None,
+            None,
+            |candidate, _| validate(candidate),
+        )
     }
 
     /// Durably publish an already-receipted private database image.
@@ -10386,7 +11631,67 @@ impl Connection {
             source,
             candidate_path.as_ref(),
             Some(expected_candidate),
-            validate,
+            None,
+            |candidate, _| validate(candidate),
+        )
+    }
+
+    /// Durably publish an already-receipted private database image while
+    /// proving the complete candidate with bounded resident memory and a
+    /// physically read-only snapshot.
+    ///
+    /// This has the same candidate/source CAS, validation, rollback,
+    /// publication, and rebind semantics as
+    /// [`Self::publish_database_image_from_receipt`]. In addition, the
+    /// identity-bound validation connection is opened with a page-buffer
+    /// ceiling of `validation_page_limit` and begins one explicit deferred
+    /// transaction. A disk-backed one-byte-per-page ownership spool proves
+    /// every candidate page is owned exactly once without an O(database)
+    /// resident map. Ordinary ROWID-table indexes are then checked by bounded
+    /// table rescans plus exact point probes and ordered index scans, avoiding
+    /// O(rows) reconciliation maps. `validate` runs inside that exact same
+    /// physically read-only transaction, after the structural/semantic proof
+    /// and before rollback, so no writer can cross a snapshot generation
+    /// between proof and application checks. The callback receives both the
+    /// fixed residency bounds and semantic proof counters.
+    ///
+    /// The target contract intentionally accepts only fresh, self-contained
+    /// rollback/DELETE-mode images with `auto_vacuum=NONE` and an empty durable
+    /// freelist. Semantic validation supports ordinary ROWID tables and
+    /// built-in `BINARY`, `NOCASE`, and `RTRIM` collations, including UNIQUE,
+    /// partial, expression, DESC, and NULL-bearing indexes. WITHOUT ROWID,
+    /// virtual/generated-column, or custom-collation target schemas receive a
+    /// typed unsupported refusal rather than an incomplete proof.
+    pub fn publish_database_image_from_receipt_with_bounded_validation<F>(
+        &self,
+        source: &DatabaseImageReceipt,
+        expected_candidate: &DatabaseImageReceipt,
+        candidate_path: impl AsRef<Path>,
+        validation_page_limit: usize,
+        validate: F,
+    ) -> Result<DatabaseImagePublication>
+    where
+        F: FnOnce(&Self, BoundedDatabaseValidationStats) -> Result<()>,
+    {
+        if validation_page_limit == 0 {
+            return Err(FrankenError::OutOfRange {
+                what: "database image validation page limit".to_owned(),
+                value: "0".to_owned(),
+            });
+        }
+        self.publish_database_image_inner(
+            source,
+            candidate_path.as_ref(),
+            Some(expected_candidate),
+            Some(validation_page_limit),
+            move |candidate, stats| {
+                let stats = stats.ok_or_else(|| {
+                    FrankenError::internal(
+                        "bounded database image validation completed without proof statistics",
+                    )
+                })?;
+                validate(candidate, stats)
+            },
         )
     }
 
@@ -10395,10 +11700,11 @@ impl Connection {
         source: &DatabaseImageReceipt,
         candidate_path: &Path,
         expected_candidate: Option<&DatabaseImageReceipt>,
+        bounded_validation_page_limit: Option<usize>,
         validate: F,
     ) -> Result<DatabaseImagePublication>
     where
-        F: FnOnce(&Self) -> Result<()>,
+        F: FnOnce(&Self, Option<BoundedDatabaseValidationStats>) -> Result<()>,
     {
         if !self.pager.is_file_backed() {
             return Err(FrankenError::Unsupported);
@@ -10462,37 +11768,78 @@ impl Connection {
             &provisional_candidate,
             expected_change_counter,
         )?;
-        let repaired_candidate_check = self
-            .pager
-            .inspect_self_contained_database_image(&cx, candidate_path)?;
-        if repaired_candidate_check != repaired_candidate {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: "database candidate changed across source-derived change-counter repair"
-                    .to_owned(),
-            });
-        }
+        let validation_result = (|| -> Result<DatabaseImageReceipt> {
+            let repaired_candidate_check = self
+                .pager
+                .inspect_self_contained_database_image(&cx, candidate_path)?;
+            if repaired_candidate_check != repaired_candidate {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail:
+                        "database candidate changed across source-derived change-counter repair"
+                            .to_owned(),
+                });
+            }
 
-        self.validate_database_image(candidate_path, repaired_candidate.identity(), validate)?;
-        let validated_candidate = self
-            .pager
-            .inspect_self_contained_database_image(&cx, candidate_path)?;
-        if validated_candidate != repaired_candidate {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: "database candidate identity or content changed during semantic validation"
-                    .to_owned(),
-            });
-        }
-        if validated_candidate.header().change_counter != expected_change_counter
-            || validated_candidate.header().version_valid_for != expected_change_counter
-        {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "database candidate lost source-derived change-counter provenance: change_counter={}, version_valid_for={}, expected={expected_change_counter}",
-                    validated_candidate.header().change_counter,
-                    validated_candidate.header().version_valid_for
-                ),
-            });
-        }
+            self.validate_database_image(
+                candidate_path,
+                repaired_candidate.identity(),
+                bounded_validation_page_limit,
+                validate,
+            )?;
+            let validated_candidate = self
+                .pager
+                .inspect_self_contained_database_image(&cx, candidate_path)?;
+            if validated_candidate != repaired_candidate {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail:
+                        "database candidate identity or content changed during semantic validation"
+                            .to_owned(),
+                });
+            }
+            if validated_candidate.header().change_counter != expected_change_counter
+                || validated_candidate.header().version_valid_for != expected_change_counter
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "database candidate lost source-derived change-counter provenance: change_counter={}, version_valid_for={}, expected={expected_change_counter}",
+                        validated_candidate.header().change_counter,
+                        validated_candidate.header().version_valid_for
+                    ),
+                });
+            }
+            Ok(validated_candidate)
+        })();
+        let validated_candidate = match validation_result {
+            Ok(validated_candidate) => validated_candidate,
+            Err(validation_error) => {
+                let restored = self.pager.restore_vacuum_candidate_header_counters(
+                    &cx,
+                    candidate_path,
+                    &repaired_candidate,
+                    provisional_candidate.header().change_counter,
+                    provisional_candidate.header().version_valid_for,
+                );
+                match restored {
+                    Ok(restored) if restored == provisional_candidate => {
+                        return Err(validation_error);
+                    }
+                    Ok(_) => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "database candidate validation failed and exact provisional receipt restoration could not be proven: validation={validation_error}"
+                            ),
+                        });
+                    }
+                    Err(restore_error) => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "database candidate validation failed and exact provisional receipt restoration also failed: validation={validation_error}; restore={restore_error}"
+                            ),
+                        });
+                    }
+                }
+            }
+        };
 
         let restore_hydrated_rows = self.memdb_rows_loaded.get();
         self.pager.publish_validated_database_image(
@@ -10582,6 +11929,34 @@ impl Connection {
             page_cache: self.pager.cache_metrics_snapshot()?,
             memory_vfs: self.pager.memory_vfs_usage_snapshot()?,
         })
+    }
+
+    /// Observe the currently active opt-in bounded read snapshot.
+    ///
+    /// Returns `Ok(None)` when there is no active pager transaction or the
+    /// connection uses the ordinary snapshot path.
+    pub fn active_bounded_read_snapshot_stats(&self) -> Result<Option<BoundedReadSnapshotStats>> {
+        self.active_txn
+            .borrow()
+            .as_ref()
+            .map_or(Ok(None), TransactionKind::bounded_read_snapshot_stats)
+    }
+
+    /// Return current and latest-transaction high-water accounting for an
+    /// explicitly bounded schema-only builder write set.
+    ///
+    /// After commit or rollback, `current_dirty_pages` and
+    /// `current_dirty_bytes` are zero while the high-water fields retain the
+    /// completed batch's peak until the next transaction begins.
+    pub fn write_set_stats(&self) -> Result<Option<WriteSetStats>> {
+        Ok(self.pager.write_set_stats())
+    }
+
+    /// Return resource accounting from the most recent successful full
+    /// persisted-schema load.
+    #[must_use]
+    pub fn schema_load_stats(&self) -> SchemaLoadStats {
+        self.schema_load_stats.get()
     }
 
     /// Return the background-runtime health for this connection's database.
@@ -15410,6 +16785,18 @@ impl Connection {
     pub fn begin_transaction(&self) -> Result<()> {
         self.background_status()?;
         self.execute_begin(fsqlite_ast::BeginStatement { mode: None })
+    }
+
+    /// Begin an explicitly DEFERRED transaction without SQL parsing.
+    ///
+    /// Unlike [`Self::begin_transaction`], this never auto-promotes to
+    /// concurrent mode when `concurrent_mode_default` is enabled. It is the
+    /// transaction entry point for physically read-only bounded snapshots.
+    pub fn begin_deferred_transaction(&self) -> Result<()> {
+        self.background_status()?;
+        self.execute_begin(fsqlite_ast::BeginStatement {
+            mode: Some(fsqlite_ast::TransactionMode::Deferred),
+        })
     }
 
     /// Commit the active transaction without reparsing a `COMMIT` statement.
@@ -42669,10 +44056,11 @@ impl Connection {
         &self,
         image_path: &Path,
         expected_identity: FileIdentity,
+        bounded_validation_page_limit: Option<usize>,
         validate: F,
     ) -> Result<()>
     where
-        F: FnOnce(&Self) -> Result<()>,
+        F: FnOnce(&Self, Option<BoundedDatabaseValidationStats>) -> Result<()>,
     {
         let image_path_text = image_path
             .to_str()
@@ -42680,18 +44068,35 @@ impl Connection {
                 path: image_path.to_owned(),
             })?;
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-        let validation_conn = Self::open_schema_only_with_expected_identity(
-            image_path_text.to_owned(),
-            expected_identity,
-        )
-        .map_err(|err| {
-            FrankenError::Internal(format!(
-                "database candidate failed identity-bound pre-publication schema reload: {err}"
-            ))
-        })?;
+        let validation_conn = {
+            let opened = if let Some(page_limit) = bounded_validation_page_limit {
+                let mut env = self.attach_env.clone();
+                env.set_page_buffer_max(page_limit);
+                env.set_bounded_read_snapshot_page_limit(page_limit);
+                env.set_strict_multi_process(true);
+                Self::open_schema_only_with_expected_identity_and_env(
+                    image_path_text.to_owned(),
+                    expected_identity,
+                    env,
+                )
+            } else {
+                Self::open_schema_only_with_expected_identity(
+                    image_path_text.to_owned(),
+                    expected_identity,
+                )
+            };
+            opened.map_err(|err| {
+                FrankenError::Internal(format!(
+                    "database candidate failed identity-bound pre-publication schema reload: {err}"
+                ))
+            })?
+        };
         #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
         let validation_conn = {
             let _ = expected_identity;
+            if bounded_validation_page_limit.is_some() {
+                return Err(FrankenError::Unsupported);
+            }
             Self::open_schema_only(image_path_text.to_owned()).map_err(|err| {
                 FrankenError::Internal(format!(
                     "database candidate failed pre-publication schema reload: {err}"
@@ -42699,7 +44104,7 @@ impl Connection {
             })?
         };
 
-        let validation_result = (|| {
+        let run_integrity_checks = || -> Result<()> {
             for pragma in ["quick_check", "integrity_check"] {
                 let rows = validation_conn.query(&format!("PRAGMA {pragma};"))?;
                 let passed = rows.len() == 1
@@ -42724,8 +44129,46 @@ impl Connection {
                     });
                 }
             }
-            validate(&validation_conn)
-        })();
+            Ok(())
+        };
+        let validation_result = if bounded_validation_page_limit.is_some() {
+            // Foreign-key enforcement is transaction-scoped configuration:
+            // SQLite ignores attempts to change it after BEGIN. Configure it
+            // before pinning the continuous proof+callback snapshot.
+            match validation_conn
+                .execute("PRAGMA foreign_keys = ON;")
+                .and_then(|_| validation_conn.begin_deferred_transaction())
+            {
+                Ok(()) => {
+                    #[cfg(test)]
+                    fire_bounded_validation_after_begin_hook();
+                    let spool_parent = image_path
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .unwrap_or_else(|| Path::new("."));
+                    let bounded_result = validation_conn
+                        .validate_database_integrity_bounded(spool_parent)
+                        .and_then(|stats| validate(&validation_conn, Some(stats)));
+                    let rollback_result = validation_conn.rollback_transaction();
+                    match (bounded_result, rollback_result) {
+                        (Ok(()), Ok(())) => Ok(()),
+                        (Err(validation_error), Ok(())) => Err(validation_error),
+                        (Ok(_), Err(rollback_error)) => Err(rollback_error),
+                        (Err(validation_error), Err(rollback_error)) => {
+                            tracing::warn!(
+                                error = %rollback_error,
+                                image = %image_path.display(),
+                                "bounded database candidate validation failed and its transaction also failed to roll back"
+                            );
+                            Err(validation_error)
+                        }
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            run_integrity_checks().and_then(|()| validate(&validation_conn, None))
+        };
         let close_result = validation_conn.close();
         match (validation_result, close_result) {
             (Ok(()), Ok(())) => Ok(()),
@@ -42746,7 +44189,12 @@ impl Connection {
         &self,
         rebuild_target: &crate::vacuum::VacuumTargetReservation,
     ) -> Result<()> {
-        self.validate_database_image(rebuild_target.path(), rebuild_target.identity(), |_| Ok(()))?;
+        self.validate_database_image(
+            rebuild_target.path(),
+            rebuild_target.identity(),
+            None,
+            |_, _| Ok(()),
+        )?;
         #[cfg(test)]
         if self.fail_vacuum_rebuild_validation_once.replace(false) {
             return Err(FrankenError::Internal(
@@ -47786,6 +49234,1182 @@ impl Connection {
         result
     }
 
+    fn bounded_validation_refusal(detail: impl Into<String>) -> FrankenError {
+        FrankenError::NotImplemented(format!(
+            "bounded whole-image validation refused unsupported candidate shape: {}",
+            detail.into()
+        ))
+    }
+
+    fn validate_bounded_collations_in_sql(sql: &str, object_name: &str) -> Result<()> {
+        let tokens = collect_unquoted_sql_tokens(sql);
+        for pair in tokens.windows(2) {
+            if pair[0].eq_ignore_ascii_case("collate")
+                && !matches!(
+                    pair[1].to_ascii_lowercase().as_str(),
+                    "binary" | "nocase" | "rtrim"
+                )
+            {
+                return Err(Self::bounded_validation_refusal(format!(
+                    "`{object_name}` uses custom or unknown collation `{}`",
+                    pair[1]
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_bounded_schema_support(&self) -> Result<()> {
+        let schema = self.schema.borrow();
+        if schema.len() > BOUNDED_VALIDATION_MAX_SCHEMA_TABLES {
+            return Err(Self::bounded_validation_refusal(format!(
+                "schema contains {} tables, above the fixed limit {BOUNDED_VALIDATION_MAX_SCHEMA_TABLES}",
+                schema.len()
+            )));
+        }
+        let original_ddl = self.original_ddl_sql.borrow();
+        for table in schema.iter() {
+            if table.without_rowid {
+                return Err(Self::bounded_validation_refusal(format!(
+                    "WITHOUT ROWID table `{}`",
+                    table.name
+                )));
+            }
+            if table.root_page <= 0
+                || original_ddl
+                    .get(&table.name.to_ascii_lowercase())
+                    .is_some_and(|sql| is_virtual_table_sql(sql))
+            {
+                return Err(Self::bounded_validation_refusal(format!(
+                    "virtual or rootless table `{}`",
+                    table.name
+                )));
+            }
+            if let Some(column) = table
+                .columns
+                .iter()
+                .find(|column| column.generated_expr.is_some())
+            {
+                return Err(Self::bounded_validation_refusal(format!(
+                    "generated column `{}.{}`",
+                    table.name, column.name
+                )));
+            }
+            for index in &table.indexes {
+                if index.root_page <= 0 {
+                    return Err(Self::bounded_validation_refusal(format!(
+                        "rootless index `{}`",
+                        index.name
+                    )));
+                }
+                let term_count = index.key_term_count();
+                if term_count == 0 {
+                    return Err(Self::bounded_validation_refusal(format!(
+                        "zero-term index `{}`",
+                        index.name
+                    )));
+                }
+                if !index.key_sort_directions.is_empty()
+                    && index.key_sort_directions.len() != term_count
+                {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "index `{}` has {} key terms but {} sort directions",
+                            index.name,
+                            term_count,
+                            index.key_sort_directions.len()
+                        ),
+                    });
+                }
+                if !index.key_collations.is_empty() && index.key_collations.len() != term_count {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "index `{}` has {} key terms but {} collations",
+                            index.name,
+                            term_count,
+                            index.key_collations.len()
+                        ),
+                    });
+                }
+                for collation in index.key_collations.iter().flatten() {
+                    if !matches!(
+                        collation.to_ascii_lowercase().as_str(),
+                        "binary" | "nocase" | "rtrim"
+                    ) {
+                        return Err(Self::bounded_validation_refusal(format!(
+                            "index `{}` uses custom or unknown collation `{collation}`",
+                            index.name
+                        )));
+                    }
+                }
+                for expression in &index.key_expressions {
+                    Self::validate_bounded_collations_in_sql(expression, &index.name)?;
+                }
+                if let Some(predicate) = index.where_clause.as_deref() {
+                    Self::validate_bounded_collations_in_sql(predicate, &index.name)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn bounded_mark_overflow_chain(
+        cx: &Cx,
+        txn: &dyn TransactionHandle,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        owners: &mut crate::bounded_validation::PrivatePageOwnership,
+        first_overflow: PageNumber,
+        payload_size: u32,
+        local_size: u32,
+        owner: &str,
+    ) -> Result<()> {
+        let usable_size = page_size.usable(reserved_per_page);
+        if usable_size <= 4 || payload_size <= local_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("{owner} has invalid overflow sizing"),
+            });
+        }
+        let bytes_per_overflow = usize::try_from(usable_size - 4).unwrap_or(0);
+        let mut remaining = usize::try_from(payload_size - local_size).unwrap_or(usize::MAX);
+        let mut current = Some(first_overflow);
+        let mut overflow_index = 0_usize;
+        while remaining > 0 {
+            if overflow_index >= fsqlite_btree::overflow::MAX_OVERFLOW_CHAIN {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("{owner} overflow chain exceeds fixed safety bound"),
+                });
+            }
+            let page_no = current.ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!("{owner} overflow chain ended before its declared payload"),
+            })?;
+            owners.mark(page_size, page_no, 3, owner)?;
+            let page = txn.get_page(cx, page_no)?;
+            let bytes = page.as_ref();
+            if bytes.len() < 4 {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("overflow page {} is too small", page_no.get()),
+                });
+            }
+            let next_raw = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let available = bytes.len().saturating_sub(4).min(bytes_per_overflow);
+            if available == 0 {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("overflow page {} stores no payload bytes", page_no.get()),
+                });
+            }
+            remaining = remaining.saturating_sub(available.min(remaining));
+            current = PageNumber::new(next_raw);
+            if remaining == 0 && current.is_some() {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("{owner} overflow chain has trailing pages"),
+                });
+            }
+            if remaining > 0 && current.is_none() {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("{owner} overflow chain ended early"),
+                });
+            }
+            overflow_index = overflow_index.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_walk_btree(
+        cx: &Cx,
+        txn: &mut dyn TransactionHandle,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        owners: &mut crate::bounded_validation::PrivatePageOwnership,
+        page_no: PageNumber,
+        kind: BoundedBtreeKind,
+        owner_class: u8,
+        owner: &str,
+        depth: usize,
+    ) -> Result<Option<BoundedTableSubtreeBounds>> {
+        if depth >= usize::from(BTREE_MAX_DEPTH) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("{owner} exceeds the fixed B-tree depth limit {BTREE_MAX_DEPTH}"),
+            });
+        }
+        owners.mark(page_size, page_no, owner_class, owner)?;
+        let page = txn.get_page(cx, page_no)?;
+        let bytes = page.as_ref();
+        let header = BTreePageHeader::parse(
+            bytes,
+            page_size,
+            reserved_per_page,
+            page_no == PageNumber::ONE,
+        )
+        .map_err(|error| FrankenError::DatabaseCorrupt {
+            detail: format!("{owner} page {} header invalid: {error}", page_no.get()),
+        })?;
+        let pointers = header
+            .parse_cell_pointers(bytes, page_size, reserved_per_page)
+            .map_err(|error| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "{owner} page {} cell pointers invalid: {error}",
+                    page_no.get()
+                ),
+            })?;
+        header
+            .parse_freeblocks(bytes, page_size, reserved_per_page)
+            .map_err(|error| FrankenError::DatabaseCorrupt {
+                detail: format!("{owner} page {} freeblocks invalid: {error}", page_no.get()),
+            })?;
+        let page_type = fsqlite_btree::BtreePageType::from_flag(bytes[header.header_offset])
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!("{owner} page {} has invalid B-tree type", page_no.get()),
+            })?;
+        let expected_table = kind == BoundedBtreeKind::Table;
+        if page_type.is_table() != expected_table {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("{owner} page {} has the wrong B-tree kind", page_no.get()),
+            });
+        }
+
+        let usable_size = page_size.usable(reserved_per_page);
+        let parse_cell = |cell_index: usize, pointer: u16| -> Result<fsqlite_btree::CellRef> {
+            let cell =
+                fsqlite_btree::CellRef::parse(bytes, usize::from(pointer), page_type, usable_size)
+                    .map_err(|error| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "{owner} page {} cell {cell_index} invalid: {error}",
+                            page_no.get()
+                        ),
+                    })?;
+            if usize::try_from(cell.payload_size).unwrap_or(usize::MAX)
+                > BOUNDED_VALIDATION_MAX_RECORD_BYTES
+            {
+                return Err(Self::bounded_validation_refusal(format!(
+                    "{owner} page {} cell {cell_index} payload {} exceeds the fixed {}-byte record bound",
+                    page_no.get(),
+                    cell.payload_size,
+                    BOUNDED_VALIDATION_MAX_RECORD_BYTES
+                )));
+            }
+            Ok(cell)
+        };
+
+        if kind == BoundedBtreeKind::Index {
+            for (cell_index, pointer) in pointers.iter().copied().enumerate() {
+                let cell = parse_cell(cell_index, pointer)?;
+                if let Some(child) = cell.left_child {
+                    Self::bounded_walk_btree(
+                        cx,
+                        txn,
+                        page_size,
+                        reserved_per_page,
+                        owners,
+                        child,
+                        kind,
+                        owner_class,
+                        owner,
+                        depth.saturating_add(1),
+                    )?;
+                }
+                if let Some(first_overflow) = cell.overflow_page {
+                    Self::bounded_mark_overflow_chain(
+                        cx,
+                        txn,
+                        page_size,
+                        reserved_per_page,
+                        owners,
+                        first_overflow,
+                        cell.payload_size,
+                        cell.local_size,
+                        owner,
+                    )?;
+                }
+            }
+            if page_type.is_interior() {
+                let child =
+                    header
+                        .right_most_child
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "{owner} interior index page {} is missing its right child",
+                                page_no.get()
+                            ),
+                        })?;
+                Self::bounded_walk_btree(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    owners,
+                    child,
+                    kind,
+                    owner_class,
+                    owner,
+                    depth.saturating_add(1),
+                )?;
+            }
+            return Ok(None);
+        }
+
+        if page_type.is_leaf() {
+            let mut min_rowid = None;
+            let mut max_rowid = None;
+            let mut previous_rowid = None;
+            for (cell_index, pointer) in pointers.iter().copied().enumerate() {
+                let cell = parse_cell(cell_index, pointer)?;
+                let rowid = cell.rowid.ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "{owner} table leaf page {} cell {cell_index} is missing its rowid",
+                        page_no.get()
+                    ),
+                })?;
+                if previous_rowid.is_some_and(|previous| rowid <= previous) {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "{owner} table leaf page {} rowids are not strictly increasing: {rowid} after {}",
+                            page_no.get(),
+                            previous_rowid.unwrap_or_default()
+                        ),
+                    });
+                }
+                min_rowid.get_or_insert(rowid);
+                max_rowid = Some(rowid);
+                previous_rowid = Some(rowid);
+                if let Some(first_overflow) = cell.overflow_page {
+                    Self::bounded_mark_overflow_chain(
+                        cx,
+                        txn,
+                        page_size,
+                        reserved_per_page,
+                        owners,
+                        first_overflow,
+                        cell.payload_size,
+                        cell.local_size,
+                        owner,
+                    )?;
+                }
+            }
+            return Ok(min_rowid.zip(max_rowid).map(|(min_rowid, max_rowid)| {
+                BoundedTableSubtreeBounds {
+                    min_rowid,
+                    max_rowid,
+                }
+            }));
+        }
+
+        let mut overall_min = None;
+        let mut previous_separator = None;
+        for (cell_index, pointer) in pointers.iter().copied().enumerate() {
+            let cell = parse_cell(cell_index, pointer)?;
+            let left_child = cell
+                .left_child
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "{owner} interior table page {} cell {cell_index} is missing its left child",
+                        page_no.get()
+                    ),
+                })?;
+            let separator = cell.rowid.ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "{owner} interior table page {} cell {cell_index} is missing its separator rowid",
+                    page_no.get()
+                ),
+            })?;
+            if previous_separator.is_some_and(|previous| separator <= previous) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "{owner} interior table page {} separators are not strictly increasing: {separator} after {}",
+                        page_no.get(),
+                        previous_separator.unwrap_or_default()
+                    ),
+                });
+            }
+
+            let child_bounds = Self::bounded_walk_btree(
+                cx,
+                txn,
+                page_size,
+                reserved_per_page,
+                owners,
+                left_child,
+                kind,
+                owner_class,
+                owner,
+                depth.saturating_add(1),
+            )?;
+            if let Some(previous) = previous_separator
+                && child_bounds.is_some_and(|bounds| bounds.min_rowid <= previous)
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "{owner} interior table page {} child {} overlaps prior separator {previous}",
+                        page_no.get(),
+                        left_child.get()
+                    ),
+                });
+            }
+            if let Some(bounds) = child_bounds {
+                if bounds.max_rowid > separator {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "{owner} interior table page {} child {} maximum rowid {} exceeds separator {separator}",
+                            page_no.get(),
+                            left_child.get(),
+                            bounds.max_rowid
+                        ),
+                    });
+                }
+                overall_min.get_or_insert(bounds.min_rowid);
+            }
+            previous_separator = Some(separator);
+        }
+
+        let right_child = header
+            .right_most_child
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "{owner} interior table page {} is missing its right child",
+                    page_no.get()
+                ),
+            })?;
+        let right_bounds = Self::bounded_walk_btree(
+            cx,
+            txn,
+            page_size,
+            reserved_per_page,
+            owners,
+            right_child,
+            kind,
+            owner_class,
+            owner,
+            depth.saturating_add(1),
+        )?;
+        if let Some(previous) = previous_separator
+            && right_bounds.is_some_and(|bounds| bounds.min_rowid <= previous)
+        {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "{owner} interior table page {} right child {} overlaps separator {previous}",
+                    page_no.get(),
+                    right_child.get()
+                ),
+            });
+        }
+        if let Some(right_bounds) = right_bounds {
+            return Ok(Some(BoundedTableSubtreeBounds {
+                min_rowid: overall_min.unwrap_or(right_bounds.min_rowid),
+                max_rowid: right_bounds.max_rowid,
+            }));
+        }
+        if let Some(min_rowid) = overall_min {
+            return Ok(Some(BoundedTableSubtreeBounds {
+                min_rowid,
+                max_rowid: previous_separator
+                    .expect("interior table page with cells must have a separator"),
+            }));
+        }
+        Ok(None)
+    }
+
+    fn bounded_next_table_row(
+        cx: &Cx,
+        txn: &mut dyn TransactionHandle,
+        root_page: PageNumber,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        after_rowid: Option<i64>,
+    ) -> Result<Option<(i64, Vec<u8>)>> {
+        let mut cursor =
+            Self::new_header_btree_cursor(txn, root_page, page_size, reserved_per_page, true);
+        let positioned = match after_rowid {
+            None => cursor.first(cx)?,
+            Some(i64::MAX) => false,
+            Some(after) => {
+                let target = after.checked_add(1).ok_or(FrankenError::IntegerOverflow)?;
+                let _ = cursor.table_move_to(cx, target)?;
+                !cursor.eof()
+            }
+        };
+        if !positioned {
+            return Ok(None);
+        }
+        let rowid = cursor.rowid(cx)?;
+        if after_rowid.is_some_and(|after| rowid <= after) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table B-tree rowid scan failed to advance past {}",
+                    after_rowid.unwrap_or_default()
+                ),
+            });
+        }
+        let payload = cursor.payload(cx)?;
+        if payload.len() > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
+            return Err(Self::bounded_validation_refusal(format!(
+                "table row payload {} exceeds the fixed {}-byte record bound",
+                payload.len(),
+                BOUNDED_VALIDATION_MAX_RECORD_BYTES
+            )));
+        }
+        Ok(Some((rowid, payload)))
+    }
+
+    fn bounded_index_spec(
+        table: &TableSchema,
+        index: &IndexSchema,
+    ) -> Result<BoundedIndexValidationSpec> {
+        let column_positions = if index.key_expressions.is_empty() {
+            index
+                .columns
+                .iter()
+                .map(|column| {
+                    table
+                        .column_index(column)
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "index `{}` references unknown column `{column}` on table `{}`",
+                                index.name, table.name
+                            ),
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let key_expressions = index
+            .key_expressions
+            .iter()
+            .map(|expression| {
+                fsqlite_parser::expr::parse_expr(expression).map_err(|error| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "index `{}` has invalid key expression `{expression}`: {error}",
+                            index.name
+                        ),
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let predicate = Self::parse_partial_index_predicate_for_integrity(index)?;
+        Ok(BoundedIndexValidationSpec {
+            column_positions,
+            key_expressions,
+            predicate,
+        })
+    }
+
+    fn bounded_evaluate_index_expressions(
+        &self,
+        table: &TableSchema,
+        expressions: &[Expr],
+        rowid: i64,
+        row_values: &[SqliteValue],
+        rowid_alias_col_idx: Option<usize>,
+    ) -> Result<Vec<SqliteValue>> {
+        let mut eval_row = row_values.to_vec();
+        let mut col_map = table
+            .columns
+            .iter()
+            .map(|column| (table.name.clone(), column.name.clone(), false))
+            .collect::<Vec<_>>();
+        let shadows_rowid = table.columns.iter().any(|column| {
+            matches!(
+                column.name.to_ascii_lowercase().as_str(),
+                "rowid" | "_rowid_" | "oid"
+            )
+        });
+        if !shadows_rowid {
+            eval_row.push(SqliteValue::Integer(rowid));
+            col_map.push((table.name.clone(), "rowid".to_owned(), true));
+        }
+        let mut column_collations = table
+            .columns
+            .iter()
+            .map(|column| column.collation.clone())
+            .collect::<Vec<_>>();
+        let mut column_affinities = table
+            .columns
+            .iter()
+            .map(|column| affinity_char_to_type(column.affinity))
+            .collect::<Vec<_>>();
+        if !shadows_rowid {
+            column_collations.push(None);
+            column_affinities.push(TypeAffinity::Integer);
+        }
+        let _guard = JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
+            column_collations,
+            column_affinities,
+            registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
+        });
+        expressions
+            .iter()
+            .map(|expression| {
+                let mut expression = expression.clone();
+                if let Some(ipk_column) =
+                    rowid_alias_col_idx.and_then(|index| table.columns.get(index))
+                {
+                    rewrite_rowid_aliases_in_expr(&mut expression, table, &ipk_column.name);
+                }
+                eval_join_expr(&expression, &eval_row, &col_map)
+            })
+            .collect()
+    }
+
+    fn bounded_index_key(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        spec: &BoundedIndexValidationSpec,
+        rowid: i64,
+        row_values: &[SqliteValue],
+        rowid_alias_col_idx: Option<usize>,
+    ) -> Result<Vec<u8>> {
+        let mut values = if spec.key_expressions.is_empty() {
+            spec.column_positions
+                .iter()
+                .map(|position| {
+                    row_values.get(*position).cloned().ok_or_else(|| {
+                        FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "index `{}` references missing column position {position}",
+                                index.name
+                            ),
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            self.bounded_evaluate_index_expressions(
+                table,
+                &spec.key_expressions,
+                rowid,
+                row_values,
+                rowid_alias_col_idx,
+            )?
+        };
+        values.push(SqliteValue::Integer(rowid));
+        let value_bytes = values.iter().try_fold(0_usize, |total, value| {
+            let bytes = match value {
+                SqliteValue::Text(value) => value.len(),
+                SqliteValue::Blob(value) => value.len(),
+                SqliteValue::Null | SqliteValue::Integer(_) | SqliteValue::Float(_) => 9,
+            };
+            total.checked_add(bytes).ok_or(FrankenError::TooBig)
+        })?;
+        if value_bytes > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
+            return Err(Self::bounded_validation_refusal(format!(
+                "index `{}` computed key values exceed the fixed {}-byte record bound",
+                index.name, BOUNDED_VALIDATION_MAX_RECORD_BYTES
+            )));
+        }
+        let record = serialize_record(&values);
+        if record.len() > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
+            return Err(Self::bounded_validation_refusal(format!(
+                "index `{}` computed record {} exceeds the fixed {}-byte bound",
+                index.name,
+                record.len(),
+                BOUNDED_VALIDATION_MAX_RECORD_BYTES
+            )));
+        }
+        Ok(record)
+    }
+
+    fn bounded_unique_terms_equal(
+        &self,
+        index: &IndexSchema,
+        lhs: &[SqliteValue],
+        rhs: &[SqliteValue],
+    ) -> bool {
+        let term_count = index.key_term_count();
+        if lhs.len() < term_count
+            || rhs.len() < term_count
+            || lhs[..term_count]
+                .iter()
+                .any(|value| matches!(value, SqliteValue::Null))
+            || rhs[..term_count]
+                .iter()
+                .any(|value| matches!(value, SqliteValue::Null))
+        {
+            return false;
+        }
+        self.compare_index_key_values_for_integrity(index, &lhs[..term_count], &rhs[..term_count])
+            == Some(std::cmp::Ordering::Equal)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_validate_table_rows(
+        &self,
+        cx: &Cx,
+        txn: &mut dyn TransactionHandle,
+        table: &TableSchema,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        rowid_alias_col_idx: Option<usize>,
+        column_defaults: Option<&[Option<SqliteValue>]>,
+        counters: &mut BoundedValidationCounters,
+    ) -> Result<()> {
+        let root_page = page_number_from_schema_root(table.root_page, &table.name, "table")?;
+        let mut after = None;
+        while let Some((rowid, payload)) =
+            Self::bounded_next_table_row(cx, txn, root_page, page_size, reserved_per_page, after)?
+        {
+            let values = parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table `{}` rowid {rowid} payload is not a valid SQLite record",
+                    table.name
+                ),
+            })?;
+            if values.len() > table.columns.len() {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table `{}` rowid {rowid} stores {} columns but schema allows {}",
+                        table.name,
+                        values.len(),
+                        table.columns.len()
+                    ),
+                });
+            }
+            let _ = Self::inflate_table_row_values_for_integrity(
+                table,
+                rowid,
+                &values,
+                rowid_alias_col_idx,
+                column_defaults,
+            )?;
+            counters.table_rows_checked = counters.table_rows_checked.saturating_add(1);
+            after = Some(rowid);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_validate_index_concordance(
+        &self,
+        cx: &Cx,
+        txn: &mut dyn TransactionHandle,
+        table: &TableSchema,
+        index: &IndexSchema,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        rowid_alias_col_idx: Option<usize>,
+        column_defaults: Option<&[Option<SqliteValue>]>,
+        counters: &mut BoundedValidationCounters,
+    ) -> Result<()> {
+        let spec = Self::bounded_index_spec(table, index)?;
+        let table_root = page_number_from_schema_root(table.root_page, &table.name, "table")?;
+        let index_root = page_number_from_schema_root(index.root_page, &index.name, "index")?;
+        let descending = (0..index.key_term_count())
+            .map(|position| index.key_term_descending(position))
+            .collect::<Vec<_>>();
+        let collations = (0..index.key_term_count())
+            .map(|position| index.key_term_collation(position).map(str::to_owned))
+            .collect::<Vec<_>>();
+
+        let mut expected_count = 0_u64;
+        let mut after = None;
+        while let Some((rowid, payload)) =
+            Self::bounded_next_table_row(cx, txn, table_root, page_size, reserved_per_page, after)?
+        {
+            let payload_values =
+                parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table `{}` rowid {rowid} payload is not a valid SQLite record",
+                        table.name
+                    ),
+                })?;
+            let row_values = Self::inflate_table_row_values_for_integrity(
+                table,
+                rowid,
+                &payload_values,
+                rowid_alias_col_idx,
+                column_defaults,
+            )?;
+            counters.table_rows_checked = counters.table_rows_checked.saturating_add(1);
+            if self.row_matches_partial_index_for_integrity(
+                table,
+                spec.predicate.as_ref(),
+                rowid,
+                &row_values,
+                rowid_alias_col_idx,
+            )? {
+                let expected = self.bounded_index_key(
+                    table,
+                    index,
+                    &spec,
+                    rowid,
+                    &row_values,
+                    rowid_alias_col_idx,
+                )?;
+                let mut cursor = Self::new_header_btree_index_cursor(
+                    txn,
+                    index_root,
+                    page_size,
+                    reserved_per_page,
+                    descending.clone(),
+                    collations.clone(),
+                    Arc::clone(&self.collation_registry),
+                );
+                let found = cursor.index_move_to(cx, &expected)?;
+                counters.index_point_probes = counters.index_point_probes.saturating_add(1);
+                if !found.is_found() {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table `{}` rowid {rowid} is missing from index `{}`",
+                            table.name, index.name
+                        ),
+                    });
+                }
+                let actual = cursor.payload(cx)?;
+                if actual.as_slice() != expected.as_slice() {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "index `{}` entry for table `{}` rowid {rowid} is not byte-exact",
+                            index.name, table.name
+                        ),
+                    });
+                }
+                expected_count = expected_count.checked_add(1).ok_or(FrankenError::TooBig)?;
+            }
+            after = Some(rowid);
+        }
+
+        let mut actual_count = 0_u64;
+        let mut cursor = Self::new_header_btree_index_cursor(
+            txn,
+            index_root,
+            page_size,
+            reserved_per_page,
+            descending,
+            collations,
+            Arc::clone(&self.collation_registry),
+        );
+        let mut previous_payload: Option<Vec<u8>> = None;
+        let mut previous_values: Option<Vec<SqliteValue>> = None;
+        if cursor.first(cx)? {
+            loop {
+                let payload = cursor.payload(cx)?;
+                if payload.len() > BOUNDED_VALIDATION_MAX_RECORD_BYTES {
+                    return Err(Self::bounded_validation_refusal(format!(
+                        "index `{}` entry exceeds the fixed record bound",
+                        index.name
+                    )));
+                }
+                let values =
+                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!("index `{}` contains an invalid record", index.name),
+                    })?;
+                if values.len() != index.key_term_count().saturating_add(1)
+                    || !matches!(values.last(), Some(SqliteValue::Integer(_)))
+                {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "index `{}` entry does not contain exactly {} key terms plus an integer rowid",
+                            index.name,
+                            index.key_term_count()
+                        ),
+                    });
+                }
+                if let (Some(previous_payload), Some(previous_values)) =
+                    (previous_payload.as_ref(), previous_values.as_ref())
+                {
+                    let ordering = self
+                        .compare_index_key_values_for_integrity(index, previous_values, &values)
+                        .unwrap_or_else(|| previous_payload.as_slice().cmp(payload.as_slice()));
+                    if ordering != std::cmp::Ordering::Less {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "index `{}` entries are duplicate or out of declared collation/direction order",
+                                index.name
+                            ),
+                        });
+                    }
+                    if index.is_unique
+                        && self.bounded_unique_terms_equal(index, previous_values, &values)
+                    {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "UNIQUE index `{}` contains duplicate non-NULL logical keys",
+                                index.name
+                            ),
+                        });
+                    }
+                }
+                previous_payload = Some(payload);
+                previous_values = Some(values);
+                actual_count = actual_count.checked_add(1).ok_or(FrankenError::TooBig)?;
+                counters.index_entries_checked = counters.index_entries_checked.saturating_add(1);
+                if !cursor.next(cx)? {
+                    break;
+                }
+            }
+        }
+        if actual_count != expected_count {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "index `{}` contains {actual_count} entries but table `{}` requires exactly {expected_count}",
+                    index.name, table.name
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn bounded_mark_durable_freelist(
+        cx: &Cx,
+        txn: &dyn TransactionHandle,
+        page_size: PageSize,
+        owners: &mut crate::bounded_validation::PrivatePageOwnership,
+        freelist_trunk: u32,
+        freelist_count: u32,
+    ) -> Result<()> {
+        let mut counted = 0_u32;
+        let mut next = PageNumber::new(freelist_trunk);
+        let mut trunk_index = 0_usize;
+        while let Some(trunk_page) = next {
+            owners.mark(page_size, trunk_page, 4, "freelist trunk")?;
+            let page = txn.get_page(cx, trunk_page)?;
+            let trunk =
+                fsqlite_btree::freelist::FreelistTrunk::parse(page.as_ref()).map_err(|error| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "freelist trunk page {} is malformed: {error}",
+                            trunk_page.get()
+                        ),
+                    }
+                })?;
+            counted = counted.checked_add(1).ok_or(FrankenError::TooBig)?;
+            for leaf in trunk.leaf_pages.iter().copied() {
+                owners.mark(page_size, leaf, 4, "freelist leaf")?;
+                counted = counted.checked_add(1).ok_or(FrankenError::TooBig)?;
+            }
+            next = trunk.next_trunk;
+            trunk_index = trunk_index.saturating_add(1);
+            if u32::try_from(trunk_index).unwrap_or(u32::MAX) > freelist_count {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "freelist trunk cycle or overlong chain".to_owned(),
+                });
+            }
+        }
+        if counted != freelist_count {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "freelist header claims {freelist_count} pages but structural walk found {counted}"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_validate_structure_in_txn(
+        &self,
+        cx: &Cx,
+        txn: &mut dyn TransactionHandle,
+        spool_parent: &Path,
+        require_fresh_target: bool,
+    ) -> Result<BoundedDatabaseStructuralStats> {
+        let page1 = txn.get_page(cx, PageNumber::ONE)?;
+        let bytes = page1.as_ref();
+        if bytes.iter().all(|byte| *byte == 0) || bytes.len() < DATABASE_HEADER_SIZE {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "bounded structural candidate has no initialized page 1".to_owned(),
+            });
+        }
+        let header = parse_database_header_checked(bytes)?;
+        if header.write_version != 1 || header.read_version != 1 {
+            return Err(Self::bounded_validation_refusal(
+                "main header is not rollback/DELETE mode",
+            ));
+        }
+        if require_fresh_target && (header.largest_root_page != 0 || header.incremental_vacuum != 0)
+        {
+            return Err(Self::bounded_validation_refusal(
+                "target auto_vacuum or incremental_vacuum is enabled",
+            ));
+        }
+        if require_fresh_target && (header.freelist_trunk != 0 || header.freelist_count != 0) {
+            return Err(Self::bounded_validation_refusal(format!(
+                "fresh target requires freelist=0, observed trunk={} count={}",
+                header.freelist_trunk, header.freelist_count
+            )));
+        }
+        let published_pages = self.pager.refresh_published_snapshot(cx)?.db_size;
+        if published_pages != header.page_count || published_pages == 0 {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "bounded candidate page extent mismatch: header={} snapshot={published_pages}",
+                    header.page_count
+                ),
+            });
+        }
+        if self.schema.borrow().len() > BOUNDED_VALIDATION_MAX_SCHEMA_TABLES {
+            return Err(Self::bounded_validation_refusal(format!(
+                "schema contains {} tables, above the fixed limit {BOUNDED_VALIDATION_MAX_SCHEMA_TABLES}",
+                self.schema.borrow().len()
+            )));
+        }
+
+        let mut owners =
+            crate::bounded_validation::PrivatePageOwnership::create(spool_parent, published_pages)?;
+        let auto_vacuum = header.largest_root_page != 0;
+        if auto_vacuum {
+            let usable_size = header.page_size.usable(header.reserved_per_page);
+            for raw_page in 2..=published_pages {
+                let page = PageNumber::new(raw_page).ok_or_else(|| {
+                    FrankenError::internal("non-zero pointer-map page number expected")
+                })?;
+                if fsqlite_btree::freelist::is_ptrmap_page(
+                    page,
+                    usable_size,
+                    header.page_size.get(),
+                ) {
+                    owners.mark(header.page_size, page, 5, "auto-vacuum pointer-map page")?;
+                }
+            }
+        }
+        Self::bounded_mark_durable_freelist(
+            cx,
+            txn,
+            header.page_size,
+            &mut owners,
+            header.freelist_trunk,
+            header.freelist_count,
+        )?;
+        Self::bounded_walk_btree(
+            cx,
+            txn,
+            header.page_size,
+            header.reserved_per_page,
+            &mut owners,
+            PageNumber::ONE,
+            BoundedBtreeKind::Table,
+            1,
+            "sqlite_schema",
+            0,
+        )?;
+        let schema_len = self.schema.borrow().len();
+        for table_index in 0..schema_len {
+            let table = self.schema.borrow()[table_index].clone();
+            if table.root_page <= 0 {
+                continue;
+            }
+            let table_root = page_number_from_schema_root(table.root_page, &table.name, "table")?;
+            if table_root == PageNumber::ONE {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "user table `{}` illegally aliases sqlite_schema root page 1",
+                        table.name
+                    ),
+                });
+            }
+            Self::bounded_walk_btree(
+                cx,
+                txn,
+                header.page_size,
+                header.reserved_per_page,
+                &mut owners,
+                table_root,
+                if table.without_rowid {
+                    BoundedBtreeKind::Index
+                } else {
+                    BoundedBtreeKind::Table
+                },
+                1,
+                &format!("table `{}`", table.name),
+                0,
+            )?;
+            for index in &table.indexes {
+                let index_root =
+                    page_number_from_schema_root(index.root_page, &index.name, "index")?;
+                Self::bounded_walk_btree(
+                    cx,
+                    txn,
+                    header.page_size,
+                    header.reserved_per_page,
+                    &mut owners,
+                    index_root,
+                    BoundedBtreeKind::Index,
+                    2,
+                    &format!("index `{}`", index.name),
+                    0,
+                )?;
+            }
+        }
+        if let Some(orphan) = owners.first_unowned(header.page_size)? {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("page {} is never used", orphan.get()),
+            });
+        }
+        let pager = txn
+            .bounded_read_snapshot_stats()?
+            .ok_or_else(|| FrankenError::internal("bounded oracle lost pager statistics"))?;
+        Ok(BoundedDatabaseStructuralStats {
+            pager,
+            database_pages: published_pages,
+            structural_pages_visited: owners.marked_pages(),
+            ownership_spool_bytes: owners.spool_bytes(),
+            ownership_scan_window_bytes: crate::bounded_validation::OWNERSHIP_SCAN_WINDOW_BYTES,
+            maximum_record_bytes: BOUNDED_VALIDATION_MAX_RECORD_BYTES,
+        })
+    }
+
+    fn validate_database_structure_bounded(
+        &self,
+        spool_parent: &Path,
+    ) -> Result<BoundedDatabaseStructuralStats> {
+        self.with_integrity_txn(|cx, txn| {
+            self.bounded_validate_structure_in_txn(cx, txn, spool_parent, false)
+        })
+    }
+
+    fn validate_database_integrity_bounded(
+        &self,
+        spool_parent: &Path,
+    ) -> Result<BoundedDatabaseValidationStats> {
+        self.validate_bounded_schema_support()?;
+        let rowid_aliases = self.rowid_alias_column_by_root_page();
+        let column_defaults = self.column_defaults_by_root_page();
+        self.with_integrity_txn(|cx, txn| {
+            let structural = self.bounded_validate_structure_in_txn(cx, txn, spool_parent, true)?;
+            let page1 = txn.get_page(cx, PageNumber::ONE)?;
+            let header = parse_database_header_checked(page1.as_ref())?;
+            let schema_len = self.schema.borrow().len();
+
+            let mut counters = BoundedValidationCounters::default();
+            for table_index in 0..schema_len {
+                let table = self.schema.borrow()[table_index].clone();
+                let rowid_alias_col_idx = rowid_aliases.get(&table.root_page).copied();
+                let defaults = column_defaults.get(&table.root_page).map(Vec::as_slice);
+                self.bounded_validate_table_rows(
+                    cx,
+                    txn,
+                    &table,
+                    header.page_size,
+                    header.reserved_per_page,
+                    rowid_alias_col_idx,
+                    defaults,
+                    &mut counters,
+                )?;
+                for index in &table.indexes {
+                    self.bounded_validate_index_concordance(
+                        cx,
+                        txn,
+                        &table,
+                        index,
+                        header.page_size,
+                        header.reserved_per_page,
+                        rowid_alias_col_idx,
+                        defaults,
+                        &mut counters,
+                    )?;
+                }
+            }
+            Ok(BoundedDatabaseValidationStats {
+                structural,
+                table_rows_checked: counters.table_rows_checked,
+                index_entries_checked: counters.index_entries_checked,
+                index_point_probes: counters.index_point_probes,
+            })
+        })
+    }
+
     fn validate_database_integrity(&self, quick: bool) -> Result<()> {
         // GH#113: when a write transaction is active, `with_integrity_txn`
         // reuses it, so the integrity walk reads uncommitted btree pages. But
@@ -47804,6 +50428,13 @@ impl Connection {
             .active_txn
             .borrow()
             .as_ref()
+            // Only a writer owns an authoritative in-transaction freelist
+            // projection. A physically read-only schema connection
+            // intentionally skips freelist hydration, so treating its empty
+            // vector as authoritative would make integrity_check ignore the
+            // durable trunk chain (and then misclassify valid free pages as
+            // orphans).
+            .filter(|txn| txn.is_writer())
             .map(|txn| (txn.live_freelist_pages(), txn.live_db_size()));
         self.with_integrity_txn(|cx, txn| {
             let page1 = txn.get_page(cx, PageNumber::ONE)?;
@@ -63530,6 +66161,7 @@ impl Connection {
             *self.next_master_rowid.borrow_mut() = 1;
             *self.schema_cookie.borrow_mut() = 0;
             self.schema_generation.set(0);
+            self.schema_load_stats.set(SchemaLoadStats::default());
             *self.change_counter.borrow_mut() = 0;
             // bd-#70 wedge extension: raise the finalized commit clock floor.
             self.set_memdb_visible_commit_seq_from_publication(bound_visible_commit_seq);
@@ -63648,18 +66280,78 @@ impl Connection {
             .can_preserve_existing_live_vtabs_after_reload(bound_visible_commit_seq, schema_cookie);
 
         // Read sqlite_master entries from page 1's B-tree.
-        let (master_entries, max_master_rowid) = {
+        let (master_entries, max_master_rowid, schema_load_stats) = {
             let mut entries = Vec::new();
             let mut max_rowid = 0_i64;
+            let mut budget = SchemaLoadBudget::default();
+            let mut header_prefix = Vec::with_capacity(SCHEMA_RECORD_MAX_HEADER_BYTES);
+            let mut payload_buffer = Vec::new();
             let master_root = PageNumber::ONE;
             let mut cursor =
                 Self::new_header_btree_cursor(txn, master_root, page_size, reserved_per_page, true);
 
             if cursor.first(cx)? {
                 loop {
-                    let (rowid, payload) = cursor.rowid_and_payload_cow(cx)?;
+                    let rowid = cursor.rowid(cx)?;
+                    let payload_size = cursor.payload_size(cx)?;
+                    // The encoded size is available from the B-tree cell
+                    // header without materializing overflow bytes. Reject the
+                    // two aggregate dimensions before even reading the small
+                    // record-header prefix.
+                    budget.preflight_record(payload_size)?;
+
+                    cursor.payload_prefix_into(cx, payload_size.min(9), &mut header_prefix)?;
+                    let header_size =
+                        schema_record_header_size(&header_prefix, payload_size, rowid)?;
+                    cursor.payload_prefix_into(cx, header_size, &mut header_prefix)?;
+                    let offsets = schema_record_offsets(&header_prefix, payload_size, rowid)?;
+                    validate_schema_record_types(&offsets, rowid)?;
+
+                    let identifier_bytes = [
+                        usize::try_from(offsets[0].value_len).unwrap_or(usize::MAX),
+                        usize::try_from(offsets[1].value_len).unwrap_or(usize::MAX),
+                        usize::try_from(offsets[2].value_len).unwrap_or(usize::MAX),
+                    ];
+                    let sql_bytes =
+                        if classify_serial_type(offsets[4].serial_type) == SerialTypeClass::Text {
+                            usize::try_from(offsets[4].value_len).unwrap_or(usize::MAX)
+                        } else {
+                            0
+                        };
+                    budget.admit_dimensions(payload_size, &identifier_bytes, sql_bytes)?;
+
+                    // Only now is the complete record admitted. Reuse one
+                    // bounded buffer across rows rather than cloning each
+                    // overflow payload before validation.
+                    cursor.payload_into(cx, &mut payload_buffer)?;
+                    if payload_buffer.len() != payload_size {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master row {rowid} payload size changed while loading"
+                            ),
+                        });
+                    }
+                    if sql_bytes != 0 {
+                        let sql_start =
+                            usize::try_from(offsets[4].body_offset).unwrap_or(usize::MAX);
+                        let sql_end = sql_start.checked_add(sql_bytes).ok_or_else(|| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "sqlite_master row {rowid} SQL byte range overflowed"
+                                ),
+                            }
+                        })?;
+                        let sql = payload_buffer.get(sql_start..sql_end).ok_or_else(|| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "sqlite_master row {rowid} SQL byte range exceeds payload"
+                                ),
+                            }
+                        })?;
+                        budget.admit_sql_identifiers(sql)?;
+                    }
                     max_rowid = max_rowid.max(rowid);
-                    let values = parse_record(payload.as_ref()).ok_or_else(|| {
+                    let values = parse_record(&payload_buffer).ok_or_else(|| {
                         FrankenError::DatabaseCorrupt {
                             detail: format!(
                                 "sqlite_master row {rowid} payload is not a valid SQLite record"
@@ -63672,7 +66364,7 @@ impl Connection {
                     }
                 }
             }
-            (entries, max_rowid)
+            (entries, max_rowid, budget.stats())
         };
 
         // Parse each sqlite_master row and rebuild schema + MemDatabase.
@@ -64425,6 +67117,7 @@ impl Connection {
         *self.views_by_name.borrow_mut() = new_views_by_name;
         *self.triggers.borrow_mut() = new_triggers;
         *self.triggers_by_name.borrow_mut() = new_triggers_by_name;
+        self.schema_load_stats.set(schema_load_stats);
         self.validate_schema_index();
         *self.rowid_alias_columns.borrow_mut() = new_alias_map;
         *self.autoincrement_tables.borrow_mut() = new_autoincrement_tables;
@@ -94097,11 +96790,13 @@ mod tests {
         FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS, FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS,
         FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS, FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS,
         InProcessPageLockTable, IoPollStrategy, PagerBackend, PagerPublishedSnapshot, Row,
-        RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState, SimplePager, Snapshot,
-        init_global_runtime, is_implicit_autoindex_entry, is_sqlite_master_entry_missing,
-        join_hidden_rowid_projection, join_table_supports_hidden_rowid, lock_unpoisoned,
-        memdb_row_matches_like_fast_path, statement_contains_rewritable_subquery,
-        wal_file_present_with_vfs, wal_path_for_db_path,
+        RuntimeConfig, RuntimeContext, SCHEMA_LOAD_MAX_IDENTIFIER_BYTES,
+        SCHEMA_LOAD_MAX_METADATA_BYTES, SCHEMA_LOAD_MAX_OBJECTS,
+        SCHEMA_LOAD_MAX_SQL_BYTES_PER_OBJECT, SCHEMA_LOAD_MAX_TOTAL_SQL_BYTES, SchemaEpoch,
+        SchemaLoadBudget, SharedRuntimeState, SimplePager, Snapshot, init_global_runtime,
+        is_implicit_autoindex_entry, is_sqlite_master_entry_missing, join_hidden_rowid_projection,
+        join_table_supports_hidden_rowid, lock_unpoisoned, memdb_row_matches_like_fast_path,
+        statement_contains_rewritable_subquery, wal_file_present_with_vfs, wal_path_for_db_path,
     };
     use crate::region::RegionKind;
     use fsqlite_ast::{JoinKind, SortDirection, Statement};
@@ -94121,7 +96816,7 @@ mod tests {
     use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::{SqlLikeFastPathKind, SqlLikeFastPathMatcher, SqliteValue};
-    use fsqlite_types::{LockLevel, Region};
+    use fsqlite_types::{BTreePageHeader, DATABASE_HEADER_SIZE, DatabaseHeader, LockLevel, Region};
     use fsqlite_types::{PageNumber, PageSize};
     use fsqlite_vdbe::ProgramBuilder;
     use fsqlite_vfs::MemoryVfs;
@@ -94142,6 +96837,282 @@ mod tests {
         pub(crate) fn open_in_memory() -> std::result::Result<Self, FrankenError> {
             Self::open(":memory:")
         }
+    }
+
+    fn assert_schema_load_limit(
+        error: FrankenError,
+        expected_dimension: &'static str,
+        expected_limit: usize,
+        expected_attempted: usize,
+    ) {
+        match error {
+            FrankenError::SchemaLoadLimitExceeded {
+                dimension,
+                limit,
+                attempted,
+            } => {
+                assert_eq!(dimension, expected_dimension);
+                assert_eq!(limit, expected_limit);
+                assert_eq!(attempted, expected_attempted);
+            }
+            other => panic!("expected SchemaLoadLimitExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hfdt_0117_schema_load_object_limit_admits_exact_and_refuses_limit_plus_one() {
+        let mut budget = SchemaLoadBudget::default();
+        for _ in 0..SCHEMA_LOAD_MAX_OBJECTS {
+            budget.admit_dimensions(0, &[], 0).unwrap();
+        }
+        assert_eq!(budget.stats().objects, SCHEMA_LOAD_MAX_OBJECTS);
+
+        let error = budget.admit_dimensions(0, &[], 0).unwrap_err();
+        assert_schema_load_limit(
+            error,
+            "schema_objects",
+            SCHEMA_LOAD_MAX_OBJECTS,
+            SCHEMA_LOAD_MAX_OBJECTS + 1,
+        );
+    }
+
+    #[test]
+    fn hfdt_0117_schema_load_per_object_sql_limit_admits_exact_and_refuses_limit_plus_one() {
+        let mut exact = SchemaLoadBudget::default();
+        exact
+            .admit_dimensions(
+                SCHEMA_LOAD_MAX_SQL_BYTES_PER_OBJECT,
+                &[],
+                SCHEMA_LOAD_MAX_SQL_BYTES_PER_OBJECT,
+            )
+            .unwrap();
+        assert_eq!(
+            exact.stats().largest_sql_bytes,
+            SCHEMA_LOAD_MAX_SQL_BYTES_PER_OBJECT
+        );
+
+        let mut excessive = SchemaLoadBudget::default();
+        let attempted = SCHEMA_LOAD_MAX_SQL_BYTES_PER_OBJECT + 1;
+        let error = excessive
+            .admit_dimensions(attempted, &[], attempted)
+            .unwrap_err();
+        assert_schema_load_limit(
+            error,
+            "sql_bytes_per_object",
+            SCHEMA_LOAD_MAX_SQL_BYTES_PER_OBJECT,
+            attempted,
+        );
+    }
+
+    #[test]
+    fn hfdt_0117_schema_load_total_sql_limit_admits_exact_and_refuses_limit_plus_one() {
+        let mut budget = SchemaLoadBudget::default();
+        let full_sized_objects =
+            SCHEMA_LOAD_MAX_TOTAL_SQL_BYTES / SCHEMA_LOAD_MAX_SQL_BYTES_PER_OBJECT;
+        for _ in 0..full_sized_objects {
+            // Zero metadata is intentional here: this unit test isolates the
+            // aggregate-SQL dimension from the independent aggregate-record
+            // dimension. Production admission derives both from one header.
+            budget
+                .admit_dimensions(0, &[], SCHEMA_LOAD_MAX_SQL_BYTES_PER_OBJECT)
+                .unwrap();
+        }
+        assert_eq!(budget.stats().sql_bytes, SCHEMA_LOAD_MAX_TOTAL_SQL_BYTES);
+
+        let error = budget.admit_dimensions(0, &[], 1).unwrap_err();
+        assert_schema_load_limit(
+            error,
+            "aggregate_sql_bytes",
+            SCHEMA_LOAD_MAX_TOTAL_SQL_BYTES,
+            SCHEMA_LOAD_MAX_TOTAL_SQL_BYTES + 1,
+        );
+    }
+
+    #[test]
+    fn hfdt_0117_schema_load_identifier_limit_admits_exact_and_refuses_limit_plus_one() {
+        let mut exact = SchemaLoadBudget::default();
+        exact
+            .admit_dimensions(0, &[SCHEMA_LOAD_MAX_IDENTIFIER_BYTES], 0)
+            .unwrap();
+        assert_eq!(
+            exact.stats().largest_identifier_bytes,
+            SCHEMA_LOAD_MAX_IDENTIFIER_BYTES
+        );
+
+        let mut excessive = SchemaLoadBudget::default();
+        let attempted = SCHEMA_LOAD_MAX_IDENTIFIER_BYTES + 1;
+        let error = excessive.admit_dimensions(0, &[attempted], 0).unwrap_err();
+        assert_schema_load_limit(
+            error,
+            "identifier_bytes",
+            SCHEMA_LOAD_MAX_IDENTIFIER_BYTES,
+            attempted,
+        );
+    }
+
+    #[test]
+    fn hfdt_0117_schema_load_sql_token_identifier_limit_is_lexical_and_exact() {
+        let exact_sql = format!(
+            "CREATE TABLE \"{}\" (value TEXT DEFAULT '{}'); -- {}",
+            "i".repeat(SCHEMA_LOAD_MAX_IDENTIFIER_BYTES),
+            "literal".repeat(1024),
+            "comment_word".repeat(1024),
+        );
+        let mut exact = SchemaLoadBudget::default();
+        exact.admit_sql_identifiers(exact_sql.as_bytes()).unwrap();
+        assert_eq!(
+            exact.stats().largest_identifier_bytes,
+            SCHEMA_LOAD_MAX_IDENTIFIER_BYTES
+        );
+
+        let excessive_sql = format!(
+            "CREATE TABLE \"{}\" (value INTEGER)",
+            "i".repeat(SCHEMA_LOAD_MAX_IDENTIFIER_BYTES + 1)
+        );
+        let mut excessive = SchemaLoadBudget::default();
+        let error = excessive
+            .admit_sql_identifiers(excessive_sql.as_bytes())
+            .unwrap_err();
+        assert_schema_load_limit(
+            error,
+            "identifier_bytes",
+            SCHEMA_LOAD_MAX_IDENTIFIER_BYTES,
+            SCHEMA_LOAD_MAX_IDENTIFIER_BYTES + 1,
+        );
+    }
+
+    #[test]
+    fn hfdt_0117_schema_load_metadata_limit_admits_exact_and_refuses_limit_plus_one() {
+        let mut exact = SchemaLoadBudget::default();
+        exact
+            .admit_dimensions(SCHEMA_LOAD_MAX_METADATA_BYTES, &[], 0)
+            .unwrap();
+        assert_eq!(exact.stats().metadata_bytes, SCHEMA_LOAD_MAX_METADATA_BYTES);
+
+        let mut excessive = SchemaLoadBudget::default();
+        let attempted = SCHEMA_LOAD_MAX_METADATA_BYTES + 1;
+        let error = excessive.admit_dimensions(attempted, &[], 0).unwrap_err();
+        assert_schema_load_limit(
+            error,
+            "aggregate_schema_metadata_bytes",
+            SCHEMA_LOAD_MAX_METADATA_BYTES,
+            attempted,
+        );
+    }
+
+    #[test]
+    fn hfdt_0117_schema_record_header_preflight_matches_decoded_metadata() {
+        let object_name = "international_observations";
+        let sql = "CREATE TABLE international_observations(subject_id TEXT, known_at INTEGER)";
+        let payload = super::serialize_record(&[
+            SqliteValue::Text("table".into()),
+            SqliteValue::Text(object_name.into()),
+            SqliteValue::Text(object_name.into()),
+            SqliteValue::Integer(2),
+            SqliteValue::Text(sql.into()),
+        ]);
+
+        let initial_prefix = &payload[..payload.len().min(9)];
+        let header_size =
+            super::schema_record_header_size(initial_prefix, payload.len(), 1).unwrap();
+        let offsets =
+            super::schema_record_offsets(&payload[..header_size], payload.len(), 1).unwrap();
+        super::validate_schema_record_types(&offsets, 1).unwrap();
+
+        let mut budget = SchemaLoadBudget::default();
+        budget
+            .admit_dimensions(
+                payload.len(),
+                &[
+                    usize::try_from(offsets[0].value_len).unwrap(),
+                    usize::try_from(offsets[1].value_len).unwrap(),
+                    usize::try_from(offsets[2].value_len).unwrap(),
+                ],
+                usize::try_from(offsets[4].value_len).unwrap(),
+            )
+            .unwrap();
+        let sql_start = usize::try_from(offsets[4].body_offset).unwrap();
+        let sql_end = sql_start + usize::try_from(offsets[4].value_len).unwrap();
+        assert_eq!(&payload[sql_start..sql_end], sql.as_bytes());
+        budget
+            .admit_sql_identifiers(&payload[sql_start..sql_end])
+            .unwrap();
+
+        let stats = budget.stats();
+        assert_eq!(stats.objects, 1);
+        assert_eq!(stats.sql_bytes, sql.len());
+        assert_eq!(stats.metadata_bytes, payload.len());
+        assert_eq!(stats.largest_sql_bytes, sql.len());
+        assert_eq!(stats.largest_identifier_bytes, object_name.len());
+    }
+
+    #[test]
+    fn hfdt_0117_schema_load_normal_hfdt_sized_catalog_opens_and_reports_headroom() {
+        const TABLES: usize = 96;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("normal_hfdt_schema.db");
+        let db_path_text = db_path.to_string_lossy().to_string();
+        let (expected_objects, expected_sql_bytes) = {
+            let mut sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            let transaction = sqlite.transaction().unwrap();
+            for table in 0..TABLES {
+                transaction
+                    .execute_batch(&format!(
+                        "CREATE TABLE hfdt_observations_{table:03} (
+                            subject_id TEXT NOT NULL,
+                            metric_id TEXT NOT NULL,
+                            known_at INTEGER NOT NULL,
+                            as_of INTEGER NOT NULL,
+                            value_json TEXT NOT NULL,
+                            provenance_id TEXT NOT NULL,
+                            PRIMARY KEY(subject_id, metric_id, known_at, as_of)
+                         );
+                         CREATE INDEX hfdt_observations_{table:03}_known_at
+                           ON hfdt_observations_{table:03}(known_at);
+                         CREATE INDEX hfdt_observations_{table:03}_provenance
+                           ON hfdt_observations_{table:03}(provenance_id);"
+                    ))
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+            let expected_objects = usize::try_from(
+                sqlite
+                    .query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+            )
+            .unwrap();
+            let expected_sql_bytes = usize::try_from(
+                sqlite
+                    .query_row(
+                        "SELECT COALESCE(SUM(length(CAST(sql AS BLOB))), 0) FROM sqlite_schema",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+            (expected_objects, expected_sql_bytes)
+        };
+
+        let conn = Connection::open_schema_only(&db_path_text).unwrap();
+        let stats = conn.schema_load_stats();
+        assert_eq!(stats.objects, expected_objects);
+        assert_eq!(stats.sql_bytes, expected_sql_bytes);
+        assert!(stats.objects >= TABLES * 3);
+        assert!(stats.objects < SCHEMA_LOAD_MAX_OBJECTS);
+        assert!(stats.sql_bytes < SCHEMA_LOAD_MAX_TOTAL_SQL_BYTES);
+        assert!(stats.metadata_bytes > stats.sql_bytes);
+        assert!(stats.metadata_bytes < SCHEMA_LOAD_MAX_METADATA_BYTES);
+        assert!(stats.largest_sql_bytes < SCHEMA_LOAD_MAX_SQL_BYTES_PER_OBJECT);
+        assert!(stats.largest_identifier_bytes < SCHEMA_LOAD_MAX_IDENTIFIER_BYTES);
+
+        let rows = conn
+            .query("SELECT COUNT(*) FROM hfdt_observations_095")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111448,6 +114419,148 @@ mod tests {
     }
 
     #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    fn inspect_database_image_publication_candidate_receipt(
+        source: &Connection,
+        path: &Path,
+    ) -> super::DatabaseImageReceipt {
+        let cx = source.op_cx().unwrap();
+        source
+            .pager
+            .inspect_self_contained_database_image(&cx, path)
+            .unwrap()
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    fn rewrite_stock_database_btree_page(
+        path: &Path,
+        page_no: PageNumber,
+        rewrite: impl FnOnce(&mut [u8], PageSize, u8),
+    ) {
+        let mut image = std::fs::read(path).unwrap();
+        let header_bytes: [u8; DATABASE_HEADER_SIZE] = image[..DATABASE_HEADER_SIZE]
+            .try_into()
+            .expect("stock SQLite image has a complete database header");
+        let header = DatabaseHeader::from_bytes(&header_bytes).unwrap();
+        let page_size = header.page_size.as_usize();
+        let start = usize::try_from(page_no.get() - 1)
+            .unwrap()
+            .checked_mul(page_size)
+            .unwrap();
+        let end = start.checked_add(page_size).unwrap();
+        rewrite(
+            image
+                .get_mut(start..end)
+                .expect("target B-tree page lies inside the stock SQLite image"),
+            header.page_size,
+            header.reserved_per_page,
+        );
+        std::fs::write(path, image).unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    fn swap_first_two_btree_cell_pointers(
+        page: &mut [u8],
+        page_size: PageSize,
+        reserved_per_page: u8,
+        is_page_one: bool,
+        expected_page_type: fsqlite_types::BTreePageType,
+    ) {
+        let header =
+            BTreePageHeader::parse(page, page_size, reserved_per_page, is_page_one).unwrap();
+        assert_eq!(header.page_type, expected_page_type);
+        assert!(
+            header.cell_count >= 2,
+            "ordering corruption requires at least two cells"
+        );
+        let pointer_start = header.header_offset + header.header_size();
+        let first: [u8; 2] = page[pointer_start..pointer_start + 2].try_into().unwrap();
+        let second: [u8; 2] = page[pointer_start + 2..pointer_start + 4]
+            .try_into()
+            .unwrap();
+        page[pointer_start..pointer_start + 2].copy_from_slice(&second);
+        page[pointer_start + 2..pointer_start + 4].copy_from_slice(&first);
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    fn swap_first_two_interior_table_left_children(
+        page: &mut [u8],
+        page_size: PageSize,
+        reserved_per_page: u8,
+    ) {
+        let header = BTreePageHeader::parse(page, page_size, reserved_per_page, false).unwrap();
+        assert_eq!(
+            header.page_type,
+            fsqlite_types::BTreePageType::InteriorTable
+        );
+        let pointers = header
+            .parse_cell_pointers(page, page_size, reserved_per_page)
+            .unwrap();
+        assert!(
+            pointers.len() >= 2,
+            "range corruption requires at least two interior cells"
+        );
+        let first_offset = usize::from(pointers[0]);
+        let second_offset = usize::from(pointers[1]);
+        let first: [u8; 4] = page[first_offset..first_offset + 4].try_into().unwrap();
+        let second: [u8; 4] = page[second_offset..second_offset + 4].try_into().unwrap();
+        page[first_offset..first_offset + 4].copy_from_slice(&second);
+        page[second_offset..second_offset + 4].copy_from_slice(&first);
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    fn assert_bounded_publication_corruption_is_immutable(
+        source: &Connection,
+        source_receipt: &super::DatabaseImageReceipt,
+        source_path: &Path,
+        candidate_path: &Path,
+        expected_detail_fragments: &[&str],
+    ) {
+        let candidate_receipt =
+            inspect_database_image_publication_candidate_receipt(source, candidate_path);
+        let source_before = std::fs::read(source_path).unwrap();
+        let candidate_before = std::fs::read(candidate_path).unwrap();
+        let callback_called = std::cell::Cell::new(false);
+        let error = match source.publish_database_image_from_receipt_with_bounded_validation(
+            source_receipt,
+            &candidate_receipt,
+            candidate_path,
+            1,
+            |_, _| {
+                callback_called.set(true);
+                Ok(())
+            },
+        ) {
+            Ok(_) => panic!("bounded validation must reject the corrupted candidate"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, FrankenError::DatabaseCorrupt { .. }),
+            "corrupted candidate must produce DatabaseCorrupt, got {error}"
+        );
+        let detail = error.to_string();
+        assert!(
+            expected_detail_fragments
+                .iter()
+                .all(|fragment| detail.contains(fragment)),
+            "bounded corruption diagnostic `{detail}` did not contain every expected fragment {expected_detail_fragments:?}"
+        );
+        assert!(
+            !callback_called.get(),
+            "caller validation must not run after built-in structural refusal"
+        );
+        assert_eq!(
+            std::fs::read(source_path).unwrap(),
+            source_before,
+            "rejected bounded publication must leave source bytes unchanged"
+        );
+        assert_eq!(
+            std::fs::read(candidate_path).unwrap(),
+            candidate_before,
+            "rejected bounded publication must restore the exact candidate bytes"
+        );
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
     fn assert_live_replacement_items(conn: &Connection, expected_rows: i64) {
         let rows = conn
             .query("SELECT id, value FROM replacement_items ORDER BY id;")
@@ -111539,6 +114652,592 @@ mod tests {
             .unwrap();
         conn.close().unwrap();
         assert_stock_database_image(&source_path, 3);
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_database_image_publication_bounded_validation_scans_past_page_cap_without_retention()
+     {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir
+            .path()
+            .join("bounded-image-publication-validation-source.db");
+        let candidate_path = dir
+            .path()
+            .join("bounded-image-publication-validation-candidate.db");
+        let conn = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = conn.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        {
+            let mut sqlite = rusqlite::Connection::open(&candidate_path).unwrap();
+            let tx = sqlite.transaction().unwrap();
+            for id in 30_i64..=93 {
+                let value = format!("candidate-{id:03}-{}", "x".repeat(700));
+                tx.execute(
+                    "INSERT INTO replacement_items(id, value) VALUES (?1, ?2);",
+                    rusqlite::params![id, value],
+                )
+                .unwrap();
+            }
+            for id in 1_000_i64..=1_127 {
+                let value = format!("discarded-{id:04}-{}", "y".repeat(700));
+                tx.execute(
+                    "INSERT INTO replacement_items(id, value) VALUES (?1, ?2);",
+                    rusqlite::params![id, value],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+            sqlite
+                .execute("DELETE FROM replacement_items WHERE id >= 1000;", [])
+                .unwrap();
+            sqlite.execute_batch("VACUUM;").unwrap();
+            let freelist_count: i64 = sqlite
+                .query_row("PRAGMA freelist_count;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                freelist_count, 0,
+                "bounded publication targets must be freshly compacted"
+            );
+        }
+        let candidate_receipt =
+            capture_database_image_publication_candidate_receipt(&candidate_path);
+        assert!(
+            candidate_receipt.header().page_count > 1,
+            "test candidate must contain more pages than the validation cap"
+        );
+
+        let observed_stats = std::cell::Cell::new(None);
+        let publication = conn
+            .publish_database_image_from_receipt_with_bounded_validation(
+                &source_receipt,
+                &candidate_receipt,
+                &candidate_path,
+                1,
+                |candidate, stats| {
+                    assert!(
+                        candidate
+                            .active_bounded_read_snapshot_stats()?
+                            .is_some(),
+                        "caller validation must remain inside the structurally-proven bounded transaction"
+                    );
+                    let pager = stats.structural.pager;
+                    assert_eq!(pager.page_limit, 1);
+                    assert_eq!(pager.transaction_cached_pages, 0);
+                    assert_eq!(pager.transaction_cached_pages_high_water, 0);
+                    assert!(
+                        pager.direct_page_reads > pager.page_limit as u64,
+                        "built-in validation must scan beyond the page cap: {pager:?}"
+                    );
+                    assert_eq!(
+                        pager.published_page_set_size_now,
+                        pager.published_page_set_size_at_begin,
+                        "built-in validation must not publish candidate page bodies"
+                    );
+                    assert_eq!(pager.wal_page_index_entries, 0);
+                    assert!(!pager.wal_index_is_partial);
+                    assert_eq!(pager.wal_partial_index_fallback_reads, 0);
+                    assert!(stats.table_rows_checked >= 66);
+                    assert!(stats.index_entries_checked >= 66);
+                    assert!(stats.index_point_probes >= 66);
+                    observed_stats.set(Some(stats));
+
+                    let rows = candidate.query("SELECT COUNT(*) FROM replacement_items;")?;
+                    if rows[0].values()[0] != SqliteValue::Integer(66) {
+                        return Err(FrankenError::Internal(
+                            "bounded candidate semantic row validation failed".to_owned(),
+                        ));
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(publication.connection_is_usable());
+        assert!(
+            observed_stats.get().is_some(),
+            "caller must receive bounded built-in validation statistics"
+        );
+        assert_live_replacement_items(&conn, 66);
+        conn.close().unwrap();
+        assert_stock_database_image(&source_path, 66);
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    const HFDT_0117_ABA_WRITER_DB_ENV: &str = "FSQLITE_HFDT_0117_ABA_WRITER_DB";
+    #[cfg(all(feature = "native", unix))]
+    const HFDT_0117_ABA_WRITER_PHASE_ENV: &str = "FSQLITE_HFDT_0117_ABA_WRITER_PHASE";
+
+    #[cfg(all(feature = "native", unix))]
+    fn assert_stock_sqlite_aba_writer_is_refused(path: &Path, phase: &str) {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve current Rust test binary for lock proof"),
+        )
+        .args([
+            "--ignored",
+            "--exact",
+            "connection::tests::bounded_snapshot_aba_writer_subprocess_helper",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(HFDT_0117_ABA_WRITER_DB_ENV, path)
+        .env(HFDT_0117_ABA_WRITER_PHASE_ENV, phase)
+        .output()
+        .expect("launch separate-process stock-SQLite ABA writer proof");
+        assert!(
+            output.status.success(),
+            "separate-process ABA lock proof failed at phase={phase}: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        eprintln!(
+            "[hfdt-0117][bounded-snapshot][parent] phase={phase} path={} child_status={} child_stderr={}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    #[ignore = "invoked as a separate process by the bounded snapshot lock test"]
+    fn bounded_snapshot_aba_writer_subprocess_helper() {
+        let db_path = std::env::var_os(HFDT_0117_ABA_WRITER_DB_ENV)
+            .map(PathBuf::from)
+            .expect("bounded snapshot writer helper requires its database path");
+        let phase = std::env::var(HFDT_0117_ABA_WRITER_PHASE_ENV)
+            .unwrap_or_else(|_| "unspecified".to_owned());
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        sqlite
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("disable SQLite busy retries");
+        let error = sqlite
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 UPDATE replacement_items SET value='aba-temporary' WHERE id=10;
+                 UPDATE replacement_items SET value='candidate-alpha' WHERE id=10;
+                 COMMIT;",
+            )
+            .expect_err("writer must not commit across the parent's pinned read snapshot");
+        let code = match &error {
+            rusqlite::Error::SqliteFailure(sqlite_error, _) => sqlite_error.code,
+            other => panic!("writer failed for a non-SQLite reason: {other}"),
+        };
+        assert!(
+            matches!(
+                code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ),
+            "writer refusal must be an actual SQLite lock, got {error}"
+        );
+        eprintln!(
+            "[hfdt-0117][bounded-snapshot][aba-writer] phase={phase} path={} sqlite_code={code:?} result=refused",
+            db_path.display()
+        );
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn hfdt_0117_bounded_publication_callback_shares_proven_snapshot_and_blocks_aba_writer_commit()
+    {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("bounded-continuous-source.db");
+        let candidate_path = dir.path().join("bounded-continuous-candidate.db");
+        let conn = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = conn.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        let candidate_receipt =
+            capture_database_image_publication_candidate_receipt(&candidate_path);
+        let callback_ran = std::cell::Cell::new(false);
+
+        let after_begin_candidate = candidate_path.clone();
+        let _hook_reset = super::BoundedValidationAfterBeginHookReset;
+        super::set_bounded_validation_after_begin_hook(Some(Box::new(move || {
+            assert_stock_sqlite_aba_writer_is_refused(
+                &after_begin_candidate,
+                "immediate_after_bounded_begin",
+            );
+
+            // Classic process-associated F_SETLK locks can be erased when
+            // *any* descriptor for this inode closes in the process. Force
+            // that exact hazard after the immediate probe; the bounded fence
+            // must remain stock-visible because its companion is OFD/handle
+            // owned.
+            drop(
+                std::fs::File::open(&after_begin_candidate)
+                    .expect("open unrelated descriptor for close-hazard regression"),
+            );
+            eprintln!(
+                "[hfdt-0117][bounded-snapshot][parent] phase=after_unrelated_descriptor_close path={}",
+                after_begin_candidate.display()
+            );
+        })));
+
+        let publication = conn
+            .publish_database_image_from_receipt_with_bounded_validation(
+                &source_receipt,
+                &candidate_receipt,
+                &candidate_path,
+                2,
+                |candidate, _stats| {
+                    callback_ran.set(true);
+                    assert!(
+                        candidate.active_bounded_read_snapshot_stats()?.is_some(),
+                        "proof and callback must share one pinned bounded transaction"
+                    );
+
+                    // A distinct stock-SQLite process attempts an ABA write
+                    // (mutate and restore the logical value before COMMIT). The
+                    // pinned rollback-mode reader must prevent that COMMIT from
+                    // crossing the proof/callback boundary.
+                    assert_stock_sqlite_aba_writer_is_refused(
+                        &candidate_path,
+                        "after_full_proof_and_descriptor_close",
+                    );
+
+                    let rows =
+                        candidate.query("SELECT value FROM replacement_items WHERE id=10;")?;
+                    assert_eq!(
+                        rows[0].values()[0],
+                        SqliteValue::Text("candidate-alpha".into()),
+                        "callback must observe the same generation proven before writer refusal"
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(publication.connection_is_usable());
+        assert!(callback_ran.get());
+        assert_live_replacement_items(&conn, 2);
+        conn.close().unwrap();
+        assert_stock_database_image(&source_path, 2);
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_source_structure_walks_without_rowid_pointer_maps_and_large_overflow_streaming()
+     {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("bounded-source-large-without-rowid.db");
+        {
+            let sqlite = rusqlite::Connection::open(&source_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     PRAGMA auto_vacuum=FULL;
+                     VACUUM;
+                     CREATE TABLE source_items(
+                         key TEXT PRIMARY KEY COLLATE NOCASE,
+                         payload BLOB NOT NULL
+                     ) WITHOUT ROWID;
+                     INSERT INTO source_items VALUES ('large', zeroblob(20971520));",
+                )
+                .unwrap();
+            let auto_vacuum: i64 = sqlite
+                .query_row("PRAGMA auto_vacuum;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(auto_vacuum, 1);
+        }
+
+        let source = Connection::open_existing(source_path.to_string_lossy().into_owned()).unwrap();
+        let receipt = source.capture_database_image_receipt().unwrap();
+        assert!(
+            receipt.file_size() > 16 * 1024 * 1024,
+            "test must force a payload and overflow chain above the former 16 MiB ceiling"
+        );
+        let callback_called = std::cell::Cell::new(false);
+        let stats = source
+            .with_database_image_structure_from_receipt_with_bounded_ownership(
+                &receipt,
+                &source_path,
+                1,
+                |pinned, stats| {
+                    callback_called.set(true);
+                    assert!(
+                        pinned.active_bounded_read_snapshot_stats()?.is_some(),
+                        "callback must remain inside the structurally-proven transaction"
+                    );
+                    assert_eq!(stats.maximum_record_bytes, 64 * 1024 * 1024);
+                    assert_eq!(stats.pager.page_limit, 1);
+                    assert_eq!(stats.pager.transaction_cached_pages, 0);
+                    assert!(
+                        stats.pager.direct_page_reads > 4096,
+                        "20 MiB overflow chain must be walked one page at a time: {stats:?}"
+                    );
+                    Ok(stats)
+                },
+            )
+            .unwrap();
+        assert!(callback_called.get());
+        assert_eq!(stats.maximum_record_bytes, 64 * 1024 * 1024);
+        assert_eq!(stats.ownership_spool_bytes, u64::from(stats.database_pages));
+        assert_eq!(
+            stats.ownership_scan_window_bytes,
+            crate::bounded_validation::OWNERSHIP_SCAN_WINDOW_BYTES
+        );
+        source.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_source_structure_accounts_for_a_real_durable_freelist() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("bounded-source-freelist.db");
+        {
+            let mut sqlite = rusqlite::Connection::open(&source_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     PRAGMA auto_vacuum=NONE;
+                     CREATE TABLE source_items(id INTEGER PRIMARY KEY, payload BLOB NOT NULL);",
+                )
+                .unwrap();
+            let tx = sqlite.transaction().unwrap();
+            for rowid in 1_i64..=256 {
+                tx.execute(
+                    "INSERT INTO source_items VALUES (?1, zeroblob(8192));",
+                    [rowid],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+            sqlite
+                .execute("DELETE FROM source_items WHERE id > 8;", [])
+                .unwrap();
+            let freelist: i64 = sqlite
+                .query_row("PRAGMA freelist_count;", [], |row| row.get(0))
+                .unwrap();
+            assert!(freelist > 0, "test must retain a durable freelist");
+        }
+
+        let source = Connection::open_existing(source_path.to_string_lossy().into_owned()).unwrap();
+        let receipt = source.capture_database_image_receipt().unwrap();
+        let stats = source
+            .validate_database_image_structure_from_receipt_with_bounded_ownership(
+                &receipt,
+                &source_path,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            stats.structural_pages_visited,
+            u64::from(stats.database_pages)
+        );
+        assert_eq!(stats.pager.transaction_cached_pages, 0);
+        source.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_refuses_user_table_root_page_one_without_byte_mutation() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("bounded-root-one-source.db");
+        let candidate_path = dir.path().join("bounded-root-one-candidate.db");
+        let source = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = source.capture_database_image_receipt().unwrap();
+
+        {
+            let sqlite = rusqlite::Connection::open(&candidate_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     CREATE TABLE victim(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+                     INSERT INTO victim VALUES (1, 'real-row');
+                     PRAGMA writable_schema=ON;
+                     UPDATE sqlite_schema SET rootpage=1 WHERE type='table' AND name='victim';
+                     PRAGMA writable_schema=OFF;",
+                )
+                .unwrap();
+        }
+
+        assert_bounded_publication_corruption_is_immutable(
+            &source,
+            &source_receipt,
+            &source_path,
+            &candidate_path,
+            &["user table `victim`", "sqlite_schema root page 1"],
+        );
+        source.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_refuses_out_of_order_sqlite_schema_leaf_rowids() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("bounded-schema-order-source.db");
+        let candidate_path = dir.path().join("bounded-schema-order-candidate.db");
+        let source = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = source.capture_database_image_receipt().unwrap();
+
+        {
+            let sqlite = rusqlite::Connection::open(&candidate_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     CREATE TABLE alpha(id INTEGER PRIMARY KEY);
+                     CREATE TABLE beta(id INTEGER PRIMARY KEY);
+                     CREATE TABLE gamma(id INTEGER PRIMARY KEY);",
+                )
+                .unwrap();
+        }
+        rewrite_stock_database_btree_page(
+            &candidate_path,
+            PageNumber::ONE,
+            |page, page_size, reserved_per_page| {
+                swap_first_two_btree_cell_pointers(
+                    page,
+                    page_size,
+                    reserved_per_page,
+                    true,
+                    fsqlite_types::BTreePageType::LeafTable,
+                );
+            },
+        );
+
+        assert_bounded_publication_corruption_is_immutable(
+            &source,
+            &source_receipt,
+            &source_path,
+            &candidate_path,
+            &["sqlite_schema", "rowids", "strictly increasing"],
+        );
+        source.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_refuses_out_of_order_user_table_leaf_rowids() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("bounded-user-leaf-order-source.db");
+        let candidate_path = dir.path().join("bounded-user-leaf-order-candidate.db");
+        let source = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = source.capture_database_image_receipt().unwrap();
+
+        let table_root = {
+            let sqlite = rusqlite::Connection::open(&candidate_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+                     INSERT INTO items VALUES (1, 'one'), (2, 'two'), (3, 'three');",
+                )
+                .unwrap();
+            let root: u32 = sqlite
+                .query_row(
+                    "SELECT rootpage FROM sqlite_schema WHERE type='table' AND name='items';",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            PageNumber::new(root).unwrap()
+        };
+        rewrite_stock_database_btree_page(
+            &candidate_path,
+            table_root,
+            |page, page_size, reserved_per_page| {
+                swap_first_two_btree_cell_pointers(
+                    page,
+                    page_size,
+                    reserved_per_page,
+                    false,
+                    fsqlite_types::BTreePageType::LeafTable,
+                );
+            },
+        );
+
+        assert_bounded_publication_corruption_is_immutable(
+            &source,
+            &source_receipt,
+            &source_path,
+            &candidate_path,
+            &["table `items`", "rowids", "strictly increasing"],
+        );
+        source.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_refuses_interior_table_separator_and_child_range_corruption() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("bounded-interior-order-source.db");
+        let base_path = dir.path().join("bounded-interior-order-base.db");
+        let separator_path = dir.path().join("bounded-interior-separator-candidate.db");
+        let child_range_path = dir.path().join("bounded-interior-range-candidate.db");
+        let source = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = source.capture_database_image_receipt().unwrap();
+
+        let table_root = {
+            let mut sqlite = rusqlite::Connection::open(&base_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     CREATE TABLE items(id INTEGER PRIMARY KEY, payload BLOB NOT NULL);",
+                )
+                .unwrap();
+            let transaction = sqlite.transaction().unwrap();
+            for rowid in 1_i64..=2_000 {
+                transaction
+                    .execute("INSERT INTO items VALUES (?1, zeroblob(80));", [rowid])
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+            let integrity: String = sqlite
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok");
+            let root: u32 = sqlite
+                .query_row(
+                    "SELECT rootpage FROM sqlite_schema WHERE type='table' AND name='items';",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            PageNumber::new(root).unwrap()
+        };
+        std::fs::copy(&base_path, &separator_path).unwrap();
+        std::fs::copy(&base_path, &child_range_path).unwrap();
+
+        rewrite_stock_database_btree_page(
+            &separator_path,
+            table_root,
+            |page, page_size, reserved_per_page| {
+                swap_first_two_btree_cell_pointers(
+                    page,
+                    page_size,
+                    reserved_per_page,
+                    false,
+                    fsqlite_types::BTreePageType::InteriorTable,
+                );
+            },
+        );
+        assert_bounded_publication_corruption_is_immutable(
+            &source,
+            &source_receipt,
+            &source_path,
+            &separator_path,
+            &["table `items`", "separators", "strictly increasing"],
+        );
+
+        rewrite_stock_database_btree_page(
+            &child_range_path,
+            table_root,
+            swap_first_two_interior_table_left_children,
+        );
+        assert_bounded_publication_corruption_is_immutable(
+            &source,
+            &source_receipt,
+            &source_path,
+            &child_range_path,
+            &["table `items`", "exceeds separator"],
+        );
+        source.close().unwrap();
     }
 
     #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
@@ -135915,6 +139614,1103 @@ fts5(title, body, content=docs, content_rowid=id)'
         assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
         assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn hfdt_0117_bounded_read_snapshot_configuration_refuses_unsafe_modes_and_preserves_default() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bounded_snapshot_contract.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+                     INSERT INTO items VALUES (1, 'alpha');",
+                )
+                .unwrap();
+        }
+
+        let mut zero_env = ConnectionEnv::default();
+        zero_env.set_bounded_read_snapshot_page_limit(0);
+        let zero_error = Connection::open_schema_only_with_env(&db_str, zero_env)
+            .expect_err("zero bounded-snapshot limit must be rejected");
+        assert!(matches!(zero_error, FrankenError::OutOfRange { .. }));
+
+        let mut bounded_env = ConnectionEnv::default();
+        bounded_env.set_bounded_read_snapshot_page_limit(1);
+        let writable_error = Connection::open_existing_with_env(&db_str, bounded_env.clone())
+            .expect_err("writable open must reject bounded read-only configuration");
+        assert!(matches!(writable_error, FrankenError::ReadOnly));
+        let retained = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db_path)
+            .unwrap();
+        let identity = fsqlite_vfs::FileIdentity::from_file(&retained)
+            .unwrap()
+            .expect("native regular file identity");
+        let schema_only_writable_error =
+            Connection::open_existing_schema_only_read_write_with_expected_identity_and_env(
+                &db_str,
+                identity,
+                bounded_env.clone(),
+            )
+            .expect_err("schema-only writable open must reject bounded read-only configuration");
+        assert!(matches!(schema_only_writable_error, FrankenError::ReadOnly));
+        drop(retained);
+        let memory_error = Connection::open_schema_only_with_env(":memory:", bounded_env.clone())
+            .expect_err("in-memory open cannot provide a physical snapshot fence");
+        assert!(matches!(memory_error, FrankenError::Unsupported));
+
+        let ordinary = Connection::open_schema_only(&db_str).unwrap();
+        ordinary.begin_deferred_transaction().unwrap();
+        ordinary.query("SELECT payload FROM items;").unwrap();
+        assert_eq!(
+            ordinary.active_bounded_read_snapshot_stats().unwrap(),
+            None,
+            "default schema-only behavior must remain unchanged"
+        );
+        ordinary.rollback_transaction().unwrap();
+
+        let bounded = Connection::open_schema_only_with_env(&db_str, bounded_env).unwrap();
+        let promoted_error = bounded
+            .begin_transaction()
+            .expect_err("plain BEGIN promotes to CONCURRENT and must be refused");
+        assert!(matches!(promoted_error, FrankenError::ReadOnly));
+
+        bounded.begin_deferred_transaction().unwrap();
+        let cx = bounded.op_cx().unwrap();
+        let writer_error = bounded
+            .pager
+            .begin(&cx, TransactionMode::Immediate)
+            .expect_err("bounded pager must reject writer transactions");
+        assert!(matches!(writer_error, FrankenError::ReadOnly));
+        let concurrent_reader_error = bounded
+            .pager
+            .begin(&cx, TransactionMode::ReadOnly)
+            .expect_err("bounded pager must reject a second pinned transaction");
+        assert!(matches!(concurrent_reader_error, FrankenError::Busy));
+        bounded.rollback_transaction().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn hfdt_0117_bounded_delete_snapshot_scans_past_cap_without_cache_publication_and_blocks_writer_commit()
+     {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bounded_delete_snapshot.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+        {
+            let mut sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     PRAGMA page_size=1024;
+                     VACUUM;
+                     CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);",
+                )
+                .unwrap();
+            let tx = sqlite.transaction().unwrap();
+            for id in 1_i64..=64 {
+                let payload = format!("row-{id:03}-{}", "x".repeat(700));
+                tx.execute(
+                    "INSERT INTO items(id, payload) VALUES (?1, ?2);",
+                    rusqlite::params![id, payload],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let writer = Connection::open(&db_str).unwrap();
+        writer.execute("PRAGMA busy_timeout=0;").unwrap();
+        let mut env = ConnectionEnv::default();
+        env.set_bounded_read_snapshot_page_limit(1);
+        let reader = Connection::open_schema_only_with_env(&db_str, env).unwrap();
+        reader.begin_deferred_transaction().unwrap();
+
+        let original = reader
+            .query_row("SELECT payload FROM items WHERE id = 1;")
+            .unwrap();
+        let original = match original.get(0) {
+            Some(SqliteValue::Text(value)) => value.to_string(),
+            other => panic!("expected original text payload, got {other:?}"),
+        };
+        let rows = reader
+            .query("SELECT id, payload FROM items ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 64);
+
+        let stats = reader
+            .active_bounded_read_snapshot_stats()
+            .unwrap()
+            .expect("bounded snapshot stats");
+        assert_eq!(stats.page_limit, 1);
+        assert_eq!(stats.transaction_cached_pages, 0);
+        assert_eq!(stats.transaction_cached_pages_high_water, 0);
+        assert!(
+            stats.direct_page_reads > stats.page_limit as u64,
+            "scan must cross the configured cap: {stats:?}"
+        );
+        assert_eq!(
+            stats.published_page_set_size_now, stats.published_page_set_size_at_begin,
+            "bounded reader must not publish observed pages"
+        );
+        assert_eq!(stats.wal_page_index_entries, 0);
+        assert!(!stats.wal_index_is_partial);
+
+        writer.execute("BEGIN IMMEDIATE;").unwrap();
+        writer
+            .execute("UPDATE items SET payload = 'writer-new' WHERE id = 1;")
+            .unwrap();
+        let commit_error = writer
+            .commit_transaction()
+            .expect_err("DELETE-mode writer commit must wait behind reader SHARED fence");
+        assert!(matches!(commit_error, FrankenError::Busy));
+
+        let reread = reader
+            .query_row("SELECT payload FROM items WHERE id = 1;")
+            .unwrap();
+        assert_eq!(
+            reread.get(0),
+            Some(&SqliteValue::Text(original.clone().into())),
+            "eviction-free direct reread must remain snapshot-stable"
+        );
+
+        reader.rollback_transaction().unwrap();
+        writer
+            .commit_transaction()
+            .expect("writer should commit after reader releases SHARED fence");
+        let latest = reader
+            .query_row("SELECT payload FROM items WHERE id = 1;")
+            .unwrap();
+        assert_eq!(latest.get(0), Some(&SqliteValue::Text("writer-new".into())));
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn hfdt_0117_bounded_snapshot_refuses_wal_even_after_truncate_then_accepts_delete_mode() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bounded_wal_refusal.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+        let mut sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        sqlite
+            .execute_batch(
+                "PRAGMA page_size=1024;
+                 VACUUM;
+                 PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);",
+            )
+            .unwrap();
+        {
+            let tx = sqlite.transaction().unwrap();
+            for id in 1_i64..=64 {
+                let payload = format!("row-{id:03}-{}", "w".repeat(700));
+                tx.execute(
+                    "INSERT INTO items(id, payload) VALUES (?1, ?2);",
+                    rusqlite::params![id, payload],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let wal_path = PathBuf::from(format!("{db_str}-wal"));
+        assert!(
+            std::fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() >= 32),
+            "test requires a live WAL sidecar with committed frames"
+        );
+
+        let mut env = ConnectionEnv::default();
+        env.set_bounded_read_snapshot_page_limit(1);
+        let live_wal_error = Connection::open_schema_only_with_env(&db_str, env.clone())
+            .expect_err("bounded open must refuse a live WAL");
+        assert!(
+            matches!(
+                &live_wal_error,
+                FrankenError::NotImplemented(detail)
+                    if detail.contains("rollback/DELETE journal mode")
+            ),
+            "unexpected live-WAL refusal: {live_wal_error}"
+        );
+
+        let checkpoint: (i64, i64, i64) = sqlite
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(checkpoint.0, 0, "TRUNCATE checkpoint must not be busy");
+        assert!(
+            std::fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() < 32),
+            "TRUNCATE checkpoint must remove the live WAL header"
+        );
+
+        let truncated_wal_error = Connection::open_schema_only_with_env(&db_str, env.clone())
+            .expect_err("WAL-mode header must remain refused after sidecar truncation");
+        assert!(
+            matches!(
+                &truncated_wal_error,
+                FrankenError::NotImplemented(detail)
+                    if detail.contains("rollback/DELETE journal mode")
+            ),
+            "unexpected truncated-WAL refusal: {truncated_wal_error}"
+        );
+
+        let mode: String = sqlite
+            .query_row("PRAGMA journal_mode=DELETE;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "delete");
+        drop(sqlite);
+
+        let reader = Connection::open_schema_only_with_env(&db_str, env)
+            .expect("bounded open accepts self-contained DELETE-mode image");
+        reader.begin_deferred_transaction().unwrap();
+        let rows = reader
+            .query("SELECT id, payload FROM items ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 64);
+        let stats = reader
+            .active_bounded_read_snapshot_stats()
+            .unwrap()
+            .expect("bounded DELETE stats");
+        assert_eq!(stats.page_limit, 1);
+        assert_eq!(stats.transaction_cached_pages, 0);
+        assert_eq!(stats.transaction_cached_pages_high_water, 0);
+        assert!(stats.direct_page_reads > 1, "{stats:?}");
+        assert_eq!(
+            stats.published_page_set_size_now, stats.published_page_set_size_at_begin,
+            "bounded DELETE reader must not publish page bodies"
+        );
+        assert_eq!(stats.wal_page_index_entries, 0);
+        assert!(!stats.wal_index_is_partial);
+        assert_eq!(stats.wal_partial_index_fallback_reads, 0);
+        reader.rollback_transaction().unwrap();
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn hfdt_0117_bounded_direct_pager_refuses_existing_wal_without_trusting_cached_mode() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bounded_direct_pager_wal.db");
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        sqlite
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+                 INSERT INTO items VALUES (1, 'wal-only');",
+            )
+            .unwrap();
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        assert!(
+            std::fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() >= 32),
+            "test requires a live stock-SQLite WAL"
+        );
+
+        let cx = Cx::new();
+        let mut pager =
+            SimplePager::open_readonly_with_cx(&cx, UnixVfs::new(), &db_path, PageSize::DEFAULT)
+                .expect("direct physically read-only pager open");
+        assert_eq!(pager.journal_mode(), JournalMode::Delete);
+        pager.set_bounded_read_snapshot_page_limit(Some(1)).unwrap();
+        let error = match pager.begin(&cx, TransactionMode::Deferred) {
+            Ok(_) => {
+                panic!("bounded begin must revalidate storage instead of trusting cached DELETE")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &error,
+                FrankenError::NotImplemented(detail)
+                    if detail.contains("rollback/DELETE journal mode")
+            ),
+            "unexpected direct-pager WAL refusal: {error}"
+        );
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn hfdt_0117_bounded_snapshot_revalidates_external_delete_to_wal_transition_on_each_begin() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bounded_external_mode_transition.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+                     INSERT INTO items VALUES (1, 'delete-image');",
+                )
+                .unwrap();
+        }
+
+        let mut env = ConnectionEnv::default();
+        env.set_bounded_read_snapshot_page_limit(1);
+        let reader = Connection::open_schema_only_with_env(&db_str, env).unwrap();
+        reader.begin_deferred_transaction().unwrap();
+        let before = reader
+            .query_row("SELECT payload FROM items WHERE id = 1;")
+            .unwrap();
+        assert_eq!(
+            before.get(0),
+            Some(&SqliteValue::Text("delete-image".into()))
+        );
+        reader.rollback_transaction().unwrap();
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        sqlite
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 INSERT INTO items VALUES (2, 'wal-image');",
+            )
+            .unwrap();
+        let wal_path = PathBuf::from(format!("{db_str}-wal"));
+        assert!(
+            std::fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() >= 32),
+            "external transition must retain a live WAL"
+        );
+
+        let error = reader
+            .begin_deferred_transaction()
+            .expect_err("every bounded begin must revalidate persisted journal mode");
+        assert!(
+            matches!(
+                &error,
+                FrankenError::NotImplemented(detail)
+                    if detail.contains("rollback/DELETE journal mode")
+            ),
+            "unexpected post-open DELETE-to-WAL refusal: {error}"
+        );
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn hfdt_0117_identity_bound_schema_only_read_write_reopens_and_writes_without_row_hydration() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("identity_schema_only_rw.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+                     INSERT INTO items VALUES (1, 'seed');",
+                )
+                .unwrap();
+        }
+
+        let other_path = dir.path().join("other_identity.db");
+        {
+            let sqlite = rusqlite::Connection::open(&other_path).unwrap();
+            sqlite
+                .execute_batch("CREATE TABLE other(id INTEGER);")
+                .unwrap();
+        }
+        let wrong_retained = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&other_path)
+            .unwrap();
+        let wrong_identity = fsqlite_vfs::FileIdentity::from_file(&wrong_retained)
+            .unwrap()
+            .expect("native regular file identity");
+        let mismatch =
+            Connection::open_existing_schema_only_read_write_with_expected_identity_and_env(
+                &db_str,
+                wrong_identity,
+                ConnectionEnv::default(),
+            )
+            .expect_err("schema-only writable open must reject a mismatched retained identity");
+        assert!(matches!(mismatch, FrankenError::CannotOpen { .. }));
+        drop(wrong_retained);
+
+        for batch in 0_i64..2 {
+            let retained = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&db_path)
+                .unwrap();
+            let identity = fsqlite_vfs::FileIdentity::from_file(&retained)
+                .unwrap()
+                .expect("native regular file identity");
+            let conn =
+                Connection::open_existing_schema_only_read_write_with_expected_identity_and_env(
+                    &db_str,
+                    identity,
+                    ConnectionEnv::default(),
+                )
+                .expect("identity-bound schema-only writable open");
+            assert!(!conn.memdb_rows_loaded.get());
+            let root_page = conn
+                .schema
+                .borrow()
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case("items"))
+                .map(|table| table.root_page)
+                .expect("items schema");
+            assert_eq!(
+                conn.db
+                    .borrow()
+                    .get_table(root_page)
+                    .expect("schema placeholder table")
+                    .iter_rows()
+                    .count(),
+                0,
+                "existing rows must not be copied into MemDatabase"
+            );
+            let existing = conn
+                .query_row("SELECT payload FROM items WHERE id = 1;")
+                .expect("schema-only writable connection reads existing pager rows");
+            let expected_existing = if batch == 0 { "seed" } else { "updated-0" };
+            assert_eq!(
+                existing.get(0),
+                Some(&SqliteValue::Text(expected_existing.into()))
+            );
+            assert!(
+                !conn.memdb_rows_loaded.get(),
+                "pager-backed read must not hydrate pre-existing rows"
+            );
+
+            conn.execute("BEGIN IMMEDIATE;").unwrap();
+            conn.execute_with_params(
+                "UPDATE items SET payload = ?1 WHERE id = 1;",
+                &[SqliteValue::Text(format!("updated-{batch}").into())],
+            )
+            .unwrap();
+            for offset in 0_i64..3 {
+                let id = 2 + batch * 3 + offset;
+                conn.execute_with_params(
+                    "INSERT INTO items(id, payload) VALUES (?1, ?2);",
+                    &[
+                        SqliteValue::Integer(id),
+                        SqliteValue::Text(format!("batch-{batch}-row-{offset}").into()),
+                    ],
+                )
+                .unwrap();
+            }
+            conn.commit_transaction().unwrap();
+            assert!(
+                !conn.memdb_rows_loaded.get(),
+                "schema-only write batch must not hydrate pre-existing rows"
+            );
+            conn.close().unwrap();
+            drop(retained);
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let count: i64 = sqlite
+            .query_row("SELECT COUNT(*) FROM items;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 7);
+        let payload: String = sqlite
+            .query_row("SELECT payload FROM items WHERE id = 7;", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(payload, "batch-1-row-2");
+        let updated: String = sqlite
+            .query_row("SELECT payload FROM items WHERE id = 1;", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(updated, "updated-1");
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn hfdt_0117_schema_only_builder_write_set_cap_reserves_mandatory_page_one_before_statement_escape()
+     {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("schema_only_write_set_cap.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     PRAGMA auto_vacuum=NONE;
+                     CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+                     INSERT INTO items VALUES (1, 'seed');
+                     VACUUM;",
+                )
+                .unwrap();
+        }
+        let bytes_before_refusal = std::fs::read(&db_path).unwrap();
+
+        let retained = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db_path)
+            .unwrap();
+        let identity = fsqlite_vfs::FileIdentity::from_file(&retained)
+            .unwrap()
+            .expect("native regular file identity");
+        let mut env = ConnectionEnv::default();
+        env.set_schema_only_write_set_page_limit(Some(1));
+        let conn = Connection::open_existing_schema_only_read_write_with_expected_identity_and_env(
+            &db_str, identity, env,
+        )
+        .unwrap();
+
+        conn.execute("BEGIN IMMEDIATE;").unwrap();
+        let error = conn
+            .execute("INSERT INTO items VALUES (2, 'bounded');")
+            .expect_err("the data page plus mandatory Page 1 cannot fit a one-page cap");
+        assert!(
+            matches!(
+                &error,
+                FrankenError::WriteSetLimitExceeded {
+                    page_limit: 1,
+                    current_dirty_pages: 0,
+                    attempted_dirty_pages: 2,
+                    ..
+                }
+            ),
+            "unexpected bounded builder refusal: {error}"
+        );
+        let refused = conn
+            .write_set_stats()
+            .unwrap()
+            .expect("refusal telemetry retained");
+        assert_eq!(refused.page_limit, 1);
+        assert_eq!(refused.current_dirty_pages, 0);
+        assert_eq!(refused.current_dirty_bytes, 0);
+        assert_eq!(refused.dirty_pages_high_water, 0);
+        assert_eq!(refused.dirty_bytes_high_water, 0);
+        assert_eq!(refused.cap_refusals, 1);
+        conn.commit_transaction()
+            .expect("the refused statement must not poison COMMIT into a permanent retry loop");
+        let committed = conn
+            .write_set_stats()
+            .unwrap()
+            .expect("completed-batch telemetry retained");
+        assert_eq!(committed.current_dirty_pages, 0);
+        assert_eq!(committed.current_dirty_bytes, 0);
+        assert_eq!(committed.dirty_pages_high_water, 0);
+        assert_eq!(committed.dirty_bytes_high_water, 0);
+        assert_eq!(committed.cap_refusals, 1);
+        conn.close().unwrap();
+        drop(retained);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let rows: i64 = sqlite
+            .query_row("SELECT COUNT(*) FROM items;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "refused statement must leave no partial row");
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        drop(sqlite);
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            bytes_before_refusal,
+            "refused statement plus terminating COMMIT must preserve the exact durable image"
+        );
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn hfdt_0117_schema_only_builder_write_set_cap_reports_successful_committed_batch() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("schema_only_write_set_success.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     PRAGMA auto_vacuum=NONE;
+                     CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+                     VACUUM;",
+                )
+                .unwrap();
+        }
+
+        let retained = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db_path)
+            .unwrap();
+        let identity = fsqlite_vfs::FileIdentity::from_file(&retained)
+            .unwrap()
+            .expect("native regular file identity");
+        let mut env = ConnectionEnv::default();
+        env.set_schema_only_write_set_page_limit(Some(2));
+        let conn = Connection::open_existing_schema_only_read_write_with_expected_identity_and_env(
+            &db_str, identity, env,
+        )
+        .unwrap();
+        conn.execute("BEGIN IMMEDIATE;").unwrap();
+        conn.execute("INSERT INTO items VALUES (1, 'committed');")
+            .unwrap();
+        conn.commit_transaction().unwrap();
+        let stats = conn
+            .write_set_stats()
+            .unwrap()
+            .expect("successful batch telemetry retained");
+        assert_eq!(stats.page_limit, 2);
+        assert_eq!(stats.current_dirty_pages, 0);
+        assert_eq!(stats.current_dirty_bytes, 0);
+        assert_eq!(stats.dirty_pages_high_water, 2);
+        assert_eq!(stats.dirty_bytes_high_water, stats.byte_limit);
+        assert_eq!(stats.cap_refusals, 0);
+        conn.close().unwrap();
+        drop(retained);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let payload: String = sqlite
+            .query_row("SELECT payload FROM items WHERE id=1;", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(payload, "committed");
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn hfdt_0117_schema_only_builder_write_set_cap_refuses_zero_general_readonly_and_wal_configuration()
+     {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let delete_path = dir.path().join("write_set_config_delete.db");
+        {
+            let sqlite = rusqlite::Connection::open(&delete_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     CREATE TABLE items(id INTEGER PRIMARY KEY);",
+                )
+                .unwrap();
+        }
+        let delete_str = delete_path.to_string_lossy().into_owned();
+        let retained = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&delete_path)
+            .unwrap();
+        let identity = fsqlite_vfs::FileIdentity::from_file(&retained)
+            .unwrap()
+            .expect("native regular file identity");
+
+        let mut zero = ConnectionEnv::default();
+        zero.set_schema_only_write_set_page_limit(Some(0));
+        assert!(matches!(
+            Connection::open_existing_schema_only_read_write_with_expected_identity_and_env(
+                &delete_str,
+                identity,
+                zero,
+            ),
+            Err(FrankenError::OutOfRange { .. })
+        ));
+
+        let mut general = ConnectionEnv::default();
+        general.set_schema_only_write_set_page_limit(Some(2));
+        assert!(matches!(
+            Connection::open_existing_with_env(&delete_str, general),
+            Err(FrankenError::NotImplemented(_))
+        ));
+
+        let mut readonly = ConnectionEnv::default();
+        readonly.set_schema_only_write_set_page_limit(Some(2));
+        assert!(matches!(
+            Connection::open_schema_only_with_expected_identity_and_env(
+                &delete_str,
+                identity,
+                readonly,
+            ),
+            Err(FrankenError::NotImplemented(_))
+        ));
+        drop(retained);
+
+        let wal_path = dir.path().join("write_set_config_wal.db");
+        let sqlite = rusqlite::Connection::open(&wal_path).unwrap();
+        sqlite
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE items(id INTEGER PRIMARY KEY);",
+            )
+            .unwrap();
+        let wal_retained = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&wal_path)
+            .unwrap();
+        let wal_identity = fsqlite_vfs::FileIdentity::from_file(&wal_retained)
+            .unwrap()
+            .expect("native regular file identity");
+        drop(sqlite);
+        let mut wal_env = ConnectionEnv::default();
+        wal_env.set_schema_only_write_set_page_limit(Some(2));
+        assert!(matches!(
+            Connection::open_existing_schema_only_read_write_with_expected_identity_and_env(
+                wal_path.to_string_lossy().into_owned(),
+                wal_identity,
+                wal_env,
+            ),
+            Err(FrankenError::NotImplemented(_))
+        ));
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn hfdt_0117_reserved_builder_does_not_retry_after_durable_page_one_bootstrap() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("reserved-bootstrap-busy.db");
+        let reservation =
+            Connection::reserve_schema_only_builder_target(&target).expect("reserve new target");
+
+        let _hook_reset = super::ReservedBuilderAfterPagerOpenHookReset;
+        super::set_reserved_builder_after_pager_open_hook(Some(Box::new(|| {
+            Err(FrankenError::BusyRecovery)
+        })));
+        let mut env = ConnectionEnv::default();
+        env.set_schema_only_write_set_page_limit(Some(8));
+        let error = Connection::initialize_reserved_schema_only_builder(&reservation, 4096, env)
+            .expect_err("injected post-Page-1 failure must propagate");
+        assert!(
+            matches!(error, FrankenError::BusyRecovery),
+            "reserved bootstrap must not retry a mutating attempt and mask {error} as CannotOpen"
+        );
+
+        reservation
+            .revalidate_final_target(Some(4096))
+            .expect("the retained target must still name the durable Page-1 generation");
+        let bytes = std::fs::read(&target).expect("read initialized target");
+        assert_eq!(bytes.len(), 4096);
+        assert_eq!(&bytes[..16], b"SQLite format 3\0");
+        let sqlite = rusqlite::Connection::open(&target).expect("open initialized SQLite image");
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .expect("run stock SQLite integrity check");
+        assert_eq!(integrity, "ok");
+        drop(sqlite);
+
+        let fresh_target = dir.path().join("reserved-bootstrap-after-busy.db");
+        let fresh_reservation = Connection::reserve_schema_only_builder_target(&fresh_target)
+            .expect("reserve fresh target after injected bootstrap failure");
+        let mut fresh_env = ConnectionEnv::default();
+        fresh_env.set_schema_only_write_set_page_limit(Some(8));
+        let fresh = Connection::initialize_reserved_schema_only_builder(
+            &fresh_reservation,
+            4096,
+            fresh_env,
+        )
+        .expect("an injected failure must not poison the next fresh reserved bootstrap");
+        fresh
+            .execute("CREATE TABLE after_busy(id INTEGER PRIMARY KEY);")
+            .expect("write through fresh bounded builder");
+        fresh.close().expect("close fresh bounded builder");
+        fresh_reservation
+            .revalidate_final_target(Some(std::fs::metadata(&fresh_target).unwrap().len()))
+            .expect("fresh target identity must remain bound after the preceding failure");
+        let fresh_sqlite =
+            rusqlite::Connection::open(&fresh_target).expect("open fresh post-failure image");
+        let fresh_integrity: String = fresh_sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .expect("run stock SQLite integrity check on fresh image");
+        assert_eq!(fresh_integrity, "ok");
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn hfdt_0117_reserved_schema_only_builder_creates_requested_delete_image_and_bounds_ddl_analyze()
+     {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("reserved-builder.db");
+        let reservation =
+            Connection::reserve_schema_only_builder_target(&target).expect("reserve new target");
+        assert_eq!(
+            std::fs::metadata(&target).expect("reserved metadata").len(),
+            0
+        );
+
+        let mut env = ConnectionEnv::default();
+        env.set_schema_only_write_set_page_limit(Some(64));
+        let conn = Connection::initialize_reserved_schema_only_builder(&reservation, 8192, env)
+            .expect("initialize exact retained identity");
+        let initial = conn
+            .write_set_stats()
+            .unwrap()
+            .expect("bounded writer telemetry");
+        assert_eq!(initial.page_limit, 64);
+        assert_eq!(initial.byte_limit, 64 * 8192);
+        assert_eq!(initial.current_dirty_pages, 0);
+        assert_eq!(initial.current_dirty_bytes, 0);
+        assert_eq!(initial.dirty_pages_high_water, 0);
+        assert_eq!(initial.dirty_bytes_high_water, 0);
+        assert_eq!(initial.cap_refusals, 0);
+
+        conn.execute("BEGIN IMMEDIATE;").unwrap();
+        conn.execute(
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT NOT NULL, score INTEGER);",
+        )
+        .unwrap();
+        conn.execute("CREATE UNIQUE INDEX items_name_desc ON items(name DESC);")
+            .unwrap();
+        for id in 1_i64..=32 {
+            conn.execute_with_params(
+                "INSERT INTO items VALUES (?1, ?2, ?3);",
+                &[
+                    SqliteValue::Integer(id),
+                    SqliteValue::Text(format!("item-{id:02}").into()),
+                    SqliteValue::Integer(id * 7),
+                ],
+            )
+            .unwrap();
+        }
+        conn.commit_transaction().unwrap();
+        let ddl_stats = conn
+            .write_set_stats()
+            .unwrap()
+            .expect("DDL write-set telemetry");
+        assert_eq!(ddl_stats.current_dirty_pages, 0);
+        assert!(ddl_stats.dirty_pages_high_water <= ddl_stats.page_limit);
+        assert_eq!(ddl_stats.cap_refusals, 0);
+
+        conn.execute("BEGIN IMMEDIATE;").unwrap();
+        conn.execute("ANALYZE;").unwrap();
+        conn.commit_transaction().unwrap();
+        let analyze_stats = conn
+            .write_set_stats()
+            .unwrap()
+            .expect("ANALYZE write-set telemetry");
+        assert_eq!(analyze_stats.current_dirty_pages, 0);
+        assert!(analyze_stats.dirty_pages_high_water <= analyze_stats.page_limit);
+        assert_eq!(analyze_stats.cap_refusals, 0);
+        conn.close().unwrap();
+
+        let sqlite = rusqlite::Connection::open(&target).unwrap();
+        let page_size: i64 = sqlite
+            .query_row("PRAGMA page_size;", [], |row| row.get(0))
+            .unwrap();
+        let journal_mode: String = sqlite
+            .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+            .unwrap();
+        let auto_vacuum: i64 = sqlite
+            .query_row("PRAGMA auto_vacuum;", [], |row| row.get(0))
+            .unwrap();
+        let freelist: i64 = sqlite
+            .query_row("PRAGMA freelist_count;", [], |row| row.get(0))
+            .unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        let rows: i64 = sqlite
+            .query_row("SELECT COUNT(*) FROM items;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(page_size, 8192);
+        assert_eq!(journal_mode.to_ascii_lowercase(), "delete");
+        assert_eq!(auto_vacuum, 0);
+        assert_eq!(freelist, 0);
+        assert_eq!(integrity, "ok");
+        assert_eq!(rows, 32);
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn hfdt_0117_reserved_schema_only_builder_refuses_existing_special_and_multilink_targets_without_mutation()
+     {
+        use std::os::unix::fs::symlink;
+
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+
+        let existing = dir.path().join("existing.db");
+        std::fs::write(&existing, b"existing sentinel").unwrap();
+        assert!(matches!(
+            Connection::reserve_schema_only_builder_target(&existing),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert_eq!(std::fs::read(&existing).unwrap(), b"existing sentinel");
+
+        let directory = dir.path().join("directory.db");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(matches!(
+            Connection::reserve_schema_only_builder_target(&directory),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+
+        let victim = dir.path().join("victim.db");
+        std::fs::write(&victim, b"victim sentinel").unwrap();
+        let symlink_path = dir.path().join("symlink.db");
+        symlink(&victim, &symlink_path).unwrap();
+        assert!(matches!(
+            Connection::reserve_schema_only_builder_target(&symlink_path),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim sentinel");
+
+        let fifo = dir.path().join("fifo.db");
+        let mkfifo = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo is required for the special-file refusal proof");
+        assert!(mkfifo.success());
+        assert!(matches!(
+            Connection::reserve_schema_only_builder_target(&fifo),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+
+        let hardlink_target = dir.path().join("hardlink-target.db");
+        std::fs::write(&hardlink_target, b"hardlink sentinel").unwrap();
+        let hardlink = dir.path().join("hardlink.db");
+        std::fs::hard_link(&hardlink_target, &hardlink).unwrap();
+        assert!(matches!(
+            Connection::reserve_schema_only_builder_target(&hardlink),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert_eq!(
+            std::fs::read(&hardlink_target).unwrap(),
+            b"hardlink sentinel"
+        );
+
+        let reserved = dir.path().join("reserved-then-linked.db");
+        let alias = dir.path().join("reserved-alias.db");
+        let reservation =
+            Connection::reserve_schema_only_builder_target(&reserved).expect("reserve target");
+        std::fs::hard_link(&reserved, &alias).unwrap();
+        let mut env = ConnectionEnv::default();
+        env.set_schema_only_write_set_page_limit(Some(8));
+        assert!(matches!(
+            Connection::initialize_reserved_schema_only_builder(&reservation, 4096, env),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert_eq!(std::fs::metadata(&reserved).unwrap().len(), 0);
+        assert_eq!(std::fs::metadata(&alias).unwrap().len(), 0);
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn hfdt_0117_reserved_schema_only_builder_preserves_synchronized_post_bootstrap_replacement() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("swap-target.db");
+        let displaced = dir.path().join("owned-initialized.db");
+        let replacement = vec![0xa5; 8192];
+        let reservation =
+            Connection::reserve_schema_only_builder_target(&target).expect("reserve target");
+
+        let hook_target = target.clone();
+        let hook_displaced = displaced.clone();
+        let hook_replacement = replacement.clone();
+        let _hook_reset = super::ReservedBuilderAfterBootstrapHookReset;
+        super::set_reserved_builder_after_bootstrap_hook(Some(Box::new(move || {
+            std::fs::rename(&hook_target, &hook_displaced)
+                .expect("atomically displace initialized owned target");
+            std::fs::write(&hook_target, &hook_replacement)
+                .expect("install same-length replacement in exact interposition window");
+        })));
+
+        let mut env = ConnectionEnv::default();
+        env.set_schema_only_write_set_page_limit(Some(8));
+        let error = Connection::initialize_reserved_schema_only_builder(&reservation, 8192, env)
+            .expect_err("identity drift must refuse before reopening replacement");
+        assert!(matches!(error, FrankenError::CannotOpen { .. }));
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            replacement,
+            "replacement bytes must survive without writes or unlink"
+        );
+        let displaced_bytes = std::fs::read(&displaced).unwrap();
+        assert_eq!(&displaced_bytes[..16], b"SQLite format 3\0");
+        assert_eq!(displaced_bytes.len(), 8192);
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn hfdt_0117_reserved_builder_final_revalidation_refuses_path_replacement() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("final-swap-target.db");
+        let displaced = dir.path().join("final-swap-owned.db");
+        let reservation =
+            Connection::reserve_schema_only_builder_target(&target).expect("reserve target");
+        let mut env = ConnectionEnv::default();
+        env.set_schema_only_write_set_page_limit(Some(32));
+        let conn = Connection::initialize_reserved_schema_only_builder(&reservation, 8192, env)
+            .expect("initialize retained target");
+        conn.execute("CREATE TABLE final_proof(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);")
+            .unwrap();
+        conn.close().unwrap();
+
+        let expected_len = std::fs::metadata(&target).unwrap().len();
+        reservation
+            .revalidate_final_target(None)
+            .expect("unchanged built target must validate without a length constraint");
+        let length_error = reservation
+            .revalidate_final_target(Some(expected_len.saturating_add(1)))
+            .expect_err("mismatched expected length must be refused");
+        assert!(matches!(length_error, FrankenError::CannotOpen { .. }));
+        reservation
+            .revalidate_final_target(Some(expected_len))
+            .expect("unchanged built target must validate");
+        std::fs::rename(&target, &displaced).unwrap();
+        let replacement = vec![0x5a; usize::try_from(expected_len).unwrap()];
+        std::fs::write(&target, &replacement).unwrap();
+
+        let error = reservation
+            .revalidate_final_target(Some(expected_len))
+            .expect_err("same-length pathname replacement must be refused");
+        assert!(matches!(error, FrankenError::CannotOpen { .. }));
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            replacement,
+            "final validation must not mutate or unlink the replacement"
+        );
+        let displaced_bytes = std::fs::read(&displaced).unwrap();
+        assert_eq!(&displaced_bytes[..16], b"SQLite format 3\0");
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn hfdt_0117_reserved_builder_final_revalidation_refuses_hardlink() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("final-hardlink-target.db");
+        let alias = dir.path().join("final-hardlink-alias.db");
+        let reservation =
+            Connection::reserve_schema_only_builder_target(&target).expect("reserve target");
+        let mut env = ConnectionEnv::default();
+        env.set_schema_only_write_set_page_limit(Some(32));
+        let conn = Connection::initialize_reserved_schema_only_builder(&reservation, 4096, env)
+            .expect("initialize retained target");
+        conn.execute("CREATE TABLE final_proof(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.close().unwrap();
+
+        let expected_len = std::fs::metadata(&target).unwrap().len();
+        reservation
+            .revalidate_final_target(Some(expected_len))
+            .expect("single-link built target must validate");
+        std::fs::hard_link(&target, &alias).unwrap();
+
+        let error = reservation
+            .revalidate_final_target(Some(expected_len))
+            .expect_err("new hard-link alias must be refused");
+        assert!(matches!(error, FrankenError::CannotOpen { .. }));
+        assert_eq!(
+            fsqlite_vfs::FileIdentity::from_file(&std::fs::File::open(&alias).unwrap())
+                .unwrap()
+                .unwrap(),
+            reservation.identity(),
+            "proof fixture must be a true hard link to the retained target"
+        );
     }
 
     #[test]

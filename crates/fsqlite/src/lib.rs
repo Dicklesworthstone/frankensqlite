@@ -4,9 +4,12 @@
 //! phases it also re-exports selected internal crates for integration tests.
 
 pub use fsqlite_core::connection::{
-    Connection, ConnectionEnv, DatabaseImagePublication, DatabaseImageReceipt, IoPollStrategy,
-    PreparedStatement, Row, RuntimeConfig, RuntimeContext, TraceEvent, TraceMask,
-    init_global_runtime,
+    BoundedDatabaseStructuralStats, BoundedDatabaseValidationStats, BoundedReadSnapshotStats,
+    Connection, ConnectionEnv, DatabaseBuilderReservation, DatabaseImagePublication,
+    DatabaseImageReceipt, IoPollStrategy, PreparedStatement, Row, RuntimeConfig, RuntimeContext,
+    SCHEMA_LOAD_MAX_IDENTIFIER_BYTES, SCHEMA_LOAD_MAX_METADATA_BYTES, SCHEMA_LOAD_MAX_OBJECTS,
+    SCHEMA_LOAD_MAX_SQL_BYTES_PER_OBJECT, SCHEMA_LOAD_MAX_TOTAL_SQL_BYTES, SchemaLoadStats,
+    TraceEvent, TraceMask, WriteSetStats, init_global_runtime,
 };
 pub use fsqlite_error::{DatabaseImagePublicationErrorClass, FrankenError};
 pub use fsqlite_types::SqliteValue;

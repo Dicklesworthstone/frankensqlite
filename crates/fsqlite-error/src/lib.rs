@@ -314,6 +314,40 @@ pub enum FrankenError {
         successful_evictions: usize,
     },
 
+    /// A schema-only builder transaction attempted to admit one more distinct
+    /// dirty page than its explicitly configured write-set ceiling permits.
+    ///
+    /// The refusal occurs before the page is staged, so `current_dirty_pages`
+    /// and `current_dirty_bytes` still describe the intact retryable
+    /// transaction state.
+    #[error(
+        "schema-only write-set limit exceeded: page_size={page_size}, page_limit={page_limit}, byte_limit={byte_limit}, current_dirty_pages={current_dirty_pages}, current_dirty_bytes={current_dirty_bytes}, attempted_dirty_pages={attempted_dirty_pages}, attempted_dirty_bytes={attempted_dirty_bytes}"
+    )]
+    WriteSetLimitExceeded {
+        page_size: usize,
+        page_limit: usize,
+        byte_limit: usize,
+        current_dirty_pages: usize,
+        current_dirty_bytes: usize,
+        attempted_dirty_pages: usize,
+        attempted_dirty_bytes: usize,
+    },
+
+    /// A persisted `sqlite_schema` image exceeded a fixed schema-ingress
+    /// ceiling before the loader retained or parsed the rejected metadata.
+    ///
+    /// Dimensions encoded in the record header are refused before full
+    /// payload materialization. Identifier tokens inside otherwise-admitted
+    /// SQL are inspected from the bounded payload before AST parsing.
+    #[error(
+        "schema load limit exceeded: dimension={dimension}, limit={limit}, attempted={attempted}"
+    )]
+    SchemaLoadLimitExceeded {
+        dimension: &'static str,
+        limit: usize,
+        attempted: usize,
+    },
+
     /// SQL function domain/runtime error (analogous to `sqlite3_result_error`).
     #[error("{0}")]
     FunctionError(String),
@@ -472,13 +506,14 @@ impl FrankenError {
             | Self::LockFailed { .. } => ErrorCode::Busy,
             Self::TypeMismatch { .. } => ErrorCode::Mismatch,
             Self::IntegerOverflow | Self::OutOfRange { .. } => ErrorCode::Range,
-            Self::TooBig => ErrorCode::TooBig,
+            Self::TooBig | Self::SchemaLoadLimitExceeded { .. } => ErrorCode::TooBig,
             Self::Internal(_) | Self::DatabaseImagePublicationOutcomeIndeterminate { .. } => {
                 ErrorCode::Internal
             }
             Self::Abort => ErrorCode::Abort,
             Self::AuthDenied => ErrorCode::Auth,
             Self::OutOfMemory | Self::PageBufferCapacityExhausted { .. } => ErrorCode::NoMem,
+            Self::WriteSetLimitExceeded { .. } => ErrorCode::Full,
             Self::Unsupported => ErrorCode::NoLfs,
             Self::ReadOnly => ErrorCode::ReadOnly,
             Self::Interrupt => ErrorCode::Interrupt,
@@ -504,6 +539,8 @@ impl FrankenError {
                 | Self::NoSuchColumn { .. }
                 | Self::TypeMismatch { .. }
                 | Self::PageBufferCapacityExhausted { .. }
+                | Self::WriteSetLimitExceeded { .. }
+                | Self::SchemaLoadLimitExceeded { .. }
                 | Self::CannotOpen { .. }
         )
     }
@@ -540,6 +577,12 @@ impl FrankenError {
             }
             Self::PageBufferCapacityExhausted { .. } => Some(
                 "Finish or roll back active transactions, then retry; inspect page-buffer diagnostics before raising the configured limit",
+            ),
+            Self::WriteSetLimitExceeded { .. } => Some(
+                "Commit the current schema-only builder batch, then continue with a fresh bounded batch",
+            ),
+            Self::SchemaLoadLimitExceeded { .. } => Some(
+                "Reduce the persisted schema object, SQL, identifier, or aggregate metadata size before reopening the database",
             ),
             _ => None,
         }
@@ -728,6 +771,24 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "page buffer capacity exhausted during transaction_write_stage: page_size=4096, max_buffers=8, total_buffers=8, available_buffers=0, cached_clean=0, cached_dirty=8, successful_evictions=0"
+        );
+    }
+
+    #[test]
+    fn hfdt_0117_schema_load_limit_error_is_structured_fail_closed_and_actionable() {
+        let error = FrankenError::SchemaLoadLimitExceeded {
+            dimension: "aggregate_sql_bytes",
+            limit: 16 * 1024 * 1024,
+            attempted: 16 * 1024 * 1024 + 1,
+        };
+
+        assert_eq!(error.error_code(), ErrorCode::TooBig);
+        assert!(error.is_user_recoverable());
+        assert!(!error.is_transient());
+        assert!(error.suggestion().is_some());
+        assert_eq!(
+            error.to_string(),
+            "schema load limit exceeded: dimension=aggregate_sql_bytes, limit=16777216, attempted=16777217"
         );
     }
 

@@ -10985,6 +10985,20 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         Ok((rowid, payload))
     }
 
+    fn payload_size(&self, _cx: &Cx) -> Result<usize> {
+        if self.at_eof || self.stack.is_empty() {
+            return Err(FrankenError::internal("cursor at EOF"));
+        }
+        let top = self
+            .stack
+            .last()
+            .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
+        let cell = self.parse_cell_at_uncached(top, top.cell_idx)?;
+        usize::try_from(cell.payload_size).map_err(|_| FrankenError::DatabaseCorrupt {
+            detail: "B-tree cell payload size does not fit usize".to_owned(),
+        })
+    }
+
     fn payload_prefix_into(
         &self,
         cx: &Cx,
@@ -17383,7 +17397,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rowid_and_payload_cow_reads_local_leaf_table_payload() {
+    fn hfdt_0117_payload_size_avoids_local_cache_and_overflow_materialization() {
         let payload = b"small local payload";
         let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[(7, payload)]));
@@ -17400,6 +17414,11 @@ mod tests {
             "local leaf-table payloads should stay borrowed"
         );
         assert!(cursor.cell_slot_cache.borrow().entries.is_empty());
+        assert_eq!(cursor.payload_size(&cx).unwrap(), payload.len());
+        assert!(
+            cursor.cell_slot_cache.borrow().entries.is_empty(),
+            "payload_size() must inspect encoded cell metadata without caching or materializing payload bytes"
+        );
         assert_eq!(cursor.payload(&cx).unwrap(), payload);
         assert!(
             cursor.cell_slot_cache.borrow().entries.is_empty(),
@@ -17411,6 +17430,31 @@ mod tests {
             .payload_prefix_into(&cx, 5, &mut prefix)
             .expect("local leaf prefix read should succeed");
         assert_eq!(prefix, b"small");
+
+        let overflow_payload = vec![0x5a; 5_000];
+        let mut overflow_store = MemPageStore::new(USABLE);
+        overflow_store.pages.insert(2, build_leaf_table(&[]));
+        let mut overflow_cursor =
+            BtCursor::new(PrefetchProbeStore::new(overflow_store), pn(2), USABLE, true);
+        overflow_cursor
+            .table_insert(&cx, 11, &overflow_payload)
+            .unwrap();
+        assert!(overflow_cursor.table_move_to(&cx, 11).unwrap().is_found());
+        overflow_cursor.pager.clear_probe();
+        let cached_slots_before = overflow_cursor.cell_slot_cache.borrow().entries.len();
+        assert_eq!(
+            overflow_cursor.payload_size(&cx).unwrap(),
+            overflow_payload.len()
+        );
+        assert!(
+            overflow_cursor.pager.snapshot().read_pages.is_empty(),
+            "payload_size() must not read or materialize overflow pages"
+        );
+        assert_eq!(
+            overflow_cursor.cell_slot_cache.borrow().entries.len(),
+            cached_slots_before,
+            "payload_size() must not populate the cell-slot cache for overflow cells"
+        );
     }
 
     #[test]

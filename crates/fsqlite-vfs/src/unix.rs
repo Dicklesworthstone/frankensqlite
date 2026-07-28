@@ -23,6 +23,8 @@ use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -94,6 +96,9 @@ const RESERVED_BYTE: u64 = PENDING_BYTE + 1;
 const SHARED_FIRST: u64 = PENDING_BYTE + 2;
 /// Number of bytes in the shared lock range.
 const SHARED_SIZE: u64 = 510;
+
+#[cfg(test)]
+static FSQLITE_FAIL_NEXT_BOUNDED_OFD_UNLOCK: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // WAL SHM header initialization (legacy SQLite interop)
@@ -311,6 +316,58 @@ fn posix_lock(file: &impl AsFd, lock_type: impl Into<i32>, start: u64, len: u64)
             Err(nix::errno::Errno::EINTR) => {}
             Err(nix::errno::Errno::EACCES | nix::errno::Errno::EAGAIN) => return Ok(false),
             Err(e) => return Err(FrankenError::Io(e.into())),
+        }
+    }
+}
+
+/// Attempt a Linux open-file-description lock.
+///
+/// OFD locks conflict with stock SQLite's classic POSIX locks but belong to
+/// the open file description rather than the process. They therefore survive
+/// closing an unrelated descriptor for the same inode, which is required for
+/// a continuous bounded-snapshot fence.
+#[cfg(target_os = "linux")]
+const fn linux_ofd_locks_unsupported(error: nix::errno::Errno) -> bool {
+    matches!(
+        error,
+        nix::errno::Errno::EINVAL | nix::errno::Errno::ENOSYS | nix::errno::Errno::EOPNOTSUPP
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::cast_possible_wrap)]
+fn ofd_lock(file: &impl AsFd, lock_type: impl Into<i32>, start: u64, len: u64) -> Result<bool> {
+    let lock_type_i32: i32 = lock_type.into();
+    #[cfg(test)]
+    if lock_type_i32 == libc::F_UNLCK
+        && FSQLITE_FAIL_NEXT_BOUNDED_OFD_UNLOCK.swap(false, Ordering::AcqRel)
+    {
+        return Err(FrankenError::Io(std::io::Error::other(
+            "injected bounded-snapshot OFD unlock failure",
+        )));
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let lock_type_short = lock_type_i32 as libc::c_short;
+    let flock = libc::flock {
+        l_type: lock_type_short,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: start as libc::off_t,
+        l_len: len as libc::off_t,
+        l_pid: 0,
+    };
+
+    loop {
+        match nix::fcntl::fcntl(file.as_fd(), nix::fcntl::FcntlArg::F_OFD_SETLK(&flock)) {
+            Ok(_) => return Ok(true),
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(nix::errno::Errno::EACCES | nix::errno::Errno::EAGAIN) => return Ok(false),
+            Err(error) if linux_ofd_locks_unsupported(error) => {
+                return Err(FrankenError::NotImplemented(
+                    "bounded snapshots require Linux OFD locks on the SQLite SHARED range"
+                        .to_owned(),
+                ));
+            }
+            Err(error) => return Err(FrankenError::Io(error.into())),
         }
     }
 }
@@ -925,6 +982,7 @@ impl Vfs for UnixVfs {
             shm_path,
             shm_info: None,
             busy_timeout_ms: 0,
+            bounded_snapshot_prior_level: None,
         };
 
         Ok((unix_file, out_flags))
@@ -1060,6 +1118,9 @@ pub struct UnixFile {
     /// When > 0, `posix_lock` retries with exponential backoff instead of
     /// returning `Ok(false)` immediately on `EAGAIN`/`EACCES`.
     busy_timeout_ms: u64,
+    /// Prior ordinary lock level retained while a bounded snapshot owns its
+    /// Linux OFD companion lock.
+    bounded_snapshot_prior_level: Option<LockLevel>,
 }
 
 impl UnixFile {
@@ -1822,6 +1883,9 @@ impl VfsFile for UnixFile {
             return Ok(());
         }
 
+        if self.bounded_snapshot_prior_level.is_some() {
+            self.unlock_external_bounded_shared_snapshot(cx)?;
+        }
         // Downgrade to no lock before closing.
         if self.lock_level != LockLevel::None {
             self.unlock(cx, LockLevel::None)?;
@@ -2071,6 +2135,11 @@ impl VfsFile for UnixFile {
         if level >= self.lock_level {
             return Ok(());
         }
+        if self.bounded_snapshot_prior_level.is_some() && level < LockLevel::Shared {
+            return Err(FrankenError::internal(
+                "bounded snapshot OFD fence must be released through its paired unlock",
+            ));
+        }
 
         let inode_info = Arc::clone(self.inode_info_ref());
         let mut info = inode_info
@@ -2114,6 +2183,89 @@ impl VfsFile for UnixFile {
         self.lock_level = level;
         info.close_deferred_files_if_unlocked();
         Ok(())
+    }
+
+    fn lock_external_bounded_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            if self.bounded_snapshot_prior_level.is_some() {
+                return Err(FrankenError::internal(
+                    "bounded snapshot OFD fence is already held",
+                ));
+            }
+            let prior_level = self.lock_level;
+            self.lock(cx, LockLevel::Shared)?;
+            let ofd_result = ofd_lock(self.file_ref(), libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE);
+            match ofd_result {
+                Ok(true) => {
+                    self.bounded_snapshot_prior_level = Some(prior_level);
+                    Ok(())
+                }
+                Ok(false) => {
+                    self.unlock(cx, prior_level)?;
+                    Err(FrankenError::Busy)
+                }
+                Err(lock_error) => match self.unlock(cx, prior_level) {
+                    Ok(()) => Err(lock_error),
+                    Err(unlock_error) => Err(FrankenError::internal(format!(
+                        "bounded snapshot OFD acquisition failed and ordinary SHARED cleanup also failed: lock={lock_error}; cleanup={unlock_error}"
+                    ))),
+                },
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = cx;
+            Err(FrankenError::NotImplemented(
+                "bounded snapshots require Linux OFD locks on Unix".to_owned(),
+            ))
+        }
+    }
+
+    fn unlock_external_bounded_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let Some(prior_level) = self.bounded_snapshot_prior_level else {
+                return Ok(());
+            };
+            let ofd_result = ofd_lock(self.file_ref(), libc::F_UNLCK, SHARED_FIRST, SHARED_SIZE)
+                .and_then(|unlocked| {
+                    if unlocked {
+                        Ok(())
+                    } else {
+                        Err(FrankenError::internal(
+                            "Linux OFD unlock unexpectedly reported contention",
+                        ))
+                    }
+                });
+            if let Err(error) = ofd_result {
+                // Keep the paired state armed. `close()` returns before
+                // dropping the descriptor, and a later retry must still know
+                // that the OFD surface might be live.
+                return Err(error);
+            }
+
+            // The OFD surface is gone. Temporarily clear the pairing marker so
+            // the ordinary lock implementation may restore `prior_level`. If
+            // that restoration fails, reinstate the marker: OFD unlock is
+            // idempotent, so a close/unlock retry can safely release both
+            // surfaces again without ever treating the open handle as clean.
+            self.bounded_snapshot_prior_level = None;
+            match self.unlock(cx, prior_level) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    self.bounded_snapshot_prior_level = Some(prior_level);
+                    Err(error)
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = cx;
+            Err(FrankenError::NotImplemented(
+                "bounded snapshots require Linux OFD locks on Unix".to_owned(),
+            ))
+        }
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
@@ -2347,6 +2499,65 @@ mod tests {
     use std::io::{BufRead, BufReader, Write as _};
     use std::process::{Child, Stdio};
     use std::process::{Command, Output};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hfdt_0117_linux_ofd_unavailable_errors_are_fail_closed() {
+        for error in [
+            nix::errno::Errno::EINVAL,
+            nix::errno::Errno::ENOSYS,
+            nix::errno::Errno::EOPNOTSUPP,
+        ] {
+            assert!(
+                linux_ofd_locks_unsupported(error),
+                "{error} must produce a typed unsupported refusal, never a POSIX-lock fallback"
+            );
+        }
+        assert!(!linux_ofd_locks_unsupported(nix::errno::Errno::EIO));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hfdt_0117_failed_bounded_ofd_unlock_keeps_pairing_armed_until_close_retry() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("bounded-ofd-close-retry.db");
+        fs::write(&path, b"bounded OFD close-retry lock target")
+            .expect("create ordinary lock target");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(&path), flags).expect("open main file");
+
+        file.lock_external_bounded_shared_snapshot(&cx)
+            .expect("acquire paired classic/OFD bounded fence");
+        assert_eq!(file.bounded_snapshot_prior_level, Some(LockLevel::None));
+
+        FSQLITE_FAIL_NEXT_BOUNDED_OFD_UNLOCK.store(true, Ordering::Release);
+        let error = file
+            .close(&cx)
+            .expect_err("injected OFD unlock failure must fail close");
+        assert!(
+            error
+                .to_string()
+                .contains("injected bounded-snapshot OFD unlock failure")
+        );
+        assert!(!file.closed, "failed close must retain the live descriptor");
+        assert_eq!(
+            file.bounded_snapshot_prior_level,
+            Some(LockLevel::None),
+            "failed OFD release must preserve the pairing marker for retry"
+        );
+        assert_eq!(
+            file.lock_level,
+            LockLevel::Shared,
+            "failed OFD release must preserve the ordinary SHARED claim"
+        );
+
+        file.close(&cx)
+            .expect("close retry must release both bounded lock surfaces");
+        assert!(file.closed);
+        assert_eq!(file.bounded_snapshot_prior_level, None);
+        assert_eq!(file.lock_level, LockLevel::None);
+    }
 
     #[test]
     fn shm_table_registration_and_orphan_removal_preserve_one_lock_domain() {

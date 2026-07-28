@@ -4204,6 +4204,134 @@ pub struct PagerPublishedSnapshot {
     pub page_set_size: usize,
 }
 
+/// Observable state for an opt-in bounded, physically read-only snapshot.
+///
+/// Bounded snapshots never add pages to either the normal per-transaction
+/// repeatable-read cache or the pager's published page plane. The current
+/// implementation supports self-contained main-database images only. It
+/// refuses live WAL state until the pager can retain a stock-compatible WAL
+/// reader-slot fence for the full transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundedReadSnapshotStats {
+    /// Configured maximum snapshot-owned retained page state. The current
+    /// direct-read implementation retains zero page bodies; this limit does
+    /// not resize the general shared page-buffer pool.
+    pub page_limit: usize,
+    /// Pages retained in the normal per-transaction read cache. This remains
+    /// zero for bounded snapshots.
+    pub transaction_cached_pages: usize,
+    /// High-water mark for normal per-transaction read-cache residency. The
+    /// bounded direct path never admits pages, so this remains zero.
+    pub transaction_cached_pages_high_water: usize,
+    /// Successful logical page reads performed through the direct,
+    /// snapshot-pinned storage path.
+    pub direct_page_reads: u64,
+    /// Published-plane residency when the transaction began.
+    pub published_page_set_size_at_begin: usize,
+    /// Published-plane residency at observation time.
+    pub published_page_set_size_now: usize,
+    /// Entries retained in the pinned WAL page index. This is zero while live
+    /// WAL state is refused.
+    pub wal_page_index_entries: usize,
+    /// Whether capped WAL lookup may use the backwards-scan fallback. This is
+    /// false while live WAL state is refused.
+    pub wal_index_is_partial: bool,
+    /// Cumulative partial-index fallback reads observed by this WAL backend.
+    /// This is zero while live WAL state is refused.
+    pub wal_partial_index_fallback_reads: u64,
+}
+
+/// Current and high-water write-set accounting for an explicitly bounded
+/// schema-only builder connection.
+///
+/// The byte fields are exact for the pager write set because every staged
+/// entry owns one fixed-size database page. A completed commit or rollback
+/// leaves the high-water fields intact while resetting the current fields to
+/// zero, allowing callers to certify each batch after the transaction closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteSetStats {
+    /// Maximum number of distinct dirty pages admitted to one transaction.
+    pub page_limit: usize,
+    /// Exact byte ceiling implied by `page_limit * page_size`.
+    pub byte_limit: usize,
+    /// Distinct dirty pages currently staged by the active transaction.
+    pub current_dirty_pages: usize,
+    /// Exact bytes currently staged by the active transaction.
+    pub current_dirty_bytes: usize,
+    /// Largest distinct dirty-page count observed in the latest transaction.
+    pub dirty_pages_high_water: usize,
+    /// Largest staged byte count observed in the latest transaction.
+    pub dirty_bytes_high_water: usize,
+    /// Number of pre-admission cap refusals in the latest transaction.
+    pub cap_refusals: u64,
+}
+
+#[derive(Debug, Default)]
+struct WriteSetTelemetry {
+    stats: Mutex<Option<WriteSetStats>>,
+}
+
+impl WriteSetTelemetry {
+    fn begin(&self, page_limit: Option<usize>, page_size: usize) {
+        let mut stats = self
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *stats = page_limit.map(|page_limit| WriteSetStats {
+            page_limit,
+            byte_limit: page_limit.saturating_mul(page_size),
+            current_dirty_pages: 0,
+            current_dirty_bytes: 0,
+            dirty_pages_high_water: 0,
+            dirty_bytes_high_water: 0,
+            cap_refusals: 0,
+        });
+    }
+
+    fn observe(&self, dirty_pages: usize, page_size: usize) {
+        let mut guard = self
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(stats) = guard.as_mut() else {
+            return;
+        };
+        let dirty_bytes = dirty_pages.saturating_mul(page_size);
+        stats.current_dirty_pages = dirty_pages;
+        stats.current_dirty_bytes = dirty_bytes;
+        stats.dirty_pages_high_water = stats.dirty_pages_high_water.max(dirty_pages);
+        stats.dirty_bytes_high_water = stats.dirty_bytes_high_water.max(dirty_bytes);
+    }
+
+    fn refuse(&self) {
+        let mut guard = self
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(stats) = guard.as_mut() {
+            stats.cap_refusals = stats.cap_refusals.saturating_add(1);
+        }
+    }
+
+    fn finish(&self) {
+        let mut guard = self
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(stats) = guard.as_mut() {
+            stats.current_dirty_pages = 0;
+            stats.current_dirty_bytes = 0;
+        }
+    }
+
+    fn snapshot(&self) -> Option<WriteSetStats> {
+        *self
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 #[cfg(test)]
 mod metadata_publication_contract_tests {
     use super::{
@@ -5014,6 +5142,93 @@ fn release_single_writer_baton<F: VfsFile>(inner: &mut PagerInner<F>) -> bool {
     was_active
 }
 
+/// Test-only interposition at the schema-only write-set configuration
+/// linearization point. The hook runs while `SimplePager::inner` is still
+/// locked and immediately before the published limit changes, allowing an
+/// adversarial test to prove that `begin()` cannot enter a validation/store
+/// gap.
+#[cfg(test)]
+struct SchemaWriteSetConfigLinearizationHook {
+    owner: std::thread::ThreadId,
+    callback: Box<dyn FnOnce() + Send + 'static>,
+}
+
+#[cfg(test)]
+static FSQLITE_SCHEMA_WRITE_SET_CONFIG_LINEARIZATION_HOOK: Mutex<
+    Option<SchemaWriteSetConfigLinearizationHook>,
+> = Mutex::new(None);
+
+/// Serializes tests that install the process-global schema write-set
+/// linearization hook. The guard intentionally recovers poison: an adversarial
+/// unwind must not disable later isolation checks.
+#[cfg(test)]
+static FSQLITE_SCHEMA_WRITE_SET_CONFIG_LINEARIZATION_HOOK_SERIALIZER: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+struct SchemaWriteSetConfigLinearizationHookGuard {
+    owner: std::thread::ThreadId,
+    _serializer: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for SchemaWriteSetConfigLinearizationHookGuard {
+    fn drop(&mut self) {
+        let mut slot = FSQLITE_SCHEMA_WRITE_SET_CONFIG_LINEARIZATION_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot
+            .as_ref()
+            .is_some_and(|installed| installed.owner == self.owner)
+        {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn install_schema_write_set_config_linearization_hook(
+    callback: Box<dyn FnOnce() + Send + 'static>,
+) -> SchemaWriteSetConfigLinearizationHookGuard {
+    let serializer = FSQLITE_SCHEMA_WRITE_SET_CONFIG_LINEARIZATION_HOOK_SERIALIZER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let owner = std::thread::current().id();
+    let mut slot = FSQLITE_SCHEMA_WRITE_SET_CONFIG_LINEARIZATION_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        slot.is_none(),
+        "serialized schema write-set configuration hook slot must be empty"
+    );
+    *slot = Some(SchemaWriteSetConfigLinearizationHook { owner, callback });
+    drop(slot);
+    SchemaWriteSetConfigLinearizationHookGuard {
+        owner,
+        _serializer: serializer,
+    }
+}
+
+#[cfg(test)]
+fn fire_schema_write_set_config_linearization_hook() {
+    let current = std::thread::current().id();
+    let callback = {
+        let mut slot = FSQLITE_SCHEMA_WRITE_SET_CONFIG_LINEARIZATION_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot
+            .as_ref()
+            .is_some_and(|installed| installed.owner == current)
+        {
+            slot.take().map(|installed| installed.callback)
+        } else {
+            None
+        }
+    };
+    if let Some(callback) = callback {
+        callback();
+    }
+}
+
 /// A concrete single-writer pager backed by a VFS file.
 pub struct SimplePager<V: Vfs> {
     /// VFS used to open journal/WAL companion files.
@@ -5041,6 +5256,17 @@ pub struct SimplePager<V: Vfs> {
     cache: Arc<ShardedPageCache>,
     /// Shared page buffer pool cloned into transactions for write staging.
     pool: PageBufPool,
+    /// Explicit opt-in ceiling for transaction-owned bounded read-snapshot
+    /// state. The mode is available only on physically read-only pagers and
+    /// bypasses every shared/latest page plane rather than evicting pages from
+    /// the normal repeatable-read cache.
+    bounded_read_snapshot_page_limit: Option<usize>,
+    /// Opt-in dirty-page ceiling used only by identity-bound schema-only
+    /// read-write builder connections. Zero means disabled.
+    schema_only_write_set_page_limit: AtomicUsize,
+    /// Connection-visible current/high-water accounting for that bounded
+    /// write set.
+    write_set_telemetry: Arc<WriteSetTelemetry>,
     /// Published metadata/page plane for lock-light steady-state reads.
     published: Arc<PublishedPagerState>,
     /// WAL backend for WAL-mode operation (D1-CRITICAL: separate lock for split-lock commit).
@@ -5459,6 +5685,28 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
 
+        let bounded_read_snapshot = self.bounded_read_snapshot_page_limit.is_some();
+        if bounded_read_snapshot {
+            if !inner.access_mode.is_readonly()
+                || !matches!(mode, TransactionMode::ReadOnly | TransactionMode::Deferred)
+            {
+                return Err(FrankenError::ReadOnly);
+            }
+            if inner.journal_mode == JournalMode::Wal {
+                return Err(FrankenError::NotImplemented(
+                    "bounded read snapshots require a self-contained database in rollback/DELETE \
+                     journal mode until stock-compatible WAL reader-slot fencing is available"
+                        .to_owned(),
+                ));
+            }
+            // Keep the bounded mode single-transaction: its retained external
+            // fence and zero-retention observability are defined for exactly
+            // one local reader at a time.
+            if inner.active_transactions != 0 {
+                return Err(FrankenError::Busy);
+            }
+        }
+
         if inner.checkpoint_active {
             let active_transactions = inner.active_transactions;
             let checkpoint_active = inner.checkpoint_active;
@@ -5498,7 +5746,12 @@ where
             let commit_seq_before_refresh = inner.commit_seq;
             let (committed_refresh, journal_visibility_invalidation) =
                 if active_transactions_before_begin == 0 {
-                    self.refresh_runtime_committed_state(cx, &mut maintenance_lease, &mut inner)?
+                    self.refresh_runtime_committed_state(
+                        cx,
+                        &mut maintenance_lease,
+                        &mut inner,
+                        false,
+                    )?
                 } else {
                     (
                         CommittedStateRefresh {
@@ -5550,6 +5803,18 @@ where
             let cleanup_cx = cx.clone();
             let memory_db_bump_alloc =
                 self.vfs.is_memory() && self.db_path == Path::new("/:memory:");
+            let schema_only_write_set_page_limit = match (
+                mode,
+                self.schema_only_write_set_page_limit
+                    .load(AtomicOrdering::Acquire),
+            ) {
+                (TransactionMode::ReadOnly, _) | (_, 0) => None,
+                (_, page_limit) => Some(page_limit),
+            };
+            if schema_only_write_set_page_limit.is_some() {
+                self.write_set_telemetry
+                    .begin(schema_only_write_set_page_limit, pool.page_size());
+            }
             return Ok(SimpleTransaction {
                 vfs: Arc::clone(&self.vfs),
                 journal_path: Self::journal_path(&self.db_path),
@@ -5566,6 +5831,11 @@ where
                 maintenance_lease: Some(maintenance_lease),
                 recovery_fence: Arc::clone(&self.recovery_fence),
                 read_only_pager: inner.access_mode.is_readonly(),
+                bounded_read_snapshot_page_limit: None,
+                bounded_read_direct_page_reads: Cell::new(0),
+                bounded_read_published_page_set_size_at_begin: published_snapshot.page_set_size,
+                schema_only_write_set_page_limit,
+                write_set_telemetry: Arc::clone(&self.write_set_telemetry),
                 published_visible_commit_seq: Cell::new(bound_visible_commit_seq),
                 published_db_size: Cell::new(bound_db_size),
                 write_set: PagePageMap::default(),
@@ -5597,7 +5867,12 @@ where
         let commit_seq_before_refresh = inner.commit_seq;
         let (committed_refresh, journal_visibility_invalidation) =
             if active_transactions_before_begin == 0 {
-                self.refresh_runtime_committed_state(cx, &mut maintenance_lease, &mut inner)?
+                self.refresh_runtime_committed_state(
+                    cx,
+                    &mut maintenance_lease,
+                    &mut inner,
+                    bounded_read_snapshot,
+                )?
             } else {
                 (
                     CommittedStateRefresh {
@@ -5607,7 +5882,7 @@ where
                     false,
                 )
             };
-        if active_transactions_before_begin == 0 {
+        if active_transactions_before_begin == 0 && !bounded_read_snapshot {
             // Retain one stock-visible SHARED snapshot fence for the lifetime
             // of the first local transaction. Later local transactions share
             // this file handle and the last one releases it.
@@ -5729,6 +6004,19 @@ where
         let cleanup_cx = cleanup_child_cx(cx);
         let memory_db_bump_alloc = self.vfs.is_memory() && self.db_path == Path::new("/:memory:");
         let read_only_pager = inner.access_mode.is_readonly();
+        let bounded_read_snapshot_page_limit = self.bounded_read_snapshot_page_limit;
+        let schema_only_write_set_page_limit = match (
+            mode,
+            self.schema_only_write_set_page_limit
+                .load(AtomicOrdering::Acquire),
+        ) {
+            (TransactionMode::ReadOnly, _) | (_, 0) => None,
+            (_, page_limit) => Some(page_limit),
+        };
+        if schema_only_write_set_page_limit.is_some() {
+            self.write_set_telemetry
+                .begin(schema_only_write_set_page_limit, pool.page_size());
+        }
         drop(inner);
 
         Ok(SimpleTransaction {
@@ -5747,6 +6035,11 @@ where
             maintenance_lease: Some(maintenance_lease),
             recovery_fence: Arc::clone(&self.recovery_fence),
             read_only_pager,
+            bounded_read_snapshot_page_limit,
+            bounded_read_direct_page_reads: Cell::new(0),
+            bounded_read_published_page_set_size_at_begin: published_snapshot.page_set_size,
+            schema_only_write_set_page_limit,
+            write_set_telemetry: Arc::clone(&self.write_set_telemetry),
             published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
             published_db_size: Cell::new(published_snapshot.db_size),
             write_set: PagePageMap::default(),
@@ -6239,6 +6532,32 @@ where
         provisional: &DatabaseImageReceipt,
         change_counter: u32,
     ) -> Result<DatabaseImageReceipt> {
+        self.restore_vacuum_candidate_header_counters(
+            cx,
+            image_path,
+            provisional,
+            change_counter,
+            change_counter,
+        )
+    }
+
+    /// Restore both mutable database-header counters on an identity-bound
+    /// private candidate.
+    ///
+    /// Publication uses this after a precommit validation refusal so the
+    /// caller-owned candidate returns to its exact provisional receipt rather
+    /// than retaining source-derived provenance from an image that was not
+    /// published. The same identity, exclusive-lock, full-page write, durable
+    /// sync, and byte-for-byte verification discipline as
+    /// [`Self::restore_vacuum_candidate_change_counter`] applies.
+    pub fn restore_vacuum_candidate_header_counters(
+        &self,
+        cx: &Cx,
+        image_path: &Path,
+        provisional: &DatabaseImageReceipt,
+        change_counter: u32,
+        version_valid_for: u32,
+    ) -> Result<DatabaseImageReceipt> {
         let full_path = self.vfs.full_pathname(cx, image_path)?;
         let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
         let (mut file, _) =
@@ -6274,9 +6593,8 @@ where
                 });
             }
             let mut expected_page_one = page_one.clone();
-            let counter_bytes = change_counter.to_be_bytes();
-            expected_page_one[24..28].copy_from_slice(&counter_bytes);
-            expected_page_one[92..96].copy_from_slice(&counter_bytes);
+            expected_page_one[24..28].copy_from_slice(&change_counter.to_be_bytes());
+            expected_page_one[92..96].copy_from_slice(&version_valid_for.to_be_bytes());
 
             file.write(cx, &expected_page_one, 0)?;
             file.durable_sync(cx, SyncKind::FullDurable)?;
@@ -6297,7 +6615,7 @@ where
             )?;
             let mut expected_header = provisional.header.clone();
             expected_header.change_counter = change_counter;
-            expected_header.version_valid_for = change_counter;
+            expected_header.version_valid_for = version_valid_for;
             if final_receipt.identity != provisional.identity
                 || final_receipt.file_size != provisional.file_size
                 || final_receipt.header != expected_header
@@ -7111,7 +7429,7 @@ where
         let had_recovery_pending = inner.rollback_journal_recovery_state.is_pending();
         let commit_seq_before_refresh = inner.commit_seq;
         let (refresh, journal_visibility_invalidation) =
-            self.refresh_runtime_committed_state(cx, &mut maintenance_lease, &mut inner)?;
+            self.refresh_runtime_committed_state(cx, &mut maintenance_lease, &mut inner, false)?;
 
         let clear_published_pages = had_recovery_pending
             || journal_visibility_invalidation
@@ -7469,6 +7787,100 @@ where
         }
     }
 
+    fn wal_path(db_path: &Path) -> PathBuf {
+        let mut wal_path = db_path.as_os_str().to_owned();
+        wal_path.push("-wal");
+        PathBuf::from(wal_path)
+    }
+
+    /// Validate that a bounded read can use main-file bytes as its complete
+    /// snapshot image.
+    ///
+    /// The caller must retain the stock-visible main-file SHARED fence across
+    /// this check, the subsequent committed-state refresh, snapshot binding,
+    /// and all transaction reads. That single fence prevents an external
+    /// writer from changing either the header mode or the main-file bytes
+    /// between validation and use.
+    fn validate_bounded_read_snapshot_storage_mode(
+        &self,
+        cx: &Cx,
+        inner: &PagerInner<V::File>,
+    ) -> Result<()> {
+        let refuse_wal = || {
+            FrankenError::NotImplemented(
+                "bounded read snapshots require a self-contained database in rollback/DELETE \
+                 journal mode until stock-compatible WAL reader-slot fencing is available"
+                    .to_owned(),
+            )
+        };
+
+        if inner.journal_mode == JournalMode::Wal {
+            return Err(refuse_wal());
+        }
+
+        let file_size = inner.db_file.file_size(cx)?;
+        let header_bytes = inner.read_database_file_header_bytes(cx, file_size)?;
+        // A newly created WAL database may still have a stale main-file page
+        // one whose schema-format/text-encoding fields are zero; the complete
+        // current page one exists only in committed WAL. Recognize the valid
+        // SQLite magic/page size first, then refuse from the raw format-version
+        // bytes before requiring the rest of the main header to be current.
+        if page_size_from_header_bytes(&header_bytes).is_some()
+            && (header_bytes[18] != 1 || header_bytes[19] != 1)
+        {
+            return Err(refuse_wal());
+        }
+        let header = DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
+            FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "invalid database header during bounded read snapshot validation: {error}"
+                ),
+            }
+        })?;
+        if header.read_version != 1 || header.write_version != 1 {
+            return Err(refuse_wal());
+        }
+
+        let wal_path = Self::wal_path(&self.db_path);
+        if !self.vfs.access(cx, &wal_path, AccessFlags::EXISTS)? {
+            return Ok(());
+        }
+
+        // Prefer READWRITE for the probe so a read-only canonical descriptor
+        // cannot poison later same-process WAL writers. Fall back to READONLY
+        // for a genuinely read-only filesystem.
+        let (mut wal_file, _) = self
+            .vfs
+            .open(
+                cx,
+                Some(&wal_path),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::WAL,
+            )
+            .or_else(|_| {
+                self.vfs.open(
+                    cx,
+                    Some(&wal_path),
+                    VfsOpenFlags::READONLY | VfsOpenFlags::WAL,
+                )
+            })?;
+        let size_result = wal_file.file_size(cx);
+        let close_result = wal_file.close(cx);
+        let wal_size = match (size_result, close_result) {
+            (Ok(size), Ok(())) => size,
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+            (Err(size_error), Err(close_error)) => {
+                return Err(FrankenError::internal(format!(
+                    "bounded read WAL probe failed and could not close its handle: \
+                     probe={size_error}; close={close_error}"
+                )));
+            }
+        };
+        if wal_size >= u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
+            return Err(refuse_wal());
+        }
+        Ok(())
+    }
+
     /// Bind a transaction/read boundary to one coherent durable state.
     ///
     /// Every caller enters with exactly one transaction maintenance lease and
@@ -7481,16 +7893,21 @@ where
         cx: &Cx,
         maintenance_lease: &mut PagerMaintenanceLease,
         inner: &mut PagerInner<V::File>,
+        retain_readonly_shared_snapshot: bool,
     ) -> Result<(CommittedStateRefresh, bool)> {
         let journal_path = Self::journal_path(&self.db_path);
-        inner.db_file.lock_external_shared_snapshot(cx)?;
+        lock_external_read_snapshot(&mut inner.db_file, cx, retain_readonly_shared_snapshot)?;
 
         let journal_exists = match self.vfs.access(cx, &journal_path, AccessFlags::EXISTS) {
             Ok(exists) => exists,
             Err(error) => {
                 let cleanup_cx = cleanup_child_cx(cx);
                 let _cleanup_mask = cleanup_cx.masked();
-                return match inner.db_file.unlock_external_shared_snapshot(&cleanup_cx) {
+                return match unlock_external_read_snapshot(
+                    &mut inner.db_file,
+                    &cleanup_cx,
+                    retain_readonly_shared_snapshot,
+                ) {
                     Ok(()) => Err(error),
                     Err(unlock_error) => Err(FrankenError::internal(format!(
                         "rollback-journal probe failed and could not release SHARED: probe={error}; unlock={unlock_error}"
@@ -7506,12 +7923,22 @@ where
             } else {
                 Self::verify_readonly_rollback_journal_state(cx, &*self.vfs, &journal_path)
                     .and_then(|()| {
+                        if retain_readonly_shared_snapshot {
+                            self.validate_bounded_read_snapshot_storage_mode(cx, inner)?;
+                        }
                         inner.refresh_committed_state(cx, &self.cache, &self.wal_backend)
                     })
             };
+            if retain_readonly_shared_snapshot && operation_result.is_ok() {
+                return operation_result.map(|refresh| (refresh, journal_exists));
+            }
             let cleanup_cx = cleanup_child_cx(cx);
             let _cleanup_mask = cleanup_cx.masked();
-            let unlock_result = inner.db_file.unlock_external_shared_snapshot(&cleanup_cx);
+            let unlock_result = unlock_external_read_snapshot(
+                &mut inner.db_file,
+                &cleanup_cx,
+                retain_readonly_shared_snapshot,
+            );
             return match (operation_result, unlock_result) {
                 (Ok(refresh), Ok(())) => Ok((refresh, journal_exists)),
                 (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
@@ -7527,7 +7954,7 @@ where
             // canonical order.
             let cleanup_cx = cleanup_child_cx(cx);
             let _cleanup_mask = cleanup_cx.masked();
-            inner.db_file.unlock_external_shared_snapshot(&cleanup_cx)?;
+            unlock_external_read_snapshot(&mut inner.db_file, &cleanup_cx, false)?;
             let _recovery_guard = self.recovery_fence.acquire_for_recovery()?;
             let prior_kind = maintenance_lease.upgrade_to_exclusive()?;
             let recovery_result = Self::recover_runtime_rollback_journal(
@@ -7551,7 +7978,7 @@ where
                 }
             }
 
-            inner.db_file.lock_external_shared_snapshot(cx)?;
+            lock_external_read_snapshot(&mut inner.db_file, cx, false)?;
             // A non-hot leftover is harmless if deletion failed. A new hot
             // record here means another process won a publication race after
             // our recovery epoch; fail closed instead of reading through it.
@@ -7560,7 +7987,7 @@ where
             {
                 let cleanup_cx = cleanup_child_cx(cx);
                 let _cleanup_mask = cleanup_cx.masked();
-                return match inner.db_file.unlock_external_shared_snapshot(&cleanup_cx) {
+                return match unlock_external_read_snapshot(&mut inner.db_file, &cleanup_cx, false) {
                     Ok(()) => Err(error),
                     Err(unlock_error) => Err(FrankenError::internal(format!(
                         "post-recovery journal verification failed and could not release SHARED: verification={error}; unlock={unlock_error}"
@@ -7572,7 +7999,7 @@ where
         let refresh_result = inner.refresh_committed_state(cx, &self.cache, &self.wal_backend);
         let cleanup_cx = cleanup_child_cx(cx);
         let _cleanup_mask = cleanup_cx.masked();
-        let unlock_result = inner.db_file.unlock_external_shared_snapshot(&cleanup_cx);
+        let unlock_result = unlock_external_read_snapshot(&mut inner.db_file, &cleanup_cx, false);
         match (refresh_result, unlock_result) {
             (Ok(refresh), Ok(())) => Ok((refresh, had_pending || journal_exists)),
             (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
@@ -8197,6 +8624,9 @@ where
             writer_idle: Arc::new(Condvar::new()),
             cache: Arc::new(cache),
             pool,
+            bounded_read_snapshot_page_limit: None,
+            schema_only_write_set_page_limit: AtomicUsize::new(0),
+            write_set_telemetry: Arc::new(WriteSetTelemetry::default()),
             published: Arc::new(PublishedPagerState::new(
                 db_size,
                 initial_commit_seq,
@@ -8239,6 +8669,95 @@ where
     #[must_use]
     pub fn is_single_connection_cache_fast_path_enabled(&self) -> bool {
         self.cache.is_fast_path_enabled()
+    }
+
+    /// Opt this physically read-only pager into bounded snapshot reads.
+    ///
+    /// Page bodies are read directly from the self-contained main file under
+    /// the transaction's retained SHARED fence and are not retained by the
+    /// transaction or published into shared/latest caches. Live WAL state is
+    /// refused until the pager can retain a stock-compatible WAL reader-slot
+    /// fence for the full transaction.
+    pub fn set_bounded_read_snapshot_page_limit(
+        &mut self,
+        page_limit: Option<usize>,
+    ) -> Result<()> {
+        if page_limit == Some(0) {
+            return Err(FrankenError::OutOfRange {
+                what: "bounded read snapshot page limit".to_owned(),
+                value: "0".to_owned(),
+            });
+        }
+        if page_limit.is_some() {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            if !inner.access_mode.is_readonly() {
+                return Err(FrankenError::ReadOnly);
+            }
+        }
+        self.bounded_read_snapshot_page_limit = page_limit;
+        Ok(())
+    }
+
+    /// Return the opt-in bounded read-snapshot page limit.
+    #[must_use]
+    pub const fn bounded_read_snapshot_page_limit(&self) -> Option<usize> {
+        self.bounded_read_snapshot_page_limit
+    }
+
+    /// Configure a hard dirty-page ceiling for identity-bound schema-only
+    /// builder transactions.
+    ///
+    /// This is deliberately unavailable on read-only pagers, WAL databases,
+    /// and pagers with a live transaction. The SQL connection layer exposes
+    /// it only through the dedicated existing-file schema-only RW opener.
+    pub fn set_schema_only_write_set_page_limit(&self, page_limit: Option<usize>) -> Result<()> {
+        if page_limit == Some(0) {
+            return Err(FrankenError::OutOfRange {
+                what: "schema-only write-set page limit".to_owned(),
+                value: "0".to_owned(),
+            });
+        }
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+        if page_limit.is_some() && inner.access_mode.is_readonly() {
+            return Err(FrankenError::ReadOnly);
+        }
+        if page_limit.is_some() && inner.journal_mode != JournalMode::Delete {
+            return Err(FrankenError::NotImplemented(
+                "bounded schema-only write sets require rollback/DELETE journal mode".to_owned(),
+            ));
+        }
+        if inner.active_transactions != 0 {
+            return Err(FrankenError::Busy);
+        }
+        // `begin()` reads this atomic only while holding the same `inner`
+        // mutex. Publish the new value before releasing that mutex so
+        // validation (`active_transactions == 0`) and publication form one
+        // linearizable operation. Dropping the guard first would let a
+        // transaction begin in the gap and inherit the stale disabled limit.
+        #[cfg(test)]
+        fire_schema_write_set_config_linearization_hook();
+        self.schema_only_write_set_page_limit
+            .store(page_limit.unwrap_or(0), AtomicOrdering::Release);
+        // Publish a zeroed baseline immediately so callers can certify the
+        // configured cap before the first write transaction. Each later
+        // capped transaction resets this same snapshot at begin; uncapped and
+        // internal read-only transactions do not perturb it.
+        self.write_set_telemetry
+            .begin(page_limit, self.pool.page_size());
+        drop(inner);
+        Ok(())
+    }
+
+    /// Return current and last-transaction high-water write-set accounting.
+    #[must_use]
+    pub fn write_set_stats(&self) -> Option<WriteSetStats> {
+        self.write_set_telemetry.snapshot()
     }
 
     /// Open a database in true read-only mode for fast analytical queries.
@@ -8509,6 +9028,9 @@ where
             writer_idle: Arc::new(Condvar::new()),
             cache: Arc::new(cache),
             pool,
+            bounded_read_snapshot_page_limit: None,
+            schema_only_write_set_page_limit: AtomicUsize::new(0),
+            write_set_telemetry: Arc::new(WriteSetTelemetry::default()),
             published: Arc::new(PublishedPagerState::new(
                 db_size,
                 initial_commit_seq,
@@ -9306,6 +9828,17 @@ pub struct SimpleTransaction<V: Vfs> {
     /// The physical pager was opened read-only. This is stronger than a
     /// read-only transaction mode and must reject every later writer upgrade.
     read_only_pager: bool,
+    /// Opt-in cap for direct, physically read-only snapshot reads.
+    bounded_read_snapshot_page_limit: Option<usize>,
+    /// Number of successful reads served by the bounded direct-storage path.
+    bounded_read_direct_page_reads: Cell<u64>,
+    /// Published page-plane residency captured before the bounded transaction
+    /// begins reading. It must not grow because of this transaction.
+    bounded_read_published_page_set_size_at_begin: usize,
+    /// Opt-in hard limit for distinct staged pages in this transaction.
+    schema_only_write_set_page_limit: Option<usize>,
+    /// Shared connection-level telemetry retained after commit/rollback.
+    write_set_telemetry: Arc<WriteSetTelemetry>,
     /// Visible commit sequence at snapshot capture. This remains fixed during
     /// reads; transaction-owned commit paths may advance it after publishing
     /// their own writes.
@@ -9433,6 +9966,88 @@ impl<V: Vfs> SimpleTransaction<V> {
 
     #[cfg(not(all(feature = "native", any(unix, windows))))]
     fn validate_namespace_binding(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Observe the retained state of this transaction's opt-in bounded
+    /// read-only snapshot, if enabled.
+    pub fn bounded_read_snapshot_stats(&self) -> Result<Option<BoundedReadSnapshotStats>> {
+        let Some(page_limit) = self.bounded_read_snapshot_page_limit else {
+            return Ok(None);
+        };
+        if self.journal_mode == JournalMode::Wal {
+            return Err(FrankenError::internal(
+                "bounded read transaction reached unsupported live WAL state",
+            ));
+        }
+        let transaction_cached_pages = self.txn_read_cache.borrow().len();
+        let published_page_set_size_now = self.published.snapshot().page_set_size;
+        Ok(Some(BoundedReadSnapshotStats {
+            page_limit,
+            transaction_cached_pages,
+            transaction_cached_pages_high_water: transaction_cached_pages,
+            direct_page_reads: self.bounded_read_direct_page_reads.get(),
+            published_page_set_size_at_begin: self.bounded_read_published_page_set_size_at_begin,
+            published_page_set_size_now,
+            wal_page_index_entries: 0,
+            wal_index_is_partial: false,
+            wal_partial_index_fallback_reads: 0,
+        }))
+    }
+
+    fn finish_write_set_telemetry(&self) {
+        if self.schema_only_write_set_page_limit.is_some() {
+            self.write_set_telemetry.finish();
+        }
+    }
+
+    fn admit_distinct_write_set_page(&self, page_no: PageNumber) -> Result<()> {
+        let Some(page_limit) = self.schema_only_write_set_page_limit else {
+            return Ok(());
+        };
+        if self.write_set.contains_key(&page_no) {
+            return Ok(());
+        }
+        let current_dirty_pages = self.write_set.len();
+        // Every durable rollback-journal commit stages Page 1 to publish its
+        // change counter and page count. Reserve that mandatory slot as soon
+        // as the first non-Page-1 write is admitted, rather than accepting a
+        // statement that can only fail later on every COMMIT retry.
+        let mandatory_page_one_reservation = usize::from(
+            page_no != PageNumber::ONE && !self.write_set.contains_key(&PageNumber::ONE),
+        );
+        let attempted_dirty_pages = current_dirty_pages
+            .saturating_add(1)
+            .saturating_add(mandatory_page_one_reservation);
+        if attempted_dirty_pages <= page_limit {
+            return Ok(());
+        }
+        let page_size = self.pool.page_size();
+        self.write_set_telemetry.refuse();
+        Err(FrankenError::WriteSetLimitExceeded {
+            page_size,
+            page_limit,
+            byte_limit: page_limit.saturating_mul(page_size),
+            current_dirty_pages,
+            current_dirty_bytes: current_dirty_pages.saturating_mul(page_size),
+            attempted_dirty_pages,
+            attempted_dirty_bytes: attempted_dirty_pages.saturating_mul(page_size),
+        })
+    }
+
+    fn observe_write_set(&self) {
+        self.write_set_telemetry
+            .observe(self.write_set.len(), self.pool.page_size());
+    }
+
+    fn refuse_bounded_write_set_freelist_projection(&self, freelist_dirty: bool) -> Result<()> {
+        if self.schema_only_write_set_page_limit.is_some() && freelist_dirty {
+            return Err(FrankenError::NotImplemented(
+                "bounded schema-only builder transactions require an insert-only fresh target; \
+                 commit-time freelist projection is unsupported"
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -9593,6 +10208,9 @@ impl<V: Vfs> SimpleTransaction<V> {
         budget: usize,
         penalty: f64,
     ) {
+        if self.bounded_read_snapshot_page_limit.is_some() {
+            return;
+        }
         let selected = crate::submodular_prefetch::greedy_select(candidates, budget, penalty);
         if selected.is_empty() {
             return;
@@ -10113,6 +10731,36 @@ impl<V: Vfs> SimpleTransaction<V> {
             return Ok(());
         }
 
+        // The retained overlay is a set of pages that were drained from the
+        // live write set by prior `commit_and_retain` calls. Re-admitting them
+        // one at a time would let every preflight observe the same current
+        // length and could therefore accept an aggregate projection above the
+        // configured schema-builder cap. Prove the complete distinct-page
+        // projection before materializing any page so refusal is atomic.
+        if let Some(page_limit) = self.schema_only_write_set_page_limit {
+            let current_dirty_pages = self.write_set.len();
+            let projected_has_page_one = self.write_set.contains_key(&PageNumber::ONE)
+                || overlay_page_nos.contains(&PageNumber::ONE);
+            let mandatory_page_one_reservation =
+                usize::from(!projected_has_page_one && !overlay_page_nos.is_empty());
+            let attempted_dirty_pages = current_dirty_pages
+                .saturating_add(overlay_page_nos.len())
+                .saturating_add(mandatory_page_one_reservation);
+            if attempted_dirty_pages > page_limit {
+                let page_size = self.pool.page_size();
+                self.write_set_telemetry.refuse();
+                return Err(FrankenError::WriteSetLimitExceeded {
+                    page_size,
+                    page_limit,
+                    byte_limit: page_limit.saturating_mul(page_size),
+                    current_dirty_pages,
+                    current_dirty_bytes: current_dirty_pages.saturating_mul(page_size),
+                    attempted_dirty_pages,
+                    attempted_dirty_bytes: attempted_dirty_pages.saturating_mul(page_size),
+                });
+            }
+        }
+
         let overlay_pages = {
             let txn_read_cache = self.txn_read_cache.borrow();
             overlay_page_nos
@@ -10144,6 +10792,7 @@ impl<V: Vfs> SimpleTransaction<V> {
                     "retained_memory_overlay_stage",
                 )?,
             );
+            self.observe_write_set();
         }
         Ok(())
     }
@@ -11769,6 +12418,31 @@ where
         Ok(())
     }
 
+    fn get_bounded_read_snapshot_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
+        let page_limit = self.bounded_read_snapshot_page_limit.ok_or_else(|| {
+            FrankenError::internal("bounded read helper called for an ordinary transaction")
+        })?;
+        if !self.read_only_pager || page_limit == 0 {
+            return Err(FrankenError::ReadOnly);
+        }
+
+        if self.journal_mode == JournalMode::Wal {
+            return Err(FrankenError::internal(
+                "bounded read reached unsupported live WAL state",
+            ));
+        }
+
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        let data = inner.read_page_copy_uncached(cx, page_no)?;
+        drop(inner);
+        self.bounded_read_direct_page_reads
+            .set(self.bounded_read_direct_page_reads.get().saturating_add(1));
+        Ok(PageData::from_vec(data))
+    }
+
     fn ensure_writer(&mut self, cx: &Cx) -> Result<()> {
         if self.read_only_pager {
             return Err(FrankenError::ReadOnly);
@@ -11896,14 +12570,35 @@ fn release_snapshot_after_failed_begin<F: VfsFile>(
     }
 }
 
+fn lock_external_read_snapshot<F: VfsFile>(db_file: &mut F, cx: &Cx, bounded: bool) -> Result<()> {
+    if bounded {
+        db_file.lock_external_bounded_shared_snapshot(cx)
+    } else {
+        db_file.lock_external_shared_snapshot(cx)
+    }
+}
+
+fn unlock_external_read_snapshot<F: VfsFile>(
+    db_file: &mut F,
+    cx: &Cx,
+    bounded: bool,
+) -> Result<()> {
+    if bounded {
+        db_file.unlock_external_bounded_shared_snapshot(cx)
+    } else {
+        db_file.unlock_external_shared_snapshot(cx)
+    }
+}
+
 fn release_retained_snapshot_after_txn_exit<F: VfsFile>(
     cx: &Cx,
     inner: &mut PagerInner<F>,
+    bounded: bool,
 ) -> Result<()> {
     let cleanup_cx = cleanup_child_cx(cx);
     let _cleanup_mask = cleanup_cx.masked();
     if inner.active_transactions == 0 {
-        inner.db_file.unlock_external_shared_snapshot(&cleanup_cx)
+        unlock_external_read_snapshot(&mut inner.db_file, &cleanup_cx, bounded)
     } else {
         let preserve_level =
             retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
@@ -11975,6 +12670,10 @@ where
                     ),
                 });
             }
+        }
+
+        if self.bounded_read_snapshot_page_limit.is_some() {
+            return self.get_bounded_read_snapshot_page(cx, page_no);
         }
 
         // A transaction that has already observed a page owns that exact
@@ -12119,7 +12818,14 @@ where
         Ok(page)
     }
 
+    fn bounded_read_snapshot_stats(&self) -> Result<Option<BoundedReadSnapshotStats>> {
+        SimpleTransaction::bounded_read_snapshot_stats(self)
+    }
+
     fn prefetch_page_hint(&self, _cx: &Cx, page_no: PageNumber) {
+        if self.bounded_read_snapshot_page_limit.is_some() {
+            return;
+        }
         if let Some(staged) = self.write_set.get(&page_no) {
             prefetch_l1_read(staged.as_page_bytes().as_ptr());
             return;
@@ -12157,6 +12863,7 @@ where
             return Ok(());
         }
 
+        self.admit_distinct_write_set_page(page_no)?;
         let staged = self.stage_page_bytes(data)?;
         // Mutate transaction bookkeeping only after fallible staging succeeds;
         // a capacity error must leave the prior free/write state untouched.
@@ -12168,6 +12875,7 @@ where
             page_no,
             staged,
         );
+        self.observe_write_set();
         Ok(())
     }
 
@@ -12188,6 +12896,7 @@ where
             }
         }
 
+        self.admit_distinct_write_set_page(page_no)?;
         let staged = StagedPage::from_page_data_with_cache_recovery(
             &self.pool,
             &self.cache,
@@ -12198,6 +12907,7 @@ where
         self.remove_freed_page_if_present(page_no);
         if let Some(existing) = self.write_set.get_mut(&page_no) {
             *existing = staged;
+            self.observe_write_set();
             return Ok(());
         }
 
@@ -12207,6 +12917,7 @@ where
             page_no,
             staged,
         );
+        self.observe_write_set();
         Ok(())
     }
 
@@ -12215,6 +12926,7 @@ where
         match staged.try_into_unpublished_owned_page_data() {
             Ok(data) => {
                 remove_page_sorted(&mut self.write_pages_sorted, page_no);
+                self.observe_write_set();
                 Some(data)
             }
             Err(staged) => {
@@ -12249,6 +12961,7 @@ where
         data: PageData,
     ) -> Result<()> {
         self.ensure_writer(cx)?;
+        self.admit_distinct_write_set_page(page_no)?;
         let staged = StagedPage::from_page_data_with_cache_recovery(
             &self.pool,
             &self.cache,
@@ -12263,6 +12976,7 @@ where
             page_no,
             staged,
         );
+        self.observe_write_set();
         Ok(())
     }
 
@@ -12378,6 +13092,7 @@ where
         }
         if self.write_set.remove(&page_no).is_some() {
             remove_page_sorted(&mut self.write_pages_sorted, page_no);
+            self.observe_write_set();
         }
         Ok(())
     }
@@ -12397,14 +13112,19 @@ where
             // be reused by other transactions.
             return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
-            let _ = release_retained_snapshot_after_txn_exit(cx, &mut inner);
+            let retained_snapshot_release_result = release_retained_snapshot_after_txn_exit(
+                cx,
+                &mut inner,
+                self.bounded_read_snapshot_page_limit.is_some(),
+            );
             drop(inner);
             self.committed = true;
             self.maintenance_lease.take();
             self.finished = true;
+            self.finish_write_set_telemetry();
             // IMPL-3 / AG-4B: reset scratch arena on read-only commit path.
             self.scratch_arena.reset();
-            return Ok(());
+            return retained_snapshot_release_result;
         }
         if self.vfs.is_memory()
             && self.memory_db_bump_alloc
@@ -12436,7 +13156,11 @@ where
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
             let notify_writer_idle =
                 self.mode != TransactionMode::Concurrent && release_single_writer_baton(&mut inner);
-            let _ = release_retained_snapshot_after_txn_exit(cx, &mut inner);
+            let retained_snapshot_release_result = release_retained_snapshot_after_txn_exit(
+                cx,
+                &mut inner,
+                self.bounded_read_snapshot_page_limit.is_some(),
+            );
             drop(inner);
             if notify_writer_idle {
                 self.writer_idle.notify_one();
@@ -12444,9 +13168,10 @@ where
             self.committed = true;
             self.maintenance_lease.take();
             self.finished = true;
+            self.finish_write_set_telemetry();
             // IMPL-3 / AG-4B: reset scratch arena on no-writes commit path.
             self.scratch_arena.reset();
-            return Ok(());
+            return retained_snapshot_release_result;
         }
 
         // =====================================================================
@@ -12526,6 +13251,11 @@ where
             let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
             pending_freed = std::mem::take(&mut self.freed_pages);
             self.freed_page_bounds = None;
+            if let Err(e) = self.refuse_bounded_write_set_freelist_projection(freelist_dirty) {
+                self.restore_pending_freed_pages(pending_freed);
+                return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                return Err(e);
+            }
             if freelist_dirty {
                 if let Err(e) = serialize_freelist_to_write_set(
                     cx,
@@ -12556,6 +13286,11 @@ where
                 true
             };
             if must_write_page1 {
+                if let Err(e) = self.admit_distinct_write_set_page(PageNumber::ONE) {
+                    self.restore_pending_freed_pages(pending_freed);
+                    return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                    return Err(e);
+                }
                 let mut page1 = match ensure_page_one_in_write_set(
                     cx,
                     &mut inner,
@@ -12596,6 +13331,7 @@ where
                     PageNumber::ONE,
                     page1,
                 );
+                self.observe_write_set();
             }
             cross_process_conflict_pages = if self.journal_mode == JournalMode::Wal {
                 self.predicted_conflict_pages_for_wal_commit_with_inner(
@@ -12701,6 +13437,7 @@ where
 
         let t_phase_b_done = phase_timing.then(Instant::now);
 
+        let mut retained_snapshot_release_result = Ok(());
         if commit_result.is_ok() {
             let t_phase_c_metadata_start = pager_commit_profile_start(pager_commit_profile_active);
             // Phase C1 (FAST, under inner.lock): Update metadata only.
@@ -12752,7 +13489,11 @@ where
             // committed metadata even if this commit skipped page-plane publish.
             self.publish_committed_snapshot_from_inner(&inner);
             let t_unlock_start = pager_commit_profile_start(pager_commit_profile_active);
-            let _ = release_retained_snapshot_after_txn_exit(cx, &mut inner);
+            retained_snapshot_release_result = release_retained_snapshot_after_txn_exit(
+                cx,
+                &mut inner,
+                self.bounded_read_snapshot_page_limit.is_some(),
+            );
             record_pager_commit_duration(&PAGER_COMMIT_UNLOCK_TIME_NS, t_unlock_start);
             drop(inner);
             if notify_writer_idle {
@@ -12853,6 +13594,7 @@ where
             self.committed = true;
             self.maintenance_lease.take();
             self.finished = true;
+            self.finish_write_set_telemetry();
             // IMPL-3 / AG-4B: reset scratch arena after successful commit so
             // transient per-transaction allocations do not linger. The arena
             // is dropped when the transaction drops; this reset is the
@@ -12871,7 +13613,8 @@ where
             return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
             drop(inner);
         }
-        commit_result
+        commit_result?;
+        retained_snapshot_release_result
     }
 
     fn commit_and_retain(&mut self, cx: &Cx) -> Result<bool> {
@@ -12949,6 +13692,11 @@ where
             // Match the normal commit path: capture semantic Page 1 intent
             // before freelist serialization can inject bookkeeping Page 1.
             let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
+            if let Err(e) = self.refuse_bounded_write_set_freelist_projection(freelist_dirty) {
+                self.restore_pending_freed_pages(pending_freed);
+                return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                return Err(e);
+            }
             if freelist_dirty {
                 if let Err(e) = serialize_freelist_to_write_set(
                     cx,
@@ -12984,6 +13732,11 @@ where
                 true
             };
             if must_write_page1 {
+                if let Err(e) = self.admit_distinct_write_set_page(PageNumber::ONE) {
+                    self.restore_pending_freed_pages(pending_freed);
+                    return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                    return Err(e);
+                }
                 let mut page1 = match ensure_page_one_in_write_set(
                     cx,
                     &mut inner,
@@ -13020,6 +13773,7 @@ where
                     PageNumber::ONE,
                     page1,
                 );
+                self.observe_write_set();
             }
             let cross_process_conflict_pages = if self.journal_mode == JournalMode::Wal {
                 self.predicted_conflict_pages_for_wal_commit_with_inner(
@@ -13398,7 +14152,11 @@ where
             }
         }
         inner.active_transactions = inner.active_transactions.saturating_sub(1);
-        let _ = release_retained_snapshot_after_txn_exit(&cleanup_cx, &mut inner);
+        let retained_snapshot_release_result = release_retained_snapshot_after_txn_exit(
+            &cleanup_cx,
+            &mut inner,
+            self.bounded_read_snapshot_page_limit.is_some(),
+        );
         drop(inner);
         if notify_writer_idle {
             self.writer_idle.notify_one();
@@ -13410,10 +14168,11 @@ where
         self.committed = false;
         self.maintenance_lease.take();
         self.finished = true;
+        self.finish_write_set_telemetry();
         // IMPL-3 / AG-4B: reset scratch arena so transient allocations do not
         // carry across transaction boundaries.
         self.scratch_arena.reset();
-        Ok(())
+        retained_snapshot_release_result
     }
 
     fn record_write_witness(&mut self, _cx: &Cx, _key: fsqlite_types::WitnessKey) {}
@@ -13547,6 +14306,7 @@ where
         // writes_observed should stay consistent with that.
         self.write_set = new_write_set;
         self.write_pages_sorted = write_pages_sorted_snapshot;
+        self.observe_write_set();
         if snapshot_was_empty {
             self.writes_observed = false;
         }
@@ -13645,7 +14405,11 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
                 }
             }
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
-            let _ = release_retained_snapshot_after_txn_exit(&cleanup_cx, &mut inner);
+            let _ = release_retained_snapshot_after_txn_exit(
+                &cleanup_cx,
+                &mut inner,
+                self.bounded_read_snapshot_page_limit.is_some(),
+            );
         }
         if notify_writer_idle {
             self.writer_idle.notify_one();
@@ -13654,6 +14418,7 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
         // take a Context or return a Result. It's best effort cleanup.
         // Hot journal recovery will handle any leftover files on next open.
         self.finished = true;
+        self.finish_write_set_telemetry();
     }
 }
 
@@ -14953,6 +15718,9 @@ mod tests {
         inner: MemoryVfs,
         observed_lock_level: ObservedLockLevel,
         observed_unlock_trace_ids: ObservedUnlockTraceIds,
+        external_snapshot_lock_count: Arc<AtomicUsize>,
+        external_snapshot_unlock_count: Arc<AtomicUsize>,
+        fail_next_bounded_snapshot_unlock: Arc<AtomicBool>,
         fail_unlock_on_checkpoint_error: bool,
         memory_fast_path: Arc<AtomicBool>,
     }
@@ -14963,6 +15731,9 @@ mod tests {
                 inner: MemoryVfs::new(),
                 observed_lock_level: Arc::new(Mutex::new(LockLevel::None)),
                 observed_unlock_trace_ids: Arc::new(Mutex::new(Vec::new())),
+                external_snapshot_lock_count: Arc::new(AtomicUsize::new(0)),
+                external_snapshot_unlock_count: Arc::new(AtomicUsize::new(0)),
+                fail_next_bounded_snapshot_unlock: Arc::new(AtomicBool::new(false)),
                 fail_unlock_on_checkpoint_error: false,
                 memory_fast_path: Arc::new(AtomicBool::new(true)),
             }
@@ -14975,12 +15746,38 @@ mod tests {
             result
         }
 
+        fn open_readonly_file_backed_pager(
+            &self,
+            cx: &Cx,
+            path: &Path,
+        ) -> Result<SimplePager<Self>> {
+            self.memory_fast_path.store(true, AtomicOrdering::Release);
+            let result =
+                SimplePager::open_readonly_with_cx(cx, self.clone(), path, PageSize::DEFAULT);
+            self.memory_fast_path.store(false, AtomicOrdering::Release);
+            result
+        }
+
         fn observed_lock_level(&self) -> ObservedLockLevel {
             Arc::clone(&self.observed_lock_level)
         }
 
         fn observed_unlock_trace_ids(&self) -> ObservedUnlockTraceIds {
             Arc::clone(&self.observed_unlock_trace_ids)
+        }
+
+        fn external_snapshot_counts(&self) -> (usize, usize) {
+            (
+                self.external_snapshot_lock_count
+                    .load(AtomicOrdering::Acquire),
+                self.external_snapshot_unlock_count
+                    .load(AtomicOrdering::Acquire),
+            )
+        }
+
+        fn fail_next_bounded_snapshot_unlock(&self) {
+            self.fail_next_bounded_snapshot_unlock
+                .store(true, AtomicOrdering::Release);
         }
 
         fn with_checkpoint_enforced_unlock() -> Self {
@@ -14995,6 +15792,11 @@ mod tests {
         inner: MemoryFile,
         observed_lock_level: ObservedLockLevel,
         observed_unlock_trace_ids: ObservedUnlockTraceIds,
+        external_snapshot_lock_count: Arc<AtomicUsize>,
+        external_snapshot_unlock_count: Arc<AtomicUsize>,
+        fail_next_bounded_snapshot_unlock: Arc<AtomicBool>,
+        external_snapshot_held: bool,
+        main_database: bool,
         fail_unlock_on_checkpoint_error: bool,
     }
 
@@ -15017,6 +15819,15 @@ mod tests {
                     inner,
                     observed_lock_level: self.observed_lock_level(),
                     observed_unlock_trace_ids: self.observed_unlock_trace_ids(),
+                    external_snapshot_lock_count: Arc::clone(&self.external_snapshot_lock_count),
+                    external_snapshot_unlock_count: Arc::clone(
+                        &self.external_snapshot_unlock_count,
+                    ),
+                    fail_next_bounded_snapshot_unlock: Arc::clone(
+                        &self.fail_next_bounded_snapshot_unlock,
+                    ),
+                    external_snapshot_held: false,
+                    main_database: actual_flags.contains(VfsOpenFlags::MAIN_DB),
                     fail_unlock_on_checkpoint_error: self.fail_unlock_on_checkpoint_error,
                 },
                 actual_flags,
@@ -15044,6 +15855,11 @@ mod tests {
         fn close(&mut self, cx: &Cx) -> Result<()> {
             let result = self.inner.close(cx);
             if result.is_ok() {
+                if self.external_snapshot_held {
+                    self.external_snapshot_held = false;
+                    self.external_snapshot_unlock_count
+                        .fetch_add(1, AtomicOrdering::AcqRel);
+                }
                 *self.observed_lock_level.lock().unwrap() = LockLevel::None;
             }
             result
@@ -15070,6 +15886,19 @@ mod tests {
         }
 
         fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+            if self.main_database && level == LockLevel::Exclusive {
+                let active_external_snapshots = self
+                    .external_snapshot_lock_count
+                    .load(AtomicOrdering::Acquire)
+                    .saturating_sub(
+                        self.external_snapshot_unlock_count
+                            .load(AtomicOrdering::Acquire),
+                    );
+                let own_external_snapshot = usize::from(self.external_snapshot_held);
+                if active_external_snapshots > own_external_snapshot {
+                    return Err(FrankenError::Busy);
+                }
+            }
             self.inner.lock(cx, level)?;
             *self.observed_lock_level.lock().unwrap() = level;
             Ok(())
@@ -15086,6 +15915,39 @@ mod tests {
             }
             self.inner.unlock(cx, level)?;
             *self.observed_lock_level.lock().unwrap() = level;
+            Ok(())
+        }
+
+        fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+            self.lock(cx, LockLevel::Shared)?;
+            self.external_snapshot_held = true;
+            self.external_snapshot_lock_count
+                .fetch_add(1, AtomicOrdering::AcqRel);
+            Ok(())
+        }
+
+        fn unlock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+            self.unlock(cx, LockLevel::None)?;
+            self.external_snapshot_held = false;
+            self.external_snapshot_unlock_count
+                .fetch_add(1, AtomicOrdering::AcqRel);
+            Ok(())
+        }
+
+        fn lock_external_bounded_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+            self.lock_external_shared_snapshot(cx)
+        }
+
+        fn unlock_external_bounded_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+            self.unlock_external_shared_snapshot(cx)?;
+            if self
+                .fail_next_bounded_snapshot_unlock
+                .swap(false, AtomicOrdering::AcqRel)
+            {
+                return Err(FrankenError::internal(
+                    "injected bounded snapshot unlock failure",
+                ));
+            }
             Ok(())
         }
 
@@ -16262,6 +17124,414 @@ mod tests {
             result.is_err(),
             "bead_id={BEAD_ID} case=readonly_cannot_allocate"
         );
+    }
+
+    #[test]
+    fn hfdt_0117_bounded_read_snapshot_retains_one_continuous_shared_fence_against_poised_writer() {
+        let cx = Cx::new();
+        let vfs = ObservedLockVfs::new();
+        let path = PathBuf::from("/bounded-continuous-shared-fence.db");
+        let writer_pager = vfs.open_file_backed_pager(&path).unwrap();
+
+        // A RESERVED writer is deliberately poised before the bounded reader
+        // validates the main-file header. RESERVED and SHARED may coexist, but
+        // the writer must not reach EXCLUSIVE until the bounded transaction
+        // releases the exact SHARED fence used for validation and refresh.
+        let mut writer = writer_pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let staged_page = writer.allocate_page(&cx).unwrap();
+        writer
+            .write_page(&cx, staged_page, &sample_page(0xB7))
+            .unwrap();
+
+        let mut reader_pager = vfs.open_readonly_file_backed_pager(&cx, &path).unwrap();
+        reader_pager
+            .set_bounded_read_snapshot_page_limit(Some(1))
+            .unwrap();
+
+        let counts_before_begin = vfs.external_snapshot_counts();
+        let mut reader = reader_pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        let counts_while_reader_active = vfs.external_snapshot_counts();
+        assert_eq!(
+            counts_while_reader_active.0,
+            counts_before_begin.0 + 1,
+            "bounded begin must acquire exactly one external SHARED fence"
+        );
+        assert_eq!(
+            counts_while_reader_active.1, counts_before_begin.1,
+            "bounded begin must not release SHARED between refresh and snapshot binding"
+        );
+
+        let commit_error = writer
+            .commit(&cx)
+            .expect_err("poised writer must not commit through the bounded reader fence");
+        assert!(
+            matches!(commit_error, FrankenError::Busy),
+            "expected writer EXCLUSIVE acquisition to be busy, got {commit_error}"
+        );
+        assert_eq!(
+            vfs.external_snapshot_counts().1,
+            counts_before_begin.1,
+            "failed writer commit must not release the bounded reader's SHARED fence"
+        );
+
+        reader.rollback(&cx).unwrap();
+        assert_eq!(
+            vfs.external_snapshot_counts().1,
+            counts_before_begin.1 + 1,
+            "bounded rollback must release the one retained SHARED fence"
+        );
+        writer
+            .commit(&cx)
+            .expect("poised writer may commit after bounded rollback");
+    }
+
+    #[test]
+    fn hfdt_0117_bounded_commit_propagates_retained_snapshot_unlock_failure() {
+        let cx = Cx::new();
+        let vfs = ObservedLockVfs::new();
+        let path = PathBuf::from("/bounded-commit-unlock-failure.db");
+        let initializer = vfs.open_file_backed_pager(&path).unwrap();
+        drop(initializer);
+        let mut pager = vfs.open_readonly_file_backed_pager(&cx, &path).unwrap();
+        pager.set_bounded_read_snapshot_page_limit(Some(1)).unwrap();
+
+        let counts_before = vfs.external_snapshot_counts();
+        let mut transaction = pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        assert_eq!(
+            vfs.external_snapshot_counts(),
+            (counts_before.0 + 1, counts_before.1),
+            "bounded begin must retain exactly one external snapshot"
+        );
+
+        vfs.fail_next_bounded_snapshot_unlock();
+        let error = transaction
+            .commit(&cx)
+            .expect_err("explicit bounded commit must surface the VFS unlock error");
+        assert!(
+            error
+                .to_string()
+                .contains("injected bounded snapshot unlock failure"),
+            "unexpected bounded commit error: {error}"
+        );
+        assert!(
+            transaction.finished && transaction.committed,
+            "durable transaction-finalization state must remain committed despite post-release error"
+        );
+        assert_eq!(
+            vfs.external_snapshot_counts(),
+            (counts_before.0 + 1, counts_before.1 + 1),
+            "the injected post-release failure must not strand the external lock"
+        );
+        assert_eq!(
+            pager.inner.lock().unwrap().active_transactions,
+            0,
+            "commit error propagation must not leak the active-transaction count"
+        );
+
+        let mut proof = pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        proof
+            .rollback(&cx)
+            .expect("subsequent bounded transaction must still release normally");
+    }
+
+    #[test]
+    fn hfdt_0117_bounded_rollback_propagates_retained_snapshot_unlock_failure() {
+        let cx = Cx::new();
+        let vfs = ObservedLockVfs::new();
+        let path = PathBuf::from("/bounded-rollback-unlock-failure.db");
+        let initializer = vfs.open_file_backed_pager(&path).unwrap();
+        drop(initializer);
+        let mut pager = vfs.open_readonly_file_backed_pager(&cx, &path).unwrap();
+        pager.set_bounded_read_snapshot_page_limit(Some(1)).unwrap();
+
+        let counts_before = vfs.external_snapshot_counts();
+        let mut transaction = pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        assert_eq!(
+            vfs.external_snapshot_counts(),
+            (counts_before.0 + 1, counts_before.1),
+            "bounded begin must retain exactly one external snapshot"
+        );
+
+        vfs.fail_next_bounded_snapshot_unlock();
+        let error = transaction
+            .rollback(&cx)
+            .expect_err("explicit bounded rollback must surface the VFS unlock error");
+        assert!(
+            error
+                .to_string()
+                .contains("injected bounded snapshot unlock failure"),
+            "unexpected bounded rollback error: {error}"
+        );
+        assert!(
+            transaction.finished && !transaction.committed,
+            "rollback finalization state must remain rolled back despite post-release error"
+        );
+        assert_eq!(
+            vfs.external_snapshot_counts(),
+            (counts_before.0 + 1, counts_before.1 + 1),
+            "the injected post-release failure must not strand the external lock"
+        );
+        assert_eq!(
+            pager.inner.lock().unwrap().active_transactions,
+            0,
+            "rollback error propagation must not leak the active-transaction count"
+        );
+
+        let mut proof = pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        proof
+            .commit(&cx)
+            .expect("subsequent bounded transaction must still release normally");
+    }
+
+    #[test]
+    fn hfdt_0117_schema_write_set_limit_configuration_is_linearized_with_transaction_begin() {
+        let cx = Cx::new();
+        let vfs = ObservedLockVfs::new();
+        let path = PathBuf::from("/bounded-write-set-config-linearization.db");
+        let pager = Arc::new(vfs.open_file_backed_pager(&path).unwrap());
+
+        let (installed_tx, installed_rx) = std::sync::mpsc::sync_channel(0);
+        let (start_set_tx, start_set_rx) = std::sync::mpsc::sync_channel(0);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+
+        let setter_pager = Arc::clone(&pager);
+        let setter = std::thread::spawn(move || {
+            let owner = std::thread::current().id();
+            let _hook_guard =
+                install_schema_write_set_config_linearization_hook(Box::new(move || {
+                    entered_tx
+                        .send(std::thread::current().id())
+                        .expect("announce configuration linearization point");
+                    release_rx
+                        .recv()
+                        .expect("wait for adversarial begin-gap inspection");
+                }));
+            installed_tx
+                .send(owner)
+                .expect("announce serialized hook installation");
+            start_set_rx
+                .recv()
+                .expect("wait for unrelated-thread hook-steal probe");
+            setter_pager
+                .set_schema_only_write_set_page_limit(Some(7))
+                .expect("publish bounded builder write-set limit");
+        });
+        let owner = installed_rx
+            .recv()
+            .expect("setter must install its thread-owned hook");
+
+        // An unrelated thread reaches the same production interposition point
+        // first. It must neither consume nor execute the owner thread's
+        // process-global FnOnce.
+        pager
+            .set_schema_only_write_set_page_limit(Some(3))
+            .expect("unrelated configuration must not steal the installed hook");
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "the owner-gated hook must not fire on an unrelated thread"
+        );
+        start_set_tx
+            .send(())
+            .expect("allow owner thread to configure the final limit");
+        let fired_on = entered_rx
+            .recv()
+            .expect("setter must reach its linearization point");
+        assert_eq!(
+            fired_on, owner,
+            "the FnOnce must execute only on its installing thread"
+        );
+
+        assert!(
+            matches!(
+                pager.inner.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ),
+            "configuration validation and limit publication must retain the same inner lock; \
+             otherwise begin can enter with the stale disabled limit"
+        );
+
+        release_tx
+            .send(())
+            .expect("release configuration linearization hook");
+        setter.join().expect("configuration thread must finish");
+
+        let mut transaction = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        assert_eq!(
+            transaction.schema_only_write_set_page_limit,
+            Some(7),
+            "the first transaction after configuration must inherit the published cap"
+        );
+        transaction.rollback(&cx).unwrap();
+    }
+
+    #[test]
+    fn hfdt_0117_schema_write_set_linearization_hook_raii_clears_after_unwind() {
+        let orphan_fired = Arc::new(AtomicBool::new(false));
+        let orphan_fired_for_hook = Arc::clone(&orphan_fired);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _hook_guard =
+                install_schema_write_set_config_linearization_hook(Box::new(move || {
+                    orphan_fired_for_hook.store(true, AtomicOrdering::Release);
+                }));
+            panic!("intentional schema write-set hook-owner unwind");
+        }));
+        assert!(unwind.is_err(), "the adversarial owner scope must unwind");
+
+        fire_schema_write_set_config_linearization_hook();
+        assert!(
+            !orphan_fired.load(AtomicOrdering::Acquire),
+            "RAII drop must clear an unfired callback after owner unwind"
+        );
+
+        let replacement_fired = Arc::new(AtomicBool::new(false));
+        let replacement_fired_for_hook = Arc::clone(&replacement_fired);
+        {
+            let _hook_guard =
+                install_schema_write_set_config_linearization_hook(Box::new(move || {
+                    replacement_fired_for_hook.store(true, AtomicOrdering::Release);
+                }));
+            fire_schema_write_set_config_linearization_hook();
+        }
+        assert!(
+            replacement_fired.load(AtomicOrdering::Acquire),
+            "a recovered poisoned serializer must admit and fire a fresh callback"
+        );
+    }
+
+    #[test]
+    fn hfdt_0117_memory_pager_enforces_configured_schema_write_set_limit() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        pager
+            .set_schema_only_write_set_page_limit(Some(1))
+            .expect("configure bounded MemoryVfs write set");
+        let baseline = pager
+            .write_set_stats()
+            .expect("configuration must publish baseline telemetry");
+        assert_eq!(baseline.page_limit, 1);
+        assert_eq!(baseline.byte_limit, PageSize::DEFAULT.as_usize());
+        assert_eq!(baseline.current_dirty_pages, 0);
+        assert_eq!(baseline.current_dirty_bytes, 0);
+        assert_eq!(baseline.dirty_pages_high_water, 0);
+        assert_eq!(baseline.dirty_bytes_high_water, 0);
+        assert_eq!(baseline.cap_refusals, 0);
+
+        let mut first = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        first
+            .write_page(&cx, PageNumber::ONE, &sample_page(0xA1))
+            .expect("one dirty Page 1 must fit the one-page ceiling");
+        let active = pager
+            .write_set_stats()
+            .expect("active bounded MemoryVfs telemetry");
+        assert_eq!(active.current_dirty_pages, 1);
+        assert_eq!(active.dirty_pages_high_water, 1);
+        first.rollback(&cx).unwrap();
+        let completed = pager
+            .write_set_stats()
+            .expect("completed bounded MemoryVfs telemetry");
+        assert_eq!(completed.current_dirty_pages, 0);
+        assert_eq!(completed.dirty_pages_high_water, 1);
+
+        let mut transaction = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        assert_eq!(
+            transaction.schema_only_write_set_page_limit,
+            Some(1),
+            "MemoryVfs transactions must inherit the same configured ceiling as file-backed ones"
+        );
+        let reset = pager
+            .write_set_stats()
+            .expect("the next capped transaction must reset telemetry");
+        assert_eq!(reset.current_dirty_pages, 0);
+        assert_eq!(reset.dirty_pages_high_water, 0);
+        assert_eq!(reset.cap_refusals, 0);
+        let error = transaction
+            .write_page(&cx, PageNumber::new(2).unwrap(), &sample_page(0xB1))
+            .expect_err("Page 2 plus mandatory Page 1 must exceed a one-page ceiling");
+        assert!(
+            matches!(
+                error,
+                FrankenError::WriteSetLimitExceeded {
+                    page_limit: 1,
+                    current_dirty_pages: 0,
+                    attempted_dirty_pages: 2,
+                    ..
+                }
+            ),
+            "MemoryVfs must report the exact bounded admission refusal, got {error}"
+        );
+        transaction.rollback(&cx).unwrap();
+
+        let stats = pager
+            .write_set_stats()
+            .expect("bounded MemoryVfs telemetry must remain available");
+        assert_eq!(stats.page_limit, 1);
+        assert_eq!(stats.current_dirty_pages, 0);
+        assert_eq!(stats.dirty_pages_high_water, 0);
+        assert_eq!(stats.cap_refusals, 1);
+    }
+
+    #[test]
+    fn hfdt_0117_retained_memory_overlay_is_atomically_preflighted_against_write_set_cap() {
+        let pager = private_memory_pager();
+        pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
+        pager
+            .set_schema_only_write_set_page_limit(Some(2))
+            .expect("configure a two-page schema-builder ceiling");
+        let cx = Cx::new();
+        let mut transaction = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let retained_page = transaction.allocate_page(&cx).unwrap();
+        transaction
+            .write_page(&cx, retained_page, &sample_page(0xC1))
+            .unwrap();
+        assert!(
+            transaction.commit_and_retain(&cx).unwrap(),
+            "the first Page-1-plus-data-page logical commit must fit the two-page cap"
+        );
+        assert_eq!(
+            transaction.retained_memory_overlay_dirty_pages,
+            BTreeSet::from([retained_page]),
+            "the retained overlay must expose only the still-deferred data page; aggregate preflight separately reserves mandatory Page 1"
+        );
+
+        let new_page = transaction.allocate_page(&cx).unwrap();
+        transaction
+            .write_page(&cx, new_page, &sample_page(0xC2))
+            .unwrap();
+        let error = transaction.commit(&cx).expect_err(
+            "one live page plus one retained page and mandatory Page 1 must exceed the cap",
+        );
+        assert!(
+            matches!(
+                error,
+                FrankenError::WriteSetLimitExceeded {
+                    page_limit: 2,
+                    current_dirty_pages: 1,
+                    attempted_dirty_pages: 3,
+                    ..
+                }
+            ),
+            "retained-overlay refusal must report the complete distinct-page projection, got {error}"
+        );
+        assert_eq!(
+            transaction.write_set_page_numbers(),
+            vec![new_page],
+            "aggregate preflight must refuse before materializing any retained page"
+        );
+        let stats = pager
+            .write_set_stats()
+            .expect("bounded retained-overlay telemetry");
+        assert_eq!(stats.current_dirty_pages, 1);
+        assert_eq!(
+            stats.dirty_pages_high_water, 1,
+            "a refused aggregate projection must not inflate the accepted dirty-page high-water"
+        );
+        assert_eq!(stats.cap_refusals, 1);
+
+        transaction
+            .rollback(&cx)
+            .expect("bounded retained transaction must remain rollback-safe after refusal");
     }
 
     #[test]
