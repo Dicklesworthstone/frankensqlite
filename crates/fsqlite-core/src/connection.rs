@@ -100972,6 +100972,99 @@ mod tests {
     }
 
     #[test]
+    fn test_prepared_statement_nested_uncorrelated_aggregate_exists_is_rewritten_before_compile() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let reference = rusqlite::Connection::open_in_memory().unwrap();
+            let setup = [
+                "CREATE TABLE outer_rows(a INTEGER);",
+                "INSERT INTO outer_rows VALUES (1);",
+                "CREATE TABLE inner_rows(b INTEGER);",
+                "INSERT INTO inner_rows VALUES (1), (2);",
+            ];
+            for sql in setup {
+                conn.execute(sql).await.unwrap();
+                reference.execute_batch(sql).unwrap();
+            }
+
+            let sql = "
+                SELECT a
+                FROM outer_rows
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM inner_rows AS outer_inner
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM inner_rows AS grouped_inner
+                        GROUP BY grouped_inner.b
+                        HAVING COUNT(*) > 1
+                    )
+                );
+            ";
+            let stmt = conn.prepare(sql).await.unwrap();
+            let rows = stmt.query().await.unwrap();
+            let reference_rows = reference
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+
+            assert!(
+                reference_rows.is_empty(),
+                "C SQLite must reject the outer row because every nested group has count one"
+            );
+            assert!(
+                rows.is_empty(),
+                "prepared execution must match C SQLite for nested aggregate EXISTS"
+            );
+            assert!(
+                stmt.deferred_query_statement.is_none(),
+                "the uncorrelated nested EXISTS should be folded correctly before compilation"
+            );
+        });
+    }
+
+    #[test]
+    fn test_prepared_statement_nested_multi_term_correlated_exists_uses_dispatch_path() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE outer_rows(id INTEGER PRIMARY KEY, a INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE inner_rows(id INTEGER PRIMARY KEY, a INTEGER);")
+                .await
+                .unwrap();
+
+            let stmt = conn
+                .prepare(
+                    "
+                    SELECT outer_row.id
+                    FROM outer_rows AS outer_row
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM inner_rows AS middle_row
+                        WHERE EXISTS (
+                            SELECT 1
+                            FROM inner_rows AS inner_row
+                            WHERE inner_row.a = outer_row.a
+                              AND inner_row.id <> outer_row.id
+                        )
+                    );
+                    ",
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                stmt.deferred_query_statement.is_some(),
+                "nested multi-term correlated EXISTS must remain on prepared dispatch"
+            );
+        });
+    }
+
+    #[test]
     fn test_prepared_statement_simple_derived_table_is_flattened_before_dispatch() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
