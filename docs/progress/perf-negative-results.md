@@ -48,6 +48,37 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-07-28 - ATTRIBUTED: general recursive-CTE frontier gap (bd-gpi5i) = ~135ns/AST-node boxed-future evaluation (~53%) + ~720ns/iter async loop plumbing (~47%); fix spec'd, perf-tooling attempts all failed (recorded)
+
+- Target row: "Recursive CTE general COUNT (1..1000)" — four release-perf runs
+  on superserver: C=249-257us vs F=1.58-1.64ms (6.1-6.5x slower, CV<2.2%),
+  while the specialized SUM row is simultaneously 25-32x FASTER (closed
+  form). Artifact: `tests/artifacts/perf/cte-frontier-profile-20260728T1810Z-superserver/`.
+- MECHANISM (measured, not inferred): CLI node-count differential — same
+  Direct tier, 6-node vs 16-node arm expressions at depth 1000 → per
+  iteration T = ~720ns + ~135ns×AST-nodes; depth scaling linear (no O(n^2)).
+  135ns/node = the `Pin<Box<dyn Future>>`-per-node signature of
+  `eval_expr_with_subqueries` (connection.rs:56302), which the Direct-plan
+  matcher (:66898) makes pure waste (it admits NO subquery expressions; the
+  async evaluator's own simple-node fallthrough is `eval_join_expr`).
+- FIX: patch-ready hunk spec on bd-gpi5i (sync evaluator for a conservative
+  node set + fully-sync iteration loop when all arms qualify — H4(b) is what
+  removes the 47% fixed share). connection.rs leased → RusticBasin applies at
+  checkpoint. En route: bd-g54oq filed (eval_join_expr UnaryOp::Plus → NULL
+  latent bug); the existing recursive_cte_perf_repro.rs scaling test no
+  longer guards the general frontier (SUM specialization short-circuits it) —
+  COUNT twin required.
+- NEGATIVE RESULTS (perf tooling on a busy shared host; do not repeat):
+  (1) whole-run dwarf record at -F 999 → kernel-throttled to ~1K samples/2min,
+  zero window coverage; (2) trigger + `perf record -p PID` → ESRCH race;
+  (3) trigger + `-C cpus` system-wide → /proc-maps synthesis latency ate the
+  1.9s phase twice (even with --proc-map-timeout=50); (4) `--overwrite` ring
+  dump → unparseable perf.data on perf 6.17.13. RETRY CONDITION: none needed —
+  the CLI repetition differential (400 reps × /usr/bin/time, minimums) was
+  strictly better for phase-scoped attribution; prefer it for engine-internal
+  hot loops. If a flamegraph is ever truly required: dedicated quiet host +
+  record-from-birth + --quick + line-tables build.
+
 ## 2026-07-28 - ATTRIBUTED: the high-writer decline decomposed — registry guard held 0.7-7ms per commit (~80% of the decline); leaf-boundary conflicts ~20%; merge ladder found production-dormant
 
 - Three-receipt attribution of why F declines 150k→52k wps from 8→128
