@@ -716,6 +716,7 @@ thread_local! {
 }
 static FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RECURSIVE_CTE_DIRECT_EVAL_HITS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_RECURSIVE_CTE_DIRECT_SYNC_EVAL_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RECURSIVE_CTE_PRECOMPILED_ARM_HITS: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static FSQLITE_RECURSIVE_CTE_INTEGER_SERIES_SUM_HITS_TLS: std::cell::Cell<u64> =
@@ -4181,6 +4182,11 @@ struct RecursiveCteDirectEvalPlan {
     col_map: Vec<(String, String, bool)>,
     result_exprs: Vec<Expr>,
     where_clause: Option<Expr>,
+    /// Every plan expression is within the sync evaluator's node set
+    /// (`recursive_cte_direct_expr_sync_evaluable`), so the per-iteration
+    /// frontier loop may bypass the boxed-future expression evaluator
+    /// entirely (bd-gpi5i: ~135ns per AST node per row per iteration).
+    sync_evaluable: bool,
 }
 
 #[derive(Clone)]
@@ -4842,7 +4848,7 @@ enum PreparedQueryFastPath {
         index_root_page: i32,
         column_index: usize,
         probe_root_page: i32,
-        probe_rowid_upper_exclusive: Option<i64>,
+        probe_rowid_upper_bound: PreparedProbeRowidBound,
     },
     SimpleStringScalarProjection {
         root_page: i32,
@@ -5283,12 +5289,55 @@ struct PreparedCountIndexedRowidProbeLastResult {
     count: i64,
 }
 
+/// Rowid upper bound for the prepared count-indexed-rowid-probe fast path
+/// (bd-5zeai). `Parameter` defers resolution to execute time so the
+/// placeholder variant of the shape keeps the fast path instead of falling
+/// to the general dispatcher (measured 20.1x presence effect,
+/// param-tax-controls-20260728T0630Z).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PreparedProbeRowidBound {
+    /// No rowid bound term in the probe WHERE clause.
+    None,
+    /// Literal bound, already normalized to EXCLUSIVE at prepare time.
+    LiteralExclusive(i64),
+    /// Numbered placeholder (0-based params index); inclusivity applied at
+    /// resolution because the bound value is unknown until bind time.
+    Parameter { index: usize, inclusive: bool },
+}
+
+impl PreparedProbeRowidBound {
+    /// Resolve to the executor's `Option<i64>` exclusive bound.
+    /// Outer `None` = unresolvable with these params (non-Integer binding or
+    /// missing slot) — the caller MUST fall back to the general path, which
+    /// preserves SQLite affinity/coercion semantics by never entering the
+    /// shortcut for those cases. Inner `None` = resolvable, no bound term.
+    /// The two Nones mean different things; collapsing them would conflate
+    /// "skip the fast path" with "unbounded probe".
+    #[allow(clippy::option_option)]
+    fn resolve(self, params: Option<&[SqliteValue]>) -> Option<Option<i64>> {
+        match self {
+            Self::None => Some(None),
+            Self::LiteralExclusive(bound) => Some(Some(bound)),
+            Self::Parameter { index, inclusive } => {
+                match params.and_then(|params| params.get(index)) {
+                    Some(SqliteValue::Integer(bound)) => Some(Some(if inclusive {
+                        bound.saturating_add(1)
+                    } else {
+                        *bound
+                    })),
+                    _ => None,
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PreparedCountIndexedRowidProbeSpec {
     column_index: usize,
     index_root_page: i32,
     probe_root_page: i32,
-    probe_rowid_upper_exclusive: Option<i64>,
+    probe_rowid_upper_bound: PreparedProbeRowidBound,
 }
 
 #[derive(Debug, Clone)]
@@ -5887,15 +5936,24 @@ impl PreparedStatement<'_> {
         }))
     }
 
-    fn try_query_row_clean_memory_count_indexed_rowid_probe_fast(&self) -> Result<Option<Row>> {
+    fn try_query_row_clean_memory_count_indexed_rowid_probe_fast(
+        &self,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<Row>> {
         let Some(PreparedQueryFastPath::SimpleCountIndexedRowidProbe {
             root_page,
             index_root_page,
             column_index,
             probe_root_page,
-            probe_rowid_upper_exclusive,
+            probe_rowid_upper_bound,
         }) = self.prepared_query_fast_path.as_ref()
         else {
+            return Ok(None);
+        };
+        // bd-5zeai: resolve the (possibly parameterized) bound first — a
+        // non-Integer binding falls back to the general path, preserving
+        // affinity/coercion semantics by never entering the shortcut.
+        let Some(probe_rowid_upper_exclusive) = probe_rowid_upper_bound.resolve(params) else {
             return Ok(None);
         };
         if self.dml_dispatch.is_some()
@@ -5919,7 +5977,7 @@ impl PreparedStatement<'_> {
             *index_root_page,
             *column_index,
             *probe_root_page,
-            *probe_rowid_upper_exclusive,
+            probe_rowid_upper_exclusive,
         )?
         else {
             return Ok(None);
@@ -6951,9 +7009,10 @@ impl PreparedStatement<'_> {
         {
             return Ok(direct_query_row_result(row));
         }
-        if params.is_none()
-            && let Some(row) = self.try_query_row_clean_memory_count_indexed_rowid_probe_fast()?
-        {
+        // bd-5zeai: the count-probe fast path resolves parameterized bounds
+        // itself, so it runs in BOTH params branches; unresolvable bindings
+        // return None and fall through to the general dispatcher.
+        if let Some(row) = self.try_query_row_clean_memory_count_indexed_rowid_probe_fast(params)? {
             return Ok(direct_query_row_result(row));
         }
         self.conn
@@ -7770,12 +7829,16 @@ fn select_numeric_literal(expr: &Expr) -> Option<SqliteValue> {
     }
 }
 
-fn select_rowid_upper_bound_exclusive(
+/// Match a `rowid <=|< value` probe upper-bound term (bd-5zeai). The value
+/// may be an integer literal (normalized to an exclusive bound at prepare
+/// time) or a numbered placeholder, deferred to execute-time resolution via
+/// `PreparedProbeRowidBound::resolve`.
+fn select_rowid_upper_bound_spec(
     expr: &Expr,
     table: &TableSchema,
     table_label: &str,
     rowid_alias_name: Option<&str>,
-) -> Option<i64> {
+) -> Option<PreparedProbeRowidBound> {
     let Expr::BinaryOp {
         left, op, right, ..
     } = expr
@@ -7795,12 +7858,15 @@ fn select_rowid_upper_bound_exclusive(
         return None;
     }
 
-    let bound = select_integer_literal(value_expr)?;
-    Some(if inclusive {
-        bound.saturating_add(1)
-    } else {
-        bound
-    })
+    if let Some(bound) = select_integer_literal(value_expr) {
+        return Some(PreparedProbeRowidBound::LiteralExclusive(if inclusive {
+            bound.saturating_add(1)
+        } else {
+            bound
+        }));
+    }
+    let index = select_numbered_placeholder_index(value_expr)?;
+    Some(PreparedProbeRowidBound::Parameter { index, inclusive })
 }
 
 fn row_from_memdb_row_values(
@@ -18420,9 +18486,6 @@ impl Connection {
         params: Option<&[SqliteValue]>,
         row: &Row,
     ) {
-        if params.is_some() {
-            return;
-        }
         if !self.clean_memory_prepared_memdb_fast_path_candidate(stmt)
             || self.memdb_requires_active_txn_reload.get()
         {
@@ -18433,9 +18496,14 @@ impl Connection {
             index_root_page,
             column_index,
             probe_root_page,
-            probe_rowid_upper_exclusive,
+            probe_rowid_upper_bound,
         }) = stmt.prepared_query_fast_path.as_ref()
         else {
+            return;
+        };
+        // bd-5zeai: cache under the RESOLVED bound so rebinds get correct
+        // per-value entries; unresolvable bindings are never cached.
+        let Some(probe_rowid_upper_exclusive) = probe_rowid_upper_bound.resolve(params) else {
             return;
         };
         let Some(SqliteValue::Integer(count)) = row.get(0) else {
@@ -18446,7 +18514,7 @@ impl Connection {
             *index_root_page,
             *column_index,
             *probe_root_page,
-            *probe_rowid_upper_exclusive,
+            probe_rowid_upper_exclusive,
         );
         self.store_prepared_count_indexed_rowid_probe_last_result(cache_key, *count);
     }
@@ -19754,16 +19822,24 @@ impl Connection {
                 index_root_page,
                 column_index,
                 probe_root_page,
-                probe_rowid_upper_exclusive,
-            } => Ok(self
-                .prepared_count_indexed_rowid_probe_row(
-                    root_page,
-                    index_root_page,
-                    column_index,
-                    probe_root_page,
-                    probe_rowid_upper_exclusive,
-                )?
-                .map(QueryRowCollectionOutcome::Row)),
+                probe_rowid_upper_bound,
+            } => {
+                // bd-5zeai: unresolvable (non-Integer) bindings fall back to
+                // the general path.
+                let Some(probe_rowid_upper_exclusive) = probe_rowid_upper_bound.resolve(params)
+                else {
+                    return Ok(None);
+                };
+                Ok(self
+                    .prepared_count_indexed_rowid_probe_row(
+                        root_page,
+                        index_root_page,
+                        column_index,
+                        probe_root_page,
+                        probe_rowid_upper_exclusive,
+                    )?
+                    .map(QueryRowCollectionOutcome::Row))
+            }
             PreparedQueryFastPath::SimpleRowidLookup {
                 root_page,
                 parameter_index,
@@ -31171,7 +31247,7 @@ impl Connection {
                 flatten_and_terms(sub_where, &mut terms);
 
                 let mut probe_spec = None;
-                let mut probe_rowid_upper_exclusive = None;
+                let mut probe_rowid_upper_bound = None;
                 for term in terms {
                     if probe_spec.is_none()
                         && let Expr::BinaryOp {
@@ -31209,13 +31285,13 @@ impl Connection {
                         }
                     }
 
-                    let upper = select_rowid_upper_bound_exclusive(
+                    let upper = select_rowid_upper_bound_spec(
                         term,
                         probe_table,
                         probe_label,
                         probe_rowid_alias_name,
                     )?;
-                    if probe_rowid_upper_exclusive.replace(upper).is_some() {
+                    if probe_rowid_upper_bound.replace(upper).is_some() {
                         return None;
                     }
                 }
@@ -31225,7 +31301,8 @@ impl Connection {
                     column_index,
                     index_root_page,
                     probe_root_page: probe_table.root_page,
-                    probe_rowid_upper_exclusive,
+                    probe_rowid_upper_bound: probe_rowid_upper_bound
+                        .unwrap_or(PreparedProbeRowidBound::None),
                 }
             }
             Expr::In {
@@ -31295,22 +31372,23 @@ impl Connection {
                     return None;
                 }
 
-                let probe_rowid_upper_exclusive =
-                    where_clause.as_deref().map_or(Some(None), |expr| {
-                        select_rowid_upper_bound_exclusive(
+                let probe_rowid_upper_bound = where_clause.as_deref().map_or(
+                    Some(PreparedProbeRowidBound::None),
+                    |expr| {
+                        select_rowid_upper_bound_spec(
                             expr,
                             probe_table,
                             probe_label,
                             probe_rowid_alias_name,
                         )
-                        .map(Some)
-                    })?;
+                    },
+                )?;
 
                 PreparedCountIndexedRowidProbeSpec {
                     column_index,
                     index_root_page,
                     probe_root_page: probe_table.root_page,
-                    probe_rowid_upper_exclusive,
+                    probe_rowid_upper_bound,
                 }
             }
             _ => return None,
@@ -31321,7 +31399,7 @@ impl Connection {
             index_root_page: spec.index_root_page,
             column_index: spec.column_index,
             probe_root_page: spec.probe_root_page,
-            probe_rowid_upper_exclusive: spec.probe_rowid_upper_exclusive,
+            probe_rowid_upper_bound: spec.probe_rowid_upper_bound,
         })
     }
 
@@ -62125,12 +62203,30 @@ impl Connection {
                     }
                 }
             }
-            // Execute each recursive arm.
+            // Execute each recursive arm. Sync-evaluable Direct arms are
+            // called as plain functions: no per-iteration future
+            // materialization, no await (bd-gpi5i H4b — the measured ~47%
+            // fixed per-iteration overhead).
             let mut new_rows: Vec<Vec<SqliteValue>> = Vec::new();
             for (op, execution_plan) in &recursive_arms {
-                let arm_rows = self
-                    .execute_recursive_cte_arm_select(&op_cx, execution_plan, &working_set, params)
-                    .await?;
+                let arm_rows = match execution_plan {
+                    RecursiveCteArmExecutionPlan::Direct(plan) if plan.sync_evaluable => {
+                        Self::execute_recursive_cte_direct_eval_plan_sync(
+                            plan,
+                            &working_set,
+                            params,
+                        )?
+                    }
+                    _ => {
+                        self.execute_recursive_cte_arm_select(
+                            &op_cx,
+                            execution_plan,
+                            &working_set,
+                            params,
+                        )
+                        .await?
+                    }
+                };
                 for row in &arm_rows {
                     let vals = row.values().to_vec();
                     match op {
@@ -62287,11 +62383,55 @@ impl Connection {
             .iter()
             .map(|column| (label.clone(), column.clone(), false))
             .collect();
+        let sync_evaluable = result_exprs
+            .iter()
+            .all(recursive_cte_direct_expr_sync_evaluable)
+            && where_clause
+                .as_deref()
+                .is_none_or(recursive_cte_direct_expr_sync_evaluable);
         Some(RecursiveCteDirectEvalPlan {
             col_map,
             result_exprs,
             where_clause: where_clause.as_deref().cloned(),
+            sync_evaluable,
         })
+    }
+
+    /// Sync frontier-arm evaluation for plans whose every expression is
+    /// within the sync node set. Bypasses the per-AST-node boxed-future
+    /// evaluator AND, via the caller's dispatch, per-iteration future
+    /// materialization (bd-gpi5i: measured ~720ns/iter fixed + ~135ns/node).
+    fn execute_recursive_cte_direct_eval_plan_sync(
+        plan: &RecursiveCteDirectEvalPlan,
+        working_set: &[Vec<SqliteValue>],
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        FSQLITE_RECURSIVE_CTE_DIRECT_SYNC_EVAL_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+        let mut rows = Vec::with_capacity(working_set.len());
+        for input_row in working_set {
+            if let Some(where_expr) = plan.where_clause.as_ref() {
+                let predicate = eval_recursive_cte_direct_expr_sync(
+                    where_expr,
+                    input_row,
+                    &plan.col_map,
+                    params,
+                )?;
+                if !is_sqlite_truthy(&predicate) {
+                    continue;
+                }
+            }
+            let mut values = Vec::with_capacity(plan.result_exprs.len());
+            for expr in &plan.result_exprs {
+                values.push(eval_recursive_cte_direct_expr_sync(
+                    expr,
+                    input_row,
+                    &plan.col_map,
+                    params,
+                )?);
+            }
+            rows.push(Row { values });
+        }
+        Ok(rows)
     }
 
     async fn execute_recursive_cte_direct_eval_plan(
@@ -62300,6 +62440,9 @@ impl Connection {
         working_set: &[Vec<SqliteValue>],
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        if plan.sync_evaluable {
+            return Self::execute_recursive_cte_direct_eval_plan_sync(plan, working_set, params);
+        }
         FSQLITE_RECURSIVE_CTE_DIRECT_EVAL_HITS.fetch_add(1, AtomicOrdering::Relaxed);
         let mut rows = Vec::with_capacity(working_set.len());
         for input_row in working_set {
@@ -66892,6 +67035,31 @@ fn is_distinct_select(select: &SelectStatement) -> bool {
     match &select.body.select {
         SelectCore::Select { distinct, .. } => *distinct != Distinctness::All,
         SelectCore::Values(_) => false,
+    }
+}
+
+/// Conservative node set for the SYNC recursive-CTE direct evaluator
+/// (bd-gpi5i). Only nodes whose async-evaluator arms are either the literal
+/// `eval_join_expr` fallthrough (Column/Literal) or straight-line copies with
+/// no affinity/collation/function-registry dependence (BinaryOp/UnaryOp/
+/// IsNull/numbered Placeholder) qualify. Between/Case/Like/In/Cast/Collate/
+/// FunctionCall deliberately stay on the async path: their async arms consult
+/// schema affinity, collation resolution, or the connection function
+/// registry, and blind sync parity is not certifiable.
+fn recursive_cte_direct_expr_sync_evaluable(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(_, _) | Expr::Literal(_, _) => true,
+        Expr::Placeholder(placeholder, _) => {
+            matches!(placeholder, PlaceholderType::Numbered(_))
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            recursive_cte_direct_expr_sync_evaluable(left)
+                && recursive_cte_direct_expr_sync_evaluable(right)
+        }
+        Expr::UnaryOp { expr: inner, .. } | Expr::IsNull { expr: inner, .. } => {
+            recursive_cte_direct_expr_sync_evaluable(inner)
+        }
+        _ => false,
     }
 }
 
@@ -94022,6 +94190,87 @@ fn compare_join_expr_values(
 
 /// Evaluate an expression against a combined join row, producing a value.
 #[allow(clippy::too_many_lines)]
+/// Sync twin of `eval_expr_with_subqueries` for the recursive-CTE Direct
+/// frontier path (bd-gpi5i), valid ONLY for expressions admitted by
+/// `recursive_cte_direct_expr_sync_evaluable`. Arm bodies are copied from the
+/// async evaluator verbatim (BinaryOp IS TRUE/FALSE prelude, UnaryOp — note
+/// `Plus => val`, NOT `eval_join_expr`'s bugged `_ => Null` fallthrough,
+/// bd-g54oq — and IsNull), terminating in the same `eval_join_binary_op`;
+/// Column/Literal take the async evaluator's own `eval_join_expr`
+/// fallthrough. Parity is by construction, not by re-derivation.
+fn eval_recursive_cte_direct_expr_sync(
+    expr: &Expr,
+    row: &[SqliteValue],
+    col_map: &[(String, String, bool)],
+    params: Option<&[SqliteValue]>,
+) -> Result<SqliteValue> {
+    match expr {
+        Expr::Placeholder(placeholder, _) => eval_numbered_placeholder_param(placeholder, params),
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            if matches!(op, BinaryOp::Is | BinaryOp::IsNot) {
+                if let Expr::Literal(lit, _) = right.as_ref() {
+                    if matches!(lit, Literal::True | Literal::False) {
+                        let lv = eval_recursive_cte_direct_expr_sync(left, row, col_map, params)?;
+                        let truthy = if lv.is_null() {
+                            None
+                        } else {
+                            Some(is_sqlite_truthy(&lv))
+                        };
+                        let is_true_test = matches!(lit, Literal::True);
+                        let is_not = matches!(op, BinaryOp::IsNot);
+                        let result = match truthy {
+                            Some(t) => {
+                                let keep = is_true_test != is_not;
+                                i64::from(if keep { t } else { !t })
+                            }
+                            None => i64::from(is_not),
+                        };
+                        return Ok(SqliteValue::Integer(result));
+                    }
+                }
+            }
+            let l = eval_recursive_cte_direct_expr_sync(left, row, col_map, params)?;
+            let r = eval_recursive_cte_direct_expr_sync(right, row, col_map, params)?;
+            Ok(eval_join_binary_op(left, &l, *op, right, &r, col_map))
+        }
+        Expr::UnaryOp { op, expr: e, .. } => {
+            let val = eval_recursive_cte_direct_expr_sync(e, row, col_map, params)?;
+            match op {
+                UnaryOp::Negate => match &val {
+                    SqliteValue::Integer(n) => Ok(n
+                        .checked_neg()
+                        .map_or_else(|| SqliteValue::Float(-(*n as f64)), SqliteValue::Integer)),
+                    SqliteValue::Float(f) => Ok(SqliteValue::Float(-f)),
+                    _ => Ok(SqliteValue::Null),
+                },
+                UnaryOp::Plus => Ok(val),
+                UnaryOp::Not => {
+                    if val.is_null() {
+                        Ok(SqliteValue::Null)
+                    } else {
+                        Ok(SqliteValue::Integer(i64::from(!is_sqlite_truthy(&val))))
+                    }
+                }
+                UnaryOp::BitNot => {
+                    if val.is_null() {
+                        Ok(SqliteValue::Null)
+                    } else {
+                        Ok(SqliteValue::Integer(!val.to_integer()))
+                    }
+                }
+            }
+        }
+        Expr::IsNull { expr: e, not, .. } => {
+            let val = eval_recursive_cte_direct_expr_sync(e, row, col_map, params)?;
+            let result = if *not { !val.is_null() } else { val.is_null() };
+            Ok(SqliteValue::Integer(i64::from(result)))
+        }
+        _ => eval_join_expr(expr, row, col_map),
+    }
+}
+
 pub(crate) fn eval_join_expr(
     expr: &Expr,
     row: &[SqliteValue],
@@ -139894,6 +140143,7 @@ mod transaction_lifecycle_tests {
         asupersync::test_utils::run_test(|| async {
             let _serial = super::fsqlite_core_test_serializer();
             FSQLITE_RECURSIVE_CTE_DIRECT_EVAL_HITS.store(0, AtomicOrdering::Relaxed);
+            FSQLITE_RECURSIVE_CTE_DIRECT_SYNC_EVAL_HITS.store(0, AtomicOrdering::Relaxed);
             FSQLITE_RECURSIVE_CTE_PRECOMPILED_ARM_HITS.store(0, AtomicOrdering::Relaxed);
             FSQLITE_RECURSIVE_CTE_DIRECT_SUM_CONSUMER_HITS.store(0, AtomicOrdering::Relaxed);
             FSQLITE_RECURSIVE_CTE_INTEGER_SERIES_SUM_HITS.store(0, AtomicOrdering::Relaxed);
@@ -139917,6 +140167,8 @@ mod transaction_lifecycle_tests {
 
             assert!(
                 FSQLITE_RECURSIVE_CTE_DIRECT_EVAL_HITS.load(AtomicOrdering::Relaxed) > 0
+                    || FSQLITE_RECURSIVE_CTE_DIRECT_SYNC_EVAL_HITS.load(AtomicOrdering::Relaxed)
+                        > 0
                     || FSQLITE_RECURSIVE_CTE_PRECOMPILED_ARM_HITS.load(AtomicOrdering::Relaxed) > 0
                     || FSQLITE_RECURSIVE_CTE_INTEGER_SERIES_SUM_HITS.load(AtomicOrdering::Relaxed)
                         > 0,
@@ -139926,6 +140178,176 @@ mod transaction_lifecycle_tests {
                 FSQLITE_RECURSIVE_CTE_DIRECT_SUM_CONSUMER_HITS.load(AtomicOrdering::Relaxed) > 0,
                 "recursive CTE benchmark shape should bypass temp-table materialization for the final SUM consumer"
             );
+        });
+    }
+
+    #[test]
+    fn test_recursive_cte_general_count_uses_sync_direct_eval() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            FSQLITE_RECURSIVE_CTE_DIRECT_SYNC_EVAL_HITS.store(0, AtomicOrdering::Relaxed);
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            // COUNT defeats the integer-series SUM specialization, so this is
+            // the general frontier path (bd-gpi5i); the x+1 / x<N arm is
+            // within the sync node set and must take the sync Direct lane.
+            let stmt = conn
+                .prepare(
+                    "WITH RECURSIVE cnt(x) AS (\
+                   SELECT 1 \
+                   UNION ALL \
+                   SELECT x+1 FROM cnt WHERE x < 100\
+                 ) SELECT COUNT(*) FROM cnt",
+                )
+                .await
+                .unwrap();
+            let row = stmt.query_row().await.unwrap();
+            assert_eq!(row.get(0).unwrap(), &SqliteValue::Integer(100));
+            assert!(
+                FSQLITE_RECURSIVE_CTE_DIRECT_SYNC_EVAL_HITS.load(AtomicOrdering::Relaxed) > 0,
+                "general recursive COUNT arm should run the SYNC direct-eval lane"
+            );
+
+            // CAST in the projection leaves the Direct tier's sync node set,
+            // so the async evaluator must still serve it — with an identical
+            // row set (parity guard for the sync/async split).
+            let cast_stmt = conn
+                .prepare(
+                    "WITH RECURSIVE cnt(x) AS (\
+                   SELECT 1 \
+                   UNION ALL \
+                   SELECT CAST(x+1 AS INTEGER) FROM cnt WHERE x < 100\
+                 ) SELECT COUNT(*) FROM cnt",
+                )
+                .await
+                .unwrap();
+            let cast_row = cast_stmt.query_row().await.unwrap();
+            assert_eq!(cast_row.get(0).unwrap(), &SqliteValue::Integer(100));
+        });
+    }
+
+    #[test]
+    fn test_prepared_count_indexed_rowid_probe_parameterized_bound() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t(val INTEGER)").await.unwrap();
+            conn.execute("CREATE INDEX idx_t_val ON t(val)")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE probe(id INTEGER PRIMARY KEY, note TEXT)")
+                .await
+                .unwrap();
+            for v in 1..=20_i64 {
+                conn.execute(&format!("INSERT INTO t VALUES ({v})"))
+                    .await
+                    .unwrap();
+            }
+            for v in 1..=10_i64 {
+                conn.execute(&format!("INSERT INTO probe VALUES ({v}, 'p{v}')"))
+                    .await
+                    .unwrap();
+            }
+
+            let count_of = |row: Row| -> i64 {
+                match row.get(0).unwrap() {
+                    SqliteValue::Integer(v) => *v,
+                    other => panic!("count not integer: {other:?}"),
+                }
+            };
+
+            // Literal twin: the pre-existing fast path.
+            let literal = conn
+                .prepare(
+                    "SELECT COUNT(*) FROM t WHERE EXISTS(\
+                       SELECT 1 FROM probe WHERE probe.id = t.val AND probe.id < 8)",
+                )
+                .await
+                .unwrap();
+            let baseline_hits = FSQLITE_DIRECT_COUNT_INDEXED_ROWID_PROBE_QUERY_ROW_HITS
+                .load(AtomicOrdering::Relaxed);
+            let literal_count = count_of(literal.query_row().await.unwrap());
+            assert_eq!(literal_count, 7);
+            let literal_hits = FSQLITE_DIRECT_COUNT_INDEXED_ROWID_PROBE_QUERY_ROW_HITS
+                .load(AtomicOrdering::Relaxed);
+            assert!(
+                literal_hits > baseline_hits,
+                "literal count-probe shape must stay on the fast path"
+            );
+
+            // bd-5zeai: the SAME shape with a parameterized bound must ALSO
+            // take the fast path and agree with the literal twin.
+            let param = conn
+                .prepare(
+                    "SELECT COUNT(*) FROM t WHERE EXISTS(\
+                       SELECT 1 FROM probe WHERE probe.id = t.val AND probe.id < ?1)",
+                )
+                .await
+                .unwrap();
+            let param_count = count_of(
+                param
+                    .query_row_with_params(&[SqliteValue::Integer(8)])
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(param_count, literal_count);
+            let param_hits = FSQLITE_DIRECT_COUNT_INDEXED_ROWID_PROBE_QUERY_ROW_HITS
+                .load(AtomicOrdering::Relaxed);
+            assert!(
+                param_hits > literal_hits,
+                "parameterized count-probe bound must stay on the fast path (bd-5zeai)"
+            );
+
+            // Rebinds resolve per-execution (resolved-key caching, no stale
+            // hits), including a repeat of an earlier bound.
+            for (bound, expected) in [(3_i64, 2_i64), (11, 10), (8, 7), (3, 2)] {
+                let got = count_of(
+                    param
+                        .query_row_with_params(&[SqliteValue::Integer(bound)])
+                        .await
+                        .unwrap(),
+                );
+                assert_eq!(got, expected, "bound {bound} must count {expected}");
+            }
+
+            // Non-Integer bindings leave the shortcut (affinity semantics via
+            // the general path) but must still be CORRECT.
+            let hits_before_float = FSQLITE_DIRECT_COUNT_INDEXED_ROWID_PROBE_QUERY_ROW_HITS
+                .load(AtomicOrdering::Relaxed);
+            let float_count = count_of(
+                param
+                    .query_row_with_params(&[SqliteValue::Float(8.0)])
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(float_count, 7, "float bound must match SQLite semantics");
+            let null_count = count_of(
+                param
+                    .query_row_with_params(&[SqliteValue::Null])
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(null_count, 0, "NULL bound matches nothing");
+            assert_eq!(
+                FSQLITE_DIRECT_COUNT_INDEXED_ROWID_PROBE_QUERY_ROW_HITS
+                    .load(AtomicOrdering::Relaxed),
+                hits_before_float,
+                "non-Integer bindings must NOT enter the shortcut"
+            );
+
+            // Writes invalidate: a new probe row must be visible to the next
+            // parameterized execution.
+            conn.execute("INSERT INTO probe VALUES (11, 'p11')")
+                .await
+                .unwrap();
+            let after_write = count_of(
+                param
+                    .query_row_with_params(&[SqliteValue::Integer(12)])
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(after_write, 11, "post-write rebind must see the new row");
         });
     }
 
