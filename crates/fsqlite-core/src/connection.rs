@@ -9773,9 +9773,13 @@ struct FkCascadeDepthGuard<'a> {
 }
 
 impl<'a> FkCascadeDepthGuard<'a> {
-    fn enter(depth: &'a Cell<usize>) -> Self {
-        depth.set(depth.get() + 1);
-        Self { depth }
+    fn enter(depth: &'a Cell<usize>) -> Result<Self> {
+        let current_depth = depth.get();
+        if current_depth >= MAX_FK_CASCADE_DEPTH {
+            return Err(FrankenError::TriggerRecursionDepthExceeded);
+        }
+        depth.set(current_depth + 1);
+        Ok(Self { depth })
     }
 }
 
@@ -45447,12 +45451,15 @@ impl Connection {
     }
 
     /// Returns `true` when `PRAGMA foreign_keys` is ON, regardless of cascade
-    /// depth.  Used for DELETE FK cascade propagation so that multi-level
-    /// cascades (grandparent -> parent -> child) work correctly.
-    /// Bounded by `MAX_FK_CASCADE_DEPTH` to prevent infinite recursion.
+    /// depth. Used for parent-side FK propagation so that multi-level cascades
+    /// (grandparent -> parent -> child) remain on the conservative dispatcher.
+    ///
+    /// The depth bound is enforced by the fallible `FkCascadeDepthGuard::enter`
+    /// immediately before a nested action starts. Suppressing propagation here
+    /// at the limit would silently skip the next action and could also re-enable
+    /// prepared direct dispatch, leaving an orphan while reporting success.
     fn fk_cascade_propagation_enabled(&self) -> bool {
         self.pragma_state.borrow().foreign_keys
-            && self.fk_cascade_depth.get() < MAX_FK_CASCADE_DEPTH
     }
 
     /// Returns `true` when a parent-existence violation for `fk` should be
@@ -46006,7 +46013,7 @@ impl Connection {
                     where_parts.join(" AND ")
                 );
                 let result = {
-                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth);
+                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth)?;
                     self.execute_with_params(&sql, parent_values).await
                 };
                 result?;
@@ -46033,7 +46040,7 @@ impl Connection {
                     where_parts.join(" AND ")
                 );
                 let result = {
-                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth);
+                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth)?;
                     self.execute_with_params(&sql, parent_values).await
                 };
                 result?;
@@ -46062,7 +46069,7 @@ impl Connection {
                     where_parts.join(" AND ")
                 );
                 let result = {
-                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth);
+                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth)?;
                     self.execute_with_params(&sql, parent_values).await
                 };
                 result?;
@@ -46252,7 +46259,7 @@ impl Connection {
                 let mut params = new_parent_values.clone();
                 params.extend_from_slice(old_parent_values);
                 let result = {
-                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth);
+                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth)?;
                     self.execute_with_params(&sql, &params).await
                 };
                 result?;
@@ -46279,7 +46286,7 @@ impl Connection {
                     where_parts.join(" AND ")
                 );
                 let result = {
-                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth);
+                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth)?;
                     self.execute_with_params(&sql, old_parent_values).await
                 };
                 result?;
@@ -46308,7 +46315,7 @@ impl Connection {
                     where_parts.join(" AND ")
                 );
                 let result = {
-                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth);
+                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth)?;
                     self.execute_with_params(&sql, old_parent_values).await
                 };
                 result?;
@@ -210606,6 +210613,232 @@ mod pager_routing_tests {
             let rows = conn.query("SELECT id FROM child;").await.unwrap();
             assert_eq!(rows[0].values()[0], SqliteValue::Integer(4));
         });
+    }
+
+    const DEEP_FK_CASCADE_TABLE_COUNT: usize = MAX_FK_CASCADE_DEPTH + 2;
+
+    async fn create_deep_fk_cascade_chain(conn: &Connection, prefix: &str) {
+        conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+        conn.execute(&format!(
+            "CREATE TABLE {prefix}_0 (id INTEGER PRIMARY KEY);"
+        ))
+        .await
+        .unwrap();
+        for depth in 1..DEEP_FK_CASCADE_TABLE_COUNT {
+            let parent_depth = depth - 1;
+            conn.execute(&format!(
+                "CREATE TABLE {prefix}_{depth} (
+                    id INTEGER PRIMARY KEY
+                        REFERENCES {prefix}_{parent_depth}(id)
+                        ON DELETE CASCADE
+                        ON UPDATE CASCADE
+                );"
+            ))
+            .await
+            .unwrap();
+        }
+        for depth in 0..DEEP_FK_CASCADE_TABLE_COUNT {
+            conn.execute(&format!("INSERT INTO {prefix}_{depth} VALUES (1);"))
+                .await
+                .unwrap();
+        }
+    }
+
+    fn create_deep_fk_cascade_oracle(oracle: &rusqlite::Connection, prefix: &str) {
+        oracle.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        oracle
+            .execute(
+                &format!("CREATE TABLE {prefix}_0 (id INTEGER PRIMARY KEY);"),
+                [],
+            )
+            .unwrap();
+        for depth in 1..DEEP_FK_CASCADE_TABLE_COUNT {
+            let parent_depth = depth - 1;
+            oracle
+                .execute(
+                    &format!(
+                        "CREATE TABLE {prefix}_{depth} (
+                            id INTEGER PRIMARY KEY
+                                REFERENCES {prefix}_{parent_depth}(id)
+                                ON DELETE CASCADE
+                                ON UPDATE CASCADE
+                        );"
+                    ),
+                    [],
+                )
+                .unwrap();
+        }
+        for depth in 0..DEEP_FK_CASCADE_TABLE_COUNT {
+            oracle
+                .execute(&format!("INSERT INTO {prefix}_{depth} VALUES (1);"), [])
+                .unwrap();
+        }
+    }
+
+    async fn assert_deep_fk_chain_value(conn: &Connection, prefix: &str, expected: i64) {
+        for depth in 0..DEEP_FK_CASCADE_TABLE_COUNT {
+            let rows = conn
+                .query(&format!("SELECT id FROM {prefix}_{depth};"))
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.len(),
+                1,
+                "{prefix}_{depth} should retain exactly one row"
+            );
+            assert_eq!(
+                rows[0].values()[0],
+                SqliteValue::Integer(expected),
+                "{prefix}_{depth} has the wrong key after the failed cascade"
+            );
+        }
+        let violations = conn.query("PRAGMA foreign_key_check;").await.unwrap();
+        assert!(
+            violations.is_empty(),
+            "failed cascade left foreign-key violations: {violations:?}"
+        );
+    }
+
+    fn assert_oracle_fk_integrity(oracle: &rusqlite::Connection) {
+        let mut statement = oracle.prepare("PRAGMA foreign_key_check;").unwrap();
+        let mut violations = statement.query([]).unwrap();
+        assert!(
+            violations.next().unwrap().is_none(),
+            "C SQLite oracle should retain foreign-key integrity"
+        );
+    }
+
+    #[test]
+    fn test_fk_delete_depth_limit_fails_closed_and_rolls_back_statement() {
+        std::thread::Builder::new()
+            .name("fk-delete-depth-limit".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let oracle = rusqlite::Connection::open_in_memory().unwrap();
+                create_deep_fk_cascade_oracle(&oracle, "oracle_fk_delete_depth");
+                oracle
+                    .execute("DELETE FROM oracle_fk_delete_depth_0 WHERE id = 1;", [])
+                    .unwrap();
+                for depth in 0..DEEP_FK_CASCADE_TABLE_COUNT {
+                    let remaining: i64 = oracle
+                        .query_row(
+                            &format!("SELECT COUNT(*) FROM oracle_fk_delete_depth_{depth};"),
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        remaining, 0,
+                        "C SQLite should complete the depth-{depth} delete cascade"
+                    );
+                }
+                assert_oracle_fk_integrity(&oracle);
+
+                let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build FK DELETE depth regression runtime");
+                runtime.block_on(async {
+                    let conn = Connection::open(":memory:").await.unwrap();
+                    create_deep_fk_cascade_chain(&conn, "fk_delete_depth").await;
+                    conn.execute("CREATE TABLE fk_delete_marker (id INTEGER PRIMARY KEY);")
+                        .await
+                        .unwrap();
+
+                    conn.execute("BEGIN;").await.unwrap();
+                    conn.execute("INSERT INTO fk_delete_marker VALUES (1);")
+                        .await
+                        .unwrap();
+                    let err = conn
+                        .execute("DELETE FROM fk_delete_depth_0 WHERE id = 1;")
+                        .await
+                        .expect_err("cascade beyond the safe depth must fail closed");
+                    assert!(matches!(err, FrankenError::TriggerRecursionDepthExceeded));
+                    assert!(
+                        conn.in_transaction(),
+                        "a depth error should abort only the failed statement"
+                    );
+                    assert_deep_fk_chain_value(&conn, "fk_delete_depth", 1).await;
+
+                    conn.execute("INSERT INTO fk_delete_marker VALUES (2);")
+                        .await
+                        .unwrap();
+                    conn.execute("COMMIT;").await.unwrap();
+                    let marker_count = conn
+                        .query("SELECT COUNT(*) FROM fk_delete_marker;")
+                        .await
+                        .unwrap();
+                    assert_eq!(marker_count[0].values()[0], SqliteValue::Integer(2));
+                    assert_deep_fk_chain_value(&conn, "fk_delete_depth", 1).await;
+                });
+            })
+            .expect("spawn deep FK DELETE regression thread")
+            .join()
+            .expect("deep FK DELETE regression thread panicked");
+    }
+
+    #[test]
+    fn test_fk_update_depth_limit_fails_closed_and_rolls_back_autocommit() {
+        std::thread::Builder::new()
+            .name("fk-update-depth-limit".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let oracle = rusqlite::Connection::open_in_memory().unwrap();
+                create_deep_fk_cascade_oracle(&oracle, "oracle_fk_update_depth");
+                oracle
+                    .execute(
+                        "UPDATE oracle_fk_update_depth_0 SET id = 2 WHERE id = 1;",
+                        [],
+                    )
+                    .unwrap();
+                for depth in 0..DEEP_FK_CASCADE_TABLE_COUNT {
+                    let id: i64 = oracle
+                        .query_row(
+                            &format!("SELECT id FROM oracle_fk_update_depth_{depth};"),
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        id, 2,
+                        "C SQLite should complete the depth-{depth} update cascade"
+                    );
+                }
+                assert_oracle_fk_integrity(&oracle);
+
+                let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build FK UPDATE depth regression runtime");
+                runtime.block_on(async {
+                    let conn = Connection::open(":memory:").await.unwrap();
+                    create_deep_fk_cascade_chain(&conn, "fk_update_depth").await;
+
+                    let err = conn
+                        .execute("UPDATE fk_update_depth_0 SET id = 2 WHERE id = 1;")
+                        .await
+                        .expect_err("cascade beyond the safe depth must fail closed");
+                    assert!(matches!(err, FrankenError::TriggerRecursionDepthExceeded));
+                    assert!(
+                        !conn.in_transaction(),
+                        "autocommit cascade failure must roll back its implicit transaction"
+                    );
+                    assert_deep_fk_chain_value(&conn, "fk_update_depth", 1).await;
+
+                    conn.execute("CREATE TABLE fk_update_after_error (id INTEGER PRIMARY KEY);")
+                        .await
+                        .unwrap();
+                    conn.execute("INSERT INTO fk_update_after_error VALUES (1);")
+                        .await
+                        .unwrap();
+                    let rows = conn
+                        .query("SELECT id FROM fk_update_after_error;")
+                        .await
+                        .unwrap();
+                    assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+                });
+            })
+            .expect("spawn deep FK UPDATE regression thread")
+            .join()
+            .expect("deep FK UPDATE regression thread panicked");
     }
 
     /// Regression: SQLite executes ON DELETE actions after removing the parent
