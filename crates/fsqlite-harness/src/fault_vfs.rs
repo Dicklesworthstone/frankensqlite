@@ -28,7 +28,9 @@ use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_vfs::shm::ShmRegion;
-use fsqlite_vfs::traits::{FileIdentity, Vfs, VfsFile, VfsWriteCompletion};
+use fsqlite_vfs::traits::{
+    FileIdentity, Vfs, VfsFile, VfsWriteCompletion, VfsWriteCompletionSource,
+};
 use tracing::{debug, debug_span};
 
 /// Bead identifier for tracing/log correlation.
@@ -676,35 +678,111 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
         offset: u64,
         completion: VfsWriteCompletion,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        let mut source_completion = VfsWriteCompletionSource::new(completion);
         async move {
             match self.state.check_write(&self.path, offset, buf.len()) {
-                WriteDecision::Allow => self.inner.write_tracked(cx, buf, offset, completion).await,
+                WriteDecision::Allow => {
+                    let inner = source_completion.handoff_to(|completion| {
+                        self.inner.write_tracked(cx, buf, offset, completion)
+                    });
+                    inner.await
+                }
                 WriteDecision::TornWrite { valid_bytes }
                 | WriteDecision::PartialWrite { valid_bytes } => {
                     let applied = valid_bytes.min(buf.len());
                     if applied > 0 {
-                        let partial_completion = completion.error_mapped_child();
-                        self.inner
-                            .write_tracked(cx, &buf[..applied], offset, partial_completion)
-                            .await?;
+                        let inner = source_completion.handoff_to(|completion| {
+                            let partial_completion = completion.error_mapped_child();
+                            self.inner.write_tracked(
+                                cx,
+                                &buf[..applied],
+                                offset,
+                                partial_completion,
+                            )
+                        });
+                        inner.await?;
                     } else {
-                        completion.complete_error();
+                        source_completion.complete_error();
                     }
                     Err(io_failure_error("fault injection: partial write"))
                 }
                 WriteDecision::IoError => {
-                    completion.complete_error();
+                    source_completion.complete_error();
                     Err(io_failure_error("fault injection: write failure"))
                 }
                 WriteDecision::DiskFull => {
-                    completion.complete_error();
+                    source_completion.complete_error();
                     Err(FrankenError::DatabaseFull)
                 }
                 WriteDecision::PoweredOff => {
-                    completion.complete_error();
+                    source_completion.complete_error();
                     Err(power_cut_error())
                 }
             }
+        }
+    }
+
+    fn write_page_batch_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        let mut source_completion = VfsWriteCompletionSource::new(completion);
+        async move {
+            let mut accepted = Vec::with_capacity(writes.len());
+            let mut terminal_error = None;
+
+            // Batch fault decisions are a deterministic pre-submission phase.
+            // This lets the accepted prefix (plus any valid torn-write slice)
+            // retain one lower batch source and one exact terminal boundary.
+            for (offset, data) in writes {
+                match self.state.check_write(&self.path, *offset, data.len()) {
+                    WriteDecision::Allow => accepted.push((*offset, *data)),
+                    WriteDecision::TornWrite { valid_bytes }
+                    | WriteDecision::PartialWrite { valid_bytes } => {
+                        let applied = valid_bytes.min(data.len());
+                        if applied > 0 {
+                            accepted.push((*offset, &data[..applied]));
+                        }
+                        terminal_error = Some(io_failure_error("fault injection: partial write"));
+                        break;
+                    }
+                    WriteDecision::IoError => {
+                        terminal_error = Some(io_failure_error("fault injection: write failure"));
+                        break;
+                    }
+                    WriteDecision::DiskFull => {
+                        terminal_error = Some(FrankenError::DatabaseFull);
+                        break;
+                    }
+                    WriteDecision::PoweredOff => {
+                        terminal_error = Some(power_cut_error());
+                        break;
+                    }
+                }
+            }
+
+            let Some(error) = terminal_error else {
+                let inner = source_completion.handoff_to(|completion| {
+                    self.inner
+                        .write_page_batch_tracked(cx, &accepted, completion)
+                });
+                return inner.await;
+            };
+
+            if accepted.is_empty() {
+                source_completion.complete_error();
+                return Err(error);
+            }
+
+            let inner = source_completion.handoff_to(|completion| {
+                let partial_completion = completion.error_mapped_child();
+                self.inner
+                    .write_page_batch_tracked(cx, &accepted, partial_completion)
+            });
+            inner.await?;
+            Err(error)
         }
     }
 
@@ -1384,6 +1462,164 @@ mod tests {
             .block_on(future)
     }
 
+    struct BatchCountingFile<F: VfsFile> {
+        inner: F,
+        single_writes: Arc<AtomicU64>,
+        batch_writes: Arc<AtomicU64>,
+    }
+
+    impl<F: VfsFile> VfsFile for BatchCountingFile<F> {
+        fn close(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.close(cx)
+        }
+
+        fn file_identity(&self) -> Result<Option<FileIdentity>> {
+            self.inner.file_identity()
+        }
+
+        async fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+            self.inner.read(cx, buf, offset).await
+        }
+
+        async fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+            self.single_writes.fetch_add(1, Ordering::Relaxed);
+            self.inner.write(cx, buf, offset).await
+        }
+
+        async fn write_page_batch(&self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
+            self.batch_writes.fetch_add(1, Ordering::Relaxed);
+            self.inner.write_page_batch(cx, writes).await
+        }
+
+        fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
+            self.inner.truncate(cx, size)
+        }
+
+        fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
+            self.inner.sync(cx, flags)
+        }
+
+        fn file_size(&self, cx: &Cx) -> Result<u64> {
+            self.inner.file_size(cx)
+        }
+
+        fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+            self.inner.lock(cx, level)
+        }
+
+        fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+            self.inner.unlock(cx, level)
+        }
+
+        fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
+            self.inner.check_reserved_lock(cx)
+        }
+
+        fn shm_map(
+            &mut self,
+            cx: &Cx,
+            region: u32,
+            region_size: u32,
+            extend: bool,
+        ) -> Result<ShmRegion> {
+            self.inner.shm_map(cx, region, region_size, extend)
+        }
+
+        fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+            self.inner.shm_lock(cx, offset, n, flags)
+        }
+
+        fn shm_barrier(&self) {
+            self.inner.shm_barrier();
+        }
+
+        fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()> {
+            self.inner.shm_unmap(cx, delete)
+        }
+    }
+
+    struct GatedTrackedBatchFile {
+        admitted_source: Arc<Mutex<Option<VfsWriteCompletionSource>>>,
+    }
+
+    impl VfsFile for GatedTrackedBatchFile {
+        fn close(&mut self, _: &Cx) -> Result<()> {
+            Ok(())
+        }
+
+        fn read<'a>(
+            &'a self,
+            _: &'a Cx,
+            _: &'a mut [u8],
+            _: u64,
+        ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+            std::future::ready(Ok(0))
+        }
+
+        fn write<'a>(
+            &'a self,
+            _: &'a Cx,
+            _: &'a [u8],
+            _: u64,
+        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+            std::future::ready(Ok(()))
+        }
+
+        fn write_page_batch_tracked<'a>(
+            &'a self,
+            _: &'a Cx,
+            _: &'a [(u64, &'a [u8])],
+            completion: VfsWriteCompletion,
+        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+            let source = VfsWriteCompletionSource::new(completion);
+            async move {
+                self.admitted_source
+                    .lock()
+                    .expect("lock admitted batch source")
+                    .replace(source);
+                std::future::pending().await
+            }
+        }
+
+        fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn sync(&mut self, _: &Cx, _: SyncFlags) -> Result<()> {
+            Ok(())
+        }
+
+        fn file_size(&self, _: &Cx) -> Result<u64> {
+            Ok(0)
+        }
+
+        fn lock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+            Ok(())
+        }
+
+        fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+            Ok(())
+        }
+
+        fn check_reserved_lock(&self, _: &Cx) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn shm_map(&mut self, _: &Cx, _: u32, _: u32, _: bool) -> Result<ShmRegion> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn shm_lock(&mut self, _: &Cx, _: u32, _: u32, _: u32) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn shm_barrier(&self) {}
+
+        fn shm_unmap(&mut self, _: &Cx, _: bool) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[cfg(unix)]
     fn native_vfs() -> NativeVfs {
         UnixVfs::new()
@@ -1507,6 +1743,246 @@ mod tests {
         assert_eq!(&buf, data);
 
         file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn never_polled_tracked_fault_vfs_writes_fail_closed_without_mutation() {
+        let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+        let cx = test_cx();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
+        let (file, _) = vfs
+            .open(&cx, Some(Path::new("never-polled.db")), flags)
+            .unwrap();
+        let payload = b"must not be forwarded";
+
+        let single_completion = VfsWriteCompletion::new();
+        drop(<_ as VfsFile>::write_tracked(
+            &file,
+            &cx,
+            payload,
+            0,
+            single_completion.clone(),
+        ));
+        assert_eq!(
+            single_completion.state(),
+            fsqlite_vfs::traits::VfsWriteCompletionState::Error
+        );
+
+        let writes = [(0_u64, &payload[..])];
+        let batch_completion = VfsWriteCompletion::new();
+        drop(<_ as VfsFile>::write_page_batch_tracked(
+            &file,
+            &cx,
+            &writes,
+            batch_completion.clone(),
+        ));
+        assert_eq!(
+            batch_completion.state(),
+            fsqlite_vfs::traits::VfsWriteCompletionState::Error
+        );
+        assert_eq!(
+            file.file_size(&cx).unwrap(),
+            0,
+            "a never-polled wrapper future cannot have forwarded bytes"
+        );
+    }
+
+    #[test]
+    fn tracked_fault_batch_applies_prefix_and_partial_range_before_error() {
+        let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+        vfs.inject_fault(
+            FaultSpec::torn_write("partial-batch.db")
+                .at_offset_bytes(4)
+                .valid_bytes(2)
+                .build(),
+        );
+        let cx = test_cx();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
+        let (file, _) = vfs
+            .open(&cx, Some(Path::new("partial-batch.db")), flags)
+            .unwrap();
+        let writes = [
+            (0_u64, &b"AAAA"[..]),
+            (4_u64, &b"BBBB"[..]),
+            (8_u64, &b"CCCC"[..]),
+        ];
+        let completion = VfsWriteCompletion::new();
+
+        let result = run_io(<_ as VfsFile>::write_page_batch_tracked(
+            &file,
+            &cx,
+            &writes,
+            completion.clone(),
+        ));
+        assert!(result.is_err());
+        assert_eq!(
+            completion.state(),
+            fsqlite_vfs::traits::VfsWriteCompletionState::Error
+        );
+        assert_eq!(
+            file.file_size(&cx).unwrap(),
+            6,
+            "the first range and exact valid prefix must be the only applied bytes"
+        );
+        let mut bytes = [0_u8; 6];
+        assert_eq!(run_io(file.read(&cx, &mut bytes, 0)).unwrap(), 6);
+        assert_eq!(&bytes, b"AAAABB");
+    }
+
+    #[test]
+    fn tracked_fault_batch_forwards_all_allowed_ranges_as_one_inner_batch() {
+        let cx = test_cx();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
+        let memory_vfs = MemoryVfs::new();
+        let (inner, _) = memory_vfs
+            .open(&cx, Some(Path::new("allowed-batch.db")), flags)
+            .unwrap();
+        let single_writes = Arc::new(AtomicU64::new(0));
+        let batch_writes = Arc::new(AtomicU64::new(0));
+        let file = FaultInjectingFile {
+            inner: BatchCountingFile {
+                inner,
+                single_writes: Arc::clone(&single_writes),
+                batch_writes: Arc::clone(&batch_writes),
+            },
+            state: Arc::new(FaultState::new()),
+            path: PathBuf::from("allowed-batch.db"),
+        };
+        let writes = [
+            (0_u64, &b"AAAA"[..]),
+            (4_u64, &b"BBBB"[..]),
+            (8_u64, &b"CCCC"[..]),
+        ];
+        let completion = VfsWriteCompletion::new();
+
+        run_io(<_ as VfsFile>::write_page_batch_tracked(
+            &file,
+            &cx,
+            &writes,
+            completion.clone(),
+        ))
+        .unwrap();
+        assert_eq!(
+            completion.state(),
+            fsqlite_vfs::traits::VfsWriteCompletionState::Success
+        );
+        assert_eq!(batch_writes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            single_writes.load(Ordering::Relaxed),
+            0,
+            "an all-allowed fault batch must not decompose into single writes"
+        );
+    }
+
+    #[test]
+    fn dropped_allowed_fault_batch_retains_exact_inner_source() {
+        use std::future::Future as _;
+        use std::task::{Context, Poll, Waker};
+
+        let admitted_source = Arc::new(Mutex::new(None));
+        let file = FaultInjectingFile {
+            inner: GatedTrackedBatchFile {
+                admitted_source: Arc::clone(&admitted_source),
+            },
+            state: Arc::new(FaultState::new()),
+            path: PathBuf::from("gated-allowed.db"),
+        };
+        let cx = test_cx();
+        let writes = [(0_u64, &b"AAAA"[..]), (4_u64, &b"BBBB"[..])];
+        let completion = VfsWriteCompletion::new();
+        let mut observer = Box::pin(<_ as VfsFile>::write_page_batch_tracked(
+            &file,
+            &cx,
+            &writes,
+            completion.clone(),
+        ));
+        let mut task_cx = Context::from_waker(Waker::noop());
+
+        assert!(matches!(
+            observer.as_mut().poll(&mut task_cx),
+            Poll::Pending
+        ));
+        assert_eq!(
+            completion.state(),
+            fsqlite_vfs::traits::VfsWriteCompletionState::Pending
+        );
+        drop(observer);
+        assert_eq!(
+            completion.state(),
+            fsqlite_vfs::traits::VfsWriteCompletionState::Pending,
+            "dropping the wrapper must not outrun the admitted batch source"
+        );
+
+        admitted_source
+            .lock()
+            .expect("lock admitted batch source")
+            .take()
+            .expect("inner source must own the completion obligation")
+            .complete_success();
+        assert_eq!(
+            completion.state(),
+            fsqlite_vfs::traits::VfsWriteCompletionState::Success,
+            "the admitted inner source must publish the exact terminal outcome"
+        );
+    }
+
+    #[test]
+    fn dropped_partial_fault_batch_waits_for_exact_inner_source_before_error() {
+        use std::future::Future as _;
+        use std::task::{Context, Poll, Waker};
+
+        let admitted_source = Arc::new(Mutex::new(None));
+        let state = Arc::new(FaultState::new());
+        state.inject_fault(
+            FaultSpec::partial_write("gated-partial.db")
+                .at_offset_bytes(4)
+                .valid_bytes(2)
+                .build(),
+        );
+        let file = FaultInjectingFile {
+            inner: GatedTrackedBatchFile {
+                admitted_source: Arc::clone(&admitted_source),
+            },
+            state,
+            path: PathBuf::from("gated-partial.db"),
+        };
+        let cx = test_cx();
+        let writes = [(0_u64, &b"AAAA"[..]), (4_u64, &b"BBBB"[..])];
+        let completion = VfsWriteCompletion::new();
+        let mut observer = Box::pin(<_ as VfsFile>::write_page_batch_tracked(
+            &file,
+            &cx,
+            &writes,
+            completion.clone(),
+        ));
+        let mut task_cx = Context::from_waker(Waker::noop());
+
+        assert!(matches!(
+            observer.as_mut().poll(&mut task_cx),
+            Poll::Pending
+        ));
+        assert_eq!(
+            completion.state(),
+            fsqlite_vfs::traits::VfsWriteCompletionState::Pending
+        );
+        drop(observer);
+        assert_eq!(
+            completion.state(),
+            fsqlite_vfs::traits::VfsWriteCompletionState::Pending,
+            "dropping the observer must not outrun the admitted partial source"
+        );
+
+        admitted_source
+            .lock()
+            .expect("lock admitted batch source")
+            .take()
+            .expect("inner source must own the completion obligation")
+            .complete_success();
+        assert_eq!(
+            completion.state(),
+            fsqlite_vfs::traits::VfsWriteCompletionState::Error,
+            "the mapped child must publish Error only after its source terminates"
+        );
     }
 
     #[cfg(any(unix, windows))]

@@ -29,7 +29,7 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
 
 use crate::shm::ShmRegion;
-use crate::traits::{FileIdentity, VfsFile, VfsWriteCompletion};
+use crate::traits::{FileIdentity, VfsFile, VfsWriteCompletion, VfsWriteCompletionSource};
 
 // ---------------------------------------------------------------------------
 // Global metrics counters
@@ -286,20 +286,49 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
         self.write_tracked(cx, buf, offset, VfsWriteCompletion::new())
     }
 
-    async fn write_tracked(
-        &self,
-        cx: &Cx,
-        buf: &[u8],
+    fn write_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
         offset: u64,
         completion: VfsWriteCompletion,
-    ) -> Result<()> {
-        GLOBAL_VFS_METRICS.write_ops.fetch_add(1, Ordering::Relaxed);
-        let bytes = buf.len() as u64;
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        let source_completion = VfsWriteCompletionSource::new(completion);
+        async move {
+            GLOBAL_VFS_METRICS.write_ops.fetch_add(1, Ordering::Relaxed);
+            let bytes = buf.len() as u64;
+            let inner = source_completion
+                .handoff_to(|completion| self.inner.write_tracked(cx, buf, offset, completion));
+            let result = vfs_trace_op!("write_async", &*self.path, bytes, inner.await);
+            if result.is_ok() {
+                GLOBAL_VFS_METRICS
+                    .write_bytes_total
+                    .fetch_add(bytes, Ordering::Relaxed);
+            }
+            result
+        }
+    }
+
+    async fn write_page_batch(&self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
+        let operation_count = u64::try_from(writes.len()).unwrap_or(u64::MAX);
+        let bytes = writes.iter().fold(0_u64, |total, (_, data)| {
+            total.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX))
+        });
+        // Batch accounting is logical: write_ops counts all requested ranges
+        // at admission, while the backend receives one logical batch.
+        // `write_bytes_total` remains observer-based: it advances only when
+        // the complete logical batch returns Ok. A partial failure or a
+        // dropped observer can therefore undercount bytes that reached a
+        // hidden source; the completion token, not this metric, is the
+        // authoritative durability signal.
+        GLOBAL_VFS_METRICS
+            .write_ops
+            .fetch_add(operation_count, Ordering::Relaxed);
         let result = vfs_trace_op!(
-            "write_async",
+            "write_page_batch_async",
             &*self.path,
             bytes,
-            self.inner.write_tracked(cx, buf, offset, completion).await
+            self.inner.write_page_batch(cx, writes).await
         );
         if result.is_ok() {
             GLOBAL_VFS_METRICS
@@ -307,6 +336,41 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
                 .fetch_add(bytes, Ordering::Relaxed);
         }
         result
+    }
+
+    fn write_page_batch_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        let source_completion = VfsWriteCompletionSource::new(completion);
+        async move {
+            let operation_count = u64::try_from(writes.len()).unwrap_or(u64::MAX);
+            let bytes = writes.iter().fold(0_u64, |total, (_, data)| {
+                total.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX))
+            });
+            // Batch accounting is logical: write_ops counts all requested
+            // ranges at admission, while the backend receives one logical
+            // batch.
+            // `write_bytes_total` remains observer-based: it advances only
+            // when the complete logical batch returns Ok. A partial failure or
+            // dropped observer can undercount physical bytes; terminal
+            // recovery decisions must use `completion`, never this counter.
+            GLOBAL_VFS_METRICS
+                .write_ops
+                .fetch_add(operation_count, Ordering::Relaxed);
+            let inner = source_completion.handoff_to(|completion| {
+                self.inner.write_page_batch_tracked(cx, writes, completion)
+            });
+            let result = vfs_trace_op!("write_page_batch_async", &*self.path, bytes, inner.await);
+            if result.is_ok() {
+                GLOBAL_VFS_METRICS
+                    .write_bytes_total
+                    .fetch_add(bytes, Ordering::Relaxed);
+            }
+            result
+        }
     }
 
     fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
@@ -448,6 +512,52 @@ mod tests {
 
         // Close.
         traced.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn tracing_file_never_polled_tracked_writes_fail_closed_before_forwarding() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let (file, _) = vfs
+            .open(
+                &cx,
+                Some(Path::new("metrics-never-polled.db")),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+            )
+            .unwrap();
+        let traced = TracingFile::new(file, "metrics-never-polled.db");
+        let payload = b"must not be forwarded";
+
+        let single_completion = VfsWriteCompletion::new();
+        drop(<TracingFile<_> as VfsFile>::write_tracked(
+            &traced,
+            &cx,
+            payload,
+            0,
+            single_completion.clone(),
+        ));
+        assert_eq!(
+            single_completion.state(),
+            crate::traits::VfsWriteCompletionState::Error
+        );
+
+        let writes = [(0_u64, &payload[..])];
+        let batch_completion = VfsWriteCompletion::new();
+        drop(<TracingFile<_> as VfsFile>::write_page_batch_tracked(
+            &traced,
+            &cx,
+            &writes,
+            batch_completion.clone(),
+        ));
+        assert_eq!(
+            batch_completion.state(),
+            crate::traits::VfsWriteCompletionState::Error
+        );
+        assert_eq!(
+            traced.file_size(&cx).unwrap(),
+            0,
+            "the wrapper must not forward an unpolled operation"
+        );
     }
 
     #[test]

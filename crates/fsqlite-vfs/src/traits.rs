@@ -695,7 +695,8 @@ pub enum VfsWriteCompletionState {
     Pending,
     /// The complete requested byte range was written.
     Success,
-    /// The write terminated with an error or cancellation.
+    /// The write terminated with an error or cancellation, or its observer
+    /// was abandoned before any backend code could admit the operation.
     ///
     /// This does not prove that zero bytes were written; a caller reconciling
     /// an append must still validate the on-disk interval before aborting it.
@@ -809,11 +810,13 @@ impl VfsWriteCompletion {
                 inner.terminal_relay.take(),
             )
         };
-        for (_, waiter) in waiters {
-            waiter.wake();
-        }
         if let Some((relay, mapped_terminal)) = terminal_relay {
             relay.complete(mapped_terminal);
+        }
+        // Relay the authoritative state before invoking arbitrary user wakers.
+        // A panicking waiter must not strand an outer partial-write token.
+        for (_, waiter) in waiters {
+            waiter.wake();
         }
         true
     }
@@ -825,33 +828,61 @@ impl Default for VfsWriteCompletion {
     }
 }
 
-/// Source-owned guard that fails closed if an accepted write is abandoned.
+/// Source/admission guard that fails closed if its completion obligation is abandoned.
 ///
-/// Blocking-pool cancellation can discard a queued closure before executing
-/// it, and driver teardown can discard an uncompleted request. Keeping this
-/// guard with that source ensures those paths terminate as `Error` instead of
-/// leaving a caller-retained token pending forever.
+/// Before admission, keeping this guard in the returned future makes a
+/// never-polled operation terminate as `Error`. After admission, blocking-pool
+/// cancellation can discard a queued closure before executing it, and driver
+/// teardown can discard an uncompleted request. Transferring the same guard to
+/// that source ensures those paths terminate as `Error` instead of leaving a
+/// caller-retained token pending forever.
+#[doc(hidden)]
 #[derive(Debug)]
-pub(crate) struct VfsWriteCompletionSource {
+pub struct VfsWriteCompletionSource {
     completion: VfsWriteCompletion,
     armed: bool,
 }
 
 impl VfsWriteCompletionSource {
-    pub(crate) fn new(completion: VfsWriteCompletion) -> Self {
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new(completion: VfsWriteCompletion) -> Self {
         Self {
             completion,
             armed: true,
         }
     }
 
-    pub(crate) fn complete_success(&mut self) {
+    #[doc(hidden)]
+    pub fn complete_success(&mut self) {
         self.completion.complete_success();
         self.armed = false;
     }
 
-    pub(crate) fn complete_error(&mut self) {
+    #[doc(hidden)]
+    pub fn complete_error(&mut self) {
         self.completion.complete_error();
+        self.armed = false;
+    }
+
+    /// Construct the next source owner before disarming this guard.
+    ///
+    /// If `recipient` unwinds, this guard remains armed and fails closed.
+    /// After it returns, the recipient owns the completion obligation.
+    #[doc(hidden)]
+    pub fn handoff_to<T>(mut self, recipient: impl FnOnce(VfsWriteCompletion) -> T) -> T {
+        let recipient = recipient(self.completion.clone());
+        self.armed = false;
+        recipient
+    }
+
+    /// Enter the conservative in-doubt state used by trait defaults.
+    ///
+    /// The caller must first construct the unknown untracked future while this
+    /// guard is armed. Once disarmed, an observer drop intentionally leaves the
+    /// token Pending because that future may hide an admitted I/O source.
+    #[doc(hidden)]
+    pub fn disarm_to_in_doubt(mut self) {
         self.armed = false;
     }
 }
@@ -1002,10 +1033,18 @@ pub trait VfsFile: Send + Sync {
     ///
     /// The ordinary [`Self::write`] contract is unchanged. This additive path
     /// lets durability coordinators retain an observation handle when their
-    /// caller future is externally dropped. Backends whose hidden side effect
-    /// outlives their returned future must override this method and complete
-    /// the token at that hidden source. The conservative default can remain
-    /// `Pending` after such a drop; callers must treat that as in-doubt.
+    /// caller future is externally dropped. A future dropped before its first
+    /// poll completes the token as `Error`, because no implementation code
+    /// could have accepted the write. After the first poll, backends whose
+    /// hidden side effect outlives their returned future must override this
+    /// method and complete the token at that hidden source. The conservative
+    /// default can remain `Pending` after such an in-flight drop; callers must
+    /// treat that as in-doubt.
+    ///
+    /// The default assumes normal future laziness: merely constructing the
+    /// future returned by [`Self::write`] must not admit hidden I/O. A backend
+    /// that admits work during future construction must override this method
+    /// and establish source ownership around that admission boundary.
     fn write_tracked<'a>(
         &'a self,
         cx: &'a Cx,
@@ -1013,12 +1052,21 @@ pub trait VfsFile: Send + Sync {
         offset: u64,
         completion: VfsWriteCompletion,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        let result_completion = completion.clone();
+        let source = VfsWriteCompletionSource::new(completion);
         async move {
-            let result = self.write(cx, buf, offset).await;
+            // Before the first poll no implementation code has run, so
+            // dropping `source` can safely terminate as Error. Once polling
+            // enters the unknown untracked implementation, disarm it: that
+            // implementation may own hidden I/O after its observer is dropped,
+            // and Pending is the only truthful conservative state.
+            let inner = self.write(cx, buf, offset);
+            source.disarm_to_in_doubt();
+            let result = inner.await;
             if result.is_ok() {
-                completion.complete_success();
+                result_completion.complete_success();
             } else {
-                completion.complete_error();
+                result_completion.complete_error();
             }
             result
         }
@@ -1039,6 +1087,56 @@ pub trait VfsFile: Send + Sync {
                 self.write(cx, data, *offset).await?;
             }
             Ok(())
+        }
+    }
+
+    /// Write a page batch and report its source-owned terminal state.
+    ///
+    /// This is the batched counterpart to [`Self::write_tracked`]. Input order
+    /// is significant: overlapping ranges use last-write-wins semantics, just
+    /// like sequential calls to [`Self::write`]. A batch is not atomic; an
+    /// `Error` may therefore follow a successfully written prefix.
+    ///
+    /// `completion` must remain `Pending` until the backend can no longer
+    /// mutate any requested range. Backends whose I/O source can outlive the
+    /// returned future must override this method and transfer source ownership
+    /// of the token to that I/O source. A never-polled future terminates as
+    /// `Error`, because no implementation code could have accepted the batch.
+    /// Once polled, the conservative default completes the token only after
+    /// [`Self::write_page_batch`] returns; if a custom backend's hidden source
+    /// survives a dropped future, the token remains `Pending` and callers must
+    /// treat the batch as in doubt.
+    ///
+    /// The default assumes normal future laziness: merely constructing the
+    /// future returned by [`Self::write_page_batch`] must not admit hidden I/O.
+    /// A backend that admits work during construction must override this method
+    /// and establish source ownership around that admission boundary.
+    ///
+    /// The first terminal transition wins. In particular, cancellation
+    /// observed after the complete batch was written cannot replace
+    /// `Success` with `Error`.
+    fn write_page_batch_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        let result_completion = completion.clone();
+        let source = VfsWriteCompletionSource::new(completion);
+        async move {
+            // See `write_tracked`: after first poll the default cannot know
+            // whether a custom backend hides an accepted source behind its
+            // ordinary batch future, so an in-flight observer drop remains
+            // Pending rather than publishing a premature Error.
+            let inner = self.write_page_batch(cx, writes);
+            source.disarm_to_in_doubt();
+            let result = inner.await;
+            if result.is_ok() {
+                result_completion.complete_success();
+            } else {
+                result_completion.complete_error();
+            }
+            result
         }
     }
 
@@ -1527,6 +1625,16 @@ mod tests {
         let writes: Vec<(u64, &[u8])> = vec![(0, &data), (4096, &data), (8192, &data)];
         poll_ready(file.write_page_batch(&cx, &writes)).unwrap();
         assert_eq!(WRITE_COUNT.load(Ordering::Relaxed), 3);
+
+        WRITE_COUNT.store(0, Ordering::Relaxed);
+        let completion = VfsWriteCompletion::new();
+        poll_ready(file.write_page_batch_tracked(&cx, &writes, completion.clone())).unwrap();
+        assert_eq!(WRITE_COUNT.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            completion.state(),
+            VfsWriteCompletionState::Success,
+            "the default tracked batch must publish success after the last write"
+        );
     }
 
     #[test]
@@ -1605,6 +1713,14 @@ mod tests {
         let file = Stub;
         let writes: Vec<(u64, &[u8])> = vec![];
         poll_ready(file.write_page_batch(&cx, &writes)).unwrap();
+
+        let completion = VfsWriteCompletion::new();
+        poll_ready(file.write_page_batch_tracked(&cx, &writes, completion.clone())).unwrap();
+        assert_eq!(
+            completion.state(),
+            VfsWriteCompletionState::Success,
+            "an empty tracked batch is immediately complete"
+        );
     }
 
     #[test]
@@ -1698,6 +1814,17 @@ mod tests {
             CALL_COUNT.load(Ordering::Relaxed),
             2,
             "should stop after second write fails, not call third"
+        );
+
+        CALL_COUNT.store(0, Ordering::Relaxed);
+        let completion = VfsWriteCompletion::new();
+        let result = poll_ready(file.write_page_batch_tracked(&cx, &writes, completion.clone()));
+        assert!(result.is_err());
+        assert_eq!(CALL_COUNT.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            completion.state(),
+            VfsWriteCompletionState::Error,
+            "a failed tracked batch must publish a terminal error"
         );
     }
 
@@ -1914,6 +2041,173 @@ mod tests {
         );
     }
 
+    struct NeverReadyWriteFile {
+        panic_on_construct: bool,
+    }
+
+    impl VfsFile for NeverReadyWriteFile {
+        fn close(&mut self, _: &Cx) -> Result<()> {
+            Ok(())
+        }
+
+        async fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn write<'a>(
+            &'a self,
+            _: &'a Cx,
+            _: &'a [u8],
+            _: u64,
+        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+            if self.panic_on_construct {
+                std::panic::resume_unwind(Box::new("intentional future-construction failure"));
+            }
+            std::future::pending()
+        }
+
+        fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn sync(&mut self, _: &Cx, _: SyncFlags) -> Result<()> {
+            Ok(())
+        }
+
+        fn file_size(&self, _: &Cx) -> Result<u64> {
+            Ok(0)
+        }
+
+        fn lock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+            Ok(())
+        }
+
+        fn unlock(&mut self, _: &Cx, _: LockLevel) -> Result<()> {
+            Ok(())
+        }
+
+        fn check_reserved_lock(&self, _: &Cx) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn shm_map(&mut self, _: &Cx, _: u32, _: u32, _: bool) -> Result<ShmRegion> {
+            Err(fsqlite_error::FrankenError::Unsupported)
+        }
+
+        fn shm_lock(&mut self, _: &Cx, _: u32, _: u32, _: u32) -> Result<()> {
+            Err(fsqlite_error::FrankenError::Unsupported)
+        }
+
+        fn shm_barrier(&self) {}
+
+        fn shm_unmap(&mut self, _: &Cx, _: bool) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_tracked_writes_distinguish_never_polled_from_in_flight_drop() {
+        use std::future::Future as _;
+
+        let cx = Cx::new();
+        let file = NeverReadyWriteFile {
+            panic_on_construct: false,
+        };
+        let data = [7_u8];
+        let writes = [(0_u64, data.as_slice())];
+
+        let never_polled_write = VfsWriteCompletion::new();
+        drop(file.write_tracked(&cx, &data, 0, never_polled_write.clone()));
+        assert_eq!(never_polled_write.state(), VfsWriteCompletionState::Error);
+
+        let never_polled_batch = VfsWriteCompletion::new();
+        drop(file.write_page_batch_tracked(&cx, &writes, never_polled_batch.clone()));
+        assert_eq!(never_polled_batch.state(), VfsWriteCompletionState::Error);
+
+        let in_flight_write = VfsWriteCompletion::new();
+        let mut write_future = Box::pin(file.write_tracked(&cx, &data, 0, in_flight_write.clone()));
+        let mut task_cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            write_future.as_mut().poll(&mut task_cx),
+            Poll::Pending
+        ));
+        drop(write_future);
+        assert_eq!(
+            in_flight_write.state(),
+            VfsWriteCompletionState::Pending,
+            "the default cannot classify an unknown in-flight source"
+        );
+
+        let in_flight_batch = VfsWriteCompletion::new();
+        let mut batch_future =
+            Box::pin(file.write_page_batch_tracked(&cx, &writes, in_flight_batch.clone()));
+        assert!(matches!(
+            batch_future.as_mut().poll(&mut task_cx),
+            Poll::Pending
+        ));
+        drop(batch_future);
+        assert_eq!(
+            in_flight_batch.state(),
+            VfsWriteCompletionState::Pending,
+            "the default cannot classify an unknown in-flight batch source"
+        );
+    }
+
+    #[test]
+    fn default_tracked_write_guard_survives_inner_future_constructor_panic() {
+        use std::future::Future as _;
+
+        let cx = Cx::new();
+        let file = NeverReadyWriteFile {
+            panic_on_construct: true,
+        };
+        let completion = VfsWriteCompletion::new();
+        let mut future =
+            Box::pin(file.write_tracked(&cx, b"constructor failure", 0, completion.clone()));
+        let mut task_cx = Context::from_waker(Waker::noop());
+        let transition = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            future.as_mut().poll(&mut task_cx)
+        }));
+        assert!(transition.is_err(), "inner future construction must unwind");
+        drop(future);
+        assert_eq!(
+            completion.state(),
+            VfsWriteCompletionState::Error,
+            "the armed preflight guard must fail closed on constructor unwind"
+        );
+    }
+
+    struct CompletionPanickingWake;
+
+    impl std::task::Wake for CompletionPanickingWake {
+        fn wake(self: Arc<Self>) {
+            std::panic::resume_unwind(Box::new("intentional completion-waker failure"));
+        }
+    }
+
+    #[test]
+    fn write_completion_relays_before_invoking_panicking_waiter() {
+        use std::future::Future as _;
+
+        let outer = VfsWriteCompletion::new();
+        let child = outer.error_mapped_child();
+        let mut waiter = Box::pin(child.wait());
+        let waker = Waker::from(Arc::new(CompletionPanickingWake));
+        {
+            let mut task_cx = Context::from_waker(&waker);
+            assert!(matches!(waiter.as_mut().poll(&mut task_cx), Poll::Pending));
+        }
+
+        let transition =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| child.complete_success()));
+        assert!(transition.is_err(), "test waker must unwind");
+        assert_eq!(
+            outer.state(),
+            VfsWriteCompletionState::Error,
+            "the mapped terminal state must publish before arbitrary wakers run"
+        );
+    }
+
     struct CompletionLockProbeWake {
         completion: VfsWriteCompletion,
         dropped_while_completion_locked: Arc<std::sync::atomic::AtomicBool>,
@@ -2053,6 +2347,30 @@ mod tests {
             | fsqlite_types::flags::VfsOpenFlags::READWRITE;
         let (file, _) = vfs.open(&cx, None, flags).unwrap();
 
+        let never_polled_single = VfsWriteCompletion::new();
+        drop(<MemoryFile as VfsFile>::write_tracked(
+            &file,
+            &cx,
+            b"not submitted",
+            0,
+            never_polled_single.clone(),
+        ));
+        assert_eq!(never_polled_single.state(), VfsWriteCompletionState::Error);
+        let never_polled_writes = [(0_u64, &b"not submitted"[..])];
+        let never_polled_batch = VfsWriteCompletion::new();
+        drop(<MemoryFile as VfsFile>::write_page_batch_tracked(
+            &file,
+            &cx,
+            &never_polled_writes,
+            never_polled_batch.clone(),
+        ));
+        assert_eq!(never_polled_batch.state(), VfsWriteCompletionState::Error);
+        assert_eq!(
+            file.file_size(&cx).unwrap(),
+            0,
+            "never-polled memory operations must not mutate storage"
+        );
+
         let payload = b"hello async vfs";
         let waker = Waker::noop();
         let mut task_cx = Context::from_waker(waker);
@@ -2088,13 +2406,22 @@ mod tests {
 
         let writes: &[(u64, &[u8])] = &[(0, b"real"), (8, b"batch")];
         {
-            let mut batch = std::pin::pin!(<MemoryFile as VfsFile>::write_page_batch(
-                &file, &cx, writes,
+            let completion = VfsWriteCompletion::new();
+            let mut batch = std::pin::pin!(<MemoryFile as VfsFile>::write_page_batch_tracked(
+                &file,
+                &cx,
+                writes,
+                completion.clone(),
             ));
             assert!(matches!(
                 batch.as_mut().poll(&mut task_cx),
                 Poll::Ready(Ok(()))
             ));
+            assert_eq!(
+                completion.state(),
+                VfsWriteCompletionState::Success,
+                "the immediate memory batch must complete its token before Ready"
+            );
         }
 
         let mut batch_buf = [0_u8; 13];

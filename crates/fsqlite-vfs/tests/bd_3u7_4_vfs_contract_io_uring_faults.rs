@@ -12,6 +12,7 @@ use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_vfs::IoUringVfs;
 #[cfg(all(feature = "native", unix))]
 use fsqlite_vfs::UnixVfs;
+use fsqlite_vfs::traits::VfsWriteCompletionSource;
 use fsqlite_vfs::{MemoryVfs, Vfs, VfsFile, VfsWriteCompletion};
 #[cfg(all(feature = "native", unix))]
 use tempfile::tempdir;
@@ -387,37 +388,51 @@ impl<F: VfsFile> VfsFile for TestFaultFile<F> {
         }
     }
 
-    async fn write_tracked(
-        &self,
-        cx: &Cx,
-        buf: &[u8],
+    fn write_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
         offset: u64,
         completion: VfsWriteCompletion,
-    ) -> Result<()> {
-        let maybe_fault = self
-            .faults
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .next_write
-            .take();
-        match maybe_fault {
-            Some(InjectedWriteFault::Io) => {
-                completion.complete_error();
-                Err(injected_io_error("fault injection: write failure"))
-            }
-            Some(InjectedWriteFault::Partial { valid_bytes }) => {
-                let applied = valid_bytes.min(buf.len());
-                if applied > 0 {
-                    let partial_completion = completion.error_mapped_child();
-                    self.inner
-                        .write_tracked(cx, &buf[..applied], offset, partial_completion)
-                        .await?;
-                } else {
-                    completion.complete_error();
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        let mut source_completion = VfsWriteCompletionSource::new(completion);
+        async move {
+            let maybe_fault = self
+                .faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .next_write
+                .take();
+            match maybe_fault {
+                Some(InjectedWriteFault::Io) => {
+                    source_completion.complete_error();
+                    Err(injected_io_error("fault injection: write failure"))
                 }
-                Err(injected_io_error("fault injection: partial write"))
+                Some(InjectedWriteFault::Partial { valid_bytes }) => {
+                    let applied = valid_bytes.min(buf.len());
+                    if applied > 0 {
+                        let inner = source_completion.handoff_to(|completion| {
+                            let partial_completion = completion.error_mapped_child();
+                            self.inner.write_tracked(
+                                cx,
+                                &buf[..applied],
+                                offset,
+                                partial_completion,
+                            )
+                        });
+                        inner.await?;
+                    } else {
+                        source_completion.complete_error();
+                    }
+                    Err(injected_io_error("fault injection: partial write"))
+                }
+                None => {
+                    let inner = source_completion.handoff_to(|completion| {
+                        self.inner.write_tracked(cx, buf, offset, completion)
+                    });
+                    inner.await
+                }
             }
-            None => self.inner.write_tracked(cx, buf, offset, completion).await,
         }
     }
 

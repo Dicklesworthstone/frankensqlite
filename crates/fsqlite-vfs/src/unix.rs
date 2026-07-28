@@ -143,6 +143,29 @@ fn write_owned_at_tracked(
     result
 }
 
+#[allow(clippy::needless_pass_by_value)] // owns closure inputs for spawn_blocking_io
+fn write_owned_batch(file: Arc<File>, writes: Vec<(u64, Vec<u8>)>) -> io::Result<()> {
+    for (offset, data) in writes {
+        write_owned_at(Arc::clone(&file), data, offset)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::needless_pass_by_value)] // owns closure inputs for spawn_blocking_io
+fn write_owned_batch_tracked(
+    file: Arc<File>,
+    writes: Vec<(u64, Vec<u8>)>,
+    mut completion: VfsWriteCompletionSource,
+) -> io::Result<()> {
+    let result = write_owned_batch(file, writes);
+    if result.is_ok() {
+        completion.complete_success();
+    } else {
+        completion.complete_error();
+    }
+    result
+}
+
 /// Write the whole buffer at `offset`, retrying short writes and `EINTR`.
 ///
 /// GH #200: `pwrite(2)` can be interrupted by a signal at any iteration,
@@ -1203,6 +1226,103 @@ impl UnixFile {
             .ok_or_else(|| FrankenError::internal("unix file is closed"))
     }
 
+    async fn write_page_batch_inner(
+        &self,
+        cx: &Cx,
+        writes: &[(u64, &[u8])],
+        mut completion: Option<VfsWriteCompletionSource>,
+    ) -> Result<()> {
+        // Pager commit batches are page-sized writes to one descriptor. The
+        // default trait loop pays a blocking-pool round-trip per page, which
+        // is ~90% of an 11-13x per-page write tax (bd-trfah decomposition,
+        // 2026-07-27). Stage the batch and issue ONE pool hop that pwrites
+        // every page, amortizing the hop without blocking a scheduler
+        // worker — inline syscalls on shared runtime workers are outside
+        // the async contract (bd-trfah thread). The staging copies are
+        // ~1% of the former per-page cost.
+        if let Err(error) = checkpoint_or_abort(cx) {
+            if let Some(completion) = completion.as_mut() {
+                completion.complete_error();
+            }
+            return Err(error);
+        }
+        if writes.is_empty() {
+            if let Some(completion) = completion.as_mut() {
+                completion.complete_success();
+            }
+            return Ok(());
+        }
+        let file = match self
+            .file
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| FrankenError::internal("unix file is closed"))
+        {
+            Ok(file) => file,
+            Err(error) => {
+                if let Some(completion) = completion.as_mut() {
+                    completion.complete_error();
+                }
+                return Err(error);
+            }
+        };
+        // Validate every offset before the first pwrite. Otherwise a later
+        // overflowing range could report an input error after an earlier page
+        // was already applied.
+        for (offset, data) in writes {
+            if let Err(error) = checked_io_range(*offset, data.len(), "write") {
+                if let Some(completion) = completion.as_mut() {
+                    completion.complete_error();
+                }
+                return Err(error);
+            }
+        }
+        // bd-bjm5d: on a dedicated engine thread the whole batch can be
+        // pwritten inline — no hop AND no staging copies at all.
+        if cx.blocking_io_inline_safe()
+            && writes
+                .iter()
+                .all(|(_, data)| data.len() <= INLINE_IO_MAX_BYTES)
+        {
+            for (offset, data) in writes {
+                if let Err(error) = write_full_at(
+                    |chunk, off| file.write_at(chunk, off),
+                    data,
+                    *offset,
+                    "write",
+                ) {
+                    if let Some(completion) = completion.as_mut() {
+                        completion.complete_error();
+                    }
+                    return Err(error);
+                }
+            }
+            if let Some(completion) = completion.as_mut() {
+                completion.complete_success();
+            }
+            return checkpoint_or_abort(cx);
+        }
+        let mut staged: Vec<(u64, Vec<u8>)> = Vec::with_capacity(writes.len());
+        for (offset, data) in writes {
+            staged.push((*offset, data.to_vec()));
+        }
+        match completion {
+            Some(source_completion) => {
+                spawn_blocking_io(move || {
+                    write_owned_batch_tracked(file, staged, source_completion)
+                })
+                .await
+                .map_err(FrankenError::Io)?;
+            }
+            None => {
+                spawn_blocking_io(move || write_owned_batch(file, staged))
+                    .await
+                    .map_err(FrankenError::Io)?;
+            }
+        }
+        checkpoint_or_abort(cx)
+    }
+
     fn inode_info_ref(&self) -> &Arc<Mutex<InodeInfo>> {
         self.inode_info
             .as_ref()
@@ -2012,103 +2132,66 @@ impl VfsFile for UnixFile {
         self.write_tracked(cx, buf, offset, VfsWriteCompletion::new())
     }
 
-    async fn write_tracked(
-        &self,
-        cx: &Cx,
-        buf: &[u8],
+    fn write_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
         offset: u64,
         completion: VfsWriteCompletion,
-    ) -> Result<()> {
-        let file = match (|| {
-            checkpoint_or_abort(cx)?;
-            checked_io_range(offset, buf.len(), "write")?;
-            self.file
-                .as_ref()
-                .map(Arc::clone)
-                .ok_or_else(|| FrankenError::internal("unix file is closed"))
-        })() {
-            Ok(file) => file,
-            Err(error) => {
-                completion.complete_error();
-                return Err(error);
-            }
-        };
-        // bd-bjm5d: inline the bounded write on a dedicated engine thread.
-        // The completion token resolves at the syscall site, which the
-        // inline arm satisfies trivially (same thread, same frame); the
-        // pre-flight error path above already completed the token.
-        if cx.blocking_io_inline_safe() && buf.len() <= INLINE_IO_MAX_BYTES {
-            match write_full_at(|chunk, off| file.write_at(chunk, off), buf, offset, "write") {
-                Ok(()) => {
-                    completion.complete_success();
-                    return checkpoint_or_abort(cx);
-                }
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        let mut source_completion = VfsWriteCompletionSource::new(completion);
+        async move {
+            let file = match (|| {
+                checkpoint_or_abort(cx)?;
+                checked_io_range(offset, buf.len(), "write")?;
+                self.file
+                    .as_ref()
+                    .map(Arc::clone)
+                    .ok_or_else(|| FrankenError::internal("unix file is closed"))
+            })() {
+                Ok(file) => file,
                 Err(error) => {
-                    completion.complete_error();
+                    source_completion.complete_error();
                     return Err(error);
                 }
+            };
+            // bd-bjm5d: inline the bounded write on a dedicated engine thread.
+            // The completion token resolves at the syscall site, which the
+            // inline arm satisfies trivially (same thread, same frame); the
+            // pre-flight error path above already completed the token.
+            if cx.blocking_io_inline_safe() && buf.len() <= INLINE_IO_MAX_BYTES {
+                match write_full_at(|chunk, off| file.write_at(chunk, off), buf, offset, "write") {
+                    Ok(()) => {
+                        source_completion.complete_success();
+                        return checkpoint_or_abort(cx);
+                    }
+                    Err(error) => {
+                        source_completion.complete_error();
+                        return Err(error);
+                    }
+                }
             }
-        }
-        let data = buf.to_vec();
-        let source_completion = VfsWriteCompletionSource::new(completion.clone());
-        spawn_blocking_io(move || write_owned_at_tracked(file, data, offset, source_completion))
+            let data = buf.to_vec();
+            spawn_blocking_io(move || {
+                write_owned_at_tracked(file, data, offset, source_completion)
+            })
             .await
             .map_err(FrankenError::Io)?;
-        checkpoint_or_abort(cx)
+            checkpoint_or_abort(cx)
+        }
     }
 
     async fn write_page_batch(&self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
-        // Pager commit batches are page-sized writes to one descriptor. The
-        // default trait loop pays a blocking-pool round-trip per page, which
-        // is ~90% of an 11-13x per-page write tax (bd-trfah decomposition,
-        // 2026-07-27). Stage the batch and issue ONE pool hop that pwrites
-        // every page, amortizing the hop without blocking a scheduler
-        // worker — inline syscalls on shared runtime workers are outside
-        // the async contract (bd-trfah thread). The staging copies are
-        // ~1% of the former per-page cost.
-        checkpoint_or_abort(cx)?;
-        if writes.is_empty() {
-            return Ok(());
-        }
-        let file = Arc::clone(
-            self.file
-                .as_ref()
-                .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
-        );
-        // bd-bjm5d: on a dedicated engine thread the whole batch can be
-        // pwritten inline — no hop AND no staging copies at all.
-        if cx.blocking_io_inline_safe()
-            && writes
-                .iter()
-                .all(|(_, data)| data.len() <= INLINE_IO_MAX_BYTES)
-        {
-            for (offset, data) in writes {
-                checked_io_range(*offset, data.len(), "write")?;
-            }
-            for (offset, data) in writes {
-                write_full_at(
-                    |chunk, off| file.write_at(chunk, off),
-                    data,
-                    *offset,
-                    "write",
-                )?;
-            }
-            return checkpoint_or_abort(cx);
-        }
-        let mut staged: Vec<(u64, Vec<u8>)> = Vec::with_capacity(writes.len());
-        for (offset, data) in writes {
-            checked_io_range(*offset, data.len(), "write")?;
-            staged.push((*offset, data.to_vec()));
-        }
-        spawn_blocking_io(move || {
-            for (offset, data) in staged {
-                write_owned_at(Arc::clone(&file), data, offset)?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(FrankenError::Io)?;
-        checkpoint_or_abort(cx)
+        self.write_page_batch_inner(cx, writes, None).await
+    }
+
+    fn write_page_batch_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        self.write_page_batch_inner(cx, writes, Some(VfsWriteCompletionSource::new(completion)))
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
@@ -4467,6 +4550,106 @@ mod tests {
     }
 
     #[test]
+    fn tracked_blocking_batch_completion_survives_observer_future_drop() {
+        use std::future::{Future as _, poll_fn};
+        use std::sync::mpsc;
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().expect("create tracked-batch tempdir");
+        let path = directory.path().join("tracked-batch.db");
+        let file = Arc::new(
+            File::options()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("open tracked-batch target"),
+        );
+        let completion = VfsWriteCompletion::new();
+        let source_completion = VfsWriteCompletionSource::new(completion.clone());
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let writes = vec![
+            (0, b"first".to_vec()),
+            (8, b"second".to_vec()),
+            (3, b"LAST".to_vec()),
+        ];
+        let cx = Cx::new();
+
+        crate::block_on_test_io(&cx, async {
+            let mut observer = Box::pin(spawn_blocking_io(move || {
+                started_tx.send(()).expect("report batch source start");
+                release_rx.recv().expect("wait for batch observer drop");
+                write_owned_batch_tracked(file, writes, source_completion)
+            }));
+            let first_poll = poll_fn(|task_cx| Poll::Ready(observer.as_mut().poll(task_cx))).await;
+            assert!(
+                matches!(first_poll, Poll::Pending),
+                "gated blocking batch cannot complete on first poll"
+            );
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("blocking batch source must start before observer is dropped");
+            drop(observer);
+
+            release_tx
+                .send(())
+                .expect("release batch source after observer drop");
+            assert_eq!(
+                completion.wait().await,
+                crate::traits::VfsWriteCompletionState::Success
+            );
+        });
+
+        assert_eq!(
+            std::fs::read(path).expect("read tracked-batch target"),
+            b"firLAST\0second"
+        );
+    }
+
+    #[test]
+    fn never_polled_tracked_unix_writes_fail_closed_without_mutation() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_directory, path) = make_temp_path("never-polled-tracked.db");
+        let (file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let payload = b"must not be written";
+
+        let single_completion = VfsWriteCompletion::new();
+        drop(<UnixFile as VfsFile>::write_tracked(
+            &file,
+            &cx,
+            payload,
+            0,
+            single_completion.clone(),
+        ));
+        assert_eq!(
+            single_completion.state(),
+            crate::traits::VfsWriteCompletionState::Error
+        );
+
+        let writes = [(0_u64, payload.as_slice())];
+        let batch_completion = VfsWriteCompletion::new();
+        drop(<UnixFile as VfsFile>::write_page_batch_tracked(
+            &file,
+            &cx,
+            &writes,
+            batch_completion.clone(),
+        ));
+        assert_eq!(
+            batch_completion.state(),
+            crate::traits::VfsWriteCompletionState::Error
+        );
+        assert_eq!(
+            file.file_size(&cx).unwrap(),
+            0,
+            "a never-polled future cannot have submitted bytes"
+        );
+    }
+
+    #[test]
     fn tracked_blocking_write_completion_cancelled_while_queued_reports_error() {
         use std::future::{Future as _, poll_fn};
         use std::sync::mpsc;
@@ -4653,11 +4836,114 @@ mod tests {
         let b = vec![0x02_u8; 4096];
         let writes: Vec<(u64, &[u8])> = vec![(0, a.as_slice()), (4096, b.as_slice())];
         file.write_page_batch_sync(&cx, &writes).unwrap();
+        let completion = VfsWriteCompletion::new();
+        crate::block_on_test_io(
+            &cx,
+            <UnixFile as VfsFile>::write_page_batch_tracked(
+                &file,
+                &cx,
+                &writes,
+                completion.clone(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            completion.state(),
+            crate::traits::VfsWriteCompletionState::Success
+        );
 
         let mut buf = vec![0_u8; 8192];
         assert_eq!(file.read(&cx, &mut buf, 0).unwrap(), 8192);
         assert_eq!(&buf[..4096], a.as_slice());
         assert_eq!(&buf[4096..], b.as_slice());
+    }
+
+    #[test]
+    fn inline_tracked_batch_prevalidates_every_range_before_writing() {
+        let cx = Cx::new();
+        cx.mark_blocking_io_inline_safe();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("inline-invalid-batch.db");
+        let (file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+
+        let first = [0xA5_u8; 32];
+        let overflowing = [0x5A_u8; 2];
+        let writes: Vec<(u64, &[u8])> =
+            vec![(0, first.as_slice()), (u64::MAX, overflowing.as_slice())];
+        let completion = VfsWriteCompletion::new();
+        let result = crate::block_on_test_io(
+            &cx,
+            <UnixFile as VfsFile>::write_page_batch_tracked(
+                &file,
+                &cx,
+                &writes,
+                completion.clone(),
+            ),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            completion.state(),
+            crate::traits::VfsWriteCompletionState::Error
+        );
+        assert_eq!(
+            file.file_size(&cx).unwrap(),
+            0,
+            "an invalid later range must be rejected before the first pwrite"
+        );
+    }
+
+    #[test]
+    fn inline_tracked_batch_publication_wins_same_turn_cancellation() {
+        use std::future::Future as _;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct CancelOnWake(Cx);
+
+        impl Wake for CancelOnWake {
+            fn wake(self: Arc<Self>) {
+                self.0.cancel();
+            }
+        }
+
+        let cx = Cx::new();
+        cx.mark_blocking_io_inline_safe();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("inline-publication-wins.db");
+        let (file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let writes: Vec<(u64, &[u8])> = vec![(0, b"published"), (4, b"LAST")];
+        let completion = VfsWriteCompletion::new();
+
+        let mut completion_wait = Box::pin(completion.wait());
+        let cancel_waker = Waker::from(Arc::new(CancelOnWake(cx.clone())));
+        let mut task_cx = Context::from_waker(&cancel_waker);
+        assert!(matches!(
+            completion_wait.as_mut().poll(&mut task_cx),
+            Poll::Pending
+        ));
+
+        let result = crate::block_on_test_io(
+            &cx,
+            <UnixFile as VfsFile>::write_page_batch_tracked(
+                &file,
+                &cx,
+                &writes,
+                completion.clone(),
+            ),
+        );
+        assert!(
+            matches!(result, Err(FrankenError::Abort)),
+            "same-turn cancellation is reported after the source publishes"
+        );
+        assert_eq!(
+            completion.state(),
+            crate::traits::VfsWriteCompletionState::Success,
+            "the source-published Success must win over the later checkpoint"
+        );
+        assert_eq!(
+            std::fs::read(path).expect("read publication-wins target"),
+            b"publLASTd",
+            "all writes must be visible before Success is published"
+        );
     }
 
     #[test]

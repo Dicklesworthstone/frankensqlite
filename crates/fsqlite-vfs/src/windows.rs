@@ -66,6 +66,12 @@ fn blocking_io_offset(offset: u64, total: usize, op: &'static str) -> std::io::R
     })
 }
 
+fn checked_io_range(offset: u64, len: usize, op: &'static str) -> Result<()> {
+    blocking_io_offset(offset, len, op)
+        .map(|_| ())
+        .map_err(FrankenError::Io)
+}
+
 fn read_owned_at(file: File, len: usize, offset: u64) -> std::io::Result<(Vec<u8>, usize)> {
     let mut data = vec![0_u8; len];
     let mut total = 0_usize;
@@ -81,7 +87,7 @@ fn read_owned_at(file: File, len: usize, offset: u64) -> std::io::Result<(Vec<u8
     Ok((data, total))
 }
 
-fn write_owned_at(file: File, data: Vec<u8>, offset: u64) -> std::io::Result<()> {
+fn write_all_at(file: &File, data: &[u8], offset: u64) -> std::io::Result<()> {
     let mut total = 0_usize;
     while total < data.len() {
         let current = blocking_io_offset(offset, total, "write")?;
@@ -100,6 +106,10 @@ fn write_owned_at(file: File, data: Vec<u8>, offset: u64) -> std::io::Result<()>
     Ok(())
 }
 
+fn write_owned_at(file: File, data: Vec<u8>, offset: u64) -> std::io::Result<()> {
+    write_all_at(&file, &data, offset)
+}
+
 fn write_owned_at_tracked(
     file: File,
     data: Vec<u8>,
@@ -107,6 +117,27 @@ fn write_owned_at_tracked(
     mut completion: VfsWriteCompletionSource,
 ) -> std::io::Result<()> {
     let result = write_owned_at(file, data, offset);
+    if result.is_ok() {
+        completion.complete_success();
+    } else {
+        completion.complete_error();
+    }
+    result
+}
+
+fn write_owned_batch(file: File, writes: Vec<(u64, Vec<u8>)>) -> std::io::Result<()> {
+    for (offset, data) in writes {
+        write_all_at(&file, &data, offset)?;
+    }
+    Ok(())
+}
+
+fn write_owned_batch_tracked(
+    file: File,
+    writes: Vec<(u64, Vec<u8>)>,
+    mut completion: VfsWriteCompletionSource,
+) -> std::io::Result<()> {
+    let result = write_owned_batch(file, writes);
     if result.is_ok() {
         completion.complete_success();
     } else {
@@ -1422,6 +1453,68 @@ impl WindowsFile {
             .ok_or_else(|| FrankenError::internal("windows file is closed"))
     }
 
+    async fn write_page_batch_inner(
+        &self,
+        cx: &Cx,
+        writes: &[(u64, &[u8])],
+        mut completion: Option<VfsWriteCompletionSource>,
+    ) -> Result<()> {
+        if let Err(error) = checkpoint_or_abort(cx) {
+            if let Some(completion) = completion.as_mut() {
+                completion.complete_error();
+            }
+            return Err(error);
+        }
+        if writes.is_empty() {
+            if let Some(completion) = completion.as_mut() {
+                completion.complete_success();
+            }
+            return Ok(());
+        }
+        let file = match self
+            .file_ref()
+            .and_then(|file| file.try_clone().map_err(FrankenError::Io))
+        {
+            Ok(file) => file,
+            Err(error) => {
+                if let Some(completion) = completion.as_mut() {
+                    completion.complete_error();
+                }
+                return Err(error);
+            }
+        };
+        // Reject every invalid range before the closure can apply the first
+        // page, preserving input-order partial-write semantics only for actual
+        // I/O failures.
+        for (offset, data) in writes {
+            if let Err(error) = checked_io_range(*offset, data.len(), "write") {
+                if let Some(completion) = completion.as_mut() {
+                    completion.complete_error();
+                }
+                return Err(error);
+            }
+        }
+        let staged = writes
+            .iter()
+            .map(|(offset, data)| (*offset, data.to_vec()))
+            .collect();
+        match completion {
+            Some(source_completion) => {
+                spawn_blocking_io(move || {
+                    write_owned_batch_tracked(file, staged, source_completion)
+                })
+                .await
+                .map_err(FrankenError::Io)?;
+            }
+            None => {
+                spawn_blocking_io(move || write_owned_batch(file, staged))
+                    .await
+                    .map_err(FrankenError::Io)?;
+            }
+        }
+        checkpoint_or_abort(cx)
+    }
+
     fn os_locks_ref(&self) -> Result<&WindowsOsLockFiles> {
         self.os_locks
             .as_ref()
@@ -1799,6 +1892,7 @@ impl VfsFile for WindowsFile {
         offset: u64,
         completion: VfsWriteCompletion,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        let mut source_completion = VfsWriteCompletionSource::new(completion);
         async move {
             let file = match (|| {
                 checkpoint_or_abort(cx)?;
@@ -1806,12 +1900,11 @@ impl VfsFile for WindowsFile {
             })() {
                 Ok(file) => file,
                 Err(error) => {
-                    completion.complete_error();
+                    source_completion.complete_error();
                     return Err(error);
                 }
             };
             let data = buf.to_vec();
-            let source_completion = VfsWriteCompletionSource::new(completion.clone());
             spawn_blocking_io(move || {
                 write_owned_at_tracked(file, data, offset, source_completion)
             })
@@ -1819,6 +1912,23 @@ impl VfsFile for WindowsFile {
             .map_err(FrankenError::Io)?;
             checkpoint_or_abort(cx)
         }
+    }
+
+    fn write_page_batch<'a>(
+        &'a self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        self.write_page_batch_inner(cx, writes, None)
+    }
+
+    fn write_page_batch_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        self.write_page_batch_inner(cx, writes, Some(VfsWriteCompletionSource::new(completion)))
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
@@ -2235,6 +2345,49 @@ mod tests {
         let mut suffixed = path.as_os_str().to_owned();
         suffixed.push(suffix);
         PathBuf::from(suffixed)
+    }
+
+    #[test]
+    fn never_polled_tracked_windows_writes_fail_closed_without_mutation() {
+        let cx = Cx::new();
+        let directory = tempdir().expect("create Windows tracked-write tempdir");
+        let path = directory.path().join("never-polled-tracked.db");
+        let vfs = WindowsVfs::new();
+        let (file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open tracked-write target");
+        let payload = b"must not be written";
+
+        let single_completion = VfsWriteCompletion::new();
+        drop(<WindowsFile as VfsFile>::write_tracked(
+            &file,
+            &cx,
+            payload,
+            0,
+            single_completion.clone(),
+        ));
+        assert_eq!(
+            single_completion.state(),
+            crate::traits::VfsWriteCompletionState::Error
+        );
+
+        let writes = [(0_u64, &payload[..])];
+        let batch_completion = VfsWriteCompletion::new();
+        drop(<WindowsFile as VfsFile>::write_page_batch_tracked(
+            &file,
+            &cx,
+            &writes,
+            batch_completion.clone(),
+        ));
+        assert_eq!(
+            batch_completion.state(),
+            crate::traits::VfsWriteCompletionState::Error
+        );
+        assert_eq!(
+            file.file_size(&cx).expect("read tracked-write size"),
+            0,
+            "a never-polled future cannot have submitted bytes"
+        );
     }
 
     #[test]

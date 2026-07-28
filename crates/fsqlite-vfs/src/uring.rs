@@ -487,7 +487,7 @@ impl IoUringRuntime {
         file: Arc<File>,
         data: Vec<u8>,
         offset: u64,
-        write_completion: Option<VfsWriteCompletion>,
+        write_completion: Option<VfsWriteCompletionSource>,
     ) -> Result<(u64, Receiver<DriverCompletion>)> {
         self.enqueue(
             cx,
@@ -507,7 +507,7 @@ impl IoUringRuntime {
         file: Arc<File>,
         offset: u64,
         kind: DriverRequestKind,
-        write_completion: Option<VfsWriteCompletion>,
+        write_completion: Option<VfsWriteCompletionSource>,
     ) -> Result<(u64, Receiver<DriverCompletion>)> {
         checkpoint_or_abort(cx)?;
         if !self.is_available() {
@@ -536,7 +536,7 @@ impl IoUringRuntime {
                 offset,
                 kind,
                 completion,
-                write_completion: write_completion.map(VfsWriteCompletionSource::new),
+                write_completion,
             });
             id
         };
@@ -1053,6 +1053,18 @@ impl VfsFile for IoUringFile {
         self.inner.write_page_batch(cx, writes)
     }
 
+    fn write_page_batch_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        // The io_uring data path does not yet submit linked page batches.
+        // Preserve the Unix backend's one-hop batch and its source-owned
+        // completion token instead of falling back to one request per page.
+        self.inner.write_page_batch_tracked(cx, writes, completion)
+    }
+
     fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
         self.inner.shm_lock(cx, offset, n, flags)
     }
@@ -1334,40 +1346,61 @@ impl IoUringFile {
         Ok(())
     }
 
-    async fn write_data_path_tracked(
+    fn write_data_path_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+        completion: VfsWriteCompletion,
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        self.write_data_path_tracked_inner(
+            cx,
+            buf,
+            offset,
+            VfsWriteCompletionSource::new(completion),
+        )
+    }
+
+    async fn write_data_path_tracked_inner(
         &self,
         cx: &Cx,
         buf: &[u8],
         offset: u64,
-        completion: VfsWriteCompletion,
+        mut source_completion: VfsWriteCompletionSource,
     ) -> Result<()> {
         if let Err(error) = checkpoint_or_abort(cx) {
-            completion.complete_error();
+            source_completion.complete_error();
             return Err(error);
         }
         if buf.is_empty() {
-            completion.complete_success();
+            source_completion.complete_success();
             return Ok(());
         }
         if !self.runtime.is_available() {
             record_io_uring_write_unix_fallback();
-            return self.inner.write_tracked(cx, buf, offset, completion).await;
+            let inner = source_completion
+                .handoff_to(|completion| self.inner.write_tracked(cx, buf, offset, completion));
+            return inner.await;
         }
         // See `read_data_path`: do not substitute `NativeCx::current()` here.
         let Some(native_cx) = cx.attached_native_cx() else {
             record_io_uring_write_unix_fallback();
-            return self.inner.write_tracked(cx, buf, offset, completion).await;
+            let inner = source_completion
+                .handoff_to(|completion| self.inner.write_tracked(cx, buf, offset, completion));
+            return inner.await;
         };
         if u32::try_from(buf.len()).is_err() {
             record_io_uring_write_unix_fallback();
-            return self.inner.write_tracked(cx, buf, offset, completion).await;
+            let inner = source_completion
+                .handoff_to(|completion| self.inner.write_tracked(cx, buf, offset, completion));
+            return inner.await;
         }
         let write_range_is_valid = u64::try_from(buf.len())
             .ok()
             .and_then(|len| offset.checked_add(len))
             .is_some();
         if !write_range_is_valid {
-            completion.complete_error();
+            source_completion.complete_error();
             return Err(FrankenError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "offset overflow during tracked async io_uring write",
@@ -1376,14 +1409,14 @@ impl IoUringFile {
         let file = match self.inner.canonical_file() {
             Ok(file) => file,
             Err(error) => {
-                completion.complete_error();
+                source_completion.complete_error();
                 return Err(error);
             }
         };
 
         #[cfg(test)]
         if FORCE_ASUPERSYNC_WRITE_ABORT.load(Ordering::Acquire) {
-            completion.complete_error();
+            source_completion.complete_error();
             return Err(FrankenError::Abort);
         }
 
@@ -1391,7 +1424,9 @@ impl IoUringFile {
         if FORCE_ASUPERSYNC_WRITE_FAIL.load(Ordering::Acquire) {
             self.runtime.disable(IO_URING_WRITE_ERROR_FALLBACK_MSG);
             record_io_uring_write_unix_fallback();
-            return self.inner.write_tracked(cx, buf, offset, completion).await;
+            let inner = source_completion
+                .handoff_to(|completion| self.inner.write_tracked(cx, buf, offset, completion));
+            return inner.await;
         }
 
         let start = Instant::now();
@@ -1401,14 +1436,11 @@ impl IoUringFile {
             file,
             buf.to_vec(),
             offset,
-            Some(completion.clone()),
+            Some(source_completion),
         );
         let (request_id, mut receiver) = match enqueue_result {
             Ok(request) => request,
-            Err(error) => {
-                completion.complete_error();
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let mut cancel_guard = RequestCancellationGuard::new(Arc::clone(&self.runtime), request_id);
         asupersync::runtime::yield_now().await;
@@ -1533,6 +1565,49 @@ mod tests {
         IO_URING_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn never_polled_tracked_io_uring_writes_fail_closed_without_mutation() {
+        let cx = Cx::new();
+        let directory = tempfile::tempdir().expect("create io_uring tracked-write tempdir");
+        let path = directory.path().join("never-polled-tracked.db");
+        let vfs = IoUringVfs::new();
+        let (file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create_unlocked())
+            .expect("open tracked-write target");
+        let payload = b"must not be written";
+
+        let single_completion = VfsWriteCompletion::new();
+        drop(<IoUringFile as VfsFile>::write_tracked(
+            &file,
+            &cx,
+            payload,
+            0,
+            single_completion.clone(),
+        ));
+        assert_eq!(
+            single_completion.state(),
+            crate::traits::VfsWriteCompletionState::Error
+        );
+
+        let writes = [(0_u64, &payload[..])];
+        let batch_completion = VfsWriteCompletion::new();
+        drop(<IoUringFile as VfsFile>::write_page_batch_tracked(
+            &file,
+            &cx,
+            &writes,
+            batch_completion.clone(),
+        ));
+        assert_eq!(
+            batch_completion.state(),
+            crate::traits::VfsWriteCompletionState::Error
+        );
+        assert_eq!(
+            file.file_size(&cx).expect("read tracked-write size"),
+            0,
+            "a never-polled future cannot have submitted bytes"
+        );
     }
 
     #[test]
