@@ -5040,8 +5040,11 @@ std::thread_local! {
             % PUBLISHED_COUNTER_STRIPE_COUNT;
 }
 
+// Padded to the platform cache line (128B on aarch64 — Apple M-series lines)
+// so adjacent striped counters never share a line.
 #[derive(Debug)]
-#[repr(align(64))]
+#[cfg_attr(target_arch = "aarch64", repr(align(128)))]
+#[cfg_attr(not(target_arch = "aarch64"), repr(align(64)))]
 struct CacheAlignedAtomicU64(AtomicU64);
 
 impl CacheAlignedAtomicU64 {

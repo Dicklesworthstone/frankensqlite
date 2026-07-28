@@ -175,7 +175,11 @@ impl PageLockEntry {
     }
 }
 
-#[repr(align(64))]
+// Padded to the platform cache line (128B on aarch64 — Apple M-series lines;
+// see cache_aligned::CACHE_LINE_BYTES) so adjacent striped counters never
+// share a line.
+#[cfg_attr(target_arch = "aarch64", repr(align(128)))]
+#[cfg_attr(not(target_arch = "aarch64"), repr(align(64)))]
 struct CacheAlignedAtomicU32(AtomicU32);
 
 impl CacheAlignedAtomicU32 {

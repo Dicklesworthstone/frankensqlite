@@ -43,6 +43,11 @@ asupersync = { workspace = true }
 nix = { workspace = true }
 
 [dev-dependencies]
+# Tests use `asupersync::test_utils::run_test`, which lives behind
+# `test-internals` (same pattern as fsqlite-vfs/fsqlite/harness/cli). Without
+# this, standalone `cargo test -p fsqlite-mvcc` fails to compile even though
+# workspace-unified builds pass.
+asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
 loom = "0.7.2"
 proptest = { workspace = true }

@@ -2127,17 +2127,40 @@ impl VfsFile for UnixFile {
     fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<()> {
         checkpoint_or_abort(cx)?;
         #[cfg(target_os = "macos")]
-        if kind == SyncKind::FullDurable {
-            // fsync(2) does not guarantee that drive write caches are flushed
-            // on macOS. F_FULLFSYNC is the durability barrier SQLite uses for
-            // transactions that request full-fsync semantics.
+        {
+            if kind == SyncKind::FullDurable {
+                // fsync(2) does not guarantee that drive write caches are
+                // flushed on macOS. F_FULLFSYNC is the durability barrier
+                // SQLite uses for transactions that request full-fsync
+                // semantics.
+                // SAFETY: fcntl receives this live file descriptor and the
+                // argument-less F_FULLFSYNC command documented by Darwin.
+                let result = unsafe { libc::fcntl(self.file_ref().as_raw_fd(), libc::F_FULLFSYNC) };
+                if result == 0 {
+                    return Ok(());
+                }
+                return Err(FrankenError::Io(std::io::Error::last_os_error()));
+            }
+
+            // Non-FullDurable syncs (the `synchronous=NORMAL` WAL class):
+            // Darwin's plain fsync neither flushes the drive cache nor
+            // orders writes against later ones, so it is both slow-ish and
+            // weak. F_BARRIERFSYNC (Apple's own SQLite uses it for WAL
+            // syncs) issues a write barrier after flushing file data —
+            // proper WAL→checkpoint ordering at a fraction of F_FULLFSYNC's
+            // multi-millisecond cost. Pinned locally rather than via
+            // `libc::F_BARRIERFSYNC` so the build does not depend on the
+            // libc crate's Darwin surface; the value is stable Darwin ABI
+            // (fcntl.h). Falls back to the plain sync if the filesystem
+            // rejects the fcntl (e.g. SMB/NFS).
+            const F_BARRIERFSYNC: libc::c_int = 85;
             // SAFETY: fcntl receives this live file descriptor and the
-            // argument-less F_FULLFSYNC command documented by Darwin.
-            let result = unsafe { libc::fcntl(self.file_ref().as_raw_fd(), libc::F_FULLFSYNC) };
+            // argument-less F_BARRIERFSYNC command documented by Darwin.
+            let result = unsafe { libc::fcntl(self.file_ref().as_raw_fd(), F_BARRIERFSYNC) };
             if result == 0 {
                 return Ok(());
             }
-            return Err(FrankenError::Io(std::io::Error::last_os_error()));
+            // Fall through to the portable path below.
         }
 
         match kind {

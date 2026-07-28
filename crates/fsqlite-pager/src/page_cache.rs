@@ -2131,9 +2131,10 @@ impl std::fmt::Debug for FlatPageSlots {
 /// A single shard of the page cache.
 ///
 /// Each shard contains its own hash map and metrics counters. The shard is
-/// cache-line aligned to prevent false sharing between adjacent shards when
-/// accessed by different threads.
-#[repr(align(64))]
+/// cache-line aligned (128B on aarch64 — Apple M-series lines) to prevent
+/// false sharing between adjacent shards when accessed by different threads.
+#[cfg_attr(target_arch = "aarch64", repr(align(128)))]
+#[cfg_attr(not(target_arch = "aarch64"), repr(align(64)))]
 struct PageCacheShard {
     pages: std::collections::HashMap<PageNumber, CachedPageEntry, foldhash::fast::FixedState>,
     /// Local hit counter (aggregated on metrics snapshot).
@@ -7494,26 +7495,32 @@ mod tests {
     #[test]
     fn test_sharded_cache_shard_padding_alignment() {
         // Verify cache-line alignment by checking struct sizes.
-        // PageCacheShard is #[repr(align(64))], so size must be multiple of 64.
+        // PageCacheShard is padded to the platform cache line: 128 bytes on
+        // aarch64 (Apple M-series), 64 elsewhere.
+        let expected_line = if cfg!(target_arch = "aarch64") {
+            128
+        } else {
+            64
+        };
         let shard_size = std::mem::size_of::<PageCacheShard>();
         assert!(
-            shard_size >= 64,
+            shard_size >= expected_line,
             "bead_id={BEAD_3WOP3_2} case=shard_padding \
-             PageCacheShard size {shard_size} should be >= 64 bytes"
+             PageCacheShard size {shard_size} should be >= {expected_line} bytes"
         );
         assert_eq!(
-            shard_size % 64,
+            shard_size % expected_line,
             0,
             "bead_id={BEAD_3WOP3_2} case=shard_alignment \
-             PageCacheShard size {shard_size} must be multiple of 64"
+             PageCacheShard size {shard_size} must be multiple of {expected_line}"
         );
 
         // Verify alignment requirement
         let shard_align = std::mem::align_of::<PageCacheShard>();
         assert_eq!(
-            shard_align, 64,
+            shard_align, expected_line,
             "bead_id={BEAD_3WOP3_2} case=shard_align_req \
-             PageCacheShard alignment should be 64, got {shard_align}"
+             PageCacheShard alignment should be {expected_line}, got {shard_align}"
         );
     }
 
