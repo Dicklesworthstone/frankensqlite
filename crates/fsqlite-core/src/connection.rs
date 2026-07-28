@@ -97,8 +97,9 @@ use fsqlite_func::vtab::{
     VirtualTableCursor, VtabModuleFactory, module_factory_from,
 };
 use fsqlite_func::{
-    ErasedWindowFunction, FunctionRegistry, get_last_changes, get_last_insert_rowid,
-    get_total_changes, sqlite_compile_options,
+    BuiltinFunctionFamily, ErasedWindowFunction, FunctionRegistry,
+    builtin_function_surface_inventory, get_last_changes, get_last_insert_rowid, get_total_changes,
+    sqlite_compile_options,
 };
 #[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_pager::ConnectionPagerOpenMode;
@@ -11450,8 +11451,9 @@ impl Connection {
     /// while this method deliberately holds an active read transaction.
     ///
     /// The continuous external-file snapshot fence is currently implemented
-    /// only on Linux and Windows. Other targets receive a typed
-    /// [`FrankenError::NotImplemented`] refusal before the image is opened.
+    /// only by native-feature builds on Linux and Windows. Feature-disabled or
+    /// other-target builds receive a typed [`FrankenError::NotImplemented`]
+    /// refusal before the image is opened.
     pub fn with_database_image_structure_from_receipt_with_bounded_ownership<F, T>(
         &self,
         expected: &DatabaseImageReceipt,
@@ -11462,6 +11464,8 @@ impl Connection {
     where
         F: FnOnce(&Self, BoundedDatabaseStructuralStats) -> Result<T>,
     {
+        #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
+        let _ = &use_snapshot;
         if validation_page_limit == 0 {
             return Err(FrankenError::OutOfRange {
                 what: "database image structural validation page limit".to_owned(),
@@ -11673,9 +11677,9 @@ impl Connection {
     /// checked against every inflated table row.
     ///
     /// The continuous external-file snapshot fence is currently implemented
-    /// only on Linux and Windows. Other targets receive a typed
-    /// [`FrankenError::NotImplemented`] refusal before publication can inspect
-    /// or mutate either image.
+    /// only by native-feature builds on Linux and Windows. Feature-disabled or
+    /// other-target builds receive a typed [`FrankenError::NotImplemented`]
+    /// refusal before publication can inspect or mutate either image.
     pub fn publish_database_image_from_receipt_with_bounded_validation<F>(
         &self,
         source: &DatabaseImageReceipt,
@@ -41813,12 +41817,12 @@ impl Connection {
     /// Build evaluated column default values keyed by root page.
     /// Used by the VDBE engine to apply ALTER TABLE ADD COLUMN defaults
     /// when a row's record has fewer columns than the current schema.
-    fn column_defaults_by_root_page(&self) -> HashMap<i32, Vec<Option<SqliteValue>>> {
+    fn column_defaults_by_root_page(&self) -> Result<HashMap<i32, Vec<Option<SqliteValue>>>> {
         let metadata = self.table_execution_metadata();
         if self.is_evaluating_column_default()
             || metadata.column_default_sql_by_root_page.is_empty()
         {
-            return HashMap::new();
+            return Ok(HashMap::new());
         }
         if hot_path_profile_enabled() {
             FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.fetch_add(1, AtomicOrdering::Relaxed);
@@ -41848,33 +41852,30 @@ impl Connection {
                 })
                 .collect()
         };
-        metadata
-            .column_default_sql_by_root_page
-            .iter()
-            .filter_map(|(root_page, default_sqls)| {
-                let affinities = affinity_by_root_page.get(root_page);
-                let defaults: Vec<Option<SqliteValue>> = default_sqls
-                    .iter()
-                    .enumerate()
-                    .map(|(col_idx, default_sql)| {
-                        default_sql.as_deref().and_then(|sql| {
-                            self.evaluate_column_default_value(Some(sql))
-                                .ok()
-                                .map(|value| {
-                                    match affinities.and_then(|affs| affs.get(col_idx).copied()) {
-                                        Some(aff) => value.apply_affinity(aff),
-                                        None => value,
-                                    }
-                                })
-                        })
-                    })
-                    .collect();
-                defaults
-                    .iter()
-                    .any(Option::is_some)
-                    .then_some((*root_page, defaults))
-            })
-            .collect()
+        let mut defaults_by_root_page = HashMap::new();
+        for (root_page, default_sqls) in metadata.column_default_sql_by_root_page.iter() {
+            let affinities = affinity_by_root_page.get(root_page);
+            let mut defaults = Vec::with_capacity(default_sqls.len());
+            for (col_idx, default_sql) in default_sqls.iter().enumerate() {
+                let value = match default_sql.as_deref() {
+                    Some(sql) => {
+                        let value = self.evaluate_column_default_value(Some(sql))?;
+                        Some(
+                            match affinities.and_then(|affs| affs.get(col_idx).copied()) {
+                                Some(affinity) => value.apply_affinity(affinity),
+                                None => value,
+                            },
+                        )
+                    }
+                    None => None,
+                };
+                defaults.push(value);
+            }
+            if defaults.iter().any(Option::is_some) {
+                defaults_by_root_page.insert(*root_page, defaults);
+            }
+        }
+        Ok(defaults_by_root_page)
     }
 
     /// Process a CREATE TABLE statement: register the schema and create the
@@ -44206,6 +44207,7 @@ impl Connection {
         }
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     fn validate_vacuum_rebuild(
         &self,
         rebuild_target: &crate::vacuum::VacuumTargetReservation,
@@ -44224,6 +44226,17 @@ impl Connection {
         }
 
         Ok(())
+    }
+
+    #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
+    fn validate_vacuum_rebuild(
+        &self,
+        rebuild_target: &crate::vacuum::VacuumTargetReservation,
+    ) -> Result<()> {
+        let _ = (self, rebuild_target);
+        Err(FrankenError::not_implemented(
+            "VACUUM rebuilt-image validation requires native file support",
+        ))
     }
 
     /// Rebind every connection-local cache and schema mapping after a new
@@ -49263,19 +49276,28 @@ impl Connection {
     }
 
     fn require_bounded_external_snapshot_platform() -> Result<()> {
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(all(
+            feature = "native",
+            not(target_arch = "wasm32"),
+            any(target_os = "linux", target_os = "windows")
+        ))]
         {
             Ok(())
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        #[cfg(not(all(
+            feature = "native",
+            not(target_arch = "wasm32"),
+            any(target_os = "linux", target_os = "windows")
+        )))]
         {
             Err(FrankenError::NotImplemented(
-                "bounded external database-image snapshots require the Linux or Windows native lock fence"
+                "bounded external database-image snapshots require the native feature and the Linux or Windows lock fence"
                     .to_owned(),
             ))
         }
     }
 
+    #[cfg(test)]
     fn validate_bounded_collations_in_sql(sql: &str, object_name: &str) -> Result<()> {
         // Parse the expression instead of inferring COLLATE operands from a
         // lossy token stream.  SQLite accepts delimited identifiers after
@@ -49284,42 +49306,146 @@ impl Connection {
         // validation must fail closed.  Walking the AST also keeps string
         // literals and comments from spoofing either the COLLATE keyword or
         // its operand.
-        let expression =
-            fsqlite_parser::expr::parse_expr(sql).map_err(|error| FrankenError::DatabaseCorrupt {
+        let expression = fsqlite_parser::expr::parse_expr(sql).map_err(|error| {
+            FrankenError::DatabaseCorrupt {
                 detail: format!(
-                    "index `{object_name}` has invalid expression during bounded collation validation: {error}"
+                    "schema object `{object_name}` has invalid persisted expression: {error}"
                 ),
-            })?;
-        match first_unsupported_bounded_collation(&expression) {
+            }
+        })?;
+        match first_unsupported_bounded_ast(
+            BoundedCollationAstNode::Expr(&expression),
+            true,
+            None,
+            false,
+        ) {
             Ok(None) => {}
-            Ok(Some(collation)) => {
-                return Err(Self::bounded_validation_refusal(format!(
-                    "`{object_name}` uses custom or unknown collation `{collation}`"
-                )));
+            Ok(Some(unsupported)) => {
+                return Err(Self::bounded_ast_unsupported_refusal(
+                    object_name,
+                    unsupported,
+                ));
             }
             Err(BoundedCollationTraversalLimit::Nodes) => {
                 return Err(Self::bounded_validation_refusal(format!(
-                    "`{object_name}` collation expression AST exceeds the fixed {BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES}-node proof limit"
+                    "`{object_name}` expression AST exceeds the fixed {BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES}-node proof limit"
                 )));
             }
             Err(BoundedCollationTraversalLimit::Depth) => {
                 return Err(Self::bounded_validation_refusal(format!(
-                    "`{object_name}` collation expression AST exceeds the fixed depth limit {BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH}"
+                    "`{object_name}` expression AST exceeds the fixed depth limit {BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH}"
                 )));
             }
         }
         Ok(())
     }
 
+    fn bounded_ast_unsupported_refusal(
+        object_name: &str,
+        unsupported: BoundedAstUnsupported,
+    ) -> FrankenError {
+        let detail = match unsupported {
+            BoundedAstUnsupported::Collation(collation) => {
+                format!("`{object_name}` uses custom or unknown collation `{collation}`")
+            }
+            BoundedAstUnsupported::Function { name, arity } => format!(
+                "`{object_name}` uses unsupported, non-built-in, non-deterministic, or wrong-arity function `{name}`/{arity}"
+            ),
+            BoundedAstUnsupported::Shape(shape) => {
+                format!("`{object_name}` uses unsupported AST shape: {shape}")
+            }
+            BoundedAstUnsupported::Statement(statement) => {
+                format!("`{object_name}` contains unsupported trigger-body statement `{statement}`")
+            }
+        };
+        Self::bounded_validation_refusal(detail)
+    }
+
+    fn validate_bounded_ast_render_budget(
+        root: BoundedCollationAstNode<'_>,
+        object_name: &str,
+    ) -> Result<()> {
+        match first_unsupported_bounded_ast(root, false, None, false) {
+            Ok(None) => Ok(()),
+            Ok(Some(unsupported)) => Err(Self::bounded_ast_unsupported_refusal(
+                object_name,
+                unsupported,
+            )),
+            Err(BoundedCollationTraversalLimit::Nodes) => {
+                Err(Self::bounded_validation_refusal(format!(
+                    "`{object_name}` expression AST exceeds the fixed {BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES}-node rendering limit"
+                )))
+            }
+            Err(BoundedCollationTraversalLimit::Depth) => {
+                Err(Self::bounded_validation_refusal(format!(
+                    "`{object_name}` expression AST exceeds the fixed rendering depth limit {BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH}"
+                )))
+            }
+        }
+    }
+
+    fn validate_bounded_ast_semantics(
+        &self,
+        root: BoundedCollationAstNode<'_>,
+        object_name: &str,
+        reject_schema_expression_shapes: bool,
+    ) -> Result<()> {
+        let registry = self.func_registry.borrow();
+        let supported_function = |name: &str, args: &FunctionArgs, decorated: bool| {
+            bounded_builtin_scalar_function_supported(&registry, name, args, decorated)
+        };
+        match first_unsupported_bounded_ast(
+            root,
+            true,
+            Some(&supported_function),
+            reject_schema_expression_shapes,
+        ) {
+            Ok(None) => Ok(()),
+            Ok(Some(unsupported)) => Err(Self::bounded_ast_unsupported_refusal(
+                object_name,
+                unsupported,
+            )),
+            Err(BoundedCollationTraversalLimit::Nodes) => {
+                Err(Self::bounded_validation_refusal(format!(
+                    "`{object_name}` expression AST exceeds the fixed {BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES}-node proof limit"
+                )))
+            }
+            Err(BoundedCollationTraversalLimit::Depth) => {
+                Err(Self::bounded_validation_refusal(format!(
+                    "`{object_name}` expression AST exceeds the fixed depth limit {BOUNDED_VALIDATION_MAX_COLLATION_AST_DEPTH}"
+                )))
+            }
+        }
+    }
+
+    fn validate_bounded_schema_expression_in_sql(
+        &self,
+        sql: &str,
+        object_name: &str,
+    ) -> Result<()> {
+        let expression = fsqlite_parser::expr::parse_expr(sql).map_err(|error| {
+            FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "schema object `{object_name}` has invalid persisted expression: {error}"
+                ),
+            }
+        })?;
+        self.validate_bounded_ast_semantics(
+            BoundedCollationAstNode::Expr(&expression),
+            object_name,
+            true,
+        )
+    }
+
     fn validate_bounded_schema_support(&self) -> Result<()> {
-        let schema = self.schema.borrow();
+        let schema = self.schema.borrow().clone();
         if schema.len() > BOUNDED_VALIDATION_MAX_SCHEMA_TABLES {
             return Err(Self::bounded_validation_refusal(format!(
                 "schema contains {} tables, above the fixed limit {BOUNDED_VALIDATION_MAX_SCHEMA_TABLES}",
                 schema.len()
             )));
         }
-        let original_ddl = self.original_ddl_sql.borrow();
+        let original_ddl = self.original_ddl_sql.borrow().clone();
         for table in schema.iter() {
             if table.without_rowid {
                 return Err(Self::bounded_validation_refusal(format!(
@@ -49379,6 +49505,12 @@ impl Connection {
                         table.name, column.name
                     )));
                 }
+                if let Some(default_sql) = column.default_value.as_deref() {
+                    self.validate_bounded_schema_expression_in_sql(
+                        default_sql,
+                        &format!("column default `{}.{}`", table.name, column.name),
+                    )?;
+                }
             }
             for index in &table.indexes {
                 if index.root_page <= 0 {
@@ -49425,11 +49557,38 @@ impl Connection {
                     }
                 }
                 for expression in &index.key_expressions {
-                    Self::validate_bounded_collations_in_sql(expression, &index.name)?;
+                    self.validate_bounded_schema_expression_in_sql(expression, &index.name)?;
                 }
                 if let Some(predicate) = index.where_clause.as_deref() {
-                    Self::validate_bounded_collations_in_sql(predicate, &index.name)?;
+                    self.validate_bounded_schema_expression_in_sql(predicate, &index.name)?;
                 }
+            }
+        }
+        for view in self.views.borrow().clone() {
+            self.validate_bounded_ast_semantics(
+                BoundedCollationAstNode::Select(&view.query),
+                &format!("view `{}`", view.name),
+                false,
+            )?;
+        }
+        for trigger in self.triggers.borrow().clone() {
+            if let Some(predicate) = trigger.when_clause.as_ref() {
+                self.validate_bounded_ast_semantics(
+                    BoundedCollationAstNode::Expr(predicate),
+                    &format!("trigger `{}` WHEN clause", trigger.name),
+                    false,
+                )?;
+            }
+            for (statement_index, statement) in trigger.body.iter().enumerate() {
+                self.validate_bounded_ast_semantics(
+                    BoundedCollationAstNode::Statement(statement),
+                    &format!(
+                        "trigger `{}` body statement {}",
+                        trigger.name,
+                        statement_index + 1
+                    ),
+                    false,
+                )?;
             }
         }
         Ok(())
@@ -50474,7 +50633,7 @@ impl Connection {
     ) -> Result<BoundedDatabaseValidationStats> {
         self.validate_bounded_schema_support()?;
         let rowid_aliases = self.rowid_alias_column_by_root_page();
-        let column_defaults = self.column_defaults_by_root_page();
+        let column_defaults = self.column_defaults_by_root_page()?;
         self.with_integrity_txn(|cx, txn| {
             let structural = self.bounded_validate_structure_in_txn(cx, txn, spool_parent, true)?;
             let page1 = txn.get_page(cx, PageNumber::ONE)?;
@@ -51550,7 +51709,11 @@ impl Connection {
     ) -> Result<()> {
         let schema = self.schema.borrow().clone();
         let rowid_alias_col_by_root_page = (!quick).then(|| self.rowid_alias_column_by_root_page());
-        let column_defaults_by_root_page = (!quick).then(|| self.column_defaults_by_root_page());
+        let column_defaults_by_root_page = if quick {
+            None
+        } else {
+            Some(self.column_defaults_by_root_page()?)
+        };
 
         if !quick {
             Self::validate_page_ownership_in_txn(
@@ -66557,6 +66720,35 @@ impl Connection {
                         });
                     }
                 };
+                let catalog_table_name = match &entry[2] {
+                    SqliteValue::Text(name) => name,
+                    other => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master trigger `{trigger_name}` table name must be TEXT, found {:?}",
+                                other.storage_class()
+                            ),
+                        });
+                    }
+                };
+                match &entry[3] {
+                    SqliteValue::Integer(0) => {}
+                    SqliteValue::Integer(root_page) => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master trigger `{trigger_name}` has invalid rootpage {root_page}; expected 0"
+                            ),
+                        });
+                    }
+                    other => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master trigger `{trigger_name}` rootpage must be INTEGER, found {:?}",
+                                other.storage_class()
+                            ),
+                        });
+                    }
+                }
                 let create_sql = match &entry[4] {
                     SqliteValue::Text(s) => s.clone(),
                     other => {
@@ -66575,6 +66767,23 @@ impl Connection {
                                 detail: format!(
                                     "sqlite_master trigger name `{trigger_name}` does not match CREATE TRIGGER name `{}`",
                                     stmt.name.name
+                                ),
+                            });
+                        }
+                        if !stmt.table.eq_ignore_ascii_case(catalog_table_name) {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "sqlite_master trigger `{trigger_name}` table `{catalog_table_name}` does not match CREATE TRIGGER table `{}`",
+                                    stmt.table
+                                ),
+                            });
+                        }
+                        if new_triggers.iter().any(|trigger: &TriggerDef| {
+                            trigger.name.eq_ignore_ascii_case(trigger_name)
+                        }) {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "sqlite_master contains duplicate trigger `{trigger_name}`"
                                 ),
                             });
                         }
@@ -66604,83 +66813,95 @@ impl Connection {
             if entry_type.eq_ignore_ascii_case("index") {
                 let index_name = match &entry[1] {
                     SqliteValue::Text(s) => s.clone(),
-                    _ => continue,
+                    other => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master index name must be TEXT, found {:?}",
+                                other.storage_class()
+                            ),
+                        });
+                    }
                 };
                 let table_name = match &entry[2] {
                     SqliteValue::Text(s) => s.clone(),
-                    _ => continue,
+                    other => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master index `{index_name}` table name must be TEXT, found {:?}",
+                                other.storage_class()
+                            ),
+                        });
+                    }
                 };
                 let root_page_num = match &entry[3] {
                     SqliteValue::Integer(n) => *n,
-                    _ => continue,
+                    other => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master index `{index_name}` rootpage must be INTEGER, found {:?}",
+                                other.storage_class()
+                            ),
+                        });
+                    }
                 };
-                let root_page = i32::try_from(root_page_num).unwrap_or(0);
+                let root_page =
+                    i32::try_from(root_page_num).map_err(|_| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_master index `{index_name}` rootpage {root_page_num} is outside the supported range"
+                        ),
+                    })?;
                 if root_page <= 0 {
-                    continue;
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_master index `{index_name}` has invalid rootpage {root_page}; expected a positive page number"
+                        ),
+                    });
                 }
-                let maybe_index_definition = match &entry[4] {
+                let index_definition = match &entry[4] {
                     SqliteValue::Text(create_sql) => {
                         new_original_ddl_sql
                             .insert(index_name.to_ascii_lowercase(), create_sql.to_string());
-                        let table_columns = new_schema
+                        let table_columns = if let Some(table) = new_schema
                             .iter()
                             .find(|table| table.name.eq_ignore_ascii_case(&table_name))
-                            .map(|table| table.columns.clone())
-                            .or_else(|| {
-                                master_entries.iter().find_map(|candidate| {
-                                    if candidate.len() < 5 {
-                                        return None;
-                                    }
-                                    let entry_type = match &candidate[0] {
-                                        SqliteValue::Text(s) => s,
-                                        _ => return None,
-                                    };
-                                    if !entry_type.eq_ignore_ascii_case("table") {
-                                        return None;
-                                    }
-                                    let entry_name = match &candidate[1] {
-                                        SqliteValue::Text(s) => s,
-                                        _ => return None,
-                                    };
-                                    if !entry_name.eq_ignore_ascii_case(&table_name) {
-                                        return None;
-                                    }
-                                    let create_sql = match &candidate[4] {
-                                        SqliteValue::Text(sql) => sql,
-                                        _ => return None,
-                                    };
-                                    Some(
-                                        crate::compat_persist::parse_columns_from_sqlite_master_sql(
-                                            create_sql,
-                                        ),
-                                    )
-                                })
-                            });
-                        parse_index_definition_from_create_sql(create_sql, table_columns.as_deref())
+                        {
+                            Some(table.columns.clone())
+                        } else {
+                            exact_table_columns_from_master_entries(
+                                &master_entries,
+                                &table_name,
+                            )?
+                        };
+                        parse_index_definition_from_create_sql(
+                            create_sql,
+                            table_columns.as_deref(),
+                            &index_name,
+                            &table_name,
+                        )?
                     }
                     SqliteValue::Null => infer_implicit_index_definition_from_master_entries(
                         &master_entries,
                         &table_name,
                         &index_name,
-                    ),
-                    _ => None,
-                };
-                let Some(index_definition) = maybe_index_definition else {
-                    let reason = match &entry[4] {
-                        SqliteValue::Null => {
-                            "implicit index has NULL sql and could not be inferred from table schema"
-                        }
-                        SqliteValue::Text(_) => {
-                            "index SQL could not be parsed into executable index metadata"
-                        }
-                        _ => "index SQL has unsupported sqlite_master representation",
-                    };
-                    return Err(FrankenError::Internal(format!(
-                        "schema reload cannot safely proceed: failed to reconstruct index `{index_name}` on table `{table_name}` ({reason})"
-                    )));
+                    )
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_master implicit index `{index_name}` on table `{table_name}` could not be inferred exactly from CREATE TABLE SQL"
+                        ),
+                    })?,
+                    other => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master index `{index_name}` SQL must be TEXT or NULL, found {:?}",
+                                other.storage_class()
+                            ),
+                        });
+                    }
                 };
                 if index_definition.key_term_count() == 0 {
-                    continue;
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!("sqlite_master index `{index_name}` has zero key terms"),
+                    });
                 }
                 pending_indexes.push((
                     index_name.to_string(),
@@ -66704,6 +66925,42 @@ impl Connection {
                         });
                     }
                 };
+                let catalog_table_name = match &entry[2] {
+                    SqliteValue::Text(name) => name,
+                    other => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master view `{view_name}` table name must be TEXT, found {:?}",
+                                other.storage_class()
+                            ),
+                        });
+                    }
+                };
+                if !catalog_table_name.eq_ignore_ascii_case(view_name) {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_master view `{view_name}` has mismatched table name `{catalog_table_name}`"
+                        ),
+                    });
+                }
+                match &entry[3] {
+                    SqliteValue::Integer(0) => {}
+                    SqliteValue::Integer(root_page) => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master view `{view_name}` has invalid rootpage {root_page}; expected 0"
+                            ),
+                        });
+                    }
+                    other => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master view `{view_name}` rootpage must be INTEGER, found {:?}",
+                                other.storage_class()
+                            ),
+                        });
+                    }
+                }
                 let create_sql = match &entry[4] {
                     SqliteValue::Text(sql) => sql,
                     other => {
@@ -66723,6 +66980,16 @@ impl Connection {
                                 detail: format!(
                                     "sqlite_master view name `{view_name}` does not match CREATE VIEW name `{}`",
                                     stmt.name.name
+                                ),
+                            });
+                        }
+                        if new_views
+                            .iter()
+                            .any(|view| view.name.eq_ignore_ascii_case(view_name))
+                        {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "sqlite_master contains duplicate view `{view_name}`"
                                 ),
                             });
                         }
@@ -66751,24 +67018,108 @@ impl Connection {
             }
 
             if !entry_type.eq_ignore_ascii_case("table") {
-                continue;
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "sqlite_master row has unknown object type `{entry_type}`; expected table, index, view, or trigger"
+                    ),
+                });
             }
 
             let name = match &entry[1] {
                 SqliteValue::Text(s) => s.clone(),
-                _ => continue,
+                other => {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_master table name must be TEXT, found {:?}",
+                            other.storage_class()
+                        ),
+                    });
+                }
+            };
+            let catalog_table_name = match &entry[2] {
+                SqliteValue::Text(s) => s,
+                other => {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_master table `{name}` table name must be TEXT, found {:?}",
+                            other.storage_class()
+                        ),
+                    });
+                }
+            };
+            if !catalog_table_name.eq_ignore_ascii_case(&name) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "sqlite_master table `{name}` has mismatched table name `{catalog_table_name}`"
+                    ),
+                });
             };
             let root_page_num = match &entry[3] {
                 SqliteValue::Integer(n) => *n,
-                _ => continue,
+                other => {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_master table `{name}` rootpage must be INTEGER, found {:?}",
+                            other.storage_class()
+                        ),
+                    });
+                }
             };
             let create_sql = match &entry[4] {
                 SqliteValue::Text(s) => s.clone(),
-                _ => continue,
+                other => {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_master table `{name}` SQL must be TEXT, found {:?}",
+                            other.storage_class()
+                        ),
+                    });
+                }
             };
             new_original_ddl_sql.insert(name.to_ascii_lowercase(), create_sql.to_string());
 
-            let is_virtual_sql = is_virtual_table_sql(&create_sql);
+            let parsed_catalog_statement =
+                parse_single_statement(&create_sql).map_err(|error| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_master table `{name}` SQL failed exact parsing: {error}"
+                        ),
+                    }
+                })?;
+            let (parsed_create_table, virtual_columns) = match parsed_catalog_statement {
+                Statement::CreateTable(create_stmt) => {
+                    if !create_stmt.name.name.eq_ignore_ascii_case(&name) {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master table name `{name}` does not match CREATE TABLE name `{}`",
+                                create_stmt.name.name
+                            ),
+                        });
+                    }
+                    validate_create_table_render_budget(&create_stmt, &name)?;
+                    (Some(create_stmt), None)
+                }
+                Statement::CreateVirtualTable(create_stmt) => {
+                    if !create_stmt.name.name.eq_ignore_ascii_case(&name) {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master table name `{name}` does not match CREATE VIRTUAL TABLE name `{}`",
+                                create_stmt.name.name
+                            ),
+                        });
+                    }
+                    let columns = parse_virtual_table_column_infos(&create_stmt.args);
+                    (None, Some(columns))
+                }
+                _ => {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_master table `{name}` SQL did not parse as CREATE TABLE or CREATE VIRTUAL TABLE"
+                        ),
+                    });
+                }
+            };
+            let is_virtual_sql = virtual_columns.is_some();
             if root_page_num == 0 && is_virtual_sql {
                 let shadowed_by_materialized =
                     materialized_virtual_tables.contains(&name.to_ascii_lowercase());
@@ -66781,18 +67132,20 @@ impl Connection {
                     continue;
                 }
 
-                let columns = match parse_single_statement(&create_sql) {
-                    Ok(Statement::CreateVirtualTable(create_stmt)) => {
-                        parse_virtual_table_column_infos(&create_stmt.args)
-                    }
-                    _ => crate::compat_persist::parse_columns_from_sqlite_master_sql(&create_sql),
-                };
                 pending_rootpage_zero_virtual_tables.push((
                     name.to_string(),
                     create_sql.to_string(),
-                    columns,
+                    virtual_columns.unwrap_or_default(),
                 ));
                 continue;
+            }
+            if new_schema
+                .iter()
+                .any(|table| table.name.eq_ignore_ascii_case(&name))
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("sqlite_master contains duplicate table `{name}`"),
+                });
             }
             if is_virtual_sql {
                 pending_materialized_live_vtabs.push((name.to_string(), create_sql.to_string()));
@@ -66800,26 +67153,28 @@ impl Connection {
             let root_page_u32 =
                 crate::compat_persist::validate_sqlite_master_root_page(&name, root_page_num)?;
 
-            // Parse the CREATE TABLE to extract column info.
-            let parsed_create_table = match parse_single_statement(&create_sql) {
-                Ok(Statement::CreateTable(create_stmt)) => Some(create_stmt),
-                _ => None,
+            let columns = match parsed_create_table.as_ref() {
+                Some(create_stmt) => {
+                    crate::compat_persist::columns_from_create_table_statement(create_stmt)
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master table `{name}` CREATE TABLE AST could not be converted into complete column metadata"
+                            ),
+                        })?
+                }
+                None => virtual_columns.ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "sqlite_master table `{name}` lost virtual-table column metadata during reload"
+                    ),
+                })?,
             };
-            let columns = parsed_create_table
-                .as_ref()
-                .and_then(crate::compat_persist::columns_from_create_table_statement)
-                .unwrap_or_else(|| {
-                    crate::compat_persist::parse_columns_from_sqlite_master_sql(&create_sql)
-                });
             let num_columns = columns.len();
-            let without_rowid = parsed_create_table.as_ref().map_or_else(
-                || is_without_rowid_table_sql(&create_sql),
-                |create| create.without_rowid,
-            );
-            let is_autoincrement = parsed_create_table.as_ref().map_or_else(
-                || crate::compat_persist::is_autoincrement_table_sql(&create_sql),
-                crate::compat_persist::autoincrement_from_create_table_statement,
-            );
+            let without_rowid = parsed_create_table
+                .as_ref()
+                .is_some_and(|create| create.without_rowid);
+            let is_autoincrement = parsed_create_table
+                .as_ref()
+                .is_some_and(crate::compat_persist::autoincrement_from_create_table_statement);
 
             // Track rowid alias columns (INTEGER PRIMARY KEY). The alias value
             // is the physical rowid; persisted records may carry a NULL
@@ -66852,6 +67207,14 @@ impl Connection {
                     for (i, col) in col_defs.iter().enumerate() {
                         for c in &col.constraints {
                             if let ColumnConstraintKind::ForeignKey(fk_clause) = &c.kind {
+                                if !fk_clause.columns.is_empty() && fk_clause.columns.len() != 1 {
+                                    return Err(FrankenError::DatabaseCorrupt {
+                                        detail: format!(
+                                            "sqlite_master table `{name}` column FOREIGN KEY has 1 child column but {} parent columns",
+                                            fk_clause.columns.len()
+                                        ),
+                                    });
+                                }
                                 fk_defs.push(fk_clause_to_def(&[i], fk_clause));
                             }
                         }
@@ -66863,17 +67226,39 @@ impl Connection {
                             clause,
                         } = &tc.kind
                         {
-                            let child_indices: Vec<usize> = fk_cols
-                                .iter()
-                                .filter_map(|fk_name| {
-                                    columns
-                                        .iter()
-                                        .position(|c| c.name.eq_ignore_ascii_case(fk_name))
-                                })
-                                .collect();
-                            if !child_indices.is_empty() {
-                                fk_defs.push(fk_clause_to_def(&child_indices, clause));
+                            let mut child_indices = Vec::with_capacity(fk_cols.len());
+                            for fk_name in fk_cols {
+                                let child_index = columns
+                                    .iter()
+                                    .position(|column| {
+                                        column.name.eq_ignore_ascii_case(fk_name)
+                                    })
+                                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                                        detail: format!(
+                                            "sqlite_master table `{name}` FOREIGN KEY references missing child column `{fk_name}`"
+                                        ),
+                                    })?;
+                                child_indices.push(child_index);
                             }
+                            if child_indices.is_empty() {
+                                return Err(FrankenError::DatabaseCorrupt {
+                                    detail: format!(
+                                        "sqlite_master table `{name}` has a zero-column FOREIGN KEY"
+                                    ),
+                                });
+                            }
+                            if !clause.columns.is_empty()
+                                && clause.columns.len() != child_indices.len()
+                            {
+                                return Err(FrankenError::DatabaseCorrupt {
+                                    detail: format!(
+                                        "sqlite_master table `{name}` FOREIGN KEY has {} child columns but {} parent columns",
+                                        child_indices.len(),
+                                        clause.columns.len()
+                                    ),
+                                });
+                            }
+                            fk_defs.push(fk_clause_to_def(&child_indices, clause));
                         }
                     }
 
@@ -66902,7 +67287,11 @@ impl Connection {
                                         idx_cols, &columns,
                                     )
                                 else {
-                                    continue;
+                                    return Err(FrankenError::DatabaseCorrupt {
+                                        detail: format!(
+                                            "sqlite_master table `{name}` UNIQUE or PRIMARY KEY constraint contains a non-column term"
+                                        ),
+                                    });
                                 };
                                 let Some(col_indices) = normalized_terms
                                     .iter()
@@ -66913,20 +67302,29 @@ impl Connection {
                                     })
                                     .collect::<Option<Vec<_>>>()
                                 else {
-                                    continue;
+                                    return Err(FrankenError::DatabaseCorrupt {
+                                        detail: format!(
+                                            "sqlite_master table `{name}` UNIQUE or PRIMARY KEY constraint references a missing column"
+                                        ),
+                                    });
                                 };
-                                if !col_indices.is_empty() {
-                                    let all_ipk = col_indices.iter().all(|&i| columns[i].is_ipk);
-                                    if !all_ipk {
-                                        let collations = normalized_terms
-                                            .into_iter()
-                                            .map(|term| term.collation)
-                                            .collect();
-                                        mem_table.add_unique_column_group_with_collations(
-                                            col_indices,
-                                            collations,
-                                        );
-                                    }
+                                if col_indices.is_empty() {
+                                    return Err(FrankenError::DatabaseCorrupt {
+                                        detail: format!(
+                                            "sqlite_master table `{name}` has a zero-column UNIQUE or PRIMARY KEY constraint"
+                                        ),
+                                    });
+                                }
+                                let all_ipk = col_indices.iter().all(|&i| columns[i].is_ipk);
+                                if !all_ipk {
+                                    let collations = normalized_terms
+                                        .into_iter()
+                                        .map(|term| term.collation)
+                                        .collect();
+                                    mem_table.add_unique_column_group_with_collations(
+                                        col_indices,
+                                        collations,
+                                    );
                                 }
                             }
                         }
@@ -66934,20 +67332,19 @@ impl Connection {
                 }
             }
 
-            let check_defs = parsed_create_table.as_ref().map_or_else(
-                || crate::compat_persist::extract_check_constraints_from_sql(&create_sql),
-                crate::compat_persist::check_constraints_from_create_table_statement,
-            );
+            let check_defs = parsed_create_table
+                .as_ref()
+                .map(crate::compat_persist::check_constraints_from_create_table_statement)
+                .unwrap_or_default();
 
             new_schema.push(TableSchema {
                 name: name.to_string(),
                 root_page: real_root_page,
                 columns,
                 indexes: Vec::new(),
-                strict: parsed_create_table.as_ref().map_or_else(
-                    || crate::compat_persist::is_strict_table_sql(&create_sql),
-                    |create| create.strict,
-                ),
+                strict: parsed_create_table
+                    .as_ref()
+                    .is_some_and(|create| create.strict),
                 without_rowid,
                 primary_key_constraints,
                 foreign_keys: fk_defs,
@@ -67050,31 +67447,38 @@ impl Connection {
 
         // Attach indexes after all table schemas are available.
         for (index_name, table_name, root_page, index_definition) in pending_indexes {
-            if let Some(table) = new_schema
+            let table = new_schema
                 .iter_mut()
                 .find(|t| t.name.eq_ignore_ascii_case(&table_name))
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "sqlite_master index `{index_name}` references missing table `{table_name}`"
+                    ),
+                })?;
+            if table
+                .indexes
+                .iter()
+                .any(|index| index.name.eq_ignore_ascii_case(&index_name))
             {
-                if table
-                    .indexes
-                    .iter()
-                    .any(|idx| idx.name.eq_ignore_ascii_case(&index_name))
-                {
-                    continue;
-                }
-                table.indexes.push(IndexSchema {
-                    name: index_name,
-                    root_page,
-                    columns: index_definition.columns,
-                    key_expressions: index_definition.key_expressions,
-                    key_sort_directions: index_definition.key_sort_directions,
-                    key_collations: index_definition.key_collations,
-                    where_clause: index_definition.where_clause,
-                    is_unique: index_definition.is_unique,
-                    conflict_action: index_definition.conflict_action,
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "sqlite_master contains duplicate index `{index_name}` on table `{table_name}`"
+                    ),
                 });
-                if !new_db.tables.contains_key(&root_page) {
-                    new_db.create_table_at(root_page, 0);
-                }
+            }
+            table.indexes.push(IndexSchema {
+                name: index_name,
+                root_page,
+                columns: index_definition.columns,
+                key_expressions: index_definition.key_expressions,
+                key_sort_directions: index_definition.key_sort_directions,
+                key_collations: index_definition.key_collations,
+                where_clause: index_definition.where_clause,
+                is_unique: index_definition.is_unique,
+                conflict_action: index_definition.conflict_action,
+            });
+            if !new_db.tables.contains_key(&root_page) {
+                new_db.create_table_at(root_page, 0);
             }
         }
 
@@ -67096,6 +67500,23 @@ impl Connection {
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
             });
+        }
+
+        for trigger in &new_triggers {
+            let target_exists = new_schema
+                .iter()
+                .any(|table| table.name.eq_ignore_ascii_case(&trigger.table_name))
+                || new_views
+                    .iter()
+                    .any(|view| view.name.eq_ignore_ascii_case(&trigger.table_name));
+            if !target_exists {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "sqlite_master trigger `{}` references missing table or view `{}`",
+                        trigger.name, trigger.table_name
+                    ),
+                });
+            }
         }
 
         let reloaded_live_vtabs = if self.transactional_live_vtab_registry_active() {
@@ -71361,6 +71782,7 @@ fn is_bounded_builtin_collation(collation: &str) -> bool {
 
 #[derive(Clone, Copy)]
 enum BoundedCollationAstNode<'a> {
+    Statement(&'a Statement),
     Expr(&'a Expr),
     Select(&'a SelectStatement),
     SelectCore(&'a SelectCore),
@@ -71377,10 +71799,21 @@ enum BoundedCollationTraversalLimit {
     Depth,
 }
 
-fn first_unsupported_bounded_collation(
-    expression: &Expr,
-) -> std::result::Result<Option<&str>, BoundedCollationTraversalLimit> {
-    let mut pending = vec![(BoundedCollationAstNode::Expr(expression), 0_usize)];
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BoundedAstUnsupported {
+    Collation(String),
+    Function { name: String, arity: i32 },
+    Shape(&'static str),
+    Statement(&'static str),
+}
+
+fn first_unsupported_bounded_ast(
+    root: BoundedCollationAstNode<'_>,
+    reject_custom_collations: bool,
+    supported_function: Option<&dyn Fn(&str, &FunctionArgs, bool) -> bool>,
+    reject_schema_expression_shapes: bool,
+) -> std::result::Result<Option<BoundedAstUnsupported>, BoundedCollationTraversalLimit> {
+    let mut pending = vec![(root, 0_usize)];
     let mut visited = 0_usize;
 
     while let Some((node, depth)) = pending.pop() {
@@ -71394,11 +71827,197 @@ fn first_unsupported_bounded_collation(
         let child_depth = depth.saturating_add(1);
 
         match node {
+            BoundedCollationAstNode::Statement(statement) => match statement {
+                Statement::Select(select) => {
+                    pending.push((BoundedCollationAstNode::Select(select), child_depth));
+                }
+                Statement::Insert(insert) => {
+                    for column in insert.returning.iter().rev() {
+                        if let ResultColumn::Expr { expr, .. } = column {
+                            pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                        }
+                    }
+                    for upsert in insert.upsert.iter().rev() {
+                        if let UpsertAction::Update {
+                            assignments,
+                            where_clause,
+                        } = &upsert.action
+                        {
+                            if let Some(predicate) = where_clause.as_deref() {
+                                pending
+                                    .push((BoundedCollationAstNode::Expr(predicate), child_depth));
+                            }
+                            for assignment in assignments.iter().rev() {
+                                pending.push((
+                                    BoundedCollationAstNode::Expr(&assignment.value),
+                                    child_depth,
+                                ));
+                            }
+                        }
+                        if let Some(target) = upsert.target.as_ref() {
+                            if let Some(predicate) = target.where_clause.as_ref() {
+                                pending
+                                    .push((BoundedCollationAstNode::Expr(predicate), child_depth));
+                            }
+                            for column in target.columns.iter().rev() {
+                                pending.push((
+                                    BoundedCollationAstNode::Expr(&column.expr),
+                                    child_depth,
+                                ));
+                            }
+                        }
+                    }
+                    match &insert.source {
+                        InsertSource::Values(rows) => {
+                            for row in rows.iter().rev() {
+                                for expression in row.iter().rev() {
+                                    pending.push((
+                                        BoundedCollationAstNode::Expr(expression),
+                                        child_depth,
+                                    ));
+                                }
+                            }
+                        }
+                        InsertSource::Select(select) => {
+                            pending.push((BoundedCollationAstNode::Select(select), child_depth));
+                        }
+                        InsertSource::DefaultValues => {}
+                    }
+                    if let Some(with) = insert.with.as_ref() {
+                        for cte in with.ctes.iter().rev() {
+                            pending
+                                .push((BoundedCollationAstNode::Select(&cte.query), child_depth));
+                        }
+                    }
+                }
+                Statement::Update(update) => {
+                    if let Some(limit) = update.limit.as_ref() {
+                        if let Some(offset) = limit.offset.as_ref() {
+                            pending.push((BoundedCollationAstNode::Expr(offset), child_depth));
+                        }
+                        pending.push((BoundedCollationAstNode::Expr(&limit.limit), child_depth));
+                    }
+                    for term in update.order_by.iter().rev() {
+                        pending.push((BoundedCollationAstNode::Expr(&term.expr), child_depth));
+                    }
+                    for column in update.returning.iter().rev() {
+                        if let ResultColumn::Expr { expr, .. } = column {
+                            pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                        }
+                    }
+                    if let Some(predicate) = update.where_clause.as_ref() {
+                        pending.push((BoundedCollationAstNode::Expr(predicate), child_depth));
+                    }
+                    if let Some(from) = update.from.as_ref() {
+                        pending.push((BoundedCollationAstNode::From(from), child_depth));
+                    }
+                    for assignment in update.assignments.iter().rev() {
+                        pending.push((
+                            BoundedCollationAstNode::Expr(&assignment.value),
+                            child_depth,
+                        ));
+                    }
+                    if let Some(with) = update.with.as_ref() {
+                        for cte in with.ctes.iter().rev() {
+                            pending
+                                .push((BoundedCollationAstNode::Select(&cte.query), child_depth));
+                        }
+                    }
+                }
+                Statement::Delete(delete) => {
+                    if let Some(limit) = delete.limit.as_ref() {
+                        if let Some(offset) = limit.offset.as_ref() {
+                            pending.push((BoundedCollationAstNode::Expr(offset), child_depth));
+                        }
+                        pending.push((BoundedCollationAstNode::Expr(&limit.limit), child_depth));
+                    }
+                    for term in delete.order_by.iter().rev() {
+                        pending.push((BoundedCollationAstNode::Expr(&term.expr), child_depth));
+                    }
+                    for column in delete.returning.iter().rev() {
+                        if let ResultColumn::Expr { expr, .. } = column {
+                            pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
+                        }
+                    }
+                    if let Some(predicate) = delete.where_clause.as_ref() {
+                        pending.push((BoundedCollationAstNode::Expr(predicate), child_depth));
+                    }
+                    if let Some(with) = delete.with.as_ref() {
+                        for cte in with.ctes.iter().rev() {
+                            pending
+                                .push((BoundedCollationAstNode::Select(&cte.query), child_depth));
+                        }
+                    }
+                }
+                Statement::Explain { stmt, .. } => {
+                    pending.push((BoundedCollationAstNode::Statement(stmt), child_depth));
+                }
+                Statement::CreateTable(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("CREATE TABLE")));
+                }
+                Statement::CreateIndex(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("CREATE INDEX")));
+                }
+                Statement::CreateView(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("CREATE VIEW")));
+                }
+                Statement::CreateTrigger(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("CREATE TRIGGER")));
+                }
+                Statement::CreateVirtualTable(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement(
+                        "CREATE VIRTUAL TABLE",
+                    )));
+                }
+                Statement::Drop(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("DROP")));
+                }
+                Statement::AlterTable(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("ALTER TABLE")));
+                }
+                Statement::Begin(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("BEGIN")));
+                }
+                Statement::Commit => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("COMMIT")));
+                }
+                Statement::Rollback(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("ROLLBACK")));
+                }
+                Statement::Savepoint(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("SAVEPOINT")));
+                }
+                Statement::Release(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("RELEASE")));
+                }
+                Statement::Attach(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("ATTACH")));
+                }
+                Statement::Detach(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("DETACH")));
+                }
+                Statement::Pragma(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("PRAGMA")));
+                }
+                Statement::Vacuum(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("VACUUM")));
+                }
+                Statement::Reindex(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("REINDEX")));
+                }
+                Statement::Analyze(_) => {
+                    return Ok(Some(BoundedAstUnsupported::Statement("ANALYZE")));
+                }
+            },
             BoundedCollationAstNode::Expr(expr) => match expr {
-                Expr::Literal(_, _)
-                | Expr::Column(_, _)
-                | Expr::Raise { .. }
-                | Expr::Placeholder(_, _) => {}
+                Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } => {}
+                Expr::Placeholder(_, _) => {
+                    if reject_schema_expression_shapes {
+                        return Ok(Some(BoundedAstUnsupported::Shape(
+                            "bind parameter in persisted schema expression",
+                        )));
+                    }
+                }
                 Expr::BinaryOp { left, right, .. } => {
                     pending.push((BoundedCollationAstNode::Expr(right), child_depth));
                     pending.push((BoundedCollationAstNode::Expr(left), child_depth));
@@ -71411,8 +72030,8 @@ fn first_unsupported_bounded_collation(
                 Expr::Collate {
                     expr, collation, ..
                 } => {
-                    if !is_bounded_builtin_collation(collation) {
-                        return Ok(Some(collation));
+                    if reject_custom_collations && !is_bounded_builtin_collation(collation) {
+                        return Ok(Some(BoundedAstUnsupported::Collation(collation.clone())));
                     }
                     pending.push((BoundedCollationAstNode::Expr(expr), child_depth));
                 }
@@ -71431,6 +72050,11 @@ fn first_unsupported_bounded_collation(
                             }
                         }
                         InSet::Subquery(select) => {
+                            if reject_schema_expression_shapes {
+                                return Ok(Some(BoundedAstUnsupported::Shape(
+                                    "subquery in persisted schema expression",
+                                )));
+                            }
                             pending.push((BoundedCollationAstNode::Select(select), child_depth));
                         }
                         InSet::Table(_) => {}
@@ -71467,15 +72091,31 @@ fn first_unsupported_bounded_collation(
                     }
                 }
                 Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+                    if reject_schema_expression_shapes {
+                        return Ok(Some(BoundedAstUnsupported::Shape(
+                            "subquery in persisted schema expression",
+                        )));
+                    }
                     pending.push((BoundedCollationAstNode::Select(subquery), child_depth));
                 }
                 Expr::FunctionCall {
+                    name,
                     args,
                     order_by,
                     filter,
                     over,
                     ..
                 } => {
+                    let has_aggregate_decorations =
+                        !order_by.is_empty() || filter.is_some() || over.is_some();
+                    if let Some(is_supported) = supported_function
+                        && !is_supported(name, args, has_aggregate_decorations)
+                    {
+                        return Ok(Some(BoundedAstUnsupported::Function {
+                            name: name.clone(),
+                            arity: function_args_len(args),
+                        }));
+                    }
                     if let Some(window) = over.as_ref() {
                         pending.push((BoundedCollationAstNode::Window(window), child_depth));
                     }
@@ -71584,6 +72224,11 @@ fn first_unsupported_bounded_collation(
                     pending.push((BoundedCollationAstNode::Select(query), child_depth));
                 }
                 TableOrSubquery::TableFunction { args, .. } => {
+                    if supported_function.is_some() {
+                        return Ok(Some(BoundedAstUnsupported::Shape(
+                            "table-valued function in persisted view or trigger",
+                        )));
+                    }
                     for argument in args.iter().rev() {
                         pending.push((BoundedCollationAstNode::Expr(argument), child_depth));
                     }
@@ -71624,6 +72269,27 @@ fn first_unsupported_bounded_collation(
     }
 
     Ok(None)
+}
+
+fn bounded_builtin_scalar_function_supported(
+    registry: &FunctionRegistry,
+    name: &str,
+    args: &FunctionArgs,
+    has_aggregate_decorations: bool,
+) -> bool {
+    if has_aggregate_decorations || matches!(args, FunctionArgs::Star) {
+        return false;
+    }
+    let arity = function_args_len(args);
+    let declared_builtin = builtin_function_surface_inventory().iter().any(|entry| {
+        entry.family == BuiltinFunctionFamily::Scalar
+            && entry.name.eq_ignore_ascii_case(name)
+            && (entry.num_args == arity || entry.num_args == -1)
+    });
+    declared_builtin
+        && registry.find_scalar(name, arity).is_some_and(|function| {
+            function.is_deterministic() && function.accepts_arg_count(arity)
+        })
 }
 
 fn term_has_unquoted_collation_keyword(term: &str) -> bool {
@@ -79006,16 +79672,181 @@ impl ReconstructedIndexDefinition {
     }
 }
 
+fn validate_create_table_render_budget(
+    create: &fsqlite_ast::CreateTableStatement,
+    object_name: &str,
+) -> Result<()> {
+    match &create.body {
+        CreateTableBody::AsSelect(select) => Connection::validate_bounded_ast_render_budget(
+            BoundedCollationAstNode::Select(select),
+            object_name,
+        ),
+        CreateTableBody::Columns {
+            columns,
+            constraints,
+        } => {
+            for column in columns {
+                for constraint in &column.constraints {
+                    match &constraint.kind {
+                        ColumnConstraintKind::Check(expression)
+                        | ColumnConstraintKind::Generated {
+                            expr: expression, ..
+                        }
+                        | ColumnConstraintKind::Default(
+                            fsqlite_ast::DefaultValue::Expr(expression)
+                            | fsqlite_ast::DefaultValue::ParenExpr(expression),
+                        ) => Connection::validate_bounded_ast_render_budget(
+                            BoundedCollationAstNode::Expr(expression),
+                            object_name,
+                        )?,
+                        ColumnConstraintKind::PrimaryKey { .. }
+                        | ColumnConstraintKind::NotNull { .. }
+                        | ColumnConstraintKind::Null
+                        | ColumnConstraintKind::Unique { .. }
+                        | ColumnConstraintKind::Collate(_)
+                        | ColumnConstraintKind::ForeignKey(_) => {}
+                    }
+                }
+            }
+            for constraint in constraints {
+                match &constraint.kind {
+                    TableConstraintKind::Check(expression) => {
+                        Connection::validate_bounded_ast_render_budget(
+                            BoundedCollationAstNode::Expr(expression),
+                            object_name,
+                        )?;
+                    }
+                    TableConstraintKind::PrimaryKey {
+                        columns: indexed_columns,
+                        ..
+                    }
+                    | TableConstraintKind::Unique {
+                        columns: indexed_columns,
+                        ..
+                    } => {
+                        for indexed in indexed_columns {
+                            Connection::validate_bounded_ast_render_budget(
+                                BoundedCollationAstNode::Expr(&indexed.expr),
+                                object_name,
+                            )?;
+                        }
+                    }
+                    TableConstraintKind::ForeignKey { .. } => {}
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn exact_table_columns_from_master_entries(
+    master_entries: &[Vec<SqliteValue>],
+    table_name: &str,
+) -> Result<Option<Vec<ColumnInfo>>> {
+    let Some(entry) = master_entries.iter().find(|entry| {
+        entry.len() >= 2
+            && matches!(&entry[0], SqliteValue::Text(kind) if kind.eq_ignore_ascii_case("table"))
+            && matches!(&entry[1], SqliteValue::Text(name) if name.eq_ignore_ascii_case(table_name))
+    }) else {
+        return Ok(None);
+    };
+    if entry.len() < 5 {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "sqlite_master table `{table_name}` row has {} columns; expected at least 5",
+                entry.len()
+            ),
+        });
+    }
+    let create_sql = match &entry[4] {
+        SqliteValue::Text(sql) => sql,
+        other => {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "sqlite_master table `{table_name}` SQL must be TEXT, found {:?}",
+                    other.storage_class()
+                ),
+            });
+        }
+    };
+    let statement =
+        parse_single_statement(create_sql).map_err(|error| FrankenError::DatabaseCorrupt {
+            detail: format!("sqlite_master table `{table_name}` SQL failed exact parsing: {error}"),
+        })?;
+    match statement {
+        Statement::CreateTable(create) => {
+            if !create.name.name.eq_ignore_ascii_case(table_name) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "sqlite_master table name `{table_name}` does not match CREATE TABLE name `{}`",
+                        create.name.name
+                    ),
+                });
+            }
+            validate_create_table_render_budget(&create, table_name)?;
+            crate::compat_persist::columns_from_create_table_statement(&create)
+                .map(Some)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "sqlite_master table `{table_name}` CREATE TABLE AST could not be converted into complete column metadata"
+                    ),
+                })
+        }
+        Statement::CreateVirtualTable(create) => {
+            if !create.name.name.eq_ignore_ascii_case(table_name) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "sqlite_master table name `{table_name}` does not match CREATE VIRTUAL TABLE name `{}`",
+                        create.name.name
+                    ),
+                });
+            }
+            Ok(Some(parse_virtual_table_column_infos(&create.args)))
+        }
+        _ => Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "sqlite_master table `{table_name}` SQL did not parse as CREATE TABLE or CREATE VIRTUAL TABLE"
+            ),
+        }),
+    }
+}
+
 fn parse_index_definition_from_create_sql(
     create_sql: &str,
     table_columns: Option<&[ColumnInfo]>,
-) -> Option<ReconstructedIndexDefinition> {
-    match parse_single_statement(create_sql).ok()? {
-        Statement::CreateIndex(stmt) => {
-            index_definition_from_create_index_statement(&stmt, table_columns)
-        }
-        _ => None,
+    catalog_index_name: &str,
+    catalog_table_name: &str,
+) -> Result<ReconstructedIndexDefinition> {
+    let statement =
+        parse_single_statement(create_sql).map_err(|error| FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "sqlite_master index `{catalog_index_name}` SQL failed exact parsing: {error}"
+            ),
+        })?;
+    let Statement::CreateIndex(stmt) = statement else {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "sqlite_master index `{catalog_index_name}` SQL did not parse as CREATE INDEX"
+            ),
+        });
+    };
+    if !stmt.name.name.eq_ignore_ascii_case(catalog_index_name) {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "sqlite_master index name `{catalog_index_name}` does not match CREATE INDEX name `{}`",
+                stmt.name.name
+            ),
+        });
     }
+    if !stmt.table.eq_ignore_ascii_case(catalog_table_name) {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "sqlite_master index `{catalog_index_name}` table `{catalog_table_name}` does not match CREATE INDEX table `{}`",
+                stmt.table
+            ),
+        });
+    }
+    index_definition_from_create_index_statement(&stmt, table_columns, catalog_index_name)
 }
 
 fn infer_implicit_index_definition_from_master_entries(
@@ -79161,9 +79992,24 @@ fn implicit_index_definitions_from_create_table_sql(
 fn index_definition_from_create_index_statement(
     stmt: &fsqlite_ast::CreateIndexStatement,
     table_columns: Option<&[ColumnInfo]>,
-) -> Option<ReconstructedIndexDefinition> {
+    object_name: &str,
+) -> Result<ReconstructedIndexDefinition> {
     if stmt.columns.is_empty() {
-        return None;
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!("sqlite_master index `{object_name}` has zero key terms"),
+        });
+    }
+    for column in &stmt.columns {
+        Connection::validate_bounded_ast_render_budget(
+            BoundedCollationAstNode::Expr(&column.expr),
+            object_name,
+        )?;
+    }
+    if let Some(predicate) = stmt.where_clause.as_ref() {
+        Connection::validate_bounded_ast_render_budget(
+            BoundedCollationAstNode::Expr(predicate),
+            object_name,
+        )?;
     }
     let simple_columns = extract_simple_index_columns(&stmt.columns);
     let key_expressions = if simple_columns.len() == stmt.columns.len() {
@@ -79182,7 +80028,7 @@ fn index_definition_from_create_index_statement(
                 .map(normalize_indexed_column_term)
                 .collect()
         });
-    Some(ReconstructedIndexDefinition {
+    Ok(ReconstructedIndexDefinition {
         // Explicit CREATE INDEX cannot declare an ON CONFLICT clause.
         conflict_action: None,
         columns: simple_columns,
@@ -114980,6 +115826,29 @@ mod tests {
     }
 
     #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    fn mutate_stock_sqlite_schema(path: &Path, mutate: impl FnOnce(&rusqlite::Connection)) {
+        let sqlite = rusqlite::Connection::open(path).unwrap();
+        sqlite.execute_batch("PRAGMA writable_schema=ON;").unwrap();
+        mutate(&sqlite);
+        let schema_version: i64 = sqlite
+            .query_row("PRAGMA schema_version;", [], |row| row.get(0))
+            .unwrap();
+        sqlite
+            .execute_batch(&format!(
+                "PRAGMA schema_version={}; PRAGMA writable_schema=OFF;",
+                schema_version.saturating_add(1)
+            ))
+            .unwrap();
+        drop(sqlite);
+        for suffix in ["-journal", "-wal", "-shm", "-wal-fec"] {
+            assert!(
+                !publication_sidecar(path, suffix).exists(),
+                "closed schema-mutated candidate retained forbidden sidecar {suffix}"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
     fn assert_bounded_publication_shape_refusal_is_immutable(
         source: &Connection,
         source_receipt: &super::DatabaseImageReceipt,
@@ -115030,6 +115899,30 @@ mod tests {
             candidate_before,
             "rejected bounded publication must restore the exact candidate bytes"
         );
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    fn assert_hfdt_0117_catalog_corruption_case(
+        case_name: &str,
+        mutate_candidate: impl FnOnce(&Path),
+        expected_detail_fragments: &[&str],
+    ) {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join(format!("{case_name}-source.db"));
+        let candidate_path = dir.path().join(format!("{case_name}-candidate.db"));
+        let source = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = source.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        mutate_candidate(&candidate_path);
+        assert_bounded_publication_corruption_is_immutable(
+            &source,
+            &source_receipt,
+            &source_path,
+            &candidate_path,
+            expected_detail_fragments,
+        );
+        source.close().unwrap();
     }
 
     #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
@@ -115162,6 +116055,11 @@ mod tests {
                 "[tenant_custom_bracket]",
                 "tenant_custom_bracket",
             ),
+            (
+                "single_quote",
+                "'tenant_custom_single'",
+                "tenant_custom_single",
+            ),
         ] {
             let sql = format!("lower(account_name) COLLATE {quoted_name}");
             let context = format!("hfdt_0117_expression_{quote_form}");
@@ -115186,6 +116084,11 @@ mod tests {
                 "bracket",
                 "[tenant_predicate_bracket]",
                 "tenant_predicate_bracket",
+            ),
+            (
+                "single_quote",
+                "'tenant_predicate_single'",
+                "tenant_predicate_single",
             ),
         ] {
             let sql = format!("account_name COLLATE {quoted_name} = 'active'");
@@ -115244,14 +116147,22 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(all(
+        feature = "native",
+        not(target_arch = "wasm32"),
+        any(target_os = "linux", target_os = "windows")
+    ))]
     #[test]
     fn hfdt_0117_bounded_external_snapshot_platform_gate_accepts_implemented_targets() {
         Connection::require_bounded_external_snapshot_platform()
-            .expect("Linux and Windows provide the native bounded snapshot lock fence");
+            .expect("native Linux and Windows builds provide the bounded snapshot lock fence");
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(not(all(
+        feature = "native",
+        not(target_arch = "wasm32"),
+        any(target_os = "linux", target_os = "windows")
+    )))]
     #[test]
     fn hfdt_0117_bounded_external_snapshot_platform_gate_refuses_unimplemented_targets() {
         let error = Connection::require_bounded_external_snapshot_platform()
@@ -115260,10 +116171,385 @@ mod tests {
             matches!(
                 error,
                 FrankenError::NotImplemented(ref detail)
-                    if detail.contains("Linux or Windows native lock fence")
+                    if detail.contains("native feature")
+                        && detail.contains("Linux or Windows lock fence")
             ),
             "unexpected bounded external snapshot platform refusal: {error}"
         );
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_rejects_catalog_table_sql_tail_and_name_misbinding() {
+        assert_hfdt_0117_catalog_corruption_case(
+            "bounded-table-trailing-syntax",
+            |candidate_path| {
+                rewrite_stock_sqlite_schema_sql(
+                    candidate_path,
+                    "table",
+                    "replacement_items",
+                    "CREATE TABLE replacement_items(
+                         id INTEGER PRIMARY KEY,
+                         value TEXT NOT NULL UNIQUE
+                     ) trailing_catalog_garbage",
+                );
+            },
+            &["table `replacement_items`", "failed exact parsing"],
+        );
+        assert_hfdt_0117_catalog_corruption_case(
+            "bounded-table-name-misbinding",
+            |candidate_path| {
+                rewrite_stock_sqlite_schema_sql(
+                    candidate_path,
+                    "table",
+                    "replacement_items",
+                    "CREATE TABLE other_items(
+                         id INTEGER PRIMARY KEY,
+                         value TEXT NOT NULL UNIQUE
+                     )",
+                );
+            },
+            &[
+                "table name `replacement_items`",
+                "CREATE TABLE name `other_items`",
+            ],
+        );
+        assert_hfdt_0117_catalog_corruption_case(
+            "bounded-table-null-sql",
+            |candidate_path| {
+                mutate_stock_sqlite_schema(candidate_path, |sqlite| {
+                    let changed = sqlite
+                        .execute(
+                            "UPDATE sqlite_schema SET sql=NULL
+                             WHERE type='table' AND name='replacement_items';",
+                            [],
+                        )
+                        .unwrap();
+                    assert_eq!(changed, 1);
+                });
+            },
+            &["table `replacement_items` SQL must be TEXT"],
+        );
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_rejects_unresolved_foreign_key_child_column() {
+        assert_hfdt_0117_catalog_corruption_case(
+            "bounded-unresolved-foreign-key-child",
+            |candidate_path| {
+                rewrite_stock_sqlite_schema_sql(
+                    candidate_path,
+                    "table",
+                    "replacement_items",
+                    "CREATE TABLE replacement_items(
+                         id INTEGER PRIMARY KEY,
+                         value TEXT NOT NULL UNIQUE,
+                         FOREIGN KEY(missing_child) REFERENCES parent_items(id)
+                     )",
+                );
+            },
+            &[
+                "table `replacement_items`",
+                "FOREIGN KEY",
+                "missing child column `missing_child`",
+            ],
+        );
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_rejects_rootless_and_misbound_explicit_indexes() {
+        assert_hfdt_0117_catalog_corruption_case(
+            "bounded-rootless-implicit-index",
+            |candidate_path| {
+                mutate_stock_sqlite_schema(candidate_path, |sqlite| {
+                    let changed = sqlite
+                        .execute(
+                            "UPDATE sqlite_schema SET rootpage=0
+                             WHERE type='index'
+                               AND name='sqlite_autoindex_replacement_items_1';",
+                            [],
+                        )
+                        .unwrap();
+                    assert_eq!(changed, 1);
+                });
+            },
+            &[
+                "index `sqlite_autoindex_replacement_items_1`",
+                "invalid rootpage 0",
+            ],
+        );
+
+        for (case_name, replacement_sql, expected) in [
+            (
+                "bounded-index-name-misbinding",
+                "CREATE INDEX other_index ON replacement_items(value)",
+                "CREATE INDEX name `other_index`",
+            ),
+            (
+                "bounded-index-table-misbinding",
+                "CREATE INDEX idx_value ON other_items(value)",
+                "CREATE INDEX table `other_items`",
+            ),
+            (
+                "bounded-index-trailing-syntax",
+                "CREATE INDEX idx_value ON replacement_items(value) trailing_index_garbage",
+                "failed exact parsing",
+            ),
+        ] {
+            assert_hfdt_0117_catalog_corruption_case(
+                case_name,
+                |candidate_path| {
+                    let sqlite = rusqlite::Connection::open(candidate_path).unwrap();
+                    sqlite
+                        .execute("CREATE INDEX idx_value ON replacement_items(value);", [])
+                        .unwrap();
+                    drop(sqlite);
+                    rewrite_stock_sqlite_schema_sql(
+                        candidate_path,
+                        "index",
+                        "idx_value",
+                        replacement_sql,
+                    );
+                },
+                &["sqlite_master index", "`idx_value`", expected],
+            );
+        }
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_rejects_unknown_catalog_object_type() {
+        assert_hfdt_0117_catalog_corruption_case(
+            "bounded-unknown-catalog-type",
+            |candidate_path| {
+                mutate_stock_sqlite_schema(candidate_path, |sqlite| {
+                    let changed = sqlite
+                        .execute(
+                            "UPDATE sqlite_schema SET type='mystery'
+                             WHERE type='table' AND name='replacement_items';",
+                            [],
+                        )
+                        .unwrap();
+                    assert_eq!(changed, 1);
+                });
+            },
+            &["unknown object type `mystery`"],
+        );
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_rejects_custom_collation_in_column_default() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("bounded-default-collation-source.db");
+        let candidate_path = dir.path().join("bounded-default-collation-candidate.db");
+        let source = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = source.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        rewrite_stock_sqlite_schema_sql(
+            &candidate_path,
+            "table",
+            "replacement_items",
+            "CREATE TABLE replacement_items(
+                 id INTEGER PRIMARY KEY,
+                 value TEXT NOT NULL UNIQUE,
+                 policy INTEGER DEFAULT (
+                     CASE
+                       WHEN 'A' COLLATE tenant_custom = 'a' THEN 1
+                       ELSE 0
+                     END
+                 )
+             )",
+        );
+
+        assert_bounded_publication_shape_refusal_is_immutable(
+            &source,
+            &source_receipt,
+            &source_path,
+            &candidate_path,
+            &["column default `replacement_items.policy`", "tenant_custom"],
+        );
+        source.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_validates_view_and_trigger_expression_asts() {
+        for (case_name, create_sql, object_type, object_name, replacement_sql) in [
+            (
+                "bounded-view-custom-collation",
+                "CREATE VIEW active_items AS
+                   SELECT value FROM replacement_items
+                   WHERE value COLLATE NOCASE = 'candidate-alpha';",
+                "view",
+                "active_items",
+                "CREATE VIEW active_items AS
+                   SELECT value FROM replacement_items
+                   WHERE value COLLATE tenant_view = 'candidate-alpha'",
+            ),
+            (
+                "bounded-trigger-custom-collation",
+                "CREATE TRIGGER validate_item BEFORE INSERT ON replacement_items
+                   WHEN NEW.value COLLATE NOCASE = 'blocked'
+                   BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+                "trigger",
+                "validate_item",
+                "CREATE TRIGGER validate_item BEFORE INSERT ON replacement_items
+                   WHEN NEW.value COLLATE tenant_trigger = 'blocked'
+                   BEGIN SELECT RAISE(ABORT, 'blocked'); END",
+            ),
+        ] {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join(format!("{case_name}-source.db"));
+            let candidate_path = dir.path().join(format!("{case_name}-candidate.db"));
+            let source = open_database_image_publication_source(&source_path, "delete");
+            let source_receipt = source.capture_database_image_receipt().unwrap();
+            create_database_image_publication_candidate(&candidate_path, "delete");
+            {
+                let sqlite = rusqlite::Connection::open(&candidate_path).unwrap();
+                sqlite.execute_batch(create_sql).unwrap();
+            }
+            rewrite_stock_sqlite_schema_sql(
+                &candidate_path,
+                object_type,
+                object_name,
+                replacement_sql,
+            );
+
+            assert_bounded_publication_shape_refusal_is_immutable(
+                &source,
+                &source_receipt,
+                &source_path,
+                &candidate_path,
+                &[object_name, "custom or unknown collation"],
+            );
+            source.close().unwrap();
+        }
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_refuses_empty_index_with_registered_udf() {
+        use fsqlite_func::ScalarFunction;
+
+        struct TenantKey;
+
+        impl ScalarFunction for TenantKey {
+            fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+                Ok(args.first().cloned().unwrap_or(SqliteValue::Null))
+            }
+
+            fn num_args(&self) -> i32 {
+                1
+            }
+
+            fn name(&self) -> &str {
+                "tenant_key"
+            }
+        }
+
+        for registered_on_validator in [false, true] {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let case_name = if registered_on_validator {
+                "bounded-empty-registered-udf"
+            } else {
+                "bounded-empty-unknown-udf"
+            };
+            let source_path = dir.path().join(format!("{case_name}-source.db"));
+            let candidate_path = dir.path().join(format!("{case_name}-candidate.db"));
+            let source = open_database_image_publication_source(&source_path, "delete");
+            if registered_on_validator {
+                source.register_scalar_function(TenantKey);
+            }
+            let source_receipt = source.capture_database_image_receipt().unwrap();
+            {
+                let sqlite = rusqlite::Connection::open(&candidate_path).unwrap();
+                sqlite
+                    .execute_batch(
+                        "PRAGMA journal_mode=DELETE;
+                         CREATE TABLE replacement_items(id INTEGER, value TEXT);
+                         CREATE INDEX idx_tenant_key
+                           ON replacement_items(value);",
+                    )
+                    .unwrap();
+                let row_count: i64 = sqlite
+                    .query_row("SELECT count(*) FROM replacement_items;", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    row_count, 0,
+                    "the adversarial UDF index must remain empty so row evaluation cannot hide missing preflight"
+                );
+            }
+            rewrite_stock_sqlite_schema_sql(
+                &candidate_path,
+                "index",
+                "idx_tenant_key",
+                "CREATE INDEX idx_tenant_key
+                   ON replacement_items(tenant_key(value))",
+            );
+
+            assert_bounded_publication_shape_refusal_is_immutable(
+                &source,
+                &source_receipt,
+                &source_path,
+                &candidate_path,
+                &["idx_tenant_key", "function `tenant_key`/1"],
+            );
+            source.close().unwrap();
+        }
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_refuses_over_node_budget_flat_index_ast_before_render() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("bounded-flat-node-budget-source.db");
+        let candidate_path = dir.path().join("bounded-flat-node-budget-candidate.db");
+        let source = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = source.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        {
+            let sqlite = rusqlite::Connection::open(&candidate_path).unwrap();
+            sqlite
+                .execute(
+                    "CREATE INDEX idx_flat_nodes
+                     ON replacement_items(value)
+                     WHERE id > 0;",
+                    [],
+                )
+                .unwrap();
+        }
+        let values = (0..=super::BOUNDED_VALIDATION_MAX_COLLATION_AST_NODES)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        rewrite_stock_sqlite_schema_sql(
+            &candidate_path,
+            "index",
+            "idx_flat_nodes",
+            &format!(
+                "CREATE INDEX idx_flat_nodes
+                 ON replacement_items(value)
+                 WHERE id IN ({values})"
+            ),
+        );
+
+        assert_bounded_publication_shape_refusal_is_immutable(
+            &source,
+            &source_receipt,
+            &source_path,
+            &candidate_path,
+            &["idx_flat_nodes", "node rendering limit"],
+        );
+        source.close().unwrap();
     }
 
     #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
@@ -115326,6 +116612,11 @@ mod tests {
             ),
             ("backtick_semicolon", "`NOCASE;--x`", "NOCASE;--x"),
             ("bracket_comment", "[NOCASE/*x*/]", "NOCASE/*x*/"),
+            (
+                "single_identifier",
+                "'tenant_single_identifier'",
+                "tenant_single_identifier",
+            ),
         ] {
             let candidate_path = dir
                 .path()
@@ -115364,6 +116655,48 @@ mod tests {
                 &["idx_accounts", decoded_collation],
             );
         }
+        source.close().unwrap();
+    }
+
+    #[cfg(all(feature = "native", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn hfdt_0117_bounded_publication_preserves_single_quoted_partial_index_collation_on_reload() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("bounded-single-quoted-partial-source.db");
+        let candidate_path = dir
+            .path()
+            .join("bounded-single-quoted-partial-candidate.db");
+        let source = open_database_image_publication_source(&source_path, "delete");
+        let source_receipt = source.capture_database_image_receipt().unwrap();
+        create_database_image_publication_candidate(&candidate_path, "delete");
+        {
+            let sqlite = rusqlite::Connection::open(&candidate_path).unwrap();
+            sqlite
+                .execute(
+                    "CREATE INDEX idx_single_quoted_partial
+                     ON replacement_items(value)
+                     WHERE value COLLATE NOCASE = 'candidate-alpha';",
+                    [],
+                )
+                .unwrap();
+        }
+        rewrite_stock_sqlite_schema_sql(
+            &candidate_path,
+            "index",
+            "idx_single_quoted_partial",
+            "CREATE INDEX idx_single_quoted_partial
+             ON replacement_items(value)
+             WHERE value COLLATE 'tenant_single_partial' = 'candidate-alpha'",
+        );
+
+        assert_bounded_publication_shape_refusal_is_immutable(
+            &source,
+            &source_receipt,
+            &source_path,
+            &candidate_path,
+            &["idx_single_quoted_partial", "tenant_single_partial"],
+        );
         source.close().unwrap();
     }
 
@@ -115566,7 +116899,7 @@ mod tests {
             &source_receipt,
             &source_path,
             &candidate_path,
-            &["idx_deep_predicate", "fixed depth limit 512"],
+            &["idx_deep_predicate", "fixed rendering depth limit 512"],
         );
         source.close().unwrap();
     }
@@ -115611,8 +116944,12 @@ mod tests {
             )
             .expect_err("malformed sqlite_schema metadata must fail validation open");
         assert!(
-            !matches!(&error, FrankenError::Internal(_)),
-            "identity-bound validation open must preserve its typed error, got {error}"
+            matches!(
+                &error,
+                FrankenError::DatabaseCorrupt { detail }
+                    if detail.contains("invalid rootpage -1")
+            ),
+            "identity-bound validation open must preserve exact DatabaseCorrupt rootpage detail, got {error}"
         );
         assert!(
             !callback_called.get(),
