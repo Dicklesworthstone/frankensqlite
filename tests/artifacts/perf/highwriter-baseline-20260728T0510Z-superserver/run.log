@@ -1,0 +1,21 @@
+bench_elf_sha256=4132d5a74966fb73d3fc0bedb872f7d96e837b734cc5bbd4879545c5ae9e9892 (19318832 bytes) /data/tmp/claude-1000/-data-projects-frankensqlite/f5a994fd-7753-4768-9c20-6883f50192de/scratchpad/e2e-gate-target/release-perf/mt-mvcc-bench
+bench_source_sha256 /data/projects/frankensqlite/crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs:1eed9624e08773a3abd0ef54b18646ee67b6843bb8c28e0cf79b979c1d07a039:70183
+mt-mvcc-bench: rows_per_thread=1000 threads=[1, 8, 16, 32, 64, 128] paired_rounds=7 bootstrap_reps=10000 synchronous=NORMAL apples_to_apples=false separate_tables=false
+threads | fsqlite_wps | sqlite_wps | throughput_ratio | fsqlite_wps_p95 | fsqlite_wps_p99 | sqlite_wps_p95 | sqlite_wps_p99 | fsqlite_ms_p50 | fsqlite_ms_p95 | fsqlite_ms_p99 | sqlite_ms_p50 | sqlite_ms_p95 | sqlite_ms_p99 | time_ratio | fsqlite_failed | sqlite_failed
+      1 |      134577 |      65099 |             2.11x |          165995 |          168453 |          72987 |          74784 |           7.43 |           8.46 |           8.47 |         15.36 |         17.12 |         17.16 |       0.48x |              0 |             0
+case=shared_table threads=1 synchronous=NORMAL null_c_c ratio_median=0.932345 ci95=[0.782698,1.076345] cv_pct=19.990 mad=0.144000 cv_gate=never
+case=shared_table threads=1 synchronous=NORMAL claim_f_over_c ratio_median=2.111123 ci95=[1.897035,2.311372] cv_pct=11.824 mad=0.200249 fsqlite_p50_wps=134576.769 sqlite_p50_wps=65099.191 fsqlite_failed=0 sqlite_failed=0
+case=shared_table threads=1 median_ci_gate=FSQLITE_FASTER rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.217302 claim_margin=5.113 min_decidable_gain=1.434605 max_decidable_regression=0.565395
+      8 |      149638 |      54729 |             2.70x |          201640 |          219155 |          55868 |          55933 |          53.46 |          61.61 |          63.41 |        146.17 |        180.35 |        191.97 |       0.37x |              0 |             0
+case=shared_table threads=8 synchronous=NORMAL null_c_c ratio_median=0.996447 ci95=[0.989887,0.998506] cv_pct=30.392 mad=0.002059 cv_gate=never
+case=shared_table threads=8 synchronous=NORMAL claim_f_over_c ratio_median=2.702832 ci95=[2.537765,3.667380] cv_pct=22.386 mad=0.165067 fsqlite_p50_wps=149637.801 sqlite_p50_wps=54729.162 fsqlite_failed=0 sqlite_failed=0
+case=shared_table threads=8 median_ci_gate=FSQLITE_FASTER rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.010113 claim_margin=168.372 min_decidable_gain=1.020227 max_decidable_regression=0.979773
+     16 |      123457 |      18830 |             6.56x |          146437 |          148344 |          18886 |          18889 |         129.60 |         225.30 |         246.34 |        849.71 |        951.44 |        951.63 |       0.15x |              0 |             0
+case=shared_table threads=16 synchronous=NORMAL null_c_c ratio_median=1.142300 ci95=[0.995452,1.357273] cv_pct=25.646 mad=0.214814 cv_gate=never
+case=shared_table threads=16 synchronous=NORMAL claim_f_over_c ratio_median=6.556409 ci95=[5.231431,7.882942] cv_pct=26.560 mad=1.324977 fsqlite_p50_wps=123456.863 sqlite_p50_wps=18829.953 fsqlite_failed=0 sqlite_failed=0
+case=shared_table threads=16 median_ci_gate=FSQLITE_FASTER rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.357273 claim_margin=15.552 min_decidable_gain=1.714545 max_decidable_regression=0.285455
+     32 |       95434 |      13001 |             7.33x |          124147 |          127211 |          16095 |          17000 |         335.31 |        2273.69 |        2376.71 |       2461.28 |       2551.23 |       2580.89 |       0.14x |              0 |             0
+case=shared_table threads=32 synchronous=NORMAL null_c_c ratio_median=0.990459 ci95=[0.792817,1.002768] cv_pct=22.946 mad=0.055185 cv_gate=never
+case=shared_table threads=32 synchronous=NORMAL claim_f_over_c ratio_median=7.332626 ci95=[1.205358,7.473745] cv_pct=70.249 mad=1.538734 fsqlite_p50_wps=95433.545 sqlite_p50_wps=13001.382 fsqlite_failed=0 sqlite_failed=0
+case=shared_table threads=32 median_ci_gate=INCONCLUSIVE rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.207183 claim_margin=30.565 min_decidable_gain=1.414366 max_decidable_regression=0.585634
+error: [fsqlite t0] INSERT 0 exhausted retry budget after 1 retries: database is busy

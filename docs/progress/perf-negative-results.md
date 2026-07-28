@@ -48,6 +48,26 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-07-28 - MEASURED: first 1-128 writer scaling attempt — F/C grows 2.1x→7.3x through 32 writers; p95 latency convoying at 32 confirms the registry hypothesis; 64+ unmeasurable until the bench retry envelope scales
+
+- Post-revert tree a29e136d, mt-mvcc-bench ELF 4132d5a7…, shared table,
+  synchronous=NORMAL both arms, 7 paired rounds with same-invocation C/C
+  nulls, host superserver (64 logical CPUs, shared box — diagnostic-only).
+  Artifact: `tests/artifacts/perf/highwriter-baseline-20260728T0510Z-superserver/`.
+- Median-CI-gated: 1w 2.111x FASTER; 8w 2.703x FASTER; 16w 6.556x FASTER;
+  32w 7.333x median but INCONCLUSIVE (CV 70%). C collapses 65k→13k wps
+  under its single-writer lock while F holds 95-150k. Zero failed writes
+  through 32 writers on both engines.
+- ENGINE SIGNAL: F p95 per-txn latency 225ms@16 → 2,273ms@32 (10x for 2x
+  writers) with throughput nearly flat — convoying at a serialization
+  point, consistent with the concurrent_registry mutex held across
+  physical commit (the audit's named suspect). This is the instrumentation
+  target; fanout changes stay rejected until it is profiled.
+- HARNESS ENVELOPE: 64-writer arm aborts via the FIXED 5s wall-clock retry
+  budget (FSQLITE_RETRY_TIMEOUT, mt_mvcc_bench.rs:94) — queueing alone
+  exceeds it at 64×1000-row txns. bd-caa6u files the scaling fix; 64/128
+  rows are unmeasured, not bad.
+
 ## 2026-07-28 - REVERTED same-hour: platform scaling slice (7b2c2c61 → reverted at b5074aa4) — reachability audit invalidated all three claims
 
 - Target: aarch64 128B padding, 64→128 contention-table fanout, macOS
