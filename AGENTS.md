@@ -119,6 +119,13 @@ inherits = "release"
 opt-level = 3
 ```
 
+For HOST-TUNED perf measurement on a known machine (e.g. Zen3 Threadripper,
+Apple M-series), additionally set `RUSTFLAGS="-C target-cpu=native"` on the
+`release-perf` build. Never bake `target-cpu` into the shipped `release`
+profile or committed cargo config — release artifacts must stay
+baseline-portable — and record the flag in any perf artifact's provenance,
+since host-tuned and portable binaries are not comparable.
+
 ### Performance Negative Results Ledger
 
 Before starting performance work, read

@@ -48,6 +48,52 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-07-28 - REVERTED same-hour: platform scaling slice (7b2c2c61 → reverted at b5074aa4) — reachability audit invalidated all three claims
+
+- Target: aarch64 128B padding, 64→128 contention-table fanout, macOS
+  barrier-fsync. Landed at 7b2c2c61 and reverted at b5074aa4 within the
+  hour after RusticBasin's independent immutable-checkout audit (agent-mail
+  msgs 4467/4468/4470/4471) showed every headline claim was
+  reachability-unsound:
+  1. **Barrier-fsync was dead code**: production has ZERO callers of
+     `durable_sync(DataOnly|DataAndMetadata)` — every production call is
+     FullDurable, and real WAL/pager syncs go through legacy
+     `.sync(SyncFlags)`. Also stale premise: pinned Rust maps Apple
+     `sync_all` AND `sync_data` to F_FULLFSYNC already. Barrier is ordering,
+     not persistence — never a substitute for commit/checkpoint fences.
+     Retry condition: map the production sync call graph first, add a
+     distinct ordering-intent API, prove reachability via fcntl tracing,
+     phase-order + power-loss tests (bd-64uz9 reworked to carry this).
+  2. **The three 64s are not a writer ceiling**: LOCK_TABLE_SHARDS hashes
+     only pages >65536 (ordinary pages take direct atomic fast arrays);
+     CHAIN_HEAD_SHARDS is CONNECTION-LOCAL (one per SQL writer — sizing it
+     from the global writer cap is category confusion); the page-lock FC is
+     default-off (`mvcc-flat-combining`) and its slots serve a rare fallback
+     shard. History I failed to mine before editing: 256→64 was an
+     INTENTIONAL reduction and several sharded variants were
+     benchmark-reverted. The likely real 64+ writer bottleneck is the
+     concurrent_registry mutex held across physical commit + active commit
+     sequence allocation. Retry condition: instrument (a) the
+     registry/commit critical section and (b) >65536-fallback frequency and
+     shard-wait BEFORE any fanout change; then SHA-stamped pinned-worker
+     1/8/16/32/64/128 ABBA runs.
+  3. **aarch64 padding was mis-scoped**: `cfg(target_arch = "aarch64")`
+     overpads Linux-ARM (Graviton = 64B lines), misses Rosetta, and the
+     audit found aarch64 layout tests that break deterministically. Retry
+     condition: Apple-vendor-scoped design, matrix {Intel Mac, native
+     M-series, Rosetta, Graviton}, origin-64 vs apple-128 vs runtime-stride
+     with contention AND single-thread/RSS controls.
+- Process lesson (why this entry exists): I changed contention constants
+  without mining the ledger/history for fanout-specific reversions — the
+  exact failure mode the ledger preamble warns about. The audit caught it
+  pre-merge-damage because reservations + agent-mail worked as designed.
+- Kept from the slice (re-landed separately, uncontested): the fsqlite-mvcc
+  `test-internals` dev-dep (standalone `cargo test -p fsqlite-mvcc` had been
+  compile-broken; sibling crates already carry it) and the AGENTS.md
+  host-tuned target-cpu documentation. Also durable: seqlock's two
+  throughput tests are load-flaky (solo-green receipts); bd-fmkbv's 6 pager
+  failures reproduced byte-identical on this tree (826/6/11).
+
 ## 2026-07-28 - MEASURED: release-perf post-fix truth for the subquery section — fixes hold at full optimization; residual is a ~50-60µs FLAT parameterized-execution tax (bd-5zeai), not subquery logic
 
 - First release-perf (opt-level=3) run of the section post-fa85adfc/5d35b79e
