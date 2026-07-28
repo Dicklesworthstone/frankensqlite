@@ -31371,7 +31371,16 @@ impl Connection {
         if !select_has_correlated_exists_in_where(select) {
             return false;
         }
-        !self.select_correlated_exists_where_can_use_indexed_count_probe(select)
+        if self.select_correlated_exists_where_can_use_indexed_count_probe(select) {
+            return false;
+        }
+        // bd-8sfs3: the memdb probe above requires an integer-literal rowid
+        // bound (`select_rowid_upper_bound_exclusive`), but the compiled
+        // semijoin/rowid-probe path binds placeholders per execution via
+        // Opcode::Variable. When every correlated EXISTS in the WHERE is the
+        // one shape the VDBE compiles correctly, stay on the compiled path
+        // instead of the per-outer-row nested-statement fallback.
+        !select_correlated_exists_in_where_all_match_count_semijoin_shape(select)
     }
 
     async fn execute_correlated_subquery_where_fallback(
@@ -72630,7 +72639,17 @@ fn exists_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -
         // frankensim-kl17o: parameter-dependent subqueries survive the
         // prepare-time rewrite un-folded and must route through dispatch
         // paths that bind placeholders at execution.
-        || select_contains_any_placeholder(sub)
+        //
+        // bd-8sfs3 carve-out: the correlated count-semijoin probe shape
+        // never goes through the prepare-time rewrite — its residual bound
+        // lowers through emit_expr to Opcode::Variable and is bound fresh at
+        // every execution, so placeholders are native to its compiled form.
+        // Without this exception the parameterized variant of the shape fell
+        // to the per-outer-row nested-statement fallback (one full
+        // execute_statement per outer row: ~26,000x slower than the
+        // compiled CountIndexEqRun plan at 10k outer rows).
+        || (select_contains_any_placeholder(sub)
+            && !correlated_exists_matches_count_semijoin_shape(sub))
     {
         return false;
     }
@@ -75057,6 +75076,30 @@ fn select_has_correlated_exists_in_where(select: &SelectStatement) -> bool {
     where_clause
         .as_deref()
         .is_some_and(expr_has_correlated_exists)
+}
+
+/// True when every correlated EXISTS subquery in the WHERE clause matches the
+/// indexed count-semijoin probe shape (`correlated_exists_matches_count_semijoin_shape`)
+/// — the one correlated shape the compiled path handles correctly, including
+/// placeholder residual bounds (bd-8sfs3). Callers must have already
+/// established that at least one correlated EXISTS is present.
+fn select_correlated_exists_in_where_all_match_count_semijoin_shape(
+    select: &SelectStatement,
+) -> bool {
+    let SelectCore::Select { where_clause, .. } = &select.body.select else {
+        return false;
+    };
+    let Some(where_expr) = where_clause.as_deref() else {
+        return false;
+    };
+    !expr_contains_subquery_match(where_expr, &mut |sub| {
+        matches!(
+            sub,
+            SubqueryExprRef::Exists(inner)
+                if is_correlated_subquery(inner)
+                    && !correlated_exists_matches_count_semijoin_shape(inner)
+        )
+    })
 }
 
 /// Return true if the WHERE clause contains a correlated `x IN (SELECT ...)`
@@ -102261,6 +102304,109 @@ mod tests {
 
             let row = stmt.query_row().await.unwrap();
             assert_eq!(row.values()[0], SqliteValue::Integer(4));
+        });
+    }
+
+    /// bd-8sfs3: the parameterized variant of the count-semijoin shape must
+    /// take the same compiled path as the literal variant. Before the router
+    /// carve-outs, `?1` inside the subquery forced deferred dispatch and a
+    /// per-outer-row nested-statement fallback (~26,000x slower at 10k rows).
+    #[test]
+    fn test_prepared_statement_exists_subquery_with_placeholder_uses_compiled_path() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(
+                "CREATE TABLE products (id INTEGER PRIMARY KEY, category_id INTEGER NOT NULL);",
+            )
+            .await
+            .unwrap();
+            conn.execute("CREATE TABLE categories (id INTEGER PRIMARY KEY, name TEXT);")
+                .await
+                .unwrap();
+            conn.execute("CREATE INDEX idx_prod_cat ON products(category_id);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO categories VALUES (1, 'cat_1'), (2, 'cat_2'), (3, 'cat_3');")
+                .await
+                .unwrap();
+            conn.execute(
+                "INSERT INTO products VALUES (1, 1), (2, 2), (3, 3), (4, 1), (5, 4), (6, 2);",
+            )
+            .await
+            .unwrap();
+
+            let stmt = conn
+            .prepare(
+                "SELECT COUNT(*) FROM products p WHERE EXISTS (SELECT 1 FROM categories c WHERE c.id = p.category_id AND c.id <= ?1)",
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                stmt.deferred_query_statement.is_none(),
+                "a placeholder residual bound must not evict the count-semijoin shape from the compiled path"
+            );
+            assert!(
+                stmt.program
+                    .ops()
+                    .iter()
+                    .any(|op| op.opcode == Opcode::CountIndexEqRun),
+                "the parameterized semijoin must fuse duplicate-run counting exactly like the literal variant"
+            );
+            assert!(
+                stmt.program
+                    .ops()
+                    .iter()
+                    .any(|op| op.opcode == Opcode::Variable),
+                "the placeholder bound must lower to Opcode::Variable so it rebinds per execution"
+            );
+
+            // Rebinding must re-evaluate the bound: each threshold admits a
+            // different category set (products' category_ids: 1,2,3,1,4,2).
+            for (threshold, expected) in [(2_i64, 4_i64), (1, 2), (3, 5), (0, 0)] {
+                let row = stmt
+                    .query_row_with_params(&[SqliteValue::Integer(threshold)])
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    row.values()[0],
+                    SqliteValue::Integer(expected),
+                    "threshold {threshold} must count products whose category_id has a category with id <= {threshold}"
+                );
+            }
+
+            // The same carve-outs also route the non-aggregate variant to the
+            // compiled per-row probe (previously Gate B forced it to the
+            // fallback even with a literal bound). Verify row-set parity
+            // across rebinds.
+            let list_stmt = conn
+            .prepare(
+                "SELECT p.id FROM products p WHERE EXISTS (SELECT 1 FROM categories c WHERE c.id = p.category_id AND c.id <= ?1) ORDER BY p.id",
+            )
+            .await
+            .unwrap();
+            for (threshold, expected_ids) in [
+                (2_i64, vec![1_i64, 2, 4, 6]),
+                (1, vec![1, 4]),
+                (3, vec![1, 2, 3, 4, 6]),
+                (0, vec![]),
+            ] {
+                let rows = list_stmt
+                    .query_with_params(&[SqliteValue::Integer(threshold)])
+                    .await
+                    .unwrap();
+                let ids: Vec<i64> = rows
+                    .iter()
+                    .map(|row| match row.values()[0] {
+                        SqliteValue::Integer(id) => id,
+                        ref other => panic!("expected integer id, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    ids, expected_ids,
+                    "threshold {threshold} must select exactly the products whose category has id <= {threshold}"
+                );
+            }
         });
     }
 
