@@ -25,6 +25,11 @@
 //!   FSQLITE_BENCH_PERF_CTL=`<fifo>`      Enable/disable an attached perf session around exact DML windows.
 //!   FSQLITE_BENCH_PERF_ACK=`<fifo>`      Wait for perf control acknowledgements before crossing each boundary.
 
+// bd-mnlk2 / bd-zavyn: the hoisted timed windows await fsqlite-core's
+// deliberately large, deeply nested engine futures inside one runtime entry
+// per sample; boxing them would put an allocation inside the timed window.
+#![allow(clippy::large_futures)]
+
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};

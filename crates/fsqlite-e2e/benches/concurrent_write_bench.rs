@@ -1,4 +1,8 @@
 #![recursion_limit = "512"]
+// bd-mnlk2 / bd-zavyn: the hoisted timed bodies await fsqlite-core's
+// deliberately large, deeply nested engine futures inside one runtime entry
+// per sample; boxing them would put an allocation inside the timed window.
+#![allow(clippy::large_futures)]
 
 //! Benchmark: concurrent write throughput (2/4/8 threads).
 //!
@@ -127,24 +131,26 @@ fn bench_concurrent_csqlite(c: &mut Criterion, n_threads: usize, label: &str) {
                 conn
             },
             |conn| {
-                let stmt = fsqlite_e2e::block_on(
-                    conn.prepare("INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7));"),
-                )
-                .unwrap();
-                for tid in 0..n_threads {
-                    fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
-                    #[allow(clippy::cast_possible_wrap)]
-                    let base = tid as i64 * RANGE_SIZE;
-                    for i in 0..ROWS_PER_THREAD {
-                        black_box(
-                            fsqlite_e2e::block_on(
-                                stmt.execute_with_params(&[SqliteValue::Integer(base + i)]),
-                            )
-                            .unwrap(),
-                        );
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    let stmt = conn
+                        .prepare("INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7));")
+                        .await
+                        .unwrap();
+                    for tid in 0..n_threads {
+                        conn.execute("BEGIN").await.unwrap();
+                        #[allow(clippy::cast_possible_wrap)]
+                        let base = tid as i64 * RANGE_SIZE;
+                        for i in 0..ROWS_PER_THREAD {
+                            black_box(
+                                stmt.execute_with_params(&[SqliteValue::Integer(base + i)])
+                                    .await
+                                    .unwrap(),
+                            );
+                        }
+                        conn.execute("COMMIT").await.unwrap();
                     }
-                    fsqlite_e2e::block_on(conn.execute("COMMIT")).unwrap();
-                }
+                });
             },
             criterion::BatchSize::LargeInput,
         );

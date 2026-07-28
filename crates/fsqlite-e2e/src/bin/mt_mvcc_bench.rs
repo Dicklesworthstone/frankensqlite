@@ -57,6 +57,12 @@
 //!   C/C A/A null. The verdict uses a bootstrap CI for the per-round median
 //!   ratio; CV and MAD are provenance only.
 
+// bd-mnlk2 / bd-zavyn: the hoisted timed windows await fsqlite-core's
+// deliberately large, deeply nested engine futures inside one runtime entry
+// per transaction attempt; boxing them would put an allocation inside the
+// timed window.
+#![allow(clippy::large_futures)]
+
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
@@ -488,7 +494,7 @@ fn median(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
     let upper = values.len() / 2;
     if values.len() % 2 == 0 {
-        (values[upper - 1] + values[upper]) / 2.0
+        f64::midpoint(values[upper - 1], values[upper])
     } else {
         values[upper]
     }

@@ -1,4 +1,11 @@
 #![recursion_limit = "512"]
+// bd-mnlk2 / bd-zavyn: the consolidated timed bodies await fsqlite-core's
+// deliberately non-`Send`, deeply nested engine futures inside one runtime
+// entry per sample; `future_not_send` and `large_futures` contradict that
+// design (see fsqlite-core/src/lib.rs for the full rationale, including why
+// boxing was rejected by the perf ledger).
+#![allow(clippy::future_not_send)]
+#![allow(clippy::large_futures)]
 
 //! Benchmark: single-threaded sequential write throughput.
 //!
@@ -75,19 +82,22 @@ fn run_csqlite_ad_hoc_inserts(conn: &rusqlite::Connection, start: i64, end: i64)
     }
 }
 
-fn run_fsqlite_prepared_inserts(conn: &fsqlite::Connection, start: i64, end: i64) {
-    let stmt = fsqlite_e2e::block_on(conn.prepare(INSERT_SQL)).unwrap();
+async fn run_fsqlite_prepared_inserts(conn: &fsqlite::Connection, start: i64, end: i64) {
+    let stmt = conn.prepare(INSERT_SQL).await.unwrap();
     for i in start..end {
         black_box(
-            fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)])).unwrap(),
+            stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                .await
+                .unwrap(),
         );
     }
 }
 
-fn run_fsqlite_ad_hoc_inserts(conn: &fsqlite::Connection, start: i64, end: i64) {
+async fn run_fsqlite_ad_hoc_inserts(conn: &fsqlite::Connection, start: i64, end: i64) {
     for i in start..end {
         black_box(
-            fsqlite_e2e::block_on(conn.execute_with_params(INSERT_SQL, &[SqliteValue::Integer(i)]))
+            conn.execute_with_params(INSERT_SQL, &[SqliteValue::Integer(i)])
+                .await
                 .unwrap(),
         );
     }
@@ -101,8 +111,8 @@ fn verify_row_count_csqlite(conn: &rusqlite::Connection) {
     assert_eq!(count, ROW_COUNT);
 }
 
-fn verify_row_count_fsqlite(conn: &fsqlite::Connection) {
-    let rows = fsqlite_e2e::block_on(conn.query("SELECT COUNT(*) FROM bench")).unwrap();
+async fn verify_row_count_fsqlite(conn: &fsqlite::Connection) {
+    let rows = conn.query("SELECT COUNT(*) FROM bench").await.unwrap();
     black_box(&rows);
     assert_eq!(rows[0].values()[0], SqliteValue::Integer(ROW_COUNT));
 }
@@ -166,8 +176,11 @@ fn bench_write_autocommit(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                run_fsqlite_prepared_inserts(&conn, 0, ROW_COUNT);
-                verify_row_count_fsqlite(&conn);
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    run_fsqlite_prepared_inserts(&conn, 0, ROW_COUNT).await;
+                    verify_row_count_fsqlite(&conn).await;
+                });
             },
             BatchSize::LargeInput,
         );
@@ -182,8 +195,11 @@ fn bench_write_autocommit(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                run_fsqlite_ad_hoc_inserts(&conn, 0, ROW_COUNT);
-                verify_row_count_fsqlite(&conn);
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    run_fsqlite_ad_hoc_inserts(&conn, 0, ROW_COUNT).await;
+                    verify_row_count_fsqlite(&conn).await;
+                });
             },
             BatchSize::LargeInput,
         );
@@ -255,13 +271,16 @@ fn bench_write_batched(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                for batch in 0..NUM_BATCHES {
-                    fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
-                    let start = batch * BATCH_SIZE;
-                    run_fsqlite_prepared_inserts(&conn, start, start + BATCH_SIZE);
-                    fsqlite_e2e::block_on(conn.execute("COMMIT")).unwrap();
-                }
-                verify_row_count_fsqlite(&conn);
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    for batch in 0..NUM_BATCHES {
+                        conn.execute("BEGIN").await.unwrap();
+                        let start = batch * BATCH_SIZE;
+                        run_fsqlite_prepared_inserts(&conn, start, start + BATCH_SIZE).await;
+                        conn.execute("COMMIT").await.unwrap();
+                    }
+                    verify_row_count_fsqlite(&conn).await;
+                });
             },
             BatchSize::LargeInput,
         );
@@ -276,13 +295,16 @@ fn bench_write_batched(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                for batch in 0..NUM_BATCHES {
-                    fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
-                    let start = batch * BATCH_SIZE;
-                    run_fsqlite_ad_hoc_inserts(&conn, start, start + BATCH_SIZE);
-                    fsqlite_e2e::block_on(conn.execute("COMMIT")).unwrap();
-                }
-                verify_row_count_fsqlite(&conn);
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    for batch in 0..NUM_BATCHES {
+                        conn.execute("BEGIN").await.unwrap();
+                        let start = batch * BATCH_SIZE;
+                        run_fsqlite_ad_hoc_inserts(&conn, start, start + BATCH_SIZE).await;
+                        conn.execute("COMMIT").await.unwrap();
+                    }
+                    verify_row_count_fsqlite(&conn).await;
+                });
             },
             BatchSize::LargeInput,
         );
@@ -348,10 +370,13 @@ fn bench_write_single_txn(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
-                run_fsqlite_prepared_inserts(&conn, 0, ROW_COUNT);
-                fsqlite_e2e::block_on(conn.execute("COMMIT")).unwrap();
-                verify_row_count_fsqlite(&conn);
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    conn.execute("BEGIN").await.unwrap();
+                    run_fsqlite_prepared_inserts(&conn, 0, ROW_COUNT).await;
+                    conn.execute("COMMIT").await.unwrap();
+                    verify_row_count_fsqlite(&conn).await;
+                });
             },
             BatchSize::LargeInput,
         );
@@ -366,10 +391,13 @@ fn bench_write_single_txn(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
-                run_fsqlite_ad_hoc_inserts(&conn, 0, ROW_COUNT);
-                fsqlite_e2e::block_on(conn.execute("COMMIT")).unwrap();
-                verify_row_count_fsqlite(&conn);
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    conn.execute("BEGIN").await.unwrap();
+                    run_fsqlite_ad_hoc_inserts(&conn, 0, ROW_COUNT).await;
+                    conn.execute("COMMIT").await.unwrap();
+                    verify_row_count_fsqlite(&conn).await;
+                });
             },
             BatchSize::LargeInput,
         );

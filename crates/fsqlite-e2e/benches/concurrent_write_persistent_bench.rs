@@ -29,6 +29,14 @@
 //!   `component_comparison.{json,md}` artifacts without changing default
 //!   stderr output
 
+// bd-mnlk2 / bd-zavyn: the consolidated timed bodies await fsqlite-core's
+// deliberately non-`Send`, deeply nested engine futures inside one runtime
+// entry per transaction attempt; `future_not_send` and `large_futures`
+// contradict that design (see fsqlite-core/src/lib.rs for the full rationale,
+// including why boxing was rejected by the perf ledger).
+#![allow(clippy::future_not_send)]
+#![allow(clippy::large_futures)]
+
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -96,7 +104,7 @@ fn apply_setup_pragmas_fsqlite(conn: &fsqlite::Connection) {
     }
 }
 
-fn apply_session_pragmas_fsqlite(conn: &fsqlite::Connection) {
+async fn apply_session_pragmas_fsqlite(conn: &fsqlite::Connection) {
     for pragma in [
         "PRAGMA journal_mode = WAL;",
         "PRAGMA synchronous = NORMAL;",
@@ -104,7 +112,9 @@ fn apply_session_pragmas_fsqlite(conn: &fsqlite::Connection) {
         "PRAGMA busy_timeout = 0;",
         "PRAGMA fsqlite.concurrent_mode = ON;",
     ] {
-        run_fsqlite_pragma(conn, pragma);
+        conn.execute(pragma).await.unwrap_or_else(|error| {
+            panic!("failed to execute benchmark pragma `{pragma}`: {error:?}")
+        });
     }
 }
 
@@ -802,13 +812,30 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                         let op_timings = operation_timings.clone();
                         let per_thread_retry_stages = retry_stage_counts.clone();
                         thread::spawn(move || {
-                            let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(&p))
-                                .expect("open FrankenSQLite writer connection");
-                            apply_session_pragmas_fsqlite(&conn);
+                            // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                            let conn = fsqlite_e2e::block_on(async {
+                                let conn = fsqlite::Connection::open(&p)
+                                    .await
+                                    .expect("open FrankenSQLite writer connection");
+                                apply_session_pragmas_fsqlite(&conn).await;
+                                conn
+                            });
                             let insert_stmt = insert_sql(tid);
+                            // `PreparedStatement` borrows the connection, so the
+                            // prepare stays its own (per-thread, pre-loop) entry.
                             let stmt = fsqlite_e2e::block_on(conn.prepare(&insert_stmt))
                                 .expect("prepare FrankenSQLite INSERT");
                             bar.wait();
+
+                            // Stage-tagged outcome of one transaction attempt so
+                            // retry classification, rollback, and backoff stay
+                            // outside the entered runtime.
+                            enum AttemptOutcome {
+                                Committed,
+                                BeginFailed(FrankenError),
+                                InsertFailed(FrankenError),
+                                CommitFailed(FrankenError),
+                            }
 
                             for i in 0..ROWS_PER_THREAD {
                                 // Each thread writes to its own table, so row IDs can match
@@ -819,136 +846,143 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                 let mut retry_count = 0u32;
 
                                 'txn: loop {
-                                    // BEGIN CONCURRENT with retry
-                                    loop {
+                                    // bd-mnlk2 / bd-zavyn: one runtime entry per transaction attempt; backoff stays outside the runtime.
+                                    let outcome = fsqlite_e2e::block_on(async {
+                                        // BEGIN CONCURRENT
                                         let begin_start = Instant::now();
-                                        match fsqlite_e2e::block_on(
-                                            conn.execute("BEGIN CONCURRENT"),
-                                        ) {
-                                            Ok(_) => {
-                                                operation_timing.begin_retry_handoff +=
-                                                    begin_start.elapsed();
-                                                break;
-                                            }
-                                            Err(e) => {
-                                                operation_timing.begin_retry_handoff +=
-                                                    begin_start.elapsed();
-                                                if is_retryable_fsqlite_error(&e) {
-                                                    conflicts.fetch_add(1, Ordering::Relaxed);
-                                                    retry_count += 1;
-                                                    {
-                                                        let mut retry_counts =
-                                                            per_thread_retry_stages[tid]
-                                                                .lock()
-                                                                .unwrap();
-                                                        retry_counts.total_retries = retry_counts
-                                                            .total_retries
-                                                            .saturating_add(1);
-                                                        retry_counts.begin_retries = retry_counts
-                                                            .begin_retries
-                                                            .saturating_add(1);
-                                                    }
-                                                    if retry_count >= MAX_TXN_RETRIES {
-                                                        panic!(
-                                                            "BEGIN CONCURRENT failed after {MAX_TXN_RETRIES} retries: {e:?}"
-                                                        );
-                                                    }
-                                                    sleep_with_accounting(
-                                                        &mut operation_timing,
-                                                        RETRY_BACKOFF,
-                                                    );
-                                                } else {
-                                                    panic!("BEGIN CONCURRENT failed: {e:?}");
-                                                }
-                                            }
+                                        let begin_result = conn.execute("BEGIN CONCURRENT").await;
+                                        operation_timing.begin_retry_handoff +=
+                                            begin_start.elapsed();
+                                        if let Err(e) = begin_result {
+                                            return AttemptOutcome::BeginFailed(e);
                                         }
-                                    }
 
-                                    // INSERT
-                                    let execute_start = Instant::now();
-                                    if let Err(e) = fsqlite_e2e::block_on(
-                                        stmt.execute_with_params(&[SqliteValue::Integer(row_id)]),
-                                    )
-                                    {
+                                        // INSERT
+                                        let execute_start = Instant::now();
+                                        let insert_result = stmt
+                                            .execute_with_params(&[SqliteValue::Integer(row_id)])
+                                            .await;
                                         operation_timing.statement_execute_body +=
                                             execute_start.elapsed();
-                                        if is_duplicate_insert_after_retry(&e) {
-                                            // Row already exists (from previous retry that actually committed)
-                                            {
-                                                let mut retry_counts =
-                                                    per_thread_retry_stages[tid]
-                                                        .lock()
-                                                        .unwrap();
-                                                retry_counts.duplicate_after_retry_exits =
-                                                    retry_counts
-                                                        .duplicate_after_retry_exits
-                                                        .saturating_add(1);
-                                            }
-                                            let rollback_start = Instant::now();
-                                            rollback_fsqlite(
-                                                &conn,
-                                                "duplicate INSERT after retry",
-                                            );
-                                            operation_timing.rollback_cleanup +=
-                                                rollback_start.elapsed();
-                                            break 'txn;
+                                        if let Err(e) = insert_result {
+                                            return AttemptOutcome::InsertFailed(e);
                                         }
-                                        if is_retryable_fsqlite_error(&e)
-                                            || matches!(e, FrankenError::SerializationFailure { .. })
-                                        {
-                                            // Snapshot conflict — rollback and retry
-                                            conflicts.fetch_add(1, Ordering::Relaxed);
-                                            let rollback_start = Instant::now();
-                                            rollback_fsqlite(&conn, "INSERT conflict");
-                                            operation_timing.rollback_cleanup +=
-                                                rollback_start.elapsed();
-                                            retry_count += 1;
-                                            {
-                                                let mut retry_counts =
-                                                    per_thread_retry_stages[tid]
-                                                        .lock()
-                                                        .unwrap();
-                                                retry_counts.total_retries = retry_counts
-                                                    .total_retries
-                                                    .saturating_add(1);
-                                                retry_counts.body_retries = retry_counts
-                                                    .body_retries
-                                                    .saturating_add(1);
-                                            }
-                                            if retry_count >= MAX_TXN_RETRIES {
-                                                panic!("INSERT failed after {MAX_TXN_RETRIES} retries: {e:?}");
-                                            }
-                                            sleep_with_accounting(
-                                                &mut operation_timing,
-                                                RETRY_BACKOFF,
-                                            );
-                                            continue 'txn;
-                                        }
-                                        if is_corruption_error(&e) {
-                                            let rollback_start = Instant::now();
-                                            rollback_fsqlite(&conn, "corrupt INSERT");
-                                            operation_timing.rollback_cleanup +=
-                                                rollback_start.elapsed();
-                                            panic!("CORRUPTION DETECTED: {e:?}");
-                                        }
-                                        panic!("INSERT failed: {e:?}");
-                                    }
-                                    operation_timing.statement_execute_body +=
-                                        execute_start.elapsed();
 
-                                    // COMMIT with retry
-                                    let commit_start = Instant::now();
-                                    match fsqlite_e2e::block_on(conn.execute("COMMIT")) {
-                                        Ok(_) => {
-                                            operation_timing.commit_roundtrip +=
-                                                commit_start.elapsed();
-                                            break 'txn;
+                                        // COMMIT
+                                        let commit_start = Instant::now();
+                                        let commit_result = conn.execute("COMMIT").await;
+                                        operation_timing.commit_roundtrip +=
+                                            commit_start.elapsed();
+                                        match commit_result {
+                                            Ok(_) => AttemptOutcome::Committed,
+                                            Err(e) => AttemptOutcome::CommitFailed(e),
                                         }
-                                        Err(e) => {
-                                            operation_timing.commit_roundtrip +=
-                                                commit_start.elapsed();
+                                    });
+
+                                    match outcome {
+                                        AttemptOutcome::Committed => break 'txn,
+                                        AttemptOutcome::BeginFailed(e) => {
+                                            if is_retryable_fsqlite_error(&e) {
+                                                conflicts.fetch_add(1, Ordering::Relaxed);
+                                                retry_count += 1;
+                                                {
+                                                    let mut retry_counts =
+                                                        per_thread_retry_stages[tid]
+                                                            .lock()
+                                                            .unwrap();
+                                                    retry_counts.total_retries = retry_counts
+                                                        .total_retries
+                                                        .saturating_add(1);
+                                                    retry_counts.begin_retries = retry_counts
+                                                        .begin_retries
+                                                        .saturating_add(1);
+                                                }
+                                                if retry_count >= MAX_TXN_RETRIES {
+                                                    panic!(
+                                                        "BEGIN CONCURRENT failed after {MAX_TXN_RETRIES} retries: {e:?}"
+                                                    );
+                                                }
+                                                sleep_with_accounting(
+                                                    &mut operation_timing,
+                                                    RETRY_BACKOFF,
+                                                );
+                                            } else {
+                                                panic!("BEGIN CONCURRENT failed: {e:?}");
+                                            }
+                                        }
+                                        AttemptOutcome::InsertFailed(e) => {
+                                            if is_duplicate_insert_after_retry(&e) {
+                                                // Row already exists (from previous retry that actually committed)
+                                                {
+                                                    let mut retry_counts =
+                                                        per_thread_retry_stages[tid]
+                                                            .lock()
+                                                            .unwrap();
+                                                    retry_counts.duplicate_after_retry_exits =
+                                                        retry_counts
+                                                            .duplicate_after_retry_exits
+                                                            .saturating_add(1);
+                                                }
+                                                let rollback_start = Instant::now();
+                                                rollback_fsqlite(
+                                                    &conn,
+                                                    "duplicate INSERT after retry",
+                                                );
+                                                operation_timing.rollback_cleanup +=
+                                                    rollback_start.elapsed();
+                                                break 'txn;
+                                            }
                                             if is_retryable_fsqlite_error(&e)
-                                                || matches!(e, FrankenError::SerializationFailure { .. })
+                                                || matches!(
+                                                    e,
+                                                    FrankenError::SerializationFailure { .. }
+                                                )
+                                            {
+                                                // Snapshot conflict — rollback and retry
+                                                conflicts.fetch_add(1, Ordering::Relaxed);
+                                                let rollback_start = Instant::now();
+                                                rollback_fsqlite(&conn, "INSERT conflict");
+                                                operation_timing.rollback_cleanup +=
+                                                    rollback_start.elapsed();
+                                                retry_count += 1;
+                                                {
+                                                    let mut retry_counts =
+                                                        per_thread_retry_stages[tid]
+                                                            .lock()
+                                                            .unwrap();
+                                                    retry_counts.total_retries = retry_counts
+                                                        .total_retries
+                                                        .saturating_add(1);
+                                                    retry_counts.body_retries = retry_counts
+                                                        .body_retries
+                                                        .saturating_add(1);
+                                                }
+                                                if retry_count >= MAX_TXN_RETRIES {
+                                                    panic!(
+                                                        "INSERT failed after {MAX_TXN_RETRIES} retries: {e:?}"
+                                                    );
+                                                }
+                                                sleep_with_accounting(
+                                                    &mut operation_timing,
+                                                    RETRY_BACKOFF,
+                                                );
+                                                continue 'txn;
+                                            }
+                                            if is_corruption_error(&e) {
+                                                let rollback_start = Instant::now();
+                                                rollback_fsqlite(&conn, "corrupt INSERT");
+                                                operation_timing.rollback_cleanup +=
+                                                    rollback_start.elapsed();
+                                                panic!("CORRUPTION DETECTED: {e:?}");
+                                            }
+                                            panic!("INSERT failed: {e:?}");
+                                        }
+                                        AttemptOutcome::CommitFailed(e) => {
+                                            if is_retryable_fsqlite_error(&e)
+                                                || matches!(
+                                                    e,
+                                                    FrankenError::SerializationFailure { .. }
+                                                )
                                             {
                                                 conflicts.fetch_add(1, Ordering::Relaxed);
                                                 let rollback_start = Instant::now();
@@ -969,7 +1003,9 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                                                         .saturating_add(1);
                                                 }
                                                 if retry_count >= MAX_TXN_RETRIES {
-                                                    panic!("COMMIT failed after {MAX_TXN_RETRIES} retries: {e:?}");
+                                                    panic!(
+                                                        "COMMIT failed after {MAX_TXN_RETRIES} retries: {e:?}"
+                                                    );
                                                 }
                                                 sleep_with_accounting(
                                                     &mut operation_timing,

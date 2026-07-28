@@ -803,6 +803,48 @@ fn normalize_fsqlite_value(value: &fsqlite::SqliteValue) -> String {
     }
 }
 
+/// One-time cross-engine result-set oracle for multi-row benchmark queries
+/// (bd-czzlp): both engines run `sql` once, outside the timed loops, and the
+/// normalized results must match as multisets. Ordering is not compared
+/// because these shapes carry no ORDER BY.
+fn assert_result_set_oracle(
+    cs_conn: &rusqlite::Connection,
+    fs_conn: &fsqlite::Connection,
+    sql: &str,
+    context: &str,
+) {
+    let mut stmt = cs_conn
+        .prepare(sql)
+        .unwrap_or_else(|e| panic!("{context}: C SQLite prepare failed: {e}"));
+    let col_count = stmt.column_count();
+    let mut cs_rows: Vec<Vec<String>> = stmt
+        .query_map([], |row| {
+            let mut values = Vec::with_capacity(col_count);
+            for idx in 0..col_count {
+                values.push(normalize_csqlite_value(row.get_ref(idx)?));
+            }
+            Ok(values)
+        })
+        .unwrap_or_else(|e| panic!("{context}: C SQLite query failed: {e}"))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|e| panic!("{context}: C SQLite row decode failed: {e}"));
+    let mut fs_rows: Vec<Vec<String>> = fsqlite_e2e::block_on(fs_conn.query(sql))
+        .unwrap_or_else(|e| panic!("{context}: FrankenSQLite query failed: {e}"))
+        .iter()
+        .map(|row| row.values().iter().map(normalize_fsqlite_value).collect())
+        .collect();
+    assert_eq!(
+        cs_rows.len(),
+        fs_rows.len(),
+        "{context}: row-count mismatch (C={}, F={})",
+        cs_rows.len(),
+        fs_rows.len()
+    );
+    cs_rows.sort_unstable();
+    fs_rows.sort_unstable();
+    assert_eq!(cs_rows, fs_rows, "{context}: result-set mismatch");
+}
+
 fn normalize_effective_pragma_value(pragma: &str, value: String) -> Result<String, String> {
     if !pragma.eq_ignore_ascii_case("synchronous") {
         return Ok(value);
@@ -10877,18 +10919,15 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
 
         // Scalar subquery in SELECT.
         eprint!("    Scalar subquery in SELECT... ");
+        let scalar_sub_sql = "SELECT p.name, (SELECT c.name FROM categories c WHERE c.id = p.category_id) AS cat_name FROM products p LIMIT 100";
+        assert_result_set_oracle(&cs_conn, &fs_conn, scalar_sub_sql, "scalar-subquery oracle");
         let cs = {
-            let mut stmt = cs_conn.prepare(
-                "SELECT p.name, (SELECT c.name FROM categories c WHERE c.id = p.category_id) AS cat_name FROM products p LIMIT 100"
-            ).unwrap();
+            let mut stmt = cs_conn.prepare(scalar_sub_sql).unwrap();
             measure(&format!("cs_scalar_sub_{count}"), 100, || {
                 let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
-        let fs_stmt = fs_prepare(
-            &fs_conn,
-            "SELECT p.name, (SELECT c.name FROM categories c WHERE c.id = p.category_id) AS cat_name FROM products p LIMIT 100",
-        );
+        let fs_stmt = fs_prepare(&fs_conn, scalar_sub_sql);
         let fs = measure(&format!("fs_scalar_sub_{count}"), 100, || {
             std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
         });
@@ -11022,20 +11061,16 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
 
         // CTE (non-recursive).
         eprint!("    CTE (non-recursive)... ");
+        let cte_join_sql = "WITH top_cats AS (SELECT category_id, SUM(price) AS total FROM products GROUP BY category_id ORDER BY total DESC LIMIT 5) \
+             SELECT p.name, p.price FROM products p JOIN top_cats tc ON p.category_id = tc.category_id";
+        assert_result_set_oracle(&cs_conn, &fs_conn, cte_join_sql, "CTE+JOIN oracle");
         let cs = {
-            let mut stmt = cs_conn.prepare(
-                "WITH top_cats AS (SELECT category_id, SUM(price) AS total FROM products GROUP BY category_id ORDER BY total DESC LIMIT 5) \
-                 SELECT p.name, p.price FROM products p JOIN top_cats tc ON p.category_id = tc.category_id"
-            ).unwrap();
+            let mut stmt = cs_conn.prepare(cte_join_sql).unwrap();
             measure(&format!("cs_cte_{count}"), count, || {
                 let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
-        let fs_stmt = fs_prepare(
-            &fs_conn,
-            "WITH top_cats AS (SELECT category_id, SUM(price) AS total FROM products GROUP BY category_id ORDER BY total DESC LIMIT 5) \
-             SELECT p.name, p.price FROM products p JOIN top_cats tc ON p.category_id = tc.category_id",
-        );
+        let fs_stmt = fs_prepare(&fs_conn, cte_join_sql);
         let fs = measure(&format!("fs_cte_{count}"), count, || {
             std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
         });

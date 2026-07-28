@@ -12,6 +12,11 @@
 //! sampling) but is available as a standalone `#[test]` in the correctness
 //! suite.
 
+// bd-mnlk2 / bd-zavyn: the hoisted timed bodies await fsqlite-core's
+// deliberately large, deeply nested engine futures inside one runtime entry
+// per sample; boxing them would put an allocation inside the timed window.
+#![allow(clippy::large_futures)]
+
 use std::hint::black_box;
 use std::time::Duration;
 
@@ -106,28 +111,34 @@ fn bench_large_txn_10k(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
-                let stmt = fsqlite_e2e::block_on(conn.prepare(
-                    "INSERT INTO bench VALUES (\
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    conn.execute("BEGIN").await.unwrap();
+                    let stmt = conn
+                        .prepare(
+                            "INSERT INTO bench VALUES (\
                              ?1, ('name_' || ?1), ('user_' || ?1 || '@test.com'), (?1 * 7), \
                              ('2026-01-' || ((?1 % 28) + 1))\
                          )",
-                ))
-                .unwrap();
-                #[allow(clippy::cast_possible_wrap)]
-                for i in 0..ROW_COUNT_10K as i64 {
-                    black_box(
-                        fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
-                            .unwrap(),
-                    );
-                }
-                fsqlite_e2e::block_on(conn.execute("COMMIT")).unwrap();
+                        )
+                        .await
+                        .unwrap();
+                    #[allow(clippy::cast_possible_wrap)]
+                    for i in 0..ROW_COUNT_10K as i64 {
+                        black_box(
+                            stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                    conn.execute("COMMIT").await.unwrap();
 
-                let rows = fsqlite_e2e::block_on(conn.query("SELECT COUNT(*) FROM bench")).unwrap();
-                black_box(&rows);
-                #[allow(clippy::cast_possible_wrap)]
-                let expected = ROW_COUNT_10K as i64;
-                assert_eq!(rows[0].values()[0], SqliteValue::Integer(expected));
+                    let rows = conn.query("SELECT COUNT(*) FROM bench").await.unwrap();
+                    black_box(&rows);
+                    #[allow(clippy::cast_possible_wrap)]
+                    let expected = ROW_COUNT_10K as i64;
+                    assert_eq!(rows[0].values()[0], SqliteValue::Integer(expected));
+                });
             },
             BatchSize::LargeInput,
         );
@@ -190,28 +201,34 @@ fn bench_large_txn_100k(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
-                let stmt = fsqlite_e2e::block_on(conn.prepare(
-                    "INSERT INTO bench VALUES (\
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    conn.execute("BEGIN").await.unwrap();
+                    let stmt = conn
+                        .prepare(
+                            "INSERT INTO bench VALUES (\
                              ?1, ('name_' || ?1), ('user_' || ?1 || '@test.com'), (?1 * 7), \
                              ('2026-01-' || ((?1 % 28) + 1))\
                          )",
-                ))
-                .unwrap();
-                #[allow(clippy::cast_possible_wrap)]
-                for i in 0..ROW_COUNT_100K as i64 {
-                    black_box(
-                        fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
-                            .unwrap(),
-                    );
-                }
-                fsqlite_e2e::block_on(conn.execute("COMMIT")).unwrap();
+                        )
+                        .await
+                        .unwrap();
+                    #[allow(clippy::cast_possible_wrap)]
+                    for i in 0..ROW_COUNT_100K as i64 {
+                        black_box(
+                            stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                    conn.execute("COMMIT").await.unwrap();
 
-                let rows = fsqlite_e2e::block_on(conn.query("SELECT COUNT(*) FROM bench")).unwrap();
-                black_box(&rows);
-                #[allow(clippy::cast_possible_wrap)]
-                let expected = ROW_COUNT_100K as i64;
-                assert_eq!(rows[0].values()[0], SqliteValue::Integer(expected));
+                    let rows = conn.query("SELECT COUNT(*) FROM bench").await.unwrap();
+                    black_box(&rows);
+                    #[allow(clippy::cast_possible_wrap)]
+                    let expected = ROW_COUNT_100K as i64;
+                    assert_eq!(rows[0].values()[0], SqliteValue::Integer(expected));
+                });
             },
             BatchSize::LargeInput,
         );
@@ -275,31 +292,35 @@ fn bench_large_txn_100k_batched(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                let stmt = fsqlite_e2e::block_on(conn.prepare(
-                    "INSERT INTO bench VALUES (\
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    let stmt = conn
+                        .prepare(
+                            "INSERT INTO bench VALUES (\
                              ?1, ('name_' || ?1), ('user_' || ?1 || '@test.com'), (?1 * 7), \
                              ('2026-01-' || ((?1 % 28) + 1))\
                          )",
-                ))
-                .unwrap();
-                for batch in 0..10_i64 {
-                    fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
-                    let base = batch * 10_000;
-                    for i in base..base + 10_000 {
-                        black_box(
-                            fsqlite_e2e::block_on(
-                                stmt.execute_with_params(&[SqliteValue::Integer(i)]),
-                            )
-                            .unwrap(),
-                        );
+                        )
+                        .await
+                        .unwrap();
+                    for batch in 0..10_i64 {
+                        conn.execute("BEGIN").await.unwrap();
+                        let base = batch * 10_000;
+                        for i in base..base + 10_000 {
+                            black_box(
+                                stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                                    .await
+                                    .unwrap(),
+                            );
+                        }
+                        conn.execute("COMMIT").await.unwrap();
                     }
-                    fsqlite_e2e::block_on(conn.execute("COMMIT")).unwrap();
-                }
-                let rows = fsqlite_e2e::block_on(conn.query("SELECT COUNT(*) FROM bench")).unwrap();
-                black_box(&rows);
-                #[allow(clippy::cast_possible_wrap)]
-                let expected = ROW_COUNT_100K as i64;
-                assert_eq!(rows[0].values()[0], SqliteValue::Integer(expected));
+                    let rows = conn.query("SELECT COUNT(*) FROM bench").await.unwrap();
+                    black_box(&rows);
+                    #[allow(clippy::cast_possible_wrap)]
+                    let expected = ROW_COUNT_100K as i64;
+                    assert_eq!(rows[0].values()[0], SqliteValue::Integer(expected));
+                });
             },
             BatchSize::LargeInput,
         );

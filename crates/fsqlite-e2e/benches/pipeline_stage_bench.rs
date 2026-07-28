@@ -21,6 +21,11 @@
 //! Those ratios therefore measure caller-visible work through this synchronous
 //! benchmark bridge, not scheduler-free in-runtime engine stages.
 
+// bd-mnlk2 / bd-zavyn: the hoisted timed bodies await fsqlite-core's
+// deliberately large, deeply nested engine futures inside one runtime entry
+// per sample; boxing them would put an allocation inside the timed window.
+#![allow(clippy::large_futures)]
+
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, criterion_group};
@@ -59,6 +64,7 @@ fn criterion_config() -> Criterion {
 
 const SEED_ROWS: i64 = 1000;
 
+#[cfg(feature = "bench-internals")]
 const CLUSTERED_IN_SQL: &str = "SELECT id FROM bench WHERE id IN (
                 480, 481, 482, 483, 484, 485, 486, 487,
                 488, 489, 490, 491, 492, 493, 494, 495,
@@ -66,6 +72,7 @@ const CLUSTERED_IN_SQL: &str = "SELECT id FROM bench WHERE id IN (
                 504, 505, 506, 507, 508, 509, 510, 511
             )";
 
+#[cfg(feature = "bench-internals")]
 const CONTRACT_ROUNDS: usize = 41;
 #[cfg(feature = "bench-internals")]
 const CONTRACT_EXECS_PER_REPLICATE: usize = 128;
@@ -424,16 +431,19 @@ fn bench_btree_seek(c: &mut Criterion) {
 
     group.bench_function("frankensqlite", |b| {
         b.iter(|| {
-            let mut values = Vec::with_capacity(keys.len());
-            for &key in &keys {
-                let row = fsqlite_e2e::block_on(
-                    f_stmt.query_row_with_params(&[SqliteValue::Integer(key)]),
-                )
-                .expect("execute FrankenSQLite B-tree seek");
-                values.push(fsqlite_integer(&row, 0, "FrankenSQLite B-tree seek"));
-            }
-            assert_eq!(values, expected_values);
-            black_box(values);
+            // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+            fsqlite_e2e::block_on(async {
+                let mut values = Vec::with_capacity(keys.len());
+                for &key in &keys {
+                    let row = f_stmt
+                        .query_row_with_params(&[SqliteValue::Integer(key)])
+                        .await
+                        .expect("execute FrankenSQLite B-tree seek");
+                    values.push(fsqlite_integer(&row, 0, "FrankenSQLite B-tree seek"));
+                }
+                assert_eq!(values, expected_values);
+                black_box(values);
+            });
         });
     });
 
@@ -697,6 +707,7 @@ fn bench_insert_single(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "bench-internals")]
 fn setup_fsqlite_text_indexed_file_backed() -> (fsqlite::Connection, NamedTempFile) {
     let (connection, database) = setup_fsqlite_file_backed();
     fsqlite_e2e::block_on(connection.execute("ROLLBACK"))
@@ -748,6 +759,7 @@ criterion_group! {
         bench_insert_single,
 }
 
+#[cfg(feature = "bench-internals")]
 struct ContractArmSample {
     elapsed_ns: u128,
     checksum: u64,

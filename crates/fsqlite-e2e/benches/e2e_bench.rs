@@ -1,4 +1,8 @@
 #![recursion_limit = "512"]
+// bd-mnlk2 / bd-zavyn: the hoisted timed bodies await fsqlite-core's
+// deliberately large, deeply nested engine futures inside one runtime entry
+// per sample; boxing them would put an allocation inside the timed window.
+#![allow(clippy::large_futures)]
 
 //! General end-to-end benchmark suite.
 //!
@@ -188,14 +192,20 @@ fn bench_sequential_inserts(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                let stmt = fsqlite_e2e::block_on(conn.prepare("INSERT INTO t VALUES (?1, 'val');"))
-                    .unwrap();
-                for i in 0..100_i64 {
-                    black_box(
-                        fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
-                            .unwrap(),
-                    );
-                }
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    let stmt = conn
+                        .prepare("INSERT INTO t VALUES (?1, 'val');")
+                        .await
+                        .unwrap();
+                    for i in 0..100_i64 {
+                        black_box(
+                            stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                });
             },
             BatchSize::LargeInput,
         );
@@ -248,16 +258,22 @@ fn bench_sequential_inserts_single_txn(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                fsqlite_e2e::block_on(conn.execute("BEGIN")).unwrap();
-                let stmt = fsqlite_e2e::block_on(conn.prepare("INSERT INTO t VALUES (?1, 'val');"))
-                    .unwrap();
-                for i in 0..100_i64 {
-                    black_box(
-                        fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
-                            .unwrap(),
-                    );
-                }
-                fsqlite_e2e::block_on(conn.execute("COMMIT")).unwrap();
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    conn.execute("BEGIN").await.unwrap();
+                    let stmt = conn
+                        .prepare("INSERT INTO t VALUES (?1, 'val');")
+                        .await
+                        .unwrap();
+                    for i in 0..100_i64 {
+                        black_box(
+                            stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                    conn.execute("COMMIT").await.unwrap();
+                });
             },
             BatchSize::LargeInput,
         );
@@ -310,18 +326,22 @@ fn bench_bulk_inserts(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                fsqlite_e2e::block_on(conn.execute("BEGIN;")).unwrap();
-                let stmt = fsqlite_e2e::block_on(
-                    conn.prepare("INSERT INTO t VALUES (?1, ('name_' || ?1), (?1 * 1.1));"),
-                )
-                .unwrap();
-                for i in 0..1000_i64 {
-                    black_box(
-                        fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
-                            .unwrap(),
-                    );
-                }
-                fsqlite_e2e::block_on(conn.execute("COMMIT;")).unwrap();
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    conn.execute("BEGIN;").await.unwrap();
+                    let stmt = conn
+                        .prepare("INSERT INTO t VALUES (?1, ('name_' || ?1), (?1 * 1.1));")
+                        .await
+                        .unwrap();
+                    for i in 0..1000_i64 {
+                        black_box(
+                            stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                    conn.execute("COMMIT;").await.unwrap();
+                });
             },
             BatchSize::LargeInput,
         );
@@ -471,45 +491,47 @@ fn bench_mixed_dml(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                let update_stmt = fsqlite_e2e::block_on(
-                    conn.prepare("UPDATE t SET n = (?1 * 100) WHERE id = ?1;"),
-                )
-                .unwrap();
-                for i in 0..50_i64 {
-                    black_box(
-                        fsqlite_e2e::block_on(
-                            update_stmt.execute_with_params(&[SqliteValue::Integer(i)]),
-                        )
-                        .unwrap(),
-                    );
-                }
-                let delete_stmt =
-                    fsqlite_e2e::block_on(conn.prepare("DELETE FROM t WHERE id = ?1;")).unwrap();
-                for i in 150..200_i64 {
-                    black_box(
-                        fsqlite_e2e::block_on(
-                            delete_stmt.execute_with_params(&[SqliteValue::Integer(i)]),
-                        )
-                        .unwrap(),
-                    );
-                }
-                let insert_stmt = fsqlite_e2e::block_on(
-                    conn.prepare("INSERT INTO t VALUES (?1, ('new_' || ?1), ?1);"),
-                )
-                .unwrap();
-                for i in 200..250_i64 {
-                    black_box(
-                        fsqlite_e2e::block_on(
-                            insert_stmt.execute_with_params(&[SqliteValue::Integer(i)]),
-                        )
-                        .unwrap(),
-                    );
-                }
-                let stmt = fsqlite_e2e::block_on(conn.prepare("SELECT count(*) FROM t")).unwrap();
-                let row = fsqlite_e2e::block_on(stmt.query_row()).unwrap();
-                black_box(&row);
-                let count = &row.values()[0];
-                assert_eq!(*count, SqliteValue::Integer(200));
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    let update_stmt = conn
+                        .prepare("UPDATE t SET n = (?1 * 100) WHERE id = ?1;")
+                        .await
+                        .unwrap();
+                    for i in 0..50_i64 {
+                        black_box(
+                            update_stmt
+                                .execute_with_params(&[SqliteValue::Integer(i)])
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                    let delete_stmt = conn.prepare("DELETE FROM t WHERE id = ?1;").await.unwrap();
+                    for i in 150..200_i64 {
+                        black_box(
+                            delete_stmt
+                                .execute_with_params(&[SqliteValue::Integer(i)])
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                    let insert_stmt = conn
+                        .prepare("INSERT INTO t VALUES (?1, ('new_' || ?1), ?1);")
+                        .await
+                        .unwrap();
+                    for i in 200..250_i64 {
+                        black_box(
+                            insert_stmt
+                                .execute_with_params(&[SqliteValue::Integer(i)])
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                    let stmt = conn.prepare("SELECT count(*) FROM t").await.unwrap();
+                    let row = stmt.query_row().await.unwrap();
+                    black_box(&row);
+                    let count = &row.values()[0];
+                    assert_eq!(*count, SqliteValue::Integer(200));
+                });
             },
             BatchSize::LargeInput,
         );
@@ -560,16 +582,20 @@ fn bench_write_throughput_autocommit(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                let stmt = fsqlite_e2e::block_on(
-                    conn.prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));"),
-                )
-                .unwrap();
-                for i in 0..10_000_i64 {
-                    black_box(
-                        fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
-                            .unwrap(),
-                    );
-                }
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    let stmt = conn
+                        .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));")
+                        .await
+                        .unwrap();
+                    for i in 0..10_000_i64 {
+                        black_box(
+                            stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                });
             },
             BatchSize::LargeInput,
         );
@@ -623,23 +649,25 @@ fn bench_write_throughput_batched(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                let stmt = fsqlite_e2e::block_on(
-                    conn.prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));"),
-                )
-                .unwrap();
-                for batch in 0..10 {
-                    fsqlite_e2e::block_on(conn.execute("BEGIN;")).unwrap();
-                    let base = batch as i64 * 1000;
-                    for i in base..base + 1000 {
-                        black_box(
-                            fsqlite_e2e::block_on(
-                                stmt.execute_with_params(&[SqliteValue::Integer(i)]),
-                            )
-                            .unwrap(),
-                        );
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    let stmt = conn
+                        .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));")
+                        .await
+                        .unwrap();
+                    for batch in 0..10 {
+                        conn.execute("BEGIN;").await.unwrap();
+                        let base = batch as i64 * 1000;
+                        for i in base..base + 1000 {
+                            black_box(
+                                stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                                    .await
+                                    .unwrap(),
+                            );
+                        }
+                        conn.execute("COMMIT;").await.unwrap();
                     }
-                    fsqlite_e2e::block_on(conn.execute("COMMIT;")).unwrap();
-                }
+                });
             },
             BatchSize::LargeInput,
         );
@@ -690,18 +718,22 @@ fn bench_write_throughput_single_txn(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                fsqlite_e2e::block_on(conn.execute("BEGIN;")).unwrap();
-                let stmt = fsqlite_e2e::block_on(
-                    conn.prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));"),
-                )
-                .unwrap();
-                for i in 0..10_000_i64 {
-                    black_box(
-                        fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
-                            .unwrap(),
-                    );
-                }
-                fsqlite_e2e::block_on(conn.execute("COMMIT;")).unwrap();
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    conn.execute("BEGIN;").await.unwrap();
+                    let stmt = conn
+                        .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));")
+                        .await
+                        .unwrap();
+                    for i in 0..10_000_i64 {
+                        black_box(
+                            stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                    conn.execute("COMMIT;").await.unwrap();
+                });
             },
             BatchSize::LargeInput,
         );
@@ -814,20 +846,23 @@ fn bench_read_heavy_select(c: &mut Criterion) {
                 .unwrap();
 
         b.iter(|| {
-            let rows = fsqlite_e2e::block_on(q_range.query()).unwrap();
-            black_box(&rows);
-            assert_eq!(rows.len(), 101);
+            // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+            fsqlite_e2e::block_on(async {
+                let rows = q_range.query().await.unwrap();
+                black_box(&rows);
+                assert_eq!(rows.len(), 101);
 
-            let agg = fsqlite_e2e::block_on(q_agg.query()).unwrap();
-            black_box(&agg);
-            assert_eq!(agg.len(), 1);
+                let agg = q_agg.query().await.unwrap();
+                black_box(&agg);
+                assert_eq!(agg.len(), 1);
 
-            let groups = fsqlite_e2e::block_on(q_group.query()).unwrap();
-            black_box(&groups);
-            assert_eq!(groups.len(), 10);
+                let groups = q_group.query().await.unwrap();
+                black_box(&groups);
+                assert_eq!(groups.len(), 10);
 
-            let rows = fsqlite_e2e::block_on(q_compound.query()).unwrap();
-            black_box(&rows);
+                let rows = q_compound.query().await.unwrap();
+                black_box(&rows);
+            });
         });
     });
 
@@ -992,38 +1027,45 @@ fn bench_mixed_oltp(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                let mut next_id = 500_i64;
-                for op in 0..100_i64 {
-                    if op % 5 == 0 {
-                        if op % 10 == 0 {
-                            black_box(
-                                fsqlite_e2e::block_on(conn.execute_with_params(
-                                    "INSERT INTO t VALUES (?1, 'new', ?1)",
-                                    &[SqliteValue::Integer(next_id)],
-                                ))
-                                .unwrap(),
-                            );
-                            next_id += 1;
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    let mut next_id = 500_i64;
+                    for op in 0..100_i64 {
+                        if op % 5 == 0 {
+                            if op % 10 == 0 {
+                                black_box(
+                                    conn.execute_with_params(
+                                        "INSERT INTO t VALUES (?1, 'new', ?1)",
+                                        &[SqliteValue::Integer(next_id)],
+                                    )
+                                    .await
+                                    .unwrap(),
+                                );
+                                next_id += 1;
+                            } else {
+                                black_box(
+                                    conn.execute_with_params(
+                                        "UPDATE t SET val = ?1 WHERE id = ?2",
+                                        &[SqliteValue::Integer(op * 100), SqliteValue::Integer(op)],
+                                    )
+                                    .await
+                                    .unwrap(),
+                                );
+                            }
                         } else {
-                            black_box(
-                                fsqlite_e2e::block_on(conn.execute_with_params(
-                                    "UPDATE t SET val = ?1 WHERE id = ?2",
-                                    &[SqliteValue::Integer(op * 100), SqliteValue::Integer(op)],
-                                ))
-                                .unwrap(),
-                            );
+                            let target = (op * 5) % 500;
+                            let row = conn
+                                .query_row_with_params(
+                                    "SELECT val FROM t WHERE id = ?1",
+                                    &[SqliteValue::Integer(target)],
+                                )
+                                .await
+                                .unwrap();
+                            black_box(&row);
+                            assert_eq!(row.values().len(), 1);
                         }
-                    } else {
-                        let target = (op * 5) % 500;
-                        let row = fsqlite_e2e::block_on(conn.query_row_with_params(
-                            "SELECT val FROM t WHERE id = ?1",
-                            &[SqliteValue::Integer(target)],
-                        ))
-                        .unwrap();
-                        black_box(&row);
-                        assert_eq!(row.values().len(), 1);
                     }
-                }
+                });
             },
             BatchSize::LargeInput,
         );
@@ -1076,18 +1118,22 @@ fn bench_large_txn_100k(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                fsqlite_e2e::block_on(conn.execute("BEGIN;")).unwrap();
-                let stmt = fsqlite_e2e::block_on(
-                    conn.prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 3));"),
-                )
-                .unwrap();
-                for i in 0..100_000_i64 {
-                    black_box(
-                        fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
-                            .unwrap(),
-                    );
-                }
-                fsqlite_e2e::block_on(conn.execute("COMMIT;")).unwrap();
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    conn.execute("BEGIN;").await.unwrap();
+                    let stmt = conn
+                        .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 3));")
+                        .await
+                        .unwrap();
+                    for i in 0..100_000_i64 {
+                        black_box(
+                            stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                    conn.execute("COMMIT;").await.unwrap();
+                });
             },
             BatchSize::LargeInput,
         );
@@ -1138,18 +1184,22 @@ fn bench_large_txn_1m(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                fsqlite_e2e::block_on(conn.execute("BEGIN;")).unwrap();
-                let stmt = fsqlite_e2e::block_on(
-                    conn.prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 3));"),
-                )
-                .unwrap();
-                for i in 0..1_000_000_i64 {
-                    black_box(
-                        fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
-                            .unwrap(),
-                    );
-                }
-                fsqlite_e2e::block_on(conn.execute("COMMIT;")).unwrap();
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    conn.execute("BEGIN;").await.unwrap();
+                    let stmt = conn
+                        .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 3));")
+                        .await
+                        .unwrap();
+                    for i in 0..1_000_000_i64 {
+                        black_box(
+                            stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                    conn.execute("COMMIT;").await.unwrap();
+                });
             },
             BatchSize::LargeInput,
         );
@@ -1166,8 +1216,8 @@ fn bench_large_txn_1m(c: &mut Criterion) {
 // This is an independent-database scaling control, not shared-database
 // concurrent-writer evidence.
 
-// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=concurrent, comparison=independent_db_control
-// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=concurrent, comparison=independent_db_control
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=concurrent
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=concurrent
 fn bench_concurrent_writes(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent_write_throughput");
     group.sample_size(10);
@@ -1209,30 +1259,31 @@ fn bench_concurrent_writes(c: &mut Criterion) {
                 b.iter(|| {
                     std::thread::scope(|s| {
                         for _ in 0..threads {
+                            // bd-mnlk2 / bd-zavyn: one runtime entry per
+                            // thread transaction — a per-row block_on paid
+                            // ~333 ns x 1000 on the FrankenSQLite arm only.
                             s.spawn(|| {
-                                let conn =
-                                    fsqlite_e2e::block_on(fsqlite::Connection::open(":memory:"))
-                                        .unwrap();
-                                fsqlite_e2e::block_on(
+                                fsqlite_e2e::block_on(async {
+                                    let conn = fsqlite::Connection::open(":memory:").await.unwrap();
                                     conn.execute(
                                         "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);",
-                                    ),
-                                )
-                                .unwrap();
-                                fsqlite_e2e::block_on(conn.execute("BEGIN;")).unwrap();
-                                let stmt = fsqlite_e2e::block_on(
-                                    conn.prepare("INSERT INTO t VALUES (?1, ('v' || ?1));"),
-                                )
-                                .unwrap();
-                                for i in 0..1000_i64 {
-                                    black_box(
-                                        fsqlite_e2e::block_on(
-                                            stmt.execute_with_params(&[SqliteValue::Integer(i)]),
-                                        )
-                                        .unwrap(),
-                                    );
-                                }
-                                fsqlite_e2e::block_on(conn.execute("COMMIT;")).unwrap();
+                                    )
+                                    .await
+                                    .unwrap();
+                                    conn.execute("BEGIN;").await.unwrap();
+                                    let stmt = conn
+                                        .prepare("INSERT INTO t VALUES (?1, ('v' || ?1));")
+                                        .await
+                                        .unwrap();
+                                    for i in 0..1000_i64 {
+                                        black_box(
+                                            stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                                                .await
+                                                .unwrap(),
+                                        );
+                                    }
+                                    conn.execute("COMMIT;").await.unwrap();
+                                });
                             });
                         }
                     });

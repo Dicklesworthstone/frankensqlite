@@ -21,6 +21,14 @@
 //! `--ops-per-thread` is the exact insert count for each writer. Readers run
 //! continuously from the common start until the last writer finishes.
 
+// bd-mnlk2 / bd-zavyn: the hoisted timed bodies await fsqlite-core's
+// deliberately non-`Send`, deeply nested engine futures inside one runtime
+// entry per sample; `future_not_send` and `large_futures` contradict that
+// design (see comprehensive_bench.rs for the same rationale — boxing would
+// put an allocation inside the timed window).
+#![allow(clippy::future_not_send)]
+#![allow(clippy::large_futures)]
+
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fmt::Write as _;

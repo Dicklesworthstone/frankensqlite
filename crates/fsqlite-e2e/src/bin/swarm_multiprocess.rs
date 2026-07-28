@@ -5,6 +5,11 @@
 //! concurrency invariants from frankensqlite#70.
 
 #![allow(clippy::struct_excessive_bools, clippy::too_many_lines)]
+// bd-mnlk2 / bd-zavyn: the hoisted timed bodies await fsqlite-core's
+// deliberately large, deeply nested engine futures inside one runtime entry
+// per transaction attempt; boxing them would put an allocation inside the
+// timed window.
+#![allow(clippy::large_futures)]
 #![recursion_limit = "512"]
 
 use std::env;

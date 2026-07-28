@@ -17,6 +17,11 @@
 //! Output: one row per thread count, pipe-separated, suitable for piping
 //! into a markdown table or jq.
 
+// bd-mnlk2 / bd-zavyn: the hoisted timed bodies await fsqlite-core's
+// deliberately large, deeply nested engine futures inside one runtime entry
+// per sample; boxing them would put an allocation inside the timed window.
+#![allow(clippy::large_futures)]
+
 use serde::Serialize;
 use std::error::Error;
 use std::fs;

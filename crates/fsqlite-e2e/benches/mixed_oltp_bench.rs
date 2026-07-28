@@ -13,6 +13,11 @@
 //! The benchmark measures throughput (ops/sec) over a fixed number of
 //! operations on both backends.
 //!
+// bd-mnlk2 / bd-zavyn: the hoisted timed bodies await fsqlite-core's
+// deliberately large, deeply nested engine futures inside one runtime entry
+// per sample; boxing them would put an allocation inside the timed window.
+#![allow(clippy::large_futures)]
+
 use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::time::Duration;
@@ -276,101 +281,117 @@ fn bench_mixed_oltp_fsqlite(c: &mut Criterion) {
         b.iter_batched(
             setup_fsqlite,
             |conn| {
-                let mut rng = Rng64::new(42);
-                let mut next_id = SEED_ROWS as i64 + 1;
-                let mut expected_row_count = SEED_ROWS as i64;
-                let select_pt =
-                    fsqlite_e2e::block_on(conn.prepare("SELECT * FROM bench WHERE id = ?1"))
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    let mut rng = Rng64::new(42);
+                    let mut next_id = SEED_ROWS as i64 + 1;
+                    let mut expected_row_count = SEED_ROWS as i64;
+                    let select_pt = conn
+                        .prepare("SELECT * FROM bench WHERE id = ?1")
+                        .await
                         .expect("prepare FrankenSQLite point lookup");
-                let select_range = fsqlite_e2e::block_on(
-                    conn.prepare("SELECT COUNT(*) FROM bench WHERE id >= ?1 AND id < ?2"),
-                )
-                .expect("prepare FrankenSQLite range lookup");
-                let select_agg =
-                    fsqlite_e2e::block_on(conn.prepare("SELECT COUNT(*), SUM(score) FROM bench"))
+                    let select_range = conn
+                        .prepare("SELECT COUNT(*) FROM bench WHERE id >= ?1 AND id < ?2")
+                        .await
+                        .expect("prepare FrankenSQLite range lookup");
+                    let select_agg = conn
+                        .prepare("SELECT COUNT(*), SUM(score) FROM bench")
+                        .await
                         .expect("prepare FrankenSQLite aggregate");
-                let insert = fsqlite_e2e::block_on(
-                    conn.prepare("INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))"),
-                )
-                .expect("prepare FrankenSQLite INSERT");
-                let update = fsqlite_e2e::block_on(
-                    conn.prepare("UPDATE bench SET score = ?2 WHERE id = ?1"),
-                )
-                .expect("prepare FrankenSQLite UPDATE");
-                let delete = fsqlite_e2e::block_on(conn.prepare("DELETE FROM bench WHERE id = ?1"))
-                    .expect("prepare FrankenSQLite DELETE");
+                    let insert = conn
+                        .prepare("INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))")
+                        .await
+                        .expect("prepare FrankenSQLite INSERT");
+                    let update = conn
+                        .prepare("UPDATE bench SET score = ?2 WHERE id = ?1")
+                        .await
+                        .expect("prepare FrankenSQLite UPDATE");
+                    let delete = conn
+                        .prepare("DELETE FROM bench WHERE id = ?1")
+                        .await
+                        .expect("prepare FrankenSQLite DELETE");
 
-                for _ in 0..OPS_PER_ITERATION {
-                    let roll = rng.next_usize(100);
-                    if roll < 40 {
-                        let id = (rng.next_usize(SEED_ROWS) + 1) as i64;
-                        let row = match fsqlite_e2e::block_on(
-                            select_pt.query_row_with_params(&[SqliteValue::Integer(id)]),
-                        ) {
-                            Ok(row) => Some(row),
-                            Err(FrankenError::QueryReturnedNoRows) => None,
-                            Err(error) => {
-                                panic!("FrankenSQLite point lookup failed: {error:?}")
-                            }
-                        };
-                        drop(black_box(row));
-                    } else if roll < 60 {
-                        let start = (rng.next_usize(SEED_ROWS - 50) + 1) as i64;
-                        let row = fsqlite_e2e::block_on(select_range.query_row_with_params(&[
-                            SqliteValue::Integer(start),
-                            SqliteValue::Integer(start + 50),
-                        ]))
-                        .expect("FrankenSQLite range lookup");
-                        black_box(fsqlite_integer(&row, 0, "FrankenSQLite range lookup"));
-                    } else if roll < 80 {
-                        let row = fsqlite_e2e::block_on(select_agg.query_row())
-                            .expect("FrankenSQLite aggregate");
-                        black_box((
-                            fsqlite_integer(&row, 0, "FrankenSQLite aggregate"),
-                            fsqlite_integer(&row, 1, "FrankenSQLite aggregate"),
-                        ));
-                    } else if roll < 95 {
-                        let inserted = fsqlite_e2e::block_on(
-                            insert.execute_with_params(&[SqliteValue::Integer(next_id)]),
-                        )
-                        .expect("FrankenSQLite INSERT");
-                        assert_eq!(inserted, 1, "FrankenSQLite INSERT affected-row count");
-                        expected_row_count += i64::try_from(inserted).unwrap();
-                        next_id += 1;
-                    } else if roll < 98 {
-                        let id = (rng.next_usize(SEED_ROWS) + 1) as i64;
-                        let updated = fsqlite_e2e::block_on(update.execute_with_params(&[
-                            SqliteValue::Integer(id),
-                            SqliteValue::Integer(id * 99),
-                        ]))
-                        .expect("FrankenSQLite UPDATE");
-                        assert!(updated <= 1, "FrankenSQLite UPDATE affected {updated} rows");
-                    } else {
-                        let id = (rng.next_usize(SEED_ROWS) + 1) as i64;
-                        let deleted = fsqlite_e2e::block_on(
-                            delete.execute_with_params(&[SqliteValue::Integer(id)]),
-                        )
-                        .expect("FrankenSQLite DELETE");
-                        assert!(deleted <= 1, "FrankenSQLite DELETE affected {deleted} rows");
-                        expected_row_count -= i64::try_from(deleted).unwrap();
+                    for _ in 0..OPS_PER_ITERATION {
+                        let roll = rng.next_usize(100);
+                        if roll < 40 {
+                            let id = (rng.next_usize(SEED_ROWS) + 1) as i64;
+                            let row = match select_pt
+                                .query_row_with_params(&[SqliteValue::Integer(id)])
+                                .await
+                            {
+                                Ok(row) => Some(row),
+                                Err(FrankenError::QueryReturnedNoRows) => None,
+                                Err(error) => {
+                                    panic!("FrankenSQLite point lookup failed: {error:?}")
+                                }
+                            };
+                            drop(black_box(row));
+                        } else if roll < 60 {
+                            let start = (rng.next_usize(SEED_ROWS - 50) + 1) as i64;
+                            let row = select_range
+                                .query_row_with_params(&[
+                                    SqliteValue::Integer(start),
+                                    SqliteValue::Integer(start + 50),
+                                ])
+                                .await
+                                .expect("FrankenSQLite range lookup");
+                            black_box(fsqlite_integer(&row, 0, "FrankenSQLite range lookup"));
+                        } else if roll < 80 {
+                            let row = select_agg
+                                .query_row()
+                                .await
+                                .expect("FrankenSQLite aggregate");
+                            black_box((
+                                fsqlite_integer(&row, 0, "FrankenSQLite aggregate"),
+                                fsqlite_integer(&row, 1, "FrankenSQLite aggregate"),
+                            ));
+                        } else if roll < 95 {
+                            let inserted = insert
+                                .execute_with_params(&[SqliteValue::Integer(next_id)])
+                                .await
+                                .expect("FrankenSQLite INSERT");
+                            assert_eq!(inserted, 1, "FrankenSQLite INSERT affected-row count");
+                            expected_row_count += i64::try_from(inserted).unwrap();
+                            next_id += 1;
+                        } else if roll < 98 {
+                            let id = (rng.next_usize(SEED_ROWS) + 1) as i64;
+                            let updated = update
+                                .execute_with_params(&[
+                                    SqliteValue::Integer(id),
+                                    SqliteValue::Integer(id * 99),
+                                ])
+                                .await
+                                .expect("FrankenSQLite UPDATE");
+                            assert!(updated <= 1, "FrankenSQLite UPDATE affected {updated} rows");
+                        } else {
+                            let id = (rng.next_usize(SEED_ROWS) + 1) as i64;
+                            let deleted = delete
+                                .execute_with_params(&[SqliteValue::Integer(id)])
+                                .await
+                                .expect("FrankenSQLite DELETE");
+                            assert!(deleted <= 1, "FrankenSQLite DELETE affected {deleted} rows");
+                            expected_row_count -= i64::try_from(deleted).unwrap();
+                        }
                     }
-                }
 
-                let row = fsqlite_e2e::block_on(select_agg.query_row())
-                    .expect("FrankenSQLite post-workload aggregate");
-                let aggregate = (
-                    fsqlite_integer(&row, 0, "FrankenSQLite post-workload aggregate"),
-                    fsqlite_integer(&row, 1, "FrankenSQLite post-workload aggregate"),
-                );
-                assert_eq!(
-                    aggregate.0, expected_row_count,
-                    "FrankenSQLite post-workload row count"
-                );
-                assert_eq!(
-                    aggregate, expected_aggregate,
-                    "FrankenSQLite post-workload aggregate"
-                );
-                black_box(aggregate);
+                    let row = select_agg
+                        .query_row()
+                        .await
+                        .expect("FrankenSQLite post-workload aggregate");
+                    let aggregate = (
+                        fsqlite_integer(&row, 0, "FrankenSQLite post-workload aggregate"),
+                        fsqlite_integer(&row, 1, "FrankenSQLite post-workload aggregate"),
+                    );
+                    assert_eq!(
+                        aggregate.0, expected_row_count,
+                        "FrankenSQLite post-workload row count"
+                    );
+                    assert_eq!(
+                        aggregate, expected_aggregate,
+                        "FrankenSQLite post-workload aggregate"
+                    );
+                    black_box(aggregate);
+                });
             },
             BatchSize::LargeInput,
         );

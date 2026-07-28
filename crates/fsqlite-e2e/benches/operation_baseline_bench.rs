@@ -14,6 +14,11 @@
 //! Both FrankenSQLite and C SQLite are benchmarked with identical PRAGMA
 //! settings for fair comparison.
 
+// bd-mnlk2 / bd-zavyn: the hoisted timed bodies await fsqlite-core's
+// deliberately large, deeply nested engine futures inside one runtime entry
+// per sample; boxing them would put an allocation inside the timed window.
+#![allow(clippy::large_futures)]
+
 use std::hint::black_box;
 use std::time::Duration;
 
@@ -370,17 +375,24 @@ fn bench_single_row_insert(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                let inserted = fsqlite_e2e::block_on(
-                    conn.execute("INSERT INTO bench VALUES (1, 'test_name', 42)"),
-                )
-                .expect("execute FrankenSQLite single INSERT");
-                assert_eq!(inserted, 1, "FrankenSQLite INSERT affected-row count");
-                let stmt = fsqlite_e2e::block_on(conn.prepare("SELECT COUNT(*) FROM bench"))
-                    .expect("prepare FrankenSQLite post-INSERT count");
-                let row = fsqlite_e2e::block_on(stmt.query_row())
-                    .expect("query FrankenSQLite post-INSERT count");
-                assert_eq!(row.values()[0], SqliteValue::Integer(1));
-                black_box(row);
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    let inserted = conn
+                        .execute("INSERT INTO bench VALUES (1, 'test_name', 42)")
+                        .await
+                        .expect("execute FrankenSQLite single INSERT");
+                    assert_eq!(inserted, 1, "FrankenSQLite INSERT affected-row count");
+                    let stmt = conn
+                        .prepare("SELECT COUNT(*) FROM bench")
+                        .await
+                        .expect("prepare FrankenSQLite post-INSERT count");
+                    let row = stmt
+                        .query_row()
+                        .await
+                        .expect("query FrankenSQLite post-INSERT count");
+                    assert_eq!(row.values()[0], SqliteValue::Integer(1));
+                    black_box(row);
+                });
             },
             BatchSize::SmallInput,
         );
@@ -445,26 +457,36 @@ fn bench_batch_insert(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                fsqlite_e2e::block_on(conn.execute("BEGIN"))
-                    .expect("begin FrankenSQLite batch-INSERT transaction");
-                let stmt = fsqlite_e2e::block_on(
-                    conn.prepare("INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))"),
-                )
-                .expect("prepare FrankenSQLite batch INSERT");
-                for i in 1..=1000_i64 {
-                    let inserted =
-                        fsqlite_e2e::block_on(stmt.execute_with_params(&[SqliteValue::Integer(i)]))
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    conn.execute("BEGIN")
+                        .await
+                        .expect("begin FrankenSQLite batch-INSERT transaction");
+                    let stmt = conn
+                        .prepare("INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))")
+                        .await
+                        .expect("prepare FrankenSQLite batch INSERT");
+                    for i in 1..=1000_i64 {
+                        let inserted = stmt
+                            .execute_with_params(&[SqliteValue::Integer(i)])
+                            .await
                             .expect("execute FrankenSQLite batch INSERT");
-                    assert_eq!(inserted, 1, "FrankenSQLite batch INSERT affected-row count");
-                }
-                fsqlite_e2e::block_on(conn.execute("COMMIT"))
-                    .expect("commit FrankenSQLite batch-INSERT transaction");
-                let count_stmt = fsqlite_e2e::block_on(conn.prepare("SELECT COUNT(*) FROM bench"))
-                    .expect("prepare FrankenSQLite post-batch count");
-                let row = fsqlite_e2e::block_on(count_stmt.query_row())
-                    .expect("query FrankenSQLite post-batch count");
-                assert_eq!(row.values()[0], SqliteValue::Integer(1000));
-                black_box(row);
+                        assert_eq!(inserted, 1, "FrankenSQLite batch INSERT affected-row count");
+                    }
+                    conn.execute("COMMIT")
+                        .await
+                        .expect("commit FrankenSQLite batch-INSERT transaction");
+                    let count_stmt = conn
+                        .prepare("SELECT COUNT(*) FROM bench")
+                        .await
+                        .expect("prepare FrankenSQLite post-batch count");
+                    let row = count_stmt
+                        .query_row()
+                        .await
+                        .expect("query FrankenSQLite post-batch count");
+                    assert_eq!(row.values()[0], SqliteValue::Integer(1000));
+                    black_box(row);
+                });
             },
             BatchSize::LargeInput,
         );
@@ -553,16 +575,24 @@ fn bench_single_row_delete(c: &mut Criterion) {
         b.iter_batched(
             setup_fsqlite_seeded,
             |conn| {
-                let deleted =
-                    fsqlite_e2e::block_on(conn.execute("DELETE FROM bench WHERE id = 500"))
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    let deleted = conn
+                        .execute("DELETE FROM bench WHERE id = 500")
+                        .await
                         .expect("execute FrankenSQLite DELETE");
-                assert_eq!(deleted, 1, "FrankenSQLite DELETE affected-row count");
-                let stmt = fsqlite_e2e::block_on(conn.prepare("SELECT COUNT(*) FROM bench"))
-                    .expect("prepare FrankenSQLite post-DELETE count");
-                let row = fsqlite_e2e::block_on(stmt.query_row())
-                    .expect("query FrankenSQLite post-DELETE count");
-                assert_eq!(row.values()[0], SqliteValue::Integer(SEED_ROWS - 1));
-                black_box(row);
+                    assert_eq!(deleted, 1, "FrankenSQLite DELETE affected-row count");
+                    let stmt = conn
+                        .prepare("SELECT COUNT(*) FROM bench")
+                        .await
+                        .expect("prepare FrankenSQLite post-DELETE count");
+                    let row = stmt
+                        .query_row()
+                        .await
+                        .expect("query FrankenSQLite post-DELETE count");
+                    assert_eq!(row.values()[0], SqliteValue::Integer(SEED_ROWS - 1));
+                    black_box(row);
+                });
             },
             BatchSize::LargeInput,
         );
@@ -706,26 +736,34 @@ fn bench_column_list_insert_prepared(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                fsqlite_e2e::block_on(conn.execute("BEGIN"))
-                    .expect("begin FrankenSQLite no-column-list transaction");
-                // No column list → should hit direct insert path
-                let stmt =
-                    fsqlite_e2e::block_on(conn.prepare("INSERT INTO bench VALUES (?1, ?2, ?3)"))
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    conn.execute("BEGIN")
+                        .await
+                        .expect("begin FrankenSQLite no-column-list transaction");
+                    // No column list → should hit direct insert path
+                    let stmt = conn
+                        .prepare("INSERT INTO bench VALUES (?1, ?2, ?3)")
+                        .await
                         .expect("prepare FrankenSQLite no-column-list INSERT");
-                for i in 1..=1000_i64 {
-                    let inserted = fsqlite_e2e::block_on(stmt.execute_with_params(&[
-                        SqliteValue::Integer(i),
-                        SqliteValue::Text(format!("name_{i}").into()),
-                        SqliteValue::Integer(i * 7),
-                    ]))
-                    .expect("execute FrankenSQLite no-column-list INSERT");
-                    assert_eq!(
-                        inserted, 1,
-                        "FrankenSQLite no-column-list INSERT affected-row count"
-                    );
-                }
-                fsqlite_e2e::block_on(conn.execute("COMMIT"))
-                    .expect("commit FrankenSQLite no-column-list transaction");
+                    for i in 1..=1000_i64 {
+                        let inserted = stmt
+                            .execute_with_params(&[
+                                SqliteValue::Integer(i),
+                                SqliteValue::Text(format!("name_{i}").into()),
+                                SqliteValue::Integer(i * 7),
+                            ])
+                            .await
+                            .expect("execute FrankenSQLite no-column-list INSERT");
+                        assert_eq!(
+                            inserted, 1,
+                            "FrankenSQLite no-column-list INSERT affected-row count"
+                        );
+                    }
+                    conn.execute("COMMIT")
+                        .await
+                        .expect("commit FrankenSQLite no-column-list transaction");
+                });
             },
             BatchSize::LargeInput,
         );
@@ -745,27 +783,34 @@ fn bench_column_list_insert_prepared(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                fsqlite_e2e::block_on(conn.execute("BEGIN"))
-                    .expect("begin FrankenSQLite same-order column-list transaction");
-                // Column list in same order → currently VDBE path, should be direct after fix
-                let stmt = fsqlite_e2e::block_on(
-                    conn.prepare("INSERT INTO bench(id, name, score) VALUES (?1, ?2, ?3)"),
-                )
-                .expect("prepare FrankenSQLite same-order column-list INSERT");
-                for i in 1..=1000_i64 {
-                    let inserted = fsqlite_e2e::block_on(stmt.execute_with_params(&[
-                        SqliteValue::Integer(i),
-                        SqliteValue::Text(format!("name_{i}").into()),
-                        SqliteValue::Integer(i * 7),
-                    ]))
-                    .expect("execute FrankenSQLite same-order column-list INSERT");
-                    assert_eq!(
-                        inserted, 1,
-                        "FrankenSQLite same-order column-list INSERT affected-row count"
-                    );
-                }
-                fsqlite_e2e::block_on(conn.execute("COMMIT"))
-                    .expect("commit FrankenSQLite same-order column-list transaction");
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    conn.execute("BEGIN")
+                        .await
+                        .expect("begin FrankenSQLite same-order column-list transaction");
+                    // Column list in same order → currently VDBE path, should be direct after fix
+                    let stmt = conn
+                        .prepare("INSERT INTO bench(id, name, score) VALUES (?1, ?2, ?3)")
+                        .await
+                        .expect("prepare FrankenSQLite same-order column-list INSERT");
+                    for i in 1..=1000_i64 {
+                        let inserted = stmt
+                            .execute_with_params(&[
+                                SqliteValue::Integer(i),
+                                SqliteValue::Text(format!("name_{i}").into()),
+                                SqliteValue::Integer(i * 7),
+                            ])
+                            .await
+                            .expect("execute FrankenSQLite same-order column-list INSERT");
+                        assert_eq!(
+                            inserted, 1,
+                            "FrankenSQLite same-order column-list INSERT affected-row count"
+                        );
+                    }
+                    conn.execute("COMMIT")
+                        .await
+                        .expect("commit FrankenSQLite same-order column-list transaction");
+                });
             },
             BatchSize::LargeInput,
         );
@@ -785,27 +830,34 @@ fn bench_column_list_insert_prepared(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                fsqlite_e2e::block_on(conn.execute("BEGIN"))
-                    .expect("begin FrankenSQLite reordered column-list transaction");
-                // Column list in different order → requires reordering
-                let stmt = fsqlite_e2e::block_on(
-                    conn.prepare("INSERT INTO bench(score, name, id) VALUES (?1, ?2, ?3)"),
-                )
-                .expect("prepare FrankenSQLite reordered column-list INSERT");
-                for i in 1..=1000_i64 {
-                    let inserted = fsqlite_e2e::block_on(stmt.execute_with_params(&[
-                        SqliteValue::Integer(i * 7),                   // score
-                        SqliteValue::Text(format!("name_{i}").into()), // name
-                        SqliteValue::Integer(i),                       // id
-                    ]))
-                    .expect("execute FrankenSQLite reordered column-list INSERT");
-                    assert_eq!(
-                        inserted, 1,
-                        "FrankenSQLite reordered column-list INSERT affected-row count"
-                    );
-                }
-                fsqlite_e2e::block_on(conn.execute("COMMIT"))
-                    .expect("commit FrankenSQLite reordered column-list transaction");
+                // bd-mnlk2 / bd-zavyn: one runtime entry per timed sample.
+                fsqlite_e2e::block_on(async {
+                    conn.execute("BEGIN")
+                        .await
+                        .expect("begin FrankenSQLite reordered column-list transaction");
+                    // Column list in different order → requires reordering
+                    let stmt = conn
+                        .prepare("INSERT INTO bench(score, name, id) VALUES (?1, ?2, ?3)")
+                        .await
+                        .expect("prepare FrankenSQLite reordered column-list INSERT");
+                    for i in 1..=1000_i64 {
+                        let inserted = stmt
+                            .execute_with_params(&[
+                                SqliteValue::Integer(i * 7),                   // score
+                                SqliteValue::Text(format!("name_{i}").into()), // name
+                                SqliteValue::Integer(i),                       // id
+                            ])
+                            .await
+                            .expect("execute FrankenSQLite reordered column-list INSERT");
+                        assert_eq!(
+                            inserted, 1,
+                            "FrankenSQLite reordered column-list INSERT affected-row count"
+                        );
+                    }
+                    conn.execute("COMMIT")
+                        .await
+                        .expect("commit FrankenSQLite reordered column-list transaction");
+                });
             },
             BatchSize::LargeInput,
         );

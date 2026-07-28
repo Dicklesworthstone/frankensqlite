@@ -6,6 +6,11 @@
 //! epoch, and 256-row epoch. Reports rust-hot-cache-warm timings side by side
 //! so the only changing variable is the micro-batcher itself.
 
+// bd-mnlk2 / bd-zavyn: the hoisted timed bodies await fsqlite-core's
+// deliberately large, deeply nested engine futures inside one runtime entry
+// per sample; boxing them would put an allocation inside the timed window.
+#![allow(clippy::large_futures)]
+
 use std::time::Instant;
 
 const WARMUP: usize = 4;
