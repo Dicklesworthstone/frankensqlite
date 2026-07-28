@@ -17,23 +17,12 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use fsqlite_observability::GLOBAL_TXN_SLOT_METRICS;
 
-/// Cache line size in bytes for IN-PROCESS false-sharing padding.
+/// Cache line size in bytes.
 ///
-/// 64 bytes on x86-64 (Intel/AMD). 128 bytes on aarch64: Apple M-series
-/// (M1–M5) use 128-byte L1D/L2 lines, and padding contended atomics to only
-/// 64 bytes there puts two logically-independent shards on one line —
-/// exactly the false sharing this module exists to prevent. (Graviton uses
-/// 64-byte lines; over-padding to 128 there costs a few KiB across all shard
-/// tables and is harmless.)
-///
-/// NOT a shared-memory layout constant: [`SharedTxnSlot`] and every other
-/// cross-process structure pin their own literal `repr(align(..))` because
-/// the shm layout is a file format and must not vary by architecture.
-pub const CACHE_LINE_BYTES: usize = if cfg!(target_arch = "aarch64") {
-    128
-} else {
-    64
-};
+/// 64 bytes for x86-64 (Intel/AMD) and AArch64 (Apple M-series, Graviton).
+/// Over-aligning for platforms with 128-byte lines (some ARM) is safe
+/// (wastes a little memory but prevents false sharing on 64-byte platforms).
+pub const CACHE_LINE_BYTES: usize = 64;
 
 // ---------------------------------------------------------------------------
 // CacheAligned<T>
@@ -47,12 +36,10 @@ pub const CACHE_LINE_BYTES: usize = if cfg!(target_arch = "aarch64") {
 ///
 /// # Layout
 ///
-/// `#[repr(C, align(N))]` (N = [`CACHE_LINE_BYTES`]: 128 on aarch64, 64
-/// elsewhere) guarantees:
-/// - The struct starts at a cache-line-aligned address.
-/// - The struct size is rounded up to the next multiple of the line size.
-#[cfg_attr(target_arch = "aarch64", repr(C, align(128)))]
-#[cfg_attr(not(target_arch = "aarch64"), repr(C, align(64)))]
+/// `#[repr(C, align(64))]` guarantees:
+/// - The struct starts at a 64-byte-aligned address.
+/// - The struct size is rounded up to the next multiple of 64 bytes.
+#[repr(C, align(64))]
 pub struct CacheAligned<T> {
     value: T,
 }
@@ -185,11 +172,6 @@ pub const CLAIMING_TIMEOUT_NO_PID_SECS: u64 = 30;
 ///
 /// All fields are atomic for lock-free cross-process access via shared memory.
 /// A `txn_id` of 0 indicates the slot is free.
-///
-/// LAYOUT CONTRACT: the literal `align(64)` here is shared-memory FILE
-/// FORMAT (§5.6.2 fixed offsets), deliberately NOT [`CACHE_LINE_BYTES`] —
-/// the shm layout must be identical on every architecture, while the
-/// in-process padding constant varies (128 on aarch64).
 #[repr(C, align(64))]
 pub struct SharedTxnSlot {
     // === First cache line (offsets 0–63) — hot read path ===

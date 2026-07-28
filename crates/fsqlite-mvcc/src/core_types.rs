@@ -358,12 +358,7 @@ impl std::fmt::Debug for VersionArena {
 /// bookkeeping. Keep this power-of-two fanout high enough for fallback
 /// concurrency without making every fresh database pay a large open-time
 /// allocation cost.
-///
-/// 128 matches `MAX_CONCURRENT_WRITERS`: on high-core-count hosts
-/// (128-thread Threadrippers), 64 shards guaranteed ≥2 writers per shard by
-/// pigeonhole even under a uniform page distribution. In-process only —
-/// shm.rs pins its own cross-process layout independently.
-pub const LOCK_TABLE_SHARDS: usize = 128;
+pub const LOCK_TABLE_SHARDS: usize = 64;
 
 /// Size of the fast atomic lock address space covering page numbers
 /// 1..=FAST_LOCK_ARRAY_SIZE.
@@ -4140,9 +4135,8 @@ mod tests {
             let gap = b - a;
             assert!(
                 gap >= crate::cache_aligned::CACHE_LINE_BYTES,
-                "lock table shard {i} and {next} must be >= {line} bytes apart, got {gap}",
-                next = i + 1,
-                line = crate::cache_aligned::CACHE_LINE_BYTES
+                "lock table shard {i} and {next} must be >= 64 bytes apart, got {gap}",
+                next = i + 1
             );
             assert_eq!(
                 a % crate::cache_aligned::CACHE_LINE_BYTES,
@@ -4161,9 +4155,8 @@ mod tests {
             let gap = b - a;
             assert!(
                 gap >= crate::cache_aligned::CACHE_LINE_BYTES,
-                "commit index shard {i} and {next} must be >= {line} bytes apart, got {gap}",
-                next = i + 1,
-                line = crate::cache_aligned::CACHE_LINE_BYTES
+                "commit index shard {i} and {next} must be >= 64 bytes apart, got {gap}",
+                next = i + 1
             );
             assert_eq!(
                 a % crate::cache_aligned::CACHE_LINE_BYTES,

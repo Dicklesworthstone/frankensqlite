@@ -91,11 +91,9 @@ fn chain_head_empty_sentinel_constant() {
 
 #[test]
 fn chain_head_sharding_constant() {
-    // 128 matches MAX_CONCURRENT_WRITERS so a full complement of concurrent
-    // writers averages <=1 per shard on 128-thread hosts.
     assert_eq!(
-        CHAIN_HEAD_SHARDS, 128,
-        "bead_id={BEAD} shard count should be 128"
+        CHAIN_HEAD_SHARDS, 64,
+        "bead_id={BEAD} shard count should be 64"
     );
 }
 

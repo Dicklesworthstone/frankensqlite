@@ -106,14 +106,12 @@ fn update_max(metric: &AtomicU64, val: u64) {
 // CommitSlot
 // ---------------------------------------------------------------------------
 
-/// Cache-line aligned commit slot (one full line: 64 bytes on x86-64,
-/// 128 on aarch64 where M-series lines are 128 bytes).
+/// Cache-line aligned commit slot (64 bytes).
 ///
 /// Uses atomic operations for both state and result to avoid `unsafe` code.
 /// The state field encodes the slot state in the high bits and reserves
 /// low bits for future extensions.
-#[cfg_attr(target_arch = "aarch64", repr(align(128)))]
-#[cfg_attr(not(target_arch = "aarch64"), repr(align(64)))]
+#[repr(align(64))]
 struct CommitSlot {
     /// Slot state: EMPTY, PENDING, or DONE.
     state: AtomicU8,

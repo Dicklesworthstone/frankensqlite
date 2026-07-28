@@ -78,13 +78,10 @@ use crate::cache_aligned::CacheAligned;
 
 /// Maximum threads that can simultaneously publish into one shard.
 ///
-/// The publication list is a fixed-size array; when every slot is taken,
-/// `acquire_slot` spin-parks until one frees — a latency cliff, not an
-/// error. Sized to `MAX_CONCURRENT_WRITERS` (128, begin_concurrent.rs) so a
-/// full complement of concurrent writers on a 128-thread host never hits
-/// the cliff. (An earlier revision said writers were capped "< 32"; that
-/// was stale — the registry admits 128.)
-pub const MAX_FC_SLOTS: usize = 128;
+/// The publication list is a fixed-size array; if every slot is full, a
+/// thread falls back to acquiring the combiner lock directly. In practice,
+/// 64 far exceeds FrankenSQLite's `MAX_CONCURRENT_WRITERS` (which is < 32).
+pub const MAX_FC_SLOTS: usize = 64;
 
 /// Emit an INFO-level tracing event when a combiner drains a batch at least
 /// this large. Batches this big indicate real contention that the flat

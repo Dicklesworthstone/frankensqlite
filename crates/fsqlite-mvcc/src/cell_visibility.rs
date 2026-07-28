@@ -3542,9 +3542,8 @@ mod tests {
     /// Test: shard padding prevents false sharing (compile-time assert on alignment)
     #[test]
     fn c3_test_shard_padding_alignment() {
-        // CellLogShard should be cache-line aligned (64 bytes on x86-64,
-        // 128 on aarch64) — enforced by CacheAligned / the platform-
-        // conditional repr(align) on the shard struct.
+        // CellLogShard should be cache-line aligned (64 bytes)
+        // This is enforced by #[repr(align(64))] on the shard struct
 
         // Verify the shard count and that different pages map to different shards
         let mut shard_counts = [0usize; CELL_LOG_SHARDS];

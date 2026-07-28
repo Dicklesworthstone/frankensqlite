@@ -253,11 +253,8 @@ pub struct SnapshotResolveTrace {
 // ChainHeadTable — latch-free MVCC version chain heads (bd-688.3)
 // ---------------------------------------------------------------------------
 
-/// Number of shards in the chain head table (power of 2).
-///
-/// 128 matches `MAX_CONCURRENT_WRITERS` so a full complement of concurrent
-/// writers averages ≤1 per shard on 128-thread hosts.
-pub const CHAIN_HEAD_SHARDS: usize = 128;
+/// Number of shards in the chain head table (power of 2 for fast modular indexing).
+pub const CHAIN_HEAD_SHARDS: usize = 64;
 
 /// Sentinel value stored in an `AtomicU64` slot to indicate "no version" (empty chain).
 pub const CHAIN_HEAD_EMPTY: u64 = u64::MAX;
