@@ -9772,6 +9772,28 @@ struct FkCascadeDepthGuard<'a> {
     depth: &'a Cell<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatementFailurePolicy {
+    Rollback,
+    PreserveApplicableConstraintChanges,
+}
+
+impl StatementFailurePolicy {
+    const fn for_or_fail(or_fail: bool) -> Self {
+        if or_fail {
+            Self::PreserveApplicableConstraintChanges
+        } else {
+            Self::Rollback
+        }
+    }
+
+    fn preserves_prior_changes(self, error: &FrankenError) -> bool {
+        matches!(error, FrankenError::RaiseFail(_))
+            || (self == Self::PreserveApplicableConstraintChanges
+                && error_uses_conflict_resolution(error))
+    }
+}
+
 impl<'a> FkCascadeDepthGuard<'a> {
     fn enter(depth: &'a Cell<usize>) -> Result<Self> {
         let current_depth = depth.get();
@@ -11571,6 +11593,9 @@ impl Connection {
                     );
                     let preserve_prior_changes_on_constraint_violation =
                         insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
+                    let failure_policy = StatementFailurePolicy::for_or_fail(
+                        preserve_prior_changes_on_constraint_violation,
+                    );
                     match &rewritten.source {
                         fsqlite_ast::InsertSource::Select(select_stmt) => {
                             tracing::debug!(
@@ -11608,9 +11633,7 @@ impl Connection {
                                     Ok(Some(Vec::new()))
                                 }
                                 Err(error) => {
-                                    if preserve_prior_changes_on_constraint_violation
-                                        && error_is_constraint_violation(&error)
-                                    {
+                                    if failure_policy.preserves_prior_changes(&error) {
                                         self.apply_attached_insert_tracking(
                                             changes,
                                             last_insert_rowid,
@@ -11645,9 +11668,7 @@ impl Connection {
                                     Ok(Some(rows))
                                 }
                                 Err(error) => {
-                                    if preserve_prior_changes_on_constraint_violation
-                                        && error_is_constraint_violation(&error)
-                                    {
+                                    if failure_policy.preserves_prior_changes(&error) {
                                         self.apply_attached_insert_tracking(
                                             changes,
                                             last_insert_rowid,
@@ -11689,6 +11710,9 @@ impl Connection {
                     );
                     let preserve_prior_changes_on_constraint_violation =
                         update.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
+                    let failure_policy = StatementFailurePolicy::for_or_fail(
+                        preserve_prior_changes_on_constraint_violation,
+                    );
                     let (result, changes) = self
                         .with_attached_connection_async(&target_schema, async |conn| {
                             let previous_last_insert_rowid = conn.current_last_insert_rowid();
@@ -11696,12 +11720,10 @@ impl Connection {
                                 .execute_statement(&Statement::Update(rewritten), params)
                                 .await;
                             let changes = conn.last_changes.get();
-                            if preserve_prior_changes_on_constraint_violation
-                                && matches!(
-                                    result.as_ref(),
-                                    Err(error) if error_is_constraint_violation(error)
-                                )
-                            {
+                            if matches!(
+                                result.as_ref(),
+                                Err(error) if failure_policy.preserves_prior_changes(error)
+                            ) {
                                 // Attached connections are reused across statements, so
                                 // preserve their own last_insert_rowid() state too.
                                 conn.record_last_insert_rowid(previous_last_insert_rowid);
@@ -11715,9 +11737,7 @@ impl Connection {
                             Ok(Some(rows))
                         }
                         Err(error) => {
-                            if preserve_prior_changes_on_constraint_violation
-                                && error_is_constraint_violation(&error)
-                            {
+                            if failure_policy.preserves_prior_changes(&error) {
                                 self.apply_attached_statement_tracking(changes);
                                 // UPDATE must preserve the outer connection's
                                 // prior last_insert_rowid().
@@ -13245,13 +13265,13 @@ impl Connection {
 
     fn restore_failed_statement_tracking(
         &self,
-        preserve_prior_changes_on_constraint_violation: bool,
+        failure_policy: StatementFailurePolicy,
         error: &FrankenError,
         previous_total_changes: usize,
         previous_last_insert_rowid: i64,
     ) {
         let error_state = self.take_table_program_error_state();
-        if preserve_prior_changes_on_constraint_violation && error_is_constraint_violation(error) {
+        if failure_policy.preserves_prior_changes(error) {
             if let Some(state) = error_state {
                 self.restore_change_tracking_state(
                     state.changes,
@@ -19914,16 +19934,16 @@ impl Connection {
         let previous_total_changes = self.total_changes.get();
         let previous_last_insert_rowid = self.current_last_insert_rowid();
         self.txn_metrics_note_write();
+        let failure_policy =
+            StatementFailurePolicy::for_or_fail(preserve_prior_changes_on_constraint_violation);
         let use_statement_savepoint = !skip_statement_savepoint_in_explicit_txn
-            && self.should_use_statement_savepoint(
-                was_auto,
-                preserve_prior_changes_on_constraint_violation,
-            );
+            && self.should_use_statement_savepoint(was_auto);
         let execute_body_start = hot_path_profile_enabled().then(Instant::now);
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint_and_cx(
                 execution_cx,
                 statement_kind,
+                failure_policy,
                 execute_body,
             )
             .await
@@ -19935,7 +19955,7 @@ impl Connection {
             Ok(affected) => Ok(affected),
             Err(error) => {
                 self.restore_failed_statement_tracking(
-                    preserve_prior_changes_on_constraint_violation,
+                    failure_policy,
                     &error,
                     previous_total_changes,
                     previous_last_insert_rowid,
@@ -19954,11 +19974,12 @@ impl Connection {
             }
         };
         let commit_autocommit_on_error = was_auto
-            && preserve_prior_changes_on_constraint_violation
-            && matches!(
-                result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
-            );
+            && ((preserve_prior_changes_on_constraint_violation
+                && matches!(
+                    result.as_ref(),
+                    Err(error) if error_uses_conflict_resolution(error)
+                ))
+                || matches!(result.as_ref(), Err(FrankenError::RaiseFail(_))));
         let execution_ok = result.is_ok() || commit_autocommit_on_error;
         let autocommit_resolve_start =
             (direct_insert_autocommit_candidate && was_auto).then(Instant::now);
@@ -20293,7 +20314,7 @@ impl Connection {
         let commit_autocommit_on_error = preserve_prior_changes_on_constraint_violation
             && matches!(
                 result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
+                Err(error) if error_uses_conflict_resolution(error)
             );
         let ok = result.is_ok() || commit_autocommit_on_error;
         let autocommit_resolve_start = hot_path_profile_enabled().then(Instant::now);
@@ -23145,7 +23166,7 @@ impl Connection {
         let commit_autocommit_on_error = preserve_prior_changes_on_constraint_violation
             && matches!(
                 result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
+                Err(error) if error_uses_conflict_resolution(error)
             );
         let ok = result.is_ok() || commit_autocommit_on_error;
         if matches!(result.as_ref(), Ok(0)) {
@@ -24364,12 +24385,17 @@ impl Connection {
         self.execute_rollback(&rollback_stmt).await
     }
 
-    async fn with_internal_statement_savepoint<T, F>(&self, purpose: &str, body: F) -> Result<T>
+    async fn with_internal_statement_savepoint<T, F>(
+        &self,
+        purpose: &str,
+        failure_policy: StatementFailurePolicy,
+        body: F,
+    ) -> Result<T>
     where
         F: std::ops::AsyncFnOnce() -> Result<T>,
     {
         let cx = self.op_cx()?;
-        self.with_internal_statement_savepoint_and_cx(&cx, purpose, body)
+        self.with_internal_statement_savepoint_and_cx(&cx, purpose, failure_policy, body)
             .await
     }
 
@@ -24377,6 +24403,7 @@ impl Connection {
         &self,
         cx: &Cx,
         purpose: &str,
+        failure_policy: StatementFailurePolicy,
         body: F,
     ) -> Result<T>
     where
@@ -24459,10 +24486,12 @@ impl Connection {
                 Ok(value)
             }
             Err(statement_error) => {
-                // RAISE(FAIL): the statement fails but its already-applied rows
-                // are KEPT. Release the savepoint exactly as on success (instead
-                // of rolling back to it), then propagate the error.
-                if matches!(statement_error, FrankenError::RaiseFail(_)) {
+                // RAISE(FAIL), or an applicable constraint under INSERT/UPDATE
+                // OR FAIL, keeps the rows changed before the failure. Release
+                // the savepoint exactly as on success, then propagate the
+                // original error. Foreign-key, datatype, recursion-depth,
+                // internal, and I/O errors retain ABORT semantics.
+                if failure_policy.preserves_prior_changes(&statement_error) {
                     if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
                         txn.release_savepoint(cx, &savepoint_name)?;
                     }
@@ -24998,14 +25027,9 @@ impl Connection {
         true
     }
 
-    fn should_use_statement_savepoint(
-        &self,
-        was_auto: bool,
-        preserve_prior_changes_on_constraint_violation: bool,
-    ) -> bool {
+    fn should_use_statement_savepoint(&self, was_auto: bool) -> bool {
         self.active_txn_is_open_or_borrowed()
             && self.internal_statement_savepoint_depth.get() == 0
-            && !preserve_prior_changes_on_constraint_violation
             && (!was_auto || self.retained_autocommit_batch_active())
     }
 
@@ -25295,35 +25319,42 @@ impl Connection {
                     }
                 }
             }
-            let use_statement_savepoint = self.should_use_statement_savepoint(
-                was_auto,
-                statement_preserves_prior_changes_on_constraint(statement.as_ref()),
-            ) && matches!(
-                statement.as_ref(),
-                Statement::Insert(_)
-                    | Statement::Update(_)
-                    | Statement::Delete(_)
-                    | Statement::CreateIndex(_)
-                    | Statement::AlterTable(fsqlite_ast::AlterTableStatement {
-                        action: AlterTableAction::DropColumn(_),
-                        ..
-                    })
-                    | Statement::Reindex(_)
-            );
+            let preserve_prior_changes_on_constraint_violation =
+                statement_preserves_prior_changes_on_constraint(statement.as_ref());
+            let failure_policy =
+                StatementFailurePolicy::for_or_fail(preserve_prior_changes_on_constraint_violation);
+            let use_statement_savepoint = self.should_use_statement_savepoint(was_auto)
+                && matches!(
+                    statement.as_ref(),
+                    Statement::Insert(_)
+                        | Statement::Update(_)
+                        | Statement::Delete(_)
+                        | Statement::CreateIndex(_)
+                        | Statement::AlterTable(fsqlite_ast::AlterTableStatement {
+                            action: AlterTableAction::DropColumn(_),
+                            ..
+                        })
+                        | Statement::Reindex(_)
+                );
             let rollback_on_constraint_violation =
                 statement_rolls_back_transaction_on_constraint(statement.as_ref());
             let execute_body_start = hot_path_profile_enabled().then(Instant::now);
             let result = if use_statement_savepoint {
-                self.with_internal_statement_savepoint_and_cx(&op_cx, statement_kind, async || {
-                    self.execute_statement_dispatch_impl(
-                        &op_cx,
-                        statement.as_ref(),
-                        params,
-                        precompiled,
-                        derived_storage_log_select.as_ref(),
-                    )
-                    .await
-                })
+                self.with_internal_statement_savepoint_and_cx(
+                    &op_cx,
+                    statement_kind,
+                    failure_policy,
+                    async || {
+                        self.execute_statement_dispatch_impl(
+                            &op_cx,
+                            statement.as_ref(),
+                            params,
+                            precompiled,
+                            derived_storage_log_select.as_ref(),
+                        )
+                        .await
+                    },
+                )
                 .await
             } else {
                 self.execute_statement_dispatch_impl(
@@ -25344,7 +25375,7 @@ impl Connection {
                         Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
                     ) {
                         self.restore_failed_statement_tracking(
-                            statement_preserves_prior_changes_on_constraint(statement.as_ref()),
+                            failure_policy,
                             &error,
                             previous_total_changes,
                             previous_last_insert_rowid,
@@ -25364,10 +25395,10 @@ impl Connection {
                 }
             };
             let commit_autocommit_on_error = was_auto
-                && ((statement_preserves_prior_changes_on_constraint(statement.as_ref())
+                && ((preserve_prior_changes_on_constraint_violation
                 && matches!(
                     result.as_ref(),
-                    Err(error) if error_is_constraint_violation(error)
+                    Err(error) if error_uses_conflict_resolution(error)
                 ))
                 // RAISE(FAIL) keeps the statement's already-applied rows, so an
                 // autocommit statement must commit them rather than roll back.
@@ -27317,12 +27348,11 @@ impl Connection {
         let was_auto = self.ensure_autocommit_txn().await?;
         let preserve_prior_changes_on_constraint_violation =
             insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
-        let use_statement_savepoint = self.should_use_statement_savepoint(
-            was_auto,
-            preserve_prior_changes_on_constraint_violation,
-        );
+        let failure_policy =
+            StatementFailurePolicy::for_or_fail(preserve_prior_changes_on_constraint_violation);
+        let use_statement_savepoint = self.should_use_statement_savepoint(was_auto);
         let result = if use_statement_savepoint {
-            self.with_internal_statement_savepoint("insert_select", async || {
+            self.with_internal_statement_savepoint("insert_select", failure_policy, async || {
                 self.execute_insert_select_materialized_rows(insert, source_rows)
                     .await
             })
@@ -27335,7 +27365,7 @@ impl Connection {
             && ((preserve_prior_changes_on_constraint_violation
                 && matches!(
                     result.as_ref(),
-                    Err(error) if error_is_constraint_violation(error)
+                    Err(error) if error_uses_conflict_resolution(error)
                 ))
                 // RAISE(FAIL) in a BEFORE trigger keeps the rows already inserted
                 // by this statement; commit them instead of rolling back.
@@ -27635,6 +27665,7 @@ impl Connection {
 
 struct InsertSelectReplayEmitter<'conn> {
     connection: &'conn Connection,
+    failure_policy: StatementFailurePolicy,
     source_column_count: usize,
     prepared: Option<PreparedStatement<'conn>>,
     returning_statement: Option<Statement>,
@@ -27647,9 +27678,11 @@ struct InsertSelectReplayEmitter<'conn> {
 }
 
 impl InsertSelectReplayEmitter<'_> {
-    fn record_error_state(&mut self) {
+    fn record_error_state(&mut self, error: &FrankenError) {
         self.error_state_recorded = true;
-        if self.connection.internal_statement_savepoint_depth.get() > 0 {
+        if self.connection.internal_statement_savepoint_depth.get() > 0
+            && !self.failure_policy.preserves_prior_changes(error)
+        {
             self.connection.restore_change_tracking_state(
                 0,
                 self.previous_total_changes,
@@ -27705,7 +27738,7 @@ impl InsertSelectReplayEmitter<'_> {
                 Ok(())
             }
             Err(error) => {
-                self.record_error_state();
+                self.record_error_state(&error);
                 Err(error)
             }
         }
@@ -27742,6 +27775,8 @@ impl Connection {
         let collect_returning = !insert.returning.is_empty();
         let preserve_prior_changes_on_constraint_violation =
             insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
+        let failure_policy =
+            StatementFailurePolicy::for_or_fail(preserve_prior_changes_on_constraint_violation);
         let previous_total_changes = self.total_changes.get();
         let previous_last_insert_rowid = self.current_last_insert_rowid();
         let mut execute_rows = async || -> Result<InsertSelectReplayOutcome> {
@@ -27759,6 +27794,7 @@ impl Connection {
             };
             let mut emitter = InsertSelectReplayEmitter {
                 connection: self,
+                failure_policy,
                 source_column_count,
                 prepared,
                 returning_statement,
@@ -27772,18 +27808,16 @@ impl Connection {
 
             if let Err(error) = producer(&mut emitter).await {
                 if !emitter.error_state_recorded {
-                    emitter.record_error_state();
+                    emitter.record_error_state(&error);
                 }
                 return Err(error);
             }
             Ok(emitter.into_outcome())
         };
 
-        if !preserve_prior_changes_on_constraint_violation
-            && self.active_txn.borrow().is_some()
-            && self.internal_statement_savepoint_depth.get() == 0
+        if self.active_txn.borrow().is_some() && self.internal_statement_savepoint_depth.get() == 0
         {
-            self.with_internal_statement_savepoint("insert_select", execute_rows)
+            self.with_internal_statement_savepoint("insert_select", failure_policy, execute_rows)
                 .await
         } else {
             execute_rows().await
@@ -30630,7 +30664,10 @@ impl Connection {
         &self,
         insert: &fsqlite_ast::InsertStatement,
     ) -> bool {
-        if insert.or_conflict == Some(fsqlite_ast::ConflictAction::Rollback) {
+        if matches!(
+            insert.or_conflict,
+            Some(fsqlite_ast::ConflictAction::Rollback | fsqlite_ast::ConflictAction::Fail)
+        ) {
             return false;
         }
         if !self.prepared_insert_supports_direct_dispatch(insert) {
@@ -30668,8 +30705,10 @@ impl Connection {
         &self,
         update: &fsqlite_ast::UpdateStatement,
     ) -> bool {
-        if update.or_conflict == Some(fsqlite_ast::ConflictAction::Rollback)
-            || update.from.is_some()
+        if matches!(
+            update.or_conflict,
+            Some(fsqlite_ast::ConflictAction::Rollback | fsqlite_ast::ConflictAction::Fail)
+        ) || update.from.is_some()
         {
             return false;
         }
@@ -61575,6 +61614,8 @@ impl Connection {
             let statement = Statement::Update(stripped);
             let preserve_prior_changes_on_constraint_violation =
                 update.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
+            let failure_policy =
+                StatementFailurePolicy::for_or_fail(preserve_prior_changes_on_constraint_violation);
             let (result, changes) = self
                 .with_attached_connection_async(&target_schema, async move |conn| {
                     let previous_last_insert_rowid = conn.current_last_insert_rowid();
@@ -61586,12 +61627,10 @@ impl Connection {
                         )
                         .await;
                     let changes = conn.last_changes.get();
-                    if preserve_prior_changes_on_constraint_violation
-                        && matches!(
-                            result.as_ref(),
-                            Err(error) if error_is_constraint_violation(error)
-                        )
-                    {
+                    if matches!(
+                        result.as_ref(),
+                        Err(error) if failure_policy.preserves_prior_changes(error)
+                    ) {
                         conn.record_last_insert_rowid(previous_last_insert_rowid);
                     }
                     Ok((result, changes))
@@ -61603,9 +61642,7 @@ impl Connection {
                     Ok(rows)
                 }
                 Err(error) => {
-                    if preserve_prior_changes_on_constraint_violation
-                        && error_is_constraint_violation(&error)
-                    {
+                    if failure_policy.preserves_prior_changes(&error) {
                         self.apply_attached_statement_tracking(changes);
                         self.record_table_program_error_state(changes, None);
                     }
@@ -61649,6 +61686,8 @@ impl Connection {
             let statement = Statement::Insert(stripped.clone());
             let preserve_prior_changes_on_constraint_violation =
                 insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
+            let failure_policy =
+                StatementFailurePolicy::for_or_fail(preserve_prior_changes_on_constraint_violation);
             let (result, changes, last_insert_rowid) = self
                 .with_attached_connection_async(&target_schema, async move |conn| {
                     let result = conn
@@ -61671,9 +61710,7 @@ impl Connection {
                     Ok(rows)
                 }
                 Err(error) => {
-                    if preserve_prior_changes_on_constraint_violation
-                        && error_is_constraint_violation(&error)
-                    {
+                    if failure_policy.preserves_prior_changes(&error) {
                         self.apply_attached_insert_tracking(changes, last_insert_rowid);
                         self.record_table_program_error_state(changes, last_insert_rowid);
                     }
@@ -93102,22 +93139,36 @@ fn statement_preserves_prior_changes_on_constraint(statement: &Statement) -> boo
     )
 }
 
-fn error_is_constraint_violation(error: &FrankenError) -> bool {
-    if error.error_code() == ErrorCode::Constraint {
-        return true;
+/// Whether SQLite's statement-level `ON CONFLICT` algorithm applies to this
+/// error. Foreign-key and STRICT datatype constraints always use ABORT
+/// semantics, even when the statement says `OR FAIL` or `OR ROLLBACK`.
+fn error_uses_conflict_resolution(error: &FrankenError) -> bool {
+    match error {
+        FrankenError::UniqueViolation { .. }
+        | FrankenError::NotNullViolation { .. }
+        | FrankenError::CheckViolation { .. }
+        | FrankenError::PrimaryKeyViolation => true,
+        FrankenError::Internal(message) => {
+            let Some(rest) = message.strip_prefix("VDBE halted with code ") else {
+                return false;
+            };
+            let Some((code, detail)) = rest.split_once(": ") else {
+                return false;
+            };
+            if code.parse::<i32>().ok() != Some(ErrorCode::Constraint as i32) {
+                return false;
+            }
+            detail.starts_with("UNIQUE constraint failed")
+                || detail.starts_with("NOT NULL constraint failed")
+                || detail.starts_with("CHECK constraint failed")
+                || detail.starts_with("PRIMARY KEY constraint failed")
+        }
+        _ => false,
     }
-    matches!(
-        error,
-        FrankenError::Internal(message)
-            if message.starts_with(&format!(
-                "VDBE halted with code {}:",
-                ErrorCode::Constraint as i32
-            ))
-    )
 }
 
 fn error_triggers_conflict_action_rollback(error: &FrankenError) -> bool {
-    error_is_constraint_violation(error)
+    error_uses_conflict_resolution(error)
 }
 
 fn reverse_vtab_constraint_op(op: BinaryOp) -> Option<ConstraintOp> {
@@ -96741,8 +96792,8 @@ mod tests {
         FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS, InProcessPageLockTable, IoPollStrategy,
         MAX_TRIGGER_DEPTH, PagerBackend, PagerPublishedSnapshot, Row, RuntimeConfig,
         RuntimeContext, SchemaEpoch, SharedRuntimeState, SimplePager, Snapshot,
-        arm_trigger_stack_probe, init_global_runtime, is_implicit_autoindex_entry,
-        is_sqlite_master_entry_missing, join_hidden_rowid_projection,
+        StatementFailurePolicy, arm_trigger_stack_probe, init_global_runtime,
+        is_implicit_autoindex_entry, is_sqlite_master_entry_missing, join_hidden_rowid_projection,
         join_table_supports_hidden_rowid, lock_unpoisoned, memdb_row_matches_like_fast_path,
         set_trigger_depth_limit_override, statement_contains_rewritable_subquery,
         take_trigger_stack_probe, wal_file_present_with_vfs, wal_path_for_db_path,
@@ -117911,6 +117962,14 @@ mod tests {
                 FrankenError::RaiseFail(ref msg) if msg == "fail insert"
             ));
 
+            let tracking = conn
+                .query("SELECT last_insert_rowid(), changes(), total_changes();")
+                .await
+                .unwrap();
+            assert_eq!(tracking[0].values()[0], SqliteValue::Integer(2));
+            assert_eq!(tracking[0].values()[1], SqliteValue::Integer(2));
+            assert_eq!(tracking[0].values()[2], SqliteValue::Integer(2));
+
             // Rows 1 and 2 (inserted before the failing row 3) must survive.
             let rows = conn.query("SELECT id FROM t ORDER BY id;").await.unwrap();
             let ids: Vec<i64> = rows
@@ -117921,6 +117980,52 @@ mod tests {
                 })
                 .collect();
             assert_eq!(ids, vec![1, 2], "RAISE(FAIL) must keep prior rows");
+
+            let explicit = Connection::open(":memory:").await.unwrap();
+            explicit
+                .execute("CREATE TABLE t (id INTEGER);")
+                .await
+                .unwrap();
+            explicit
+                .execute(
+                    "CREATE TRIGGER trg_raise_fail BEFORE INSERT ON t WHEN NEW.id = 3 \
+                     BEGIN SELECT RAISE(FAIL, 'fail insert'); END;",
+                )
+                .await
+                .unwrap();
+            explicit.execute("BEGIN;").await.unwrap();
+            let err = explicit
+                .execute("INSERT INTO t VALUES (1),(2),(3),(4);")
+                .await
+                .expect_err("explicit-transaction INSERT should fail via RAISE(FAIL)");
+            assert!(matches!(
+                err,
+                FrankenError::RaiseFail(ref msg) if msg == "fail insert"
+            ));
+            assert!(
+                explicit.in_transaction(),
+                "RAISE(FAIL) must leave the explicit transaction open"
+            );
+            let tracking = explicit
+                .query("SELECT last_insert_rowid(), changes(), total_changes();")
+                .await
+                .unwrap();
+            assert_eq!(tracking[0].values()[0], SqliteValue::Integer(2));
+            assert_eq!(tracking[0].values()[1], SqliteValue::Integer(2));
+            assert_eq!(tracking[0].values()[2], SqliteValue::Integer(2));
+            let rows = explicit
+                .query("SELECT id FROM t ORDER BY id;")
+                .await
+                .unwrap();
+            let ids = rows
+                .iter()
+                .map(|row| match row.values()[0] {
+                    SqliteValue::Integer(value) => value,
+                    ref other => panic!("unexpected value {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(ids, vec![1, 2]);
+            explicit.execute("ROLLBACK;").await.unwrap();
         });
     }
 
@@ -129049,6 +129154,7 @@ mod tests {
             let err = conn
                 .with_internal_statement_savepoint(
                     "vtab_cleanup_failure",
+                    StatementFailurePolicy::Rollback,
                     async || -> Result<()> {
                         with_txn_test_vtab(&conn, "vt", |vtab| vtab.fail_rollback_to_at = Some(0));
                         Err(FrankenError::Internal(
@@ -143340,6 +143446,7 @@ mod schema_cookie_tests {
             let err = conn
                 .with_internal_statement_savepoint(
                     "test_missing_session",
+                    StatementFailurePolicy::Rollback,
                     async || -> Result<()> {
                         conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
                         *conn.concurrent_session_id.borrow_mut() = None;
@@ -143419,6 +143526,7 @@ mod schema_cookie_tests {
             let err = conn
                 .with_internal_statement_savepoint(
                     "test_rollback_failure",
+                    StatementFailurePolicy::Rollback,
                     async || -> Result<()> {
                         let replacement = fsqlite_pager::MvccPager::begin(
                             &pager,
@@ -163063,16 +163171,20 @@ mod pager_routing_tests {
 
             conn.begin_transaction().await.unwrap();
             let err = conn
-            .with_internal_statement_savepoint("append_hint_clear", async || -> Result<()> {
-                stmt.execute_with_params(&[SqliteValue::Text("rolled_back".into())]).await?;
-                assert!(
-                    conn.prepared_direct_insert_append_hint.borrow().is_some(),
-                    "direct prepared INSERT should populate the append hint before the statement savepoint rolls back"
-                );
-                Err(FrankenError::FunctionError(
-                    "forced statement rollback".to_owned(),
-                ))
-            })
+            .with_internal_statement_savepoint(
+                "append_hint_clear",
+                StatementFailurePolicy::Rollback,
+                async || -> Result<()> {
+                    stmt.execute_with_params(&[SqliteValue::Text("rolled_back".into())]).await?;
+                    assert!(
+                        conn.prepared_direct_insert_append_hint.borrow().is_some(),
+                        "direct prepared INSERT should populate the append hint before the statement savepoint rolls back"
+                    );
+                    Err(FrankenError::FunctionError(
+                        "forced statement rollback".to_owned(),
+                    ))
+                },
+            )
             .await
             .expect_err("forced statement error should roll back the internal savepoint");
             assert!(
@@ -175971,6 +176083,66 @@ mod pager_routing_tests {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
             assert_eq!(rows[0].values()[1], SqliteValue::Text("dup".into()));
+        });
+    }
+
+    #[test]
+    fn test_attached_insert_select_raise_fail_preserves_change_tracking() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("ATTACH DATABASE ':memory:' AS aux;")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE aux.dest (id INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE aux.src (id INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO aux.src VALUES (1), (2), (3), (4);")
+                .await
+                .unwrap();
+            conn.with_attached_connection_async("aux", async |attached| {
+                attached
+                    .execute(
+                        "CREATE TRIGGER dest_raise_fail
+                         BEFORE INSERT ON dest WHEN NEW.id = 3
+                         BEGIN
+                             SELECT RAISE(FAIL, 'fail attached insert');
+                         END;",
+                    )
+                    .await
+            })
+            .await
+            .unwrap();
+
+            let error = conn
+                .execute("INSERT INTO aux.dest SELECT id FROM aux.src ORDER BY id;")
+                .await
+                .expect_err("attached INSERT SELECT should stop at RAISE(FAIL)");
+            assert!(matches!(
+                error,
+                FrankenError::RaiseFail(ref message) if message == "fail attached insert"
+            ));
+
+            let tracking = conn
+                .query_row("SELECT changes(), total_changes(), last_insert_rowid();")
+                .await
+                .unwrap();
+            assert_eq!(tracking.values()[0], SqliteValue::Integer(2));
+            assert_eq!(tracking.values()[1], SqliteValue::Integer(6));
+            assert_eq!(tracking.values()[2], SqliteValue::Integer(2));
+
+            let rows = conn
+                .query("SELECT id FROM aux.dest ORDER BY id;")
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.values()[0].clone())
+                    .collect::<Vec<_>>(),
+                vec![SqliteValue::Integer(1), SqliteValue::Integer(2)]
+            );
         });
     }
 
@@ -210709,6 +210881,38 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_statement_conflict_resolution_excludes_fk_datatype_and_general_errors() {
+        assert!(error_uses_conflict_resolution(
+            &FrankenError::PrimaryKeyViolation
+        ));
+        assert!(error_uses_conflict_resolution(
+            &FrankenError::UniqueViolation {
+                columns: "t.value".to_owned(),
+            }
+        ));
+        assert!(error_uses_conflict_resolution(&FrankenError::Internal(
+            "VDBE halted with code 19: NOT NULL constraint failed: t.value".to_owned(),
+        )));
+
+        assert!(!error_uses_conflict_resolution(
+            &FrankenError::ForeignKeyViolation
+        ));
+        assert!(!error_uses_conflict_resolution(
+            &FrankenError::DatatypeViolation {
+                column: "t.value".to_owned(),
+                column_type: "INTEGER".to_owned(),
+                actual: "text".to_owned(),
+            }
+        ));
+        assert!(!error_uses_conflict_resolution(&FrankenError::Internal(
+            "VDBE halted with code 19: FOREIGN KEY constraint failed".to_owned(),
+        )));
+        assert!(!error_uses_conflict_resolution(
+            &FrankenError::TriggerRecursionDepthExceeded
+        ));
+    }
+
+    #[test]
     fn test_fk_delete_depth_limit_fails_closed_and_rolls_back_statement() {
         std::thread::Builder::new()
             .name("fk-delete-depth-limit".to_owned())
@@ -210839,6 +211043,235 @@ mod pager_routing_tests {
             .expect("spawn deep FK UPDATE regression thread")
             .join()
             .expect("deep FK UPDATE regression thread panicked");
+    }
+
+    async fn exercise_fk_update_or_fail_depth_limit(prepared: bool) {
+        let conn = Connection::open(":memory:").await.unwrap();
+        let prefix = if prepared {
+            "fk_update_or_fail_prepared"
+        } else {
+            "fk_update_or_fail_ad_hoc"
+        };
+        create_deep_fk_cascade_chain(&conn, prefix).await;
+        conn.execute(&format!(
+            "CREATE TABLE {prefix}_marker (label TEXT NOT NULL);
+             CREATE TRIGGER {prefix}_before_update
+             BEFORE UPDATE ON {prefix}_0
+             BEGIN
+                 INSERT INTO {prefix}_marker VALUES ('statement');
+             END;"
+        ))
+        .await
+        .unwrap();
+
+        conn.execute("BEGIN;").await.unwrap();
+        conn.execute(&format!("INSERT INTO {prefix}_marker VALUES ('prior');"))
+            .await
+            .unwrap();
+
+        let error = if prepared {
+            let statement = conn
+                .prepare(&format!(
+                    "UPDATE OR FAIL {prefix}_0 SET id = ?1 WHERE id = ?2;"
+                ))
+                .await
+                .unwrap();
+            conn.execute_prepared_with_params(
+                &statement,
+                &[SqliteValue::Integer(2), SqliteValue::Integer(1)],
+            )
+            .await
+        } else {
+            conn.execute(&format!(
+                "UPDATE OR FAIL {prefix}_0 SET id = 2 WHERE id = 1;"
+            ))
+            .await
+        }
+        .expect_err("OR FAIL must not suppress a cascade-depth failure");
+        assert!(matches!(error, FrankenError::TriggerRecursionDepthExceeded));
+        assert!(
+            conn.in_transaction(),
+            "cascade-depth failure must leave the explicit transaction usable"
+        );
+        assert_deep_fk_chain_value(&conn, prefix, 1).await;
+
+        let marker_count = conn
+            .query(&format!("SELECT COUNT(*) FROM {prefix}_marker;"))
+            .await
+            .unwrap();
+        assert_eq!(
+            marker_count[0].values()[0],
+            SqliteValue::Integer(1),
+            "OR FAIL must roll back the failed statement's BEFORE-trigger side effect"
+        );
+        let statement_marker_count = conn
+            .query(&format!(
+                "SELECT COUNT(*) FROM {prefix}_marker WHERE label = 'statement';"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            statement_marker_count[0].values()[0],
+            SqliteValue::Integer(0)
+        );
+
+        conn.execute(&format!("INSERT INTO {prefix}_marker VALUES ('after');"))
+            .await
+            .unwrap();
+        conn.execute("COMMIT;").await.unwrap();
+        let committed_marker_count = conn
+            .query(&format!("SELECT COUNT(*) FROM {prefix}_marker;"))
+            .await
+            .unwrap();
+        assert_eq!(
+            committed_marker_count[0].values()[0],
+            SqliteValue::Integer(2),
+            "writes before and after the failed statement should still commit"
+        );
+    }
+
+    #[test]
+    fn test_fk_update_or_fail_depth_limit_rolls_back_ad_hoc_and_prepared() {
+        std::thread::Builder::new()
+            .name("fk-update-or-fail-depth-limit".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build FK UPDATE OR FAIL depth regression runtime");
+                runtime.block_on(async {
+                    exercise_fk_update_or_fail_depth_limit(false).await;
+                    exercise_fk_update_or_fail_depth_limit(true).await;
+                });
+            })
+            .expect("spawn deep FK UPDATE OR FAIL regression thread")
+            .join()
+            .expect("deep FK UPDATE OR FAIL regression thread panicked");
+    }
+
+    #[test]
+    fn test_insert_or_fail_foreign_key_error_aborts_entire_insert_select() {
+        asupersync::test_utils::run_test(|| async {
+            let oracle = rusqlite::Connection::open_in_memory().unwrap();
+            oracle
+                .execute_batch(
+                    "PRAGMA foreign_keys = ON;
+                     CREATE TABLE parent (id INTEGER PRIMARY KEY);
+                     CREATE TABLE source (id INTEGER PRIMARY KEY, parent_id INTEGER);
+                     CREATE TABLE child (
+                         id INTEGER PRIMARY KEY,
+                         parent_id INTEGER REFERENCES parent(id)
+                     );
+                     CREATE TABLE marker (id INTEGER);
+                     CREATE TRIGGER child_before_insert
+                     BEFORE INSERT ON child
+                     BEGIN
+                         INSERT INTO marker VALUES (NEW.id);
+                     END;
+                     INSERT INTO parent VALUES (1);
+                     INSERT INTO source VALUES (1, 1), (2, 999);",
+                )
+                .unwrap();
+            oracle
+                .execute(
+                    "INSERT OR FAIL INTO child
+                     SELECT id, parent_id FROM source ORDER BY id;",
+                    [],
+                )
+                .expect_err("C SQLite must ABORT OR FAIL on a foreign-key violation");
+            let oracle_child_count: i64 = oracle
+                .query_row("SELECT COUNT(*) FROM child;", [], |row| row.get(0))
+                .unwrap();
+            let oracle_marker_count: i64 = oracle
+                .query_row("SELECT COUNT(*) FROM marker;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(oracle_child_count, 0);
+            assert_eq!(oracle_marker_count, 0);
+            assert_oracle_fk_integrity(&oracle);
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE parent (id INTEGER PRIMARY KEY);
+                 CREATE TABLE source (id INTEGER PRIMARY KEY, parent_id INTEGER);
+                 CREATE TABLE child (
+                     id INTEGER PRIMARY KEY,
+                     parent_id INTEGER REFERENCES parent(id)
+                 );
+                 CREATE TABLE marker (id INTEGER);
+                 CREATE TRIGGER child_before_insert
+                 BEFORE INSERT ON child
+                 BEGIN
+                     INSERT INTO marker VALUES (NEW.id);
+                 END;
+                 INSERT INTO parent VALUES (1);
+                 INSERT INTO source VALUES (1, 1), (2, 999);",
+            )
+            .await
+            .unwrap();
+
+            let insert = "INSERT OR FAIL INTO child
+                          SELECT id, parent_id FROM source ORDER BY id;";
+            let error = conn
+                .execute(insert)
+                .await
+                .expect_err("foreign-key failure must abort the whole autocommit statement");
+            assert!(matches!(error, FrankenError::ForeignKeyViolation));
+            assert!(!conn.in_transaction());
+            let child_count = conn.query("SELECT COUNT(*) FROM child;").await.unwrap();
+            let marker_count = conn.query("SELECT COUNT(*) FROM marker;").await.unwrap();
+            assert_eq!(child_count[0].values()[0], SqliteValue::Integer(0));
+            assert_eq!(marker_count[0].values()[0], SqliteValue::Integer(0));
+
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO marker VALUES (99);")
+                .await
+                .unwrap();
+            let error = conn
+                .execute(insert)
+                .await
+                .expect_err("foreign-key failure must abort only the explicit-txn statement");
+            assert!(matches!(error, FrankenError::ForeignKeyViolation));
+            assert!(conn.in_transaction());
+            let child_count = conn.query("SELECT COUNT(*) FROM child;").await.unwrap();
+            let marker_count = conn.query("SELECT COUNT(*) FROM marker;").await.unwrap();
+            assert_eq!(child_count[0].values()[0], SqliteValue::Integer(0));
+            assert_eq!(
+                marker_count[0].values()[0],
+                SqliteValue::Integer(1),
+                "the prior transaction write must survive while trigger effects roll back"
+            );
+            let violations = conn.query("PRAGMA foreign_key_check;").await.unwrap();
+            assert!(violations.is_empty());
+            conn.execute("COMMIT;").await.unwrap();
+
+            conn.execute("DELETE FROM marker;").await.unwrap();
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO marker VALUES (100);")
+                .await
+                .unwrap();
+            let rollback_error = conn
+                .execute(
+                    "INSERT OR ROLLBACK INTO child
+                     SELECT id, parent_id FROM source ORDER BY id;",
+                )
+                .await
+                .expect_err("foreign-key failure must use ABORT, not OR ROLLBACK");
+            assert!(matches!(rollback_error, FrankenError::ForeignKeyViolation));
+            assert!(
+                conn.in_transaction(),
+                "OR ROLLBACK does not apply to foreign-key violations"
+            );
+            let child_count = conn.query("SELECT COUNT(*) FROM child;").await.unwrap();
+            let marker_count = conn.query("SELECT COUNT(*) FROM marker;").await.unwrap();
+            assert_eq!(child_count[0].values()[0], SqliteValue::Integer(0));
+            assert_eq!(
+                marker_count[0].values()[0],
+                SqliteValue::Integer(1),
+                "the prior transaction write must survive the FK ABORT"
+            );
+            conn.execute("COMMIT;").await.unwrap();
+        });
     }
 
     /// Regression: SQLite executes ON DELETE actions after removing the parent
