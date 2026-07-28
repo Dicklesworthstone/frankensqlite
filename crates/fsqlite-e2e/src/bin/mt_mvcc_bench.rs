@@ -95,10 +95,12 @@ const MAX_RETRY_SLEEP_MS: u64 = 25;
 /// Scaled up with offered work by [`fsqlite_retry_timeout`] — the fixed 5s
 /// was exceeded by queueing alone at 64 writers x 1000-row txns (bd-caa6u).
 const FSQLITE_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
-/// Pessimistic whole-run contention floor used to scale the retry budget:
-/// measured floors on the first 1-32 writer receipt were F >= 95k wps and
-/// C ~13k wps, so 10k wps bounds even a badly convoyed run from below.
-const RETRY_BUDGET_FLOOR_WPS: u64 = 10_000;
+/// Pessimistic whole-run contention floor used to scale the retry budget.
+/// The first full-matrix run showed 10k wps was still optimistic at peak
+/// contention: the 64-writer arm (11s budget) starved 58 txns past the
+/// envelope while the 128-writer arm (17.8s) passed with zero failures.
+/// 5k wps gives 64 writers ~17.8s and 128 writers ~30.6s.
+const RETRY_BUDGET_FLOOR_WPS: u64 = 5_000;
 
 /// Wall-clock retry budget for one transaction attempt loop, scaled with the
 /// total offered work so a txn that legitimately waits behind a 64/128-writer

@@ -1,0 +1,9 @@
+bench_elf_sha256=cea901d3485b1f0ac54e45bf619d5a3653209409fd5a56a5eb68beb2f05ed44e (19319664 bytes) /data/tmp/claude-1000/-data-projects-frankensqlite/f5a994fd-7753-4768-9c20-6883f50192de/scratchpad/e2e-gate-target/release-perf/mt-mvcc-bench
+bench_source_sha256 /data/projects/frankensqlite/crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs:edb46dcaadd38bd3d4afa7b8b85bf0fce6c95ce789bc03e7bb76feeb539180df:72705
+mt-mvcc-bench: rows_per_thread=1000 threads=[64] paired_rounds=7 bootstrap_reps=10000 synchronous=NORMAL apples_to_apples=false separate_tables=false
+threads | fsqlite_wps | sqlite_wps | throughput_ratio | fsqlite_wps_p95 | fsqlite_wps_p99 | sqlite_wps_p95 | sqlite_wps_p99 | fsqlite_ms_p50 | fsqlite_ms_p95 | fsqlite_ms_p99 | sqlite_ms_p50 | sqlite_ms_p95 | sqlite_ms_p99 | time_ratio | fsqlite_failed | sqlite_failed
+     64 |       52996 |      12539 |             4.26x |           79079 |           81849 |          12577 |          12581 |        1207.65 |        9360.45 |       12083.62 |       5104.10 |       5134.74 |       5141.40 |       0.24x |              0 |             0
+case=shared_table threads=64 synchronous=NORMAL null_c_c ratio_median=1.002623 ci95=[0.991063,1.005402] cv_pct=0.746 mad=0.002966 cv_gate=never
+case=shared_table threads=64 synchronous=NORMAL claim_f_over_c ratio_median=4.258744 ci95=[3.592782,5.643265] cv_pct=46.952 mad=1.175121 fsqlite_p50_wps=52995.641 sqlite_p50_wps=12538.929 fsqlite_failed=0 sqlite_failed=0
+case=shared_table threads=64 median_ci_gate=FSQLITE_FASTER rule=claim_ci95_beyond_2x_null_radius cv_gate=never null_radius=0.008937 claim_margin=364.620 min_decidable_gain=1.017875 max_decidable_regression=0.982125
+mt-mvcc-bench: updated pass-over-pass history .bench-history/mt-mvcc-bench.latest.json
