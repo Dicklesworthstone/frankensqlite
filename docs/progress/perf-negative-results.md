@@ -48,6 +48,50 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-07-28 - LANDED: bd-8sfs3 fixed at fa85adfc — the ~26,000x correlated-EXISTS pathology was ROUTING, not execution (~2,250x recovered on the 10k shape)
+
+- Target: the correlated count-semijoin EXISTS shape with a placeholder
+  residual bound (`... WHERE EXISTS (SELECT 1 FROM c WHERE c.id =
+  p.category_id AND c.id <= ?1)`), the worst row in the honest subquery
+  matrix.
+- Root cause: two connection.rs router gates forced the per-outer-row
+  nested-statement fallback SOLELY because the subquery contained `?1` —
+  `exists_subquery_supported_by_vdbe`'s blanket kl17o placeholder rejection
+  (fires before its own semijoin-shape check), and
+  `select_correlated_exists_where_requires_fallback`, whose only escape
+  requires an integer-literal rowid bound. The fallback clones the subquery
+  AST, substitutes the outer value, and runs a FULL `execute_statement` per
+  outer row (~43µs × 10k ≈ 427ms/exec). The compiled `CountIndexEqRun`
+  semijoin already lowered placeholder bounds to `Opcode::Variable`
+  (rebound per execution, no prepare-time folding) — the literal variant of
+  the same query ran in µs all along; only the router differed.
+- Fix: shape-scoped carve-outs at both gates via the existing
+  `correlated_exists_matches_count_semijoin_shape` predicate (exactly one
+  correlated probe equality + ≤1 inner-only residual; the known-bad
+  multi-correlated-term family stays on the fallback; kl17o stands for all
+  other placeholder subqueries). Side effect: literal non-aggregate
+  correlated semijoins (previously Gate-B-forced to fallback) now compile
+  too, covered by a row-set parity test across rebinds.
+- Evidence: paired same-host (hz1) pre/post `--quick --filter subquery`
+  runs, both diagnostic-only debug profile — the paired delta and the
+  scaling-shape change are the evidence, not the absolutes. EXISTS rows:
+  14.76ms/155.68ms/~427ms-per-exec → 366.9µs/461.1µs/190.1µs at
+  100/1k/10k rows; pre-fix time scaled ~linearly in outer×inner, post-fix
+  flat. Artifacts (force-added past the perf gitignore so citations
+  resolve): `tests/artifacts/perf/subq-oracle-receipt-20260727T2345Z-hz1/`
+  and `tests/artifacts/perf/exists-semijoin-fix-20260728T0230Z-hz1/`.
+  Tests: new compiled-path + rebind-correctness test (aggregate and
+  non-aggregate), 242-test adjacency battery green (one solo-green
+  load-flake in an unrelated copy-profile counter test), clippy --lib -D
+  warnings green.
+- Still open in the same receipt: parameter-varying IN-subquery at 10k is
+  C=7.4µs / F=4.40ms (~600x) — bd-2dgf5's planner lane; general recursive
+  CTE COUNT is C=387µs / F=12.97ms (~33x). Neither is this mechanism.
+- Retry/regression condition: if the semijoin shape ever reroutes to
+  dispatch, `test_prepared_statement_exists_subquery_with_placeholder_uses_compiled_path`
+  fails on the deferred-statement assert before any perf regression is
+  visible.
+
 ## 2026-07-27 - LANDED: bench-truth sweep — criterion suite had 30 per-op runtime-entry sites (bd-mnlk2 complete), subquery/CTE rows now cross-engine validated (bd-czzlp), dropped-pragma fix confirmed (bd-fd1ra)
 
 - Target: the remaining instrument-drift surface after bd-zavyn/bd-i8pt6.
