@@ -956,6 +956,25 @@ fn verify_effective_fsqlite_pragma(
     ))
 }
 
+/// Optional checkpoint-cadence override for diagnostic isolation runs
+/// (bd-jyeus, macOS F_FULLFSYNC ceiling): when
+/// `FSQLITE_BENCH_WAL_AUTOCHECKPOINT` parses as a non-negative integer, BOTH
+/// engines apply `PRAGMA wal_autocheckpoint=<n>` (0 disables
+/// auto-checkpointing), keeping the paired arms symmetric. Unset => engine
+/// defaults, i.e. the published configuration.
+fn bench_wal_autocheckpoint_override() -> Option<u64> {
+    let raw = std::env::var("FSQLITE_BENCH_WAL_AUTOCHECKPOINT").ok()?;
+    match raw.parse::<u64>() {
+        Ok(pages) => Some(pages),
+        Err(_) => {
+            eprintln!(
+                "mt-mvcc-bench: ignoring unparseable FSQLITE_BENCH_WAL_AUTOCHECKPOINT={raw:?}"
+            );
+            None
+        }
+    }
+}
+
 fn prepare_fsqlite_schema(path: &str, threads: usize, separate_tables: bool) -> Result<(), String> {
     let conn = fsqlite_e2e::block_on(fsqlite::Connection::open(path.to_owned()))
         .map_err(|error| format!("fsqlite open (init): {error}"))?;
@@ -976,6 +995,11 @@ fn prepare_fsqlite_schema(path: &str, threads: usize, separate_tables: bool) -> 
     }
     verify_effective_fsqlite_pragma(&conn, "journal_mode", &["wal"])?;
     verify_effective_fsqlite_pragma(&conn, "synchronous", &["normal", "1"])?;
+    if let Some(pages) = bench_wal_autocheckpoint_override() {
+        let pragma = format!("PRAGMA wal_autocheckpoint={pages};");
+        fsqlite_e2e::block_on(conn.execute(&pragma))
+            .map_err(|error| format!("fsqlite schema pragma `{pragma}`: {error}"))?;
+    }
     for tid in 0..worker_table_count(threads, separate_tables) {
         let table_name = worker_table_name(tid, separate_tables);
         let create_sql = create_table_sql(&table_name);
@@ -1025,6 +1049,11 @@ fn open_fsqlite_worker(path: &str) -> Result<(fsqlite::Connection, bool), String
     // of defaults" — discarding the result reinstated exactly that coincidence,
     // because a failed pin was indistinguishable from a successful one.
     verify_effective_fsqlite_pragma(&conn, "synchronous", &["normal", "1"])?;
+    if let Some(pages) = bench_wal_autocheckpoint_override() {
+        let pragma = format!("PRAGMA wal_autocheckpoint={pages};");
+        fsqlite_e2e::block_on(conn.execute(&pragma))
+            .map_err(|error| format!("fsqlite worker `{pragma}`: {error}"))?;
+    }
     let concurrent_ok =
         fsqlite_e2e::block_on(conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")).is_ok();
     fsqlite_e2e::block_on(conn.execute("PRAGMA busy_timeout=5000;"))
@@ -1306,6 +1335,10 @@ fn run_rusqlite(threads: usize, rows_per_thread: usize, separate_tables: bool) -
             .to_owned();
         schema_sql.push_str(&create_tables_sql(threads, separate_tables));
         conn.execute_batch(&schema_sql).expect("init schema");
+        if let Some(pages) = bench_wal_autocheckpoint_override() {
+            conn.execute_batch(&format!("PRAGMA wal_autocheckpoint={pages};"))
+                .expect("init wal_autocheckpoint override");
+        }
     }
 
     let path = Arc::new(path);
@@ -1329,6 +1362,10 @@ fn run_rusqlite(threads: usize, rows_per_thread: usize, separate_tables: bool) -
                  PRAGMA busy_timeout=5000;",
             )
             .expect("worker pragmas");
+            if let Some(pages) = bench_wal_autocheckpoint_override() {
+                conn.execute_batch(&format!("PRAGMA wal_autocheckpoint={pages};"))
+                    .expect("worker wal_autocheckpoint override");
+            }
 
             barrier.wait();
 
@@ -1502,6 +1539,12 @@ fn run() -> Result<(), String> {
         opts.apples_to_apples,
         opts.separate_tables,
     );
+    if let Some(pages) = bench_wal_autocheckpoint_override() {
+        eprintln!(
+            "mt-mvcc-bench: DIAGNOSTIC OVERRIDE wal_autocheckpoint={pages} applied to BOTH \
+             engines — results are NOT comparable with published default-cadence numbers"
+        );
+    }
 
     println!(
         "threads | fsqlite_wps | sqlite_wps | throughput_ratio | fsqlite_wps_p95 | fsqlite_wps_p99 | sqlite_wps_p95 | sqlite_wps_p99 | fsqlite_ms_p50 | fsqlite_ms_p95 | fsqlite_ms_p99 | sqlite_ms_p50 | sqlite_ms_p95 | sqlite_ms_p99 | time_ratio | fsqlite_failed | sqlite_failed"
