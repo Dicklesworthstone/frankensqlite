@@ -48,6 +48,31 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-07-28 - MEASURED: COMPLETE 1-128 writer matrix (f1ab7663) — FSQLITE_FASTER at every gated arm incl. 64w 4.259x and 128w 4.082x, zero failed writes; hot page 45 identified; bd-5zeai controls confirm fast-path-presence 20.1x dominant
+
+- Follow-up to the truncated first attempt (below). With the bd-caa6u
+  envelope scaling (c53aaf93, floor deepened 10k→5k at f1ab7663), the full
+  matrix completed: 1w 2.111x / 8w 2.703x / 16w 6.556x FSQLITE_FASTER; 32w
+  7.333x median (CV-inconclusive); **64w 4.259x and 128w 4.082x
+  FSQLITE_FASTER with zero failed writes** — C pins to its ~12.5k wps
+  single-writer floor from 32w up while F stays 4-7x ahead through the
+  MAX_CONCURRENT_WRITERS cap. Artifact:
+  `tests/artifacts/perf/highwriter-full-20260728T0645Z-superserver/`
+  (diagnostic host; within-run CI gates are the evidence).
+- Extraction targets sharpened: the failed first 64-arm identified **hot
+  page 45 by number** ("snapshot conflict on pages: 45", 3-5 attempts) as
+  one starvation mode alongside busy-retry convoying (69-84 attempts); F's
+  own decline 150k→52k wps under contention is the registry-convoy cost —
+  RegistryCommitLockMetrics (mvcc side landed c53aaf93; core RAII shim
+  handed to RusticBasin) will quantify hold/wait vs writer count.
+- bd-5zeai control battery (same day, c53aaf93): Option gate 0.49µs,
+  params-on-fast-path 0.58µs, A/A 0.00µs, fast-path presence 20.1x
+  (0.64µs literal vs 12.90µs placeholder, same query) — parameter passing
+  is free; the placeholder fast-path gap is the whole mechanism.
+  Implementation awaiting RusticBasin ack. Cross-agent same-day flow:
+  bd-f8iph (silent-Null IN emitter) fixed by RusticBasin at 8f75946d,
+  verified downstream and closed; bd-3ua5h invariants locked at 2ef61094.
+
 ## 2026-07-28 - MEASURED: first 1-128 writer scaling attempt — F/C grows 2.1x→7.3x through 32 writers; p95 latency convoying at 32 confirms the registry hypothesis; 64+ unmeasurable until the bench retry envelope scales
 
 - Post-revert tree a29e136d, mt-mvcc-bench ELF 4132d5a7…, shared table,
