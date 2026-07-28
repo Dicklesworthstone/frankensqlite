@@ -29,6 +29,11 @@ asupersync = { workspace = true }
 fsqlite = { path = "../fsqlite", version = "0.1.19", default-features = false, features = ["json", "fts5", "rtree"] }
 fsqlite-btree = { workspace = true }
 fsqlite-core = { path = "../fsqlite-core", version = "0.1.19", default-features = false }
+# Regular (not dev) dependency: mt-mvcc-bench reads the in-process registry
+# commit-lock counters (registry_commit_lock_metrics) after each writer arm.
+# Already in the dependency graph via fsqlite-core, so this adds visibility,
+# not build weight.
+fsqlite-mvcc = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-harness = { workspace = true }
 fsqlite-parser = { workspace = true }
@@ -58,7 +63,6 @@ criterion = { workspace = true }
 flate2 = "1.1"
 jsonschema = { version = "0.48.5", default-features = false }
 fsqlite-ext-session = { workspace = true }
-fsqlite-mvcc = { workspace = true }
 fsqlite-pager = { workspace = true }
 
 [[bin]]

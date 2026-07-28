@@ -1521,7 +1521,29 @@ fn run() -> Result<(), String> {
                     || fsqlite_retry_timeout(n, opts.rows_per_thread),
                     Duration::from_secs,
                 );
-                run_fsqlite(n, opts.rows_per_thread, opts.separate_tables, retry_timeout)
+                // Registry commit-lock decomposition (bd-i0tn6 evidence):
+                // reset before / snapshot after each F invocation so every
+                // paired round prints its own hold/wait line, tagged with
+                // the thread count. The bench writers run in-process, so
+                // the process-global counters are exactly this run's.
+                fsqlite_mvcc::reset_registry_commit_lock_metrics();
+                let result =
+                    run_fsqlite(n, opts.rows_per_thread, opts.separate_tables, retry_timeout);
+                let m = fsqlite_mvcc::registry_commit_lock_metrics();
+                if m.holds_total > 0 {
+                    eprintln!(
+                        "registry_lock threads={n} holds={} wait_ns_total={} wait_ns_max={} \
+                         hold_ns_total={} hold_ns_max={} mean_hold_us={:.1} mean_wait_us={:.1}",
+                        m.holds_total,
+                        m.wait_ns_total,
+                        m.wait_ns_max,
+                        m.hold_ns_total,
+                        m.hold_ns_max,
+                        m.hold_ns_total as f64 / m.holds_total as f64 / 1_000.0,
+                        m.wait_ns_total as f64 / m.holds_total as f64 / 1_000.0,
+                    );
+                }
+                result
             },
         )?;
         let report = build_thread_report(n, &null, &claim);
