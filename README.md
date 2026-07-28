@@ -175,6 +175,15 @@ This README describes the target end-state architecture. The runnable code today
 - Operating modes: the current user-facing runtime is the compatibility/pager-backed path. Native-mode/ECS sections below should be read as design plus partial implementation unless explicitly called out as live behavior.
 - Extensions: extension crates are present and feature-gated in the workspace/public API crate, but extension virtual table/function wiring is still in progress.
 - Storage stack status: `fsqlite-vfs`, `fsqlite-pager`, `fsqlite-wal`, `fsqlite-mvcc`, and `fsqlite-btree` are wired into default runtime execution. Remaining work focuses on removing residual fallback paths, closing opcode/behavior gaps, and finishing parity/certification tracks.
+- Safe write-merge ladder status: the ladder described below (intent replay +
+  structured page patches) is **design plus dormant implementation, not live
+  commit behavior**. The production commit path resolves every same-page
+  base-drift conflict by abort/retry (`SQLITE_BUSY_SNAPSHOT`); the rebase and
+  patch-merge code exists in `fsqlite-mvcc` but is exercised only by tests,
+  the intent log is not yet populated during writes, and
+  `PRAGMA fsqlite.write_merge` currently functions as an SSI-validation
+  switch (`SAFE`/`LAB_UNSAFE`; `OFF` is not accepted). Wiring the ladder
+  into the live conflict path is tracked in bd-3d5y3 / bd-p4dcv.
 
 ### Native File Namespace Safety
 
@@ -367,6 +376,10 @@ enum IntentOp {
 3. **INV-3 (Version chain ordering):** In every version chain, newer versions have strictly higher `created_by` TxnIds.
 
 ### Safe Write Merging and Intent Logs
+
+> **Status:** this section is design plus dormant implementation — see
+> "Current Implementation Status" above. Today's live commit path aborts and
+> retries every same-page conflict; the ladder is not yet wired in.
 
 Standard page-level MVCC produces false conflicts when two transactions modify different rows that happen to live on the same B-tree leaf page. The safe write-merge ladder (§5.10 in the spec) reduces aborts from commuting same-page conflicts without introducing row-level MVCC metadata.
 
