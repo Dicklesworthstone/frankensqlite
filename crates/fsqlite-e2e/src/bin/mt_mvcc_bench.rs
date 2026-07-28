@@ -2006,7 +2006,7 @@ mod tests {
 
     #[test]
     fn retry_budget_allows_busy_timeout_scaled_retries() {
-        let mut budget = FsqliteRetryBudget::new();
+        let mut budget = FsqliteRetryBudget::new(fsqlite_retry_timeout(8, 1000));
         let mut waits = Vec::new();
         for _ in 0..MAX_RETRIES {
             waits.push(
