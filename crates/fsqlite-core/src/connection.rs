@@ -6901,6 +6901,7 @@ impl PreparedStatement<'_> {
     /// Execute as a query and return all result rows.
     pub async fn query(&self) -> Result<Vec<Row>> {
         self.conn.background_status()?;
+        self.conn.settle_pending_transaction_cleanup().await?;
         self.conn
             .query_prepared_with_params_after_background_status(self, &[])
             .await
@@ -6909,6 +6910,7 @@ impl PreparedStatement<'_> {
     /// Execute as a query with bound SQL parameters (`?1`, `?2`, ...).
     pub async fn query_with_params(&self, params: &[SqliteValue]) -> Result<Vec<Row>> {
         self.conn.background_status()?;
+        self.conn.settle_pending_transaction_cleanup().await?;
         if let Some(rows) = self.try_query_clean_memory_indexed_equality_fast(params)? {
             return Ok(rows);
         }
@@ -6923,6 +6925,7 @@ impl PreparedStatement<'_> {
         F: FnMut(&Row) -> Result<()>,
     {
         self.conn.background_status()?;
+        self.conn.settle_pending_transaction_cleanup().await?;
         self.conn
             .query_prepared_with_params_for_each_after_background_status(self, params, f)
             .await
@@ -6940,6 +6943,7 @@ impl PreparedStatement<'_> {
 
     async fn query_row_internal(&self, params: Option<&[SqliteValue]>) -> Result<Row> {
         self.conn.background_status()?;
+        self.conn.settle_pending_transaction_cleanup().await?;
         if let Some(params) = params
             && let Some(row_outcome) = self.try_query_row_clean_memory_rowid_lookup_fast(params)?
         {
@@ -10859,7 +10863,9 @@ impl Connection {
 
     /// Export the current database as a self-contained SQLite database image.
     pub async fn export_bytes(&self) -> Result<Vec<u8>> {
-        let cx = self.op_cx()?;
+        self.background_status()?;
+        self.settle_pending_transaction_cleanup().await?;
+        let cx = self.op_cx_after_background_status();
         self.quiesce_pager_export_state(&cx).await?;
         self.pager.export_bytes(&cx).await
     }
@@ -15991,6 +15997,7 @@ impl Connection {
         parameter_sets: &[Vec<SqliteValue>],
     ) -> Result<usize> {
         self.background_status()?;
+        self.settle_pending_transaction_cleanup().await?;
         if !self.in_transaction() {
             return Err(FrankenError::internal(
                 "batched parameter execution requires an explicit transaction",
@@ -16129,6 +16136,7 @@ impl Connection {
         params: &[SqliteValue],
     ) -> Result<usize> {
         self.background_status()?;
+        self.settle_pending_transaction_cleanup().await?;
         self.execute_prepared_with_params_after_background_status(stmt, params, false)
             .await
     }
@@ -53403,6 +53411,8 @@ impl Connection {
         view_name: &str,
         sender: mpsc::Sender<DifferentialEvent>,
     ) -> Result<u64> {
+        self.background_status()?;
+        self.settle_pending_transaction_cleanup().await?;
         if !self.pragma_state.borrow().differential_views.is_enabled() {
             return Err(FrankenError::NotImplemented(
                 "differential subscribers require PRAGMA fsqlite_differential_views = ON"
@@ -64880,15 +64890,17 @@ impl Connection {
     /// is rewritten (DDL, page-count change). For `:memory:` databases there is
     /// no persistent header, so the cached counter (maintained by reload/VACUUM)
     /// is returned. (5D.4 / bd-lxm9j)
-    pub async fn change_counter(&self) -> u32 {
+    pub async fn change_counter(&self) -> Result<u32> {
+        self.background_status()?;
+        self.settle_pending_transaction_cleanup().await?;
         if !self.pager.is_memory()
-            && let Ok(Some(header)) = self.pragma_database_header().await
+            && let Some(header) = self.pragma_database_header().await?
         {
             let counter = header.change_counter;
             *self.change_counter.borrow_mut() = counter;
-            return counter;
+            return Ok(counter);
         }
-        *self.change_counter.borrow()
+        Ok(*self.change_counter.borrow())
     }
 
     // ── 5D.2: Pager-backed rollback reload (bd-1ene) ─────────────────────
@@ -119713,6 +119725,39 @@ mod tests {
     }
 
     #[test]
+    fn test_export_bytes_settles_abandoned_transaction_before_copying() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(
+                "CREATE TABLE export_cleanup (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+            )
+            .await
+            .unwrap();
+            conn.begin_transaction().await.unwrap();
+            conn.execute("INSERT INTO export_cleanup VALUES (1, 'abandoned');")
+                .await
+                .unwrap();
+            conn.mark_transaction_cleanup_required();
+
+            let bytes = conn
+                .export_bytes()
+                .await
+                .expect("export must settle the deferred rollback instead of returning Busy");
+            assert!(!conn.in_transaction());
+
+            let imported = Connection::import_bytes(&bytes).await.unwrap();
+            let rows = imported
+                .query("SELECT id, name FROM export_cleanup;")
+                .await
+                .unwrap();
+            assert!(
+                rows.is_empty(),
+                "an exported image must never contain an abandoned transaction's rows"
+            );
+        });
+    }
+
+    #[test]
     fn test_export_bytes_are_readable_by_external_sqlite() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
@@ -135833,6 +135878,46 @@ mod tests {
     }
 
     #[test]
+    fn test_differential_subscriber_settles_abandoned_transaction_before_snapshot() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE subscriber_cleanup (id INTEGER PRIMARY KEY, name TEXT);")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE VIEW v_subscriber_cleanup AS \
+                 SELECT id, name FROM subscriber_cleanup ORDER BY id;",
+            )
+            .await
+            .unwrap();
+            conn.execute("PRAGMA fsqlite_differential_views = ON;")
+                .await
+                .unwrap();
+            conn.begin_transaction().await.unwrap();
+            conn.execute("INSERT INTO subscriber_cleanup VALUES (1, 'abandoned');")
+                .await
+                .unwrap();
+            conn.mark_transaction_cleanup_required();
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            conn.register_differential_view_subscriber("v_subscriber_cleanup", tx)
+                .await
+                .expect("subscriber registration must settle before checking autocommit mode");
+            assert!(!conn.in_transaction());
+
+            let snapshot = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+            match snapshot {
+                DifferentialEvent::Snapshot { rows, .. } => assert!(
+                    rows.is_empty(),
+                    "subscriber bootstrap must not expose an abandoned transaction's row"
+                ),
+                other => panic!("expected bootstrap snapshot, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
     fn test_differential_subscriber_unregister_stops_future_invalidations() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
@@ -143018,7 +143103,37 @@ mod schema_cookie_tests {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             assert_eq!(conn.schema_cookie(), 0);
-            assert_eq!(conn.change_counter().await, 0);
+            assert_eq!(conn.change_counter().await.unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn test_change_counter_settles_abandoned_transaction_before_reading_header() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("change_counter_cleanup.db");
+            let conn = Connection::open(db_path.to_string_lossy()).await.unwrap();
+            conn.execute("CREATE TABLE counter_cleanup (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.begin_transaction().await.unwrap();
+            conn.execute("INSERT INTO counter_cleanup VALUES (1);")
+                .await
+                .unwrap();
+            conn.mark_transaction_cleanup_required();
+
+            let _counter = conn.change_counter().await.unwrap();
+            assert!(
+                !conn.in_transaction(),
+                "change_counter must settle before observing connection header state"
+            );
+            assert!(
+                conn.query("SELECT id FROM counter_cleanup;")
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "the header read must not leave the abandoned row visible"
+            );
         });
     }
 
@@ -143375,11 +143490,11 @@ mod schema_cookie_tests {
                 conn.execute("PRAGMA journal_mode = 'delete';")
                     .await
                     .unwrap();
-                let baseline = conn.change_counter().await;
+                let baseline = conn.change_counter().await.unwrap();
 
                 // CREATE TABLE writes sqlite_master (page 1) and commits → one txn.
                 conn.execute("CREATE TABLE t1 (a INTEGER);").await.unwrap();
-                let after_create = conn.change_counter().await;
+                let after_create = conn.change_counter().await.unwrap();
                 assert!(
                     after_create > baseline,
                     "CREATE should bump the file change counter: {after_create} !> {baseline}"
@@ -143388,7 +143503,7 @@ mod schema_cookie_tests {
                 // A plain INSERT commits another write transaction → +1 in
                 // rollback-journal mode (page 1 is rewritten with the new counter).
                 conn.execute("INSERT INTO t1 VALUES (42);").await.unwrap();
-                after_insert = conn.change_counter().await;
+                after_insert = conn.change_counter().await.unwrap();
                 assert!(
                     after_insert > after_create,
                     "INSERT (rollback-journal) should bump the file change counter: \
@@ -143400,7 +143515,7 @@ mod schema_cookie_tests {
             {
                 let conn = Connection::open(db_str).await.unwrap();
                 assert_eq!(
-                    conn.change_counter().await,
+                    conn.change_counter().await.unwrap(),
                     after_insert,
                     "reopened change counter must match the persisted value"
                 );
@@ -159069,6 +159184,161 @@ mod pager_routing_tests {
                 SqliteValue::Text("before".into()),
                 "rollback should restore original value"
             );
+        });
+    }
+
+    #[test]
+    fn test_abandoned_transaction_cleanup_precedes_every_prepared_query_entry() {
+        asupersync::test_utils::run_test(|| async {
+            let _profile_guard = StatementReuseHotPathProfileGuard::new();
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(
+                "CREATE TABLE prepared_cleanup (id INTEGER PRIMARY KEY, val TEXT NOT NULL);",
+            )
+            .await
+            .unwrap();
+            let all_rows = conn
+                .prepare("SELECT val FROM prepared_cleanup ORDER BY id;")
+                .await
+                .unwrap();
+            let row_by_id = conn
+                .prepare("SELECT val FROM prepared_cleanup WHERE id = ?1;")
+                .await
+                .unwrap();
+
+            conn.begin_transaction().await.unwrap();
+            conn.execute("INSERT INTO prepared_cleanup VALUES (1, 'query');")
+                .await
+                .unwrap();
+            conn.mark_transaction_cleanup_required();
+            assert!(
+                all_rows.query().await.unwrap().is_empty(),
+                "PreparedStatement::query must roll back an abandoned transaction before reading"
+            );
+
+            conn.begin_transaction().await.unwrap();
+            conn.execute("INSERT INTO prepared_cleanup VALUES (2, 'query_with_params');")
+                .await
+                .unwrap();
+            conn.mark_transaction_cleanup_required();
+            assert!(
+                row_by_id
+                    .query_with_params(&[SqliteValue::Integer(2)])
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "PreparedStatement::query_with_params must settle before its direct lookup fast path"
+            );
+
+            conn.begin_transaction().await.unwrap();
+            conn.execute("INSERT INTO prepared_cleanup VALUES (3, 'query_row');")
+                .await
+                .unwrap();
+            conn.mark_transaction_cleanup_required();
+            let error = all_rows
+                .query_row()
+                .await
+                .expect_err("the abandoned row must not reach query_row");
+            assert!(matches!(error, FrankenError::QueryReturnedNoRows));
+
+            conn.begin_transaction().await.unwrap();
+            conn.execute("INSERT INTO prepared_cleanup VALUES (4, 'query_row_with_params');")
+                .await
+                .unwrap();
+            conn.mark_transaction_cleanup_required();
+            let direct_rowid_hits_before =
+                FSQLITE_DIRECT_ROWID_LOOKUP_QUERY_ROW_HITS.load(AtomicOrdering::Relaxed);
+            let error = row_by_id
+                .query_row_with_params(&[SqliteValue::Integer(4)])
+                .await
+                .expect_err("the abandoned row must not reach query_row_with_params");
+            assert!(matches!(error, FrankenError::QueryReturnedNoRows));
+            assert!(
+                FSQLITE_DIRECT_ROWID_LOOKUP_QUERY_ROW_HITS.load(AtomicOrdering::Relaxed)
+                    > direct_rowid_hits_before,
+                "cleanup must finish before the direct prepared rowid lookup fast path runs"
+            );
+
+            conn.begin_transaction().await.unwrap();
+            conn.execute("INSERT INTO prepared_cleanup VALUES (5, 'for_each');")
+                .await
+                .unwrap();
+            conn.mark_transaction_cleanup_required();
+            let mut visited = 0_usize;
+            row_by_id
+                .query_with_params_for_each(&[SqliteValue::Integer(5)], |_| {
+                    visited += 1;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                visited, 0,
+                "PreparedStatement::query_with_params_for_each must settle before visiting rows"
+            );
+            assert!(!conn.in_transaction());
+        });
+    }
+
+    #[test]
+    fn test_abandoned_transaction_cleanup_precedes_prepared_dml_and_execute_many() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(
+                "CREATE TABLE prepared_dml_cleanup (id INTEGER PRIMARY KEY, val TEXT NOT NULL);",
+            )
+            .await
+            .unwrap();
+            let insert = conn
+                .prepare("INSERT INTO prepared_dml_cleanup VALUES (?1, ?2);")
+                .await
+                .unwrap();
+
+            conn.begin_transaction().await.unwrap();
+            conn.execute("INSERT INTO prepared_dml_cleanup VALUES (1, 'abandoned');")
+                .await
+                .unwrap();
+            conn.mark_transaction_cleanup_required();
+            insert
+                .execute_with_params(&[
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("autocommit".into()),
+                ])
+                .await
+                .unwrap();
+
+            let rows = conn
+                .query("SELECT id, val FROM prepared_dml_cleanup ORDER BY id;")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+            assert_eq!(rows[0].values()[1], SqliteValue::Text("autocommit".into()));
+
+            conn.begin_transaction().await.unwrap();
+            conn.execute("INSERT INTO prepared_dml_cleanup VALUES (3, 'second abandoned');")
+                .await
+                .unwrap();
+            conn.mark_transaction_cleanup_required();
+            let error = conn
+                .execute_many_with_params_skip_statement_savepoint_in_explicit_txn(
+                    "INSERT INTO prepared_dml_cleanup VALUES (?1, ?2);",
+                    &[vec![
+                        SqliteValue::Integer(4),
+                        SqliteValue::Text("must not execute".into()),
+                    ]],
+                )
+                .await
+                .expect_err("settlement must end the abandoned explicit transaction");
+            assert!(
+                matches!(error, FrankenError::Internal(message) if message.contains("requires an explicit transaction"))
+            );
+            let rows = conn
+                .query("SELECT id FROM prepared_dml_cleanup ORDER BY id;")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
         });
     }
 
