@@ -48,6 +48,31 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-07-28 - LANDED: bd-2dgf5 closed at 5d35b79e — the parameterized IN-subquery had the same routing disease (~32x recovered at 10k, scaling inversion gone); original aggregate-seek scope verified already fixed
+
+- Target: the second of the two subquery routing pathologies. Same disease
+  as bd-8sfs3: `in_subquery_supported_by_vdbe`'s blanket kl17o placeholder
+  rejection banished `col IN (SELECT ... WHERE id <= ?1)` to the interpreted
+  outer full scan while `resolve_in_probe_source` consumes exactly this
+  shape natively (residual per execution, `Opcode::Variable` rebinds).
+- Fix: shape-scoped carve-out (structural mirror of the probe-source
+  acceptance, non-correlated only; correlated IN keeps bd-zvk68 routing).
+  Paired same-host receipt: IN row 252µs/423µs/4.40ms →
+  171µs/352µs/137µs at 100/1k/10k — flat scaling restored
+  (`tests/artifacts/perf/in-subquery-fix-20260728T0250Z-hz1/`).
+- Also verified: the bead's ORIGINAL "aggregates never use an index" scope
+  (incl. rowid-PK-seek-lost-under-COUNT) was already fixed by the
+  aggregate index-seek machinery at codegen.rs:1851-1884 — EXPLAIN on
+  current main shows SeekGE+AggStep / SeekRowid with the scan-fallback
+  safety valve. The bead's 2026-07-09 numbers are historical.
+- Pattern for future perf triage (two-for-two now): when a shape is
+  catastrophically slow ONLY when parameterized, suspect the dispatch
+  router before the executor — diff the literal twin's EXPLAIN first; the
+  compiled path frequently already handles the shape and placeholders.
+  Remaining subquery-family residual: general recursive CTE COUNT (~13x-33x
+  in the debug receipts) and the flat ~4-20x bridge/debug overhead on all
+  parameterized rows (bd-uzq54 class).
+
 ## 2026-07-28 - LANDED: bd-8sfs3 fixed at fa85adfc — the ~26,000x correlated-EXISTS pathology was ROUTING, not execution (~2,250x recovered on the 10k shape)
 
 - Target: the correlated count-semijoin EXISTS shape with a placeholder
