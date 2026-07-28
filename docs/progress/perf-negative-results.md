@@ -48,6 +48,75 @@ candidate median ratio clears the A/A median bootstrap-CI radius by at least
 2x (and the effect is at least 1%); otherwise report INCONCLUSIVE. CV and MAD
 are provenance only and must never gate the verdict.
 
+## 2026-07-27 - LANDED: bench-truth sweep — criterion suite had 30 per-op runtime-entry sites (bd-mnlk2 complete), subquery/CTE rows now cross-engine validated (bd-czzlp), dropped-pragma fix confirmed (bd-fd1ra)
+
+- Target: the remaining instrument-drift surface after bd-zavyn/bd-i8pt6.
+  Exhaustive audit of every criterion timed closure in
+  `crates/fsqlite-e2e/benches/` (110 sites across 9 files, three independent
+  auditors, every site dispositioned) plus the two bins bd-mnlk2 had left
+  (`perf_update_delete.rs`, `swarm_multiprocess.rs` — both turned out already
+  fixed in-tree with hoisted entries).
+- Finding: 30 live defect sites in 8 bench files — every FrankenSQLite timed
+  closure mirrored its rusqlite twin statement-for-statement, so each sync C
+  call was its own ~333ns runtime entry on the F side only. Extremes:
+  `large_txn_bench` 1M-row txn = 1,000,003 entries/sample (~0.33s pure bridge
+  tax per sample); `write_throughput_bench` 10k-row shapes ≈ 10,001-10,031;
+  `mixed_oltp_bench` 2000-op loop ≈ 2,007; `e2e_bench` 11 sites incl. the
+  concurrent-writes arm (per-row entries in every spawned thread);
+  `concurrent_write_persistent_bench` additionally constructed each writer's
+  thread-local runtime inside the timed region. `read_heavy_bench.rs` was the
+  only fully clean file. No thread::sleep-inside-runtime and no
+  future-re-poll instances anywhere in the audited set.
+- Fix (uniform, RusticBasin's Gate 0 shape): one
+  `fsqlite_e2e::block_on(async { .. })` per timed sample — per transaction
+  attempt with backoff outside the runtime for the contended persistent
+  bench, matching the landed mt_mvcc idiom. C arms byte-untouched. Also:
+  `mt_oltp_bench.rs` gained the crate-root
+  `future_not_send`/`large_futures` allows its siblings already carry
+  (the hoisted bodies await the 16-50KB statement futures of bd-uzq54;
+  Box::pin would put an allocation inside the timed window) — that bin had
+  been clippy-red at -D warnings since the 4/6-bin hoist landed, masked by
+  nobody running clippy on --bins (bd-h9o9r class).
+- bd-czzlp closeout: EXISTS/IN rows were already parameter-varying with
+  oracle asserts and the recursive CTE already split specialized-vs-general;
+  the remaining gap was the scalar-subquery and CTE+JOIN rows, which timed
+  fully-materialized results on both arms but never compared them. Added
+  `assert_result_set_oracle` (one-shot, outside timed loops, normalized
+  multiset compare). Verified `PreparedStatement::query()` returns fully
+  decoded `Vec<Row>` (work-symmetric with `collect_rusqlite_rows`) and that
+  the only retained caches (count/sum single-row, indexed-equality) cannot
+  serve these multi-row shapes, so no parameter variation is needed there.
+- bd-fd1ra confirmation: all sites from the bead (7 e2e criterion benches,
+  persistent bench, `prepared_cache_hot_paths.rs`) now await their pragmas
+  with panic-on-error; repo-wide sweep found no remaining unpolled
+  execute/query futures (`validation.rs` hits go through the sync
+  `SqlBackend` trait; `execute_batch` hits are rusqlite best-effort
+  rollbacks).
+- Consequence for published numbers: every pre-fix cross-engine ratio from
+  the 8 affected criterion benches UNDER-reports FrankenSQLite (bridge tax on
+  the F side only, up to ~0.33s/sample); any artifact citing them needs
+  re-derivation post-fix. Direction of published F-wins is safe; magnitudes
+  are not engine truth.
+- Evidence: audit tables + per-site old→new entry counts in bd-mnlk2
+  comments; fix commit referenced on the beads. Compile/clippy/fmt gates
+  green at landing (fsqlite-e2e bins+benches, -D warnings). Note the clippy
+  gate had to run LOCALLY with a session-scoped CARGO_TARGET_DIR: two rch
+  workers (vmi1264463, and vmi1149989 for artifact retrieval) served stale
+  or incomplete state during this slice, while hz1 stayed fresh — line-number
+  fingerprints in the diagnostics distinguish a stale worker tree from a real
+  failure (bd-8wumh comment has the details).
+- UNMASKED by the fix (first honest measurement of the shape): the
+  parameter-varying correlated-EXISTS row is catastrophically slow —
+  C=20.0µs/F=14.76ms at 100 rows, C=16.3µs/F=155.68ms at 1k,
+  C=16.1µs/F≈427ms-per-exec at 10k (~26,000x, debug profile, diagnostic
+  host hz1; magnitude is 5 orders, not noise). Scaling ~linear in
+  products×categories ⇒ per-outer-row re-execution of the inner subquery
+  with no early termination and no PK probe. Filed bd-8sfs3 (P0); sibling
+  IN-subquery planner gap is bd-2dgf5 (~89x, distinct mechanism). The old
+  constant-threshold row reported this shape as a ~70ns cache-hit "win".
+  Scalar-subquery and CTE+JOIN rows are genuinely F-faster in the same
+  section, so the pathology is subquery-execution-specific.
+
 ## 2026-07-27 - LANDED: io_uring reachable for the first time (bd-fo6xw) + inline-I/O marker with default-off gate (bd-bjm5d) + write_page_batch production wiring
 
 - Target: the three I/O-side residual mechanisms. All landed on main the
