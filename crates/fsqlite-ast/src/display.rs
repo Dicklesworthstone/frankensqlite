@@ -252,8 +252,8 @@ pub fn write_qualified_name(
 /// precedence level in SQLite — a semantically different expression.
 /// Parenthesizing also prevents operator merging (e.g. `--x`, which would
 /// lex as a line comment).
-fn write_operand(f: &mut fmt::Formatter<'_>, expr: &crate::Expr) -> fmt::Result {
-    let needs_parens = match expr {
+fn operand_needs_parentheses(expr: &crate::Expr) -> bool {
+    match expr {
         // Operator-bearing forms: never safe to embed bare in an operand
         // position; precedence on re-parse could regroup them.
         crate::Expr::BinaryOp { .. }
@@ -277,12 +277,369 @@ fn write_operand(f: &mut fmt::Formatter<'_>, expr: &crate::Expr) -> fmt::Result 
         | crate::Expr::Raise { .. }
         | crate::Expr::RowValue(..)
         | crate::Expr::Placeholder(..) => false,
-    };
-    if needs_parens {
-        write!(f, "({expr})")
-    } else {
-        write!(f, "{expr}")
     }
+}
+
+enum ExprWriteTask<'a> {
+    Expr(&'a Expr),
+    Operand(&'a Expr),
+    Text(&'static str),
+    Raw(&'a str),
+    Ident(&'a str),
+    Literal(&'a Literal),
+    Column(&'a ColumnRef),
+    BinaryOp(&'a BinaryOp),
+    UnaryOp(&'a UnaryOp),
+    LikeOp(&'a LikeOp),
+    TypeName(&'a TypeName),
+    Placeholder(&'a PlaceholderType),
+    QualifiedName(&'a QualifiedName),
+    ParenthesizedSelect(&'a SelectStatement),
+    OrderingTerm(&'a OrderingTerm),
+    Window(&'a WindowSpec),
+    Frame(&'a FrameSpec),
+    FrameBound(&'a FrameBound),
+}
+
+fn push_comma_separated_exprs<'a>(tasks: &mut Vec<ExprWriteTask<'a>>, exprs: &'a [Expr]) {
+    for (index, expr) in exprs.iter().enumerate().rev() {
+        tasks.push(ExprWriteTask::Expr(expr));
+        if index > 0 {
+            tasks.push(ExprWriteTask::Text(", "));
+        }
+    }
+}
+
+fn push_comma_separated_ordering_terms<'a>(
+    tasks: &mut Vec<ExprWriteTask<'a>>,
+    terms: &'a [OrderingTerm],
+) {
+    for (index, term) in terms.iter().enumerate().rev() {
+        tasks.push(ExprWriteTask::OrderingTerm(term));
+        if index > 0 {
+            tasks.push(ExprWriteTask::Text(", "));
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn write_expr(f: &mut fmt::Formatter<'_>, root: &Expr) -> fmt::Result {
+    let mut tasks = vec![ExprWriteTask::Expr(root)];
+    while let Some(task) = tasks.pop() {
+        match task {
+            ExprWriteTask::Text(text) | ExprWriteTask::Raw(text) => f.write_str(text)?,
+            ExprWriteTask::Ident(name) => write_ident(f, name)?,
+            ExprWriteTask::Literal(literal) => write!(f, "{literal}")?,
+            ExprWriteTask::Column(column) => write!(f, "{column}")?,
+            ExprWriteTask::BinaryOp(op) => write!(f, "{op}")?,
+            ExprWriteTask::UnaryOp(op) => write!(f, "{op}")?,
+            ExprWriteTask::LikeOp(op) => write!(f, "{op}")?,
+            ExprWriteTask::TypeName(type_name) => write!(f, "{type_name}")?,
+            ExprWriteTask::Placeholder(placeholder) => write!(f, "{placeholder}")?,
+            ExprWriteTask::QualifiedName(name) => write!(f, "{name}")?,
+            ExprWriteTask::ParenthesizedSelect(select) => write!(f, "({select})")?,
+            ExprWriteTask::Operand(expr) => {
+                if operand_needs_parentheses(expr) {
+                    tasks.push(ExprWriteTask::Text(")"));
+                    tasks.push(ExprWriteTask::Expr(expr));
+                    tasks.push(ExprWriteTask::Text("("));
+                } else {
+                    tasks.push(ExprWriteTask::Expr(expr));
+                }
+            }
+            ExprWriteTask::OrderingTerm(term) => {
+                if let Some(nulls) = term.nulls {
+                    match nulls {
+                        NullsOrder::First => tasks.push(ExprWriteTask::Text(" NULLS FIRST")),
+                        NullsOrder::Last => tasks.push(ExprWriteTask::Text(" NULLS LAST")),
+                    }
+                }
+                if let Some(direction) = term.direction {
+                    match direction {
+                        SortDirection::Asc => tasks.push(ExprWriteTask::Text(" ASC")),
+                        SortDirection::Desc => tasks.push(ExprWriteTask::Text(" DESC")),
+                    }
+                }
+                tasks.push(ExprWriteTask::Expr(&term.expr));
+            }
+            ExprWriteTask::Window(window) => {
+                let has_base = window.base_window.is_some();
+                let has_partition = !window.partition_by.is_empty();
+                let has_order = !window.order_by.is_empty();
+                tasks.push(ExprWriteTask::Text(")"));
+                if let Some(frame) = &window.frame {
+                    tasks.push(ExprWriteTask::Frame(frame));
+                    if has_base || has_partition || has_order {
+                        tasks.push(ExprWriteTask::Text(" "));
+                    }
+                }
+                if has_order {
+                    push_comma_separated_ordering_terms(&mut tasks, &window.order_by);
+                    tasks.push(ExprWriteTask::Text("ORDER BY "));
+                    if has_base || has_partition {
+                        tasks.push(ExprWriteTask::Text(" "));
+                    }
+                }
+                if has_partition {
+                    push_comma_separated_exprs(&mut tasks, &window.partition_by);
+                    tasks.push(ExprWriteTask::Text("PARTITION BY "));
+                    if has_base {
+                        tasks.push(ExprWriteTask::Text(" "));
+                    }
+                }
+                if let Some(base) = &window.base_window {
+                    tasks.push(ExprWriteTask::Ident(base));
+                }
+                tasks.push(ExprWriteTask::Text("("));
+            }
+            ExprWriteTask::Frame(frame) => {
+                if let Some(exclude) = frame.exclude {
+                    match exclude {
+                        FrameExclude::NoOthers => {
+                            tasks.push(ExprWriteTask::Text(" EXCLUDE NO OTHERS"));
+                        }
+                        FrameExclude::CurrentRow => {
+                            tasks.push(ExprWriteTask::Text(" EXCLUDE CURRENT ROW"));
+                        }
+                        FrameExclude::Group => {
+                            tasks.push(ExprWriteTask::Text(" EXCLUDE GROUP"));
+                        }
+                        FrameExclude::Ties => {
+                            tasks.push(ExprWriteTask::Text(" EXCLUDE TIES"));
+                        }
+                    }
+                }
+                if let Some(end) = &frame.end {
+                    tasks.push(ExprWriteTask::FrameBound(end));
+                    tasks.push(ExprWriteTask::Text(" AND "));
+                    tasks.push(ExprWriteTask::FrameBound(&frame.start));
+                    tasks.push(ExprWriteTask::Text(" BETWEEN "));
+                } else {
+                    tasks.push(ExprWriteTask::FrameBound(&frame.start));
+                    tasks.push(ExprWriteTask::Text(" "));
+                }
+                match frame.frame_type {
+                    FrameType::Rows => tasks.push(ExprWriteTask::Text("ROWS")),
+                    FrameType::Range => tasks.push(ExprWriteTask::Text("RANGE")),
+                    FrameType::Groups => tasks.push(ExprWriteTask::Text("GROUPS")),
+                }
+            }
+            ExprWriteTask::FrameBound(bound) => match bound {
+                FrameBound::UnboundedPreceding => {
+                    tasks.push(ExprWriteTask::Text("UNBOUNDED PRECEDING"));
+                }
+                FrameBound::Preceding(expr) => {
+                    tasks.push(ExprWriteTask::Text(" PRECEDING"));
+                    tasks.push(ExprWriteTask::Expr(expr));
+                }
+                FrameBound::CurrentRow => tasks.push(ExprWriteTask::Text("CURRENT ROW")),
+                FrameBound::Following(expr) => {
+                    tasks.push(ExprWriteTask::Text(" FOLLOWING"));
+                    tasks.push(ExprWriteTask::Expr(expr));
+                }
+                FrameBound::UnboundedFollowing => {
+                    tasks.push(ExprWriteTask::Text("UNBOUNDED FOLLOWING"));
+                }
+            },
+            ExprWriteTask::Expr(expr) => match expr {
+                Expr::Literal(literal, _) => tasks.push(ExprWriteTask::Literal(literal)),
+                Expr::Column(column, _) => tasks.push(ExprWriteTask::Column(column)),
+                Expr::BinaryOp {
+                    left, op, right, ..
+                } => {
+                    tasks.push(ExprWriteTask::Operand(right));
+                    tasks.push(ExprWriteTask::Text(" "));
+                    tasks.push(ExprWriteTask::BinaryOp(op));
+                    tasks.push(ExprWriteTask::Text(" "));
+                    tasks.push(ExprWriteTask::Operand(left));
+                }
+                Expr::UnaryOp { op, expr, .. } => {
+                    tasks.push(ExprWriteTask::Operand(expr));
+                    if matches!(op, UnaryOp::Not) {
+                        tasks.push(ExprWriteTask::Text("NOT "));
+                    } else {
+                        tasks.push(ExprWriteTask::UnaryOp(op));
+                    }
+                }
+                Expr::Between {
+                    expr,
+                    low,
+                    high,
+                    not,
+                    ..
+                } => {
+                    tasks.push(ExprWriteTask::Operand(high));
+                    tasks.push(ExprWriteTask::Text(" AND "));
+                    tasks.push(ExprWriteTask::Operand(low));
+                    tasks.push(ExprWriteTask::Text(" BETWEEN "));
+                    if *not {
+                        tasks.push(ExprWriteTask::Text(" NOT"));
+                    }
+                    tasks.push(ExprWriteTask::Operand(expr));
+                }
+                Expr::In { expr, set, not, .. } => {
+                    match set {
+                        InSet::List(items) => {
+                            tasks.push(ExprWriteTask::Text(")"));
+                            push_comma_separated_exprs(&mut tasks, items);
+                            tasks.push(ExprWriteTask::Text("("));
+                        }
+                        InSet::Subquery(select) => {
+                            tasks.push(ExprWriteTask::ParenthesizedSelect(select));
+                        }
+                        InSet::Table(name) => tasks.push(ExprWriteTask::QualifiedName(name)),
+                    }
+                    tasks.push(ExprWriteTask::Text(" IN "));
+                    if *not {
+                        tasks.push(ExprWriteTask::Text(" NOT"));
+                    }
+                    tasks.push(ExprWriteTask::Operand(expr));
+                }
+                Expr::Like {
+                    expr,
+                    pattern,
+                    escape,
+                    op,
+                    not,
+                    ..
+                } => {
+                    if let Some(escape) = escape {
+                        tasks.push(ExprWriteTask::Operand(escape));
+                        tasks.push(ExprWriteTask::Text(" ESCAPE "));
+                    }
+                    tasks.push(ExprWriteTask::Operand(pattern));
+                    tasks.push(ExprWriteTask::Text(" "));
+                    tasks.push(ExprWriteTask::LikeOp(op));
+                    tasks.push(ExprWriteTask::Text(" "));
+                    if *not {
+                        tasks.push(ExprWriteTask::Text(" NOT"));
+                    }
+                    tasks.push(ExprWriteTask::Operand(expr));
+                }
+                Expr::Case {
+                    operand,
+                    whens,
+                    else_expr,
+                    ..
+                } => {
+                    tasks.push(ExprWriteTask::Text(" END"));
+                    if let Some(else_expr) = else_expr {
+                        tasks.push(ExprWriteTask::Expr(else_expr));
+                        tasks.push(ExprWriteTask::Text(" ELSE "));
+                    }
+                    for (condition, result) in whens.iter().rev() {
+                        tasks.push(ExprWriteTask::Expr(result));
+                        tasks.push(ExprWriteTask::Text(" THEN "));
+                        tasks.push(ExprWriteTask::Expr(condition));
+                        tasks.push(ExprWriteTask::Text(" WHEN "));
+                    }
+                    if let Some(operand) = operand {
+                        tasks.push(ExprWriteTask::Expr(operand));
+                        tasks.push(ExprWriteTask::Text(" "));
+                    }
+                    tasks.push(ExprWriteTask::Text("CASE"));
+                }
+                Expr::Cast {
+                    expr, type_name, ..
+                } => {
+                    tasks.push(ExprWriteTask::Text(")"));
+                    tasks.push(ExprWriteTask::TypeName(type_name));
+                    tasks.push(ExprWriteTask::Text(" AS "));
+                    tasks.push(ExprWriteTask::Expr(expr));
+                    tasks.push(ExprWriteTask::Text("CAST("));
+                }
+                Expr::Exists { subquery, not, .. } => {
+                    if *not {
+                        f.write_str("NOT ")?;
+                    }
+                    write!(f, "EXISTS ({subquery})")?;
+                }
+                Expr::Subquery(select, _) => write!(f, "({select})")?,
+                Expr::FunctionCall {
+                    name,
+                    args,
+                    distinct,
+                    order_by,
+                    filter,
+                    over,
+                    ..
+                } => {
+                    if let Some(window) = over {
+                        if let Some(base) = &window.base_window {
+                            tasks.push(ExprWriteTask::Ident(base));
+                        } else {
+                            tasks.push(ExprWriteTask::Window(window));
+                        }
+                        tasks.push(ExprWriteTask::Text(" OVER "));
+                    }
+                    if let Some(filter) = filter {
+                        tasks.push(ExprWriteTask::Text(")"));
+                        tasks.push(ExprWriteTask::Expr(filter));
+                        tasks.push(ExprWriteTask::Text(" FILTER (WHERE "));
+                    }
+                    tasks.push(ExprWriteTask::Text(")"));
+                    if !order_by.is_empty() {
+                        push_comma_separated_ordering_terms(&mut tasks, order_by);
+                        tasks.push(ExprWriteTask::Text(" ORDER BY "));
+                    }
+                    match args {
+                        FunctionArgs::Star => tasks.push(ExprWriteTask::Text("*")),
+                        FunctionArgs::List(items) => {
+                            push_comma_separated_exprs(&mut tasks, items);
+                        }
+                    }
+                    if *distinct {
+                        tasks.push(ExprWriteTask::Text("DISTINCT "));
+                    }
+                    tasks.push(ExprWriteTask::Text("("));
+                    tasks.push(ExprWriteTask::Ident(name));
+                }
+                Expr::Collate {
+                    expr, collation, ..
+                } => {
+                    tasks.push(ExprWriteTask::Raw(collation));
+                    tasks.push(ExprWriteTask::Text(" COLLATE "));
+                    tasks.push(ExprWriteTask::Operand(expr));
+                }
+                Expr::IsNull { expr, not, .. } => {
+                    if *not {
+                        tasks.push(ExprWriteTask::Text(" IS NOT NULL"));
+                    } else {
+                        tasks.push(ExprWriteTask::Text(" IS NULL"));
+                    }
+                    tasks.push(ExprWriteTask::Operand(expr));
+                }
+                Expr::Raise {
+                    action, message, ..
+                } => {
+                    write!(f, "RAISE({action}")?;
+                    if let Some(message) = message {
+                        write!(f, ", '{}'", message.replace('\'', "''"))?;
+                    }
+                    f.write_str(")")?;
+                }
+                Expr::JsonAccess {
+                    expr, path, arrow, ..
+                } => {
+                    tasks.push(ExprWriteTask::Operand(path));
+                    match arrow {
+                        JsonArrow::Arrow => tasks.push(ExprWriteTask::Text(" -> ")),
+                        JsonArrow::DoubleArrow => tasks.push(ExprWriteTask::Text(" ->> ")),
+                    }
+                    tasks.push(ExprWriteTask::Operand(expr));
+                }
+                Expr::RowValue(exprs, _) => {
+                    tasks.push(ExprWriteTask::Text(")"));
+                    push_comma_separated_exprs(&mut tasks, exprs);
+                    tasks.push(ExprWriteTask::Text("("));
+                }
+                Expr::Placeholder(placeholder, _) => {
+                    tasks.push(ExprWriteTask::Placeholder(placeholder));
+                }
+            },
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -401,183 +758,8 @@ impl fmt::Display for RaiseAction {
 // ---------------------------------------------------------------------------
 
 impl fmt::Display for Expr {
-    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Literal(lit, _) => write!(f, "{lit}"),
-            Self::Column(col, _) => write!(f, "{col}"),
-            Self::BinaryOp {
-                left, op, right, ..
-            } => {
-                write_operand(f, left)?;
-                write!(f, " {op} ")?;
-                write_operand(f, right)
-            }
-            Self::UnaryOp { op, expr, .. } => {
-                if matches!(op, UnaryOp::Not) {
-                    write!(f, "NOT ")?;
-                } else {
-                    write!(f, "{op}")?;
-                }
-                write_operand(f, expr)
-            }
-            Self::Between {
-                expr,
-                low,
-                high,
-                not,
-                ..
-            } => {
-                write_operand(f, expr)?;
-                if *not {
-                    f.write_str(" NOT")?;
-                }
-                f.write_str(" BETWEEN ")?;
-                write_operand(f, low)?;
-                f.write_str(" AND ")?;
-                write_operand(f, high)
-            }
-            Self::In { expr, set, not, .. } => {
-                write_operand(f, expr)?;
-                if *not {
-                    f.write_str(" NOT")?;
-                }
-                f.write_str(" IN ")?;
-                match set {
-                    InSet::List(items) => {
-                        f.write_str("(")?;
-                        comma_list(f, items)?;
-                        f.write_str(")")
-                    }
-                    InSet::Subquery(q) => write!(f, "({q})"),
-                    InSet::Table(name) => write!(f, "{name}"),
-                }
-            }
-            Self::Like {
-                expr,
-                pattern,
-                escape,
-                op,
-                not,
-                ..
-            } => {
-                write_operand(f, expr)?;
-                if *not {
-                    f.write_str(" NOT")?;
-                }
-                write!(f, " {op} ")?;
-                write_operand(f, pattern)?;
-                if let Some(esc) = escape {
-                    f.write_str(" ESCAPE ")?;
-                    write_operand(f, esc)?;
-                }
-                Ok(())
-            }
-            Self::Case {
-                operand,
-                whens,
-                else_expr,
-                ..
-            } => {
-                f.write_str("CASE")?;
-                if let Some(op) = operand {
-                    write!(f, " {op}")?;
-                }
-                for (cond, then) in whens {
-                    write!(f, " WHEN {cond} THEN {then}")?;
-                }
-                if let Some(el) = else_expr {
-                    write!(f, " ELSE {el}")?;
-                }
-                f.write_str(" END")
-            }
-            Self::Cast {
-                expr, type_name, ..
-            } => write!(f, "CAST({expr} AS {type_name})"),
-            Self::Exists { subquery, not, .. } => {
-                if *not {
-                    f.write_str("NOT ")?;
-                }
-                write!(f, "EXISTS ({subquery})")
-            }
-            Self::Subquery(q, _) => write!(f, "({q})"),
-            Self::FunctionCall {
-                name,
-                args,
-                distinct,
-                order_by,
-                filter,
-                over,
-                ..
-            } => {
-                write_ident(f, name)?;
-                f.write_str("(")?;
-                if *distinct {
-                    f.write_str("DISTINCT ")?;
-                }
-                match args {
-                    FunctionArgs::Star => f.write_str("*")?,
-                    FunctionArgs::List(items) => comma_list(f, items)?,
-                }
-                if !order_by.is_empty() {
-                    f.write_str(" ORDER BY ")?;
-                    comma_list(f, order_by)?;
-                }
-                f.write_str(")")?;
-                if let Some(filter_expr) = filter {
-                    write!(f, " FILTER (WHERE {filter_expr})")?;
-                }
-                if let Some(win) = over {
-                    f.write_str(" OVER ")?;
-                    if let Some(ref base) = win.base_window {
-                        write_ident(f, base)?;
-                    } else {
-                        write!(f, "{win}")?;
-                    }
-                }
-                Ok(())
-            }
-            Self::Collate {
-                expr, collation, ..
-            } => {
-                write_operand(f, expr)?;
-                write!(f, " COLLATE {collation}")
-            }
-            Self::IsNull { expr, not, .. } => {
-                write_operand(f, expr)?;
-                if *not {
-                    f.write_str(" IS NOT NULL")
-                } else {
-                    f.write_str(" IS NULL")
-                }
-            }
-            Self::Raise {
-                action, message, ..
-            } => {
-                f.write_str("RAISE(")?;
-                write!(f, "{action}")?;
-                if let Some(msg) = message {
-                    write!(f, ", '{}'", msg.replace('\'', "''"))?;
-                }
-                f.write_str(")")
-            }
-            Self::JsonAccess {
-                expr, path, arrow, ..
-            } => {
-                write_operand(f, expr)?;
-                match arrow {
-                    JsonArrow::Arrow => f.write_str(" -> ")?,
-                    JsonArrow::DoubleArrow => f.write_str(" ->> ")?,
-                }
-                write_operand(f, path)
-            }
-            Self::RowValue(exprs, _) => {
-                f.write_str("(")?;
-                comma_list(f, exprs)?;
-                f.write_str(")")
-            }
-            Self::Placeholder(ph, _) => write!(f, "{ph}"),
-        }
+        write_expr(f, self)
     }
 }
 
@@ -1820,5 +2002,27 @@ impl fmt::Display for Statement {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod expr_display_tests {
+    use super::*;
+
+    #[test]
+    fn expression_display_height_1000_uses_bounded_work_stack() {
+        let mut expr = Expr::Literal(Literal::Integer(1), Span::ZERO);
+        for _ in 1..1000 {
+            expr = Expr::BinaryOp {
+                left: Box::new(expr),
+                op: BinaryOp::Add,
+                right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                span: Span::ZERO,
+            };
+        }
+
+        let rendered = expr.to_string();
+        assert_eq!(rendered.matches('+').count(), 999);
+        assert!(rendered.ends_with(" + 1"));
     }
 }
