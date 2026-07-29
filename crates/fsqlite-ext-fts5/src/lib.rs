@@ -2112,8 +2112,7 @@ impl Fts5ScoreSnapshot {
         &self,
         queries: &[&str],
     ) -> std::result::Result<Vec<String>, Fts5QueryError> {
-        let tokenizer = create_tokenizer(&self.tokenizer_name)
-            .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
+        let tokenizer = create_capped_tokenizer(&self.tokenizer_name);
         query_terms_for_query_strings(&self.columns, queries, tokenizer.as_ref(), self.detail)
     }
 
@@ -2126,8 +2125,7 @@ impl Fts5ScoreSnapshot {
         match &self.source {
             Fts5ScoreSource::InMemory(index) => Ok(bm25_score(index, rowid, query_terms, weights)),
             Fts5ScoreSource::Shadow(rows) => {
-                let tokenizer = create_tokenizer(&self.tokenizer_name)
-                    .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
+                let tokenizer = create_capped_tokenizer(&self.tokenizer_name);
                 Fts5ShadowQuery::new(rows, &self.columns, tokenizer.as_ref(), self.detail)?
                     .bm25_score(rowid, query_terms, weights)
             }
@@ -3386,6 +3384,18 @@ impl Fts5Tokenizer for MaxTokenLenTokenizer {
                 sink(term, start, end, colocated);
             });
     }
+}
+
+/// Shared capped construction for every tokenizer the table, hydration,
+/// query, and scoring paths use (cass#362). The bare [`create_tokenizer`]
+/// factory stays uncapped for spec validation and direct API use; every
+/// indexing and MATCH consumer must come through this guard so the live
+/// index, the persisted segments, and query normalization all see the same
+/// bounded term stream.
+fn create_capped_tokenizer(name: &str) -> Box<dyn Fts5Tokenizer> {
+    Box::new(MaxTokenLenTokenizer {
+        inner: create_tokenizer(name).unwrap_or_else(|| Box::new(Unicode61Tokenizer::new())),
+    })
 }
 
 /// Unicode61 tokenizer: splits on non-alphanumeric characters, lowercases.
@@ -7559,10 +7569,7 @@ impl Fts5Table {
     }
 
     pub fn create_tokenizer_instance(&self) -> Box<dyn Fts5Tokenizer> {
-        Box::new(MaxTokenLenTokenizer {
-            inner: create_tokenizer(&self.tokenizer_name)
-                .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new())),
-        })
+        create_capped_tokenizer(&self.tokenizer_name)
     }
 
     pub fn open_shadow_rows(
@@ -7808,8 +7815,12 @@ impl Fts5Table {
         self.clear_lazy_on_disk();
         self.row_locales.clear();
         self.next_rowid = 1;
-        let tokenizer = create_tokenizer(&self.tokenizer_name)
-            .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
+        // cass#362: hydration must use the same capped tokenizer as inserts,
+        // or a reopened content table's live in-memory index would carry
+        // overlong terms the persisted segments (and fresh sessions) skip —
+        // and a later contentless-style flush of that index would re-hit the
+        // u16 leaf-offset failure this cap exists to prevent.
+        let tokenizer = create_capped_tokenizer(&self.tokenizer_name);
         for (rowid, columns) in rows {
             self.index_document_with_tokenizer(rowid, &columns, tokenizer.as_ref());
             self.next_rowid = self.next_rowid.max(rowid.saturating_add(1));
@@ -9048,8 +9059,7 @@ impl VirtualTableCursor for Fts5Cursor {
                 let weights: Vec<f64> = self.columns.iter().map(|_| 1.0).collect();
                 let queries: Vec<String> = args.iter().map(SqliteValue::to_text).collect();
                 let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
-                let tokenizer = create_tokenizer(&self.tokenizer_name)
-                    .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
+                let tokenizer = create_capped_tokenizer(&self.tokenizer_name);
                 self.results = if let Some(rows) = self.shadow_rows.as_ref() {
                     Fts5ShadowQuery::new(rows, &self.columns, tokenizer.as_ref(), self.detail)
                         .and_then(|query| query.search_queries_with_weights(&query_refs, &weights))

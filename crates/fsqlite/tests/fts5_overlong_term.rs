@@ -145,3 +145,71 @@ fn overlong_term_batch_rebuild_shape_survives() {
         assert_eq!(match_rowids(&conn, "row4").await, vec![4]);
     });
 }
+
+async fn match_rowids_in(conn: &Connection, table: &str, term: &str) -> Vec<i64> {
+    conn.query(&format!(
+        "SELECT rowid FROM {table} WHERE {table} MATCH '{term}' ORDER BY rowid"
+    ))
+    .await
+    .expect("MATCH query")
+    .iter()
+    .map(|r| match &r.values()[0] {
+        SqliteValue::Integer(i) => *i,
+        other => panic!("unexpected rowid value: {other:?}"),
+    })
+    .collect()
+}
+
+/// The hydration hole: `rebuild_documents` (content-table reopen) used a bare
+/// undecorated tokenizer, so a reopened table's live in-memory index carried
+/// the overlong term the persisted segments and fresh sessions skip — making
+/// `MATCH '<giant>'` return rows only after a reopen. Every tokenizer
+/// construction now goes through the shared capped factory, so the overlong
+/// term stays unqueryable in both sessions.
+#[test]
+fn overlong_term_stays_unqueryable_across_content_table_hydration() {
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_owned();
+
+        // Over the 1024-byte cap, small enough for an inline MATCH literal.
+        let giant = "q".repeat(4_000);
+
+        {
+            let conn = Connection::open(&path).await.unwrap();
+            conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+            conn.execute("CREATE VIRTUAL TABLE cidx USING fts5(body)")
+                .await
+                .expect("create content-full fts5");
+            conn.execute_with_params(
+                "INSERT INTO cidx(rowid, body) VALUES (?1, ?2)",
+                &[
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text(format!("prefix {giant} needle").into()),
+                ],
+            )
+            .await
+            .expect("insert content row with overlong term");
+
+            assert_eq!(match_rowids_in(&conn, "cidx", "needle").await, vec![1]);
+            assert!(
+                match_rowids_in(&conn, "cidx", &giant).await.is_empty(),
+                "live session must not index the overlong term"
+            );
+        }
+
+        {
+            let conn = Connection::open(&path).await.unwrap();
+            assert_eq!(
+                match_rowids_in(&conn, "cidx", "needle").await,
+                vec![1],
+                "content row lost across reopen"
+            );
+            assert!(
+                match_rowids_in(&conn, "cidx", &giant).await.is_empty(),
+                "hydrated in-memory index must apply the same term cap as \
+                 fresh inserts (cass#362 rebuild_documents hole)"
+            );
+        }
+    });
+}
