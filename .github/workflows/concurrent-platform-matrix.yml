@@ -240,6 +240,32 @@ jobs:
           test_status=${PIPESTATUS[0]}
           echo "exit_code=${test_status}" >> artifacts/concurrent-${{ matrix.platform_tag }}/replace_conflict_guard.exit
 
+      # Deliberately named a smoke test, not a corruption guard. Its own header
+      # says so: the captured stream is an open-only capture that replays clean
+      # even against the v0.1.18 tree it was supposed to corrupt, so a green run
+      # here is NOT evidence that bd-105ga is absent -- that is
+      # replace_conflict_guard's job, above. What this does buy: ~5k real
+      # statements (1,024 REPLACE INTO upserts inside one BEGIN IMMEDIATE ...
+      # ROLLBACK) against an 18 MB real-world database, checked by both our
+      # integrity_check and C SQLite's. Nothing else in CI exercises a
+      # bulk-upsert-then-rollback workload on a non-toy file.
+      #
+      # COST: measured at 265 s locally (2026-07-29), and this job is a
+      # per-platform matrix, so budget that per platform. If the matrix gets
+      # tight, this is the most defensible step to move to a nightly job --
+      # it is a smoke test, not a correctness gate.
+      - name: Bulk-upsert rollback smoke test on a real 18 MB database
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          cargo test --locked -p fsqlite-e2e \
+            --test bd_105ga_replay_regression \
+            -- --exact bd105ga_stream_replays_without_error_or_integrity_loss --nocapture \
+            2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/replay_smoke.log
+          test_status=${PIPESTATUS[0]}
+          echo "exit_code=${test_status}" >> artifacts/concurrent-${{ matrix.platform_tag }}/replay_smoke.exit
+
       - name: Cross-engine integrity check on artifacts (Linux only)
         if: runner.os == 'Linux'
         shell: bash
@@ -322,6 +348,7 @@ jobs:
             connection_sync
             swarm_harness
             replace_conflict_guard
+            replay_smoke
           )
           shopt -s nullglob
           actual_receipts=(artifacts/concurrent-${{ matrix.platform_tag }}/*.exit)
