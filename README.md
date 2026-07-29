@@ -5,7 +5,7 @@
 <h1 align="center">FrankenSQLite</h1>
 
 <p align="center">
-  <strong>An independent ground-up Rust reimplementation of SQLite with concurrent writers and information-theoretic durability.</strong>
+  <strong>An independent ground-up Rust reimplementation of SQLite with page-level MVCC concurrent-writer support.</strong>
 </p>
 
 <p align="center">
@@ -23,9 +23,9 @@
 
 **The Solution:** FrankenSQLite reimplements SQLite from scratch in Rust, with a safe engine core and two architectural innovations:
 
-1. **MVCC Concurrent Writers.** The single-writer lock is replaced with page-level Multi-Version Concurrency Control. Multiple writers commit simultaneously as long as they touch different pages. Serializable Snapshot Isolation (SSI) prevents write skew by default. A safe write-merge ladder (intent replay + structured page patches) resolves commuting same-page conflicts without row-level MVCC metadata; raw byte-range XOR merges are forbidden for SQLite structured pages.
+1. **MVCC Concurrent Writers.** The single-writer lock is replaced with page-level Multi-Version Concurrency Control. Writers that touch different pages can overlap their page work, while commit validation and publication still contain coordinated sections. Serializable Snapshot Isolation (SSI) tracks write-skew dependencies by default. A safe write-merge ladder (intent replay + structured page patches) is present as dormant/tested implementation work but is not yet wired into the live commit path; current same-page base drift aborts and retries.
 
-2. **RaptorQ-Pervasive Durability.** Every persistent layer is infused with RFC 6330 fountain codes via asupersync's production-grade RaptorQ implementation. WAL frames carry repair symbols for self-healing after torn writes. Snapshot transfer uses rateless coding for bandwidth-optimal replication over lossy networks. Data loss becomes a mathematical near-impossibility rather than a failure mode to mitigate.
+2. **RaptorQ Durability Research.** The workspace contains RaptorQ/ECS building blocks and partial native-mode integration. The live compatibility runtime does not yet justify a blanket self-healing or numeric durability claim; the native-mode sections below are design plus partial implementation and are gated on end-to-end recovery evidence.
 
 The current runnable engine is already real, but still hybrid. Compatibility mode over standard SQLite files is the live runtime path today; Native mode / ECS sections below describe the longer-term design plus partial implementation work. See "Current Implementation Status" before treating every section as present-day behavior.
 
@@ -64,7 +64,7 @@ closed rather than silently downgrading authenticity.
 | Memory safety | Manual (C) | Core engine is safe Rust; `unsafe` is limited to `fsqlite-vfs` (mmap/shm) and the optional `fsqlite-c-api` shim (FFI) |
 | Data races | Possible (careful C) | Prevented inside the Rust engine by ownership and type-system checks |
 | File format | SQLite 3.x | Compatibility mode targets SQLite 3.x parity; Native/ECS work is separate |
-| Self-healing storage | No | Yes (RaptorQ repair symbols) |
+| Self-healing storage | No | Native/ECS design plus partial implementation; not a blanket compatibility-runtime guarantee |
 | Page-level encryption | No (commercial SEE extension) | XChaCha20-Poly1305 (DEK/KEK envelope, Argon2id KEK derivation) |
 | SQL dialect | Full | Large and growing subset; parser coverage exceeds full execution parity today |
 | Extensions | FTS3/4/5, R-tree, JSON1, etc. | Extension crates are present; some runtime wiring is still in progress |
@@ -85,7 +85,7 @@ Page-level versioning sits at the right point in the complexity/concurrency trad
 
 - **Row-level** (PostgreSQL-style) would break the file format and require VACUUM
 - **Table-level** would conflict on every write to a shared table
-- **Page-level** maps naturally to SQLite's B-tree structure. Writers to different leaf pages proceed in parallel. Conflicts only arise when two transactions modify the same physical page.
+- **Page-level** maps naturally to SQLite's B-tree structure. Writers to different leaf pages can perform page-version work concurrently. Commit publication still coordinates shared metadata, and transactions can also retry because of SSI dependencies or structural B-tree overlap.
 
 ### 3. Safe Rust Engine Core
 
@@ -97,7 +97,7 @@ Compatibility with existing SQLite databases is a core goal of the current runti
 
 ### 5. Serializable Snapshot Isolation (SSI) by Default
 
-`BEGIN CONCURRENT` provides full SERIALIZABLE isolation, not merely Snapshot Isolation. The conservative Cahill/Fekete rule applied at page granularity ("Page-SSI") prevents write skew: no committed transaction may have both an incoming and outgoing rw-antidependency edge. PostgreSQL has shipped SSI since 2011 with less than 7% throughput overhead. `PRAGMA fsqlite.serializable = OFF` explicitly downgrades to plain SI for benchmarking or applications that tolerate write skew. When two writers touch the same page, FCW detects base drift; commuting conflicts may be resolved by the safe merge ladder, otherwise the loser retries with `SQLITE_BUSY_SNAPSHOT`. Deadlocks are impossible by construction (eager page locking, no wait-for cycles).
+`BEGIN CONCURRENT` targets SERIALIZABLE isolation rather than merely Snapshot Isolation. The conservative Cahill/Fekete rule applied at page granularity ("Page-SSI") rejects a transaction that would become a dangerous rw-antidependency pivot. PostgreSQL's SSI results are useful prior art, but they do not establish FrankenSQLite's overhead; that cost remains part of this project's release benchmark matrix. `PRAGMA fsqlite.serializable = OFF` explicitly downgrades to plain SI for benchmarking or applications that tolerate write skew. When two writers touch the same page, FCW detects base drift; commuting conflicts may be resolved by the safe merge ladder, otherwise the loser retries with `SQLITE_BUSY_SNAPSHOT`. Page-lock acquisition does not wait, so it cannot form a page-lock wait-for cycle.
 
 ### 6. Strong Types Over Runtime Checks
 
@@ -107,9 +107,12 @@ Page numbers, transaction IDs, page sizes, error codes, opcode variants, and loc
 
 Each subsystem lives in its own crate with explicit dependency boundaries enforced by Cargo. The parser cannot reach into the pager. The B-tree cannot call the planner. This prevents the kind of circular coupling that accumulates in a single-file C codebase and makes each component independently testable.
 
-### 8. RaptorQ Everywhere
+### 8. RaptorQ Native-Mode Design
 
-RFC 6330 fountain codes are woven into every persistent layer, not bolted on as a replication afterthought. The WAL uses repair symbols to survive torn writes without double-write journaling. Version chains use RaptorQ delta encoding for near-optimal compression. The replication protocol is fountain-coded for bandwidth-optimal transfer over lossy networks. In Native mode, every durable object is stored as an ECS (Erasure-Coded Stream) object with content-addressed BLAKE3 identity.
+The native-mode design applies RFC 6330 fountain codes to persistent objects,
+replication, and recovery. These sections describe design plus partial
+implementation; they do not claim that every compatibility-mode WAL frame or
+version-chain operation currently uses RaptorQ.
 
 ### 9. Mechanical Sympathy
 
@@ -267,9 +270,11 @@ Transaction A: INSERT INTO users ...        Transaction B: INSERT INTO orders ..
   4. Release page lock                        4. Release page lock
 ```
 
-Both transactions commit in parallel. No blocking.
+The page-version work can overlap. Commit validation and durable publication
+still coordinate shared state, so this diagram is not a claim that the complete
+commit path is lock-free or always parallel.
 
-### The Read Path (Lock-Free)
+### The Snapshot Read Path
 
 ```
 read(page 47, snapshot TxnId=41)
@@ -281,7 +286,9 @@ read(page 47, snapshot TxnId=41)
   └──▶ Database file → Read page (implicit TxnId::ZERO), return
 ```
 
-Readers never acquire locks. Unlimited concurrent readers.
+Readers do not acquire writer page locks for ordinary snapshot reads. Their
+concurrency remains bounded by configured transaction slots, WAL read marks in
+compatibility mode, memory, file descriptors, and shared-registry coordination.
 
 ### Conflict Detection (SSI + First-Committer-Wins)
 
@@ -316,7 +323,7 @@ A page version `V` is visible to snapshot `S` if and only if both conditions hol
 1. `V.commit_seq <= S.high` (the version was committed before the snapshot was taken)
 2. `V` is the newest version satisfying (1) (older qualifying versions are shadowed)
 
-These rules produce snapshot isolation: each transaction sees a frozen view of the database as of its start time, regardless of concurrent commits happening around it. Because visibility depends only on the monotonic `CommitSeq` counter (not on an in-flight set), the check is a single integer comparison — O(1) with no bitmap or Bloom filter required.
+These rules produce snapshot isolation: each transaction sees a frozen view of the database as of its start time, regardless of concurrent commits happening around it. Testing whether one candidate version is old enough for a snapshot is a single `CommitSeq` comparison; locating the newest eligible version can still require an index lookup or version-chain traversal.
 
 ### MVCC Core Data Structures
 
@@ -420,7 +427,9 @@ The proof is simple:
 3. A transaction that does not wait cannot participate in a wait-for cycle.
 4. No wait-for cycle means no deadlock. QED.
 
-This trades potential throughput (a waiter could eventually succeed) for absolute simplicity (no deadlock detector, no timeout tuning, no lock ordering requirements). In practice, page conflicts in SQLite workloads are rare because different writers typically touch different leaf pages.
+This trades potential throughput (a waiter could eventually succeed) for a
+smaller page-lock state machine. Conflict frequency is workload- and page-layout
+dependent and must be measured; it is not assumed to be rare.
 
 ---
 
@@ -805,7 +814,11 @@ Journal Page Records (repeated page_count times):
 
 ## Buffer Pool: ARC Cache
 
-LRU fails on database workloads: a single table scan evicts the entire working set. FrankenSQLite uses an **Adaptive Replacement Cache (ARC)** that balances recency and frequency, with a provable competitive ratio of 2 against OPT.
+LRU can perform poorly on database workloads because a table scan may evict a
+hot working set. FrankenSQLite uses an **Adaptive Replacement Cache (ARC)**
+that adapts between recency and frequency and retains ghost entries to detect
+changes in the workload. The README does not claim a universal competitive
+ratio for this implementation.
 
 ### MVCC-Aware Structure
 
@@ -853,7 +866,10 @@ Ghost entries (B1/B2) store only the cache key, not page data. They let ARC lear
 
 ### Visibility Check
 
-With CommitSeq-based snapshots, visibility is a single integer comparison (`V.commit_seq <= S.high`) — O(1) with no auxiliary data structure. No in-flight bitmap or Bloom filter is needed. This is a direct consequence of the monotonic commit clock design: the sequencer assigns `CommitSeq` values at commit time, so a snapshot taken at `high = N` sees exactly those versions with `commit_seq <= N`.
+With CommitSeq-based snapshots, the eligibility test for one version is the
+integer comparison `V.commit_seq <= S.high`; no in-flight bitmap or Bloom
+filter is needed for that test. Finding the newest eligible version is a
+separate lookup/traversal cost.
 
 ---
 
@@ -991,7 +1007,8 @@ Full JSON manipulation within SQL:
 | `json_patch(target, patch)` | RFC 7396 merge patch |
 | `json_valid(doc)` | Check if a string is valid JSON |
 
-Also supports JSONB (binary JSON) for faster repeated access to large documents.
+Also supports JSONB (binary JSON), a representation intended to avoid repeated
+text parsing; its performance relative to JSON text is not claimed here.
 
 ### Session Extension
 
@@ -1201,252 +1218,28 @@ The human-readable scope lock for that contract lives in
 
 ## Performance Characteristics
 
-> ### ⚠ These numbers are under re-verification and do not describe current `main`
->
-> Every figure in this section was measured on the **pre-async** engine. The
-> storage stack has since been migrated to `async`, and same-host diagnostic
-> comparisons detected a release-blocking FrankenSQLite-side timing
-> discontinuity. Those comparisons are not an async-only A/B: the cohorts
-> differ across engine, dependency, and benchmark-driver code.
->
-> **Attribution remains open.** Diagnostic cohort walks narrow the
-> discontinuity to the async branch before its merge, and a same-source
-> mechanism experiment shows that entering a runtime once per operation is
-> materially different from entering once per timed scenario. Neither result
-> is release- or README-citable: the historical drivers lack symmetric work
-> receipts, and the same-source run failed its declared host-provenance gates
-> for isolation, load, I/O pressure, and watchdog coverage. The diagnostic
-> evidence and its explicit interpretation ceilings are retained in
-> `docs/progress/perf-negative-results.md` and under:
->
-> - `tests/artifacts/perf/gate0-historical-drift-20260725T1625Z-trj/`
-> - `tests/artifacts/perf/gate0-boundary-three-cohort-c967eaeb-a0ab400a-13ec577f-20260726T0542Z-trj/`
-> - `tests/artifacts/perf/gate0-boundary-abba-c967eaeb-13ec577f-20260726T0531Z-trj/`
-> - `tests/artifacts/perf/gate0-bridge-413ed24c-20260726T0806Z-trj/`
->
-> Consequently, no post-migration write-side result is published here and no
-> single mechanism is assigned the historical loss. `bd-dqdoe` tracks the
-> citable, same-source Gate 0 rerun and residual attribution.
->
-> Two further caveats that affect what any of these numbers mean:
->
-> - **The shipped profile is unmeasured by a citable matrix.** Benchmarks build
->   `release-perf` (`opt-level=3`), while the released binary is
->   `opt-level="z"` + lto + codegen-units=1 + panic=abort. The diagnostic
->   same-source run flags a size/throughput risk, but its failed provenance
->   gates prohibit publishing a magnitude or choosing a profile from it.
-> - **The io_uring fast path is never reached at runtime, for the same underlying
->   reason.** On a file-backed database opened through the normal `Connection`
->   API, the 2026-07-26 `bd-fo6xw` structural-counter probe reported no successful
->   io_uring data-path samples and only Unix fallbacks. Its exact counters,
->   method, and debug-CLI binary SHA-256 are retained in
->   `docs/progress/perf-negative-results.md`. This is not a stray gate that can
->   be deleted: the shared io_uring driver needs a spawner that outlives the
->   operation, and a per-operation `block_on` tears its runtime down on return,
->   so forcing the path on makes writes fail outright (tried and reverted the
->   same day; the refutation is in the ledger and inline at `uring.rs`). Until a
->   runtime spans at least a transaction, io_uring cannot engage — so any
->   statement about this engine's I/O behaviour currently describes the fallback
->   path, which per page costs a thread-pool hop, a zeroed page allocation, and a
->   second full-page copy.
->
-> Separately, three defects were found in the benchmark harness itself, which
-> affect published numbers in *both* directions and must be fixed before any
-> figure here is re-stated:
->
-> | Defect | Effect on reported numbers |
-> |---|---|
-> | `bd-i8pt6` — mt_oltp reader loop bound its query with `let _ =` and never polled the future, timing future construction rather than execution | made FrankenSQLite look **faster**; prior mt_oltp reader figures are void |
-> | `bd-fd1ra` — benchmark PRAGMAs were silently dropped on the FrankenSQLite side | made FrankenSQLite look **slower** (unconfigured vs configured C SQLite) |
-> | Concurrent arm omitted connection-local `cache_size` for C workers and hardcoded page_size 4096 | scored an asymmetric comparison |
->
-> Separately again, an audit of this section's own citations found that most of
-> them cannot be checked. AGENTS.md requires every numeric performance claim to
-> name a real artifact path or commit; these do not resolve:
->
-> | Cited reference | Status |
-> |---|---|
-> | `tests/artifacts/perf/cod-fullquick-refresh-20260722T1800Z/full-quick.json` | present |
-> | `tests/artifacts/perf/codex-dml-profile-after-active-probe-fix-20260517T1730Z/update-delete-profile.json` | **missing from the repo** |
-> | `tests/artifacts/perf/codex-mt-shared-16-recheck-27d5f71d-20260512T2032Z-iters3/mt-shared-16.json` | **missing from the repo** |
-> | `tests/artifacts/perf/may8-current-gap-audit-20260508T2330Z/` | **missing from the repo** |
-> | source snapshot `140e77df` | **not a reachable git object** |
->
-> The former concurrent-writer headline figures (including `40.99x`) cited
-> evidence that is not in the repository and could not be reproduced by a
-> reader. The 2026-07-26 exact-binary matrices below replace those claims.
->
-> Until `bd-dqdoe` produces a citation-grade artifact on a verified-quiet host,
-> treat the full-quick matrix and every pre-2026-07-26 row in this section as
-> **historical and unverified**: accurate at most for the commit it names, not
-> for `main`. The concurrent-writer subsection below is a 2026-07-26
-> exact-binary remeasurement and states its narrower scope explicitly.
-> Releases remain held on the broader re-verification.
+No numeric performance result is claimed for current `main`.
 
-### Workloads That Benefit Most from MVCC
+The async storage migration changed engine, dependency, and benchmark-driver
+behavior after the last published matrices. Same-host diagnostics found a
+release-blocking timing discontinuity, but the historical cohorts are not a
+controlled async-only comparison. Several older artifacts also have missing or
+null Git provenance, asymmetric settings, or harness defects. They remain
+diagnostic history in `docs/progress/perf-negative-results.md`, not release
+evidence.
 
-Current full-quick benchmark source of truth: `comprehensive-bench --quick` in
-`tests/artifacts/perf/cod-fullquick-refresh-20260722T1800Z/full-quick.json`.
-This July 22, 2026 strict-remote run used the clean `140e77df` source snapshot
-and the `release-perf` profile. (RCH excludes worktree metadata from transfer,
-so the report's Git fields are null.) It keeps the corrected UPDATE/DELETE
-semantics: population and teardown stay outside the timed interval, DML
-statements are prepared once for both engines before timed samples, and private
-`:memory:` direct DML keeps the memory page I/O skip.
-Time ratios report FrankenSQLite time divided by C SQLite time, so values
-**below `1.0x` are faster for FrankenSQLite**.
+The currently demonstrated file-backed path uses the Unix fallback rather than
+the intended io_uring data path. The shipped size-optimized profile is also
+unmeasured by a citation-grade matrix. Both facts are explicit release gates,
+not assumptions to hide behind `release-perf` results.
 
-Standalone concurrent-writer scaling is measured by `mt-mvcc-bench`. The
-current citation-grade rows are recorded in
-`docs/progress/perf-negative-results.md` under the dated 2026-07-26 matched-sync
-entry. That harness reports paired throughput as FrankenSQLite writes/sec
-divided by C SQLite writes/sec, so values **above `1.0x` favor
-FrankenSQLite**—but only a median-CI verdict outside the same-invocation A/A
-null envelope is called faster or slower.
-
-#### Full-quick matrix headline (93 scenarios)
-
-| Aggregate | Value | Reading |
-|-----------|------:|---------|
-| FrankenSQLite faster / comparable / C SQLite faster | `78 / 2 / 13` | ≈ 84 % of scenarios are faster |
-| Geomean F/C time ratio | `0.31327x` | ≈ 3.19× faster overall |
-| Median F/C time ratio | `0.34869x` | ≈ 2.87× faster at the median |
-| Average F/C time ratio | `0.54647x` | ≈ 1.83× faster on the arithmetic mean |
-| p90 F/C time ratio | `1.12976x` | The 90th-percentile scenario is just past parity |
-| p99 F/C time ratio | `3.31882x` | Corrected 100-row DELETE tail with prepared DML on both engines |
-| Per-category weighted score | `0.42838` | Lower is better; weights favour single-row reads/writes |
-
-Per-category geomean F/C time ratio:
-
-| Category | n | Geomean F/C | Reading |
-|---|---:|---:|---|
-| read_aggregate | 25 | `0.099x` | ≈ 10.1× faster |
-| mixed | 1 | `0.289x` | ≈ 3.46× faster |
-| read_single | 33 | `0.235x` | ≈ 4.26× faster |
-| write_bulk | 22 | `0.866x` | ≈ 1.15× faster |
-| concurrent_writers | 3 | `0.769x` | ⚠ do not cite — see the note below. Use the `mt-mvcc-bench` rows for the concurrent-writer result. |
-| **write_single** | **9** | **`1.376x`** | **The remaining gap (corrected prepared-DML DELETE tail)** |
-
-> **The 3 `concurrent_writers` rows above are not a usable comparison, and they
-> are included in the aggregate table's 93 scenarios.** Two independent defects:
-> (1) *unmatched durability* — when this artifact was measured, the section's C
-> SQLite writer connections never set `synchronous`, so they inherited the
-> compiled default `FULL` (a real WAL fsync per commit) while FrankenSQLite's
-> writers ran at `NORMAL` (`WalCommitSyncPolicy::Deferred`, no per-commit fsync).
-> `synchronous` is per-connection, so the setup connection's `NORMAL` never
-> reached them. This has since been fixed in `comprehensive_bench.rs` — both
-> engines' writer connections now set `synchronous=NORMAL` — but the numbers
-> above predate the fix. (2) *irreducible disk noise* — even on a quiet host with
-> a `release-perf` binary, this file-backed WAL section cannot resolve the effect:
-> repeat runs put the C 2-writer median anywhere from 95 ms to 138 ms (CV up to
-> 104 % at 8 writers), a spread larger than the ~20-28 % fsync component being
-> measured. FrankenSQLite's side is stable across runs; C's is not. No corrected
-> ratio is published here because no reliable one can be measured from this
-> section — the concurrent-writer claim rests on `mt-mvcc-bench` below, which
-> runs both engines at `synchronous=NORMAL` and uses higher iteration counts.
-> Evidence and the refuted estimates are in `docs/progress/perf-negative-results.md`
-> (2026-07-23, bd-x5gzk).
-
-#### Concurrent writers (the headline MVCC win)
-
-The 2026-07-26 Lane-M remeasurement used 1,000 rows/thread, 21 paired rounds,
-10,000 bootstrap resamples, a fresh file-backed database for every arm, and
-explicit `synchronous=NORMAL` on every worker connection in both engines.
-Each thread-count row interleaved an independent C/C null control and the C/F
-claim in the same invocation. CV and MAD were recorded but never gated a
-verdict. All rows completed with zero failed writes.
-
-The exact shared-table ELF was
-`cd51cf5b7e20761de32b38a1933a230ea493ab52a86a681419064b4573e79386`
-(19,249,488 bytes); the exact separate-table ELF was
-`0a5f7554ad90f7fc8326f003404f2d00f42cd814e7630cc160e52f8af9908789`
-(19,249,488 bytes). Both invocations reported benchmark-source SHA-256
-`76f6cffe86676b2cff4b5da4daea2acb3afb37a7bb8e4303ecef225453e78f77`.
-Full commands, null intervals, claim intervals, worker identity, and retry
-predicates are durable in `docs/progress/perf-negative-results.md`
-(2026-07-26 matched-sync entry).
-
-Paired ratios below are medians of each round's F/C throughput ratio. The F and
-C writes/sec columns are marginal medians, so dividing them need not reproduce
-the paired-ratio median.
-
-Shared table, disjoint rowid ranges:
-
-| Threads | F writes/sec | C writes/sec | Paired F/C median (95% CI) | Median-CI verdict |
-|---:|---:|---:|---:|---|
-| 1 | `225 560` | `283 075` | `0.812x` (`0.796–0.918`) | Inconclusive inside C/C null envelope |
-| 2 | `165 483` | `287 230` | `0.567x` (`0.479–0.658`) | Inconclusive inside 2× C/C null radius |
-| 4 | `188 692` | `175 909` | `1.066x` (`0.878–1.272`) | Inconclusive |
-| 8 | `166 672` | `94 160` | **`1.869x`** (`1.799–1.992`) | **FrankenSQLite faster** |
-
-Separate table per writer:
-
-| Threads | F writes/sec | C writes/sec | Paired F/C median (95% CI) | Median-CI verdict |
-|---:|---:|---:|---:|---|
-| 1 | `207 567` | `244 237` | `0.810x` (`0.727–0.880`) | Inconclusive inside C/C null envelope |
-| 2 | `164 789` | `271 822` | **`0.553x`** (`0.489–0.708`) | **FrankenSQLite slower** |
-| 4 | `198 425` | `176 200` | `1.017x` (`0.794–1.154`) | Inconclusive |
-| 8 | `244 465` | `73 614` | **`2.966x`** (`2.626–3.289`) | **FrankenSQLite faster** |
-
-These rows supersede the uncited historical `40.99x` separate-table claim and
-the three-iteration `2.57x / 1.79x` shared-table claim. They are
-**exact-binary evidence, not an unrestricted claim about future `main`**:
-re-run after engine or harness changes, and do not turn an inconclusive raw
-ratio into a speed claim. The pass-over-pass history file is diagnostic only;
-the same-invocation median-CI contract is the decision gate.
-
-#### Mixed OLTP
-
-| Workload | C ms | F ms | F/C |
-|----------|-----:|-----:|----:|
-| 5 000 ops on a 5 000-row table, 80 % reads / 20 % writes | `167.26` | `48.28` | `0.289x` (≈ 3.46× faster) |
-
-#### Where the remaining gap lives
-
-The C-faster tail is concentrated in small writes, small large-row INSERTs, and
-the corrected prepared-DML DELETE rows. The old UPDATE/DELETE matrix timed table
-creation and population inside the sample even though the section describes a
-pre-populated table. A later correction moved reset work outside the timed
-interval, batched eligible same-leaf direct DELETEs, and compacted retained
-same-leaf DELETE runs once at flush. The current correction also avoids timing
-repeated uncached C SQLite prepares against FSQLite prepared-cache hits.
-
-With those benchmark semantics, the current full-quick artifact reports the
-worst row as `100 rows / delete 5 rows` at `3.319x` F/C, with
-`1000 rows / delete 50 rows` at `2.815x`, `10000 rows / delete 500 rows` at
-`1.847x`, and `100 rows / update 10 rows` at `2.112x`. The first three small-DML
-samples are noisy in quick mode (at least one engine exceeds 5 % CV); the
-10 000-row / 500-delete row is the stable tail at `1.48 %` C CV and `1.08 %`
-FrankenSQLite CV. Larger UPDATE rows remain faster than C SQLite in the same
-full-quick refresh. The remaining non-DML tail is close to parity: small
-100-row INSERT shapes and the low-thread file-backed concurrent row.
-
-The focused DML diagnostic predecessor is
-`tests/artifacts/perf/codex-dml-profile-after-active-probe-fix-20260517T1730Z/update-delete-profile.json`.
-That May 17, 2026 screen confirms the focused UPDATE rows are faster at medium
-and large sizes, while DELETE remains the write-single tail at `2.255x`,
-`1.941x`, and `1.755x` F/C for the 5-, 50-, and 500-row DELETE cases.
-Rejected predecessor attempts are recorded in
-`docs/progress/perf-negative-results.md`; the prepared-DML DELETE tail still
-needs a broader transaction-local DML mutation operator.
-
-### Memory Overhead
-
-MVCC adds memory overhead proportional to the number of concurrent active versions. With 10 active transactions each modifying 50 unique pages (4KB each), the additional memory is approximately `10 * 50 * 4KB = 2MB`. Garbage collection reclaims old versions within ~1 second of the last reader closing.
-
-### Scaling Expectations
-
-| Metric | Current measurement |
-|--------|---------------------|
-| Full-quick matrix headline | `78 / 2 / 13` faster/comparable/slower across 93 scenarios; geomean `0.31327x` F/C (`cod-fullquick-refresh-20260722T1800Z/full-quick.json`, July 22, 2026) |
-| Small-N write throughput (1 writer) | Corrected matrix shows the gap is dominated by prepared-DML DELETE rows; raw worst row `3.319x` F/C, stable 10 000-row / 500-delete row `1.847x` F/C |
-| Single-row INSERT throughput (8 writers, separate tables) | `mt-mvcc-bench --separate-tables`: paired median `2.966x` F/C, 95% CI `2.626–3.289`, at 1 000 rows/thread (2026-07-26 ledger entry) |
-| Single-row INSERT throughput (8 writers, shared table) | `mt-mvcc-bench`: paired median `1.869x` F/C, 95% CI `1.799–1.992`, at 1 000 rows/thread (2026-07-26 ledger entry) |
-| Point SELECT by rowid | `read_single` geomean `0.235x` F/C across 33 scenarios (≈ 4.26× faster) |
-| Aggregate / scan reads | `read_aggregate` geomean `0.099x` F/C across 25 scenarios (≈ 10.1× faster) |
-| Mixed OLTP (80 % reads / 20 % writes) | `0.289x` F/C on the 5 000-op / 5 000-row scenario (≈ 3.46× faster) |
-| WAL checkpoint latency | Slightly higher (must check active snapshots) |
-| Reader throughput under write load | The mixed 80/20 row above is faster overall; a p99-specific read-latency claim still needs a dedicated harness |
+`bd-dqdoe` tracks the same-source performance re-verification. A release may
+restore numeric claims here only after the repository contains an immutable
+artifact that records the exact source commit, binary hashes, build profile and
+flags, host state, commands, matched durability settings, A/A null envelope,
+and paired confidence intervals. The required matrix must cover the shipped
+profile as well as `release-perf`, and it must be rerun after the durability,
+async-actor, namespace-lifecycle, and registry changes settle.
 
 ---
 
@@ -1702,13 +1495,18 @@ The Native-mode commit protocol decouples **bulk durability** (payload bytes) fr
 - **FSYNC_1** prevents "committed marker, lost data" — the worst-case native mode failure where recovery finds a marker but cannot decode its capsule.
 - **FSYNC_2** prevents "client thinks committed, marker not persisted" — a silent transaction loss on crash.
 
-The two-fsync cost (~100-200 microseconds on NVMe) is amortized by batching multiple commits per WriteCoordinator iteration.
+Batching can amortize the two barriers across multiple commits. The shipped
+implementation must measure the resulting latency on the release matrix rather
+than assume an NVMe barrier cost.
 
 ---
 
 ## ECS Compaction (Design)
 
-Native Mode's append-only symbol logs (`ecs/symbols/*.log`) grow indefinitely. To reclaim storage, the system runs a **mark-and-compact** process that is cancel-safe, crash-safe, cross-process safe, and non-disruptive to p99 query latency.
+Native Mode's append-only symbol logs (`ecs/symbols/*.log`) grow indefinitely.
+The design reclaims storage with a **mark-and-compact** process intended to be
+cancel-safe, crash-safe, cross-process safe, and incrementally schedulable.
+Its query-latency impact is not yet quantified.
 
 **Compaction triggers:**
 - **Space amplification:** `total_log_size / live_data_size > 2.0` (configurable via PRAGMA).
@@ -1753,7 +1551,9 @@ FrankenSQLite extends MVCC coordination across OS processes via a shared-memory 
 └─────────────────────────────────────┘
 ```
 
-All fields use atomic operations. The fast in-process path is unchanged; the cross-process path adds ~100ns per lock operation via mmap-based atomics.
+All fields use atomic operations. The cross-process path adds shared-memory
+coordination; its current cost is intentionally left unquantified until the
+post-async release matrix is complete.
 
 ### Crash Cleanup
 
@@ -1788,7 +1588,10 @@ In Native mode, encryption applies before RaptorQ encoding (encrypt-then-code). 
 
 ## The Mathematics Behind FrankenSQLite
 
-Most database engines hand-wave their concurrency model and hope the tests catch regressions. FrankenSQLite is built on formal mathematics at every layer: the concurrency model has machine-checkable safety proofs, the storage layer has information-theoretic durability bounds, and the conflict model has closed-form probability estimates. This section walks through the core mathematical machinery, targeting engineers who want to understand *why* the system works, not just *that* it works.
+This section records mathematical models that guide the design. A model is not
+evidence that the implementation satisfies its assumptions: executable proofs,
+fault-injection tests, and citation-grade measurements remain separate release
+gates.
 
 ### Probabilistic Conflict Model (Birthday Paradox for Pages)
 
@@ -1813,19 +1616,19 @@ Any-conflict probability (N concurrent transactions):
     This is the birthday paradox with n = N*W "people" and P "days."
 ```
 
-**Intuition threshold:** Conflicts become likely when `N * W ≈ √P`. For a 1 GB database with 4 KB pages (P = 262,144 pages), 8 writers each touching 50 pages: `8 * 50 = 400`, while `√262144 ≈ 512`. You're close to the threshold but still under it — expect occasional conflicts, not constant ones.
+**Uniform-model threshold:** Under the assumptions above, overlap becomes
+likely when `N * W ≈ √P`. Real B-tree workloads are not uniform, so this
+threshold is illustrative rather than a prediction of production conflict
+rates.
 
 **Worked example:**
 
 ```
+Hypothetical uniform workload with
 P = 100,000 pages, W = 50 pages/txn, N = 8 writers:
 
     Pairwise:  P(conflict) ≈ 1 - e^(-2500/100000) ≈ 0.025  (2.5%)
     Per-txn:   P(any conflict for one txn) ≈ 1 - (1-0.025)^7 ≈ 0.16  (16%)
-    With safe merge ladder resolving f_merge=0.40 of detected conflicts (empirical): effective P_abort ≈ 0.10
-    After one retry (geometric): P_abort ≈ 0.01
-
-    TPS ≈ N × (1 - P_abort) / T_txn ≈ 8 × 0.99 / T_txn
 ```
 
 Real workloads aren't uniform — they follow **Zipf distributions** where a few hot pages absorb most writes:
@@ -1835,15 +1638,19 @@ Zipf access probability for page ranked k:
     p(k) = (1/k^s) / H(P, s)
 
     where H(P, s) = Σ_{i=1}^{P} 1/i^s   (generalized harmonic number)
-          s ≈ 0.8-1.2 for typical database workloads
+          s is a workload parameter that must be fitted from traces
 
 Conflict probability under Zipf:
     P(conflict, Zipf) ≈ 1 - Π_k (1 - p(k))^{n_k}
 ```
 
-Zipf concentrates conflicts on hot pages (the top 1% of pages absorb 20-40% of writes for s ≈ 1.0). This is exactly where safe write merging pays off most when intents commute (e.g., distinct-key inserts landing on the same hot leaf).
+Compared with a uniform model, a fitted Zipf distribution concentrates
+conflicts on hot pages. Safe write merging can help when intents on such a page
+commute, but the benefit is workload-specific.
 
-**Result:** At typical database sizes and concurrency levels, page-level MVCC delivers near-linear scaling. The birthday paradox model lets you predict your conflict rate from three numbers: page count, write set size, and writer count.
+**Result:** The birthday-paradox model is a first-order hypothesis generator
+from page count, write-set size, and writer count. It does not establish
+near-linear scaling; the benchmark matrix must do that.
 
 ### GF(256) Arithmetic: The Algebra of Erasure Coding
 
@@ -1897,13 +1704,20 @@ Usage (single table lookup, O(1)):
     fn mul(a: u8, b: u8) -> u8 { MUL_TABLES[a as usize][b as usize] }
 ```
 
-The critical hot-path operation is **symbol multiply-and-add** (fused `dst[i] ^= MUL[c][src[i]]`), which runs in the inner loop of every RaptorQ decode. For a 4 KB symbol (one database page), this is 4,096 table lookups and XOR operations — about 500 nanoseconds on modern hardware.
+The critical hot-path operation is **symbol multiply-and-add** (fused
+`dst[i] ^= MUL[c][src[i]]`), which runs in the inner loop of every RaptorQ
+decode. For a 4 KiB symbol this performs 4,096 table lookups and XOR
+operations; its latency depends on the implementation, compiler, and host and
+is therefore left to the benchmark matrix.
 
 **Why GF(256)?** Byte-aligned arithmetic means no bit-packing overhead. The 64 KB multiplication table fits in L1 cache. Field operations are branchless (important for constant-time security properties). And 256 elements provide enough algebraic structure for the RaptorQ constraint system while keeping everything byte-addressable.
 
 ### Fountain Codes: Information-Theoretic Durability Bounds
 
-Traditional redundancy (RAID, triple replication) wastes bandwidth and provides fixed fault tolerance. FrankenSQLite uses **RaptorQ fountain codes** (RFC 6330), which are *rateless* — you can generate an unlimited stream of encoding symbols from any source data, and a receiver can reconstruct the original from *any* sufficient subset.
+Traditional redundancy (RAID, triple replication) provides fixed fault
+tolerance. The native-mode design uses **RaptorQ fountain codes**
+([RFC 6330](https://www.rfc-editor.org/rfc/rfc6330.html)), which can generate
+additional repair symbols from a source block.
 
 ```
 Source data: K symbols (each symbol = one database page, typically 4096 bytes)
@@ -1913,29 +1727,23 @@ Encoding:
     Repair symbols:  generated on demand, unlimited quantity
     Each repair symbol = GF(256) linear combination of intermediate symbols
 
-Decoding (the key guarantee):
-    With exactly K received symbols:     ~99% success rate
-    With K+1 received symbols:           failure < 10⁻⁵
-    With K+2 received symbols:           failure < 10⁻⁷
+Decoding probability from RFC 6330, stated in terms of the extended source
+block size K':
+    With K' received symbols:            failure is about 1%
+    With K'+1 received symbols:          failure is at most 10⁻⁴
+    With K'+2 received symbols:          failure is at most 10⁻⁶
 
-V1 default policy: store enough symbols that the decoder can always collect K+2.
+These are code-level decoder probabilities, not an end-to-end database
+durability claim. Storage-loss correlation, metadata, implementation defects,
+and the symbol-selection policy require separate analysis.
 ```
 
 **Intuition:** Think of it as a mathematical hologram. Every repair symbol encodes information about *all* source symbols. Lose any subset of symbols and the remaining ones contain enough information to reconstruct the whole. This is fundamentally different from replication, where losing the one copy of page 47 means page 47 is gone.
 
-**Durability bound:**
-
-```
-For K source symbols with R = 0.2K repair symbols (20% overhead),
-and independent per-symbol corruption probability p = 10⁻⁴:
-
-    P(data loss) ≤ Σ_{i=R+1}^{K+R} C(K+R, i) × p^i × (1-p)^{K+R-i}
-
-    For V1 defaults: P(data loss) ≤ 10^{-5K}
-
-    Example: 1000-page database → P(loss) ≤ 10⁻⁵⁰⁰⁰
-    That's not "five nines" — that's five thousand nines.
-```
+An end-to-end durability bound would additionally need a validated failure
+model, correlation assumptions, object-size policy, symbol placement and
+retention rules, and evidence that the shipped implementation matches that
+model. FrankenSQLite does not currently publish such a numeric bound.
 
 **How encoding works (simplified):**
 
@@ -1970,23 +1778,31 @@ Phase 2 — Gaussian elimination on the "inactive" subsystem:
     Cost: O(I² × T) for symbol operations, negligible since I < 50 for K' < 10,000.
 ```
 
-**Bandwidth savings for replication:**
+**Illustrative multicast bandwidth model:**
 
 ```
-Traditional TCP replication (per receiver):
+Independent unicast replication:
     Total sender bandwidth: O(N × K / (1-p))     where N = receivers, p = loss rate
 
 Fountain-coded multicast:
     Sender emits: K × 1.02 / (1-p) symbols       (2% overhead, independent of N)
-    Savings: factor of N
+    This assumes one multicast symbol reaches all receivers and independent
+    loss with the same rate at every receiver.
 
 Example: K=1000 pages, p=5% loss, N=10 replicas
-    TCP:     ~11,579 transmissions
+    Unicast: ~10,526 transmissions
     Fountain: ~1,074 transmissions
-    Savings: 10.8×
+    Ratio:   ~9.8× under those assumptions
 ```
 
-**Result:** RaptorQ gives FrankenSQLite durability guarantees that are mathematically provable, not just empirically tested. The 20% storage overhead buys durability measured in thousands of nines.
+This arithmetic is not a measured FrankenSQLite replication result and does
+not account for correlated loss, feedback, headers, metadata, retransmission
+policy, or implementation overhead.
+
+**Result:** RaptorQ supplies a standards-defined erasure-code building block.
+The repository treats database-level durability as a property to prove and
+test across the complete storage protocol, not as a probability inferred from
+the decoder alone.
 
 ### Safe Write Merge Ladder (Intent + Structured Patches)
 
@@ -2020,24 +1836,22 @@ SQLite structured pages.
 
 ### Three-Tier Checksum Architecture
 
-Not all checksums are created equal. FrankenSQLite uses three hash algorithms, each chosen for a specific point in the speed/security tradeoff:
+Not all checksums are created equal. The design assigns algorithms by integrity
+and trust requirement; throughput is deliberately left to release artifacts.
 
 ```
 Tier 1 — Hot-path integrity (every page access):
     Algorithm:  XXH3-128
-    Speed:      ~50 GB/s on x86-64 with AVX2  (~80 ns per 4 KB page)
     Collision:  2⁻¹²⁸ ≈ 3 × 10⁻³⁹
     Where:      Buffer pool, MVCC version chain, cache reads, WAL frame verification
 
 Tier 2 — Content identity (object addressing):
     Algorithm:  BLAKE3 (truncated to 128 bits)
-    Speed:      ~5 GB/s
     Collision:  Cryptographic (2⁻¹²⁸ practical security)
     Where:      ObjectId derivation, CommitCapsule identity, ECS object naming
 
 Tier 3 — Cryptographic authentication (trust boundaries):
     Algorithm:  asupersync::security::SecurityContext (key-dependent)
-    Speed:      Key-dependent, hardware-accelerated
     Where:      Replication transport, authenticated symbols, cross-node verification
 ```
 
@@ -2296,7 +2110,9 @@ Proof sketch:
     All operations bounded ⟹ total work bounded ⟹ terminates.  QED ∎
 ```
 
-**Result:** These proofs aren't academic exercises — they're the foundation for FrankenSQLite's claim that MVCC concurrency is correct by construction. Each proof is verified empirically via proptest and DPOR trace exploration, but the formal argument means you don't have to trust the tests alone.
+**Result:** These arguments define obligations for the implementation. Property
+tests and deterministic concurrency exploration provide evidence for selected
+state spaces, but they are not a machine-checked proof of the complete engine.
 
 ### SSI: The Cahill/Fekete Rule at Page Granularity
 
@@ -2354,7 +2170,10 @@ On commit: scan SireadTable for pages in write_set
 Downgrade: PRAGMA fsqlite.serializable = OFF  → skip SSI checks, use plain SI
 ```
 
-**Result:** SSI makes `BEGIN CONCURRENT` truly serializable — not "serializable because we serialize," but "serializable because the Cahill/Fekete rule mathematically prevents all anomalies." The overhead is a hash table lookup per page read and a scan at commit — less than 7% throughput cost for anomaly-free concurrency.
+**Result:** Page-SSI is the mechanism by which `BEGIN CONCURRENT` targets
+serializable behavior without serializing every writer. Its correctness and
+performance are release gates; PostgreSQL measurements are prior art, not a
+numeric claim about this implementation.
 
 ### Sheaf-Theoretic Consistency Checking
 
@@ -2419,7 +2238,10 @@ Encoding scheme (1-9 bytes):
     The 9th byte (if reached) uses all 8 bits for data.
 ```
 
-**Why this matters for databases:** Rowids cluster near small values (most tables have fewer than 2 billion rows). Serial type codes are always small (0-13 for fixed types). Header sizes rarely exceed 127 bytes. The varint encoding means these common values consume just 1 byte instead of 8, compressing the record format by 30-50% compared to fixed-width integers.
+**Why this matters for databases:** Small rowids, serial type codes, and record
+headers use fewer bytes than a fixed-width integer representation. The actual
+space reduction depends on the data distribution and is not claimed here as a
+universal percentage.
 
 **Decode performance:** A varint decode is a tight loop with one branch per byte. For 1-byte varints (the common case), it's a single comparison and mask. The branch predictor handles this well because the common case (1-2 bytes) dominates.
 
@@ -2499,7 +2321,9 @@ RAISE functions (trigger-specific error control):
 Execution model:
     Triggers compile to VDBE subroutines.
     Trigger body is a sequence of DML statements, each compiled independently.
-    Maximum trigger recursion depth: 1000 (SQLITE_MAX_TRIGGER_DEPTH).
+    Current generated trigger/FK action depth bound: 8.
+    SQLite's default depth of 1000 remains a compatibility target gated on
+    exact bounded-stack proof.
     Recursive triggers require PRAGMA recursive_triggers = ON.
 ```
 
@@ -2829,7 +2653,7 @@ A: The current runtime uses epoch-based reclamation rather than a periodic sweep
 A: A reader that holds a snapshot open for a long time pins all page versions newer than its snapshot, preventing GC from reclaiming them. This is the same tradeoff PostgreSQL makes. In practice, connection timeouts and application-level query deadlines prevent runaway memory growth.
 
 **Q: What is SSI and why does it matter?**
-A: Serializable Snapshot Isolation detects write skew -- a class of anomaly where two transactions each read data the other writes, producing a result impossible under serial execution. Plain Snapshot Isolation misses this. FrankenSQLite applies the conservative Cahill/Fekete rule at page granularity: if a committed transaction has both an incoming and outgoing rw-antidependency edge, it is aborted. PostgreSQL has shipped SSI since 2011 with less than 7% throughput overhead. You can downgrade to plain SI with `PRAGMA fsqlite.serializable = OFF`.
+A: Serializable Snapshot Isolation detects write skew -- a class of anomaly where two transactions each read data the other writes, producing a result impossible under serial execution. Plain Snapshot Isolation misses this. FrankenSQLite applies the conservative Cahill/Fekete rule at page granularity: a transaction that would become a dangerous rw-antidependency pivot is aborted. PostgreSQL's SSI work is prior art, but its measured overhead is not evidence for FrankenSQLite; this implementation's cost is covered by the release matrix. You can downgrade to plain SI with `PRAGMA fsqlite.serializable = OFF`.
 
 **Q: What does RaptorQ actually buy me in practice?**
 A: Three things. (1) Self-healing after torn writes: WAL frames carry repair symbols, so partial writes during a crash are recoverable without double-write journaling. (2) Bandwidth-optimal replication: fountain coding means a receiver can reconstruct data from any sufficient subset of encoding symbols, regardless of which symbols arrive. (3) Version chain compression: older page versions are stored as RaptorQ-encoded deltas rather than full copies.
