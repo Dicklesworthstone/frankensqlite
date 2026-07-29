@@ -155,7 +155,8 @@ pub fn pager_commit_profile_snapshot() -> PagerCommitProfileSnapshot {
 }
 
 #[inline]
-fn pager_commit_profile_enabled() -> bool {
+#[must_use]
+pub fn pager_commit_profile_enabled() -> bool {
     PAGER_COMMIT_PROFILE_ENABLED.load(AtomicOrdering::Relaxed)
 }
 

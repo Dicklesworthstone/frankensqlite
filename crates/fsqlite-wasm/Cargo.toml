@@ -14,7 +14,11 @@ categories.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
+# Browser consumers get one canonical asupersync runtime profile by default.
+# Development harnesses that need `wasm-browser-dev` disable this default and
+# select that profile on their own direct asupersync dependency.
+default = ["wasm-runtime-minimal"]
+wasm-runtime-minimal = ["asupersync/wasm-browser-minimal"]
 api-extras = []
 backup = []
 batch-execution = []
@@ -60,11 +64,14 @@ fsqlite-core = { version = "0.1.19", path = "../fsqlite-core", default-features 
 fsqlite-core = { version = "0.1.19", path = "../fsqlite-core", default-features = false, features = ["native"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+asupersync = { workspace = true }
 fsqlite-core = { version = "0.1.19", path = "../fsqlite-core", default-features = false, features = ["wasm"] }
 tracing = { workspace = true, optional = true, features = ["release_max_level_error"] }
 tracing-wasm = { version = "0.2", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+fsqlite-btree = { version = "0.1.19", path = "../fsqlite-btree", default-features = false, features = ["wasm"] }
+fsqlite-vdbe = { version = "0.1.19", path = "../fsqlite-vdbe", default-features = false, features = ["wasm"] }
 getrandom = { version = "0.4.3", features = ["wasm_js"] }
 wasm-bindgen-test = "0.3.75"
 

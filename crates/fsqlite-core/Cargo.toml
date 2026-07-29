@@ -82,6 +82,10 @@ foldhash = "0.2.0"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 asupersync = { workspace = true }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The final browser package owns canonical asupersync profile selection.
+asupersync = { workspace = true }
+
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }

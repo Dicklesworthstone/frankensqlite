@@ -58,9 +58,10 @@ pub use pager::{
     ConnectionPagerOpenMode, PAGER_METADATA_PUBLICATION_CONTRACTS, PagerCommitProfileSnapshot,
     PagerMetadataPublicationClass, PagerMetadataPublicationContract, PagerPublishedSnapshot,
     ParallelWalPublicationIntent, SimplePager, SimplePagerCheckpointWriter, SimpleTransaction,
-    WalCommitSyncPolicy, pager_commit_profile_snapshot, remove_group_commit_queue,
-    reset_pager_commit_profile, reset_staged_page_overwrite_steals_total,
-    set_pager_commit_profile_enabled, staged_page_overwrite_steals_total,
+    WalCommitSyncPolicy, pager_commit_profile_enabled, pager_commit_profile_snapshot,
+    remove_group_commit_queue, reset_pager_commit_profile,
+    reset_staged_page_overwrite_steals_total, set_pager_commit_profile_enabled,
+    staged_page_overwrite_steals_total,
 };
 pub use s3_fifo::{
     QueueKind, QueueLocation, RolloutDecision, RolloutMetrics, RolloutPolicy, S3Fifo, S3FifoConfig,

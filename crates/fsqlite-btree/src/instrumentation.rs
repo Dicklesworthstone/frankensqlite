@@ -1021,6 +1021,13 @@ pub(crate) fn copy_profile_enabled() -> bool {
     BTREE_COPY_PROFILE_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Read the B-tree copy-profile instrumentation gate.
+#[inline]
+#[must_use]
+pub fn btree_copy_profile_enabled() -> bool {
+    copy_profile_enabled()
+}
+
 /// Start a profiling timer for a hot-path segment.
 ///
 /// Returns `Some(Instant::now())` only when the copy profile gate is enabled;

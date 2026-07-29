@@ -32,6 +32,14 @@ Environment:
                           default: 0
   FSQLITE_WASM_FEATURES   comma-separated cargo features to enable
                           default: empty
+  FSQLITE_WASM_EXPECT_ACTIVE_FEATURES
+                          comma-separated exact active feature set required by
+                          this build; mismatches fail before wasm-pack
+                          default: empty (no exact-set assertion)
+  FSQLITE_WASM_PREBUILT_ACTIVE_FEATURES
+                          comma-separated feature provenance for package-only
+                          mode; required when an exact-set assertion is active
+                          default: empty (feature provenance unknown)
   FSQLITE_WASM_TWIGGY     twiggy size report mode: auto | required | disabled
                           default: auto
   FSQLITE_WASM_WASM_OPT   wasm-opt mode: auto | required | disabled
@@ -74,13 +82,33 @@ json_number_or_null() {
     fi
 }
 
+canonicalize_feature_csv() {
+    local value="$1"
+
+    if [[ -z "${value}" ]]; then
+        return
+    fi
+    if [[ ! "${value}" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]]; then
+        echo "Feature lists must be comma-separated Cargo feature names: ${value}" >&2
+        exit 1
+    fi
+
+    printf '%s\n' "${value}" \
+        | tr ',' '\n' \
+        | LC_ALL=C sort -u \
+        | paste -sd, -
+}
+
 wasm_opt_kept=""
 wasm_opt_original_gzip_bytes=""
 wasm_opt_optimized_gzip_bytes=""
+wasm_opt_unselected_artifact=""
 
 select_wasm_opt_output() {
     local original_path="$1"
     local optimized_path="$2"
+    local candidate_dir="${out_dir}-wasm-opt-candidates"
+    local preserved_path=""
 
     wasm_opt_original_gzip_bytes="$(gzip_size_bytes "${original_path}")"
     wasm_opt_optimized_gzip_bytes="$(gzip_size_bytes "${optimized_path}")"
@@ -93,13 +121,26 @@ select_wasm_opt_output() {
         exit 1
     fi
 
+    mkdir -p "${candidate_dir}"
     if (( wasm_opt_optimized_gzip_bytes <= wasm_opt_original_gzip_bytes )); then
+        preserved_path="${candidate_dir}/$(basename "${original_path}").unoptimized"
+        if [[ -e "${preserved_path}" ]]; then
+            echo "Refusing to overwrite preserved wasm-opt candidate: ${preserved_path}" >&2
+            exit 1
+        fi
+        mv "${original_path}" "${preserved_path}"
         mv "${optimized_path}" "${original_path}"
         wasm_opt_kept="optimized"
     else
-        rm -f -- "${optimized_path}"
+        preserved_path="${candidate_dir}/$(basename "${optimized_path}").rejected"
+        if [[ -e "${preserved_path}" ]]; then
+            echo "Refusing to overwrite preserved wasm-opt candidate: ${preserved_path}" >&2
+            exit 1
+        fi
+        mv "${optimized_path}" "${preserved_path}"
         wasm_opt_kept="original"
     fi
+    wasm_opt_unselected_artifact="../$(basename "${candidate_dir}")/$(basename "${preserved_path}")"
 }
 
 normalize_package_json() {
@@ -110,6 +151,10 @@ normalize_package_json() {
         --arg main "${out_name}.js" \
         --arg types "${out_name}.d.ts" \
         --arg wasm "${out_name}_bg.wasm" \
+        --arg activeFeatures "${active_features}" \
+        --arg expectedActiveFeatures "${expected_active_features}" \
+        --argjson activeFeaturesKnown "${active_features_known_json}" \
+        --argjson defaultFeaturesEnabled "${default_features_enabled_json}" \
         '
         .name = $name |
         .version = (.version // $version) |
@@ -140,7 +185,23 @@ normalize_package_json() {
           "type": "git",
           "url": "https://github.com/Dicklesworthstone/frankensqlite"
         } |
-        .publishConfig = { "access": "public" }
+        .publishConfig = { "access": "public" } |
+        .frankensqlite = {
+          cargoPackage: "fsqlite-wasm",
+          cargoFeatures: (
+            if $activeFeaturesKnown
+            then ($activeFeatures | split(",") | map(select(length > 0)))
+            else null
+            end
+          ),
+          defaultFeaturesEnabled: $defaultFeaturesEnabled,
+          expectedCargoFeatures: (
+            if $expectedActiveFeatures == ""
+            then null
+            else ($expectedActiveFeatures | split(","))
+            end
+          )
+        }
         ' "$@"
 }
 
@@ -170,10 +231,15 @@ write_size_report() {
         --arg profile "${profile}" \
         --arg wasmOptMode "${wasm_opt_mode}" \
         --arg wasmOptKept "${wasm_opt_kept}" \
+        --arg wasmOptUnselectedArtifact "${wasm_opt_unselected_artifact}" \
         --arg packedArchive "${packed_file_arg}" \
         --arg twiggyReport "${twiggy_report}" \
+        --arg activeFeatures "${active_features}" \
+        --arg expectedActiveFeatures "${expected_active_features}" \
         --argjson packageOnly "${package_only_json}" \
         --argjson stripLocationDetail "${strip_location_detail_json}" \
+        --argjson activeFeaturesKnown "${active_features_known_json}" \
+        --argjson defaultFeaturesEnabled "${default_features_enabled_json}" \
         --argjson wasmBytes "$(json_number_or_null "${wasm_bytes}")" \
         --argjson wasmGzipBytes "$(json_number_or_null "${gzip_bytes}")" \
         --argjson maxGzipBytes "${max_gzip_bytes}" \
@@ -188,9 +254,36 @@ write_size_report() {
           buildTarget: $buildTarget,
           profile: $profile,
           stripLocationDetail: $stripLocationDetail,
+          cargoFeatures: (
+            if $activeFeaturesKnown
+            then ($activeFeatures | split(",") | map(select(length > 0)))
+            else null
+            end
+          ),
+          defaultFeaturesEnabled: $defaultFeaturesEnabled,
+          expectedCargoFeatures: (
+            if $expectedActiveFeatures == ""
+            then null
+            else ($expectedActiveFeatures | split(","))
+            end
+          ),
+          featureContractPass: (
+            if $expectedActiveFeatures == ""
+            then null
+            elif $activeFeaturesKnown
+            then $activeFeatures == $expectedActiveFeatures
+            else false
+            end
+          ),
           wasmOpt: {
             mode: $wasmOptMode,
             kept: (if $wasmOptKept == "" then null else $wasmOptKept end),
+            unselectedArtifact: (
+              if $wasmOptUnselectedArtifact == ""
+              then null
+              else $wasmOptUnselectedArtifact
+              end
+            ),
             originalGzipBytes: $wasmOptOriginalGzipBytes,
             optimizedGzipBytes: $wasmOptOptimizedGzipBytes
           },
@@ -246,6 +339,8 @@ package_only="${FSQLITE_WASM_PACKAGE_ONLY:-0}"
 forbid_local_build="${FSQLITE_WASM_FORBID_LOCAL_BUILD:-0}"
 no_default_features="${FSQLITE_WASM_NO_DEFAULT_FEATURES:-0}"
 features="${FSQLITE_WASM_FEATURES:-}"
+expected_active_features_input="${FSQLITE_WASM_EXPECT_ACTIVE_FEATURES:-}"
+prebuilt_active_features_input="${FSQLITE_WASM_PREBUILT_ACTIVE_FEATURES:-}"
 twiggy_mode="${FSQLITE_WASM_TWIGGY:-auto}"
 if [[ -n "${FSQLITE_WASM_WASM_OPT:-}" ]]; then
     wasm_opt_mode="${FSQLITE_WASM_WASM_OPT}"
@@ -348,6 +443,54 @@ case "${strip_location_detail}" in
         ;;
 esac
 
+requested_features="$(canonicalize_feature_csv "${features}")"
+expected_active_features="$(canonicalize_feature_csv "${expected_active_features_input}")"
+prebuilt_active_features="$(canonicalize_feature_csv "${prebuilt_active_features_input}")"
+active_features=""
+active_features_known_json="true"
+default_features_enabled_json="false"
+
+if [[ "${package_only}" == "1" ]]; then
+    if [[ -n "${prebuilt_active_features}" ]]; then
+        active_features="${prebuilt_active_features}"
+        active_features_known_json="true"
+        default_features_enabled_json="null"
+    else
+        active_features_known_json="false"
+        default_features_enabled_json="null"
+    fi
+elif [[ -n "${prebuilt_active_features_input}" ]]; then
+    echo "FSQLITE_WASM_PREBUILT_ACTIVE_FEATURES is valid only with FSQLITE_WASM_PACKAGE_ONLY=1." >&2
+    exit 1
+else
+    active_features="${requested_features}"
+    if [[ "${no_default_features}" == "0" ]]; then
+        if ! grep -Fqx 'default = ["wasm-runtime-minimal"]' "${crate_dir}/Cargo.toml"; then
+            echo "The package helper expects fsqlite-wasm's exact default feature contract to remain [\"wasm-runtime-minimal\"]." >&2
+            exit 1
+        fi
+        active_features="$(
+            canonicalize_feature_csv \
+                "wasm-runtime-minimal${requested_features:+,${requested_features}}"
+        )"
+        default_features_enabled_json="true"
+    fi
+fi
+
+if [[ -n "${expected_active_features}" ]]; then
+    if [[ "${active_features_known_json}" != "true" ]]; then
+        echo "Cannot enforce FSQLITE_WASM_EXPECT_ACTIVE_FEATURES without known prebuilt feature provenance." >&2
+        echo "Set FSQLITE_WASM_PREBUILT_ACTIVE_FEATURES for package-only mode." >&2
+        exit 1
+    fi
+    if [[ "${active_features}" != "${expected_active_features}" ]]; then
+        echo "WASM feature contract mismatch." >&2
+        echo "  expected: ${expected_active_features}" >&2
+        echo "  active:   ${active_features}" >&2
+        exit 1
+    fi
+fi
+
 if [[ "${package_only}" == "1" ]]; then
     if [[ -n "${FSQLITE_WASM_TARGET+x}" ]]; then
         echo "FSQLITE_WASM_PACKAGE_ONLY=1 cannot apply FSQLITE_WASM_TARGET=${FSQLITE_WASM_TARGET}." >&2
@@ -386,6 +529,15 @@ if [[ "${package_only}" == "1" ]]; then
     fi
 fi
 
+if [[ "${active_features_known_json}" == "true" ]]; then
+    echo "Active fsqlite-wasm Cargo features: ${active_features:-<none>}"
+else
+    echo "Active fsqlite-wasm Cargo features: unknown (package-only mode)" >&2
+fi
+if [[ -n "${expected_active_features}" ]]; then
+    echo "Exact fsqlite-wasm feature contract satisfied: ${expected_active_features}"
+fi
+
 if [[ "${package_only}" == "0" ]]; then
     if [[ "${forbid_local_build}" == "1" ]]; then
         echo "FSQLITE_WASM_FORBID_LOCAL_BUILD=1 refuses to run wasm-pack locally." >&2
@@ -413,6 +565,10 @@ if [[ "${package_only}" == "1" ]]; then
     fi
     echo "FSQLITE_WASM_PACKAGE_ONLY=1: skipping wasm-pack build and postprocessing ${out_dir}"
 else
+    if [[ -e "${out_dir}" ]]; then
+        echo "Refusing to overwrite an existing wasm package output directory: ${out_dir}" >&2
+        exit 1
+    fi
     mkdir -p "${out_dir}"
     out_dir_rel="$(realpath -m --relative-to "${crate_dir}" "${out_dir}")"
 
@@ -443,7 +599,14 @@ fi
 
 tmp_json="$(mktemp)"
 if [[ -f "${out_dir}/package.json" ]]; then
-    package_json_source="${out_dir}/package.json"
+    package_json_provenance_dir="${out_dir}-build-provenance"
+    package_json_source="${package_json_provenance_dir}/wasm-pack-package.json"
+    if [[ -e "${package_json_source}" ]]; then
+        echo "Refusing to overwrite wasm-pack package metadata provenance: ${package_json_source}" >&2
+        exit 1
+    fi
+    mkdir -p "${package_json_provenance_dir}"
+    mv "${out_dir}/package.json" "${package_json_source}"
 else
     package_json_source="/dev/stdin"
 fi
@@ -485,6 +648,14 @@ case "${wasm_opt_mode}" in
 esac
 
 gzip_path="${wasm_path}.gz"
+if [[ -e "${gzip_path}" ]]; then
+    echo "Refusing to overwrite existing gzip artifact: ${gzip_path}" >&2
+    exit 1
+fi
+if [[ -e "${size_report_path}" ]]; then
+    echo "Refusing to overwrite existing size report: ${size_report_path}" >&2
+    exit 1
+fi
 wasm_bytes="$(wc -c < "${wasm_path}" | tr -d '[:space:]')"
 if [[ ! "${wasm_bytes}" =~ ^[0-9]+$ ]]; then
     echo "Unable to determine wasm size for ${wasm_path}" >&2
@@ -503,6 +674,11 @@ write_twiggy_report
 if [[ "${max_gzip_bytes}" != "0" ]] && (( gzip_bytes > max_gzip_bytes )); then
     write_size_report
     echo "Gzipped wasm artifact exceeds size budget: ${gzip_bytes} > ${max_gzip_bytes} bytes" >&2
+    exit 1
+fi
+
+if find "${out_dir}" -maxdepth 1 -type f -name '*.tgz' -print -quit | grep -q .; then
+    echo "Refusing to overwrite an existing npm package archive in ${out_dir}" >&2
     exit 1
 fi
 

@@ -41,10 +41,14 @@ hashbrown.workspace = true
 dashmap.workspace = true
 tracing.workspace = true
 blake3 = { workspace = true }
-asupersync.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+asupersync.workspace = true
 parking_lot = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The final browser package owns canonical asupersync profile selection.
+asupersync.workspace = true
 
 [dev-dependencies]
 # The storage stack is `async`, so inline tests must drive a runtime via
