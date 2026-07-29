@@ -1302,18 +1302,33 @@ impl Parser {
         let unique = self.eat_kw(&TokenKind::KwUnique);
 
         if self.eat_kw(&TokenKind::KwTable) {
+            if unique {
+                return Err(self.err_expected("INDEX after UNIQUE"));
+            }
             return self.parse_create_table(temporary);
         }
         if self.eat_kw(&TokenKind::KwIndex) {
+            if temporary {
+                return Err(self.err_expected("TABLE, VIEW, or TRIGGER after TEMP"));
+            }
             return self.parse_create_index(unique);
         }
         if self.eat_kw(&TokenKind::KwView) {
+            if unique {
+                return Err(self.err_expected("INDEX after UNIQUE"));
+            }
             return self.parse_create_view(temporary);
         }
         if self.eat_kw(&TokenKind::KwTrigger) {
+            if unique {
+                return Err(self.err_expected("INDEX after UNIQUE"));
+            }
             return self.parse_create_trigger(temporary);
         }
         if self.eat_kw(&TokenKind::KwVirtual) {
+            if temporary || unique {
+                return Err(self.err_expected("TABLE, INDEX, VIEW, or TRIGGER"));
+            }
             self.expect_kw(&TokenKind::KwTable)?;
             return self.parse_create_virtual_table();
         }
@@ -5403,6 +5418,32 @@ mod tests {
         } else {
             unreachable!("expected CreateTable");
         }
+    }
+
+    #[test]
+    fn test_create_rejects_modifiers_for_incompatible_object_kinds() {
+        for sql in [
+            "CREATE UNIQUE TABLE t(value INTEGER)",
+            "CREATE UNIQUE VIEW v AS SELECT 1",
+            "CREATE UNIQUE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
+            "CREATE UNIQUE VIRTUAL TABLE vt USING fts5(content)",
+            "CREATE TEMP INDEX i ON t(value)",
+            "CREATE TEMP VIRTUAL TABLE vt USING fts5(content)",
+        ] {
+            Parser::from_sql(sql)
+                .parse_statement()
+                .expect_err("CREATE modifiers must not be discarded for incompatible objects");
+        }
+    }
+
+    #[test]
+    fn test_invalid_create_modifier_recovers_next_statement() {
+        let (statements, errors) =
+            Parser::from_sql("CREATE UNIQUE TABLE t(value INTEGER); SELECT 42;").parse_all();
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(statements.len(), 1);
+        assert!(matches!(statements[0], Statement::Select(_)));
     }
 
     #[test]
