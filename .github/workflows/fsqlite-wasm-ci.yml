@@ -72,23 +72,26 @@ jobs:
           set -euo pipefail
           cargo install twiggy --locked
 
-      - name: Run host tests
+      - name: Run default and all-feature host tests
         shell: bash
         run: |
           set -euo pipefail
           cargo test -p fsqlite-wasm --locked -- --nocapture
+          cargo test -p fsqlite-wasm --locked --all-features -- --nocapture
 
-      - name: Run browser tests
+      - name: Run default and all-feature browser tests
         shell: bash
         run: |
           set -euo pipefail
-          wasm-pack test --headless --chrome crates/fsqlite-wasm
+          wasm-pack test --headless --chrome crates/fsqlite-wasm --locked
+          wasm-pack test --headless --chrome crates/fsqlite-wasm --locked --all-features
 
-      - name: Verify wasm32 build
+      - name: Verify default and all-feature wasm32 builds
         shell: bash
         run: |
           set -euo pipefail
           cargo build -p fsqlite-wasm --locked --target wasm32-unknown-unknown --release
+          cargo build -p fsqlite-wasm --locked --target wasm32-unknown-unknown --release --all-features
 
       - name: Build and pack npm artifact
         shell: bash
