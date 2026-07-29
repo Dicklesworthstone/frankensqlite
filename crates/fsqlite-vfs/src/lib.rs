@@ -1,3 +1,5 @@
+#![cfg_attr(windows, feature(windows_by_handle))]
+
 pub mod memory;
 pub mod metrics;
 #[cfg(all(feature = "native", any(unix, windows)))]
@@ -227,7 +229,9 @@ pub use memory::{MemoryFile, MemoryVfs, MemoryVfsConfig, MemoryVfsUsageSnapshot}
 pub use metrics::{GLOBAL_VFS_METRICS, TracingFile, VfsMetrics};
 #[cfg(all(feature = "native", any(unix, windows)))]
 pub use namespace::{
-    DatabaseNamespaceBinding, NamespaceOpenIntent, PendingNamespaceOpen, WindowsLockSidecarPolicy,
+    DatabaseNamespaceBinding, DatabaseNamespaceGenerationTransition,
+    NamespaceGenerationTransitionOutcome, NamespaceOpenIntent, PendingNamespaceOpen,
+    WindowsLockSidecarPolicy, begin_database_namespace_generation_transition,
     cleanup_abandoned_private_database, validate_reserved_database_artifacts,
 };
 pub use shm::ShmRegion;
