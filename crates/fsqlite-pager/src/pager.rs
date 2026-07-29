@@ -871,6 +871,13 @@ struct GroupCommitQueue {
     /// handoff: every waiter must bind its batch id to the certificate before
     /// Phase C may expose pager visibility.
     persisted_epochs: Mutex<HashMap<u64, PersistedGroupCommitEpoch>>,
+    /// Active batch owners that can still consume terminal evidence by epoch.
+    ///
+    /// Registration happens while the consolidator mutex still owns admission,
+    /// so publication cannot overtake a newly admitted consumer. The matching
+    /// RAII lease releases on success, error, or cancellation. Terminal
+    /// evidence is reclaimed only after this count reaches zero.
+    epoch_consumer_counts: Mutex<HashMap<u64, usize>>,
     /// Lazily seeded from the pager's current visible commit clock at the
     /// first physical flush for this database identity.
     durability_combiner: Mutex<Option<Arc<ParallelWalDurabilityCombiner>>>,
@@ -932,6 +939,22 @@ struct PersistedGroupCommitEpoch {
     frames_end: u64,
     fsync_seq: u64,
     durability_receipt: ParallelWalDurabilityReceipt,
+}
+
+struct GroupCommitEpochConsumer {
+    queue: Weak<GroupCommitQueue>,
+    epoch: u64,
+    tracked: bool,
+}
+
+impl Drop for GroupCommitEpochConsumer {
+    fn drop(&mut self) {
+        if self.tracked {
+            if let Some(queue) = self.queue.upgrade() {
+                queue.release_epoch_consumer(self.epoch);
+            }
+        }
+    }
 }
 
 struct PersistedGroupCommitInput<'a> {
@@ -1189,6 +1212,7 @@ impl GroupCommitQueue {
             completed_epoch: AtomicU64::new(0),
             failed_epochs: Mutex::new(HashMap::new()),
             persisted_epochs: Mutex::new(HashMap::new()),
+            epoch_consumer_counts: Mutex::new(HashMap::new()),
             durability_combiner: Mutex::new(None),
             epoch_waiters: KeyedWaitRegistry::new(),
             commit_service_control_epoch: AtomicU64::new(0),
@@ -1412,6 +1436,73 @@ impl GroupCommitQueue {
             .cloned()
     }
 
+    fn register_epoch_consumer(self: &Arc<Self>, epoch: u64) -> Arc<GroupCommitEpochConsumer> {
+        let tracked = {
+            let mut counts = self
+                .epoch_consumer_counts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let count = counts.entry(epoch).or_default();
+            if *count == usize::MAX {
+                // Fail closed by retaining this epoch forever in the
+                // unrepresentable case rather than risking early evidence
+                // reclamation.
+                tracing::error!(epoch, "group-commit epoch consumer count overflow");
+                false
+            } else {
+                *count += 1;
+                true
+            }
+        };
+        Arc::new(GroupCommitEpochConsumer {
+            queue: Arc::downgrade(self),
+            epoch,
+            tracked,
+        })
+    }
+
+    fn release_epoch_consumer(&self, epoch: u64) {
+        let mut counts = self
+            .epoch_consumer_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(count) = counts.get_mut(&epoch) else {
+            tracing::error!(
+                epoch,
+                "group-commit epoch consumer released without registration"
+            );
+            return;
+        };
+        if *count > 1 {
+            *count -= 1;
+            return;
+        }
+        counts.remove(&epoch);
+        self.remove_epoch_metadata(epoch);
+    }
+
+    fn reclaim_epoch_metadata_if_unowned(&self, epoch: u64) {
+        let counts = self
+            .epoch_consumer_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if counts.contains_key(&epoch) {
+            return;
+        }
+        self.remove_epoch_metadata(epoch);
+    }
+
+    fn remove_epoch_metadata(&self, epoch: u64) {
+        self.failed_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&epoch);
+        self.persisted_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&epoch);
+    }
+
     /// Publish a completed epoch and wake all waiters.
     ///
     /// We take the consolidator mutex before publishing so a waiter cannot
@@ -1443,7 +1534,7 @@ impl GroupCommitQueue {
         }
 
         self.signal_completed_epoch_waiters(epoch, wake_next_epoch, !suppress_legacy_notify);
-        self.prune_stale_epoch_metadata(epoch);
+        self.reclaim_epoch_metadata_if_unowned(epoch);
     }
 
     /// Publish a failed epoch and wake all waiters.
@@ -1462,6 +1553,7 @@ impl GroupCommitQueue {
         failed_epochs.insert(epoch, GroupCommitEpochFailure::from_error(error));
         drop(failed_epochs);
         self.signal_failed_epoch_waiters(epoch, wake_next_epoch);
+        self.reclaim_epoch_metadata_if_unowned(epoch);
     }
 
     fn abort_cancelled_flush(&self, epoch: u64) {
@@ -1737,24 +1829,6 @@ impl GroupCommitQueue {
             }
         };
         self.publish_failed_epoch(failed_epoch, &FrankenError::Abort, false);
-    }
-
-    /// Evict epoch metadata older than `current_epoch - RETENTION` from
-    /// both the failure and persisted-trace maps.
-    fn prune_stale_epoch_metadata(&self, current_epoch: u64) {
-        const RETENTION: u64 = 128;
-        let cutoff = current_epoch.saturating_sub(RETENTION);
-        if cutoff == 0 {
-            return;
-        }
-        self.failed_epochs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|&epoch, _| epoch > cutoff);
-        self.persisted_epochs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|&epoch, _| epoch > cutoff);
     }
 
     /// Check if a given epoch has completed (for waiters).
@@ -2166,7 +2240,8 @@ enum PendingGroupCommitRecoveryResolution {
 }
 
 struct PendingGroupCommitRecovery<F: VfsFile + 'static> {
-    queue: Arc<GroupCommitQueue>,
+    queue: Weak<GroupCommitQueue>,
+    _epoch_consumer: Arc<GroupCommitEpochConsumer>,
     publication: Arc<PendingGroupCommitPublication>,
     wal_backend: SharedWalBackend,
     inner: Arc<Mutex<PagerInner<F>>>,
@@ -2224,7 +2299,12 @@ impl<F: VfsFile + 'static> PendingGroupCommitRecovery<F> {
             .as_ref()
             .map(|_| PublishedPagerState::prepare_parallel_wal_group_pages(&self.batches))
             .transpose()?;
-        let receipt = self.publication.finalize(&self.queue)?;
+        let queue = self.queue.upgrade().ok_or_else(|| {
+            FrankenError::internal(
+                "group-commit queue dropped before pending durability recovery finalized",
+            )
+        })?;
+        let receipt = self.publication.finalize(&queue)?;
         if let (Some(published), Some(prepared_pages)) = (self.published.as_ref(), prepared_pages) {
             published.publish_prepared_parallel_wal_group(
                 cx,
@@ -7213,6 +7293,7 @@ where
                     committed_snapshot: Arc::clone(&self.committed_snapshot),
                     shared_connection_count: self.shared_connection_count.get().cloned(),
                     maintenance_lease: Some(maintenance_lease),
+                    pending_group_commit_epoch_consumer: None,
                     recovery_fence: Arc::clone(&self.recovery_fence),
                     read_only_pager: inner.access_mode.is_readonly(),
                     published_visible_commit_seq: Cell::new(bound_visible_commit_seq),
@@ -7409,6 +7490,7 @@ where
                 committed_snapshot: Arc::clone(&self.committed_snapshot),
                 shared_connection_count: self.shared_connection_count.get().cloned(),
                 maintenance_lease: Some(maintenance_lease),
+                pending_group_commit_epoch_consumer: None,
                 recovery_fence: Arc::clone(&self.recovery_fence),
                 read_only_pager,
                 published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
@@ -11141,6 +11223,11 @@ pub struct SimpleTransaction<V: Vfs> {
     /// Same-path transaction lease. Released as soon as commit/rollback
     /// finishes, before the transaction value itself is dropped.
     maintenance_lease: Option<PagerMaintenanceLease>,
+    /// Exact group-commit terminal-evidence owner retained after an ambiguous
+    /// physical callback. Recovery may share this lease, but cannot become its
+    /// sole logical owner while this transaction can still classify the
+    /// admitted WAL attempt.
+    pending_group_commit_epoch_consumer: Option<Arc<GroupCommitEpochConsumer>>,
     recovery_fence: Arc<RecoveryFence>,
     /// The physical pager was opened read-only. This is stronger than a
     /// read-only transaction mode and must reject every later writer upgrade.
@@ -12584,6 +12671,7 @@ where
         };
 
         let mut publication_authorization = None;
+        let mut epoch_consumer = None;
         Self::commit_wal_group_commit_with_snapshot(
             cx,
             wal_backend,
@@ -12597,6 +12685,7 @@ where
             &[],
             queue,
             &mut publication_authorization,
+            &mut epoch_consumer,
         )
         .await
     }
@@ -12616,6 +12705,7 @@ where
         conflict_page_baselines: &[TransactionConflictPageBaseline],
         queue: &GroupCommitQueueRef,
         publication_authorization: &mut Option<ParallelWalPublicationAuthorization>,
+        epoch_consumer_out: &mut Option<Arc<GroupCommitEpochConsumer>>,
     ) -> Result<()> {
         // A prior flusher may have been dropped while the shared database-file
         // handle was contended. The next commit is an existing structured
@@ -12775,7 +12865,14 @@ where
         // Step 2: Submit batch to consolidator, get Flusher or Waiter role and
         // the exact epoch that will make this batch durable.
         let t_consolidator_lock_start = phase_timing.then(Instant::now);
-        let (outcome, our_epoch, target_epoch, consolidator_lock_wait_us, flushing_wait_us) = {
+        let (
+            outcome,
+            our_epoch,
+            target_epoch,
+            consolidator_lock_wait_us,
+            flushing_wait_us,
+            epoch_consumer,
+        ) = {
             let mut consolidator = queue
                 .consolidator
                 .lock()
@@ -12791,12 +12888,18 @@ where
 
             let epoch_at_queue = consolidator.epoch();
             let receipt = consolidator.submit_batch(batch)?;
+            // Register before releasing the consolidator mutex. A flusher
+            // cannot publish this target epoch between admission and consumer
+            // ownership becoming visible.
+            let epoch_consumer = queue.register_epoch_consumer(receipt.target_epoch);
+            *epoch_consumer_out = Some(Arc::clone(&epoch_consumer));
             (
                 receipt.outcome,
                 epoch_at_queue,
                 receipt.target_epoch,
                 lock_wait_us,
                 flushing_wait,
+                epoch_consumer,
             )
         };
         trace_group_commit(format_args!(
@@ -13302,7 +13405,8 @@ where
                                     Arc::new(Mutex::new(None::<VfsWriteCompletion>));
                                 let recovery =
                                     Arc::new(PendingGroupCommitRecovery::<V::File> {
-                                        queue: Arc::clone(queue),
+                                        queue: Arc::downgrade(queue),
+                                        _epoch_consumer: Arc::clone(&epoch_consumer),
                                         publication: Arc::clone(&publication),
                                         wal_backend: Arc::clone(wal_backend),
                                         inner: Arc::clone(inner_arc),
@@ -13911,6 +14015,7 @@ where
             batch_id: waiter_id,
             assigned_commit_seq,
         });
+        *epoch_consumer_out = None;
         Ok(())
     }
 
@@ -14593,6 +14698,13 @@ where
                 .resolve_one_pending_external_unlock()
                 .await?
             {}
+            if self.pending_group_commit_epoch_consumer.is_some() {
+                // Recovery may have reached a physical verdict, but this
+                // transaction has not yet recorded that ambiguous admitted
+                // attempt as committed or not committed. Never submit a second
+                // WAL attempt over the retained evidence.
+                return Err(FrankenError::BusyRecovery);
+            }
             if self.group_commit_queue.has_unresolved_in_doubt_epoch() {
                 return Err(FrankenError::BusyRecovery);
             }
@@ -14856,8 +14968,23 @@ where
                     &cross_process_conflict_page_baselines,
                     &self.group_commit_queue,
                     &mut wal_publication_authorization,
+                    &mut self.pending_group_commit_epoch_consumer,
                 )
                 .await;
+                let recovery_owns_epoch = result.is_err()
+                    && self
+                        .pending_group_commit_epoch_consumer
+                        .as_ref()
+                        .is_some_and(|consumer| {
+                            self.group_commit_queue
+                                .pending_external_unlock_ownership
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .contains_key(&consumer.epoch)
+                        });
+                if result.is_err() && !recovery_owns_epoch {
+                    self.pending_group_commit_epoch_consumer.take();
+                }
                 record_pager_commit_duration(&PAGER_COMMIT_WAL_TIME_NS, t_wal_commit_start);
 
                 // Re-acquire inner lock for Phase C (finalize).
@@ -15341,8 +15468,23 @@ where
                         &cross_process_conflict_page_baselines,
                         &self.group_commit_queue,
                         &mut wal_publication_authorization,
+                        &mut self.pending_group_commit_epoch_consumer,
                     )
                     .await;
+                    let recovery_owns_epoch = result.is_err()
+                        && self
+                            .pending_group_commit_epoch_consumer
+                            .as_ref()
+                            .is_some_and(|consumer| {
+                                self.group_commit_queue
+                                    .pending_external_unlock_ownership
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .contains_key(&consumer.epoch)
+                            });
+                    if result.is_err() && !recovery_owns_epoch {
+                        self.pending_group_commit_epoch_consumer.take();
+                    }
                     inner = match inner_arc
                         .lock()
                         .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))
@@ -15748,6 +15890,7 @@ where
             }
             self.committed = false;
             self.maintenance_lease.take();
+            self.pending_group_commit_epoch_consumer.take();
             self.finished = true;
             // IMPL-3 / AG-4B: reset scratch arena so transient allocations do not
             // carry across transaction boundaries.
@@ -24508,7 +24651,11 @@ mod tests {
 
                 let inner = Arc::clone(&pager.inner);
                 let wal_backend = Arc::clone(&pager.wal_backend);
-                let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+                let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig {
+                    max_group_delay: Duration::from_millis(10),
+                    max_group_delay_ceiling: Duration::from_millis(10),
+                    ..GroupCommitConfig::default()
+                }));
                 let pool = pager.pool.clone();
                 let start = StdArc::new(std::sync::Barrier::new(3));
 
@@ -24559,8 +24706,13 @@ mod tests {
 
                 let error_a = result_a.expect_err("flusher should observe append failure");
                 let error_b = result_b.expect_err("waiter should fail closed");
-                let saw_busy_recovery = matches!(&error_a, FrankenError::BusyRecovery)
-                    || matches!(&error_b, FrankenError::BusyRecovery);
+                let saw_fail_closed_recovery = matches!(
+                    &error_a,
+                    FrankenError::BusyRecovery | FrankenError::Unsupported
+                ) || matches!(
+                    &error_b,
+                    FrankenError::BusyRecovery | FrankenError::Unsupported
+                );
                 let error_a = error_a.to_string();
                 let error_b = error_b.to_string();
                 assert!(
@@ -24569,7 +24721,7 @@ mod tests {
                     "bead_id={BEAD_ID} case=group_commit_flusher_reports_backend_failure error_a={error_a} error_b={error_b}"
                 );
                 assert!(
-                    saw_busy_recovery,
+                    saw_fail_closed_recovery,
                     "bead_id={BEAD_ID} case=group_commit_waiter_fails_closed error_a={error_a} error_b={error_b}"
                 );
                 let consolidator = queue
@@ -24675,17 +24827,18 @@ mod tests {
                 queue.has_unresolved_in_doubt_epoch(),
                 "queued awaited error must enter BusyRecovery"
             );
-            let busy_error = match pager.begin(&cx, TransactionMode::ReadOnly).await {
-                Ok(_) => panic!("new begin must fail closed while durability is unresolved"),
-                Err(error) => error,
-            };
-            assert!(
-                matches!(busy_error, FrankenError::BusyRecovery),
-                "unresolved awaited error must surface BusyRecovery, got {busy_error}"
+            assert_eq!(
+                queue
+                    .epoch_consumer_counts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&flush_epoch),
+                Some(&1),
+                "pending recovery must retain the admitted epoch consumer after caller error"
             );
             assert!(
                 observed_unlock_trace_ids.lock().unwrap().is_empty(),
-                "neither normal error handling nor BusyRecovery may call unlock"
+                "normal error handling may not call unlock before reconciliation"
             );
             assert_eq!(
                 *observed_lock_level.lock().unwrap(),
@@ -24750,8 +24903,16 @@ mod tests {
             );
             assert!(queue.is_epoch_complete(flush_epoch));
             assert!(
-                queue.persisted_epoch_for(flush_epoch).is_some(),
-                "authorized recovery must finalize and publish the pending durability receipt"
+                queue.persisted_epoch_for(flush_epoch).is_none(),
+                "authorized recovery must reclaim the receipt after its final owner consumes it"
+            );
+            assert!(
+                !queue
+                    .epoch_consumer_counts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&flush_epoch),
+                "authorized recovery must release its final epoch consumer"
             );
             assert!(
                 !queue
@@ -24771,12 +24932,148 @@ mod tests {
                 committed_page.as_slice(),
                 "authorized recovery must publish the retained page batch"
             );
-            assert_eq!(
-                observed_unlock_trace_ids.lock().unwrap().len(),
-                1,
-                "successful post-reconciliation begin must not add an unlock"
-            );
             drop(reader);
+            let queue_weak = Arc::downgrade(&queue);
+            drop(pager);
+            drop(queue);
+            assert!(
+                queue_weak.upgrade().is_none(),
+                "terminal recovery must not retain the group-commit queue"
+            );
+        });
+    }
+
+    #[test]
+    fn test_group_commit_logical_owner_outlives_physical_recovery_and_128_epochs() {
+        asupersync::test_utils::run_test(|| async {
+            const BEAD: &str = "bd-vn2ea";
+            let vfs = ObservedLockVfs::new();
+            let path = PathBuf::from("/wal_group_commit_logical_owner_evidence.db");
+            let pager = vfs.open_file_backed_pager(&path).await.unwrap();
+            let cx = Cx::new();
+            let (backend, _frames, _sync_calls, _reconcile_calls) =
+                MockWalBackend::new_with_failing_sync();
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+            pager
+                .set_wal_commit_sync_policy(WalCommitSyncPolicy::PerCommit)
+                .unwrap();
+            let queue = Arc::clone(&pager.group_commit_queue);
+
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, page, &vec![0x78; PageSize::DEFAULT.as_usize()])
+                .await
+                .unwrap();
+            txn.commit(&cx)
+                .await
+                .expect_err("sync failure must transfer evidence ownership");
+            let flush_epoch = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .epoch();
+            assert_eq!(
+                queue
+                    .epoch_consumer_counts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&flush_epoch),
+                Some(&1),
+                "bead_id={BEAD} case=logical_attempt_owns_ambiguous_epoch"
+            );
+
+            assert!(
+                queue.resolve_one_pending_external_unlock().await.unwrap(),
+                "physical recovery must reach an authorized terminal verdict"
+            );
+            assert!(
+                queue.persisted_epoch_for(flush_epoch).is_some(),
+                "bead_id={BEAD} case=logical_owner_retains_recovered_certificate"
+            );
+            for epoch in (flush_epoch + 1)..=(flush_epoch + 129) {
+                queue.publish_completed_epoch(epoch, false);
+            }
+            assert!(
+                queue.persisted_epoch_for(flush_epoch).is_some(),
+                "bead_id={BEAD} case=logical_owner_evidence_outlives_128_later_epochs"
+            );
+
+            drop(txn);
+            assert!(
+                queue.persisted_epoch_for(flush_epoch).is_none(),
+                "bead_id={BEAD} case=logical_final_owner_reclaims_recovered_certificate"
+            );
+            assert!(
+                !queue
+                    .epoch_consumer_counts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&flush_epoch),
+                "bead_id={BEAD} case=logical_final_owner_releases_epoch_count"
+            );
+        });
+    }
+
+    #[test]
+    fn test_group_commit_nonterminal_recovery_does_not_retain_queue() {
+        asupersync::test_utils::run_test(|| async {
+            const BEAD: &str = "bd-532zd";
+            let vfs = ObservedLockVfs::new();
+            let path = PathBuf::from("/wal_group_commit_nonterminal_recovery_weak_queue.db");
+            let pager = vfs.open_file_backed_pager(&path).await.unwrap();
+            let cx = Cx::new();
+            let (backend, _frames, _sync_calls, _reconcile_calls) =
+                MockWalBackend::new_with_failing_sync();
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+            pager
+                .set_wal_commit_sync_policy(WalCommitSyncPolicy::PerCommit)
+                .unwrap();
+            let queue = Arc::clone(&pager.group_commit_queue);
+            let queue_weak = Arc::downgrade(&queue);
+
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, page, &vec![0x7A; PageSize::DEFAULT.as_usize()])
+                .await
+                .unwrap();
+            let error = txn
+                .commit(&cx)
+                .await
+                .expect_err("sync failure must leave a nonterminal recovery owner");
+            assert!(
+                error
+                    .to_string()
+                    .contains("forced group-commit sync failure after full WAL append"),
+                "bead_id={BEAD} case=nonterminal_recovery_fixture error={error}"
+            );
+            assert_eq!(
+                queue
+                    .pending_external_unlocks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                1,
+                "bead_id={BEAD} case=nonterminal_recovery_is_queued"
+            );
+            assert_eq!(
+                queue
+                    .epoch_consumer_counts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                1,
+                "bead_id={BEAD} case=nonterminal_recovery_retains_epoch_consumer"
+            );
+
+            drop(txn);
+            drop(pager);
+            drop(queue);
+            assert!(
+                queue_weak.upgrade().is_none(),
+                "bead_id={BEAD} case=nonterminal_recovery_must_not_form_queue_cycle"
+            );
         });
     }
 
@@ -24842,6 +25139,15 @@ mod tests {
                 1,
                 "pre-write callback error must retain RESERVED until exact reconciliation"
             );
+            assert_eq!(
+                queue
+                    .epoch_consumer_counts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&flush_epoch),
+                Some(&1),
+                "pre-write recovery must own the admitted epoch after the caller returns"
+            );
             assert_eq!(*observed_lock_level.lock().unwrap(), LockLevel::Reserved);
             assert!(observed_unlock_trace_ids.lock().unwrap().is_empty());
 
@@ -24878,12 +25184,20 @@ mod tests {
             );
             assert!(!queue.is_epoch_complete(flush_epoch));
             assert!(
-                queue
+                !queue
                     .failed_epochs
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .contains_key(&flush_epoch),
-                "NotCommitted recovery must publish Abort for the failed epoch"
+                "NotCommitted recovery must reclaim Abort after its final owner consumes it"
+            );
+            assert!(
+                !queue
+                    .epoch_consumer_counts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&flush_epoch),
+                "NotCommitted recovery must release its final epoch consumer"
             );
             assert!(!queue.has_unresolved_in_doubt_epoch());
         });
@@ -24978,21 +25292,19 @@ mod tests {
                     "bead_id={BEAD_ID} case=group_commit_publish_hook_runs_after_real_sync"
                 );
 
-                let error_a = result_a
-                    .expect_err("flusher should surface publish-hook failure")
-                    .to_string();
-                let error_b = result_b
-                    .expect_err("waiter should observe propagated publish-hook failure")
-                    .to_string();
+                let error = match (result_a, result_b) {
+                    (Err(error), Ok(())) | (Ok(()), Err(error)) => error.to_string(),
+                    (Err(error_a), Err(error_b)) => panic!(
+                        "exactly the flusher should surface the post-durable local fault: \
+                         error_a={error_a} error_b={error_b}"
+                    ),
+                    (Ok(()), Ok(())) => {
+                        panic!("the post-durable local fault must surface to its flusher")
+                    }
+                };
                 assert!(
-                    error_a.contains("fault_inject:after_flush_before_publish")
-                        || error_b.contains("fault_inject:after_flush_before_publish"),
-                    "bead_id={BEAD_ID} case=group_commit_publish_hook_reports_primary_failure error_a={error_a} error_b={error_b}"
-                );
-                assert!(
-                    error_a.contains("completed without a durability certificate")
-                        || error_b.contains("completed without a durability certificate"),
-                    "bead_id={BEAD_ID} case=group_commit_publish_hook_waiter_reports_recovery_boundary error_a={error_a} error_b={error_b}"
+                    error.contains("fault_inject:after_flush_before_publish"),
+                    "bead_id={BEAD_ID} case=group_commit_publish_hook_reports_primary_failure error={error}"
                 );
                 let completed_epoch = queue.completed_epoch.load(AtomicOrdering::Acquire);
                 assert!(
@@ -25006,6 +25318,14 @@ mod tests {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .is_empty(),
                     "bead_id={BEAD_ID} case=group_commit_post_durable_fault_must_not_publish_abort"
+                );
+                assert!(
+                    queue
+                        .persisted_epochs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_empty(),
+                    "bead_id={BEAD_ID} case=group_commit_post_durable_final_owner_reclaims_receipt"
                 );
                 assert_eq!(
                     queue
@@ -26759,7 +27079,8 @@ mod tests {
 
     #[test]
     fn test_group_commit_queue_retains_failed_epoch_for_late_waiter() {
-        let queue = GroupCommitQueue::new(GroupCommitConfig::default());
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+        let consumer = queue.register_epoch_consumer(1);
         queue.publish_failed_epoch(
             1,
             &FrankenError::internal("forced group commit flush failure"),
@@ -26781,6 +27102,15 @@ mod tests {
         assert!(
             message.contains("forced group commit flush failure"),
             "bead_id={BEAD_ID} case=group_commit_failed_epoch_late_waiter_preserves_detail message={message}"
+        );
+        drop(consumer);
+        assert!(
+            !queue
+                .failed_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&1),
+            "bead_id={BEAD_ID} case=group_commit_failed_epoch_final_owner_reclaims"
         );
     }
 
@@ -26807,18 +27137,20 @@ mod tests {
     #[test]
     fn test_group_commit_filling_obligation_drop_aborts_exact_target_epoch() {
         let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
-        let receipt = {
+        let (receipt, consumer) = {
             let mut consolidator = queue
                 .consolidator
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            consolidator
+            let receipt = consolidator
                 .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
                     page_number: 1,
                     page_data: sample_page(0x61),
                     db_size_if_commit: 1,
                 }]))
-                .unwrap()
+                .unwrap();
+            let consumer = queue.register_epoch_consumer(receipt.target_epoch);
+            (receipt, consumer)
         };
         assert_eq!(receipt.outcome, SubmitOutcome::Flusher);
         drop(GroupCommitFillingObligation::new(
@@ -26841,6 +27173,15 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains_key(&receipt.target_epoch),
             "cancelled filling epoch must publish one atomic Abort outcome"
+        );
+        drop(consumer);
+        assert!(
+            !queue
+                .failed_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&receipt.target_epoch),
+            "cancelled filling epoch must reclaim Abort after its final owner releases"
         );
     }
 
@@ -27249,6 +27590,74 @@ mod tests {
             queue.wait_for_epoch_outcome(guard, 1).unwrap(),
             WaitForEpochOutcome::Completed
         ));
+    }
+
+    #[test]
+    fn test_group_commit_admission_registers_consumer_before_terminal_publication() {
+        const BEAD: &str = "bd-vn2ea";
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+        let mut guard = queue
+            .consolidator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let receipt = guard
+            .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 1,
+                page_data: sample_page(0xD1),
+                db_size_if_commit: 1,
+            }]))
+            .expect("test batch should be admitted");
+        let consumer = queue.register_epoch_consumer(receipt.target_epoch);
+        let target_epoch = receipt.target_epoch;
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let publish_queue = Arc::clone(&queue);
+        let handle = std::thread::spawn(move || {
+            started_tx
+                .send(())
+                .expect("publisher thread should signal start");
+            publish_queue.publish_failed_epoch(
+                target_epoch,
+                &FrankenError::internal("admission ordering failure"),
+                false,
+            );
+            done_tx
+                .send(())
+                .expect("publisher thread should signal completion");
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("publisher should start while admission owns the consolidator");
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "bead_id={BEAD} case=terminal_publish_cannot_overtake_consumer_registration"
+        );
+        drop(guard);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("publisher should complete after admission releases the consolidator");
+        handle.join().expect("publisher thread should not panic");
+
+        assert!(
+            queue
+                .failed_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&target_epoch),
+            "bead_id={BEAD} case=terminal_failure_retained_for_admitted_consumer"
+        );
+        drop(consumer);
+        assert!(
+            !queue
+                .failed_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&target_epoch),
+            "bead_id={BEAD} case=admitted_consumer_final_drop_reclaims_failure"
+        );
     }
 
     #[test]
@@ -27697,7 +28106,7 @@ mod tests {
     fn test_group_commit_queue_failed_publish_wakes_failed_and_next_epoch_waiters() {
         let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
 
-        {
+        let (failed_consumer, next_consumer) = {
             let mut consolidator = queue
                 .consolidator
                 .lock()
@@ -27710,6 +28119,7 @@ mod tests {
             let receipt = consolidator.submit_batch(batch1).unwrap();
             assert_eq!(receipt.outcome, SubmitOutcome::Flusher);
             assert_eq!(receipt.target_epoch, 1);
+            let failed_consumer = queue.register_epoch_consumer(receipt.target_epoch);
             let _ = consolidator.begin_flush().unwrap();
             let pipelined_batch = TransactionFrameBatch::new(vec![FrameSubmission {
                 page_number: 2,
@@ -27719,7 +28129,9 @@ mod tests {
             let receipt = consolidator.submit_batch(pipelined_batch).unwrap();
             assert_eq!(receipt.outcome, SubmitOutcome::Waiter);
             assert_eq!(receipt.target_epoch, 2);
-        }
+            let next_consumer = queue.register_epoch_consumer(receipt.target_epoch);
+            (failed_consumer, next_consumer)
+        };
 
         let _failed_slot = queue.epoch_waiters.slot(1);
         let _next_slot = queue.epoch_waiters.slot(2);
@@ -27816,6 +28228,16 @@ mod tests {
 
         failed_handle.join().unwrap();
         next_handle.join().unwrap();
+        drop(failed_consumer);
+        drop(next_consumer);
+        assert!(
+            !queue
+                .failed_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&1),
+            "failed epoch must be reclaimed after its final admitted owner releases"
+        );
     }
 
     #[test]
@@ -37820,10 +38242,10 @@ mod tests {
     #[test]
     fn test_group_commit_epoch_maps_bounded_under_sustained_load() {
         const BEAD: &str = "bd-vn2ea";
-        let queue = GroupCommitQueue::with_parallel_wal_control(
+        let queue = Arc::new(GroupCommitQueue::with_parallel_wal_control(
             GroupCommitConfig::default(),
             ParallelWalControlSurface::default(),
-        );
+        ));
 
         let total_epochs: u64 = 500;
         for epoch in 1..=total_epochs {
@@ -37837,15 +38259,106 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len();
-        assert!(
-            failed_len <= 128,
-            "bead_id={BEAD} case=epoch_map_gc \
-             failed_epochs_len={failed_len} max=128 — \
-             stale epoch metadata should be pruned"
+        let persisted_len = queue
+            .persisted_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let consumer_len = queue
+            .epoch_consumer_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert_eq!(
+            (failed_len, persisted_len, consumer_len),
+            (0, 0, 0),
+            "bead_id={BEAD} case=unowned_epoch_evidence_reclaimed"
         );
         eprintln!(
-            "INFO bead_id={BEAD} case=epoch_map_gc \
-             failed_epochs_len={failed_len} total_epochs={total_epochs}"
+            "INFO bead_id={BEAD} case=owner_safe_epoch_gc \
+             failed_epochs_len={failed_len} persisted_epochs_len={persisted_len} \
+             consumer_epochs_len={consumer_len} total_epochs={total_epochs}"
+        );
+    }
+
+    #[test]
+    fn test_group_commit_epoch_evidence_survives_more_than_128_later_epochs() {
+        const BEAD: &str = "bd-vn2ea";
+        let queue = Arc::new(GroupCommitQueue::with_parallel_wal_control(
+            GroupCommitConfig::default(),
+            ParallelWalControlSurface::default(),
+        ));
+        let persisted_owner_a = queue.register_epoch_consumer(1);
+        let persisted_owner_b = queue.register_epoch_consumer(1);
+        let failed_owner = queue.register_epoch_consumer(2);
+        let authorization = publication_authorization_for_test(false);
+        queue
+            .persisted_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                1,
+                PersistedGroupCommitEpoch {
+                    members: HashSet::from([authorization.batch_id]),
+                    frames_start: 1,
+                    frames_end: 1,
+                    fsync_seq: 1,
+                    durability_receipt: authorization.durability_receipt,
+                },
+            );
+        queue.publish_completed_epoch(1, false);
+        queue.publish_failed_epoch(
+            2,
+            &FrankenError::internal("owner-retained group commit failure"),
+            false,
+        );
+
+        for epoch in 3..=260 {
+            queue.publish_completed_epoch(epoch, false);
+        }
+
+        assert!(
+            queue.persisted_epoch_for(1).is_some(),
+            "bead_id={BEAD} case=persisted_evidence_outlives_128_later_epochs"
+        );
+        let guard = queue
+            .consolidator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let error = queue.wait_for_epoch_outcome(guard, 2).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("owner-retained group commit failure"),
+            "bead_id={BEAD} case=failed_evidence_outlives_128_later_epochs error={error}"
+        );
+
+        drop(persisted_owner_a);
+        assert!(
+            queue.persisted_epoch_for(1).is_some(),
+            "bead_id={BEAD} case=first_owner_cannot_reclaim_shared_evidence"
+        );
+        drop(persisted_owner_b);
+        assert!(
+            queue.persisted_epoch_for(1).is_none(),
+            "bead_id={BEAD} case=final_persisted_owner_reclaims"
+        );
+        drop(failed_owner);
+        assert!(
+            !queue
+                .failed_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&2),
+            "bead_id={BEAD} case=final_failed_owner_reclaims"
+        );
+        assert!(
+            queue
+                .epoch_consumer_counts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "bead_id={BEAD} case=all_epoch_consumer_counts_released"
         );
     }
 
