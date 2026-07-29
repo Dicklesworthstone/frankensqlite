@@ -3339,6 +3339,55 @@ pub trait Fts5Tokenizer: Send + Sync {
     }
 }
 
+/// Upper bound on a single indexed term in bytes (cass#362).
+///
+/// The segment-leaf codec addresses term starts with u16 offsets, so a term
+/// larger than one leaf can never be represented; before this cap a single
+/// >64 KiB whitespace-delimited token (a minified JS bundle or base64 blob
+/// pasted into a coding-agent transcript — normal data in that domain) made
+/// `Fts5SegmentLeaf::encode` fail the entire INSERT, and every rebuild after
+/// it, unrecoverably. C SQLite FTS5 does not error here either way: it writes
+/// the oversized term with a silently wrapped `szLeaf` header
+/// (`fts5_index.c` `fts5WriteFlushLeaf`'s unchecked u16 cast), leaving the
+/// term unqueryable. Skipping matches that observable outcome — the term is
+/// not findable — while keeping the write path total, and matches the
+/// mainstream-engine convention (Lucene rejects >32 KiB terms outright,
+/// Elasticsearch `ignore_above` drops them). One position slot is lost per
+/// skipped token relative to C's poslists; that documented divergence only
+/// affects phrase queries spanning a pathological token.
+pub const FTS5_MAX_TERM_BYTES: usize = 1024;
+
+/// Decorator applied by [`Fts5Table::create_tokenizer_instance`] so every
+/// tokenizer (unicode61/ascii/porter/trigram) and every consumer — the
+/// pending-hash segment writer, the live in-memory index, the incremental
+/// delta index, and MATCH query parsing — sees the same bounded term stream.
+/// Query-time symmetry means a query containing an overlong term drops it
+/// exactly as indexing did.
+struct MaxTokenLenTokenizer {
+    inner: Box<dyn Fts5Tokenizer>,
+}
+
+impl Fts5Tokenizer for MaxTokenLenTokenizer {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
+        self.inner
+            .visit_tokens(text, &mut |term, start, end, colocated| {
+                if term.len() > FTS5_MAX_TERM_BYTES {
+                    tracing::warn!(
+                        term_bytes = term.len(),
+                        max_term_bytes = FTS5_MAX_TERM_BYTES,
+                        "fts5: skipping overlong term instead of failing the segment write (cass#362)"
+                    );
+                    return;
+                }
+                sink(term, start, end, colocated);
+            });
+    }
+}
+
 /// Unicode61 tokenizer: splits on non-alphanumeric characters, lowercases.
 #[derive(Debug)]
 pub struct Unicode61Tokenizer {
@@ -3533,6 +3582,13 @@ impl PorterTokenizer {
     }
 }
 
+/// C parity: `fts5_tokenize.c` (`FTS5_PORTER_MAX_TOKEN = 64`) passes tokens
+/// longer than 64 bytes through unstemmed. Mirroring it keeps term identity
+/// aligned with stock FTS5 for long tokens and avoids `porter_stem`'s
+/// per-suffix `String` reallocation storm on pathological inputs (a 91 KiB
+/// minified-JS token would otherwise be "stemmed"; cass#362).
+const FTS5_PORTER_MAX_TOKEN: usize = 64;
+
 impl Fts5Tokenizer for PorterTokenizer {
     fn name(&self) -> &'static str {
         "porter"
@@ -3541,6 +3597,10 @@ impl Fts5Tokenizer for PorterTokenizer {
     fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
         self.inner
             .visit_tokens(text, &mut |term, start, end, colocated| {
+                if term.len() > FTS5_PORTER_MAX_TOKEN {
+                    sink(term, start, end, colocated);
+                    return;
+                }
                 let stemmed = porter_stem(term);
                 sink(stemmed.as_str(), start, end, colocated);
             });
@@ -7499,8 +7559,10 @@ impl Fts5Table {
     }
 
     pub fn create_tokenizer_instance(&self) -> Box<dyn Fts5Tokenizer> {
-        create_tokenizer(&self.tokenizer_name)
-            .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()))
+        Box::new(MaxTokenLenTokenizer {
+            inner: create_tokenizer(&self.tokenizer_name)
+                .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new())),
+        })
     }
 
     pub fn open_shadow_rows(
@@ -8132,8 +8194,13 @@ impl Fts5Table {
         }
     }
 
-    #[must_use]
-    pub fn encode_data_rows(&self) -> Vec<Fts5DataRow> {
+    /// Encode the full `%_data` shadow contents from the in-memory index.
+    ///
+    /// A pending-hash build or segment flush failure is propagated (cass#362):
+    /// the previous `if let Ok(..)` fall-through silently emitted an *empty*
+    /// structure row on failure, so a full re-encode of a populated table
+    /// could "succeed" while discarding the entire inverted index.
+    pub fn encode_data_rows(&self) -> Result<Vec<Fts5DataRow>> {
         let docsize_rows = self.encode_docsize_rows();
         let averages = Fts5AveragesRecord::from_docsize_rows(
             u64::try_from(self.row_count()).unwrap_or(u64::MAX),
@@ -8148,20 +8215,18 @@ impl Fts5Table {
 
         let mut rows = vec![Fts5DataRow::new(FTS5_AVERAGES_ROWID, averages.encode())];
         let pending = if self.config.content_mode == ContentMode::Contentless {
-            self.index.build_pending_hash(&self.prefix_lengths)
+            self.index.build_pending_hash(&self.prefix_lengths)?
         } else {
-            self.build_pending_hash()
+            self.build_pending_hash()?
         };
-        if let Ok(pending) = pending
-            && !pending.is_empty()
-            && let Ok(flush) = pending.flush_to_segment(1, structure.clone())
-        {
+        if !pending.is_empty() {
+            let flush = pending.flush_to_segment(1, structure.clone())?;
             rows.extend(flush.data_rows);
-            return rows;
+            return Ok(rows);
         }
 
         rows.push(Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode()));
-        rows
+        Ok(rows)
     }
 
     pub fn decode_data_rows(&self, rows: &[Fts5DataRow]) -> Result<Fts5DataMetadata> {
@@ -8301,15 +8366,14 @@ impl Fts5Table {
         }))
     }
 
-    #[must_use]
-    pub fn encode_shadow_rows(&self) -> Fts5ShadowRows {
-        Fts5ShadowRows {
-            data: self.encode_data_rows(),
+    pub fn encode_shadow_rows(&self) -> Result<Fts5ShadowRows> {
+        Ok(Fts5ShadowRows {
+            data: self.encode_data_rows()?,
             idx: Vec::new(),
             config: self.encode_config_rows(),
             content: self.encode_content_rows(),
             docsize: self.encode_docsize_rows(),
-        }
+        })
     }
 
     pub fn apply_shadow_rows(&mut self, rows: &Fts5ShadowRows) -> Result<Fts5ConfigMetadata> {
@@ -10530,7 +10594,7 @@ mod tests {
             &["rust index".to_owned(), "shadow table rows".to_owned()],
         );
 
-        let data = table.encode_data_rows();
+        let data = table.encode_data_rows().unwrap();
         let metadata = table.decode_data_rows(&data).unwrap();
         let snapshot = Fts5DataRowsStructure {
             data_blocks: data.iter().map(|row| (row.id, row.block.clone())).collect(),
@@ -11983,7 +12047,7 @@ mod tests {
         );
         table.insert_document(9, &["sqlite notes".to_owned(), "rust fts".to_owned()]);
 
-        let rows = table.encode_shadow_rows();
+        let rows = table.encode_shadow_rows().unwrap();
         assert_eq!(
             rows.content,
             vec![
@@ -12040,7 +12104,7 @@ mod tests {
         );
         assert_eq!(table.lookup_content_row(3), None);
 
-        let rows = table.encode_shadow_rows();
+        let rows = table.encode_shadow_rows().unwrap();
         let opened = Fts5Table::open_shadow_rows(
             &cx,
             &["fts5", "main", "docs", "body", "content=''"],
@@ -12261,7 +12325,7 @@ mod tests {
         let cx = Cx::new();
         let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
         let rows = Fts5ShadowRows {
-            data: base.encode_data_rows(),
+            data: base.encode_data_rows().unwrap(),
             idx: Vec::new(),
             config: base.encode_config_rows(),
             content: vec![Fts5ContentRow::new(1, vec!["only one column".to_owned()])],
@@ -12296,7 +12360,7 @@ mod tests {
             11,
             &["rust index".to_owned(), "shadow table rows".to_owned()],
         );
-        let rows = table.encode_shadow_rows();
+        let rows = table.encode_shadow_rows().unwrap();
         let snapshot = Fts5ShadowRowsStructure {
             data: rows
                 .data

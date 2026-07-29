@@ -34783,7 +34783,7 @@ impl Connection {
                         "rootpage=0 virtual table {table_name} is not an FTS5 instance"
                     ))
                 })?;
-            fts5.encode_shadow_rows()
+            fts5.encode_shadow_rows()?
         };
 
         self.replace_storage_table_rows(
