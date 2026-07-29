@@ -268,6 +268,8 @@ fn operand_needs_parentheses(expr: &crate::Expr) -> bool {
         // NOT; plain `EXISTS (...)` is self-delimiting.
         crate::Expr::Exists { not, .. } => *not,
         // Self-delimiting forms.
+        crate::Expr::Literal(crate::Literal::Integer(value), _) => *value < 0,
+        crate::Expr::Literal(crate::Literal::Float(value), _) => value.is_sign_negative(),
         crate::Expr::Literal(..)
         | crate::Expr::Column(..)
         | crate::Expr::Case { .. }
@@ -284,7 +286,6 @@ enum ExprWriteTask<'a> {
     Expr(&'a Expr),
     Operand(&'a Expr),
     Text(&'static str),
-    Raw(&'a str),
     Ident(&'a str),
     Literal(&'a Literal),
     Column(&'a ColumnRef),
@@ -327,7 +328,7 @@ fn write_expr(f: &mut fmt::Formatter<'_>, root: &Expr) -> fmt::Result {
     let mut tasks = vec![ExprWriteTask::Expr(root)];
     while let Some(task) = tasks.pop() {
         match task {
-            ExprWriteTask::Text(text) | ExprWriteTask::Raw(text) => f.write_str(text)?,
+            ExprWriteTask::Text(text) => f.write_str(text)?,
             ExprWriteTask::Ident(name) => write_ident(f, name)?,
             ExprWriteTask::Literal(literal) => write!(f, "{literal}")?,
             ExprWriteTask::Column(column) => write!(f, "{column}")?,
@@ -565,10 +566,15 @@ fn write_expr(f: &mut fmt::Formatter<'_>, root: &Expr) -> fmt::Result {
                     ..
                 } => {
                     if let Some(window) = over {
-                        if let Some(base) = &window.base_window {
-                            tasks.push(ExprWriteTask::Ident(base));
-                        } else {
-                            tasks.push(ExprWriteTask::Window(window));
+                        match &window.base_window {
+                            Some(base)
+                                if window.partition_by.is_empty()
+                                    && window.order_by.is_empty()
+                                    && window.frame.is_none() =>
+                            {
+                                tasks.push(ExprWriteTask::Ident(base));
+                            }
+                            _ => tasks.push(ExprWriteTask::Window(window)),
                         }
                         tasks.push(ExprWriteTask::Text(" OVER "));
                     }
@@ -597,7 +603,7 @@ fn write_expr(f: &mut fmt::Formatter<'_>, root: &Expr) -> fmt::Result {
                 Expr::Collate {
                     expr, collation, ..
                 } => {
-                    tasks.push(ExprWriteTask::Raw(collation));
+                    tasks.push(ExprWriteTask::Ident(collation));
                     tasks.push(ExprWriteTask::Text(" COLLATE "));
                     tasks.push(ExprWriteTask::Operand(expr));
                 }
@@ -2009,6 +2015,10 @@ impl fmt::Display for Statement {
 mod expr_display_tests {
     use super::*;
 
+    fn column(name: &str) -> Expr {
+        Expr::Column(ColumnRef::bare(name), Span::ZERO)
+    }
+
     #[test]
     fn expression_display_height_1000_uses_bounded_work_stack() {
         let mut expr = Expr::Literal(Literal::Integer(1), Span::ZERO);
@@ -2024,5 +2034,79 @@ mod expr_display_tests {
         let rendered = expr.to_string();
         assert_eq!(rendered.matches('+').count(), 999);
         assert!(rendered.ends_with(" + 1"));
+    }
+
+    #[test]
+    fn negative_literal_operands_cannot_merge_into_sql_comments() {
+        let integer = Expr::UnaryOp {
+            op: UnaryOp::Negate,
+            expr: Box::new(Expr::Literal(Literal::Integer(i64::MIN), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        assert_eq!(integer.to_string(), "-(-9223372036854775808)");
+
+        let negative_zero = Expr::UnaryOp {
+            op: UnaryOp::Negate,
+            expr: Box::new(Expr::Literal(Literal::Float(-0.0), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        assert_eq!(negative_zero.to_string(), "-(-0.0)");
+    }
+
+    #[test]
+    fn collation_names_use_identifier_quoting() {
+        let expr = Expr::Collate {
+            expr: Box::new(column("value")),
+            collation: "my col".to_owned(),
+            span: Span::ZERO,
+        };
+        assert_eq!(expr.to_string(), "value COLLATE \"my col\"");
+    }
+
+    #[test]
+    fn window_base_keeps_extensions_but_bare_base_stays_unparenthesized() {
+        let extended = Expr::FunctionCall {
+            name: "sum".to_owned(),
+            args: FunctionArgs::List(vec![column("x")]),
+            distinct: false,
+            order_by: Vec::new(),
+            filter: None,
+            over: Some(WindowSpec {
+                base_window: Some("base".to_owned()),
+                partition_by: vec![column("p")],
+                order_by: vec![OrderingTerm {
+                    expr: column("y"),
+                    direction: None,
+                    nulls: None,
+                }],
+                frame: Some(FrameSpec {
+                    frame_type: FrameType::Rows,
+                    start: FrameBound::Preceding(Box::new(column("z"))),
+                    end: Some(FrameBound::CurrentRow),
+                    exclude: None,
+                }),
+            }),
+            span: Span::ZERO,
+        };
+        assert_eq!(
+            extended.to_string(),
+            "sum(x) OVER (base PARTITION BY p ORDER BY y ROWS BETWEEN z PRECEDING AND CURRENT ROW)"
+        );
+
+        let bare = Expr::FunctionCall {
+            name: "sum".to_owned(),
+            args: FunctionArgs::List(vec![column("x")]),
+            distinct: false,
+            order_by: Vec::new(),
+            filter: None,
+            over: Some(WindowSpec {
+                base_window: Some("base".to_owned()),
+                partition_by: Vec::new(),
+                order_by: Vec::new(),
+                frame: None,
+            }),
+            span: Span::ZERO,
+        };
+        assert_eq!(bare.to_string(), "sum(x) OVER base");
     }
 }
