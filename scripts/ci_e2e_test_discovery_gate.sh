@@ -61,8 +61,20 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 # Every integration-test target name in the crate.
-find "$tests_dir" -maxdepth 1 -name '*.rs' -type f -printf '%f\n' \
-  | sed 's/\.rs$//' | LC_ALL=C sort -u > "$tmp/all"
+#
+# Enumerate TRACKED files, not whatever is on disk. A shared developer checkout
+# routinely carries untracked scratch tests (e.g. the `zz_*` rch probes), and
+# generating the baseline from `find` bakes those transient names in — then the
+# gate fails on a clean CI checkout where they do not exist. Ask git instead, and
+# fall back to `find` only outside a work tree (e.g. a source tarball).
+if git -C . rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -C . ls-files "$tests_dir/*.rs" \
+    | xargs -r -n1 basename \
+    | sed 's/\.rs$//' | LC_ALL=C sort -u > "$tmp/all"
+else
+  find "$tests_dir" -maxdepth 1 -name '*.rs' -type f -printf '%f\n' \
+    | sed 's/\.rs$//' | LC_ALL=C sort -u > "$tmp/all"
+fi
 
 # Every test target any workflow names. `--test foo` and `--test=foo` both count.
 grep -rhoE -- '--test[= ][A-Za-z0-9_]+' "$workflows_dir" 2>/dev/null \

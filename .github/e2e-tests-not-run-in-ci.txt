@@ -262,4 +262,3 @@ window_range_offset_oracle_e2e
 without_rowid_dml_oracle_e2e
 xvv8f_ddl_visibility_repro
 zeroblob_edge_oracle_e2e
-zz_scratch_mw_race
