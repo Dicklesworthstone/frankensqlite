@@ -553,29 +553,47 @@ fn scan_numeric_prefix(bytes: &[u8]) -> usize {
     i
 }
 
-/// Parse the longest numeric prefix of `b` as an integer.
-#[allow(clippy::cast_possible_truncation)]
+/// Parse the longest signed-integer prefix of `b` as an integer.
+///
+/// SQLite's INTEGER cast consumes decimal digits only (after optional leading
+/// whitespace/sign), ignores any following decimal/exponent/text suffix, and
+/// saturates at the signed 64-bit boundaries.  Going through `f64` here loses
+/// precision for otherwise in-range values near `i64::MAX`.
 fn parse_integer_prefix_bytes(b: &[u8]) -> i64 {
-    let mut start = 0;
-    while start < b.len() && b[start].is_ascii_whitespace() {
-        start += 1;
+    let mut cursor = 0;
+    while cursor < b.len() && b[cursor].is_ascii_whitespace() {
+        cursor += 1;
     }
-    let trimmed = &b[start..];
-    let end = scan_numeric_prefix(trimmed);
-    if end == 0 {
+
+    let negative = b.get(cursor) == Some(&b'-');
+    if matches!(b.get(cursor), Some(b'+') | Some(b'-')) {
+        cursor += 1;
+    }
+    let digit_start = cursor;
+    let positive_limit = u64::try_from(i64::MAX).expect("i64::MAX fits in u64");
+    let magnitude_limit = if negative {
+        positive_limit + 1
+    } else {
+        positive_limit
+    };
+    let mut magnitude = 0_u64;
+    while let Some(byte) = b.get(cursor).copied().filter(u8::is_ascii_digit) {
+        magnitude = magnitude
+            .saturating_mul(10)
+            .saturating_add(u64::from(byte - b'0'))
+            .min(magnitude_limit);
+        cursor += 1;
+    }
+    if cursor == digit_start {
         return 0;
     }
-    // SAFETY: scan_numeric_prefix only advances over ASCII bytes (digits, +, -, ., e, E),
-    // so the slice is always valid UTF-8.
-    let s = std::str::from_utf8(&trimmed[..end]).unwrap_or("");
-    let f = s.parse::<f64>().unwrap_or(0.0);
-    #[allow(clippy::manual_clamp)]
-    if f >= i64::MAX as f64 {
-        i64::MAX
-    } else if f <= i64::MIN as f64 {
+
+    if negative && magnitude == magnitude_limit {
         i64::MIN
+    } else if negative {
+        -i64::try_from(magnitude).expect("bounded negative magnitude fits in i64")
     } else {
-        f as i64
+        i64::try_from(magnitude).expect("bounded positive magnitude fits in i64")
     }
 }
 
@@ -583,6 +601,33 @@ fn parse_integer_prefix_bytes(b: &[u8]) -> i64 {
 #[allow(clippy::cast_possible_truncation)]
 fn parse_integer_prefix(s: &str) -> i64 {
     parse_integer_prefix_bytes(s.as_bytes())
+}
+
+/// Mirrors the storage-class decision made by SQLite's `numericType()` for
+/// arithmetic.  Decimal/exponent syntax and signed-integer overflow select
+/// REAL; an in-range integer prefix selects INTEGER; non-numeric input also
+/// follows the INTEGER-zero path.
+fn bytes_have_integer_numeric_type(bytes: &[u8]) -> bool {
+    let mut start = 0;
+    while start < bytes.len() && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    let trimmed = &bytes[start..];
+    let end = scan_numeric_prefix(trimmed);
+    if end == 0 {
+        return true;
+    }
+    let prefix = &trimmed[..end];
+    if prefix
+        .iter()
+        .any(|byte| matches!(*byte, b'.' | b'e' | b'E'))
+    {
+        return false;
+    }
+    std::str::from_utf8(prefix)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .is_some()
 }
 
 /// Parse the longest numeric prefix of `b` as a float.
@@ -1008,46 +1053,31 @@ impl SqliteValue {
     /// Mirrors C SQLite's `numericType()` (SQLite VDBE:496): returns true if this
     /// value should be treated as an integer for arithmetic purposes.
     ///
-    /// Integer values are obviously integer-typed. Text/Blob values that parse
-    /// as i64 are also integer-typed. Float and Null are not.
+    /// Integer values are obviously integer-typed. Text/Blob values with an
+    /// in-range signed-integer prefix are integer-typed; non-numeric input also
+    /// takes SQLite's integer-zero arithmetic path. Decimal/exponent syntax and
+    /// integer overflow are REAL-typed. Float and Null are not integer-typed.
     #[inline]
     pub fn is_integer_numeric_type(&self) -> bool {
-        fn text_is_integer_numeric_type(s: &str) -> bool {
-            let trimmed = s.trim_start();
-            let end = scan_numeric_prefix(trimmed.as_bytes());
-            end > 0
-                && !trimmed.as_bytes()[..end]
-                    .iter()
-                    .any(|byte| matches!(*byte, b'.' | b'e' | b'E'))
-        }
-
         match self {
             Self::Integer(_) => true,
             Self::Float(_) | Self::Null => false,
-            Self::Text(s) => text_is_integer_numeric_type(s),
-            Self::Blob(b) => text_is_integer_numeric_type(&String::from_utf8_lossy(b)),
+            Self::Text(s) => bytes_have_integer_numeric_type(s.as_bytes()),
+            Self::Blob(b) => bytes_have_integer_numeric_type(b),
         }
     }
 
     /// Returns true if this value should be treated as a float for arithmetic.
-    /// A value is "float numeric type" only if it has a numeric prefix
-    /// containing '.', 'e', or 'E'. Non-numeric text/blob is NOT float
-    /// (it coerces to integer 0 in C SQLite's OP_Add/Sub/Mul).
+    /// Decimal/exponent syntax and signed-integer overflow are float numeric
+    /// types. Non-numeric text/blob is NOT float (it coerces to integer 0 in C
+    /// SQLite's OP_Add/Sub/Mul).
     #[inline]
     fn is_float_numeric_type(&self) -> bool {
-        fn text_is_float(s: &str) -> bool {
-            let trimmed = s.trim_start();
-            let end = scan_numeric_prefix(trimmed.as_bytes());
-            end > 0
-                && trimmed.as_bytes()[..end]
-                    .iter()
-                    .any(|byte| matches!(*byte, b'.' | b'e' | b'E'))
-        }
         match self {
             Self::Float(_) => true,
             Self::Integer(_) | Self::Null => false,
-            Self::Text(s) => text_is_float(s),
-            Self::Blob(b) => text_is_float(&String::from_utf8_lossy(b)),
+            Self::Text(s) => !bytes_have_integer_numeric_type(s.as_bytes()),
+            Self::Blob(b) => !bytes_have_integer_numeric_type(b),
         }
     }
 
@@ -2898,7 +2928,50 @@ mod tests {
         assert!(SqliteValue::Text(SmallText::new("123abc")).is_integer_numeric_type());
         assert!(SqliteValue::Blob(Arc::from(b"123a".as_slice())).is_integer_numeric_type());
         assert!(!SqliteValue::Text(SmallText::new("1.5e2abc")).is_integer_numeric_type());
-        assert!(!SqliteValue::Text(SmallText::new("abc")).is_integer_numeric_type());
+        assert!(SqliteValue::Text(SmallText::new("abc")).is_integer_numeric_type());
+        assert!(
+            !SqliteValue::Text(SmallText::new("9223372036854775808")).is_integer_numeric_type()
+        );
+        assert!(
+            SqliteValue::Text(SmallText::new("-9223372036854775808")).is_integer_numeric_type()
+        );
+    }
+
+    #[test]
+    fn test_integer_prefix_conversion_is_exact_and_saturating() {
+        for (input, expected) in [
+            ("9223372036854775806", 9_223_372_036_854_775_806_i64),
+            ("9223372036854775807", i64::MAX),
+            ("9223372036854775808", i64::MAX),
+            ("999999999999999999999999999999999", i64::MAX),
+            ("-9223372036854775807", -9_223_372_036_854_775_807_i64),
+            ("-9223372036854775808", i64::MIN),
+            ("-9223372036854775809", i64::MIN),
+            ("-999999999999999999999999999999999", i64::MIN),
+            ("3.0e+5", 3),
+            ("  +42suffix", 42),
+            ("not-numeric", 0),
+        ] {
+            assert_eq!(
+                SqliteValue::Text(SmallText::new(input)).to_integer(),
+                expected,
+                "INTEGER prefix conversion diverged for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_overflowing_integer_text_uses_real_arithmetic_path() {
+        let overflow = SqliteValue::Text(SmallText::new("9223372036854775808"));
+        let zero = SqliteValue::Integer(0);
+        let one = SqliteValue::Integer(1);
+        assert!(matches!(overflow.sql_add(&zero), SqliteValue::Float(_)));
+        assert!(matches!(overflow.sql_sub(&zero), SqliteValue::Float(_)));
+        assert!(matches!(overflow.sql_mul(&one), SqliteValue::Float(_)));
+        assert_eq!(
+            SqliteValue::Text(SmallText::new("not-numeric")).sql_add(&zero),
+            SqliteValue::Integer(0)
+        );
     }
 
     #[test]
