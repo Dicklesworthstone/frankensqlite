@@ -19,7 +19,9 @@ on:
     branches:
       - main
     paths:
-      - ".github/workflows/lint.yml"
+      - ".github/workflows/**"
+      - ".github/e2e-tests-not-run-in-ci.txt"
+      - "scripts/ci_e2e_test_discovery_gate.sh"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -28,6 +30,22 @@ on:
       - "benches/**"
 
 jobs:
+  # bd-ohk1x: an fsqlite-e2e integration test that no workflow names will
+  # COMPILE in CI and never EXECUTE, so it gates nothing while reading as
+  # coverage. This catches that drift. It is intentionally a static check with
+  # no toolchain and no build, so it runs in seconds and cannot be skipped for
+  # being slow.
+  e2e-test-discovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Every fsqlite-e2e test is either run by CI or explicitly baselined
+        shell: bash
+        run: scripts/ci_e2e_test_discovery_gate.sh
+
   fmt:
     runs-on: ubuntu-latest
     timeout-minutes: 15
