@@ -3350,9 +3350,14 @@ pub trait Fts5Tokenizer: Send + Sync {
 /// term unqueryable. Skipping matches that observable outcome — the term is
 /// not findable — while keeping the write path total, and matches the
 /// mainstream-engine convention (Lucene rejects >32 KiB terms outright,
-/// Elasticsearch `ignore_above` drops them). One position slot is lost per
-/// skipped token relative to C's poslists; that documented divergence only
-/// affects phrase queries spanning a pathological token.
+/// Elasticsearch `ignore_above` drops them). Divergences from C are
+/// documented rather than hidden: one position slot is lost per skipped
+/// token, so phrase and NEAR windows spanning a pathological token shift by
+/// one; a MATCH query that itself contains an overlong term drops it during
+/// query tokenization (C parses the term and finds nothing, returning zero
+/// rows, where our AND/NEAR/phrase behaves as if the term were absent —
+/// strictly broader results); and a `prefix*` query can never reach a
+/// skipped term even when the prefix itself is under the cap.
 pub const FTS5_MAX_TERM_BYTES: usize = 1024;
 
 /// Decorator applied by [`Fts5Table::create_tokenizer_instance`] so every
@@ -3363,6 +3368,11 @@ pub const FTS5_MAX_TERM_BYTES: usize = 1024;
 /// exactly as indexing did.
 struct MaxTokenLenTokenizer {
     inner: Box<dyn Fts5Tokenizer>,
+    /// First skip per tokenizer instance logs at `warn!`; the rest drop to
+    /// `debug!`. A single minified bundle can hold thousands of overlong
+    /// blobs, and hydration/rebuild re-tokenizes the whole corpus — per-token
+    /// warns would flood logs with an identical, already-actioned message.
+    warned_overlong: std::sync::atomic::AtomicBool,
 }
 
 impl Fts5Tokenizer for MaxTokenLenTokenizer {
@@ -3374,11 +3384,22 @@ impl Fts5Tokenizer for MaxTokenLenTokenizer {
         self.inner
             .visit_tokens(text, &mut |term, start, end, colocated| {
                 if term.len() > FTS5_MAX_TERM_BYTES {
-                    tracing::warn!(
-                        term_bytes = term.len(),
-                        max_term_bytes = FTS5_MAX_TERM_BYTES,
-                        "fts5: skipping overlong term instead of failing the segment write (cass#362)"
-                    );
+                    if self
+                        .warned_overlong
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        tracing::debug!(
+                            term_bytes = term.len(),
+                            max_term_bytes = FTS5_MAX_TERM_BYTES,
+                            "fts5: skipping overlong term instead of failing the segment write (cass#362)"
+                        );
+                    } else {
+                        tracing::warn!(
+                            term_bytes = term.len(),
+                            max_term_bytes = FTS5_MAX_TERM_BYTES,
+                            "fts5: skipping overlong term instead of failing the segment write (cass#362); further skips log at debug level"
+                        );
+                    }
                     return;
                 }
                 sink(term, start, end, colocated);
@@ -3395,6 +3416,7 @@ impl Fts5Tokenizer for MaxTokenLenTokenizer {
 fn create_capped_tokenizer(name: &str) -> Box<dyn Fts5Tokenizer> {
     Box::new(MaxTokenLenTokenizer {
         inner: create_tokenizer(name).unwrap_or_else(|| Box::new(Unicode61Tokenizer::new())),
+        warned_overlong: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
