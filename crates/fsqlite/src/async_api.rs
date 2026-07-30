@@ -37,10 +37,15 @@ use crate::{Connection, ConnectionEnv, FrankenError, Row, SqliteValue};
 use asupersync::channel::oneshot;
 use asupersync::cx::Cx as NativeCx;
 use asupersync::runtime::Runtime;
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 use fsqlite_types::cx::Cx;
 use futures_lite::future;
+use std::any::Any;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -58,6 +63,62 @@ const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 // worker, so reserving a larger stack here is bounded per connection and keeps
 // that implementation detail off both synchronous and asynchronous callers.
 const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerPhase {
+    Idle,
+    InTransaction,
+    Closing,
+    Terminal,
+}
+
+struct WorkerState {
+    phase: AtomicU8,
+    #[cfg(test)]
+    cleanup_calls: AtomicUsize,
+    #[cfg(test)]
+    panic_on_cleanup: AtomicBool,
+}
+
+impl WorkerState {
+    fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(WorkerPhase::Idle as u8),
+            #[cfg(test)]
+            cleanup_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            panic_on_cleanup: AtomicBool::new(false),
+        }
+    }
+
+    fn publish_connection_state(&self, conn: &Connection) {
+        let phase = if conn.in_transaction() {
+            WorkerPhase::InTransaction
+        } else {
+            WorkerPhase::Idle
+        };
+        self.phase.store(phase as u8, Ordering::Release);
+    }
+
+    fn publish_phase(&self, phase: WorkerPhase) {
+        self.phase.store(phase as u8, Ordering::Release);
+    }
+
+    fn in_transaction(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == WorkerPhase::InTransaction as u8
+    }
+
+    #[cfg(test)]
+    fn phase(&self) -> WorkerPhase {
+        match self.phase.load(Ordering::Acquire) {
+            value if value == WorkerPhase::InTransaction as u8 => WorkerPhase::InTransaction,
+            value if value == WorkerPhase::Closing as u8 => WorkerPhase::Closing,
+            value if value == WorkerPhase::Terminal as u8 => WorkerPhase::Terminal,
+            _ => WorkerPhase::Idle,
+        }
+    }
+}
 
 /// A command sent from an async method to the worker thread.
 enum Command {
@@ -118,10 +179,15 @@ enum Command {
     LastInsertRowid {
         tx: Responder<i64>,
     },
-    Close {
-        tx: Responder<()>,
-    },
+    Close,
     Shutdown,
+    #[cfg(test)]
+    BlockForTest {
+        entered_tx: mpsc::SyncSender<()>,
+        release_rx: mpsc::Receiver<()>,
+    },
+    #[cfg(test)]
+    PanicForTest,
 }
 
 fn worker_open_err() -> FrankenError {
@@ -147,8 +213,6 @@ fn worker_thread_spawn_err(error: std::io::Error) -> FrankenError {
     FrankenError::Internal(format!("failed to spawn async-api worker thread: {error}"))
 }
 
-fn blocking_wait_send_err<T>(_: oneshot::SendError<Result<T, FrankenError>>) {}
-
 fn native_cx_for_local<Caps: fsqlite_types::cx::cap::SubsetOf<fsqlite_types::cx::cap::All>>(
     cx: &Cx<Caps>,
 ) -> Result<NativeCx, FrankenError> {
@@ -167,14 +231,11 @@ async fn recv_sync_response<
     let runtime = Runtime::current_handle().ok_or_else(requires_runtime_err)?;
     let pool = runtime.blocking_handle().ok_or_else(requires_runtime_err)?;
     let native_cx = native_cx_for_local(cx)?;
-    let waiter_cx = native_cx.clone();
     let (result_tx, mut result_rx) = oneshot::channel::<Result<T, FrankenError>>();
 
     pool.spawn(move || {
         let result = rx.recv().map_err(|_| worker_dead_err());
-        let _ = result_tx
-            .send(&waiter_cx, result)
-            .map_err(blocking_wait_send_err);
+        let _ = result_tx.send_blocking(result);
     });
 
     match result_rx.recv(&native_cx).await {
@@ -194,24 +255,47 @@ fn recv_worker_response<T>(rx: mpsc::Receiver<Result<T, FrankenError>>) -> Resul
 // Worker task
 // ---------------------------------------------------------------------------
 
-fn worker_loop(mut conn: Connection, rx: mpsc::Receiver<Command>) {
+enum WorkerStop {
+    ExplicitClose,
+    Shutdown,
+    CommandChannelDisconnected,
+}
+
+fn publish_and_respond<T>(
+    conn: &Connection,
+    state: &WorkerState,
+    tx: Responder<T>,
+    result: Result<T, FrankenError>,
+) {
+    // The worker publishes the engine's actual state before making the command
+    // result visible. This also covers transaction control expressed as SQL
+    // text and rollback-on-error paths, not just the convenience methods.
+    state.publish_connection_state(conn);
+    let _ = tx.send(result);
+}
+
+fn worker_loop(conn: &Connection, rx: &mpsc::Receiver<Command>, state: &WorkerState) -> WorkerStop {
     loop {
         let cmd = match rx.recv_timeout(WORKER_POLL_INTERVAL) {
             Ok(cmd) => cmd,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return WorkerStop::CommandChannelDisconnected;
+            }
         };
 
         match cmd {
             Command::Prepare { sql, tx } => {
                 let result = future::block_on(conn.prepare(&sql)).map(drop);
-                let _ = tx.send(result);
+                publish_and_respond(conn, state, tx, result);
             }
             Command::Query { sql, tx } => {
-                let _ = tx.send(future::block_on(conn.query(&sql)));
+                let result = future::block_on(conn.query(&sql));
+                publish_and_respond(conn, state, tx, result);
             }
             Command::QueryWithParams { sql, params, tx } => {
-                let _ = tx.send(future::block_on(conn.query_with_params(&sql, &params)));
+                let result = future::block_on(conn.query_with_params(&sql, &params));
+                publish_and_respond(conn, state, tx, result);
             }
             Command::QueryWithParamsStream { sql, params, tx } => {
                 let result =
@@ -219,6 +303,7 @@ fn worker_loop(mut conn: Connection, rx: mpsc::Receiver<Command>) {
                         tx.send(Ok(Some(row.clone())))
                             .map_err(|_| stream_consumer_dead_err())
                     }));
+                state.publish_connection_state(conn);
                 match result {
                     Ok(()) => {
                         let _ = tx.send(Ok(None));
@@ -229,16 +314,20 @@ fn worker_loop(mut conn: Connection, rx: mpsc::Receiver<Command>) {
                 }
             }
             Command::QueryRow { sql, tx } => {
-                let _ = tx.send(future::block_on(conn.query_row(&sql)));
+                let result = future::block_on(conn.query_row(&sql));
+                publish_and_respond(conn, state, tx, result);
             }
             Command::QueryRowWithParams { sql, params, tx } => {
-                let _ = tx.send(future::block_on(conn.query_row_with_params(&sql, &params)));
+                let result = future::block_on(conn.query_row_with_params(&sql, &params));
+                publish_and_respond(conn, state, tx, result);
             }
             Command::Execute { sql, tx } => {
-                let _ = tx.send(future::block_on(conn.execute(&sql)));
+                let result = future::block_on(conn.execute(&sql));
+                publish_and_respond(conn, state, tx, result);
             }
             Command::ExecuteWithParams { sql, params, tx } => {
-                let _ = tx.send(future::block_on(conn.execute_with_params(&sql, &params)));
+                let result = future::block_on(conn.execute_with_params(&sql, &params));
+                publish_and_respond(conn, state, tx, result);
             }
             Command::ExecuteManyWithParamsInTransaction {
                 sql,
@@ -251,41 +340,112 @@ fn worker_loop(mut conn: Connection, rx: mpsc::Receiver<Command>) {
                         &parameter_sets,
                     ),
                 );
-                let _ = tx.send(result);
+                publish_and_respond(conn, state, tx, result);
             }
             Command::ExecuteBatch { sql, tx } => {
-                let _ = tx.send(future::block_on(conn.execute_batch(&sql)));
+                let result = future::block_on(conn.execute_batch(&sql));
+                publish_and_respond(conn, state, tx, result);
             }
             Command::BeginTransaction { tx } => {
-                let _ = tx.send(future::block_on(conn.begin_transaction()));
+                let result = future::block_on(conn.begin_transaction());
+                publish_and_respond(conn, state, tx, result);
             }
             Command::CommitTransaction { tx } => {
-                let _ = tx.send(future::block_on(conn.commit_transaction()));
+                let result = future::block_on(conn.commit_transaction());
+                publish_and_respond(conn, state, tx, result);
             }
             Command::RollbackTransaction { tx } => {
-                let _ = tx.send(future::block_on(conn.rollback_transaction()));
+                let result = future::block_on(conn.rollback_transaction());
+                publish_and_respond(conn, state, tx, result);
             }
             Command::LastInsertRowid { tx } => {
-                let _ = tx.send(Ok(conn.last_insert_rowid()));
+                let result = Ok(conn.last_insert_rowid());
+                publish_and_respond(conn, state, tx, result);
             }
-            Command::Close { tx } => {
-                // Close the connection explicitly (rolls back any active txn,
-                // runs a passive WAL checkpoint).
-                let _ = tx.send(future::block_on(conn.close_in_place()));
-                return;
+            Command::Close => {
+                return WorkerStop::ExplicitClose;
             }
             Command::Shutdown => {
-                return;
+                return WorkerStop::Shutdown;
+            }
+            #[cfg(test)]
+            Command::BlockForTest {
+                entered_tx,
+                release_rx,
+            } => {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            }
+            #[cfg(test)]
+            Command::PanicForTest => {
+                panic!("async worker command panic sentinel");
             }
         }
     }
 }
 
-struct WorkerHandle(JoinHandle<()>);
+fn panic_payload_text(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_owned()
+    } else {
+        "non-string panic payload".to_owned()
+    }
+}
+
+fn run_worker_to_terminal(
+    mut conn: Connection,
+    rx: mpsc::Receiver<Command>,
+    state: &WorkerState,
+) -> Result<(), FrankenError> {
+    let loop_result = catch_unwind(AssertUnwindSafe(|| worker_loop(&conn, &rx, state)));
+
+    state.publish_phase(WorkerPhase::Closing);
+    let cleanup_result = catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(test)]
+        {
+            state.cleanup_calls.fetch_add(1, Ordering::AcqRel);
+            if state.panic_on_cleanup.swap(false, Ordering::AcqRel) {
+                panic!("async worker cleanup panic sentinel");
+            }
+        }
+        future::block_on(conn.close_in_place())
+    }));
+    state.publish_phase(WorkerPhase::Terminal);
+
+    match (loop_result, cleanup_result) {
+        (Ok(_), Ok(result)) => result,
+        (Ok(_), Err(cleanup_panic)) => Err(FrankenError::Internal(format!(
+            "async worker cleanup panicked: {}",
+            panic_payload_text(cleanup_panic.as_ref())
+        ))),
+        (Err(worker_panic), Ok(Ok(()))) => Err(FrankenError::Internal(format!(
+            "async worker command loop panicked: {}",
+            panic_payload_text(worker_panic.as_ref())
+        ))),
+        (Err(worker_panic), Ok(Err(cleanup_error))) => Err(FrankenError::Internal(format!(
+            "async worker command loop panicked: {}; close cleanup also failed: {cleanup_error}",
+            panic_payload_text(worker_panic.as_ref())
+        ))),
+        (Err(worker_panic), Err(cleanup_panic)) => Err(FrankenError::Internal(format!(
+            "async worker command loop panicked: {}; close cleanup also panicked: {}",
+            panic_payload_text(worker_panic.as_ref()),
+            panic_payload_text(cleanup_panic.as_ref())
+        ))),
+    }
+}
+
+struct WorkerHandle(JoinHandle<Result<(), FrankenError>>);
 
 impl WorkerHandle {
-    fn wait(self) {
-        let _ = self.0.join();
+    fn wait(self) -> Result<(), FrankenError> {
+        self.0.join().map_err(|panic| {
+            FrankenError::Internal(format!(
+                "async worker thread panicked outside its terminal guard: {}",
+                panic_payload_text(panic.as_ref())
+            ))
+        })?
     }
 }
 
@@ -294,6 +454,7 @@ fn spawn_worker_thread(
     env: ConnectionEnv,
     cmd_rx: mpsc::Receiver<Command>,
     open_tx: mpsc::SyncSender<Result<(), FrankenError>>,
+    state: Arc<WorkerState>,
 ) -> Result<WorkerHandle, FrankenError> {
     thread::Builder::new()
         .name("fsqlite-worker".to_owned())
@@ -311,10 +472,12 @@ fn spawn_worker_thread(
                     // blocking_io_inline_marker_has_exactly_one_set_site).
                     conn.root_cx().mark_blocking_io_inline_safe();
                     let _ = open_tx.send(Ok(()));
-                    worker_loop(conn, cmd_rx);
+                    run_worker_to_terminal(conn, cmd_rx, &state)
                 }
                 Err(error) => {
+                    state.publish_phase(WorkerPhase::Terminal);
                     let _ = open_tx.send(Err(error));
+                    Ok(())
                 }
             },
         )
@@ -328,8 +491,39 @@ fn wait_for_worker_open(
     open_rx.recv().map_err(|_| worker_open_err())?
 }
 
-fn join_worker_task(handle: WorkerHandle) {
-    handle.wait();
+fn spawn_worker_join(
+    pool: &BlockingPoolHandle,
+    worker: WorkerHandle,
+) -> mpsc::Receiver<Result<(), FrankenError>> {
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let _join_task = pool.spawn(move || {
+        let _ = result_tx.send(worker.wait());
+    });
+    result_rx
+}
+
+async fn wait_for_worker_async(
+    native_cx: &NativeCx,
+    pool: &BlockingPoolHandle,
+    worker: WorkerHandle,
+) -> Result<(), FrankenError> {
+    let (result_tx, mut result_rx) = oneshot::channel::<Result<(), FrankenError>>();
+
+    // Join and publish from one blocking-pool job. Routing this through
+    // `recv_sync_response` would enqueue a second blocking receiver behind the
+    // join; a one-thread pool could then deadlock if that receiver ran first.
+    pool.spawn(move || {
+        let result = worker.wait();
+        let _ = result_tx.send_blocking(result);
+    });
+
+    match result_rx.recv(native_cx).await {
+        Ok(result) => result,
+        Err(oneshot::RecvError::Cancelled) => Err(FrankenError::Interrupt),
+        Err(oneshot::RecvError::Closed | oneshot::RecvError::PolledAfterCompletion) => {
+            Err(worker_dead_err())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -375,11 +569,10 @@ fn send_err<T>(_: mpsc::SendError<T>) -> FrankenError {
 pub struct AsyncConnection {
     cmd_tx: Option<mpsc::SyncSender<Command>>,
     worker: Option<WorkerHandle>,
-    /// Tracks whether the worker thread's connection has an active transaction.
-    /// Updated by `begin_transaction`, `commit_transaction`, and
-    /// `rollback_transaction` to allow `in_transaction()` to be a cheap local
-    /// read without a round-trip to the worker.
-    in_txn: Arc<AtomicBool>,
+    /// Worker-published transaction and terminal phase. The dedicated worker is
+    /// the only writer, so cancellation cannot leave caller-maintained state
+    /// behind the engine's actual transaction state.
+    state: Arc<WorkerState>,
 }
 
 impl AsyncConnection {
@@ -413,18 +606,19 @@ impl AsyncConnection {
         let path = path.into();
         let (open_tx, open_rx) = mpsc::sync_channel::<Result<(), FrankenError>>(1);
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(32);
-        let worker = spawn_worker_thread(path, env, cmd_rx, open_tx)?;
+        let state = Arc::new(WorkerState::new());
+        let worker = spawn_worker_thread(path, env, cmd_rx, open_tx, Arc::clone(&state))?;
 
         match wait_for_worker_open(open_rx) {
             Ok(()) => Ok(Self {
                 cmd_tx: Some(cmd_tx),
                 worker: Some(worker),
-                in_txn: Arc::new(AtomicBool::new(false)),
+                state,
             }),
-            Err(error) => {
-                join_worker_task(worker);
-                Err(error)
-            }
+            Err(error) => match worker.wait() {
+                Ok(()) => Err(error),
+                Err(worker_error) => Err(worker_error),
+            },
         }
     }
 
@@ -447,22 +641,38 @@ impl AsyncConnection {
         let (open_tx, open_rx) = mpsc::sync_channel::<Result<(), FrankenError>>(1);
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(32);
         let runtime = Runtime::current_handle().ok_or_else(requires_runtime_err)?;
-        runtime.blocking_handle().ok_or_else(requires_runtime_err)?;
-        let worker = spawn_worker_thread(path, env, cmd_rx, open_tx)?;
+        let pool = runtime.blocking_handle().ok_or_else(requires_runtime_err)?;
+        let native_cx = native_cx_for_local(cx)?;
+        let state = Arc::new(WorkerState::new());
+        let worker = spawn_worker_thread(path, env, cmd_rx, open_tx, Arc::clone(&state))?;
 
-        // Wait for the open result. Cancellation after dispatch still drains
-        // the newly born worker before returning; dropping the command sender
-        // first releases a successfully opened worker from its receive loop.
+        // Wait for the open result. On cancellation, dropping the command
+        // sender releases a successfully opened worker from its receive loop,
+        // while the blocking pool owns the OS-thread join to completion.
         match recv_sync_response(cx, open_rx).await {
             Ok(Ok(())) => Ok(Self {
                 cmd_tx: Some(cmd_tx),
                 worker: Some(worker),
-                in_txn: Arc::new(AtomicBool::new(false)),
+                state,
             }),
-            Ok(Err(error)) | Err(error) => {
+            Ok(Err(error)) => {
                 drop(cmd_tx);
-                join_worker_task(worker);
-                Err(error)
+                match wait_for_worker_async(&native_cx, &pool, worker).await {
+                    Ok(()) | Err(FrankenError::Interrupt) => Err(error),
+                    Err(worker_error) => Err(worker_error),
+                }
+            }
+            Err(FrankenError::Interrupt) => {
+                drop(cmd_tx);
+                let _join_rx = spawn_worker_join(&pool, worker);
+                Err(FrankenError::Interrupt)
+            }
+            Err(error) => {
+                drop(cmd_tx);
+                match wait_for_worker_async(&native_cx, &pool, worker).await {
+                    Ok(()) | Err(FrankenError::Interrupt) => Err(error),
+                    Err(worker_error) => Err(worker_error),
+                }
             }
         }
     }
@@ -646,11 +856,7 @@ impl AsyncConnection {
         self.sender()?
             .send(Command::BeginTransaction { tx })
             .map_err(send_err)?;
-        let result = recv_worker_response(rx);
-        if result.is_ok() {
-            self.in_txn.store(true, Ordering::Release);
-        }
-        result
+        recv_worker_response(rx)
     }
 
     /// Commit the active transaction through the dedicated worker.
@@ -659,11 +865,7 @@ impl AsyncConnection {
         self.sender()?
             .send(Command::CommitTransaction { tx })
             .map_err(send_err)?;
-        let result = recv_worker_response(rx);
-        if result.is_ok() {
-            self.in_txn.store(false, Ordering::Release);
-        }
-        result
+        recv_worker_response(rx)
     }
 
     /// Roll back the active transaction through the dedicated worker.
@@ -672,11 +874,7 @@ impl AsyncConnection {
         self.sender()?
             .send(Command::RollbackTransaction { tx })
             .map_err(send_err)?;
-        let result = recv_worker_response(rx);
-        if result.is_ok() {
-            self.in_txn.store(false, Ordering::Release);
-        }
-        result
+        recv_worker_response(rx)
     }
 
     /// Return the worker-owned connection's last inserted row identifier.
@@ -828,11 +1026,7 @@ impl AsyncConnection {
         self.sender()?
             .send(Command::BeginTransaction { tx })
             .map_err(send_err)?;
-        let result: Result<(), FrankenError> = recv_sync_response(cx, rx).await?;
-        if result.is_ok() {
-            self.in_txn.store(true, Ordering::Release);
-        }
-        result
+        recv_sync_response(cx, rx).await?
     }
 
     /// Commit the active transaction.
@@ -845,11 +1039,7 @@ impl AsyncConnection {
         self.sender()?
             .send(Command::CommitTransaction { tx })
             .map_err(send_err)?;
-        let result: Result<(), FrankenError> = recv_sync_response(cx, rx).await?;
-        if result.is_ok() {
-            self.in_txn.store(false, Ordering::Release);
-        }
-        result
+        recv_sync_response(cx, rx).await?
     }
 
     /// Roll back the active transaction.
@@ -862,11 +1052,7 @@ impl AsyncConnection {
         self.sender()?
             .send(Command::RollbackTransaction { tx })
             .map_err(send_err)?;
-        let result: Result<(), FrankenError> = recv_sync_response(cx, rx).await?;
-        if result.is_ok() {
-            self.in_txn.store(false, Ordering::Release);
-        }
-        result
+        recv_sync_response(cx, rx).await?
     }
 
     /// Returns `true` if an explicit transaction is currently active.
@@ -874,7 +1060,7 @@ impl AsyncConnection {
     /// This is a cheap local read — no round-trip to the worker thread.
     #[must_use]
     pub fn in_transaction(&self) -> bool {
-        self.in_txn.load(Ordering::Acquire)
+        self.state.in_transaction()
     }
 
     /// Explicitly close the connection, returning any error from the close operation.
@@ -886,48 +1072,50 @@ impl AsyncConnection {
         Caps: fsqlite_types::cx::cap::SubsetOf<fsqlite_types::cx::cap::All>,
     {
         checkpoint_or_interrupt(cx)?;
+        let runtime = Runtime::current_handle().ok_or_else(requires_runtime_err)?;
+        let pool = runtime.blocking_handle().ok_or_else(requires_runtime_err)?;
+        let native_cx = native_cx_for_local(cx)?;
 
-        if let Some(cmd_tx) = self.cmd_tx.take() {
-            let (tx, rx) = mpsc::sync_channel(1);
-            cmd_tx.send(Command::Close { tx }).map_err(send_err)?;
-            let result = recv_sync_response(cx, rx).await?;
-
-            if let Some(handle) = self.worker.take() {
-                join_worker_task(handle);
-            }
-
-            result
-        } else {
-            // Already closed.
-            Ok(())
+        let cmd_tx = self.cmd_tx.take();
+        let worker = self.worker.take();
+        if cmd_tx.is_none() && worker.is_none() {
+            return Ok(());
         }
+
+        if let Some(cmd_tx) = cmd_tx {
+            let _ = cmd_tx.try_send(Command::Close);
+            drop(cmd_tx);
+        }
+
+        let worker = worker.ok_or_else(worker_dead_err)?;
+        wait_for_worker_async(&native_cx, &pool, worker).await
     }
 
     /// Explicitly close a synchronously used connection and join its worker.
     pub fn close_sync(&mut self) -> Result<(), FrankenError> {
-        if let Some(cmd_tx) = self.cmd_tx.take() {
-            let (tx, rx) = mpsc::sync_channel(1);
-            cmd_tx.send(Command::Close { tx }).map_err(send_err)?;
-            let result = recv_worker_response(rx);
-
-            if let Some(handle) = self.worker.take() {
-                join_worker_task(handle);
-            }
-
-            result
-        } else {
-            Ok(())
+        let cmd_tx = self.cmd_tx.take();
+        let worker = self.worker.take();
+        if cmd_tx.is_none() && worker.is_none() {
+            return Ok(());
         }
+
+        if let Some(cmd_tx) = cmd_tx {
+            let _ = cmd_tx.try_send(Command::Close);
+            drop(cmd_tx);
+        }
+
+        worker.ok_or_else(worker_dead_err)?.wait()
     }
 }
 
 impl Drop for AsyncConnection {
     fn drop(&mut self) {
         if let Some(cmd_tx) = self.cmd_tx.take() {
-            let _ = cmd_tx.send(Command::Shutdown);
+            let _ = cmd_tx.try_send(Command::Shutdown);
+            drop(cmd_tx);
         }
         if let Some(handle) = self.worker.take() {
-            join_worker_task(handle);
+            let _ = handle.wait();
         }
     }
 }
@@ -1019,6 +1207,197 @@ mod tests {
             let rows = conn.query(&cx, "SELECT * FROM t").await.expect("query");
             assert_eq!(rows.len(), 1);
         });
+    }
+
+    #[test]
+    fn transaction_state_is_worker_published_when_response_is_abandoned() {
+        let mut conn = AsyncConnection::open_sync(":memory:").expect("open should succeed");
+
+        let (begin_tx, begin_rx) = mpsc::sync_channel(1);
+        drop(begin_rx);
+        conn.sender()
+            .expect("worker sender")
+            .send(Command::BeginTransaction { tx: begin_tx })
+            .expect("begin command should be admitted");
+        conn.last_insert_rowid_sync()
+            .expect("FIFO barrier after abandoned begin response");
+        assert!(
+            conn.in_transaction(),
+            "worker state must publish before the abandoned response"
+        );
+
+        let (rollback_tx, rollback_rx) = mpsc::sync_channel(1);
+        drop(rollback_rx);
+        conn.sender()
+            .expect("worker sender")
+            .send(Command::RollbackTransaction { tx: rollback_tx })
+            .expect("rollback command should be admitted");
+        conn.last_insert_rowid_sync()
+            .expect("FIFO barrier after abandoned rollback response");
+        assert!(
+            !conn.in_transaction(),
+            "worker state must remain correct when rollback response is abandoned"
+        );
+
+        conn.close_sync().expect("close should succeed");
+    }
+
+    #[test]
+    fn textual_transaction_control_updates_worker_published_state() {
+        let mut conn = AsyncConnection::open_sync(":memory:").expect("open should succeed");
+
+        conn.execute_sync("BEGIN")
+            .expect("textual BEGIN should succeed");
+        assert!(conn.in_transaction());
+
+        conn.execute_batch_sync("ROLLBACK; BEGIN; COMMIT;")
+            .expect("textual transaction batch should succeed");
+        assert!(
+            !conn.in_transaction(),
+            "final engine state after a transaction batch must be published"
+        );
+
+        conn.close_sync().expect("close should succeed");
+    }
+
+    fn assert_terminal_cleanup_once(state: &WorkerState) {
+        assert_eq!(state.phase(), WorkerPhase::Terminal);
+        assert_eq!(
+            state.cleanup_calls.load(Ordering::Acquire),
+            1,
+            "each successfully opened worker must attempt connection cleanup exactly once"
+        );
+    }
+
+    #[test]
+    fn cleanup_runs_once_for_every_worker_exit() {
+        {
+            let mut conn =
+                AsyncConnection::open_sync(":memory:").expect("explicit-close worker should open");
+            let state = Arc::clone(&conn.state);
+            conn.close_sync().expect("explicit close should succeed");
+            assert_terminal_cleanup_once(&state);
+        }
+
+        {
+            let mut conn =
+                AsyncConnection::open_sync(":memory:").expect("shutdown worker should open");
+            let state = Arc::clone(&conn.state);
+            let sender = conn.cmd_tx.take().expect("shutdown sender");
+            sender
+                .try_send(Command::Shutdown)
+                .expect("shutdown command should fit");
+            drop(sender);
+            conn.worker
+                .take()
+                .expect("shutdown worker handle")
+                .wait()
+                .expect("shutdown cleanup should succeed");
+            assert_terminal_cleanup_once(&state);
+        }
+
+        {
+            let mut conn =
+                AsyncConnection::open_sync(":memory:").expect("disconnect worker should open");
+            let state = Arc::clone(&conn.state);
+            drop(conn.cmd_tx.take().expect("disconnect sender"));
+            conn.worker
+                .take()
+                .expect("disconnect worker handle")
+                .wait()
+                .expect("disconnect cleanup should succeed");
+            assert_terminal_cleanup_once(&state);
+        }
+
+        {
+            let mut conn =
+                AsyncConnection::open_sync(":memory:").expect("panic worker should open");
+            let state = Arc::clone(&conn.state);
+            conn.sender()
+                .expect("panic sender")
+                .send(Command::PanicForTest)
+                .expect("panic command should be admitted");
+            let error = conn
+                .close_sync()
+                .expect_err("worker panic must be reported by close");
+            assert!(
+                error
+                    .to_string()
+                    .contains("async worker command panic sentinel"),
+                "unexpected worker panic diagnostic: {error}"
+            );
+            assert_terminal_cleanup_once(&state);
+        }
+    }
+
+    #[test]
+    fn cleanup_panic_is_reported_and_still_publishes_terminal_state() {
+        let mut conn = AsyncConnection::open_sync(":memory:").expect("worker should open");
+        let state = Arc::clone(&conn.state);
+        state.panic_on_cleanup.store(true, Ordering::Release);
+
+        let error = conn
+            .close_sync()
+            .expect_err("cleanup panic must be reported");
+        assert!(
+            error
+                .to_string()
+                .contains("async worker cleanup panic sentinel"),
+            "unexpected cleanup panic diagnostic: {error}"
+        );
+        assert_terminal_cleanup_once(&state);
+    }
+
+    #[test]
+    fn async_close_does_not_join_on_the_runtime_thread() {
+        let mut conn = AsyncConnection::open_sync(":memory:").expect("worker should open");
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        conn.sender()
+            .expect("worker sender")
+            .send(Command::BlockForTest {
+                entered_tx,
+                release_rx,
+            })
+            .expect("blocking test command should be admitted");
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker should enter deterministic gate");
+
+        let watchdog_timed_out = Arc::new(AtomicBool::new(false));
+        let watchdog_timed_out_in_thread = Arc::clone(&watchdog_timed_out);
+        let release_from_watchdog = release_tx.clone();
+        let (watchdog_cancel_tx, watchdog_cancel_rx) = mpsc::sync_channel(1);
+        let watchdog = thread::spawn(move || {
+            if watchdog_cancel_rx
+                .recv_timeout(Duration::from_secs(5))
+                .is_err()
+            {
+                watchdog_timed_out_in_thread.store(true, Ordering::Release);
+                let _ = release_from_watchdog.send(());
+            }
+        });
+
+        RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("single-blocking-thread test runtime should build")
+            .block_on(async {
+                let cx = Cx::new();
+                let close = conn.close(&cx);
+                let release = async move {
+                    let _ = release_tx.send(());
+                    let _ = watchdog_cancel_tx.send(());
+                };
+                let (close_result, ()) = future::zip(close, release).await;
+                close_result.expect("async close should succeed");
+            });
+
+        watchdog.join().expect("watchdog should not panic");
+        assert!(
+            !watchdog_timed_out.load(Ordering::Acquire),
+            "async close blocked the current-thread runtime before its sibling could run"
+        );
     }
 
     #[test]

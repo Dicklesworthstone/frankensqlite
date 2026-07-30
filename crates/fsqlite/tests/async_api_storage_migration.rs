@@ -283,3 +283,94 @@ fn sync_facade_owns_storage_futures_on_its_worker() {
         .expect("explicit sync close should complete");
     assert!(connection.query_sync("SELECT 1").is_err());
 }
+
+#[test]
+fn async_explicit_close_rolls_back_uncommitted_file_transaction() {
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(2, 2)
+        .build()
+        .expect("test runtime should build");
+
+    runtime.block_on(async {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database_path = directory.path().join("async-close-rollback.db");
+        let database_path = database_path.to_string_lossy().into_owned();
+        let cx = Cx::new();
+
+        let mut connection = AsyncConnection::open(&cx, database_path.clone())
+            .await
+            .expect("file-backed async connection should open");
+        connection
+            .execute(
+                &cx,
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            )
+            .await
+            .expect("schema should be created");
+        connection
+            .begin_transaction(&cx)
+            .await
+            .expect("transaction should begin");
+        connection
+            .execute(&cx, "INSERT INTO items VALUES (1, 'uncommitted')")
+            .await
+            .expect("uncommitted insert should succeed");
+        assert!(connection.in_transaction());
+
+        connection
+            .close(&cx)
+            .await
+            .expect("explicit close should roll back and finish cleanup");
+
+        let mut reopened = AsyncConnection::open(&cx, database_path)
+            .await
+            .expect("database should reopen after explicit close");
+        assert!(
+            reopened
+                .query(&cx, "SELECT id FROM items")
+                .await
+                .expect("reopened table should be queryable")
+                .is_empty(),
+            "an uncommitted row must not survive explicit async close"
+        );
+        reopened
+            .close(&cx)
+            .await
+            .expect("reopened connection should close");
+    });
+}
+
+#[test]
+fn sync_drop_rolls_back_uncommitted_file_transaction() {
+    let directory = tempfile::tempdir().expect("temporary database directory");
+    let database_path = directory.path().join("sync-drop-rollback.db");
+    let database_path = database_path.to_string_lossy().into_owned();
+
+    {
+        let connection = AsyncConnection::open_sync(database_path.clone())
+            .expect("file-backed sync connection should open");
+        connection
+            .execute_sync("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .expect("schema should be created");
+        connection
+            .begin_transaction_sync()
+            .expect("transaction should begin");
+        connection
+            .execute_sync("INSERT INTO items VALUES (1, 'uncommitted')")
+            .expect("uncommitted insert should succeed");
+        assert!(connection.in_transaction());
+    }
+
+    let mut reopened = AsyncConnection::open_sync(database_path)
+        .expect("database should reopen after synchronous drop");
+    assert!(
+        reopened
+            .query_sync("SELECT id FROM items")
+            .expect("reopened table should be queryable")
+            .is_empty(),
+        "an uncommitted row must not survive synchronous facade drop"
+    );
+    reopened
+        .close_sync()
+        .expect("reopened sync connection should close");
+}
