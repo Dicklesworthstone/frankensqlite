@@ -29,6 +29,7 @@ evalue-eviction = []
 foldhash = "0.2.0"
 smallvec = { version = "1.15.2", features = ["const_generics", "union", "const_new"] }
 bumpalo = { version = "3", features = ["collections"] }
+crossbeam-queue = { workspace = true }
 fsqlite-types = { path = "../fsqlite-types", version = "0.1.19", default-features = false }
 fsqlite-error = { path = "../fsqlite-error", version = "0.1.19" }
 fsqlite-observability = { workspace = true }

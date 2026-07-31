@@ -440,7 +440,7 @@ fn execute_batch_pragma_blocks() {
 #[test]
 fn transaction_commit_persists_data() {
     asupersync::test_utils::run_test(|| async {
-        let conn = Connection::open(":memory:").await.unwrap();
+        let mut conn = Connection::open(":memory:").await.unwrap();
         conn.execute("CREATE TABLE t(val TEXT)").await.unwrap();
 
         {
@@ -463,11 +463,11 @@ fn transaction_commit_persists_data() {
 #[test]
 fn transaction_drop_without_commit_rolls_back() {
     asupersync::test_utils::run_test(|| async {
-        let conn = Connection::open(":memory:").await.unwrap();
+        let mut conn = Connection::open(":memory:").await.unwrap();
         conn.execute("CREATE TABLE t(val TEXT)").await.unwrap();
 
         {
-            let tx = conn.transaction().await.unwrap();
+            let mut tx = conn.transaction().await.unwrap();
             tx.execute("INSERT INTO t VALUES ('dropped')")
                 .await
                 .unwrap();
@@ -482,7 +482,7 @@ fn transaction_drop_without_commit_rolls_back() {
 #[test]
 fn transaction_explicit_rollback() {
     asupersync::test_utils::run_test(|| async {
-        let conn = Connection::open(":memory:").await.unwrap();
+        let mut conn = Connection::open(":memory:").await.unwrap();
         conn.execute("CREATE TABLE t(val TEXT)").await.unwrap();
 
         let mut tx = conn.transaction().await.unwrap();
@@ -497,9 +497,103 @@ fn transaction_explicit_rollback() {
 }
 
 #[test]
+fn transaction_rejects_commit_then_insert_before_any_statement_executes() {
+    asupersync::test_utils::run_test(|| async {
+        let mut conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE TABLE t(val TEXT)").await.unwrap();
+
+        {
+            let mut tx = conn.transaction().await.unwrap();
+            tx.execute("INSERT INTO t VALUES ('before')").await.unwrap();
+            let error = tx
+                .execute("COMMIT; INSERT INTO t VALUES ('escaped')")
+                .await
+                .expect_err("scoped transactions must reject transaction-control batches");
+            assert!(
+                matches!(error, FrankenError::Internal(ref detail)
+                    if detail.contains("transaction-control SQL")),
+                "unexpected scoped-boundary error: {error:?}"
+            );
+            tx.rollback().await.unwrap();
+        }
+
+        let rows = conn.query("SELECT val FROM t").await.unwrap();
+        assert!(
+            rows.is_empty(),
+            "the rejected batch must neither commit prior work nor run its trailing INSERT"
+        );
+    });
+}
+
+#[test]
+fn transaction_rejects_commit_begin_generation_escape_before_any_effect() {
+    asupersync::test_utils::run_test(|| async {
+        let mut conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE TABLE t(val TEXT)").await.unwrap();
+
+        {
+            let mut tx = conn.transaction().await.unwrap();
+            let error = tx
+                .execute("COMMIT; BEGIN; INSERT INTO t VALUES ('generation-b')")
+                .await
+                .expect_err("a scoped wrapper must not replace its transaction generation");
+            assert!(
+                matches!(error, FrankenError::Internal(ref detail)
+                    if detail.contains("transaction-control SQL")),
+                "unexpected scoped-boundary error: {error:?}"
+            );
+            tx.rollback().await.unwrap();
+        }
+
+        assert!(
+            !conn.in_transaction(),
+            "rejecting the batch must not leave an unowned replacement transaction"
+        );
+        assert!(conn.query("SELECT val FROM t").await.unwrap().is_empty());
+    });
+}
+
+#[test]
+fn transaction_cannot_continue_after_conflict_rollback_ends_generation() {
+    asupersync::test_utils::run_test(|| async {
+        let mut conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'base')")
+            .await
+            .unwrap();
+
+        {
+            let mut tx = conn.transaction().await.unwrap();
+            tx.execute("INSERT INTO t VALUES (2, 'pending')")
+                .await
+                .unwrap();
+            tx.execute("INSERT OR ROLLBACK INTO t VALUES (1, 'duplicate')")
+                .await
+                .expect_err("duplicate primary key must end the transaction");
+            let error = tx
+                .execute("INSERT INTO t VALUES (3, 'must-not-autocommit')")
+                .await
+                .expect_err("an inactive scoped generation must reject later operations");
+            assert!(
+                matches!(error, FrankenError::Internal(ref detail)
+                    if detail.contains("is no longer active")),
+                "unexpected stale-generation error: {error:?}"
+            );
+        }
+
+        let rows = conn.query("SELECT id FROM t ORDER BY id").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
+        assert!(!conn.in_transaction());
+    });
+}
+
+#[test]
 fn transaction_execute_with_params() {
     asupersync::test_utils::run_test(|| async {
-        let conn = Connection::open(":memory:").await.unwrap();
+        let mut conn = Connection::open(":memory:").await.unwrap();
         conn.execute("CREATE TABLE t(id INTEGER, val TEXT)")
             .await
             .unwrap();
@@ -523,7 +617,7 @@ fn transaction_execute_with_params() {
 #[test]
 fn transaction_query_within() {
     asupersync::test_utils::run_test(|| async {
-        let conn = Connection::open(":memory:").await.unwrap();
+        let mut conn = Connection::open(":memory:").await.unwrap();
         conn.execute("CREATE TABLE t(val INTEGER)").await.unwrap();
         conn.execute("INSERT INTO t VALUES (42)").await.unwrap();
 
@@ -537,7 +631,7 @@ fn transaction_query_within() {
 #[test]
 fn transaction_execute_params_compat() {
     asupersync::test_utils::run_test(|| async {
-        let conn = Connection::open(":memory:").await.unwrap();
+        let mut conn = Connection::open(":memory:").await.unwrap();
         conn.execute("CREATE TABLE t(id INTEGER, val TEXT)")
             .await
             .unwrap();
@@ -560,10 +654,10 @@ fn transaction_execute_params_compat() {
 }
 
 #[test]
-fn transaction_failed_commit_keeps_transaction_open_for_explicit_rollback() {
+fn transaction_failed_commit_consumes_wrapper_and_settles_rollback_before_reuse() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("compat_failed_commit_keeps_tx_open.db");
+        let db_path = dir.path().join("compat_failed_commit_settles_rollback.db");
         let db = db_path.to_string_lossy().to_string();
 
         {
@@ -577,8 +671,8 @@ fn transaction_failed_commit_keeps_transaction_open_for_explicit_rollback() {
             conn.execute("INSERT INTO t VALUES (1, 0);").await.unwrap();
         }
 
-        let conn_a = Connection::open(&db).await.unwrap();
-        let conn_b = Connection::open(&db).await.unwrap();
+        let mut conn_a = Connection::open(&db).await.unwrap();
+        let mut conn_b = Connection::open(&db).await.unwrap();
         for conn in [&conn_a, &conn_b] {
             conn.execute("PRAGMA busy_timeout=5000;").await.unwrap();
             conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")
@@ -603,6 +697,7 @@ fn transaction_failed_commit_keeps_transaction_open_for_explicit_rollback() {
             }
             Err(err) => {
                 tx_a.commit().await.unwrap();
+                drop(tx_b);
                 err
             }
         };
@@ -611,15 +706,14 @@ fn transaction_failed_commit_keeps_transaction_open_for_explicit_rollback() {
             loser_err.is_transient(),
             "losing compat transaction should fail transiently, got {loser_err:?}"
         );
-        assert!(
-            conn_b.in_transaction(),
-            "failed compat commit must leave the underlying transaction open for caller-directed recovery"
-        );
-
-        tx_b.rollback().await.unwrap();
+        let row = conn_b
+            .query_row("SELECT v FROM t WHERE id = 1")
+            .await
+            .expect("the first later operation must settle the failed wrapper's rollback");
+        assert_eq!(row.get(0).unwrap(), &SqliteValue::Integer(1));
         assert!(
             !conn_b.in_transaction(),
-            "explicit rollback should close the failed compat transaction"
+            "settling the consumed wrapper's rollback must close its transaction"
         );
 
         let row = conn_a
@@ -1031,7 +1125,7 @@ fn param_slice_to_values_with_overflow_preserves_exact_value() {
 #[test]
 fn full_compat_round_trip() {
     asupersync::test_utils::run_test(|| async {
-        let conn = Connection::open(":memory:").await.unwrap();
+        let mut conn = Connection::open(":memory:").await.unwrap();
 
         // Schema setup via batch
         conn.execute_batch(
@@ -1107,7 +1201,7 @@ fn full_compat_round_trip() {
 
         // Transaction: insert + rollback
         {
-            let tx = conn.transaction().await.unwrap();
+            let mut tx = conn.transaction().await.unwrap();
             tx.execute_compat(
                 "INSERT INTO users (id, name) VALUES (?1, ?2)",
                 params![3_i64, "Charlie"],

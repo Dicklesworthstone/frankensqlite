@@ -15,6 +15,8 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 
 use crate::pager::SimpleTransaction;
 use fsqlite_error::{FrankenError, Result};
@@ -814,11 +816,119 @@ pub trait MvccPager: sealed::Sealed + Send + Sync {
 // TransactionHandle
 // ---------------------------------------------------------------------------
 
+/// Exact lifecycle state of a pager transaction's commit obligation.
+///
+/// `Finalizing` means an identity-bound pager cleanup ticket owns the physical
+/// outcome and terminal resource release. Callers must drive
+/// [`TransactionHandle::resolve_commit_state`] rather than infer an outcome
+/// from a generic error such as [`FrankenError::Abort`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionCommitState {
+    /// No terminal commit attempt owns this transaction.
+    Open,
+    /// An exact pager cleanup ticket is resolving the physical outcome.
+    Finalizing,
+    /// The transaction's effects are durably committed.
+    Durable,
+    /// The transaction conclusively rolled back.
+    RolledBack,
+}
+
+/// Conclusive physical outcome delivered to a transaction's terminal owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitTerminalOutcome {
+    /// The transaction's effects are durably committed.
+    Durable,
+    /// The transaction conclusively rolled back.
+    RolledBack,
+}
+
+/// Consuming callback for an exact transaction terminal obligation.
+///
+/// Consumption makes a callback intrinsically one-shot. Implementations must
+/// not rely on unwinding through the pager: [`CommitTerminalOwner`] contains a
+/// callback panic after pager cleanup has completed. The release profile uses
+/// `panic = "abort"`, where Rust does not unwind and no containment mechanism
+/// can resume execution.
+pub trait CommitTerminalCallback: Send + 'static {
+    /// Observe the transaction's conclusive physical outcome.
+    fn complete(self: Box<Self>, outcome: CommitTerminalOutcome);
+}
+
+impl<F> CommitTerminalCallback for F
+where
+    F: FnOnce(CommitTerminalOutcome) + Send + 'static,
+{
+    fn complete(self: Box<Self>, outcome: CommitTerminalOutcome) {
+        (*self)(outcome);
+    }
+}
+
+/// Exact, non-cloneable ownership of a transaction's terminal notification.
+///
+/// Installing this owner transfers the right to emit one terminal outcome to
+/// the transaction. Dropping an ordinary open transaction does not fabricate
+/// a rollback outcome; an explicit terminal operation or its persistent
+/// finalizer must complete the owner.
+#[must_use = "a terminal owner must be installed or deliberately retained"]
+pub struct CommitTerminalOwner {
+    callback: Option<Box<dyn CommitTerminalCallback>>,
+}
+
+impl CommitTerminalOwner {
+    /// Create a terminal owner from a consuming callback.
+    pub fn new<C>(callback: C) -> Self
+    where
+        C: CommitTerminalCallback,
+    {
+        Self {
+            callback: Some(Box::new(callback)),
+        }
+    }
+
+    /// Consume this owner and invoke its callback exactly once.
+    pub(crate) fn complete(mut self, outcome: CommitTerminalOutcome) {
+        let callback = self
+            .callback
+            .take()
+            .expect("terminal owner callback can only be consumed once");
+        let completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            callback.complete(outcome);
+        }));
+        if completion.is_err() {
+            tracing::error!(
+                ?outcome,
+                "transaction terminal callback panicked after pager cleanup"
+            );
+        }
+    }
+}
+
+impl std::fmt::Debug for CommitTerminalOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommitTerminalOwner")
+            .field("pending", &self.callback.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TransactionCommitState {
+    fn require_open_for_access(self) -> Result<()> {
+        match self {
+            Self::Open => Ok(()),
+            Self::Finalizing => Err(FrankenError::BusyRecovery),
+            Self::Durable | Self::RolledBack => Err(FrankenError::Abort),
+        }
+    }
+}
+
 /// A handle to an active MVCC transaction.
 ///
 /// Provides page-level read/write access scoped to the transaction's
-/// snapshot. Dropping a handle without calling [`commit`](Self::commit)
-/// implicitly rolls back.
+/// snapshot. Dropping an open handle without calling [`commit`](Self::commit)
+/// implicitly rolls back. Once commit finalization transfers ownership to an
+/// identity-bound cleanup ticket, dropping the handle leaves that exact ticket
+/// responsible for determining and publishing the terminal outcome.
 ///
 /// # Page resolution chain
 ///
@@ -926,6 +1036,30 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// WAL append, and version publish. Returns `SQLITE_BUSY_SNAPSHOT`
     /// (via `FrankenError::Busy`) on serialization failure.
     fn commit<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a;
+
+    /// Install exact ownership of this transaction's terminal notification.
+    ///
+    /// Only one owner may be installed. A duplicate or non-open transaction
+    /// returns the exact supplied owner unchanged so the caller can retain or
+    /// transfer it elsewhere.
+    fn try_install_commit_terminal_owner(
+        &mut self,
+        owner: CommitTerminalOwner,
+    ) -> std::result::Result<(), CommitTerminalOwner>;
+
+    /// Return the transaction's exact commit lifecycle state without blocking.
+    fn commit_state(&self) -> TransactionCommitState;
+
+    /// Drive an identity-bound commit obligation to a typed terminal state.
+    ///
+    /// This method is idempotent. A cancellation, `BusyRecovery`, or I/O error
+    /// leaves a `Finalizing` transaction owned by the same ticket so a later
+    /// call can resume it. Implementations must not classify
+    /// [`FrankenError::Abort`] as either terminal outcome.
+    fn resolve_commit_state<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> impl Future<Output = Result<TransactionCommitState>> + 'a;
 
     /// Commit dirty pages and reset for immediate reuse without destroying
     /// the transaction handle.
@@ -1066,9 +1200,12 @@ pub trait TransactionHandle: sealed::Sealed + Send {
 
     /// Roll back this transaction, discarding the write-set.
     ///
-    /// Rollback is infallible in the MVCC model (we simply discard the
-    /// local write-set and release page locks), but returns `Result` for
-    /// consistency with the trait surface.
+    /// A transaction that has not crossed a durability boundary can normally
+    /// roll back by discarding its local write-set and releasing page locks.
+    /// Once commit finalization has started, however, rollback may need to
+    /// resolve an identity-bound recovery obligation first. It can therefore
+    /// report `BusyRecovery`, I/O/recovery errors, or `Abort` when the physical
+    /// commit was already durable and rollback is no longer possible.
     fn rollback<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a;
 
     /// Record a granular write witness for fine-grained SSI bookkeeping.
@@ -1150,6 +1287,9 @@ impl MvccPager for MockMvccPager {
         async {
             Ok(MockTransaction {
                 committed: false,
+                commit_state: TransactionCommitState::Open,
+                commit_terminal_owner: None,
+                deferred_finalization: None,
                 next_page: 2,
                 savepoint_names: Vec::new(),
             })
@@ -1178,11 +1318,221 @@ impl MvccPager for MockMvccPager {
 }
 
 /// Test/mock transaction handle exported for cross-crate tests.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MockTransaction {
     committed: bool,
+    commit_state: TransactionCommitState,
+    commit_terminal_owner: Option<CommitTerminalOwner>,
+    deferred_finalization: Option<Arc<MockCommitFinalizationState>>,
     next_page: u32,
     savepoint_names: Vec<String>,
+}
+
+const MOCK_FINALIZATION_PENDING: u8 = 0;
+const MOCK_FINALIZATION_DURABLE: u8 = 1;
+const MOCK_FINALIZATION_ROLLED_BACK: u8 = 2;
+
+#[derive(Debug)]
+struct MockCommitFinalizationState {
+    outcome: AtomicU8,
+    next_waiter_id: AtomicU64,
+    waiter: Mutex<Option<MockCommitFinalizationWaiter>>,
+}
+
+impl MockCommitFinalizationState {
+    fn load_outcome(&self) -> Option<CommitTerminalOutcome> {
+        match self.outcome.load(AtomicOrdering::Acquire) {
+            MOCK_FINALIZATION_PENDING => None,
+            MOCK_FINALIZATION_DURABLE => Some(CommitTerminalOutcome::Durable),
+            MOCK_FINALIZATION_ROLLED_BACK => Some(CommitTerminalOutcome::RolledBack),
+            invalid => panic!("invalid mock finalization state {invalid}"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MockCommitFinalizationWaiter {
+    id: u64,
+    waker: std::task::Waker,
+}
+
+struct MockCommitFinalizationWait {
+    state: Arc<MockCommitFinalizationState>,
+    waiter_id: u64,
+}
+
+impl MockCommitFinalizationWait {
+    fn new(state: Arc<MockCommitFinalizationState>) -> Self {
+        let waiter_id = state
+            .next_waiter_id
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            .saturating_add(1);
+        Self { state, waiter_id }
+    }
+}
+
+impl Future for MockCommitFinalizationWait {
+    type Output = CommitTerminalOutcome;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if let Some(outcome) = self.state.load_outcome() {
+            return std::task::Poll::Ready(outcome);
+        }
+        // Clone before locking: cloning a user-supplied waker may execute
+        // arbitrary code and must not run under the registration mutex.
+        let incoming = cx.waker().clone();
+        let retired = {
+            let mut waiter = self
+                .state
+                .waiter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Recheck while holding the registration mutex so publication
+            // cannot slip between observation and registration.
+            if let Some(outcome) = self.state.load_outcome() {
+                return std::task::Poll::Ready(outcome);
+            }
+            if waiter.as_ref().is_some_and(|registered| {
+                registered.id == self.waiter_id && registered.waker.will_wake(&incoming)
+            }) {
+                None
+            } else {
+                std::mem::replace(
+                    &mut *waiter,
+                    Some(MockCommitFinalizationWaiter {
+                        id: self.waiter_id,
+                        waker: incoming,
+                    }),
+                )
+            }
+        };
+        // A custom waker destructor may re-enter this controller.
+        drop(retired);
+        std::task::Poll::Pending
+    }
+}
+
+impl Drop for MockCommitFinalizationWait {
+    fn drop(&mut self) {
+        let retired = {
+            let mut waiter = self
+                .state
+                .waiter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if waiter
+                .as_ref()
+                .is_some_and(|registered| registered.id == self.waiter_id)
+            {
+                waiter.take()
+            } else {
+                None
+            }
+        };
+        // Cancellation unregisters the exact waiter and retires its custom
+        // waker only after releasing the mutex.
+        drop(retired);
+    }
+}
+
+/// Deterministic cross-crate control for a mock transaction in `Finalizing`.
+///
+/// This exists only to test lifecycle integration without sleeps or scheduler
+/// races. Publishing the same terminal outcome more than once is idempotent;
+/// attempting to replace one conclusive outcome with the other returns the
+/// already-published outcome.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct MockCommitFinalizationController {
+    state: Arc<MockCommitFinalizationState>,
+}
+
+impl MockCommitFinalizationController {
+    /// Publish exact terminal evidence for the controlled mock transaction.
+    pub fn publish(
+        &self,
+        outcome: CommitTerminalOutcome,
+    ) -> std::result::Result<(), CommitTerminalOutcome> {
+        let encoded = match outcome {
+            CommitTerminalOutcome::Durable => MOCK_FINALIZATION_DURABLE,
+            CommitTerminalOutcome::RolledBack => MOCK_FINALIZATION_ROLLED_BACK,
+        };
+        let publication = self.state.outcome.compare_exchange(
+            MOCK_FINALIZATION_PENDING,
+            encoded,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        );
+        let result = match publication {
+            Ok(_) => Ok(()),
+            Err(existing) if existing == encoded => Ok(()),
+            Err(MOCK_FINALIZATION_DURABLE) => Err(CommitTerminalOutcome::Durable),
+            Err(MOCK_FINALIZATION_ROLLED_BACK) => Err(CommitTerminalOutcome::RolledBack),
+            Err(invalid) => panic!("invalid mock finalization state {invalid}"),
+        };
+        let waiter = if publication.is_ok() {
+            let mut registered = self
+                .state
+                .waiter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registered.take()
+        } else {
+            None
+        };
+        if let Some(waiter) = waiter {
+            waiter.waker.wake();
+        }
+        result
+    }
+}
+
+impl MockTransaction {
+    /// Construct a deterministic transaction whose terminal outcome is
+    /// externally controlled for cross-crate lifecycle tests.
+    #[doc(hidden)]
+    pub fn finalizing_for_test(
+        terminal_owner: Option<CommitTerminalOwner>,
+    ) -> (Self, MockCommitFinalizationController) {
+        let state = Arc::new(MockCommitFinalizationState {
+            outcome: AtomicU8::new(MOCK_FINALIZATION_PENDING),
+            next_waiter_id: AtomicU64::new(0),
+            waiter: Mutex::new(None),
+        });
+        (
+            Self {
+                committed: false,
+                commit_state: TransactionCommitState::Finalizing,
+                commit_terminal_owner: terminal_owner,
+                deferred_finalization: Some(Arc::clone(&state)),
+                next_page: 2,
+                savepoint_names: Vec::new(),
+            },
+            MockCommitFinalizationController { state },
+        )
+    }
+
+    async fn resolve_deferred_finalization(&mut self) {
+        if self.commit_state != TransactionCommitState::Finalizing {
+            return;
+        }
+        let Some(finalization) = self.deferred_finalization.as_ref().cloned() else {
+            return;
+        };
+        let outcome = MockCommitFinalizationWait::new(finalization).await;
+        self.committed = outcome == CommitTerminalOutcome::Durable;
+        self.commit_state = match outcome {
+            CommitTerminalOutcome::Durable => TransactionCommitState::Durable,
+            CommitTerminalOutcome::RolledBack => TransactionCommitState::RolledBack,
+        };
+        self.deferred_finalization = None;
+        if let Some(owner) = self.commit_terminal_owner.take() {
+            owner.complete(outcome);
+        }
+    }
 }
 
 impl sealed::Sealed for MockTransaction {}
@@ -1194,6 +1544,7 @@ impl TransactionHandle for MockTransaction {
         page_no: PageNumber,
     ) -> impl Future<Output = Result<PageData>> + 'a {
         async move {
+            self.commit_state.require_open_for_access()?;
             let size = fsqlite_types::PageSize::default();
             let mut data = PageData::zeroed(size);
             data.as_bytes_mut()[..4].copy_from_slice(&page_no.get().to_le_bytes());
@@ -1207,7 +1558,11 @@ impl TransactionHandle for MockTransaction {
         _page_no: PageNumber,
         _data: &'a [u8],
     ) -> impl Future<Output = Result<()>> + 'a {
-        async { Ok(()) }
+        async move {
+            self.commit_state.require_open_for_access()?;
+            self.committed = false;
+            Ok(())
+        }
     }
 
     fn allocate_page<'a>(
@@ -1215,6 +1570,8 @@ impl TransactionHandle for MockTransaction {
         _cx: &'a Cx,
     ) -> impl Future<Output = Result<PageNumber>> + 'a {
         async move {
+            self.commit_state.require_open_for_access()?;
+            self.committed = false;
             let page = PageNumber::new(self.next_page)
                 .expect("mock allocator must always produce non-zero page numbers");
             self.next_page += 1;
@@ -1227,13 +1584,54 @@ impl TransactionHandle for MockTransaction {
         _cx: &'a Cx,
         _page_no: PageNumber,
     ) -> impl Future<Output = Result<()>> + 'a {
-        async { Ok(()) }
+        async move {
+            self.commit_state.require_open_for_access()?;
+            self.committed = false;
+            Ok(())
+        }
     }
 
     fn commit<'a>(&'a mut self, _cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
         async move {
-            self.committed = true;
-            Ok(())
+            match self.commit_state {
+                TransactionCommitState::Open => {
+                    self.committed = true;
+                    self.commit_state = TransactionCommitState::Durable;
+                    if let Some(owner) = self.commit_terminal_owner.take() {
+                        owner.complete(CommitTerminalOutcome::Durable);
+                    }
+                    Ok(())
+                }
+                TransactionCommitState::Durable => Ok(()),
+                TransactionCommitState::Finalizing => Err(FrankenError::BusyRecovery),
+                TransactionCommitState::RolledBack => Err(FrankenError::Abort),
+            }
+        }
+    }
+
+    fn try_install_commit_terminal_owner(
+        &mut self,
+        owner: CommitTerminalOwner,
+    ) -> std::result::Result<(), CommitTerminalOwner> {
+        if self.commit_state != TransactionCommitState::Open || self.commit_terminal_owner.is_some()
+        {
+            return Err(owner);
+        }
+        self.commit_terminal_owner = Some(owner);
+        Ok(())
+    }
+
+    fn commit_state(&self) -> TransactionCommitState {
+        self.commit_state
+    }
+
+    fn resolve_commit_state<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+    ) -> impl Future<Output = Result<TransactionCommitState>> + 'a {
+        async move {
+            self.resolve_deferred_finalization().await;
+            Ok(self.commit_state)
         }
     }
 
@@ -1246,21 +1644,38 @@ impl TransactionHandle for MockTransaction {
     }
 
     fn pending_commit_pages(&self) -> Result<Vec<PageNumber>> {
+        self.commit_state.require_open_for_access()?;
         Ok(Vec::new())
     }
 
     fn rollback<'a>(&'a mut self, _cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
-        async { Ok(()) }
+        async move {
+            match self.commit_state {
+                TransactionCommitState::Open => {
+                    self.committed = false;
+                    self.commit_state = TransactionCommitState::RolledBack;
+                    if let Some(owner) = self.commit_terminal_owner.take() {
+                        owner.complete(CommitTerminalOutcome::RolledBack);
+                    }
+                    Ok(())
+                }
+                TransactionCommitState::RolledBack => Ok(()),
+                TransactionCommitState::Finalizing => Err(FrankenError::BusyRecovery),
+                TransactionCommitState::Durable => Err(FrankenError::Abort),
+            }
+        }
     }
 
     fn record_write_witness(&mut self, _cx: &Cx, _key: fsqlite_types::WitnessKey) {}
 
     fn savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        self.commit_state.require_open_for_access()?;
         self.savepoint_names.push(name.to_owned());
         Ok(())
     }
 
     fn release_savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        self.commit_state.require_open_for_access()?;
         if let Some(pos) = self.savepoint_names.iter().rposition(|n| n == name) {
             self.savepoint_names.truncate(pos);
             Ok(())
@@ -1272,6 +1687,7 @@ impl TransactionHandle for MockTransaction {
     }
 
     fn rollback_to_savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        self.commit_state.require_open_for_access()?;
         if let Some(pos) = self.savepoint_names.iter().rposition(|n| n == name) {
             self.savepoint_names.truncate(pos + 1);
             Ok(())
@@ -1301,6 +1717,8 @@ impl MvccPager for MemoryMockMvccPager {
         async {
             Ok(MemoryMockTransaction {
                 committed: false,
+                commit_state: TransactionCommitState::Open,
+                commit_terminal_owner: None,
                 next_page: 2,
                 pages: HashMap::new(),
                 savepoints: Vec::new(),
@@ -1338,9 +1756,11 @@ struct MemoryMockSavepoint {
 
 /// In-memory transaction mock that returns zero-filled pages until written and
 /// preserves writes for subsequent reads.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MemoryMockTransaction {
     committed: bool,
+    commit_state: TransactionCommitState,
+    commit_terminal_owner: Option<CommitTerminalOwner>,
     next_page: u32,
     pages: HashMap<PageNumber, PageData>,
     savepoints: Vec<MemoryMockSavepoint>,
@@ -1355,6 +1775,7 @@ impl TransactionHandle for MemoryMockTransaction {
         page_no: PageNumber,
     ) -> impl Future<Output = Result<PageData>> + 'a {
         async move {
+            self.commit_state.require_open_for_access()?;
             Ok(self
                 .pages
                 .get(&page_no)
@@ -1370,6 +1791,7 @@ impl TransactionHandle for MemoryMockTransaction {
         data: &'a [u8],
     ) -> impl Future<Output = Result<()>> + 'a {
         async move {
+            self.commit_state.require_open_for_access()?;
             self.committed = false;
             let page_size = fsqlite_types::PageSize::default().as_usize();
             let mut page = vec![0_u8; page_size];
@@ -1387,6 +1809,7 @@ impl TransactionHandle for MemoryMockTransaction {
         data: PageData,
     ) -> impl Future<Output = Result<()>> + 'a {
         async move {
+            self.commit_state.require_open_for_access()?;
             self.committed = false;
             let page_size = fsqlite_types::PageSize::default().as_usize();
             let mut page = vec![0_u8; page_size];
@@ -1402,6 +1825,7 @@ impl TransactionHandle for MemoryMockTransaction {
         _cx: &'a Cx,
     ) -> impl Future<Output = Result<PageNumber>> + 'a {
         async move {
+            self.commit_state.require_open_for_access()?;
             self.committed = false;
             let page = PageNumber::new(self.next_page)
                 .expect("mock allocator must always produce non-zero page numbers");
@@ -1419,6 +1843,7 @@ impl TransactionHandle for MemoryMockTransaction {
         page_no: PageNumber,
     ) -> impl Future<Output = Result<()>> + 'a {
         async move {
+            self.commit_state.require_open_for_access()?;
             self.committed = false;
             self.pages.remove(&page_no);
             Ok(())
@@ -1427,20 +1852,55 @@ impl TransactionHandle for MemoryMockTransaction {
 
     fn commit<'a>(&'a mut self, _cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
         async move {
-            self.committed = true;
-            Ok(())
+            match self.commit_state {
+                TransactionCommitState::Open => {
+                    self.committed = true;
+                    self.commit_state = TransactionCommitState::Durable;
+                    if let Some(owner) = self.commit_terminal_owner.take() {
+                        owner.complete(CommitTerminalOutcome::Durable);
+                    }
+                    Ok(())
+                }
+                TransactionCommitState::Durable => Ok(()),
+                TransactionCommitState::Finalizing => Err(FrankenError::BusyRecovery),
+                TransactionCommitState::RolledBack => Err(FrankenError::Abort),
+            }
         }
     }
 
+    fn try_install_commit_terminal_owner(
+        &mut self,
+        owner: CommitTerminalOwner,
+    ) -> std::result::Result<(), CommitTerminalOwner> {
+        if self.commit_state != TransactionCommitState::Open || self.commit_terminal_owner.is_some()
+        {
+            return Err(owner);
+        }
+        self.commit_terminal_owner = Some(owner);
+        Ok(())
+    }
+
+    fn commit_state(&self) -> TransactionCommitState {
+        self.commit_state
+    }
+
+    fn resolve_commit_state<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+    ) -> impl Future<Output = Result<TransactionCommitState>> + 'a {
+        async move { Ok(self.commit_state) }
+    }
+
     fn is_writer(&self) -> bool {
-        !self.pages.is_empty()
+        self.commit_state == TransactionCommitState::Open && !self.pages.is_empty()
     }
 
     fn has_pending_writes(&self) -> bool {
-        !self.committed && !self.pages.is_empty()
+        self.commit_state == TransactionCommitState::Open && !self.pages.is_empty()
     }
 
     fn pending_commit_pages(&self) -> Result<Vec<PageNumber>> {
+        self.commit_state.require_open_for_access()?;
         let mut pages = self.pages.keys().copied().collect::<Vec<_>>();
         pages.sort_unstable();
         Ok(pages)
@@ -1448,17 +1908,29 @@ impl TransactionHandle for MemoryMockTransaction {
 
     fn rollback<'a>(&'a mut self, _cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
         async move {
-            self.committed = false;
-            self.next_page = 2;
-            self.pages.clear();
-            self.savepoints.clear();
-            Ok(())
+            match self.commit_state {
+                TransactionCommitState::Open => {
+                    self.committed = false;
+                    self.commit_state = TransactionCommitState::RolledBack;
+                    self.next_page = 2;
+                    self.pages.clear();
+                    self.savepoints.clear();
+                    if let Some(owner) = self.commit_terminal_owner.take() {
+                        owner.complete(CommitTerminalOutcome::RolledBack);
+                    }
+                    Ok(())
+                }
+                TransactionCommitState::RolledBack => Ok(()),
+                TransactionCommitState::Finalizing => Err(FrankenError::BusyRecovery),
+                TransactionCommitState::Durable => Err(FrankenError::Abort),
+            }
         }
     }
 
     fn record_write_witness(&mut self, _cx: &Cx, _key: fsqlite_types::WitnessKey) {}
 
     fn savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        self.commit_state.require_open_for_access()?;
         self.savepoints.push(MemoryMockSavepoint {
             name: name.to_owned(),
             next_page: self.next_page,
@@ -1468,6 +1940,7 @@ impl TransactionHandle for MemoryMockTransaction {
     }
 
     fn release_savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        self.commit_state.require_open_for_access()?;
         if let Some(pos) = self.savepoints.iter().rposition(|sp| sp.name == name) {
             self.savepoints.truncate(pos);
             Ok(())
@@ -1479,6 +1952,7 @@ impl TransactionHandle for MemoryMockTransaction {
     }
 
     fn rollback_to_savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        self.commit_state.require_open_for_access()?;
         if let Some(pos) = self.savepoints.iter().rposition(|sp| sp.name == name) {
             let snapshot = self.savepoints[pos].clone();
             self.next_page = snapshot.next_page;
@@ -1703,6 +2177,24 @@ impl TransactionHandle for TransactionKind {
         async move { dispatch_transaction_kind!(self, txn => txn.commit(cx).await) }
     }
 
+    fn try_install_commit_terminal_owner(
+        &mut self,
+        owner: CommitTerminalOwner,
+    ) -> std::result::Result<(), CommitTerminalOwner> {
+        dispatch_transaction_kind!(self, txn => txn.try_install_commit_terminal_owner(owner))
+    }
+
+    fn commit_state(&self) -> TransactionCommitState {
+        dispatch_transaction_kind!(self, txn => txn.commit_state())
+    }
+
+    fn resolve_commit_state<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> impl Future<Output = Result<TransactionCommitState>> + 'a {
+        async move { dispatch_transaction_kind!(self, txn => txn.resolve_commit_state(cx).await) }
+    }
+
     fn commit_and_retain<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<bool>> + 'a {
         async move { dispatch_transaction_kind!(self, txn => txn.commit_and_retain(cx).await) }
     }
@@ -1809,9 +2301,33 @@ impl CheckpointPageWriter for MockCheckpointPageWriter {
 mod tests {
     use super::*;
     use fsqlite_vfs::VfsWriteCompletionState;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, Weak};
     use std::task::Poll;
 
     // -- Unit tests --
+
+    struct ReentrantMockWakerDrop {
+        state: Weak<MockCommitFinalizationState>,
+        drops_outside_waiter_mutex: Arc<AtomicUsize>,
+    }
+
+    impl std::task::Wake for ReentrantMockWakerDrop {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    impl Drop for ReentrantMockWakerDrop {
+        fn drop(&mut self) {
+            let Some(state) = self.state.upgrade() else {
+                return;
+            };
+            if let Ok(waiter) = state.waiter.try_lock() {
+                drop(waiter);
+                self.drops_outside_waiter_mutex
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
 
     const fn test_wal_generation_identity() -> WalGenerationIdentity {
         WalGenerationIdentity {
@@ -2048,10 +2564,15 @@ mod tests {
 
             txn.rollback(&cx).await.unwrap();
 
+            assert!(matches!(
+                txn.allocate_page(&cx).await,
+                Err(FrankenError::Abort)
+            ));
+            let mut fresh_txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
             assert_eq!(
-                txn.allocate_page(&cx).await.unwrap().get(),
+                fresh_txn.allocate_page(&cx).await.unwrap().get(),
                 2,
-                "rollback should restore the mock allocator to its initial state"
+                "a fresh transaction should observe the reset mock allocator"
             );
         });
     }
@@ -2171,6 +2692,280 @@ mod tests {
 
             let result = txn.release_savepoint(&cx, "nonexistent");
             assert!(result.is_err(), "releasing unknown savepoint must fail");
+        });
+    }
+
+    #[test]
+    fn transaction_commit_state_is_typed_and_transaction_kind_dispatches_exactly() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let mut mock = MockMvccPager
+                .begin(&cx, TransactionMode::Deferred)
+                .await
+                .unwrap();
+            assert_eq!(mock.commit_state(), TransactionCommitState::Open);
+            assert_eq!(
+                mock.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::Open
+            );
+            mock.commit(&cx).await.unwrap();
+            assert_eq!(mock.commit_state(), TransactionCommitState::Durable);
+            assert_eq!(
+                mock.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::Durable
+            );
+            assert!(matches!(mock.rollback(&cx).await, Err(FrankenError::Abort)));
+            assert_eq!(
+                mock.commit_state(),
+                TransactionCommitState::Durable,
+                "rollback must not overwrite a proven durable outcome"
+            );
+            assert!(matches!(
+                mock.write_page(&cx, PageNumber::ONE, &[0_u8; 1]).await,
+                Err(FrankenError::Abort)
+            ));
+            assert_eq!(
+                mock.commit_state(),
+                TransactionCommitState::Durable,
+                "post-terminal mutation must not reopen a durable mock"
+            );
+            assert!(matches!(
+                mock.get_page(&cx, PageNumber::ONE).await,
+                Err(FrankenError::Abort)
+            ));
+            assert!(matches!(
+                mock.pending_commit_pages(),
+                Err(FrankenError::Abort)
+            ));
+
+            let mut durable_memory = MemoryMockMvccPager
+                .begin(&cx, TransactionMode::Immediate)
+                .await
+                .unwrap();
+            durable_memory
+                .write_page(&cx, PageNumber::ONE, &[1_u8; 1])
+                .await
+                .unwrap();
+            assert!(durable_memory.is_writer());
+            assert!(durable_memory.has_pending_writes());
+            durable_memory.commit(&cx).await.unwrap();
+            assert_eq!(
+                durable_memory.commit_state(),
+                TransactionCommitState::Durable
+            );
+            assert!(!durable_memory.is_writer());
+            assert!(!durable_memory.has_pending_writes());
+            assert!(matches!(
+                durable_memory.pending_commit_pages(),
+                Err(FrankenError::Abort)
+            ));
+
+            let memory_mock = MemoryMockMvccPager
+                .begin(&cx, TransactionMode::Immediate)
+                .await
+                .unwrap();
+            let mut kind = TransactionKind::from(memory_mock);
+            assert_eq!(kind.commit_state(), TransactionCommitState::Open);
+            kind.rollback(&cx).await.unwrap();
+            assert_eq!(kind.commit_state(), TransactionCommitState::RolledBack);
+            assert_eq!(
+                kind.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::RolledBack
+            );
+            assert!(matches!(kind.commit(&cx).await, Err(FrankenError::Abort)));
+            assert!(matches!(
+                kind.allocate_page(&cx).await,
+                Err(FrankenError::Abort)
+            ));
+            assert!(matches!(
+                kind.get_page(&cx, PageNumber::ONE).await,
+                Err(FrankenError::Abort)
+            ));
+            assert!(!kind.is_writer());
+            assert!(!kind.has_pending_writes());
+            assert!(matches!(
+                kind.pending_commit_pages(),
+                Err(FrankenError::Abort)
+            ));
+            assert_eq!(
+                kind.commit_state(),
+                TransactionCommitState::RolledBack,
+                "post-terminal commit or mutation must not reopen a rolled-back wrapper"
+            );
+        });
+    }
+
+    #[test]
+    fn commit_terminal_owner_mock_exact_once_and_panic_is_contained() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let durable_events = Arc::new(Mutex::new(Vec::new()));
+            let duplicate_events = Arc::new(Mutex::new(Vec::new()));
+            let mut mock = TransactionKind::from(
+                MockMvccPager
+                    .begin(&cx, TransactionMode::Deferred)
+                    .await
+                    .unwrap(),
+            );
+
+            let durable_events_for_callback = Arc::clone(&durable_events);
+            mock.try_install_commit_terminal_owner(CommitTerminalOwner::new(move |outcome| {
+                durable_events_for_callback.lock().unwrap().push(outcome);
+            }))
+            .expect("first terminal owner must install");
+
+            let duplicate_events_for_callback = Arc::clone(&duplicate_events);
+            let duplicate_owner = mock
+                .try_install_commit_terminal_owner(CommitTerminalOwner::new(move |outcome| {
+                    duplicate_events_for_callback.lock().unwrap().push(outcome);
+                }))
+                .expect_err("duplicate install must return the supplied owner");
+
+            mock.commit(&cx).await.unwrap();
+            mock.commit(&cx).await.unwrap();
+            assert!(matches!(mock.rollback(&cx).await, Err(FrankenError::Abort)));
+            assert_eq!(
+                *durable_events.lock().unwrap(),
+                [CommitTerminalOutcome::Durable]
+            );
+            assert!(duplicate_events.lock().unwrap().is_empty());
+
+            let mut memory_mock = TransactionKind::from(
+                MemoryMockMvccPager
+                    .begin(&cx, TransactionMode::Deferred)
+                    .await
+                    .unwrap(),
+            );
+            memory_mock
+                .try_install_commit_terminal_owner(duplicate_owner)
+                .expect("the exact owner returned from the duplicate install remains usable");
+            memory_mock.rollback(&cx).await.unwrap();
+            memory_mock.rollback(&cx).await.unwrap();
+            assert!(matches!(
+                memory_mock.commit(&cx).await,
+                Err(FrankenError::Abort)
+            ));
+            assert_eq!(
+                *duplicate_events.lock().unwrap(),
+                [CommitTerminalOutcome::RolledBack]
+            );
+
+            let panic_calls = Arc::new(AtomicUsize::new(0));
+            let mut panicking_mock = MockMvccPager
+                .begin(&cx, TransactionMode::Deferred)
+                .await
+                .unwrap();
+            let panic_calls_for_callback = Arc::clone(&panic_calls);
+            panicking_mock
+                .try_install_commit_terminal_owner(CommitTerminalOwner::new(move |_| {
+                    panic_calls_for_callback.fetch_add(1, Ordering::AcqRel);
+                    panic!("terminal callback panic must be contained");
+                }))
+                .unwrap();
+            panicking_mock
+                .commit(&cx)
+                .await
+                .expect("callback unwind must not escape a completed commit");
+            panicking_mock.commit(&cx).await.unwrap();
+            assert_eq!(panic_calls.load(Ordering::Acquire), 1);
+        });
+    }
+
+    #[test]
+    fn terminal_finalizer_mock_controller_is_deterministic_and_exact_once() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let durable_events = Arc::new(Mutex::new(Vec::new()));
+            let durable_events_for_callback = Arc::clone(&durable_events);
+            let owner = CommitTerminalOwner::new(move |outcome| {
+                durable_events_for_callback.lock().unwrap().push(outcome);
+            });
+            let (mut durable, durable_controller) =
+                MockTransaction::finalizing_for_test(Some(owner));
+
+            let drops_outside_waiter_mutex = Arc::new(AtomicUsize::new(0));
+            let mut first_resolver = Box::pin(durable.resolve_commit_state(&cx));
+            let first_waker = std::task::Waker::from(Arc::new(ReentrantMockWakerDrop {
+                state: Arc::downgrade(&durable_controller.state),
+                drops_outside_waiter_mutex: Arc::clone(&drops_outside_waiter_mutex),
+            }));
+            let mut task_cx = std::task::Context::from_waker(&first_waker);
+            assert!(
+                Future::poll(first_resolver.as_mut(), &mut task_cx).is_pending(),
+                "unpublished terminal evidence must leave the resolver pending"
+            );
+            drop(task_cx);
+            drop(first_waker);
+            let replacement_waker = std::task::Waker::from(Arc::new(ReentrantMockWakerDrop {
+                state: Arc::downgrade(&durable_controller.state),
+                drops_outside_waiter_mutex: Arc::clone(&drops_outside_waiter_mutex),
+            }));
+            let mut replacement_cx = std::task::Context::from_waker(&replacement_waker);
+            assert!(
+                Future::poll(first_resolver.as_mut(), &mut replacement_cx).is_pending(),
+                "re-polling must replace the exact waiter without completing it"
+            );
+            drop(replacement_cx);
+            drop(replacement_waker);
+            drop(first_resolver);
+            assert!(
+                durable_controller
+                    .state
+                    .waiter
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_none(),
+                "dropping a pending resolver must unregister its exact waiter"
+            );
+            assert_eq!(
+                drops_outside_waiter_mutex.load(Ordering::Acquire),
+                2,
+                "both replacement and cancellation must retire custom wakers outside the waiter mutex"
+            );
+            assert_eq!(durable.commit_state(), TransactionCommitState::Finalizing);
+            assert!(durable_events.lock().unwrap().is_empty());
+            durable_controller
+                .publish(CommitTerminalOutcome::Durable)
+                .unwrap();
+            durable_controller
+                .publish(CommitTerminalOutcome::Durable)
+                .expect("repeating identical evidence must be idempotent");
+            assert_eq!(
+                durable_controller.publish(CommitTerminalOutcome::RolledBack),
+                Err(CommitTerminalOutcome::Durable),
+                "terminal evidence must never be overwritten"
+            );
+            assert_eq!(
+                durable.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::Durable
+            );
+            assert_eq!(
+                durable.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::Durable
+            );
+            assert_eq!(
+                *durable_events.lock().unwrap(),
+                [CommitTerminalOutcome::Durable]
+            );
+
+            let rollback_events = Arc::new(Mutex::new(Vec::new()));
+            let rollback_events_for_callback = Arc::clone(&rollback_events);
+            let owner = CommitTerminalOwner::new(move |outcome| {
+                rollback_events_for_callback.lock().unwrap().push(outcome);
+            });
+            let (mut rolled_back, rollback_controller) =
+                MockTransaction::finalizing_for_test(Some(owner));
+            rollback_controller
+                .publish(CommitTerminalOutcome::RolledBack)
+                .unwrap();
+            assert_eq!(
+                rolled_back.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::RolledBack
+            );
+            assert_eq!(
+                *rollback_events.lock().unwrap(),
+                [CommitTerminalOutcome::RolledBack]
+            );
         });
     }
 

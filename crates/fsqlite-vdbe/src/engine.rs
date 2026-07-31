@@ -2634,7 +2634,10 @@ fn wait_for_page_lock_holder_change(
             elapsed = started.elapsed();
             next_full_checkpoint = elapsed.saturating_add(PAGE_LOCK_WAIT_FULL_CHECKPOINT_POLL);
         } else if cx.is_cancel_requested() {
-            return Err(FrankenError::Abort);
+            // Preserve the cheap request probe, but fall through the complete
+            // checkpoint so the exact operation token records that engine
+            // work observed cancellation before returning `Abort`.
+            observe_execution_cancellation(cx)?;
         }
 
         let wait_budget = remaining.saturating_sub(elapsed);

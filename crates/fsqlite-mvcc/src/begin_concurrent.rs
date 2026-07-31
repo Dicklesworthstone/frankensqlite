@@ -671,6 +671,24 @@ impl ConcurrentSavepoint {
     }
 }
 
+/// Opaque identity of one registered prepare-to-publication obligation.
+///
+/// A reservation is installed after SSI/FCW validation and before physical
+/// pager I/O. Its identity lets a persistent completion owner take or cancel
+/// exactly the plan it registered without confusing a later retry from the
+/// same concurrent session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct PreparedCommitReservationId(u64);
+
+impl PreparedCommitReservationId {
+    /// Return the process-local numeric identity.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Registry tracking all active concurrent writers for a database.
 ///
 /// Enforces the soft limit on concurrent writers and provides the shared
@@ -707,8 +725,23 @@ pub struct ConcurrentRegistry {
     /// Detached handles kept for reuse so hot autocommit loops do not hit the
     /// general allocator for a fresh handle every statement.
     recycled_handles: Vec<SharedConcurrentHandle>,
+    /// Prepared commit plans whose physical outcome is not yet terminal.
+    ///
+    /// The current SSI implementation keeps a prepared plan's `has_in_rw` and
+    /// `has_out_rw` state in [`PreparedConcurrentCommit`] until finalize. It
+    /// does not publish that state into the active handle at prepare time.
+    /// Consequently, allowing two physical commits to pass prepare before
+    /// either finalizes can hide one prepared transaction's pivot state from
+    /// the other's T3 propagation. Until prepared-plan state participates in
+    /// edge discovery directly, this map is also a minimal global
+    /// pending-publication fence: at most one entry may be live.
+    prepared_commits: HashMap<PreparedCommitReservationId, PreparedCommitReservation>,
+    /// Reverse index enforcing at most one prepared obligation per session.
+    prepared_commit_by_session: HashMap<u64, PreparedCommitReservationId>,
     /// Next session id to assign.
     next_session_id: u64,
+    /// Next prepared-commit reservation id to assign.
+    next_prepared_commit_id: u64,
     /// Epoch counter for TxnToken generation (increments on each session).
     epoch_counter: u32,
 }
@@ -732,7 +765,10 @@ impl ConcurrentRegistry {
             committed_writers_by_exact_cell: HashMap::new(),
             committed_writers_with_global_keys: Vec::new(),
             recycled_handles: Vec::new(),
+            prepared_commits: HashMap::new(),
+            prepared_commit_by_session: HashMap::new(),
             next_session_id: 1,
+            next_prepared_commit_id: 1,
             epoch_counter: 0,
         }
     }
@@ -827,8 +863,201 @@ impl ConcurrentRegistry {
         self.active.get(&session_id).map(|handle| handle.lock())
     }
 
+    /// Number of registered prepare-to-publication obligations.
+    #[must_use]
+    pub fn prepared_commit_count(&self) -> usize {
+        self.prepared_commits.len()
+    }
+
+    /// Whether any prepared commit currently owns the publication fence.
+    #[must_use]
+    pub fn has_prepared_commit(&self) -> bool {
+        !self.prepared_commits.is_empty()
+    }
+
+    /// Look up a prepared reservation by its opaque identity.
+    #[must_use]
+    pub fn prepared_commit(
+        &self,
+        reservation_id: PreparedCommitReservationId,
+    ) -> Option<&PreparedCommitReservation> {
+        self.prepared_commits.get(&reservation_id)
+    }
+
+    /// Look up the prepared reservation currently owned by `session_id`.
+    #[must_use]
+    pub fn prepared_commit_for_session(
+        &self,
+        session_id: u64,
+    ) -> Option<&PreparedCommitReservation> {
+        let reservation_id = self.prepared_commit_by_session.get(&session_id)?;
+        self.prepared_commits.get(reservation_id)
+    }
+
+    /// Register a validated plan before its physical pager commit starts.
+    ///
+    /// Callers must invoke this while retaining the same registry mutex guard
+    /// used for [`prepare_concurrent_commit_with_ssi`] or
+    /// [`prepare_concurrent_commit_fcw_only`]. No await or guard release may
+    /// occur between prepare and registration.
+    ///
+    /// The current implementation deliberately admits only one registered
+    /// prepared commit across the registry. See the `prepared_commits` field
+    /// rationale: prepared SSI edge flags are not yet visible through active
+    /// handles, so concurrent physical publication would be unsafe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MvccError::InvalidState`] when the plan does not identify the
+    /// same live active session/token, its sequence moves backwards, or that
+    /// session already owns a reservation. Returns [`MvccError::Busy`] when a
+    /// different session currently owns the pending-publication fence.
+    pub fn register_prepared_commit(
+        &mut self,
+        prepared: PreparedConcurrentCommit,
+        assigned_commit_seq: CommitSeq,
+    ) -> Result<PreparedCommitReservationId, MvccError> {
+        let session_id = prepared.session_id();
+        if assigned_commit_seq < prepared.planned_commit_seq() {
+            return Err(MvccError::InvalidState);
+        }
+        let Some(handle) = self.active.get(&session_id) else {
+            return Err(MvccError::InvalidState);
+        };
+        {
+            let handle = handle.lock();
+            if !handle.is_active() || !same_txn_identity(handle.token(), prepared.txn_token()) {
+                return Err(MvccError::InvalidState);
+            }
+        }
+        if self.prepared_commit_by_session.contains_key(&session_id) {
+            return Err(MvccError::InvalidState);
+        }
+        if !self.prepared_commits.is_empty() {
+            return Err(MvccError::Busy);
+        }
+
+        let raw_id = self.next_prepared_commit_id;
+        let next_id = raw_id.checked_add(1).ok_or(MvccError::InvalidState)?;
+        if raw_id == 0 {
+            return Err(MvccError::InvalidState);
+        }
+        let reservation_id = PreparedCommitReservationId(raw_id);
+        if self.prepared_commits.contains_key(&reservation_id) {
+            return Err(MvccError::InvalidState);
+        }
+
+        self.next_prepared_commit_id = next_id;
+        self.prepared_commit_by_session
+            .insert(session_id, reservation_id);
+        self.prepared_commits.insert(
+            reservation_id,
+            PreparedCommitReservation {
+                id: reservation_id,
+                prepared,
+                assigned_commit_seq,
+            },
+        );
+        Ok(reservation_id)
+    }
+
+    /// Take one exact prepared obligation for immediate finalization.
+    ///
+    /// A mismatched session or unknown id leaves the live reservation
+    /// untouched. The caller must retain the registry mutex guard from this
+    /// take through commit-index/SSI finalization; taking releases the logical
+    /// fence, so dropping the guard before finalize would reopen the original
+    /// publication race.
+    #[must_use]
+    pub fn take_prepared_commit(
+        &mut self,
+        reservation_id: PreparedCommitReservationId,
+        expected_session_id: u64,
+    ) -> Option<PreparedCommitReservation> {
+        self.remove_prepared_commit(reservation_id, expected_session_id)
+    }
+
+    /// Cancel one exact prepared obligation after physical non-commit is
+    /// proven.
+    ///
+    /// Cancellation removes only the prepare-to-publication reservation. It
+    /// deliberately leaves the active session and its page locks intact so a
+    /// retryable SQL transaction can continue or retry.
+    #[must_use]
+    pub fn cancel_prepared_commit(
+        &mut self,
+        reservation_id: PreparedCommitReservationId,
+        expected_session_id: u64,
+    ) -> Option<PreparedCommitReservation> {
+        self.remove_prepared_commit(reservation_id, expected_session_id)
+    }
+
+    fn remove_prepared_commit(
+        &mut self,
+        reservation_id: PreparedCommitReservationId,
+        expected_session_id: u64,
+    ) -> Option<PreparedCommitReservation> {
+        let prepared = self.prepared_commits.get(&reservation_id)?;
+        let session_matches = prepared.session_id() == expected_session_id; // ubs:ignore — MVCC session ids are non-secret in-process handles.
+        if !session_matches
+            || self
+                .prepared_commit_by_session
+                .get(&expected_session_id)
+                .copied()
+                != Some(reservation_id)
+        {
+            return None;
+        }
+
+        let prepared = self
+            .prepared_commits
+            .remove(&reservation_id)
+            .expect("prepared reservation disappeared after validated lookup");
+        let removed_id = self.prepared_commit_by_session.remove(&expected_session_id);
+        debug_assert_eq!(removed_id, Some(reservation_id));
+        Some(prepared)
+    }
+
+    /// Attempt to remove a session after commit or abort.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MvccError::Busy`] while a prepared reservation still owns
+    /// this session. Its terminal completion owner must take or cancel that
+    /// exact reservation first.
+    pub fn try_remove(
+        &mut self,
+        session_id: u64,
+    ) -> Result<Option<SharedConcurrentHandle>, MvccError> {
+        if self.prepared_commit_by_session.contains_key(&session_id) {
+            return Err(MvccError::Busy);
+        }
+        Ok(self.remove_unreserved(session_id))
+    }
+
     /// Remove a session (after commit or abort).
     pub fn remove(&mut self, session_id: u64) -> Option<SharedConcurrentHandle> {
+        match self.try_remove(session_id) {
+            Ok(handle) => handle,
+            Err(MvccError::Busy) => {
+                tracing::warn!(
+                    session_id,
+                    "refusing to remove concurrent session with a live prepared commit reservation"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::error!(
+                    session_id,
+                    %error,
+                    "unexpected concurrent session removal failure"
+                );
+                None
+            }
+        }
+    }
+
+    fn remove_unreserved(&mut self, session_id: u64) -> Option<SharedConcurrentHandle> {
         let handle = self.active.remove(&session_id)?;
         if let Some(snapshot_high) = self.active_snapshot_highs.remove(&session_id) {
             self.decrement_gc_horizon_count(snapshot_high);
@@ -853,6 +1082,18 @@ impl ConcurrentRegistry {
     /// references remain.
     pub fn recycle_handle(&mut self, handle: SharedConcurrentHandle) {
         const MAX_RECYCLED_HANDLES: usize = 8;
+        let belongs_to_reserved_session =
+            self.prepared_commit_by_session.keys().any(|session_id| {
+                self.active
+                    .get(session_id)
+                    .is_some_and(|active| Arc::ptr_eq(active, &handle))
+            });
+        if belongs_to_reserved_session {
+            tracing::warn!(
+                "refusing to recycle a concurrent handle with a live prepared commit reservation"
+            );
+            return;
+        }
         if self.recycled_handles.len() >= MAX_RECYCLED_HANDLES || Arc::strong_count(&handle) != 1 {
             return;
         }
@@ -1933,6 +2174,51 @@ impl PreparedConcurrentCommit {
     }
 }
 
+/// Registered ownership of one validated commit plan and its assigned
+/// publication sequence.
+///
+/// This value is intentionally not `Clone`: taking or cancelling the registry
+/// entry transfers its single logical ownership to the terminal completion
+/// path.
+#[derive(Debug)]
+pub struct PreparedCommitReservation {
+    id: PreparedCommitReservationId,
+    prepared: PreparedConcurrentCommit,
+    assigned_commit_seq: CommitSeq,
+}
+
+impl PreparedCommitReservation {
+    /// Return this reservation's opaque identity.
+    #[must_use]
+    pub const fn id(&self) -> PreparedCommitReservationId {
+        self.id
+    }
+
+    /// Return the active session that owns this reservation.
+    #[must_use]
+    pub const fn session_id(&self) -> u64 {
+        self.prepared.session_id()
+    }
+
+    /// Return the sequence assigned before physical commit I/O.
+    #[must_use]
+    pub const fn assigned_commit_seq(&self) -> CommitSeq {
+        self.assigned_commit_seq
+    }
+
+    /// Borrow the validated plan.
+    #[must_use]
+    pub const fn prepared(&self) -> &PreparedConcurrentCommit {
+        &self.prepared
+    }
+
+    /// Consume the reservation into its plan and assigned sequence.
+    #[must_use]
+    pub fn into_parts(self) -> (PreparedConcurrentCommit, CommitSeq) {
+        (self.prepared, self.assigned_commit_seq)
+    }
+}
+
 /// Snapshot of one active transaction used during SSI edge discovery.
 #[derive(Debug, Clone, Copy, Default)]
 struct HandleViewFlags(u8);
@@ -2704,6 +2990,14 @@ pub fn prepare_concurrent_commit_with_ssi(
     session_id: u64,
     planned_commit_seq: CommitSeq,
 ) -> Result<PreparedConcurrentCommit, (MvccError, FcwResult)> {
+    // Prepared SSI flags are plan-local until finalize. A second plan must not
+    // start physical publication while the first reservation is live, because
+    // T3 propagation would inspect only the peer handle's stale pre-prepare
+    // flags and could discover an abort after both writes were already durable.
+    if registry.has_prepared_commit() {
+        return Err((MvccError::Busy, FcwResult::Clean));
+    }
+
     let txn_id = TxnId::new(session_id).ok_or((MvccError::InvalidState, FcwResult::Clean))?;
 
     let commit_view = {
@@ -3117,6 +3411,13 @@ pub fn prepare_concurrent_commit_fcw_only(
     session_id: u64,
     planned_commit_seq: CommitSeq,
 ) -> Result<PreparedConcurrentCommit, (MvccError, FcwResult)> {
+    // The FCW-only gate skips current SSI validation, but finalize still emits
+    // committed witness history and participates in T3 propagation. It must
+    // therefore obey the same pending-publication fence as the full path.
+    if registry.has_prepared_commit() {
+        return Err((MvccError::Busy, FcwResult::Clean));
+    }
+
     let txn_id = TxnId::new(session_id).ok_or((MvccError::InvalidState, FcwResult::Clean))?;
 
     let commit_view = {
@@ -3552,6 +3853,33 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
     registry.prune_committed_conflict_history();
 }
 
+/// Consume one registered prepared-commit reservation and publish its SSI
+/// side effects at the exact sequence assigned before physical commit I/O.
+///
+/// The reservation is intentionally accepted by value. Once a caller has
+/// taken the matching entry from [`ConcurrentRegistry`], this function is the
+/// finalization path that preserves the reservation's single-owner proof and
+/// prevents a later retry from reusing that same registered plan.
+///
+/// Returns the sequence carried by the consumed reservation.
+#[must_use]
+pub fn finalize_prepared_commit_reservation_with_ssi(
+    registry: &mut ConcurrentRegistry,
+    commit_index: &CommitIndex,
+    lock_table: &InProcessPageLockTable,
+    reservation: PreparedCommitReservation,
+) -> CommitSeq {
+    let (prepared, assigned_commit_seq) = reservation.into_parts();
+    finalize_prepared_concurrent_commit_with_ssi(
+        registry,
+        commit_index,
+        lock_table,
+        &prepared,
+        assigned_commit_seq,
+    );
+    assigned_commit_seq
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn concurrent_commit_with_ssi(
     registry: &mut ConcurrentRegistry,
@@ -3762,8 +4090,10 @@ mod tests {
         concurrent_restore_page_state, concurrent_rollback_to_savepoint, concurrent_savepoint,
         concurrent_stage_prepared_write_marker, concurrent_track_write_conflict_page,
         concurrent_write_metadata_page, concurrent_write_page,
-        finalize_prepared_concurrent_commit_with_ssi, prepare_concurrent_commit_with_ssi,
-        same_txn_identity, summarize_witness_keys, validate_first_committer_wins, witness_is_page,
+        finalize_prepared_commit_reservation_with_ssi,
+        finalize_prepared_concurrent_commit_with_ssi, prepare_concurrent_commit_fcw_only,
+        prepare_concurrent_commit_with_ssi, same_txn_identity, summarize_witness_keys,
+        validate_first_committer_wins, witness_is_page,
     };
 
     fn test_snapshot(high: u64) -> Snapshot {
@@ -4948,6 +5278,388 @@ mod tests {
         assert!(Arc::ptr_eq(&shared, &removed));
         assert_eq!(registry.active_count(), 0);
         assert!(removed.lock().is_active());
+    }
+
+    #[test]
+    fn test_prepared_commit_reservation_lookup_and_take_are_exact_once() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+        let session_id = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut handle = registry.get_mut(session_id).unwrap();
+            concurrent_write_page(
+                &mut handle,
+                &lock_table,
+                session_id,
+                test_page(41),
+                test_data(),
+            )
+            .unwrap();
+        }
+
+        let prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            session_id,
+            CommitSeq::new(11),
+        )
+        .expect("first plan should prepare");
+        let duplicate = prepared.clone();
+        let reservation_id = registry
+            .register_prepared_commit(prepared, CommitSeq::new(11))
+            .expect("first reservation should register");
+
+        assert_ne!(reservation_id.get(), 0);
+        assert_eq!(registry.prepared_commit_count(), 1);
+        assert!(registry.has_prepared_commit());
+        let by_id = registry.prepared_commit(reservation_id).expect("id lookup");
+        assert_eq!(by_id.id(), reservation_id);
+        assert_eq!(by_id.session_id(), session_id);
+        assert_eq!(by_id.assigned_commit_seq(), CommitSeq::new(11));
+        assert_eq!(by_id.prepared().write_set_pages(), &[test_page(41)]);
+        assert_eq!(
+            registry
+                .prepared_commit_for_session(session_id)
+                .map(|reservation| reservation.id()),
+            Some(reservation_id)
+        );
+
+        assert_eq!(
+            registry.register_prepared_commit(duplicate, CommitSeq::new(11)),
+            Err(MvccError::InvalidState),
+            "one session cannot own two reservations"
+        );
+        assert!(
+            registry
+                .take_prepared_commit(reservation_id, session_id + 1)
+                .is_none(),
+            "a wrong-session take must not consume the reservation"
+        );
+        assert_eq!(registry.prepared_commit_count(), 1);
+
+        let reservation = registry
+            .take_prepared_commit(reservation_id, session_id)
+            .expect("matching take");
+        assert_eq!(reservation.id(), reservation_id);
+        let (prepared, assigned_commit_seq) = reservation.into_parts();
+        assert_eq!(prepared.session_id(), session_id);
+        assert_eq!(assigned_commit_seq, CommitSeq::new(11));
+        assert!(!registry.has_prepared_commit());
+        assert!(
+            registry
+                .take_prepared_commit(reservation_id, session_id)
+                .is_none(),
+            "a reservation can only be taken once"
+        );
+        assert!(
+            registry
+                .cancel_prepared_commit(reservation_id, session_id)
+                .is_none(),
+            "take followed by cancel must not resolve twice"
+        );
+    }
+
+    #[test]
+    fn test_prepared_commit_reservation_finalizer_consumes_assigned_sequence() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+        let session_id = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let page = test_page(45);
+        {
+            let mut handle = registry.get_mut(session_id).unwrap();
+            concurrent_write_page(&mut handle, &lock_table, session_id, page, test_data()).unwrap();
+        }
+
+        let prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            session_id,
+            CommitSeq::new(11),
+        )
+        .expect("plan should prepare");
+        let reservation_id = registry
+            .register_prepared_commit(prepared, CommitSeq::new(12))
+            .expect("reservation should bind the physical publication sequence");
+        let reservation = registry
+            .take_prepared_commit(reservation_id, session_id)
+            .expect("matching terminal owner should take the reservation");
+
+        let committed_seq = finalize_prepared_commit_reservation_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            reservation,
+        );
+
+        assert_eq!(committed_seq, CommitSeq::new(12));
+        assert_eq!(commit_index.latest(page), Some(CommitSeq::new(12)));
+        assert_eq!(lock_table.lock_count(), 0);
+        assert!(
+            registry
+                .get(session_id)
+                .is_some_and(|handle| !handle.is_active()),
+            "consuming finalization must mark the exact session terminal"
+        );
+        assert!(!registry.has_prepared_commit());
+        assert!(
+            registry
+                .take_prepared_commit(reservation_id, session_id)
+                .is_none(),
+            "the consumed reservation cannot finalize again"
+        );
+    }
+
+    #[test]
+    fn test_prepared_commit_cancel_is_exact_once_and_preserves_live_session() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+        let session_id = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut handle = registry.get_mut(session_id).unwrap();
+            concurrent_write_page(
+                &mut handle,
+                &lock_table,
+                session_id,
+                test_page(42),
+                test_data(),
+            )
+            .unwrap();
+        }
+        let prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            session_id,
+            CommitSeq::new(11),
+        )
+        .unwrap();
+        let reservation_id = registry
+            .register_prepared_commit(prepared, CommitSeq::new(11))
+            .unwrap();
+
+        let cancelled = registry
+            .cancel_prepared_commit(reservation_id, session_id)
+            .expect("matching cancel");
+        assert_eq!(cancelled.session_id(), session_id);
+        assert!(
+            registry
+                .cancel_prepared_commit(reservation_id, session_id)
+                .is_none(),
+            "a reservation can only be cancelled once"
+        );
+        assert!(
+            registry
+                .get(session_id)
+                .is_some_and(|handle| handle.is_active()),
+            "cancelling a retryable prepared attempt must preserve its session"
+        );
+        assert!(registry.remove_and_recycle(session_id));
+    }
+
+    #[test]
+    fn test_prepared_commit_registration_rejects_missing_or_wrong_session() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+        let first_session = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let second_session = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut handle = registry.get_mut(first_session).unwrap();
+            concurrent_write_page(
+                &mut handle,
+                &lock_table,
+                first_session,
+                test_page(43),
+                test_data(),
+            )
+            .unwrap();
+        }
+
+        let prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            first_session,
+            CommitSeq::new(11),
+        )
+        .unwrap();
+        let mut wrong_session = prepared.clone();
+        wrong_session.session_id = second_session;
+        assert_eq!(
+            registry.register_prepared_commit(wrong_session, CommitSeq::new(11)),
+            Err(MvccError::InvalidState),
+            "the live session token must match the prepared plan"
+        );
+        assert_eq!(
+            registry.register_prepared_commit(prepared.clone(), CommitSeq::new(10)),
+            Err(MvccError::InvalidState),
+            "the assigned sequence cannot precede the planning frontier"
+        );
+
+        assert!(registry.remove(first_session).is_some());
+        assert_eq!(
+            registry.register_prepared_commit(prepared, CommitSeq::new(11)),
+            Err(MvccError::InvalidState),
+            "a plan for a missing session must not register"
+        );
+    }
+
+    #[test]
+    fn test_prepared_commit_pending_publication_fence_blocks_second_ssi_and_fcw_prepare() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+        let first_session = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let second_session = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        {
+            let mut first = registry.get_mut(first_session).unwrap();
+            first.record_read(test_page(20));
+            concurrent_write_page(
+                &mut first,
+                &lock_table,
+                first_session,
+                test_page(10),
+                test_data(),
+            )
+            .unwrap();
+        }
+        {
+            let mut second = registry.get_mut(second_session).unwrap();
+            second.record_read(test_page(30));
+            concurrent_write_page(
+                &mut second,
+                &lock_table,
+                second_session,
+                test_page(20),
+                test_data(),
+            )
+            .unwrap();
+        }
+
+        let first_prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            first_session,
+            CommitSeq::new(11),
+        )
+        .expect("first plan should prepare");
+        assert!(
+            first_prepared.has_out_rw(),
+            "first plan should carry an outgoing SSI edge"
+        );
+        assert!(
+            registry
+                .get(first_session)
+                .is_some_and(|handle| !handle.has_out_rw()),
+            "prepared edge state remains plan-local until finalize"
+        );
+        let reservation_id = registry
+            .register_prepared_commit(first_prepared, CommitSeq::new(11))
+            .unwrap();
+
+        assert!(matches!(
+            prepare_concurrent_commit_with_ssi(
+                &mut registry,
+                &commit_index,
+                &lock_table,
+                second_session,
+                CommitSeq::new(12),
+            ),
+            Err((MvccError::Busy, FcwResult::Clean))
+        ));
+        assert!(matches!(
+            prepare_concurrent_commit_fcw_only(
+                &mut registry,
+                &commit_index,
+                &lock_table,
+                second_session,
+                CommitSeq::new(12),
+            ),
+            Err((MvccError::Busy, FcwResult::Clean))
+        ));
+        assert!(
+            registry
+                .get(second_session)
+                .is_some_and(|handle| handle.is_active()),
+            "the fence is retryable and must not abort the blocked session"
+        );
+
+        registry
+            .cancel_prepared_commit(reservation_id, first_session)
+            .expect("release first reservation");
+        assert!(
+            prepare_concurrent_commit_with_ssi(
+                &mut registry,
+                &commit_index,
+                &lock_table,
+                second_session,
+                CommitSeq::new(12),
+            )
+            .is_ok(),
+            "the next session may prepare after the prior reservation resolves"
+        );
+    }
+
+    #[test]
+    fn test_prepared_commit_reserved_session_cannot_be_removed_or_recycled() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+        let session_id = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut handle = registry.get_mut(session_id).unwrap();
+            concurrent_write_page(
+                &mut handle,
+                &lock_table,
+                session_id,
+                test_page(44),
+                test_data(),
+            )
+            .unwrap();
+        }
+        let prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            session_id,
+            CommitSeq::new(11),
+        )
+        .unwrap();
+        let reservation_id = registry
+            .register_prepared_commit(prepared, CommitSeq::new(11))
+            .unwrap();
+        let shared = registry.handle(session_id).expect("active handle");
+
+        assert!(matches!(
+            registry.try_remove(session_id),
+            Err(MvccError::Busy)
+        ));
+        assert!(registry.remove(session_id).is_none());
+        assert!(!registry.remove_and_recycle(session_id));
+        registry.recycle_handle(Arc::clone(&shared));
+        assert_eq!(registry.recycled_handles.len(), 0);
+        assert_eq!(registry.active_count(), 1);
+        assert!(
+            registry.handle(session_id).is_some_and(|handle| {
+                Arc::ptr_eq(&handle, &shared) && handle.lock().is_active()
+            })
+        );
+
+        registry
+            .cancel_prepared_commit(reservation_id, session_id)
+            .expect("release reservation before removal");
+        let removed = registry
+            .try_remove(session_id)
+            .expect("unreserved removal is valid")
+            .expect("active handle should be removed");
+        assert!(Arc::ptr_eq(&removed, &shared));
     }
 
     // -----------------------------------------------------------------------

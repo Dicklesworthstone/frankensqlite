@@ -47,6 +47,7 @@ use std::sync::atomic::{
     AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
 };
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 #[cfg(feature = "diagnostic-pragmas")]
@@ -119,7 +120,7 @@ use fsqlite_planner::{
     best_access_path_with_hints, classify_where_term, decompose_where,
 };
 use fsqlite_types::DATABASE_HEADER_SIZE;
-use fsqlite_types::cx::{CancelReason, Cx};
+use fsqlite_types::cx::{CancelReason, Cx, OperationCancellationToken};
 use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
 use fsqlite_types::limits::MAX_VARIABLE_NUMBER;
 use fsqlite_types::opcode::{Opcode, P4};
@@ -375,23 +376,32 @@ where
 
 /// Maximum trigger recursion depth (F-PGM.11).
 ///
-/// SQLite defines `SQLITE_MAX_TRIGGER_DEPTH = 1000`, but each Rust recursion
-/// level consumes significantly more stack space than C (~20-40 KiB per level
-/// including VDBE dispatch + expression evaluation). Keep at least a 2x margin
-/// below the observed 2 MiB test-thread stack boundary: compiler changes can
-/// grow these frames, and the limit must fire before the process aborts. The
-/// regression test exercises this boundary on an explicit 1 MiB stack.
-const MAX_TRIGGER_DEPTH: usize = 8;
-
-/// Maximum depth for FK CASCADE propagation.
+/// SQLite's default recursive-trigger limit. Trigger and FK subprograms are
+/// driven by `TriggerProgramDriver`, so logical nesting grows a heap-resident
+/// task stack rather than the native call stack.
+const MAX_TRIGGER_DEPTH: usize = 1000;
+/// Maximum structural depth accepted by the recursive trigger AST clone,
+/// binder, evaluator, and drop glue.
 ///
-/// Multi-level cascades (e.g., grandparent -> parent -> child) require
-/// recursive FK enforcement.  This limit prevents infinite recursion from
-/// self-referencing or circular FK chains.  SQLite uses
-/// `SQLITE_MAX_TRIGGER_DEPTH` for the same purpose; we use a separate
-/// bound because FK cascades run through `execute_statement`, not the
-/// trigger machinery.
-const MAX_FK_CASCADE_DEPTH: usize = 50;
+/// The SQL parser accepts deeper expressions for general statements, but the
+/// trigger path must reject them before cloning or binding on a small engine
+/// stack. Raising this requires converting every remaining trigger AST
+/// consumer to an explicit heap worklist.
+const MAX_TRIGGER_PROGRAM_AST_DEPTH: usize = 256;
+/// Aggregate retained heap budget for active trigger frames and queued/running
+/// trigger/FK subprogram requests. This mirrors the VDBE frame-stack default.
+const TRIGGER_PROGRAM_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum number of trigger-program state transitions performed by one poll.
+///
+/// Recursive trigger/FK programs can otherwise construct and complete all
+/// 1,000 logical levels in one scheduler turn. Keeping this finite makes the
+/// trampoline cooperate with cancellation and other ready tasks.
+const TRIGGER_PROGRAM_POLL_TRANSITION_QUANTUM: usize = 64;
+
+// Foreign-key actions consume the same bounded trigger-program depth as SQL
+// trigger frames.  Keeping a second, larger FK-only limit would allow a
+// self-referential cascade to overflow the Rust stack after the trigger guard
+// had already established the only safe process-wide boundary.
 
 static FSQLITE_HOT_PATH_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -2313,6 +2323,28 @@ impl RuntimeContext {
         &self.config
     }
 
+    /// Whether this context is safe to move onto a dedicated database worker.
+    ///
+    /// A dedicated worker must derive engine contexts from a process-detached
+    /// root. Moving a task-attached native context or a runtime handle captured
+    /// from the caller's task onto another OS thread would violate that
+    /// runtime's ownership and lifetime boundaries.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_detached_for_dedicated_worker(&self) -> bool {
+        #[cfg(feature = "native")]
+        if self.root_cx.attached_native_cx().is_some() {
+            return false;
+        }
+
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        if self.native_runtime_handle.is_some() {
+            return false;
+        }
+
+        true
+    }
+
     /// Return the active process-global runtime context.
     #[must_use]
     pub fn global() -> Arc<Self> {
@@ -2381,6 +2413,13 @@ pub struct ConnectionEnv {
     /// converts otherwise-silent corruption symptoms into actionable
     /// `FrankenError::MultiProcessContractViolation` errors.
     strict_multi_process: bool,
+    /// Cancellation-only handoff for the open operation performed by a
+    /// dedicated connection worker.
+    ///
+    /// This token is consumed only while opening. It is cleared from the
+    /// environment retained by the connection so later ATTACH/open operations
+    /// cannot inherit cancellation from the caller that opened the connection.
+    dedicated_worker_open_operation: Option<OperationCancellationToken>,
 }
 
 impl ConnectionEnv {
@@ -2392,7 +2431,43 @@ impl ConnectionEnv {
             page_buffer_max: None,
             memory_vfs_config: None,
             strict_multi_process: false,
+            dedicated_worker_open_operation: None,
         }
+    }
+
+    /// Attach a capability-free cancellation token to one dedicated-worker
+    /// open operation.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_dedicated_worker_open_operation(
+        mut self,
+        operation: OperationCancellationToken,
+    ) -> Self {
+        self.dedicated_worker_open_operation = Some(operation);
+        self
+    }
+
+    fn bootstrap_cx(&self) -> Cx {
+        let trace_id = next_trace_id();
+        self.dedicated_worker_open_operation.as_ref().map_or_else(
+            || {
+                self.runtime
+                    .root_cx
+                    .create_child()
+                    .with_trace_context(trace_id, 0, 0)
+            },
+            |operation| {
+                self.runtime
+                    .root_cx
+                    .create_child_linked_to_operation_with_fallback_trace(operation, trace_id)
+            },
+        )
+    }
+
+    fn clone_for_connection_storage(&self) -> Self {
+        let mut stored = self.clone();
+        stored.dedicated_worker_open_operation = None;
+        stored
     }
 
     /// Enable strict multi-process mode for this connection env. With
@@ -2458,6 +2533,7 @@ impl Default for ConnectionEnv {
             page_buffer_max: None,
             memory_vfs_config: None,
             strict_multi_process: false,
+            dedicated_worker_open_operation: None,
         }
     }
 }
@@ -6837,6 +6913,8 @@ impl PreparedStatement<'_> {
 
     /// Execute as a query and return all result rows.
     pub async fn query(&self) -> Result<Vec<Row>> {
+        let _public_operation = self.conn.enter_public_operation()?;
+        self.conn.settle_pending_transaction_cleanup().await?;
         self.conn.background_status()?;
         self.conn
             .query_prepared_with_params_after_background_status(self, &[])
@@ -6845,6 +6923,8 @@ impl PreparedStatement<'_> {
 
     /// Execute as a query with bound SQL parameters (`?1`, `?2`, ...).
     pub async fn query_with_params(&self, params: &[SqliteValue]) -> Result<Vec<Row>> {
+        let _public_operation = self.conn.enter_public_operation()?;
+        self.conn.settle_pending_transaction_cleanup().await?;
         self.conn.background_status()?;
         if let Some(rows) = self.try_query_clean_memory_indexed_equality_fast(params)? {
             return Ok(rows);
@@ -6859,6 +6939,8 @@ impl PreparedStatement<'_> {
     where
         F: FnMut(&Row) -> Result<()>,
     {
+        let _public_operation = self.conn.enter_public_operation()?;
+        self.conn.settle_pending_transaction_cleanup().await?;
         self.conn.background_status()?;
         self.conn
             .query_prepared_with_params_for_each_after_background_status(self, params, f)
@@ -6867,15 +6949,18 @@ impl PreparedStatement<'_> {
 
     /// Execute as a query and return exactly one row.
     pub async fn query_row(&self) -> Result<Row> {
+        let _public_operation = self.conn.enter_public_operation()?;
         self.query_row_internal(None).await
     }
 
     /// Execute as a query with parameters and return exactly one row.
     pub async fn query_row_with_params(&self, params: &[SqliteValue]) -> Result<Row> {
+        let _public_operation = self.conn.enter_public_operation()?;
         self.query_row_internal(Some(params)).await
     }
 
     async fn query_row_internal(&self, params: Option<&[SqliteValue]>) -> Result<Row> {
+        self.conn.settle_pending_transaction_cleanup().await?;
         self.conn.background_status()?;
         if let Some(params) = params
             && let Some(row_outcome) = self.try_query_row_clean_memory_rowid_lookup_fast(params)?
@@ -6924,10 +7009,20 @@ impl PreparedStatement<'_> {
     /// constraints, and autocommit.  For SELECT statements, this returns
     /// the number of result rows.
     pub async fn execute(&self) -> Result<usize> {
+        let _public_operation = self.conn.enter_public_operation()?;
+        self.conn.settle_pending_transaction_cleanup().await?;
+        self.conn.background_status()?;
         if self.dml_dispatch.is_some() {
-            return self.conn.execute_prepared(self).await;
+            return self
+                .conn
+                .execute_prepared_with_params_after_background_status(self, &[], false)
+                .await;
         }
-        Ok(self.query().await?.len())
+        Ok(self
+            .conn
+            .query_prepared_with_params_after_background_status(self, &[])
+            .await?
+            .len())
     }
 
     /// Execute with bound SQL parameters and return affected/output row count.
@@ -6937,10 +7032,23 @@ impl PreparedStatement<'_> {
     /// constraints, and autocommit.  For SELECT statements, this returns
     /// the number of result rows.
     pub async fn execute_with_params(&self, params: &[SqliteValue]) -> Result<usize> {
+        let _public_operation = self.conn.enter_public_operation()?;
+        self.conn.settle_pending_transaction_cleanup().await?;
+        self.conn.background_status()?;
         if self.dml_dispatch.is_some() {
-            return self.conn.execute_prepared_with_params(self, params).await;
+            return self
+                .conn
+                .execute_prepared_with_params_after_background_status(self, params, false)
+                .await;
         }
-        Ok(self.query_with_params(params).await?.len())
+        if let Some(rows) = self.try_query_clean_memory_indexed_equality_fast(params)? {
+            return Ok(rows.len());
+        }
+        Ok(self
+            .conn
+            .query_prepared_with_params_after_background_status(self, params)
+            .await?
+            .len())
     }
 
     /// Return an EXPLAIN-style disassembly for the compiled program.
@@ -7032,43 +7140,122 @@ struct TriggerDef {
     event: fsqlite_ast::TriggerEvent,
     #[allow(dead_code)] // SQLite-only: always true; retained for display/roundtrip fidelity.
     for_each_row: bool,
-    when_clause: Option<Expr>,
-    body: Vec<Statement>,
+    /// Immutable parsed trigger programs are shared by execution-time clones.
+    ///
+    /// The fire paths clone `TriggerDef` values before awaiting. Keeping these
+    /// potentially large ASTs behind `Rc` prevents every recursive level from
+    /// cloning the entire body (including statements after an early
+    /// `RAISE(IGNORE)`). Schema rewrites use `Rc::make_mut` for copy-on-write.
+    when_clause: Option<Rc<Expr>>,
+    body: Rc<Vec<Statement>>,
     temporary: bool,
     create_sql: String,
 }
 
 impl TriggerDef {
+    fn validate_ast(stmt: &fsqlite_ast::CreateTriggerStatement) -> Result<()> {
+        if let Some(when_clause) = stmt.when.as_ref() {
+            TriggerAstMemoryCounter::measure_expr(when_clause)?;
+        }
+        for statement in &stmt.body {
+            TriggerAstMemoryCounter::measure(statement)?;
+        }
+        Ok(())
+    }
+
     fn from_create_statement(
         stmt: &fsqlite_ast::CreateTriggerStatement,
         create_sql: String,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Self::validate_ast(stmt)?;
+        Ok(Self {
             name: stmt.name.name.clone(),
             table_name: stmt.table.clone(),
             timing: stmt.timing,
             event: stmt.event.clone(),
             for_each_row: stmt.for_each_row,
-            when_clause: stmt.when.clone(),
-            body: stmt.body.clone(),
+            when_clause: stmt.when.clone().map(Rc::new),
+            body: Rc::new(stmt.body.clone()),
             temporary: stmt.temporary,
             create_sql,
-        }
+        })
     }
 }
 
 #[derive(Debug, Clone)]
 struct TriggerFrame {
-    table_name: String,
+    table_name: Rc<str>,
     /// Name of the trigger being executed (for recursive_triggers guard).
-    trigger_name: String,
-    column_names: Vec<String>,
+    trigger_name: Rc<str>,
+    column_names: Rc<[String]>,
     rowid_alias_col_idx: Option<usize>,
-    old_row: Option<Vec<SqliteValue>>,
-    new_row: Option<Vec<SqliteValue>>,
+    old_row: Option<Rc<[SqliteValue]>>,
+    new_row: Option<Rc<[SqliteValue]>>,
 }
 
 impl TriggerFrame {
+    fn for_trigger(&self, trigger_name: &str) -> Rc<Self> {
+        Rc::new(Self {
+            trigger_name: Rc::from(trigger_name),
+            ..self.clone()
+        })
+    }
+
+    fn estimated_memory_bytes(&self) -> Result<usize> {
+        fn checked_add(total: &mut usize, bytes: usize) -> Result<()> {
+            *total = total.checked_add(bytes).ok_or(FrankenError::OutOfMemory)?;
+            if *total > TRIGGER_PROGRAM_MEMORY_BUDGET_BYTES {
+                return Err(FrankenError::OutOfMemory);
+            }
+            Ok(())
+        }
+
+        fn add_row(total: &mut usize, row: Option<&[SqliteValue]>) -> Result<()> {
+            let Some(values) = row else {
+                return Ok(());
+            };
+            checked_add(
+                total,
+                values
+                    .len()
+                    .checked_mul(std::mem::size_of::<SqliteValue>())
+                    .ok_or(FrankenError::OutOfMemory)?,
+            )?;
+            for value in values {
+                match value {
+                    SqliteValue::Text(text) => checked_add(total, text.as_str().len())?,
+                    SqliteValue::Blob(blob) => checked_add(total, blob.len())?,
+                    SqliteValue::Null | SqliteValue::Integer(_) | SqliteValue::Float(_) => {}
+                }
+            }
+            Ok(())
+        }
+
+        // Include the `Rc` allocation headers and three retained references
+        // (the stack slot, its guard, and the executing future). Shared
+        // payloads are counted in full, deliberately favoring a conservative
+        // overcharge.
+        let mut total = std::mem::size_of::<Self>()
+            .checked_add(4 * std::mem::size_of::<usize>())
+            .and_then(|bytes| bytes.checked_add(3 * std::mem::size_of::<Rc<Self>>()))
+            .ok_or(FrankenError::OutOfMemory)?;
+        checked_add(&mut total, self.table_name.len())?;
+        checked_add(&mut total, self.trigger_name.len())?;
+        checked_add(
+            &mut total,
+            self.column_names
+                .len()
+                .checked_mul(std::mem::size_of::<String>())
+                .ok_or(FrankenError::OutOfMemory)?,
+        )?;
+        for column_name in self.column_names.iter() {
+            checked_add(&mut total, column_name.capacity())?;
+        }
+        add_row(&mut total, self.old_row.as_deref())?;
+        add_row(&mut total, self.new_row.as_deref())?;
+        Ok(total)
+    }
+
     fn column_index(&self, column_name: &str) -> Option<usize> {
         self.column_names
             .iter()
@@ -7134,12 +7321,988 @@ impl TriggerFrame {
 }
 
 struct TriggerFrameGuard<'a> {
-    stack: &'a RefCell<Vec<TriggerFrame>>,
+    stack: &'a RefCell<Vec<Rc<TriggerFrame>>>,
+    expected_frame: Rc<TriggerFrame>,
+    memory_bytes: &'a Cell<usize>,
+    charged_bytes: usize,
+}
+
+/// Release a retained trigger-program charge without hiding accounting bugs.
+///
+/// `usize::MAX` is the fail-closed poison value. Once an under-release or
+/// double-release is detected, subsequent charges remain rejected instead of a
+/// saturating subtraction making the connection appear to have free budget.
+fn release_trigger_program_memory_cell(memory_bytes: &Cell<usize>, bytes: usize) {
+    let current = memory_bytes.get();
+    if current > TRIGGER_PROGRAM_MEMORY_BUDGET_BYTES || bytes > current {
+        memory_bytes.set(usize::MAX);
+    } else {
+        memory_bytes.set(current - bytes);
+    }
 }
 
 impl Drop for TriggerFrameGuard<'_> {
     fn drop(&mut self) {
-        let _ = self.stack.borrow_mut().pop();
+        let popped = self.stack.borrow_mut().pop();
+        if popped
+            .as_ref()
+            .is_none_or(|frame| !Rc::ptr_eq(frame, &self.expected_frame))
+        {
+            // A non-LIFO frame release means later depth checks can no longer
+            // be trusted. Poison the shared budget so the connection rejects
+            // further recursive work instead of continuing undercounted.
+            self.memory_bytes.set(usize::MAX);
+        }
+        release_trigger_program_memory_cell(self.memory_bytes, self.charged_bytes);
+    }
+}
+
+/// One node in the explicit heap worklist used to size a retained trigger AST.
+///
+/// This deliberately avoids `Debug`/`Display`: both recursively walk nested
+/// expressions and can overflow the same small worker stack the trigger
+/// trampoline is meant to protect.
+enum TriggerAstMemoryNode<'a> {
+    Statement(&'a Statement),
+    Expr(&'a Expr),
+    Select(&'a SelectStatement),
+    SelectCore(&'a SelectCore),
+    From(&'a FromClause),
+    Table(&'a TableOrSubquery),
+    Window(&'a WindowSpec),
+}
+
+struct TriggerAstMemoryCounter<'a> {
+    bytes: usize,
+    node_count: usize,
+    current_depth: usize,
+    pending: Vec<(TriggerAstMemoryNode<'a>, usize)>,
+}
+
+impl<'a> TriggerAstMemoryCounter<'a> {
+    fn measure(statement: &'a Statement) -> Result<usize> {
+        Self::measure_node(
+            TriggerAstMemoryNode::Statement(statement),
+            std::mem::size_of::<Statement>(),
+        )
+    }
+
+    fn measure_expr(expr: &'a Expr) -> Result<usize> {
+        Self::measure_node(
+            TriggerAstMemoryNode::Expr(expr),
+            std::mem::size_of::<Expr>(),
+        )
+    }
+
+    fn measure_node(node: TriggerAstMemoryNode<'a>, root_bytes: usize) -> Result<usize> {
+        let mut counter = Self {
+            bytes: root_bytes,
+            node_count: 0,
+            current_depth: 0,
+            pending: Vec::new(),
+        };
+        counter
+            .pending
+            .try_reserve(1)
+            .map_err(|_| FrankenError::OutOfMemory)?;
+        counter.pending.push((node, 0));
+        while let Some((node, depth)) = counter.pending.pop() {
+            if depth > MAX_TRIGGER_PROGRAM_AST_DEPTH {
+                return Err(FrankenError::ExpressionTooDeep {
+                    max: MAX_TRIGGER_PROGRAM_AST_DEPTH,
+                });
+            }
+            counter.current_depth = depth;
+            counter.node_count = counter
+                .node_count
+                .checked_add(1)
+                .ok_or(FrankenError::OutOfMemory)?;
+            match node {
+                TriggerAstMemoryNode::Statement(statement) => {
+                    counter.visit_statement(statement)?;
+                }
+                TriggerAstMemoryNode::Expr(expr) => counter.visit_expr(expr)?,
+                TriggerAstMemoryNode::Select(select) => counter.visit_select(select)?,
+                TriggerAstMemoryNode::SelectCore(core) => counter.visit_select_core(core)?,
+                TriggerAstMemoryNode::From(from) => counter.visit_from(from)?,
+                TriggerAstMemoryNode::Table(table) => counter.visit_table(table)?,
+                TriggerAstMemoryNode::Window(window) => counter.visit_window(window)?,
+            }
+        }
+        // Cover allocator size-class rounding and the retained task/vector
+        // slots. This is intentionally conservative; every AST node gets two
+        // machine words even when it is inline in a Vec allocation.
+        let allocator_slack = counter
+            .node_count
+            .checked_mul(2 * std::mem::size_of::<usize>())
+            .ok_or(FrankenError::OutOfMemory)?;
+        counter.add(allocator_slack)?;
+        Ok(counter.bytes)
+    }
+
+    fn add(&mut self, bytes: usize) -> Result<()> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or(FrankenError::OutOfMemory)?;
+        if self.bytes > TRIGGER_PROGRAM_MEMORY_BUDGET_BYTES {
+            return Err(FrankenError::OutOfMemory);
+        }
+        Ok(())
+    }
+
+    fn add_product(&mut self, count: usize, element_size: usize) -> Result<()> {
+        self.add(
+            count
+                .checked_mul(element_size)
+                .ok_or(FrankenError::OutOfMemory)?,
+        )
+    }
+
+    fn add_vec<T>(&mut self, values: &Vec<T>) -> Result<()> {
+        self.add_product(values.capacity(), std::mem::size_of::<T>())
+    }
+
+    fn add_string(&mut self, value: &String) -> Result<()> {
+        self.add(value.capacity())
+    }
+
+    fn add_optional_string(&mut self, value: Option<&String>) -> Result<()> {
+        if let Some(value) = value {
+            self.add_string(value)?;
+        }
+        Ok(())
+    }
+
+    fn add_arc_str(&mut self, value: &Arc<str>) -> Result<()> {
+        // Count the payload and the Arc strong/weak counters. Bound statements
+        // often share these payloads, so this is a safe overcharge.
+        self.add(value.len())?;
+        self.add_product(2, std::mem::size_of::<usize>())
+    }
+
+    fn push(&mut self, node: TriggerAstMemoryNode<'a>) -> Result<()> {
+        let depth = self
+            .current_depth
+            .checked_add(1)
+            .ok_or(FrankenError::ExpressionTooDeep {
+                max: MAX_TRIGGER_PROGRAM_AST_DEPTH,
+            })?;
+        self.pending
+            .try_reserve(1)
+            .map_err(|_| FrankenError::OutOfMemory)?;
+        self.pending.push((node, depth));
+        Ok(())
+    }
+
+    fn push_boxed_expr(&mut self, expr: &'a Expr) -> Result<()> {
+        self.add(std::mem::size_of::<Expr>())?;
+        self.push(TriggerAstMemoryNode::Expr(expr))
+    }
+
+    fn push_boxed_select(&mut self, select: &'a SelectStatement) -> Result<()> {
+        self.add(std::mem::size_of::<SelectStatement>())?;
+        self.push(TriggerAstMemoryNode::Select(select))
+    }
+
+    fn add_qualified_name(&mut self, name: &QualifiedName) -> Result<()> {
+        self.add_optional_string(name.schema.as_ref())?;
+        self.add_string(&name.name)
+    }
+
+    fn add_string_vec(&mut self, values: &Vec<String>) -> Result<()> {
+        self.add_vec(values)?;
+        for value in values {
+            self.add_string(value)?;
+        }
+        Ok(())
+    }
+
+    fn visit_statement(&mut self, statement: &'a Statement) -> Result<()> {
+        match statement {
+            Statement::Select(select) => self.push(TriggerAstMemoryNode::Select(select)),
+            Statement::Insert(insert) => self.visit_insert(insert),
+            Statement::Update(update) => self.visit_update(update),
+            Statement::Delete(delete) => self.visit_delete(delete),
+            // SQLite trigger programs contain only SELECT and DML statements.
+            // Reject any future parser expansion until its retained state has an
+            // explicit accounting arm rather than silently undercounting it.
+            _ => Err(FrankenError::OutOfMemory),
+        }
+    }
+
+    fn visit_insert(&mut self, insert: &'a InsertStatement) -> Result<()> {
+        if let Some(with) = insert.with.as_ref() {
+            self.visit_with(with)?;
+        }
+        self.add_qualified_name(&insert.table)?;
+        self.add_optional_string(insert.alias.as_ref())?;
+        self.add_string_vec(&insert.columns)?;
+        match &insert.source {
+            InsertSource::Values(rows) => {
+                self.add_vec(rows)?;
+                for row in rows {
+                    self.add_vec(row)?;
+                    for expr in row {
+                        self.push(TriggerAstMemoryNode::Expr(expr))?;
+                    }
+                }
+            }
+            InsertSource::Select(select) => self.push_boxed_select(select)?,
+            InsertSource::DefaultValues => {}
+        }
+        self.add_vec(&insert.upsert)?;
+        for upsert in &insert.upsert {
+            if let Some(target) = upsert.target.as_ref() {
+                self.add_vec(&target.columns)?;
+                for column in &target.columns {
+                    self.push(TriggerAstMemoryNode::Expr(&column.expr))?;
+                    self.add_optional_string(column.collation.as_ref())?;
+                }
+                if let Some(expr) = target.where_clause.as_ref() {
+                    self.push(TriggerAstMemoryNode::Expr(expr))?;
+                }
+            }
+            if let UpsertAction::Update {
+                assignments,
+                where_clause,
+            } = &upsert.action
+            {
+                self.visit_assignments(assignments)?;
+                if let Some(expr) = where_clause.as_deref() {
+                    self.push_boxed_expr(expr)?;
+                }
+            }
+        }
+        self.visit_result_columns(&insert.returning)
+    }
+
+    fn visit_update(&mut self, update: &'a fsqlite_ast::UpdateStatement) -> Result<()> {
+        if let Some(with) = update.with.as_ref() {
+            self.visit_with(with)?;
+        }
+        self.visit_qualified_table_ref(&update.table)?;
+        self.visit_assignments(&update.assignments)?;
+        if let Some(from) = update.from.as_ref() {
+            self.push(TriggerAstMemoryNode::From(from))?;
+        }
+        if let Some(expr) = update.where_clause.as_ref() {
+            self.push(TriggerAstMemoryNode::Expr(expr))?;
+        }
+        self.visit_result_columns(&update.returning)?;
+        self.visit_ordering_terms(&update.order_by)?;
+        if let Some(limit) = update.limit.as_ref() {
+            self.visit_limit(limit)?;
+        }
+        Ok(())
+    }
+
+    fn visit_delete(&mut self, delete: &'a fsqlite_ast::DeleteStatement) -> Result<()> {
+        if let Some(with) = delete.with.as_ref() {
+            self.visit_with(with)?;
+        }
+        self.visit_qualified_table_ref(&delete.table)?;
+        if let Some(expr) = delete.where_clause.as_ref() {
+            self.push(TriggerAstMemoryNode::Expr(expr))?;
+        }
+        self.visit_result_columns(&delete.returning)?;
+        self.visit_ordering_terms(&delete.order_by)?;
+        if let Some(limit) = delete.limit.as_ref() {
+            self.visit_limit(limit)?;
+        }
+        Ok(())
+    }
+
+    fn visit_with(&mut self, with: &'a fsqlite_ast::WithClause) -> Result<()> {
+        self.add_vec(&with.ctes)?;
+        for cte in &with.ctes {
+            self.add_string(&cte.name)?;
+            self.add_string_vec(&cte.columns)?;
+            self.push(TriggerAstMemoryNode::Select(&cte.query))?;
+        }
+        Ok(())
+    }
+
+    fn visit_qualified_table_ref(
+        &mut self,
+        table: &'a fsqlite_ast::QualifiedTableRef,
+    ) -> Result<()> {
+        self.add_qualified_name(&table.name)?;
+        self.add_optional_string(table.alias.as_ref())?;
+        if let Some(fsqlite_ast::IndexHint::IndexedBy(index)) = table.index_hint.as_ref() {
+            self.add_string(index)?;
+        }
+        if let Some(fsqlite_ast::TimeTravelClause {
+            target: TimeTravelTarget::Timestamp(timestamp),
+        }) = table.time_travel.as_ref()
+        {
+            self.add_string(timestamp)?;
+        }
+        Ok(())
+    }
+
+    fn visit_assignments(&mut self, assignments: &'a Vec<fsqlite_ast::Assignment>) -> Result<()> {
+        self.add_vec(assignments)?;
+        for assignment in assignments {
+            match &assignment.target {
+                fsqlite_ast::AssignmentTarget::Column(column) => self.add_string(column)?,
+                fsqlite_ast::AssignmentTarget::ColumnList(columns) => {
+                    self.add_string_vec(columns)?;
+                }
+            }
+            self.push(TriggerAstMemoryNode::Expr(&assignment.value))?;
+        }
+        Ok(())
+    }
+
+    fn visit_result_columns(&mut self, columns: &'a Vec<ResultColumn>) -> Result<()> {
+        self.add_vec(columns)?;
+        for column in columns {
+            match column {
+                ResultColumn::Star => {}
+                ResultColumn::TableStar(name) => self.add_qualified_name(name)?,
+                ResultColumn::Expr { expr, alias } => {
+                    self.push(TriggerAstMemoryNode::Expr(expr))?;
+                    self.add_optional_string(alias.as_ref())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_ordering_terms(&mut self, terms: &'a Vec<OrderingTerm>) -> Result<()> {
+        self.add_vec(terms)?;
+        for term in terms {
+            self.push(TriggerAstMemoryNode::Expr(&term.expr))?;
+        }
+        Ok(())
+    }
+
+    fn visit_limit(&mut self, limit: &'a LimitClause) -> Result<()> {
+        self.push(TriggerAstMemoryNode::Expr(&limit.limit))?;
+        if let Some(offset) = limit.offset.as_ref() {
+            self.push(TriggerAstMemoryNode::Expr(offset))?;
+        }
+        Ok(())
+    }
+
+    fn visit_select(&mut self, select: &'a SelectStatement) -> Result<()> {
+        if let Some(with) = select.with.as_ref() {
+            self.visit_with(with)?;
+        }
+        self.push(TriggerAstMemoryNode::SelectCore(&select.body.select))?;
+        self.add_vec(&select.body.compounds)?;
+        for (_, core) in &select.body.compounds {
+            self.push(TriggerAstMemoryNode::SelectCore(core))?;
+        }
+        self.visit_ordering_terms(&select.order_by)?;
+        if let Some(limit) = select.limit.as_ref() {
+            self.visit_limit(limit)?;
+        }
+        Ok(())
+    }
+
+    fn visit_select_core(&mut self, core: &'a SelectCore) -> Result<()> {
+        match core {
+            SelectCore::Select {
+                columns,
+                from,
+                where_clause,
+                group_by,
+                having,
+                windows,
+                ..
+            } => {
+                self.visit_result_columns(columns)?;
+                if let Some(from) = from.as_ref() {
+                    self.push(TriggerAstMemoryNode::From(from))?;
+                }
+                if let Some(expr) = where_clause.as_deref() {
+                    self.push_boxed_expr(expr)?;
+                }
+                self.add_vec(group_by)?;
+                for expr in group_by {
+                    self.push(TriggerAstMemoryNode::Expr(expr))?;
+                }
+                if let Some(expr) = having.as_deref() {
+                    self.push_boxed_expr(expr)?;
+                }
+                self.add_vec(windows)?;
+                for window in windows {
+                    self.add_string(&window.name)?;
+                    self.push(TriggerAstMemoryNode::Window(&window.spec))?;
+                }
+            }
+            SelectCore::Values(rows) => {
+                self.add_vec(rows)?;
+                for row in rows {
+                    self.add_vec(row)?;
+                    for expr in row {
+                        self.push(TriggerAstMemoryNode::Expr(expr))?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_from(&mut self, from: &'a FromClause) -> Result<()> {
+        self.push(TriggerAstMemoryNode::Table(&from.source))?;
+        self.add_vec(&from.joins)?;
+        for join in &from.joins {
+            self.push(TriggerAstMemoryNode::Table(&join.table))?;
+            if let Some(constraint) = join.constraint.as_ref() {
+                match constraint {
+                    JoinConstraint::On(expr) => {
+                        self.push(TriggerAstMemoryNode::Expr(expr))?;
+                    }
+                    JoinConstraint::Using(columns) => self.add_string_vec(columns)?,
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_table(&mut self, table: &'a TableOrSubquery) -> Result<()> {
+        match table {
+            TableOrSubquery::Table {
+                name,
+                alias,
+                index_hint,
+                time_travel,
+            } => {
+                self.add_qualified_name(name)?;
+                self.add_optional_string(alias.as_ref())?;
+                if let Some(fsqlite_ast::IndexHint::IndexedBy(index)) = index_hint.as_ref() {
+                    self.add_string(index)?;
+                }
+                if let Some(fsqlite_ast::TimeTravelClause {
+                    target: TimeTravelTarget::Timestamp(timestamp),
+                }) = time_travel.as_ref()
+                {
+                    self.add_string(timestamp)?;
+                }
+            }
+            TableOrSubquery::Subquery { query, alias } => {
+                self.push_boxed_select(query)?;
+                self.add_optional_string(alias.as_ref())?;
+            }
+            TableOrSubquery::TableFunction { name, args, alias } => {
+                self.add_string(name)?;
+                self.add_vec(args)?;
+                for expr in args {
+                    self.push(TriggerAstMemoryNode::Expr(expr))?;
+                }
+                self.add_optional_string(alias.as_ref())?;
+            }
+            TableOrSubquery::ParenJoin(from) => {
+                self.add(std::mem::size_of::<FromClause>())?;
+                self.push(TriggerAstMemoryNode::From(from))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn visit_expr(&mut self, expr: &'a Expr) -> Result<()> {
+        match expr {
+            Expr::Literal(literal, _) => match literal {
+                Literal::String(value) => self.add_string(value)?,
+                Literal::Blob(value) => self.add_vec(value)?,
+                Literal::Integer(_)
+                | Literal::Float(_)
+                | Literal::Null
+                | Literal::True
+                | Literal::False
+                | Literal::CurrentTime
+                | Literal::CurrentDate
+                | Literal::CurrentTimestamp => {}
+            },
+            Expr::Column(column, _) => {
+                if let Some(table) = column.table.as_ref() {
+                    self.add_arc_str(table)?;
+                }
+                self.add_arc_str(&column.column)?;
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                self.push_boxed_expr(left)?;
+                self.push_boxed_expr(right)?;
+            }
+            Expr::UnaryOp { expr, .. } | Expr::Collate { expr, .. } | Expr::IsNull { expr, .. } => {
+                self.push_boxed_expr(expr)?
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.push_boxed_expr(expr)?;
+                self.push_boxed_expr(low)?;
+                self.push_boxed_expr(high)?;
+            }
+            Expr::In { expr, set, .. } => {
+                self.push_boxed_expr(expr)?;
+                match set {
+                    InSet::List(values) => {
+                        self.add_vec(values)?;
+                        for value in values {
+                            self.push(TriggerAstMemoryNode::Expr(value))?;
+                        }
+                    }
+                    InSet::Subquery(select) => self.push_boxed_select(select)?,
+                    InSet::Table(name) => self.add_qualified_name(name)?,
+                }
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                self.push_boxed_expr(expr)?;
+                self.push_boxed_expr(pattern)?;
+                if let Some(escape) = escape.as_deref() {
+                    self.push_boxed_expr(escape)?;
+                }
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+                ..
+            } => {
+                if let Some(operand) = operand.as_deref() {
+                    self.push_boxed_expr(operand)?;
+                }
+                self.add_vec(whens)?;
+                for (when, then) in whens {
+                    self.push(TriggerAstMemoryNode::Expr(when))?;
+                    self.push(TriggerAstMemoryNode::Expr(then))?;
+                }
+                if let Some(else_expr) = else_expr.as_deref() {
+                    self.push_boxed_expr(else_expr)?;
+                }
+            }
+            Expr::Cast {
+                expr, type_name, ..
+            } => {
+                self.push_boxed_expr(expr)?;
+                self.add_string(&type_name.name)?;
+                self.add_optional_string(type_name.arg1.as_ref())?;
+                self.add_optional_string(type_name.arg2.as_ref())?;
+            }
+            Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+                self.push_boxed_select(subquery)?;
+            }
+            Expr::FunctionCall {
+                name,
+                args,
+                order_by,
+                filter,
+                over,
+                ..
+            } => {
+                self.add_string(name)?;
+                if let FunctionArgs::List(args) = args {
+                    self.add_vec(args)?;
+                    for arg in args {
+                        self.push(TriggerAstMemoryNode::Expr(arg))?;
+                    }
+                }
+                self.visit_ordering_terms(order_by)?;
+                if let Some(filter) = filter.as_deref() {
+                    self.push_boxed_expr(filter)?;
+                }
+                if let Some(window) = over.as_ref() {
+                    self.push(TriggerAstMemoryNode::Window(window))?;
+                }
+            }
+            Expr::Raise { message, .. } => self.add_optional_string(message.as_ref())?,
+            Expr::JsonAccess { expr, path, .. } => {
+                self.push_boxed_expr(expr)?;
+                self.push_boxed_expr(path)?;
+            }
+            Expr::RowValue(values, _) => {
+                self.add_vec(values)?;
+                for value in values {
+                    self.push(TriggerAstMemoryNode::Expr(value))?;
+                }
+            }
+            Expr::Placeholder(placeholder, _) => match placeholder {
+                PlaceholderType::ColonNamed(name)
+                | PlaceholderType::AtNamed(name)
+                | PlaceholderType::DollarNamed(name) => self.add_string(name)?,
+                PlaceholderType::Anonymous | PlaceholderType::Numbered(_) => {}
+            },
+        }
+        if let Expr::Collate { collation, .. } = expr {
+            self.add_string(collation)?;
+        }
+        Ok(())
+    }
+
+    fn visit_window(&mut self, window: &'a WindowSpec) -> Result<()> {
+        self.add_optional_string(window.base_window.as_ref())?;
+        self.add_vec(&window.partition_by)?;
+        for expr in &window.partition_by {
+            self.push(TriggerAstMemoryNode::Expr(expr))?;
+        }
+        self.visit_ordering_terms(&window.order_by)?;
+        if let Some(frame) = window.frame.as_ref() {
+            self.visit_frame_bound(&frame.start)?;
+            if let Some(end) = frame.end.as_ref() {
+                self.visit_frame_bound(end)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_frame_bound(&mut self, bound: &'a FrameBound) -> Result<()> {
+        match bound {
+            FrameBound::Preceding(expr) | FrameBound::Following(expr) => self.push_boxed_expr(expr),
+            FrameBound::UnboundedPreceding
+            | FrameBound::CurrentRow
+            | FrameBound::UnboundedFollowing => Ok(()),
+        }
+    }
+}
+
+type TriggerProgramCompletion = Rc<RefCell<Option<Result<()>>>>;
+
+enum TriggerProgramWork {
+    Statement(Statement),
+    ForeignKey {
+        sql: String,
+        params: Vec<SqliteValue>,
+    },
+    #[cfg(test)]
+    TestPending,
+    #[cfg(test)]
+    TestInternalStatementThenPending {
+        internal_statement_completed: Rc<Cell<bool>>,
+    },
+    #[cfg(test)]
+    TestPanic,
+    #[cfg(test)]
+    TestEnqueueThenReady,
+    #[cfg(test)]
+    TestChain {
+        remaining: usize,
+        pending_leaf: bool,
+        lineage: Rc<RefCell<Vec<(u64, Option<u64>, usize)>>>,
+        drops: Rc<RefCell<Vec<usize>>>,
+    },
+}
+
+#[cfg(test)]
+struct TriggerProgramTestDropGuard {
+    remaining: usize,
+    drops: Rc<RefCell<Vec<usize>>>,
+}
+
+#[cfg(test)]
+impl Drop for TriggerProgramTestDropGuard {
+    fn drop(&mut self) {
+        self.drops.borrow_mut().push(self.remaining);
+    }
+}
+
+struct TriggerProgramRequest {
+    work: TriggerProgramWork,
+    completion: TriggerProgramCompletion,
+    charged_bytes: usize,
+    task_id: u64,
+    parent_task_id: Option<u64>,
+    logical_depth: usize,
+}
+
+struct TriggerProgramTask<'a> {
+    future: Pin<Box<dyn Future<Output = Result<()>> + 'a>>,
+    completion: TriggerProgramCompletion,
+    memory_bytes: &'a Cell<usize>,
+    charged_bytes: usize,
+    task_id: u64,
+    parent_task_id: Option<u64>,
+    logical_depth: usize,
+}
+
+impl Drop for TriggerProgramTask<'_> {
+    fn drop(&mut self) {
+        release_trigger_program_memory_cell(self.memory_bytes, self.charged_bytes);
+    }
+}
+
+/// Heap-resident executor for recursive SQL trigger and FK subprograms.
+///
+/// A nested subprogram registers a request and yields. The driver then polls
+/// that child only after the parent's native poll stack has unwound. Completed
+/// child results are delivered through a request-local slot before the parent
+/// is polled again, preserving ordinary `.await` ordering and error semantics.
+struct TriggerProgramDriver<'a> {
+    conn: &'a Connection,
+    id: u64,
+    tasks: Vec<TriggerProgramTask<'a>>,
+}
+
+struct TriggerProgramPollingGuard<'a> {
+    polling_driver: &'a Cell<Option<u64>>,
+    polling_task: &'a Cell<Option<u64>>,
+    polling_parent_task: &'a Cell<Option<u64>>,
+    polling_depth: &'a Cell<usize>,
+    previous_driver: Option<u64>,
+    previous_task: Option<u64>,
+    previous_parent_task: Option<u64>,
+    previous_depth: usize,
+}
+
+impl<'a> TriggerProgramPollingGuard<'a> {
+    fn enter(
+        conn: &'a Connection,
+        id: u64,
+        task_id: u64,
+        parent_task_id: Option<u64>,
+        logical_depth: usize,
+    ) -> Self {
+        let polling_driver = &conn.trigger_program_polling_driver;
+        let polling_task = &conn.trigger_program_polling_task;
+        let polling_parent_task = &conn.trigger_program_polling_parent_task;
+        let polling_depth = &conn.trigger_program_polling_depth;
+        let previous_driver = polling_driver.replace(Some(id));
+        let previous_task = polling_task.replace(Some(task_id));
+        let previous_parent_task = polling_parent_task.replace(parent_task_id);
+        let previous_depth = polling_depth.replace(logical_depth);
+        Self {
+            polling_driver,
+            polling_task,
+            polling_parent_task,
+            polling_depth,
+            previous_driver,
+            previous_task,
+            previous_parent_task,
+            previous_depth,
+        }
+    }
+}
+
+impl Drop for TriggerProgramPollingGuard<'_> {
+    fn drop(&mut self) {
+        self.polling_driver.set(self.previous_driver);
+        self.polling_task.set(self.previous_task);
+        self.polling_parent_task.set(self.previous_parent_task);
+        self.polling_depth.set(self.previous_depth);
+    }
+}
+
+impl TriggerProgramDriver<'_> {
+    /// Cancel every retained child in strict child-before-parent order.
+    fn cancel_all_tasks_and_requests(&mut self) {
+        // A queued request was admitted by the currently-polled task and is
+        // therefore its child even though it has not yet been materialized as
+        // a `TriggerProgramTask`. Dispose queued children first.
+        loop {
+            let request = self.conn.trigger_program_pending.borrow_mut().pop_back();
+            let Some(request) = request else {
+                break;
+            };
+            self.conn
+                .release_trigger_program_memory(request.charged_bytes);
+            if request.completion.borrow().is_none() {
+                *request.completion.borrow_mut() = Some(Err(FrankenError::Interrupt));
+            }
+        }
+        while let Some(task) = self.tasks.pop() {
+            if task.completion.borrow().is_none() {
+                *task.completion.borrow_mut() = Some(Err(FrankenError::Interrupt));
+            }
+            // Explicit drop documents and enforces that the deepest child
+            // releases its future and accounting before its parent.
+            drop(task);
+        }
+    }
+}
+
+impl Future for TriggerProgramDriver<'_> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.conn.trigger_program_cancellation_requested() {
+            self.cancel_all_tasks_and_requests();
+            return Poll::Ready(());
+        }
+
+        let mut transitions = 0;
+        loop {
+            if transitions == TRIGGER_PROGRAM_POLL_TRANSITION_QUANTUM {
+                if self.conn.trigger_program_cancellation_requested() {
+                    self.cancel_all_tasks_and_requests();
+                    return Poll::Ready(());
+                }
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            transitions += 1;
+
+            let poll = {
+                let conn = self.conn;
+                let driver_id = self.id;
+                let Some(task) = self.tasks.last_mut() else {
+                    return Poll::Ready(());
+                };
+                let _polling = TriggerProgramPollingGuard::enter(
+                    conn,
+                    driver_id,
+                    task.task_id,
+                    task.parent_task_id,
+                    task.logical_depth,
+                );
+                task.future.as_mut().poll(cx)
+            };
+
+            if let Some(request) = self.conn.trigger_program_pending.borrow_mut().pop_front() {
+                if poll.is_ready() {
+                    // Awaiting the dispatch future must yield after publishing
+                    // a child request. A task that publishes and completes in
+                    // one poll would leave a completed parent below its child
+                    // and later repoll that completed future. Fail closed.
+                    self.conn
+                        .release_trigger_program_memory(request.charged_bytes);
+                    *request.completion.borrow_mut() = Some(Err(FrankenError::Interrupt));
+                    let task = self
+                        .tasks
+                        .pop()
+                        .expect("request-producing trigger task must exist");
+                    *task.completion.borrow_mut() = Some(Err(FrankenError::Internal(
+                        "trigger task enqueued a child and completed in the same poll".to_owned(),
+                    )));
+                    continue;
+                }
+                let conn = self.conn;
+                let task = conn.make_trigger_program_task(request);
+                self.tasks.push(task);
+                continue;
+            }
+
+            match poll {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => {
+                    let task = self.tasks.pop().expect("polled trigger task must exist");
+                    *task.completion.borrow_mut() = Some(result);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for TriggerProgramDriver<'_> {
+    fn drop(&mut self) {
+        self.cancel_all_tasks_and_requests();
+        if self.conn.trigger_program_active_driver.get() == Some(self.id) {
+            self.conn.trigger_program_active_driver.set(None);
+        }
+        if self.conn.trigger_program_polling_driver.get() == Some(self.id) {
+            self.conn.trigger_program_polling_driver.set(None);
+        }
+        self.conn.trigger_program_polling_task.set(None);
+        self.conn.trigger_program_polling_parent_task.set(None);
+        self.conn.trigger_program_polling_depth.set(0);
+    }
+}
+
+struct TriggerProgramDispatchFuture<'a> {
+    conn: &'a Connection,
+    work: Option<TriggerProgramWork>,
+    completion: Option<TriggerProgramCompletion>,
+    driver: Option<TriggerProgramDriver<'a>>,
+}
+
+impl Future for TriggerProgramDispatchFuture<'_> {
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if let Some(completion) = &self.completion
+            && let Some(result) = completion.borrow_mut().take()
+        {
+            return Poll::Ready(result);
+        }
+
+        if self.completion.is_none() {
+            let work = self
+                .work
+                .take()
+                .expect("trigger program work is consumed exactly once");
+            if let Some(active_id) = self.conn.trigger_program_active_driver.get() {
+                if self.conn.trigger_program_polling_driver.get() != Some(active_id) {
+                    return Poll::Ready(Err(FrankenError::Busy));
+                }
+                let Some(parent_task_id) = self.conn.trigger_program_polling_task.get() else {
+                    return Poll::Ready(Err(FrankenError::Interrupt));
+                };
+                let logical_depth =
+                    match self.conn.trigger_program_polling_depth.get().checked_add(1) {
+                        Some(depth) => depth,
+                        None => return Poll::Ready(Err(FrankenError::OutOfMemory)),
+                    };
+                let charged_bytes = match self.conn.charge_trigger_program_work(&work) {
+                    Ok(bytes) => bytes,
+                    Err(error) => return Poll::Ready(Err(error)),
+                };
+                let completion = Rc::new(RefCell::new(None));
+                let task_id = self.conn.next_trigger_program_task_id();
+                self.conn
+                    .trigger_program_pending
+                    .borrow_mut()
+                    .push_back(TriggerProgramRequest {
+                        work,
+                        completion: Rc::clone(&completion),
+                        charged_bytes,
+                        task_id,
+                        parent_task_id: Some(parent_task_id),
+                        logical_depth,
+                    });
+                self.completion = Some(completion);
+                return Poll::Pending;
+            }
+
+            let id = self.conn.trigger_program_next_driver_id.get();
+            self.conn
+                .trigger_program_next_driver_id
+                .set(id.wrapping_add(1).max(1));
+            self.conn.trigger_program_active_driver.set(Some(id));
+            let charged_bytes = match self.conn.charge_trigger_program_work(&work) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.conn.trigger_program_active_driver.set(None);
+                    return Poll::Ready(Err(error));
+                }
+            };
+            let completion = Rc::new(RefCell::new(None));
+            let root = TriggerProgramRequest {
+                work,
+                completion: Rc::clone(&completion),
+                charged_bytes,
+                task_id: self.conn.next_trigger_program_task_id(),
+                parent_task_id: None,
+                logical_depth: 0,
+            };
+            self.driver = Some(TriggerProgramDriver {
+                conn: self.conn,
+                id,
+                tasks: vec![self.conn.make_trigger_program_task(root)],
+            });
+            self.completion = Some(completion);
+        }
+
+        let driver_poll = self
+            .driver
+            .as_mut()
+            .map_or(Poll::Pending, |driver| Pin::new(driver).poll(cx));
+        if let Some(completion) = &self.completion
+            && let Some(result) = completion.borrow_mut().take()
+        {
+            return Poll::Ready(result);
+        }
+        match driver_poll {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(()) => Poll::Ready(Err(FrankenError::Interrupt)),
+        }
     }
 }
 
@@ -7197,6 +8360,10 @@ async fn trigger_when_matches(
     let Some(expr) = when_clause else {
         return Ok(true);
     };
+    // Derived `Clone`, the binder, evaluator, and drop glue recurse through
+    // boxed expressions. Reject unsafe depth with a typed error before any of
+    // those recursive consumers run.
+    TriggerAstMemoryCounter::measure_expr(expr)?;
     let mut bound_expr = expr.clone();
     if let Some(active_frame) = frame {
         bind_trigger_columns_in_expr(&mut bound_expr, active_frame);
@@ -7272,6 +8439,24 @@ enum FkUpdateAction {
         child_defaults: Vec<String>,
         old_parent_values: Vec<SqliteValue>,
     },
+}
+
+/// A deferred foreign-key relation that must be valid in the final transaction
+/// state.
+///
+/// This deliberately contains no frozen child row or parent key.  A deferred
+/// constraint is a property of the state at COMMIT, not of the earlier DML
+/// that first exposed it: the application may delete or re-parent the child,
+/// or restore/reinsert the parent before retrying COMMIT.  Rechecking this
+/// relation as a final-state anti-join captures that contract exactly.
+#[derive(Debug, Clone, PartialEq)]
+struct DeferredFkRelation {
+    child_table: String,
+    child_columns: Vec<String>,
+    parent_table: String,
+    /// Empty means the FK uses the parent's implicit primary-key/IPK target;
+    /// resolve that target from the current schema at COMMIT.
+    parent_columns: Vec<String>,
 }
 
 fn trigger_statement_raise_directive(
@@ -8187,6 +9372,14 @@ struct SavepointEntry {
     snapshot: DbSnapshot,
     /// Concurrent savepoint state (MVCC mode only).
     concurrent_snapshot: Option<ConcurrentSavepoint>,
+    /// Deferred child-side FK checks present when this savepoint was opened.
+    /// `ROLLBACK TO` truncates later checks along with the writes that created
+    /// them.
+    deferred_fk_checks_len: usize,
+    /// Deferred parent-action FK checks present when this savepoint was
+    /// opened.  Kept separately so parent-side `NO ACTION` obligations have
+    /// the same transactional lifetime as their base mutation.
+    deferred_fk_parent_action_checks_len: usize,
 }
 
 enum LiveVtabRegistryUndo {
@@ -8890,6 +10083,90 @@ pub(crate) mod fast_path_gate {
 #[cfg(test)]
 type VacuumRaceHook = Box<dyn FnOnce() + Send>;
 
+/// Owned registration for one actor-admitted operation context.
+///
+/// The guard deliberately owns the shared stack handle rather than borrowing
+/// the connection. It can therefore remain live while a connection future is
+/// awaited, and its `Drop` removes exactly its own registration even when
+/// nested guards are released out of order.
+#[doc(hidden)]
+#[must_use = "dropping the guard restores the previous operation context"]
+pub struct ConnectionOperationCancellationGuard {
+    contexts: Rc<RefCell<Vec<(u64, Cx)>>>,
+    registration_id: u64,
+}
+
+impl Drop for ConnectionOperationCancellationGuard {
+    fn drop(&mut self) {
+        let mut contexts = self.contexts.borrow_mut();
+        if let Some(index) = contexts
+            .iter()
+            .position(|(registration_id, _)| *registration_id == self.registration_id)
+        {
+            contexts.remove(index);
+        }
+    }
+}
+
+/// Exclusive admission for one externally-driven connection operation.
+///
+/// `Connection` is intentionally `!Sync`, so a non-atomic `Cell` is enough:
+/// admission costs one `replace(true)` and release costs one `set(false)`.
+/// Keeping the permit alive across the whole public future prevents a second
+/// future from reaching connection `RefCell`s while the first is suspended.
+#[must_use = "dropping the permit releases public operation admission"]
+struct PublicOperationPermit<'a> {
+    active: &'a Cell<bool>,
+}
+
+impl Drop for PublicOperationPermit<'_> {
+    fn drop(&mut self) {
+        self.active.set(false);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransactionCleanupState {
+    Idle,
+    Pending(u64),
+    Poisoned { generation: u64, cause: String },
+}
+
+#[cfg(test)]
+enum TransactionCleanupRollbackTestAction {
+    PendingOnce { entered: Rc<Cell<bool>> },
+    ErrorOnce(FrankenError),
+}
+
+struct ScopedTransactionOperationGuard<'a> {
+    connection: &'a Connection,
+    generation: u64,
+    completed: bool,
+}
+
+impl<'a> ScopedTransactionOperationGuard<'a> {
+    fn new(connection: &'a Connection, generation: u64) -> Self {
+        Self {
+            connection,
+            generation,
+            completed: false,
+        }
+    }
+
+    fn mark_completed(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for ScopedTransactionOperationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.connection
+                .mark_transaction_cleanup_required(self.generation);
+        }
+    }
+}
+
 pub struct Connection {
     path: String,
     /// In-memory execution image shared with the VDBE engine.
@@ -9155,7 +10432,20 @@ pub struct Connection {
     /// HashMap side-index for O(1) trigger name lookup. See `schema_by_name` for semantics.
     triggers_by_name: RefCell<HashMap<String, usize>>,
     /// Stack of active trigger OLD/NEW bindings for nested trigger execution.
-    trigger_frame_stack: RefCell<Vec<TriggerFrame>>,
+    trigger_frame_stack: RefCell<Vec<Rc<TriggerFrame>>>,
+    /// Monotonic identity and ownership state for the connection-local trigger
+    /// and FK subprogram trampoline.
+    public_operation_active: Cell<bool>,
+    trigger_program_next_driver_id: Cell<u64>,
+    trigger_program_next_task_id: Cell<u64>,
+    trigger_program_active_driver: Cell<Option<u64>>,
+    trigger_program_polling_driver: Cell<Option<u64>>,
+    trigger_program_polling_task: Cell<Option<u64>>,
+    trigger_program_polling_parent_task: Cell<Option<u64>>,
+    trigger_program_polling_depth: Cell<usize>,
+    trigger_program_pending: RefCell<VecDeque<TriggerProgramRequest>>,
+    trigger_program_memory_bytes: Cell<usize>,
+    trigger_program_memory_peak_bytes: Cell<usize>,
     /// Scalar/aggregate/window function registry shared with the VDBE engine.
     /// Wrapped in `RefCell` to allow UDF registration after connection creation.
     func_registry: RefCell<Arc<FunctionRegistry>>,
@@ -9200,21 +10490,21 @@ pub struct Connection {
     /// (`BEGIN CONCURRENT`).  When true, the harness can observe different
     /// concurrency behaviour compared to single-writer mode.
     concurrent_txn: Cell<bool>,
-    /// Set when a scoped transaction wrapper is dropped without an awaited
-    /// `commit()`/`rollback()`.
+    /// Monotonic identity allocator for explicit and implicit transactions.
+    next_transaction_generation: Cell<u64>,
+    /// Identity of the currently active transaction. It remains set until all
+    /// commit/rollback restoration work reaches a terminal success state.
+    active_transaction_generation: Cell<Option<u64>>,
+    /// Deferred rollback obligation created by a dropped scoped transaction.
     ///
-    /// `Drop::drop` cannot await and this crate never builds its own runtime,
-    /// so the drop path cannot finish a rollback itself. Instead it records
-    /// the obligation here, and the next SQL entry point discharges it by
-    /// rolling back *before* executing anything else. That preserves the
-    /// observable rollback-on-drop contract (an un-committed transaction's
-    /// writes never become visible to subsequent statements) without blocking
-    /// in `Drop` and without owning a runtime.
-    ///
-    /// This is a `Cell<bool>` rather than a richer state machine because the
-    /// only question at the next entry point is "is there an abandoned
-    /// transaction to unwind?".
-    pending_transaction_cleanup: Cell<bool>,
+    /// The generation prevents a stale wrapper from targeting a later
+    /// transaction. `Pending` remains set until rollback and every
+    /// connection-local restoration step conclusively reach the idle state.
+    /// Dropping or failing a cleanup attempt therefore leaves the same
+    /// generation retryable by the next admitted public operation.
+    transaction_cleanup_state: RefCell<TransactionCleanupState>,
+    #[cfg(test)]
+    transaction_cleanup_rollback_test_action: RefCell<Option<TransactionCleanupRollbackTestAction>>,
     /// Connection-level flag: when set, plain `BEGIN` is promoted to
     /// `BEGIN CONCURRENT`.  Controlled by `PRAGMA fsqlite.concurrent_mode`.
     concurrent_mode_default: RefCell<bool>,
@@ -9304,15 +10594,19 @@ pub struct Connection {
     /// File change counter (offset 24 in the database header).  Incremented
     /// on every transaction that modifies the database (DML or DDL).
     change_counter: RefCell<u32>,
-    /// Depth counter for FK cascade operations.  When > 0, FK enforcement
-    /// is suppressed to prevent recursive checking during CASCADE/SET NULL
-    /// actions (matches C SQLite behavior where FK actions do not re-trigger
-    /// FK checking).
+    /// Depth counter for FK action frames in the shared trigger-program budget.
+    /// It never suppresses enforcement: nested SET DEFAULT, CASCADE, and SET
+    /// NULL actions must validate the child rows they produce.
     fk_cascade_depth: Cell<usize>,
-    /// Pending `DEFERRABLE INITIALLY DEFERRED` parent-existence checks recorded
-    /// during an explicit transaction, rechecked at COMMIT (bd-do0d6). Each
-    /// entry is `(child_table_name, row_values_in_storage_order)`.
-    deferred_fk_checks: RefCell<Vec<(String, Vec<SqliteValue>)>>,
+    /// Deferred child-side FK relations observed during this transaction.
+    /// They are final-state anti-joined at COMMIT rather than replaying a
+    /// historical row image, so repair/delete/reparent before a retry works.
+    deferred_fk_checks: RefCell<Vec<DeferredFkRelation>>,
+    /// Deferred parent-side `NO ACTION` FK relations.  `RESTRICT` never enters
+    /// this queue because it is statement-immediate even for a deferred FK.
+    /// Like child-side checks, these are final-state relations, not historical
+    /// keys, so restoring a parent before retrying COMMIT is accepted.
+    deferred_fk_parent_action_checks: RefCell<Vec<DeferredFkRelation>>,
     /// When `true`, deferred FK checks are forced to run immediately (used while
     /// rechecking the deferred set at COMMIT so the recheck actually errors).
     fk_force_immediate_check: Cell<bool>,
@@ -9322,7 +10616,8 @@ pub struct Connection {
     ///
     /// * **Statement-scoped** (`enter_fk_parent_validation_cache_scope`): used
     ///   while replaying a single multi-row `INSERT … SELECT`/`VALUES` stream.
-    ///   The RAII guard restores the previous cache at the statement boundary.
+    ///   Its RAII guard restores the previous cache only if no nested parent
+    ///   mutation invalidated the scope.
     ///
     /// * **Transaction-scoped** (`ensure_fk_parent_validation_cache`,
     ///   issue #110): lazily created on the first child INSERT inside an
@@ -9337,6 +10632,11 @@ pub struct Connection {
     ///   cached, so the "insert the parent later in the same txn" pattern stays
     ///   correct.
     fk_parent_validation_cache: RefCell<Option<FkParentValidationCache>>,
+    /// Monotonic invalidation generation for the parent-validation cache.
+    /// Statement-scoped replay guards capture this generation and may restore a
+    /// previous transaction cache only when no nested parent mutation cleared
+    /// the slot during the scope.
+    fk_parent_validation_cache_epoch: Cell<u64>,
     // ── MVCC conflict observability (bd-t6sv2.1) ──────────────────────────
     /// Shared observer for MVCC conflict analytics. Records metrics
     /// (contention, FCW drift, SSI aborts) and a ring-buffer of recent
@@ -9445,6 +10745,11 @@ pub struct Connection {
     /// Root capability context for this connection. All per-operation contexts
     /// are derived from this via `op_cx()`, inheriting the connection's trace ID.
     root_cx: Cx,
+    /// Stack of actor-admitted operation contexts. Registrations carry unique
+    /// identities so owned guards restore nesting correctly even when dropped
+    /// out of order.
+    operation_cancellation_contexts: Rc<RefCell<Vec<(u64, Cx)>>>,
+    operation_cancellation_next_id: Cell<u64>,
     /// Connection-scoped e-process oracle for adaptive cancellation decisions.
     eprocess_oracle: Arc<EProcessOracle>,
     /// Counter for throttling e-process oracle refresh (every 64 statements).
@@ -9693,33 +10998,35 @@ impl Drop for MemFallbackRejectionOverrideGuard<'_> {
     }
 }
 
-/// RAII depth guard for the foreign-key cascade counter.
+/// RAII depth guard for a foreign-key action frame.
 ///
-/// The cascade sites `await` a nested statement between incrementing and
-/// decrementing `fk_cascade_depth`. Doing that by hand is not cancel-safe:
-/// dropping the future at the await point skips the decrement, the counter
-/// stays elevated, and because `fk_enforcement_enabled()` is
-/// `foreign_keys && fk_cascade_depth.get() == 0`, foreign-key enforcement is
-/// then silently disabled for the remaining life of the connection.
-///
-/// Holding the increment in a guard makes the decrement run on the drop path
-/// too, so cancellation restores the counter instead of corrupting it.
+/// FK actions re-enter DML across an await. The guard makes the accounting
+/// cancel-safe, and its fallible entry point applies the same stack-safe depth
+/// budget used by SQL trigger frames before beginning that nested DML.
 struct FkCascadeDepthGuard<'a> {
     depth: &'a Cell<usize>,
 }
 
 impl<'a> FkCascadeDepthGuard<'a> {
-    fn enter(depth: &'a Cell<usize>) -> Self {
-        depth.set(depth.get() + 1);
-        Self { depth }
+    fn enter(conn: &'a Connection) -> Result<Self> {
+        conn.ensure_trigger_program_depth_available()?;
+        let depth = &conn.fk_cascade_depth;
+        let next_depth = depth
+            .get()
+            .checked_add(1)
+            .ok_or(FrankenError::TriggerRecursionDepthExceeded)?;
+        depth.set(next_depth);
+        Ok(Self { depth })
     }
 }
 
 impl Drop for FkCascadeDepthGuard<'_> {
     fn drop(&mut self) {
-        // saturating_sub: a guard can never legitimately see zero here, but a
-        // panic-unwind through nested cascades must not underflow.
-        self.depth.set(self.depth.get().saturating_sub(1));
+        // A live guard can never legitimately observe zero. Poison an
+        // inconsistent counter rather than saturating it back to zero and
+        // silently admitting recursive work with an undercounted depth.
+        self.depth
+            .set(self.depth.get().checked_sub(1).unwrap_or(usize::MAX));
     }
 }
 
@@ -9760,6 +11067,190 @@ impl<'a> BoolRefCellRestoreGuard<'a> {
 impl Drop for BoolRefCellRestoreGuard<'_> {
     fn drop(&mut self) {
         self.cell.replace(self.previous);
+    }
+}
+
+/// Cancel-safe consumption of a one-shot boolean request.
+///
+/// The request is cleared while an operation is in flight so recursive work
+/// cannot consume it a second time. Unless [`Self::commit`] is called, dropping
+/// the operation restores the request. A request raised independently while
+/// the operation is in flight is never cleared by this guard.
+struct OneShotBoolConsumptionGuard<'a> {
+    cell: &'a Cell<bool>,
+    restore_on_drop: bool,
+}
+
+impl<'a> OneShotBoolConsumptionGuard<'a> {
+    fn consume(cell: &'a Cell<bool>) -> (Self, bool) {
+        let pending = cell.replace(false);
+        (
+            Self {
+                cell,
+                restore_on_drop: pending,
+            },
+            pending,
+        )
+    }
+
+    fn commit(&mut self) {
+        self.restore_on_drop = false;
+    }
+}
+
+impl Drop for OneShotBoolConsumptionGuard<'_> {
+    fn drop(&mut self) {
+        if self.restore_on_drop {
+            self.cell.set(true);
+        }
+    }
+}
+
+/// Stages virtual-table instances while a pager-backed MemDB reload is in
+/// flight.
+///
+/// Existing instances cannot be cloned. When a schema-stable reload preserves
+/// one, ownership moves out of the live registry and into this guard. Any
+/// error, panic unwind, or dropped future restores every such original. Newly
+/// rebuilt instances remain separate so they can never overwrite an original
+/// until the synchronous, no-await publish step succeeds.
+struct LiveVtabReloadGuard<'a> {
+    live_instances: &'a RefCell<HashMap<String, Box<dyn ErasedVtabInstance>>>,
+    preserved: HashMap<String, Box<dyn ErasedVtabInstance>>,
+    rebuilt: HashMap<String, Box<dyn ErasedVtabInstance>>,
+}
+
+impl<'a> LiveVtabReloadGuard<'a> {
+    fn new(live_instances: &'a RefCell<HashMap<String, Box<dyn ErasedVtabInstance>>>) -> Self {
+        Self {
+            live_instances,
+            preserved: HashMap::new(),
+            rebuilt: HashMap::new(),
+        }
+    }
+
+    fn preserve_existing(&mut self, table_key: &str) -> bool {
+        // Duplicate catalog rows may revisit a key after its exact original
+        // has already been staged. Never replace that recovery owner with a
+        // reentrant or later instance.
+        if self.preserved.contains_key(table_key) {
+            return false;
+        }
+        let Some(instance) = self.live_instances.borrow_mut().remove(table_key) else {
+            return false;
+        };
+        self.preserved.insert(table_key.to_owned(), instance);
+        true
+    }
+
+    fn contains_key(&self, table_key: &str) -> bool {
+        self.preserved.contains_key(table_key) || self.rebuilt.contains_key(table_key)
+    }
+
+    fn insert_rebuilt(&mut self, table_key: String, instance: Box<dyn ErasedVtabInstance>) {
+        self.rebuilt.insert(table_key, instance);
+    }
+
+    /// Atomically replace the live registry with the staged reload result.
+    ///
+    /// Acquiring the `RefCell` borrow precedes any destructive movement out of
+    /// the guard. After that point this method performs no fallible operation
+    /// and contains no await boundary.
+    fn publish(mut self) {
+        let mut live_instances = self.live_instances.borrow_mut();
+        let mut published = std::mem::take(&mut self.preserved);
+        let mut displaced_instances = Vec::new();
+        // Preserve the prior insertion semantics: if duplicate catalog rows
+        // rebuild a key after its original was extracted, the rebuilt instance
+        // wins only at successful publication.
+        for (table_key, instance) in self.rebuilt.drain() {
+            if let Some(displaced) = published.insert(table_key, instance) {
+                displaced_instances.push(displaced);
+            }
+        }
+        let retired = std::mem::replace(&mut *live_instances, published);
+        drop(live_instances);
+        // Drop retired instances only after the registry already exposes the
+        // complete replacement and no RefCell borrow is held.
+        drop(displaced_instances);
+        drop(retired);
+    }
+}
+
+impl Drop for LiveVtabReloadGuard<'_> {
+    fn drop(&mut self) {
+        if self.preserved.is_empty() {
+            return;
+        }
+
+        let mut displaced_instances = Vec::new();
+        {
+            let mut live_instances = self.live_instances.borrow_mut();
+            for (table_key, instance) in self.preserved.drain() {
+                if let Some(displaced) = live_instances.insert(table_key, instance) {
+                    // A reentrant insertion cannot be allowed to erase the
+                    // exact pre-reload object. Retire it after releasing the
+                    // registry borrow.
+                    displaced_instances.push(displaced);
+                }
+            }
+        }
+        drop(displaced_instances);
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+enum LiveVtabReloadTestHook {
+    FailOnce {
+        table_key: String,
+        fired: Arc<AtomicBool>,
+    },
+    Pause {
+        table_key: String,
+        reached: Arc<AtomicBool>,
+        released: Arc<AtomicBool>,
+    },
+}
+
+#[cfg(test)]
+fn live_vtab_reload_test_hook() -> &'static Mutex<Option<LiveVtabReloadTestHook>> {
+    static HOOK: OnceLock<Mutex<Option<LiveVtabReloadTestHook>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn set_live_vtab_reload_test_hook(hook: Option<LiveVtabReloadTestHook>) {
+    *lock_unpoisoned(live_vtab_reload_test_hook()) = hook;
+}
+
+#[cfg(test)]
+async fn run_live_vtab_reload_test_hook(table_key: &str) -> Result<()> {
+    let hook = lock_unpoisoned(live_vtab_reload_test_hook()).clone();
+    match hook {
+        Some(LiveVtabReloadTestHook::FailOnce {
+            table_key: target,
+            fired,
+        }) if target == table_key && !fired.swap(true, AtomicOrdering::SeqCst) => Err(
+            FrankenError::Internal("test-only live-vtab reload failure".to_owned()),
+        ),
+        Some(LiveVtabReloadTestHook::Pause {
+            table_key: target,
+            reached,
+            released,
+        }) if target == table_key => {
+            reached.store(true, AtomicOrdering::SeqCst);
+            std::future::poll_fn(|_| {
+                if released.load(AtomicOrdering::SeqCst) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -10055,13 +11546,9 @@ impl Connection {
                 path: std::path::PathBuf::from(path),
             });
         }
-        let attach_env = env.clone();
-
-        let bootstrap_cx =
-            env.runtime()
-                .root_cx
-                .create_child()
-                .with_trace_context(next_trace_id(), 0, 0);
+        let open_operation = env.dedicated_worker_open_operation.clone();
+        let attach_env = env.clone_for_connection_storage();
+        let bootstrap_cx = env.bootstrap_cx();
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
         let pager = if writable {
             retry_busy_connection_bootstrap(|| {
@@ -10156,6 +11643,17 @@ impl Connection {
             triggers: RefCell::new(Vec::new()),
             triggers_by_name: RefCell::new(HashMap::new()),
             trigger_frame_stack: RefCell::new(Vec::new()),
+            public_operation_active: Cell::new(false),
+            trigger_program_next_driver_id: Cell::new(1),
+            trigger_program_next_task_id: Cell::new(1),
+            trigger_program_active_driver: Cell::new(None),
+            trigger_program_polling_driver: Cell::new(None),
+            trigger_program_polling_task: Cell::new(None),
+            trigger_program_polling_parent_task: Cell::new(None),
+            trigger_program_polling_depth: Cell::new(0),
+            trigger_program_pending: RefCell::new(VecDeque::new()),
+            trigger_program_memory_bytes: Cell::new(0),
+            trigger_program_memory_peak_bytes: Cell::new(0),
             func_registry: RefCell::new(default_function_registry(&collation_registry)),
             function_registry_generation: Cell::new(0),
             collation_registry,
@@ -10172,7 +11670,11 @@ impl Connection {
             internal_statement_savepoint_depth: Cell::new(0),
             implicit_txn: Cell::new(false),
             concurrent_txn: Cell::new(false),
-            pending_transaction_cleanup: Cell::new(false),
+            next_transaction_generation: Cell::new(1),
+            active_transaction_generation: Cell::new(None),
+            transaction_cleanup_state: RefCell::new(TransactionCleanupState::Idle),
+            #[cfg(test)]
+            transaction_cleanup_rollback_test_action: RefCell::new(None),
             concurrent_mode_default: RefCell::new(true),
             write_merge_mode: Cell::new(WriteMergeMode::Safe),
             write_merge_lab_unsafe_warned: Cell::new(false),
@@ -10193,8 +11695,10 @@ impl Connection {
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
             deferred_fk_checks: RefCell::new(Vec::new()),
+            deferred_fk_parent_action_checks: RefCell::new(Vec::new()),
             fk_force_immediate_check: Cell::new(false),
             fk_parent_validation_cache: RefCell::new(None),
+            fk_parent_validation_cache_epoch: Cell::new(0),
             conflict_observer: Arc::clone(&shared_mvcc_state.conflict_observer),
             trace_registration: RefCell::new(None),
             ssi_evidence_ledger: SsiEvidenceLedger::new(4096),
@@ -10232,6 +11736,8 @@ impl Connection {
             #[cfg(test)]
             fail_alter_drop_after_storage_once: Cell::new(false),
             root_cx,
+            operation_cancellation_contexts: Rc::new(RefCell::new(Vec::new())),
+            operation_cancellation_next_id: Cell::new(1),
             eprocess_oracle,
             statement_count_since_oracle_refresh: Cell::new(0),
             version_store: OnceCell::new(),
@@ -10285,6 +11791,9 @@ impl Connection {
             // the invariant.
             fast_path_gate: AtomicU32::new(0),
         };
+        let _open_operation_cancellation = open_operation
+            .as_ref()
+            .map(|operation| conn.enter_operation_cancellation(operation));
         let op_cx = conn.op_cx()?;
         {
             let ms = conn.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
@@ -10365,11 +11874,7 @@ impl Connection {
             });
         }
 
-        let bootstrap_cx =
-            env.runtime()
-                .root_cx
-                .create_child()
-                .with_trace_context(next_trace_id(), 0, 0);
+        let bootstrap_cx = env.bootstrap_cx();
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
         let pager = retry_busy_connection_bootstrap(|| {
             PagerBackend::open_reserved_with_page_buffer_max(
@@ -10396,11 +11901,7 @@ impl Connection {
             });
         }
 
-        let bootstrap_cx =
-            env.runtime()
-                .root_cx
-                .create_child()
-                .with_trace_context(next_trace_id(), 0, 0);
+        let bootstrap_cx = env.bootstrap_cx();
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
         let pager = retry_busy_connection_bootstrap(|| {
             PagerBackend::open_existing_with_page_buffer_max(
@@ -10437,11 +11938,7 @@ impl Connection {
             })?;
         // Phase 5 (bd-3iw8): initialize the pager backend as the primary
         // storage layer. The pager handles all persistence via WAL.
-        let bootstrap_cx =
-            env.runtime()
-                .root_cx
-                .create_child()
-                .with_trace_context(next_trace_id(), 0, 0);
+        let bootstrap_cx = env.bootstrap_cx();
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
         let storage_was_empty = if path == ":memory:" {
             true
@@ -10476,11 +11973,7 @@ impl Connection {
         }
 
         let path = ":memory:".to_owned();
-        let bootstrap_cx =
-            env.runtime()
-                .root_cx
-                .create_child()
-                .with_trace_context(next_trace_id(), 0, 0);
+        let bootstrap_cx = env.bootstrap_cx();
         let vfs = env
             .memory_vfs_config()
             .map_or_else(MemoryVfs::new, MemoryVfs::new_with_config);
@@ -10509,7 +12002,8 @@ impl Connection {
         pager: PagerBackend,
         storage_was_empty: bool,
     ) -> Result<Self> {
-        let attach_env = env.clone();
+        let open_operation = env.dedicated_worker_open_operation.clone();
+        let attach_env = env.clone_for_connection_storage();
         let pager_is_memory = pager.is_memory();
         let shared_mvcc_state = shared_mvcc_state_for_path(&path, Arc::clone(env.runtime()))?;
         let initial_visible_commit_seq = pager.published_snapshot().visible_commit_seq;
@@ -10585,6 +12079,17 @@ impl Connection {
             triggers: RefCell::new(Vec::new()),
             triggers_by_name: RefCell::new(HashMap::new()),
             trigger_frame_stack: RefCell::new(Vec::new()),
+            public_operation_active: Cell::new(false),
+            trigger_program_next_driver_id: Cell::new(1),
+            trigger_program_next_task_id: Cell::new(1),
+            trigger_program_active_driver: Cell::new(None),
+            trigger_program_polling_driver: Cell::new(None),
+            trigger_program_polling_task: Cell::new(None),
+            trigger_program_polling_parent_task: Cell::new(None),
+            trigger_program_polling_depth: Cell::new(0),
+            trigger_program_pending: RefCell::new(VecDeque::new()),
+            trigger_program_memory_bytes: Cell::new(0),
+            trigger_program_memory_peak_bytes: Cell::new(0),
             func_registry: RefCell::new(default_function_registry(&collation_registry)),
             function_registry_generation: Cell::new(0),
             collation_registry,
@@ -10601,7 +12106,11 @@ impl Connection {
             internal_statement_savepoint_depth: Cell::new(0),
             implicit_txn: Cell::new(false),
             concurrent_txn: Cell::new(false),
-            pending_transaction_cleanup: Cell::new(false),
+            next_transaction_generation: Cell::new(1),
+            active_transaction_generation: Cell::new(None),
+            transaction_cleanup_state: RefCell::new(TransactionCleanupState::Idle),
+            #[cfg(test)]
+            transaction_cleanup_rollback_test_action: RefCell::new(None),
             concurrent_mode_default: RefCell::new(true),
             write_merge_mode: Cell::new(WriteMergeMode::Safe),
             write_merge_lab_unsafe_warned: Cell::new(false),
@@ -10622,8 +12131,10 @@ impl Connection {
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
             deferred_fk_checks: RefCell::new(Vec::new()),
+            deferred_fk_parent_action_checks: RefCell::new(Vec::new()),
             fk_force_immediate_check: Cell::new(false),
             fk_parent_validation_cache: RefCell::new(None),
+            fk_parent_validation_cache_epoch: Cell::new(0),
             // MVCC conflict observability (bd-t6sv2.1)
             conflict_observer: Arc::clone(&shared_mvcc_state.conflict_observer),
             trace_registration: RefCell::new(None),
@@ -10664,6 +12175,8 @@ impl Connection {
             fail_alter_drop_after_storage_once: Cell::new(false),
             // Cx capability context (bd-2g5.6)
             root_cx,
+            operation_cancellation_contexts: Rc::new(RefCell::new(Vec::new())),
+            operation_cancellation_next_id: Cell::new(1),
             eprocess_oracle,
             statement_count_since_oracle_refresh: Cell::new(0),
             // MVCC version-chain reclamation (bd-3wop3.5)
@@ -10727,6 +12240,9 @@ impl Connection {
             // the invariant.
             fast_path_gate: AtomicU32::new(0),
         };
+        let _open_operation_cancellation = open_operation
+            .as_ref()
+            .map(|operation| conn.enter_operation_cancellation(operation));
         let op_cx = conn.op_cx()?;
         {
             let ms = conn.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
@@ -10767,10 +12283,13 @@ impl Connection {
     /// looking up [`Self::path`]. File-backed Unix connections return `Some`;
     /// memory and backends without a stable descriptor identity return `None`.
     pub async fn file_identity(&self) -> Result<Option<FileIdentity>> {
+        let _public_operation = self.enter_public_operation()?;
+        self.settle_pending_transaction_cleanup().await?;
+        self.background_status()?;
         if matches!(&self.pager, PagerBackend::Memory(_)) {
             return Ok(None);
         }
-        let cx = self.op_cx()?;
+        let cx = self.op_cx_after_background_status();
         self.pager.file_identity(&cx).await
     }
 
@@ -10784,6 +12303,9 @@ impl Connection {
 
     /// Export the current database as a self-contained SQLite database image.
     pub async fn export_bytes(&self) -> Result<Vec<u8>> {
+        let _public_operation = self.enter_public_operation()?;
+        self.settle_pending_transaction_cleanup().await?;
+        self.background_status()?;
         let cx = self.op_cx()?;
         self.quiesce_pager_export_state(&cx).await?;
         self.pager.export_bytes(&cx).await
@@ -10851,12 +12373,71 @@ impl Connection {
 
     /// Return the background-runtime health for this connection's database.
     pub fn background_status(&self) -> Result<()> {
+        self.background_status_impl(false)
+    }
+
+    /// Background-health check for code already owned by the active
+    /// trigger-program driver. Only an explicitly polled child of that driver
+    /// may use this path; externally-driven operations always use
+    /// [`Self::background_status`].
+    fn background_status_for_internal_driver(&self) -> Result<()> {
+        self.background_status_impl(true)
+    }
+
+    fn background_status_impl(&self, allow_current_trigger_driver: bool) -> Result<()> {
+        if self.active_txn.try_borrow().is_err() {
+            // A locally-driven commit/rollback currently owns the mutable
+            // transaction handle across an await. Raw `Connection` methods
+            // all take `&self`, so an unrelated future can otherwise reach a
+            // second RefCell borrow and panic. Fail admission with BUSY until
+            // the driver reaches a terminal or retryable boundary.
+            return Err(FrankenError::Busy);
+        }
+        if let Some(active_id) = self.trigger_program_active_driver.get()
+            && (!allow_current_trigger_driver
+                || self.trigger_program_polling_driver.get() != Some(active_id))
+        {
+            // Public re-entry must never ambiently inherit a driver's polling
+            // identity. Explicit private child paths opt in through
+            // `background_status_for_internal_driver`.
+            return Err(FrankenError::Busy);
+        }
         if let Some(detail) = self.post_vacuum_rebind_failure.borrow().as_deref() {
             return Err(FrankenError::Internal(format!(
                 "connection is unusable after a committed VACUUM image could not be rebound: {detail}"
             )));
         }
         self._shared_mvcc_state.background_status()
+    }
+
+    fn enter_public_operation(&self) -> Result<PublicOperationPermit<'_>> {
+        // Exactly one successful caller owns the permit. A failed nested
+        // `replace(true)` leaves the original owner's `true` unchanged and
+        // deliberately creates no guard that could release somebody else's
+        // admission.
+        if self.public_operation_active.replace(true) {
+            return Err(FrankenError::Busy);
+        }
+        let permit = PublicOperationPermit {
+            active: &self.public_operation_active,
+        };
+        // Fail before any cleanup or SQL-state RefCell access when a private
+        // trigger/FK driver owns the connection.
+        if self.trigger_program_active_driver.get().is_some() {
+            return Err(FrankenError::Busy);
+        }
+        Ok(permit)
+    }
+
+    #[cfg(test)]
+    async fn hold_public_operation_while_resolving_commit_for_test(
+        &self,
+        transaction: &mut TransactionKind,
+        cx: &Cx,
+    ) -> Result<()> {
+        let _public_operation = self.enter_public_operation()?;
+        transaction.resolve_commit_state(cx).await?;
+        Ok(())
     }
 
     // ── AAC-P6: statement micro-batcher (renewal-amortization) ───────────────
@@ -11128,6 +12709,58 @@ impl Connection {
             FrankenError::Internal(format!("attached connection missing for schema: {schema}"))
         })?;
         f(conn.as_ref()).await
+    }
+
+    async fn open_attached_connection_with_cx(&self, cx: &Cx, path: String) -> Result<Box<Self>> {
+        // Nested open receives only a capability-free cancellation token.
+        // Runtime identity and all effect authority still come from the
+        // connection's stored environment.
+        let (mut cancellation_source, cancellation_token) = cx.operation_cancellation();
+        let cancellation_probe = cancellation_token.clone();
+        let env = self
+            .attach_env
+            .clone()
+            .with_dedicated_worker_open_operation(cancellation_token);
+        let result = if self.pager.is_readonly() {
+            Self::open_schema_only_with_env(path, env)
+                .await
+                .map(Box::new)
+        } else {
+            Self::open_with_env(path, env).await.map(Box::new)
+        };
+
+        // The nested opener has published its one terminal result. Disarm
+        // source-Drop cancellation before propagating that result outward.
+        let cancellation_was_observed = cancellation_probe.cancellation_was_observed();
+        cancellation_source.disarm();
+        result.map_err(|error| {
+            if matches!(error, FrankenError::Abort) && cancellation_was_observed {
+                FrankenError::Interrupt
+            } else {
+                error
+            }
+        })
+    }
+
+    fn publish_attached_connection(
+        &self,
+        cx: &Cx,
+        schema: String,
+        path: String,
+        attached_connection: Box<Self>,
+    ) -> Result<()> {
+        // This checkpoint is the publication linearization point. There is no
+        // suspension between it and either registry mutation, so cancellation
+        // loses once publication begins and wins without partial publication
+        // when already visible here.
+        cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
+        self.attached_schemas
+            .borrow_mut()
+            .attach(schema.clone(), path)?;
+        self.attached_connections
+            .borrow_mut()
+            .insert(attached_schema_key(&schema), attached_connection);
+        Ok(())
     }
 
     fn validate_attached_target_schema(
@@ -11528,7 +13161,7 @@ impl Connection {
                                 }
                                 Err(error) => {
                                     if preserve_prior_changes_on_constraint_violation
-                                        && error_is_constraint_violation(&error)
+                                        && error_preserves_prior_changes_for_fail(&error)
                                     {
                                         self.apply_attached_insert_tracking(
                                             changes,
@@ -11565,7 +13198,7 @@ impl Connection {
                                 }
                                 Err(error) => {
                                     if preserve_prior_changes_on_constraint_violation
-                                        && error_is_constraint_violation(&error)
+                                        && error_preserves_prior_changes_for_fail(&error)
                                     {
                                         self.apply_attached_insert_tracking(
                                             changes,
@@ -11618,7 +13251,7 @@ impl Connection {
                             if preserve_prior_changes_on_constraint_violation
                                 && matches!(
                                     result.as_ref(),
-                                    Err(error) if error_is_constraint_violation(error)
+                                    Err(error) if error_preserves_prior_changes_for_fail(error)
                                 )
                             {
                                 // Attached connections are reused across statements, so
@@ -11635,7 +13268,7 @@ impl Connection {
                         }
                         Err(error) => {
                             if preserve_prior_changes_on_constraint_violation
-                                && error_is_constraint_violation(&error)
+                                && error_preserves_prior_changes_for_fail(&error)
                             {
                                 self.apply_attached_statement_tracking(changes);
                                 // UPDATE must preserve the outer connection's
@@ -13170,7 +14803,9 @@ impl Connection {
         previous_last_insert_rowid: i64,
     ) {
         let error_state = self.take_table_program_error_state();
-        if preserve_prior_changes_on_constraint_violation && error_is_constraint_violation(error) {
+        if preserve_prior_changes_on_constraint_violation
+            && error_preserves_prior_changes_for_fail(error)
+        {
             if let Some(state) = error_state {
                 self.restore_change_tracking_state(
                     state.changes,
@@ -14108,6 +15743,56 @@ impl Connection {
         &self.root_cx
     }
 
+    /// Install the cancellation signal for one actor-admitted operation.
+    ///
+    /// The returned guard owns its registration and may live across engine
+    /// awaits without borrowing the connection. Dropping it removes exactly
+    /// that registration, including when nested guards are released out of
+    /// order.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn enter_operation_cancellation(
+        &self,
+        operation: &OperationCancellationToken,
+    ) -> ConnectionOperationCancellationGuard {
+        let operation_cx = self
+            .root_cx
+            .create_child_linked_to_operation(operation)
+            .with_decision_id(next_decision_id());
+        let registration_id = {
+            let mut contexts = self.operation_cancellation_contexts.borrow_mut();
+            let mut candidate = self.operation_cancellation_next_id.get().max(1);
+            while contexts
+                .iter()
+                .any(|(registration_id, _)| *registration_id == candidate)
+            {
+                candidate = candidate.wrapping_add(1).max(1);
+            }
+            self.operation_cancellation_next_id
+                .set(candidate.wrapping_add(1).max(1));
+            contexts.push((candidate, operation_cx));
+            candidate
+        };
+        ConnectionOperationCancellationGuard {
+            contexts: Rc::clone(&self.operation_cancellation_contexts),
+            registration_id,
+        }
+    }
+
+    #[must_use]
+    fn current_operation_cx(&self) -> Option<Cx> {
+        self.operation_cancellation_contexts
+            .borrow()
+            .last()
+            .map(|(_, cx)| cx.clone())
+    }
+
+    #[must_use]
+    fn current_operation_cx_or_root(&self) -> Cx {
+        self.current_operation_cx()
+            .unwrap_or_else(|| self.root_cx.clone())
+    }
+
     /// Derive a per-operation capability context from this connection's root.
     ///
     /// Each call allocates a new `decision_id` so that per-operation tracing
@@ -14116,7 +15801,7 @@ impl Connection {
         if hot_path_profile_enabled() {
             FSQLITE_OP_CX_BACKGROUND_GATES.fetch_add(1, AtomicOrdering::Relaxed);
         }
-        self.background_status()?;
+        self.background_status_for_internal_driver()?;
         Ok(self.op_cx_after_background_status())
     }
 
@@ -14134,10 +15819,13 @@ impl Connection {
             self.statement_count_since_oracle_refresh
                 .set(statement_count + 1);
         }
-        // Hot-path SQL operations do not need independent cancellation trees
-        // per statement; cloning the connection root preserves lineage while
-        // avoiding child-context allocation and parent-child bookkeeping.
-        let op_cx = self.root_cx.clone().with_decision_id(next_decision_id());
+        // Actor-admitted work inherits its exact operation-local cancellation
+        // signal. Raw callers retain the existing cheap root clone. In either
+        // case, assigning a fresh scalar decision id does not allocate another
+        // cancellation node.
+        let op_cx = self
+            .current_operation_cx_or_root()
+            .with_decision_id(next_decision_id());
         if tracing::enabled!(target: "fsqlite::cx", tracing::Level::DEBUG) {
             tracing::debug!(
                 target: "fsqlite::cx",
@@ -14404,7 +16092,10 @@ impl Connection {
                         target: "fsqlite.time_travel",
                         "failed to reload memdb before capturing time-travel snapshot: {err}"
                     );
+                    return;
                 }
+            } else {
+                return;
             }
         }
 
@@ -15415,8 +17106,9 @@ impl Connection {
 
     /// Prepare SQL into a statement.
     pub async fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>> {
-        self.background_status()?;
+        let _public_operation = self.enter_public_operation()?;
         self.settle_pending_transaction_cleanup().await?;
+        self.background_status()?;
         self.prepare_after_background_status(sql).await
     }
 
@@ -15552,8 +17244,13 @@ impl Connection {
     /// **last** statement are returned. Intermediate statement results are
     /// discarded. This matches common SQL driver semantics (last statement wins).
     pub async fn query(&self, sql: &str) -> Result<Vec<Row>> {
-        self.background_status()?;
+        let _public_operation = self.enter_public_operation()?;
         self.settle_pending_transaction_cleanup().await?;
+        self.background_status()?;
+        self.query_after_background_status(sql).await
+    }
+
+    async fn query_after_background_status(&self, sql: &str) -> Result<Vec<Row>> {
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                 .then(|| {
@@ -15582,8 +17279,18 @@ impl Connection {
 
     /// Prepare and execute SQL as a query with bound SQL parameters.
     pub async fn query_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
-        self.background_status()?;
+        let _public_operation = self.enter_public_operation()?;
         self.settle_pending_transaction_cleanup().await?;
+        self.background_status()?;
+        self.query_with_params_after_background_status(sql, params)
+            .await
+    }
+
+    async fn query_with_params_after_background_status(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Vec<Row>> {
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                 .then(|| {
@@ -15629,8 +17336,9 @@ impl Connection {
     where
         F: FnMut(&Row) -> Result<()>,
     {
-        self.background_status()?;
+        let _public_operation = self.enter_public_operation()?;
         self.settle_pending_transaction_cleanup().await?;
+        self.background_status()?;
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                 .then(|| {
@@ -15667,8 +17375,9 @@ impl Connection {
 
     /// Prepare and execute SQL as a query, returning exactly one row.
     pub async fn query_row(&self, sql: &str) -> Result<Row> {
-        self.background_status()?;
+        let _public_operation = self.enter_public_operation()?;
         self.settle_pending_transaction_cleanup().await?;
+        self.background_status()?;
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                 .then(|| {
@@ -15706,8 +17415,9 @@ impl Connection {
 
     /// Prepare and execute SQL as a query with bound SQL parameters, returning exactly one row.
     pub async fn query_row_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Row> {
-        self.background_status()?;
+        let _public_operation = self.enter_public_operation()?;
         self.settle_pending_transaction_cleanup().await?;
+        self.background_status()?;
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                 .then(|| {
@@ -15748,8 +17458,13 @@ impl Connection {
     /// rows.  For SELECT and other statement types it returns the number of
     /// result rows.
     pub async fn execute(&self, sql: &str) -> Result<usize> {
-        self.background_status()?;
+        let _public_operation = self.enter_public_operation()?;
         self.settle_pending_transaction_cleanup().await?;
+        self.background_status()?;
+        self.execute_after_background_status(sql).await
+    }
+
+    async fn execute_after_background_status(&self, sql: &str) -> Result<usize> {
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                 .then(|| {
@@ -15798,12 +17513,13 @@ impl Connection {
     /// Empty batches and batches containing only whitespace, semicolons, or
     /// SQL comments are treated as a no-op, matching SQLite batch semantics.
     pub async fn execute_batch(&self, sql: &str) -> Result<()> {
-        self.background_status()?;
+        let _public_operation = self.enter_public_operation()?;
         self.settle_pending_transaction_cleanup().await?;
+        self.background_status()?;
         if batch_is_noop(sql)? {
             return Ok(());
         }
-        self.execute(sql).await.map(|_| ())
+        self.execute_after_background_status(sql).await.map(|_| ())
     }
 
     /// Begin a transaction without going through SQL parsing/dispatch.
@@ -15811,46 +17527,310 @@ impl Connection {
     /// This follows the same mode selection as plain `BEGIN`: explicit mode is
     /// absent, so `concurrent_mode_default` still controls whether the
     /// transaction auto-promotes to concurrent mode.
-    pub async fn begin_transaction(&self) -> Result<()> {
-        self.background_status()?;
+    pub async fn begin_transaction(&self) -> Result<u64> {
+        let _public_operation = self.enter_public_operation()?;
         // Unwind any abandoned transaction before opening a new one, so the
         // new transaction never inherits an abandoned one's uncommitted state.
         self.settle_pending_transaction_cleanup().await?;
+        self.background_status()?;
         self.execute_begin(fsqlite_ast::BeginStatement { mode: None })
             .await
     }
 
     /// Commit the active transaction without reparsing a `COMMIT` statement.
     pub async fn commit_transaction(&self) -> Result<()> {
-        self.background_status()?;
+        let _public_operation = self.enter_public_operation()?;
         // An abandoned transaction cannot be committed after the fact: unwind
         // it first so a stale wrapper cannot resurrect uncommitted writes.
         self.settle_pending_transaction_cleanup().await?;
+        self.background_status()?;
         let cx = self.op_cx_after_background_status();
         self.execute_commit_with_cx(&cx).await
     }
 
     /// Roll back the active transaction without reparsing a `ROLLBACK` statement.
     pub async fn rollback_transaction(&self) -> Result<()> {
+        let _public_operation = self.enter_public_operation()?;
+        let cleanup_state = self.transaction_cleanup_state.borrow().clone();
+        match cleanup_state {
+            TransactionCleanupState::Pending(_) => {
+                return self.settle_pending_transaction_cleanup().await;
+            }
+            TransactionCleanupState::Poisoned { generation, cause } => {
+                return Err(Self::transaction_cleanup_poison_error(generation, &cause));
+            }
+            TransactionCleanupState::Idle => {}
+        }
         self.background_status()?;
-        self.pending_transaction_cleanup.set(false);
         let cx = self.op_cx_after_background_status();
-        self.execute_rollback_with_cx(&cx, &fsqlite_ast::RollbackStatement { to_savepoint: None })
+        self.rollback_active_transaction_with_cx(&cx).await
+    }
+
+    /// Commit only if `generation` still names the transaction captured by a
+    /// scoped wrapper.
+    pub async fn commit_transaction_generation(&self, generation: u64) -> Result<()> {
+        let _public_operation = self.enter_public_operation()?;
+        self.background_status()?;
+        self.ensure_scoped_transaction_generation(generation)?;
+        let cx = self.op_cx_after_background_status();
+        self.execute_commit_with_cx(&cx).await
+    }
+
+    /// Roll back only if `generation` still names the transaction captured by
+    /// a scoped wrapper.
+    pub async fn rollback_transaction_generation(&self, generation: u64) -> Result<()> {
+        let _public_operation = self.enter_public_operation()?;
+        self.background_status()?;
+        self.ensure_scoped_transaction_generation(generation)?;
+        let cleanup_cx = self.transaction_cleanup_cx();
+        let _mask = cleanup_cx.masked();
+        self.rollback_active_transaction_with_cx(&cleanup_cx).await
+    }
+
+    fn transaction_cleanup_poison_error(generation: u64, cause: &str) -> FrankenError {
+        FrankenError::internal(format!(
+            "transaction generation {generation} cleanup is incomplete; \
+             the connection is fail-closed until explicit recovery or close: {cause}"
+        ))
+    }
+
+    /// Derive a cancellation-masked rollback context from the connection
+    /// root, never from the currently admitted statement.
+    ///
+    /// A dropped scoped transaction creates a connection-owned cleanup
+    /// obligation. Its rollback must not inherit the cancellation token (or
+    /// task-affine native runtime handle) of whichever later operation happens
+    /// to discover that obligation.
+    fn transaction_cleanup_cx(&self) -> Cx {
+        self.root_cx
+            .create_native_free_child()
+            .cleanup_scope()
+            .with_decision_id(next_decision_id())
+    }
+
+    fn ensure_scoped_transaction_generation(&self, generation: u64) -> Result<()> {
+        match self.transaction_cleanup_state.borrow().clone() {
+            TransactionCleanupState::Idle => {}
+            TransactionCleanupState::Pending(pending) => {
+                return Err(FrankenError::internal(format!(
+                    "transaction generation {pending} is awaiting deferred rollback"
+                )));
+            }
+            TransactionCleanupState::Poisoned { generation, cause } => {
+                return Err(Self::transaction_cleanup_poison_error(generation, &cause));
+            }
+        }
+        let active_txn = self
+            .active_txn
+            .try_borrow()
+            .map_err(|_| FrankenError::Busy)?;
+        if self.active_transaction_generation.get() != Some(generation)
+            || !self.in_transaction.get()
+            || active_txn.is_none()
+        {
+            return Err(FrankenError::internal(format!(
+                "transaction generation {generation} is no longer active"
+            )));
+        }
+        Ok(())
+    }
+
+    fn statement_contains_transaction_boundary(statement: &Statement) -> bool {
+        match statement {
+            Statement::Begin(_)
+            | Statement::Commit
+            | Statement::Rollback(_)
+            | Statement::Savepoint(_)
+            | Statement::Release(_) => true,
+            Statement::Explain { stmt, .. } => Self::statement_contains_transaction_boundary(stmt),
+            _ => false,
+        }
+    }
+
+    fn scoped_transaction_statements(
+        &self,
+        generation: u64,
+        sql: &str,
+    ) -> Result<Vec<Arc<Statement>>> {
+        self.ensure_scoped_transaction_generation(generation)?;
+        let statements = self.cached_parse_multi(sql)?;
+        if statements
+            .iter()
+            .any(|statement| Self::statement_contains_transaction_boundary(statement))
+        {
+            return Err(FrankenError::internal(
+                "transaction-control SQL is not allowed through a scoped transaction wrapper",
+            ));
+        }
+        Ok(statements)
+    }
+
+    /// Execute query SQL only while `generation` remains the active scoped
+    /// transaction. Transaction-control statements are rejected before any
+    /// statement executes, and the generation is revalidated between every
+    /// statement in a multi-statement input.
+    #[doc(hidden)]
+    pub async fn scoped_transaction_query_with_params(
+        &self,
+        generation: u64,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Vec<Row>> {
+        let _public_operation = self.enter_public_operation()?;
+        self.background_status()?;
+        self.scoped_transaction_query_with_params_after_background_status(generation, sql, params)
             .await
+    }
+
+    async fn scoped_transaction_query_with_params_after_background_status(
+        &self,
+        generation: u64,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Vec<Row>> {
+        let statements = self.scoped_transaction_statements(generation, sql)?;
+        let mut operation = ScopedTransactionOperationGuard::new(self, generation);
+        let result = async {
+            if statements.len() == 1
+                && self.ad_hoc_query_supports_prepared_reuse(statements[0].as_ref())
+            {
+                let prepared = self.prepare_after_background_status(sql).await?;
+                let rows = self
+                    .query_prepared_with_params_after_background_status(&prepared, params)
+                    .await?;
+                self.ensure_scoped_transaction_generation(generation)?;
+                return Ok(rows);
+            }
+
+            let mut rows = Vec::new();
+            for statement in statements {
+                self.ensure_scoped_transaction_generation(generation)?;
+                rows = self
+                    .execute_statement_after_background_status(
+                        statement.as_ref(),
+                        (!params.is_empty()).then_some(params),
+                    )
+                    .await?;
+                self.ensure_scoped_transaction_generation(generation)?;
+                self.note_connection_statement_execution_count(1);
+            }
+            Ok(rows)
+        }
+        .await;
+        operation.mark_completed();
+        result
+    }
+
+    /// Query exactly one row while `generation` remains active.
+    #[doc(hidden)]
+    pub async fn scoped_transaction_query_row_with_params(
+        &self,
+        generation: u64,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Row> {
+        let _public_operation = self.enter_public_operation()?;
+        self.background_status()?;
+        let rows = self
+            .scoped_transaction_query_with_params_after_background_status(generation, sql, params)
+            .await?;
+        exactly_one_row_or_error(rows)
+    }
+
+    /// Execute SQL only while `generation` remains the active scoped
+    /// transaction. See [`Self::scoped_transaction_query_with_params`] for the
+    /// transaction-boundary and hard-drop contract.
+    #[doc(hidden)]
+    pub async fn scoped_transaction_execute_with_params(
+        &self,
+        generation: u64,
+        sql: &str,
+        params: &[SqliteValue],
+        skip_statement_savepoint_in_explicit_txn: bool,
+    ) -> Result<usize> {
+        let _public_operation = self.enter_public_operation()?;
+        self.background_status()?;
+        let statements = self.scoped_transaction_statements(generation, sql)?;
+        let mut operation = ScopedTransactionOperationGuard::new(self, generation);
+        let result = async {
+            if statements.len() == 1
+                && self.ad_hoc_execute_supports_prepared_reuse(statements[0].as_ref())?
+            {
+                let prepared = self.prepare_after_background_status(sql).await?;
+                let affected = self
+                    .execute_prepared_with_params_after_background_status(
+                        &prepared,
+                        params,
+                        skip_statement_savepoint_in_explicit_txn,
+                    )
+                    .await?;
+                self.ensure_scoped_transaction_generation(generation)?;
+                return Ok(affected);
+            }
+
+            let mut last_count = 0;
+            for statement in statements {
+                self.ensure_scoped_transaction_generation(generation)?;
+                let is_dml = matches!(
+                    statement.as_ref(),
+                    Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+                );
+                let rows = self
+                    .execute_statement_after_background_status(
+                        statement.as_ref(),
+                        (!params.is_empty()).then_some(params),
+                    )
+                    .await?;
+                self.ensure_scoped_transaction_generation(generation)?;
+                self.note_connection_statement_execution_count(1);
+                last_count = if is_dml {
+                    self.last_changes.get()
+                } else {
+                    rows.len()
+                };
+            }
+            Ok(last_count)
+        }
+        .await;
+        operation.mark_completed();
+        result
+    }
+
+    /// Read change-tracking state only while `generation` remains active.
+    #[doc(hidden)]
+    pub fn scoped_transaction_last_insert_rowid(&self, generation: u64) -> Result<i64> {
+        self.ensure_scoped_transaction_generation(generation)?;
+        Ok(self.last_insert_rowid())
     }
 
     /// Record that a scoped transaction wrapper was dropped without an awaited
     /// `commit()` / `rollback()`.
     ///
-    /// `Drop::drop` cannot await, and this crate never builds its own runtime,
-    /// so a drop path cannot finish the rollback itself. It calls this instead
-    /// to record the obligation; [`Self::settle_pending_transaction_cleanup`]
-    /// discharges it at the next SQL entry point. The net effect is that an
-    /// abandoned transaction's writes are never observable to later
-    /// statements, which is the contract `rusqlite` callers expect from
-    /// rollback-on-drop, without blocking inside `Drop`.
-    pub fn mark_transaction_cleanup_required(&self) {
-        self.pending_transaction_cleanup.set(true);
+    /// A stale wrapper is harmless: only the generation that is still active
+    /// may arm cleanup.
+    pub fn mark_transaction_cleanup_required(&self, generation: u64) {
+        if self.active_transaction_generation.get() != Some(generation)
+            || !self.in_transaction.get()
+        {
+            return;
+        }
+        let mut state = self.transaction_cleanup_state.borrow_mut();
+        match *state {
+            TransactionCleanupState::Idle => {
+                *state = TransactionCleanupState::Pending(generation);
+            }
+            TransactionCleanupState::Pending(existing) if existing == generation => {}
+            TransactionCleanupState::Poisoned {
+                generation: existing,
+                ..
+            } if existing == generation => {}
+            _ => {
+                *state = TransactionCleanupState::Poisoned {
+                    generation,
+                    cause: "conflicting transaction cleanup generations were observed".to_owned(),
+                };
+            }
+        }
     }
 
     /// Discharge a pending abandoned-transaction obligation, if one exists.
@@ -15859,27 +17839,154 @@ impl Connection {
     /// statement executes, so no later statement can observe the abandoned
     /// transaction's writes.
     ///
-    /// The flag is cleared before the rollback is attempted, so a failing
-    /// rollback cannot wedge the connection into retrying it forever; the
-    /// error surfaces to the caller of whichever statement discharged it.
     async fn settle_pending_transaction_cleanup(&self) -> Result<()> {
-        if !self.pending_transaction_cleanup.replace(false) {
-            return Ok(());
+        let cleanup_state = self.transaction_cleanup_state.borrow().clone();
+        let generation = match cleanup_state {
+            TransactionCleanupState::Idle => {
+                let active_generation = self.active_transaction_generation.get();
+                let in_transaction = self.in_transaction.get();
+                let active_handle = self
+                    .active_txn
+                    .try_borrow()
+                    .map_err(|_| FrankenError::Busy)?
+                    .is_some();
+                if active_generation.is_some() != in_transaction || active_handle != in_transaction
+                {
+                    let generation = active_generation.unwrap_or(0);
+                    let cause = format!(
+                        "transaction lifecycle invariant failed: generation={active_generation:?}, \
+                         in_transaction={in_transaction}, active_handle={active_handle}"
+                    );
+                    *self.transaction_cleanup_state.borrow_mut() =
+                        TransactionCleanupState::Poisoned {
+                            generation,
+                            cause: cause.clone(),
+                        };
+                    return Err(Self::transaction_cleanup_poison_error(generation, &cause));
+                }
+                return Ok(());
+            }
+            TransactionCleanupState::Pending(generation) => generation,
+            TransactionCleanupState::Poisoned { generation, cause } => {
+                return Err(Self::transaction_cleanup_poison_error(generation, &cause));
+            }
+        };
+
+        let active_handle = self
+            .active_txn
+            .try_borrow()
+            .map_err(|_| FrankenError::Busy)?
+            .is_some();
+        if self.active_transaction_generation.get() != Some(generation)
+            || !self.in_transaction.get()
+            || !active_handle
+        {
+            let cause = "deferred rollback no longer matches the active transaction".to_owned();
+            *self.transaction_cleanup_state.borrow_mut() = TransactionCleanupState::Poisoned {
+                generation,
+                cause: cause.clone(),
+            };
+            return Err(Self::transaction_cleanup_poison_error(generation, &cause));
         }
-        // An explicit commit/rollback may already have closed it, or the
-        // wrapper may have been dropped after finalizing.
-        if !self.in_transaction() {
-            return Ok(());
+
+        let cleanup_cx = self.transaction_cleanup_cx();
+        let _mask = cleanup_cx.masked();
+        let result = self.rollback_active_transaction_with_cx(&cleanup_cx).await;
+        match result {
+            Ok(()) => {
+                let active_handle = self
+                    .active_txn
+                    .try_borrow()
+                    .map_err(|_| FrankenError::Busy)?
+                    .is_some();
+                if self.in_transaction.get()
+                    || self.active_transaction_generation.get().is_some()
+                    || active_handle
+                    || *self.transaction_cleanup_state.borrow()
+                        != TransactionCleanupState::Pending(generation)
+                {
+                    let cause =
+                        "rollback returned success without reaching an idle transaction state"
+                            .to_owned();
+                    *self.transaction_cleanup_state.borrow_mut() =
+                        TransactionCleanupState::Poisoned {
+                            generation,
+                            cause: cause.clone(),
+                        };
+                    return Err(Self::transaction_cleanup_poison_error(generation, &cause));
+                }
+                *self.transaction_cleanup_state.borrow_mut() = TransactionCleanupState::Idle;
+                Ok(())
+            }
+            Err(error) => {
+                let active_handle = self
+                    .active_txn
+                    .try_borrow()
+                    .map_err(|_| FrankenError::Busy)?
+                    .is_some();
+                if *self.transaction_cleanup_state.borrow()
+                    == TransactionCleanupState::Pending(generation)
+                    && self.in_transaction.get()
+                    && self.active_transaction_generation.get() == Some(generation)
+                    && active_handle
+                {
+                    return Err(error);
+                }
+                let cause = format!(
+                    "deferred rollback failed after losing its exact active transaction: {error}"
+                );
+                *self.transaction_cleanup_state.borrow_mut() = TransactionCleanupState::Poisoned {
+                    generation,
+                    cause: cause.clone(),
+                };
+                Err(Self::transaction_cleanup_poison_error(generation, &cause))
+            }
         }
-        let cx = self.op_cx_after_background_status();
-        self.execute_rollback_with_cx(&cx, &fsqlite_ast::RollbackStatement { to_savepoint: None })
-            .await
+    }
+
+    #[cfg(test)]
+    async fn run_transaction_cleanup_rollback_test_action(&self) -> Result<()> {
+        let action = self
+            .transaction_cleanup_rollback_test_action
+            .borrow_mut()
+            .take();
+        match action {
+            Some(TransactionCleanupRollbackTestAction::PendingOnce { entered }) => {
+                entered.set(true);
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+            Some(TransactionCleanupRollbackTestAction::ErrorOnce(error)) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    async fn rollback_active_transaction_with_cx(&self, cx: &Cx) -> Result<()> {
+        let generation = self.active_transaction_generation.get();
+        let result = self
+            .execute_rollback_with_cx(cx, &fsqlite_ast::RollbackStatement { to_savepoint: None })
+            .await;
+        if let Err(error) = &result
+            && let Some(generation) = generation
+            && (!self.in_transaction.get() || self.active_txn.borrow().is_none())
+        {
+            *self.transaction_cleanup_state.borrow_mut() = TransactionCleanupState::Poisoned {
+                generation,
+                cause: error.to_string(),
+            };
+        }
+        result
     }
 
     /// Prepare and execute SQL with bound SQL parameters.
     pub async fn execute_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
-        self.execute_with_params_with_statement_savepoint_policy(sql, params, false)
-            .await
+        let _public_operation = self.enter_public_operation()?;
+        self.settle_pending_transaction_cleanup().await?;
+        self.background_status()?;
+        self.execute_with_params_with_statement_savepoint_policy_after_background_status(
+            sql, params, false,
+        )
+        .await
     }
 
     /// Prepare and execute SQL with bound SQL parameters, skipping the
@@ -15896,8 +18003,13 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<usize> {
-        self.execute_with_params_with_statement_savepoint_policy(sql, params, true)
-            .await
+        let _public_operation = self.enter_public_operation()?;
+        self.settle_pending_transaction_cleanup().await?;
+        self.background_status()?;
+        self.execute_with_params_with_statement_savepoint_policy_after_background_status(
+            sql, params, true,
+        )
+        .await
     }
 
     /// Prepare one statement once and execute every parameter set inside an
@@ -15914,6 +18026,8 @@ impl Connection {
         sql: &str,
         parameter_sets: &[Vec<SqliteValue>],
     ) -> Result<usize> {
+        let _public_operation = self.enter_public_operation()?;
+        self.settle_pending_transaction_cleanup().await?;
         self.background_status()?;
         if !self.in_transaction() {
             return Err(FrankenError::internal(
@@ -15933,14 +18047,12 @@ impl Connection {
         Ok(affected)
     }
 
-    async fn execute_with_params_with_statement_savepoint_policy(
+    async fn execute_with_params_with_statement_savepoint_policy_after_background_status(
         &self,
         sql: &str,
         params: &[SqliteValue],
         skip_statement_savepoint_in_explicit_txn: bool,
     ) -> Result<usize> {
-        self.background_status()?;
-        self.settle_pending_transaction_cleanup().await?;
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                 .then(|| {
@@ -16043,7 +18155,11 @@ impl Connection {
 
     /// Execute a prepared DML statement (INSERT/UPDATE/DELETE) with no parameters.
     pub async fn execute_prepared(&self, stmt: &PreparedStatement<'_>) -> Result<usize> {
-        self.execute_prepared_with_params(stmt, &[]).await
+        let _public_operation = self.enter_public_operation()?;
+        self.settle_pending_transaction_cleanup().await?;
+        self.background_status()?;
+        self.execute_prepared_with_params_after_background_status(stmt, &[], false)
+            .await
     }
 
     /// Execute a prepared DML statement (INSERT/UPDATE/DELETE) with bound parameters.
@@ -16052,6 +18168,8 @@ impl Connection {
         stmt: &PreparedStatement<'_>,
         params: &[SqliteValue],
     ) -> Result<usize> {
+        let _public_operation = self.enter_public_operation()?;
+        self.settle_pending_transaction_cleanup().await?;
         self.background_status()?;
         self.execute_prepared_with_params_after_background_status(stmt, params, false)
             .await
@@ -19843,6 +21961,7 @@ impl Connection {
             self.with_internal_statement_savepoint_and_cx(
                 execution_cx,
                 statement_kind,
+                preserve_prior_changes_on_constraint_violation,
                 execute_body,
             )
             .await
@@ -19876,7 +21995,7 @@ impl Connection {
             && preserve_prior_changes_on_constraint_violation
             && matches!(
                 result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
+                Err(error) if error_preserves_prior_changes_for_fail(error)
             );
         let execution_ok = result.is_ok() || commit_autocommit_on_error;
         let autocommit_resolve_start =
@@ -20212,7 +22331,7 @@ impl Connection {
         let commit_autocommit_on_error = preserve_prior_changes_on_constraint_violation
             && matches!(
                 result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
+                Err(error) if error_preserves_prior_changes_for_fail(error)
             );
         let ok = result.is_ok() || commit_autocommit_on_error;
         let autocommit_resolve_start = hot_path_profile_enabled().then(Instant::now);
@@ -23064,7 +25183,7 @@ impl Connection {
         let commit_autocommit_on_error = preserve_prior_changes_on_constraint_violation
             && matches!(
                 result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
+                Err(error) if error_preserves_prior_changes_for_fail(error)
             );
         let ok = result.is_ok() || commit_autocommit_on_error;
         if matches!(result.as_ref(), Ok(0)) {
@@ -24288,7 +26407,7 @@ impl Connection {
         F: std::ops::AsyncFnOnce() -> Result<T>,
     {
         let cx = self.op_cx()?;
-        self.with_internal_statement_savepoint_and_cx(&cx, purpose, body)
+        self.with_internal_statement_savepoint_and_cx(&cx, purpose, false, body)
             .await
     }
 
@@ -24296,6 +26415,7 @@ impl Connection {
         &self,
         cx: &Cx,
         purpose: &str,
+        preserve_prior_changes_on_constraint_violation: bool,
         body: F,
     ) -> Result<T>
     where
@@ -24307,6 +26427,9 @@ impl Connection {
         self.flush_pending_direct_write_runs(cx).await?;
         let savepoint_name = self.next_internal_savepoint_name(purpose);
         let snapshot = self.snapshot();
+        let deferred_fk_checks_len = self.deferred_fk_checks.borrow().len();
+        let deferred_fk_parent_action_checks_len =
+            self.deferred_fk_parent_action_checks.borrow().len();
         self.internal_statement_savepoint_depth.set(
             self.internal_statement_savepoint_depth
                 .get()
@@ -24378,10 +26501,14 @@ impl Connection {
                 Ok(value)
             }
             Err(statement_error) => {
-                // RAISE(FAIL): the statement fails but its already-applied rows
-                // are KEPT. Release the savepoint exactly as on success (instead
-                // of rolling back to it), then propagate the error.
-                if matches!(statement_error, FrankenError::RaiseFail(_)) {
+                // RAISE(FAIL), and only the constraint kinds to which an SQL
+                // `OR FAIL` policy applies, keep already-applied rows. FK
+                // violations and trigger-program depth errors always roll back
+                // the statement even when the outer DML spelled `OR FAIL`.
+                if matches!(statement_error, FrankenError::RaiseFail(_))
+                    || (preserve_prior_changes_on_constraint_violation
+                        && error_preserves_prior_changes_for_fail(&statement_error))
+                {
                     if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
                         txn.release_savepoint(cx, &savepoint_name)?;
                     }
@@ -24471,6 +26598,12 @@ impl Connection {
                     self.txn_metrics_note_rollback();
                     self.clear_prepared_direct_insert_append_hint();
                     self.restore_snapshot(cx, &snapshot).await?;
+                    self.deferred_fk_checks
+                        .borrow_mut()
+                        .truncate(deferred_fk_checks_len);
+                    self.deferred_fk_parent_action_checks
+                        .borrow_mut()
+                        .truncate(deferred_fk_parent_action_checks_len);
                 }
 
                 if !cleanup_errors.is_empty() {
@@ -24920,11 +27053,10 @@ impl Connection {
     fn should_use_statement_savepoint(
         &self,
         was_auto: bool,
-        preserve_prior_changes_on_constraint_violation: bool,
+        _preserve_prior_changes_on_constraint_violation: bool,
     ) -> bool {
         self.active_txn_is_open_or_borrowed()
             && self.internal_statement_savepoint_depth.get() == 0
-            && !preserve_prior_changes_on_constraint_violation
             && (!was_auto || self.retained_autocommit_batch_active())
     }
 
@@ -24945,7 +27077,7 @@ impl Connection {
             if hot_path_profile_enabled() {
                 FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES.fetch_add(1, AtomicOrdering::Relaxed);
             }
-            self.background_status()?;
+            self.background_status_for_internal_driver()?;
             self.execute_statement_after_background_status(statement, params)
                 .await
         })
@@ -25030,19 +27162,54 @@ impl Connection {
                     .clone()
                     .unwrap_or_else(|| statement.to_string())
             });
+            let trigger_driver_id = self.trigger_program_polling_driver.get();
+            let trigger_task_id = self.trigger_program_polling_task.get();
+            let trigger_parent_task_id = self.trigger_program_polling_parent_task.get();
+            let trigger_logical_depth = self.trigger_program_polling_depth.get();
             let statement_span = statement_trace_enabled.then(|| {
-                let span = tracing::span!(
-                    target: "fsqlite.statement",
-                    tracing::Level::DEBUG,
-                    "statement",
-                    trace_id,
-                    decision_id,
-                    statement_kind
-                );
+                let span = if trigger_task_id.is_some() {
+                    // A physical parent chain across suspended async frames
+                    // recreates recursion inside the tracing subscriber. Keep
+                    // nested spans root-scoped and expose the logical relation
+                    // as bounded scalar fields instead.
+                    tracing::span!(
+                        target: "fsqlite.statement",
+                        parent: None,
+                        tracing::Level::DEBUG,
+                        "statement",
+                        trace_id,
+                        decision_id,
+                        statement_kind,
+                        trigger_driver_id = trigger_driver_id.unwrap_or(0),
+                        trigger_task_id = trigger_task_id.unwrap_or(0),
+                        trigger_parent_task_id = trigger_parent_task_id.unwrap_or(0),
+                        trigger_logical_depth
+                    )
+                } else {
+                    tracing::span!(
+                        target: "fsqlite.statement",
+                        tracing::Level::DEBUG,
+                        "statement",
+                        trace_id,
+                        decision_id,
+                        statement_kind,
+                        trigger_driver_id = 0_u64,
+                        trigger_task_id = 0_u64,
+                        trigger_parent_task_id = 0_u64,
+                        trigger_logical_depth = 0_usize
+                    )
+                };
                 record_trace_span_created();
                 span
             });
-            let _statement_guard = statement_span.as_ref().map(tracing::Span::enter);
+            // Never hold an entered nested span guard across `.await`: doing so
+            // leaves the subscriber's thread-local span stack nested while the
+            // trampoline polls a child. The span itself remains alive for
+            // duration/close events and carries the logical hierarchy above.
+            let _statement_guard = trigger_task_id
+                .is_none()
+                .then(|| statement_span.as_ref().map(tracing::Span::enter))
+                .flatten();
             if compat_trace_stmt_enabled {
                 emit_compat_trace_event(
                     trace_registration.as_ref(),
@@ -25069,7 +27236,11 @@ impl Connection {
                         "parse",
                         trace_id,
                         statement_kind,
-                        phase = "rewrite_subquery"
+                        phase = "rewrite_subquery",
+                        trigger_driver_id = trigger_driver_id.unwrap_or(0),
+                        trigger_task_id = trigger_task_id.unwrap_or(0),
+                        trigger_parent_task_id = trigger_parent_task_id.unwrap_or(0),
+                        trigger_logical_depth
                     );
                     record_trace_span_created();
                     span
@@ -25233,16 +27404,21 @@ impl Connection {
                 statement_rolls_back_transaction_on_constraint(statement.as_ref());
             let execute_body_start = hot_path_profile_enabled().then(Instant::now);
             let result = if use_statement_savepoint {
-                self.with_internal_statement_savepoint_and_cx(&op_cx, statement_kind, async || {
-                    self.execute_statement_dispatch_impl(
-                        &op_cx,
-                        statement.as_ref(),
-                        params,
-                        precompiled,
-                        derived_storage_log_select.as_ref(),
-                    )
-                    .await
-                })
+                self.with_internal_statement_savepoint_and_cx(
+                    &op_cx,
+                    statement_kind,
+                    statement_preserves_prior_changes_on_constraint(statement.as_ref()),
+                    async || {
+                        self.execute_statement_dispatch_impl(
+                            &op_cx,
+                            statement.as_ref(),
+                            params,
+                            precompiled,
+                            derived_storage_log_select.as_ref(),
+                        )
+                        .await
+                    },
+                )
                 .await
             } else {
                 self.execute_statement_dispatch_impl(
@@ -25286,7 +27462,7 @@ impl Connection {
                 && ((statement_preserves_prior_changes_on_constraint(statement.as_ref())
                 && matches!(
                     result.as_ref(),
-                    Err(error) if error_is_constraint_violation(error)
+                    Err(error) if error_preserves_prior_changes_for_fail(error)
                 ))
                 // RAISE(FAIL) keeps the statement's already-applied rows, so an
                 // autocommit statement must commit them rather than roll back.
@@ -26349,13 +28525,16 @@ impl Connection {
                     return Ok(Vec::new());
                 }
 
-                // FK enforcement on UPDATE:
-                // 1. Parent-side: check old values aren't orphaning children
-                //    (uses cascade-propagation gate so multi-level cascades work)
-                // 2. Child-side: check new FK values have valid parents
-                //    (uses strict gate — not needed during cascade operations)
-                if self.fk_cascade_propagation_enabled() {
-                    let rows_to_check = if !trigger_rows.is_empty() {
+                // Capture the old/new row images before the base UPDATE, but
+                // resolve FK checks only after it has changed the parent row.
+                // That ordering is essential for a self-reference such as
+                // `(id, parent) = (1, 1) -> (2, 2)`: before the base mutation
+                // there is no parent `2`, and the row still looks like a child
+                // of old parent `1`; after it, both checks see the statement's
+                // correct image. SQLite applies UPDATE as BEFORE triggers ->
+                // base parent mutation -> FK checks/actions -> AFTER triggers.
+                let fk_update_row_images = if self.fk_cascade_propagation_enabled() {
+                    if !trigger_rows.is_empty() {
                         trigger_rows
                             .iter()
                             .map(|(old, new)| (old.clone(), new.clone()))
@@ -26363,25 +28542,10 @@ impl Connection {
                     } else {
                         self.collect_update_trigger_rows(&effective_update, params)
                             .await?
-                    };
-                    for (old_values, new_values) in &rows_to_check {
-                        // Parent-side: if this table is referenced by children,
-                        // check that changing FK-referenced values doesn't orphan them.
-                        // Use ON UPDATE actions (not ON DELETE) for UPDATE statements.
-                        let fk_actions = self
-                            .check_fk_on_update(table_name, old_values, new_values)
-                            .await?;
-                        for action in &fk_actions {
-                            self.execute_fk_update_action(action).await?;
-                        }
-                        // Child-side: validate new FK values against parent tables.
-                        // Only check when NOT inside a cascade action, because
-                        // the cascade itself is modifying parent data.
-                        if self.fk_enforcement_enabled() {
-                            self.check_fk_parent_exists(table_name, new_values).await?;
-                        }
                     }
-                }
+                } else {
+                    Vec::new()
+                };
 
                 let arc_prog;
                 let program: &VdbeProgram = if let Some(p) = precompiled {
@@ -26414,6 +28578,31 @@ impl Connection {
                         true,
                     )
                     .await?;
+
+                // Child-side validation must observe the base UPDATE's new
+                // parent keys. If this fails, the enclosing statement
+                // savepoint/autocommit transaction restores the base mutation.
+                if self.fk_enforcement_enabled() {
+                    for (_, new_values) in &fk_update_row_images {
+                        self.check_fk_parent_exists(table_name, new_values).await?;
+                    }
+                }
+
+                // Re-probe child rows only after the base mutation. This makes
+                // NO ACTION/RESTRICT fail only for a *residual* old-key
+                // reference, and avoids recursively cascading a row that the
+                // same UPDATE already rewrote. CASCADE/SET descriptors still
+                // use the pre-mutation old/new images retained above.
+                let mut pending_fk_actions = Vec::new();
+                for (old_values, new_values) in &fk_update_row_images {
+                    pending_fk_actions.extend(
+                        self.check_fk_on_update(table_name, old_values, new_values)
+                            .await?,
+                    );
+                }
+                for action in &pending_fk_actions {
+                    self.execute_fk_update_action(action).await?;
+                }
 
                 // Phase 5G.3: Fire AFTER UPDATE triggers.
                 if has_after_update {
@@ -26559,27 +28748,24 @@ impl Connection {
                     return Ok(Vec::new());
                 }
 
-                // Validate FK constraints and retain the required actions before
-                // deleting the parent rows. The actions themselves must run only
-                // after the parent delete succeeds and before its AFTER DELETE
-                // triggers, matching SQLite's sqlite3FkActions() ordering.
+                // Retain pre-delete parent images, but discover residual child
+                // references only after the base delete. A sole self-reference
+                // is being deleted by this statement too, so it is neither a
+                // remaining NO ACTION/RESTRICT violation nor a row to cascade
+                // recursively. SQLite orders DELETE as BEFORE triggers -> base
+                // delete -> FK checks/actions -> AFTER triggers.
                 //
                 // Use `fk_cascade_propagation_enabled` (not
                 // `fk_enforcement_enabled`) so that multi-level cascades propagate
                 // through intermediate tables (e.g., grandparent -> parent ->
                 // child).
-                let pending_fk_actions = if self.fk_cascade_propagation_enabled() {
-                    let rows_to_check = if !trigger_old_rows.is_empty() {
+                let fk_delete_row_images = if self.fk_cascade_propagation_enabled() {
+                    if !trigger_old_rows.is_empty() {
                         trigger_old_rows.clone()
                     } else {
                         self.collect_delete_trigger_rows(&effective_delete, params)
                             .await?
-                    };
-                    let mut actions = Vec::new();
-                    for row_values in &rows_to_check {
-                        actions.extend(self.check_fk_on_delete(table_name, row_values).await?);
                     }
-                    actions
                 } else {
                     Vec::new()
                 };
@@ -26600,6 +28786,11 @@ impl Connection {
                         .execute_live_vtab_delete(&effective_delete, params)
                         .await?;
 
+                    let mut pending_fk_actions = Vec::new();
+                    for row_values in &fk_delete_row_images {
+                        pending_fk_actions
+                            .extend(self.check_fk_on_delete(table_name, row_values).await?);
+                    }
                     for action in &pending_fk_actions {
                         self.execute_fk_delete_action(action).await?;
                     }
@@ -26653,6 +28844,11 @@ impl Connection {
                     )
                     .await?;
 
+                let mut pending_fk_actions = Vec::new();
+                for row_values in &fk_delete_row_images {
+                    pending_fk_actions
+                        .extend(self.check_fk_on_delete(table_name, row_values).await?);
+                }
                 for action in &pending_fk_actions {
                     self.execute_fk_delete_action(action).await?;
                 }
@@ -26779,20 +28975,15 @@ impl Connection {
                 // surface as `ReadOnly` rather than mutating a file the parent
                 // was never granted write access to. A writable main opens the
                 // attached database read-write as usual.
-                let attached_connection = if self.pager.is_readonly() {
-                    Box::new(
-                        Self::open_schema_only_with_env(path.clone(), self.attach_env.clone())
-                            .await?,
-                    )
-                } else {
-                    Box::new(Self::open_with_env(path.clone(), self.attach_env.clone()).await?)
-                };
-                self.attached_schemas
-                    .borrow_mut()
-                    .attach(attach.schema.clone(), path)?;
-                self.attached_connections
-                    .borrow_mut()
-                    .insert(attached_schema_key(&attach.schema), attached_connection);
+                let attached_connection = self
+                    .open_attached_connection_with_cx(cx, path.clone())
+                    .await?;
+                self.publish_attached_connection(
+                    cx,
+                    attach.schema.clone(),
+                    path,
+                    attached_connection,
+                )?;
                 Ok(Vec::new())
             }
             Statement::Detach(schema_name) => {
@@ -27241,10 +29432,16 @@ impl Connection {
             preserve_prior_changes_on_constraint_violation,
         );
         let result = if use_statement_savepoint {
-            self.with_internal_statement_savepoint("insert_select", async || {
-                self.execute_insert_select_materialized_rows(insert, source_rows)
-                    .await
-            })
+            let cx = self.op_cx()?;
+            self.with_internal_statement_savepoint_and_cx(
+                &cx,
+                "insert_select",
+                preserve_prior_changes_on_constraint_violation,
+                async || {
+                    self.execute_insert_select_materialized_rows(insert, source_rows)
+                        .await
+                },
+            )
             .await
         } else {
             self.execute_insert_select_materialized_rows(insert, source_rows)
@@ -27254,7 +29451,7 @@ impl Connection {
             && ((preserve_prior_changes_on_constraint_violation
                 && matches!(
                     result.as_ref(),
-                    Err(error) if error_is_constraint_violation(error)
+                    Err(error) if error_preserves_prior_changes_for_fail(error)
                 ))
                 // RAISE(FAIL) in a BEFORE trigger keeps the rows already inserted
                 // by this statement; commit them instead of rolling back.
@@ -27389,7 +29586,12 @@ impl Connection {
                 .join(", ");
             let insert_sql = format!("INSERT INTO \"{table_name}\" VALUES ({placeholders})");
             for row in rows {
-                self.execute_with_params(&insert_sql, row.values()).await?;
+                self.execute_with_params_with_statement_savepoint_policy_after_background_status(
+                    &insert_sql,
+                    row.values(),
+                    false,
+                )
+                .await?;
             }
         }
         self.insert_sqlite_master_row("table", &table_name, &table_name, root_page, &create_sql)
@@ -27698,12 +29900,16 @@ impl Connection {
             Ok(emitter.into_outcome())
         };
 
-        if !preserve_prior_changes_on_constraint_violation
-            && self.active_txn.borrow().is_some()
-            && self.internal_statement_savepoint_depth.get() == 0
+        if self.active_txn.borrow().is_some() && self.internal_statement_savepoint_depth.get() == 0
         {
-            self.with_internal_statement_savepoint("insert_select", execute_rows)
-                .await
+            let cx = self.op_cx()?;
+            self.with_internal_statement_savepoint_and_cx(
+                &cx,
+                "insert_select",
+                preserve_prior_changes_on_constraint_violation,
+                execute_rows,
+            )
+            .await
         } else {
             execute_rows().await
         }
@@ -28295,7 +30501,7 @@ impl Connection {
                     return Ok(Some(result?));
                 }
                 let scan_sql = build_join_scan_sql(source);
-                let rows = self.query(&scan_sql).await?;
+                let rows = self.query_after_background_status(&scan_sql).await?;
                 Ok(Some(rows_into_value_vectors(rows)))
             },
             async |row| emit_row(row).await,
@@ -28406,9 +30612,10 @@ impl Connection {
             let expr_strs: Vec<String> = row_exprs.iter().map(|e| format!("{e}")).collect();
             let select_sql = format!("SELECT {}", expr_strs.join(", "));
             let eval_rows = if let Some(p) = params {
-                self.query_with_params(&select_sql, p).await?
+                self.query_with_params_after_background_status(&select_sql, p)
+                    .await?
             } else {
-                self.query(&select_sql).await?
+                self.query_after_background_status(&select_sql).await?
             };
             let values: Vec<SqliteValue> = eval_rows
                 .first()
@@ -30056,7 +32263,12 @@ impl Connection {
             !delete.returning.is_empty(),
             &delete_event,
         );
-        let foreign_key_work = self.table_is_foreign_key_parent(table_name);
+        // A prepared DELETE must not bypass the generic path whenever the
+        // target participates in any live FK relationship. Deleting a child
+        // is usually action-free, but keeping this conservative makes the
+        // prepared and unprepared semantics identical as nested constraints
+        // and trigger-program depth checks evolve.
+        let foreign_key_work = self.table_has_foreign_key_work(table_name);
         let direct_simple_delete = if static_fallback_reason.is_none() && !foreign_key_work {
             self.try_build_prepared_direct_simple_delete(delete)
                 .await
@@ -30494,18 +32706,13 @@ impl Connection {
     }
 
     fn table_has_foreign_key_work(&self, table_name: &str) -> bool {
-        let schema = self.schema.borrow();
-        let has_outbound_foreign_keys = self
-            .schema_index_of(table_name)
-            .and_then(|i| schema.get(i))
-            .is_some_and(|table| !table.foreign_keys.is_empty());
-        has_outbound_foreign_keys
-            || schema.iter().any(|table| {
-                table
-                    .foreign_keys
-                    .iter()
-                    .any(|fk| fk.parent_table.eq_ignore_ascii_case(table_name))
-            })
+        let has_outbound_foreign_keys = {
+            let schema = self.schema.borrow();
+            self.schema_index_of(table_name)
+                .and_then(|i| schema.get(i))
+                .is_some_and(|table| !table.foreign_keys.is_empty())
+        };
+        has_outbound_foreign_keys || self.table_is_foreign_key_parent(table_name)
     }
 
     fn insert_runtime_requirements(
@@ -33934,7 +36141,7 @@ impl Connection {
                         return Ok(Some(result?));
                     }
                     let scan_sql = build_join_scan_sql(source);
-                    let rows = self.query(&scan_sql).await?;
+                    let rows = self.query_after_background_status(&scan_sql).await?;
                     Ok(Some(rows_into_value_vectors(rows)))
                 },
                 |table_name| self.has_live_vtab_instance(table_name),
@@ -38765,7 +40972,7 @@ impl Connection {
         // cancellation checkpoint, so guard the flush entry explicitly. The
         // buffer stays intact because we bail before taking the run.
         if cx.is_cancel_requested() {
-            return Err(FrankenError::Abort);
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         }
         let root =
             page_number_from_schema_root(root_page, "<pending-direct-insert-page-run>", "table")?;
@@ -40516,7 +42723,7 @@ impl Connection {
         let _guard = Guard;
 
         let sql = "SELECT tbl, idx, stat FROM sqlite_stat1";
-        let Ok(rows) = self.query(sql).await else {
+        let Ok(rows) = self.query_after_background_status(sql).await else {
             return out;
         };
         for row in &rows {
@@ -43746,14 +45953,14 @@ impl Connection {
             };
             if let Some(when_clause) = &mut trigger.when_clause {
                 changed |= rename_table_refs_in_expr(
-                    when_clause,
+                    Rc::make_mut(when_clause),
                     old_name,
                     new_name,
                     &HashSet::new(),
                     false,
                 );
             }
-            for statement in &mut trigger.body {
+            for statement in Rc::make_mut(&mut trigger.body) {
                 changed |= rename_table_refs_in_statement(statement, old_name, new_name);
             }
             if changed {
@@ -43829,6 +46036,7 @@ impl Connection {
             let target_matches = trigger_probe.table_name.eq_ignore_ascii_case(table_name);
             let mut dependency_found = false;
             if let Some(when_clause) = &mut trigger_probe.when_clause {
+                let when_clause = Rc::make_mut(when_clause);
                 let mut target_bindings = ColumnRenameBindings::default();
                 if target_matches {
                     target_bindings.add_matching_binding(table_name);
@@ -43851,7 +46059,7 @@ impl Connection {
                     );
                 }
             }
-            for statement in &mut trigger_probe.body {
+            for statement in Rc::make_mut(&mut trigger_probe.body) {
                 dependency_found |= rename_column_refs_in_statement_for_table(
                     statement,
                     table_name,
@@ -43944,6 +46152,7 @@ impl Connection {
                 changed |= rename_trigger_event_columns(&mut trigger.event, old_column, new_column);
             }
             if let Some(when_clause) = &mut trigger.when_clause {
+                let when_clause = Rc::make_mut(when_clause);
                 let mut target_bindings = ColumnRenameBindings::default();
                 if trigger_target_matches {
                     target_bindings.add_matching_binding(table_name);
@@ -43966,7 +46175,7 @@ impl Connection {
                     );
                 }
             }
-            for statement in &mut trigger.body {
+            for statement in Rc::make_mut(&mut trigger.body) {
                 changed |= rename_column_refs_in_statement_for_table(
                     statement,
                     table_name,
@@ -45292,10 +47501,12 @@ impl Connection {
         }
         drop(triggers);
 
+        // Validate before recursive `Display`/`Clone`/binding touches the AST.
+        TriggerDef::validate_ast(stmt)?;
         let create_sql = stmt.to_string();
         self.triggers
             .borrow_mut()
-            .push(TriggerDef::from_create_statement(stmt, create_sql.clone()));
+            .push(TriggerDef::from_create_statement(stmt, create_sql.clone())?);
         self.rebuild_schema_indices();
 
         // TEMP triggers are connection-local and not persisted to sqlite_master.
@@ -45325,48 +47536,314 @@ impl Connection {
             .ok_or_else(|| FrankenError::NoSuchTable {
                 name: table_name.to_owned(),
             })?;
-        let column_names = table_schema
+        let column_names: Vec<String> = table_schema
             .columns
             .iter()
             .map(|column| column.name.clone())
             .collect();
         let rowid_alias_col_idx = table_schema.columns.iter().position(|column| column.is_ipk);
         Ok(TriggerFrame {
-            table_name: table_schema.name.clone(),
-            trigger_name: String::new(), // set per-trigger in the fire loop
-            column_names,
+            table_name: Rc::from(table_schema.name.as_str()),
+            trigger_name: Rc::from(""), // set per-trigger in the fire loop
+            column_names: Rc::from(column_names),
             rowid_alias_col_idx,
-            old_row: old_values.map(ToOwned::to_owned),
-            new_row: new_values.map(ToOwned::to_owned),
+            old_row: old_values.map(Rc::from),
+            new_row: new_values.map(Rc::from),
         })
     }
 
-    fn push_trigger_frame(&self, frame: TriggerFrame) -> TriggerFrameGuard<'_> {
+    fn push_trigger_frame(&self, frame: Rc<TriggerFrame>) -> Result<TriggerFrameGuard<'_>> {
+        // A trigger frame, not a mere DML trigger scan, consumes the shared
+        // trigger-program budget. This keeps nested FK actions legal when the
+        // affected table has no matching SQL trigger.
+        self.ensure_trigger_program_depth_available()?;
+        let charged_bytes = frame.estimated_memory_bytes()?;
+        self.charge_trigger_program_memory(charged_bytes)?;
         #[cfg(test)]
         record_trigger_stack_probe(trigger_probe_site::FRAME_PUSH);
-        self.trigger_frame_stack.borrow_mut().push(frame);
-        TriggerFrameGuard {
+        self.trigger_frame_stack
+            .borrow_mut()
+            .push(Rc::clone(&frame));
+        Ok(TriggerFrameGuard {
             stack: &self.trigger_frame_stack,
+            expected_frame: frame,
+            memory_bytes: &self.trigger_program_memory_bytes,
+            charged_bytes,
+        })
+    }
+
+    fn charge_trigger_program_memory(&self, bytes: usize) -> Result<()> {
+        if self.trigger_program_memory_bytes.get() > TRIGGER_PROGRAM_MEMORY_BUDGET_BYTES {
+            return Err(FrankenError::OutOfMemory);
+        }
+        let next = self
+            .trigger_program_memory_bytes
+            .get()
+            .checked_add(bytes)
+            .ok_or(FrankenError::OutOfMemory)?;
+        if next > TRIGGER_PROGRAM_MEMORY_BUDGET_BYTES {
+            return Err(FrankenError::OutOfMemory);
+        }
+        self.trigger_program_memory_bytes.set(next);
+        self.trigger_program_memory_peak_bytes
+            .set(self.trigger_program_memory_peak_bytes.get().max(next));
+        Ok(())
+    }
+
+    fn release_trigger_program_memory(&self, bytes: usize) {
+        release_trigger_program_memory_cell(&self.trigger_program_memory_bytes, bytes);
+    }
+
+    /// Cancellation checkpoint used by the bounded trigger-program driver.
+    ///
+    /// Kept behind one helper so the async actor integration can switch this
+    /// from the connection root to its admitted operation-local context without
+    /// deriving a fresh decision id on every quantum.
+    fn trigger_program_cancellation_requested(&self) -> bool {
+        self.current_operation_cx_or_root().checkpoint().is_err()
+    }
+
+    fn next_trigger_program_task_id(&self) -> u64 {
+        let task_id = self.trigger_program_next_task_id.get();
+        self.trigger_program_next_task_id
+            .set(task_id.wrapping_add(1).max(1));
+        task_id
+    }
+
+    fn trigger_program_work_memory_bytes(&self, work: &TriggerProgramWork) -> Result<usize> {
+        fn checked_sum(parts: impl IntoIterator<Item = usize>) -> Result<usize> {
+            let mut total = 0_usize;
+            for part in parts {
+                total = total.checked_add(part).ok_or(FrankenError::OutOfMemory)?;
+                if total > TRIGGER_PROGRAM_MEMORY_BUDGET_BYTES {
+                    return Err(FrankenError::OutOfMemory);
+                }
+            }
+            Ok(total)
+        }
+
+        fn values_bytes(values: &Vec<SqliteValue>) -> Result<usize> {
+            let mut total = values
+                .capacity()
+                .checked_mul(std::mem::size_of::<SqliteValue>())
+                .ok_or(FrankenError::OutOfMemory)?;
+            for value in values {
+                let payload_bytes = match value {
+                    SqliteValue::Text(text) => text.as_str().len(),
+                    SqliteValue::Blob(blob) => blob.len(),
+                    SqliteValue::Null | SqliteValue::Integer(_) | SqliteValue::Float(_) => 0,
+                };
+                total = total
+                    .checked_add(payload_bytes)
+                    .ok_or(FrankenError::OutOfMemory)?;
+                if total > TRIGGER_PROGRAM_MEMORY_BUDGET_BYTES {
+                    return Err(FrankenError::OutOfMemory);
+                }
+            }
+            Ok(total)
+        }
+        let (work_bytes, future_bytes) = match work {
+            TriggerProgramWork::Statement(statement) => {
+                static STATEMENT_FUTURE_BYTES: OnceLock<usize> = OnceLock::new();
+                let future_bytes = *STATEMENT_FUTURE_BYTES.get_or_init(|| {
+                    let entry = self.execute_statement(statement, None);
+                    let after_status =
+                        self.execute_statement_after_background_status(statement, None);
+                    let dispatch =
+                        self.execute_statement_impl_after_background_status(statement, None, None);
+                    std::mem::size_of_val(entry.as_ref().get_ref())
+                        .checked_add(std::mem::size_of_val(after_status.as_ref().get_ref()))
+                        .and_then(|bytes| {
+                            bytes.checked_add(std::mem::size_of_val(dispatch.as_ref().get_ref()))
+                        })
+                        .expect("trigger statement future sizes fit in usize")
+                });
+                (TriggerAstMemoryCounter::measure(statement)?, future_bytes)
+            }
+            TriggerProgramWork::ForeignKey { sql, params } => {
+                static FK_FUTURE_BYTES: OnceLock<usize> = OnceLock::new();
+                let future_bytes = *FK_FUTURE_BYTES.get_or_init(|| {
+                    let future = self
+                        .execute_with_params_with_statement_savepoint_policy_after_background_status(
+                            sql, params, false,
+                        );
+                    std::mem::size_of_val(&future)
+                });
+                (
+                    checked_sum([sql.capacity(), values_bytes(params)?])?,
+                    future_bytes,
+                )
+            }
+            #[cfg(test)]
+            TriggerProgramWork::TestPending
+            | TriggerProgramWork::TestPanic
+            | TriggerProgramWork::TestEnqueueThenReady
+            | TriggerProgramWork::TestChain { .. } => (0, 0),
+            #[cfg(test)]
+            TriggerProgramWork::TestInternalStatementThenPending { .. } => (0, 0),
+        };
+        // Two task/request slots cover geometric spare capacity in the
+        // driver's Vec and pending VecDeque. The completion allocation includes
+        // the Rc counters plus its RefCell payload.
+        let container_bytes = checked_sum([
+            2 * std::mem::size_of::<TriggerProgramTask<'_>>(),
+            2 * std::mem::size_of::<TriggerProgramRequest>(),
+            2 * std::mem::size_of::<usize>(),
+            std::mem::size_of::<RefCell<Option<Result<()>>>>(),
+        ])?;
+        checked_sum([container_bytes, work_bytes, future_bytes])
+    }
+
+    fn charge_trigger_program_work(&self, work: &TriggerProgramWork) -> Result<usize> {
+        let bytes = self.trigger_program_work_memory_bytes(work)?;
+        self.charge_trigger_program_memory(bytes)?;
+        Ok(bytes)
+    }
+
+    fn make_trigger_program_task(&self, request: TriggerProgramRequest) -> TriggerProgramTask<'_> {
+        let TriggerProgramRequest {
+            work,
+            completion,
+            charged_bytes,
+            task_id,
+            parent_task_id,
+            logical_depth,
+        } = request;
+        let future: Pin<Box<dyn Future<Output = Result<()>> + '_>> = match work {
+            TriggerProgramWork::Statement(statement) => Box::pin(async move {
+                self.execute_statement_after_background_status(&statement, None)
+                    .await?;
+                Ok(())
+            }),
+            TriggerProgramWork::ForeignKey { sql, params } => Box::pin(async move {
+                let _cascade = FkCascadeDepthGuard::enter(self)?;
+                self.execute_with_params_with_statement_savepoint_policy_after_background_status(
+                    &sql, &params, false,
+                )
+                .await?;
+                Ok(())
+            }),
+            #[cfg(test)]
+            TriggerProgramWork::TestPending => Box::pin(std::future::pending()),
+            #[cfg(test)]
+            TriggerProgramWork::TestInternalStatementThenPending {
+                internal_statement_completed,
+            } => Box::pin(async move {
+                let rows = self.query_after_background_status("SELECT 1;").await?;
+                if rows.len() != 1 || rows[0].values().first() != Some(&SqliteValue::Integer(1)) {
+                    return Err(FrankenError::internal(
+                        "internal trigger-driver statement returned an unexpected result",
+                    ));
+                }
+                internal_statement_completed.set(true);
+                std::future::pending::<Result<()>>().await
+            }),
+            #[cfg(test)]
+            TriggerProgramWork::TestPanic => Box::pin(async move {
+                panic!("trigger-program test panic");
+            }),
+            #[cfg(test)]
+            TriggerProgramWork::TestEnqueueThenReady => Box::pin(async move {
+                let mut child =
+                    Box::pin(self.execute_trigger_program_work(TriggerProgramWork::TestPending));
+                std::future::poll_fn(|cx| {
+                    assert!(child.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                Ok(())
+            }),
+            #[cfg(test)]
+            TriggerProgramWork::TestChain {
+                remaining,
+                pending_leaf,
+                lineage,
+                drops,
+            } => Box::pin(async move {
+                let _drop_order = TriggerProgramTestDropGuard {
+                    remaining,
+                    drops: Rc::clone(&drops),
+                };
+                lineage.borrow_mut().push((
+                    self.trigger_program_polling_task
+                        .get()
+                        .expect("test task must be polled by the driver"),
+                    self.trigger_program_polling_parent_task.get(),
+                    self.trigger_program_polling_depth.get(),
+                ));
+                if remaining == 0 {
+                    if pending_leaf {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(())
+                } else {
+                    self.execute_trigger_program_work(TriggerProgramWork::TestChain {
+                        remaining: remaining - 1,
+                        pending_leaf,
+                        lineage,
+                        drops,
+                    })
+                    .await
+                }
+            }),
+        };
+        TriggerProgramTask {
+            future,
+            completion,
+            memory_bytes: &self.trigger_program_memory_bytes,
+            charged_bytes,
+            task_id,
+            parent_task_id,
+            logical_depth,
+        }
+    }
+
+    fn execute_trigger_program_work(
+        &self,
+        work: TriggerProgramWork,
+    ) -> TriggerProgramDispatchFuture<'_> {
+        TriggerProgramDispatchFuture {
+            conn: self,
+            work: Some(work),
+            completion: None,
+            driver: None,
         }
     }
 
     // ── Foreign Key enforcement helpers (bd-thqgm) ─────────────────────
 
-    /// Returns `true` when `PRAGMA foreign_keys` is currently ON and we are
-    /// NOT inside a CASCADE action.  Used for INSERT parent-existence checks
-    /// and UPDATE parent-side/child-side FK checks, which should NOT fire
-    /// during a CASCADE operation.
+    /// Returns `true` when `PRAGMA foreign_keys` is currently ON.
+    ///
+    /// Constraint enforcement never turns off merely because the current DML
+    /// was itself started by an FK action. In particular, `SET DEFAULT` must
+    /// validate the newly-written child row and reject an orphan atomically.
     fn fk_enforcement_enabled(&self) -> bool {
-        self.pragma_state.borrow().foreign_keys && self.fk_cascade_depth.get() == 0
+        self.pragma_state.borrow().foreign_keys
     }
 
-    /// Returns `true` when `PRAGMA foreign_keys` is ON, regardless of cascade
-    /// depth.  Used for DELETE FK cascade propagation so that multi-level
-    /// cascades (grandparent -> parent -> child) work correctly.
-    /// Bounded by `MAX_FK_CASCADE_DEPTH` to prevent infinite recursion.
+    /// Returns `true` when parent-side FK actions must be discovered.
+    ///
+    /// The action guard, rather than a boolean depth cutoff, bounds recursive
+    /// cascades. A cutoff would silently skip required actions at the boundary
+    /// and can commit orphaned rows.
     fn fk_cascade_propagation_enabled(&self) -> bool {
         self.pragma_state.borrow().foreign_keys
-            && self.fk_cascade_depth.get() < MAX_FK_CASCADE_DEPTH
+    }
+
+    #[inline]
+    fn trigger_program_depth(&self) -> usize {
+        self.trigger_frame_stack
+            .borrow()
+            .len()
+            .saturating_add(self.fk_cascade_depth.get())
+    }
+
+    #[inline]
+    fn ensure_trigger_program_depth_available(&self) -> Result<()> {
+        if self.trigger_program_depth() >= trigger_depth_limit() {
+            return Err(FrankenError::TriggerRecursionDepthExceeded);
+        }
+        Ok(())
     }
 
     /// Returns `true` when a parent-existence violation for `fk` should be
@@ -45379,23 +47856,213 @@ impl Connection {
         fk.deferred && self.in_transaction.get() && !self.fk_force_immediate_check.get()
     }
 
-    /// Recheck every deferred FK parent-existence constraint accumulated during
-    /// the transaction.  Returns the first violation (if any).  Called at COMMIT.
+    /// Recheck every deferred FK relation against the final transaction state.
+    ///
+    /// This intentionally snapshots rather than `mem::take`s either queue: a
+    /// failed or cancelled COMMIT must leave the obligations intact so the
+    /// caller can repair the transaction and try COMMIT again.  Each relation
+    /// is evaluated as a final-state anti-join, not by replaying the child row
+    /// or parent key that originally caused it to be recorded.  Marker removal
+    /// is deliberately deferred until the physical COMMIT succeeds: a later
+    /// retriable pager/commit failure must not erase the obligation.
     async fn recheck_deferred_fk_at_commit(&self) -> Result<()> {
-        let pending = std::mem::take(&mut *self.deferred_fk_checks.borrow_mut());
-        if pending.is_empty() {
+        let pending_child_checks = self.deferred_fk_checks.borrow().clone();
+        let pending_parent_action_checks = self.deferred_fk_parent_action_checks.borrow().clone();
+        if pending_child_checks.is_empty() && pending_parent_action_checks.is_empty() {
             return Ok(());
         }
-        self.fk_force_immediate_check.set(true);
+        let _force_immediate_check =
+            BoolCellRestoreGuard::new(&self.fk_force_immediate_check, true);
         let result: Result<()> = async {
-            for (table_name, row_values) in &pending {
-                self.check_fk_parent_exists(table_name, row_values).await?;
+            let mut checked_relations = Vec::new();
+            for relation in pending_child_checks
+                .iter()
+                .chain(&pending_parent_action_checks)
+            {
+                if checked_relations.contains(relation) {
+                    continue;
+                }
+                if self
+                    .deferred_fk_relation_is_violated_at_commit(relation)
+                    .await?
+                {
+                    return Err(FrankenError::ForeignKeyViolation);
+                }
+                checked_relations.push(relation.clone());
             }
             Ok(())
         }
         .await;
-        self.fk_force_immediate_check.set(false);
         result
+    }
+
+    /// Evaluate one deferred FK relation as a final-state anti-join.
+    ///
+    /// MATCH SIMPLE requires a parent only when every child key column is
+    /// non-NULL.  If the child table was removed, there is no remaining child
+    /// row and the relation is satisfied.  A missing parent table/column with
+    /// a remaining non-NULL child key fails closed rather than being mistaken
+    /// for a clean empty anti-join.
+    async fn deferred_fk_relation_is_violated_at_commit(
+        &self,
+        relation: &DeferredFkRelation,
+    ) -> Result<bool> {
+        let (child_columns_valid, parent_columns) = {
+            let schema = self.schema.borrow();
+            let child = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(&relation.child_table));
+            let Some(child) = child else {
+                return Ok(false);
+            };
+            let child_columns_valid = !relation.child_columns.is_empty()
+                && relation.child_columns.iter().all(|column| {
+                    child
+                        .columns
+                        .iter()
+                        .any(|candidate| candidate.name.eq_ignore_ascii_case(column))
+                });
+            let parent = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(&relation.parent_table));
+            let parent_columns = parent
+                .map(|parent| {
+                    Self::resolve_fk_parent_key_columns(
+                        parent,
+                        &relation.parent_columns,
+                        &relation.child_table,
+                        relation.child_columns.len(),
+                    )
+                })
+                .transpose()?;
+            (child_columns_valid, parent_columns)
+        };
+
+        if !child_columns_valid {
+            return Err(FrankenError::ForeignKeyViolation);
+        }
+
+        let child_q = quote_identifier(&relation.child_table);
+        let not_null = relation
+            .child_columns
+            .iter()
+            .map(|column| format!("{child_q}.{} IS NOT NULL", quote_identifier(column)))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+
+        let Some(parent_columns) = parent_columns else {
+            let sql = format!("SELECT 1 FROM {child_q} WHERE {not_null} LIMIT 1");
+            return Ok(!self.fk_validation_query(&sql, &[]).await?.is_empty());
+        };
+
+        let parent_q = quote_identifier(&relation.parent_table);
+        let join_eq = relation
+            .child_columns
+            .iter()
+            .zip(&parent_columns)
+            .map(|(child_column, parent_column)| {
+                format!(
+                    "p.{} = {child_q}.{}",
+                    quote_identifier(parent_column),
+                    quote_identifier(child_column)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let sql = format!(
+            concat!(
+                "SELECT 1 FROM {child_q} WHERE {not_null} ",
+                "AND NOT EXISTS (SELECT 1 FROM {parent_q} AS p WHERE {join_eq}) LIMIT 1"
+            ),
+            child_q = child_q,
+            not_null = not_null,
+            parent_q = parent_q,
+            join_eq = join_eq,
+        );
+        Ok(!self.fk_validation_query(&sql, &[]).await?.is_empty())
+    }
+
+    /// Render SQLite's schema-time/dml-time foreign-key shape error without
+    /// silently weakening a constraint.  The core error enum does not yet
+    /// carry a dedicated mismatch variant, but SQLite reports this surface as
+    /// `SQLITE_ERROR`, so `FunctionError` is the compatible transport.
+    fn foreign_key_mismatch_error(child_table: &str, parent_table: &str) -> FrankenError {
+        FrankenError::FunctionError(format!(
+            "foreign key mismatch - \"{child_table}\" referencing \"{parent_table}\""
+        ))
+    }
+
+    /// Resolve the key targeted by an FK and validate its shape before any
+    /// lookup, action, or deferred-commit recheck uses it.
+    ///
+    /// SQLite shorthand `REFERENCES parent` targets the parent's declared
+    /// primary key, not merely an INTEGER PRIMARY KEY rowid alias.  That
+    /// includes `TEXT PRIMARY KEY` and composite/WITHOUT ROWID primary keys.
+    /// Older in-memory schemas may only retain the `is_ipk` marker, so retain
+    /// that as a compatibility fallback.  An absent, malformed, or arity-
+    /// mismatched target must be a visible mismatch error; treating it as an
+    /// empty key would silently skip FK enforcement or parent actions.
+    fn resolve_fk_parent_key_columns(
+        parent: &TableSchema,
+        requested_columns: &[String],
+        child_table: &str,
+        child_arity: usize,
+    ) -> Result<Vec<String>> {
+        let parent_columns = if requested_columns.is_empty() {
+            let declared_primary_keys = parent
+                .primary_key_constraints
+                .iter()
+                .filter(|columns| !columns.is_empty())
+                .collect::<Vec<_>>();
+            match declared_primary_keys.as_slice() {
+                [primary_key] => (*primary_key).clone(),
+                [] => parent
+                    .columns
+                    .iter()
+                    .find(|column| column.is_ipk)
+                    .map(|column| vec![column.name.clone()])
+                    .ok_or_else(|| Self::foreign_key_mismatch_error(child_table, &parent.name))?,
+                // CREATE TABLE rejects multiple PRIMARY KEY declarations, but
+                // fail closed when reading a malformed/legacy schema instead
+                // of selecting one arbitrarily.
+                _ => return Err(Self::foreign_key_mismatch_error(child_table, &parent.name)),
+            }
+        } else {
+            requested_columns.to_vec()
+        };
+
+        if parent_columns.len() != child_arity
+            || parent_columns.is_empty()
+            || !parent_columns.iter().all(|column| {
+                parent
+                    .columns
+                    .iter()
+                    .any(|candidate| candidate.name.eq_ignore_ascii_case(column))
+            })
+        {
+            return Err(Self::foreign_key_mismatch_error(child_table, &parent.name));
+        }
+
+        Ok(parent_columns)
+    }
+
+    fn record_deferred_fk_child_relation(&self, relation: DeferredFkRelation) {
+        let mut checks = self.deferred_fk_checks.borrow_mut();
+        if !checks.contains(&relation) {
+            checks.push(relation);
+        }
+    }
+
+    fn record_deferred_fk_parent_action_relation(&self, relation: DeferredFkRelation) {
+        let mut checks = self.deferred_fk_parent_action_checks.borrow_mut();
+        if !checks.contains(&relation) {
+            checks.push(relation);
+        }
+    }
+
+    fn clear_deferred_fk_obligations(&self) {
+        self.deferred_fk_checks.borrow_mut().clear();
+        self.deferred_fk_parent_action_checks.borrow_mut().clear();
     }
 
     /// Enforce parent-existence checks for rows inserted by an INSERT statement.
@@ -45434,7 +48101,18 @@ impl Connection {
         if table.foreign_keys.is_empty() {
             return Ok(());
         }
-        let fk_defs = table.foreign_keys.clone();
+        let fk_defs: Vec<(FkDef, Vec<String>)> = table
+            .foreign_keys
+            .iter()
+            .map(|fk| {
+                let child_columns = fk
+                    .child_columns
+                    .iter()
+                    .filter_map(|&index| table.columns.get(index).map(|column| column.name.clone()))
+                    .collect();
+                (fk.clone(), child_columns)
+            })
+            .collect();
         drop(schema);
 
         // Issue #110: activate the transaction-scoped parent-validation cache
@@ -45444,11 +48122,7 @@ impl Connection {
         // skip the FK existence SELECT and its O(rows-so-far) memdb reload.
         self.ensure_fk_parent_validation_cache();
 
-        // bd-do0d6: record a deferred row at most once even if several of its
-        // FKs are violated.
-        let mut deferred_recorded = false;
-
-        for fk in &fk_defs {
+        for (fk, child_column_names) in &fk_defs {
             // Collect child column values for this FK.
             let fk_values: Vec<&SqliteValue> = fk
                 .child_columns
@@ -45468,36 +48142,26 @@ impl Connection {
                 .iter()
                 .find(|t| t.name.eq_ignore_ascii_case(&fk.parent_table));
             let Some(parent) = parent else {
-                if self.fk_should_defer(fk) {
-                    if !deferred_recorded {
-                        self.deferred_fk_checks
-                            .borrow_mut()
-                            .push((table_name.to_owned(), row_values.to_vec()));
-                        deferred_recorded = true;
-                    }
-                    continue;
-                }
-                return Err(FrankenError::ForeignKeyViolation);
+                // SQLite accepts the DDL but rejects child DML against a
+                // missing parent schema immediately, even if the FK is
+                // DEFERRABLE INITIALLY DEFERRED. Deferral applies to a
+                // referential violation in a valid relation, not to a
+                // schema-resolution failure.
+                return Err(FrankenError::NoSuchTable {
+                    name: fk.parent_table.clone(),
+                });
             };
 
-            // Determine the parent columns to match against.
-            let parent_cols: Vec<String> = if fk.parent_columns.is_empty() {
-                // Implicit rowid reference — match against the IPK column.
-                parent
-                    .columns
-                    .iter()
-                    .find(|c| c.is_ipk)
-                    .map(|c| vec![c.name.clone()])
-                    .unwrap_or_default()
-            } else {
-                fk.parent_columns.clone()
-            };
+            // Shorthand REFERENCES targets the declared parent PRIMARY KEY,
+            // which can be non-IPK or composite.  Never turn an unresolved
+            // parent key into an empty lookup: SQLite reports a FK mismatch.
+            let parent_cols = Self::resolve_fk_parent_key_columns(
+                parent,
+                &fk.parent_columns,
+                table_name,
+                child_column_names.len(),
+            )?;
             drop(parent_schema);
-
-            if parent_cols.is_empty() {
-                // No identifiable parent column — skip (degenerate schema).
-                continue;
-            }
 
             let cache_key = self.build_fk_parent_validation_cache_key(
                 table_name,
@@ -45532,12 +48196,12 @@ impl Connection {
             let rows = self.fk_validation_query(&sql, &params).await?;
             if rows.is_empty() {
                 if self.fk_should_defer(fk) {
-                    if !deferred_recorded {
-                        self.deferred_fk_checks
-                            .borrow_mut()
-                            .push((table_name.to_owned(), row_values.to_vec()));
-                        deferred_recorded = true;
-                    }
+                    self.record_deferred_fk_child_relation(DeferredFkRelation {
+                        child_table: table_name.to_owned(),
+                        child_columns: child_column_names.clone(),
+                        parent_table: fk.parent_table.clone(),
+                        parent_columns: fk.parent_columns.clone(),
+                    });
                     continue;
                 }
                 return Err(FrankenError::ForeignKeyViolation);
@@ -45553,14 +48217,17 @@ impl Connection {
         &self,
         target_table: &str,
     ) -> Option<FkParentValidationCacheScope<'_>> {
-        if !self.fk_enforcement_enabled() {
+        if !self.fk_enforcement_enabled() || self.fk_cascade_depth.get() != 0 {
             return None;
         }
+        let captured_epoch = self.fk_parent_validation_cache_epoch.get();
         let previous = self
             .fk_parent_validation_cache
             .replace(Some(FkParentValidationCache::new(target_table)));
         Some(FkParentValidationCacheScope {
             cache: &self.fk_parent_validation_cache,
+            invalidation_epoch: &self.fk_parent_validation_cache_epoch,
+            captured_epoch,
             previous,
         })
     }
@@ -45569,8 +48236,8 @@ impl Connection {
     /// cache so repeated parent ids across successive prepared/direct INSERTs
     /// skip both the FK existence SELECT and its O(rows-so-far) memdb reload.
     ///
-    /// Only created when FK enforcement is active (so cascades, which run at
-    /// `fk_cascade_depth > 0`, never seed it) and an explicit transaction is
+    /// Only created for top-level FK enforcement (cascades, which run at
+    /// `fk_cascade_depth > 0`, deliberately never seed it) and an explicit transaction is
     /// open (autocommit each-statement-its-own-txn workloads would clear it at
     /// every boundary, so there is nothing to amortize). A statement-scoped
     /// cache already present (the `INSERT … SELECT` replay scope) is left
@@ -45580,7 +48247,10 @@ impl Connection {
     /// every transaction boundary and on every statement that could remove or
     /// alter a parent row (see `clear_fk_parent_validation_cache` call sites).
     fn ensure_fk_parent_validation_cache(&self) {
-        if !self.fk_enforcement_enabled() || !self.in_transaction.get() {
+        if !self.fk_enforcement_enabled()
+            || self.fk_cascade_depth.get() != 0
+            || !self.in_transaction.get()
+        {
             return;
         }
         if self.fk_parent_validation_cache.borrow().is_some() {
@@ -45598,20 +48268,21 @@ impl Connection {
     /// INSERT OR REPLACE / upsert, DDL). Clearing only ever forces a fresh
     /// re-probe, so it can never turn a real FK violation into a false pass.
     ///
-    /// A statement-scoped (`INSERT … SELECT` replay) cache is intentionally NOT
-    /// cleared here: it is bounded to a single statement whose own RAII guard
-    /// restores the prior state, and the conservative clear sites below never
-    /// fire in the middle of that replay.
     fn clear_fk_parent_validation_cache(&self) {
-        let is_statement_scoped = self
-            .fk_parent_validation_cache
-            .borrow()
-            .as_ref()
-            .is_some_and(|cache| cache.target_table.is_some());
-        if is_statement_scoped {
-            return;
-        }
+        // Trigger bodies can mutate a parent while an outer INSERT ... SELECT
+        // replay still owns a statement-scoped cache. Clearing that cache is
+        // required before the replay considers later rows; retaining a stale
+        // positive probe can otherwise admit an orphan.
         *self.fk_parent_validation_cache.borrow_mut() = None;
+        let next_epoch = self
+            .fk_parent_validation_cache_epoch
+            .get()
+            .checked_add(1)
+            // A wrap could make a stale scope look pristine again. Exhaustion
+            // needs 2^64 parent-invalidating statements, so fail closed rather
+            // than silently permit stale FK evidence in that impossible state.
+            .expect("FK parent-validation cache epoch overflow");
+        self.fk_parent_validation_cache_epoch.set(next_epoch);
     }
 
     /// Issue #110: does executing `statement` potentially invalidate a cached
@@ -45685,6 +48356,13 @@ impl Connection {
     }
 
     fn fk_parent_validation_cache_contains(&self, key: &FkParentValidationKey) -> bool {
+        // A parent mutation may run within an outer INSERT ... SELECT replay.
+        // That replay deliberately retains its statement-scoped cache, but an
+        // FK action nested below the mutation must re-probe the parent rather
+        // than trust evidence collected before the mutation.
+        if self.fk_cascade_depth.get() != 0 {
+            return false;
+        }
         self.fk_parent_validation_cache
             .borrow()
             .as_ref()
@@ -45692,6 +48370,9 @@ impl Connection {
     }
 
     fn fk_parent_validation_cache_insert(&self, key: FkParentValidationKey) {
+        if self.fk_cascade_depth.get() != 0 {
+            return;
+        }
         if let Some(cache) = self.fk_parent_validation_cache.borrow_mut().as_mut() {
             cache.validated.insert(key);
         }
@@ -45747,21 +48428,30 @@ impl Connection {
         // Use the normal query path. The memdb refresh above ensures the
         // MemDatabase reflects all in-transaction writes, and the engine
         // discard ensures completely fresh execution context.
-        self.query_with_params(sql, params).await
+        self.query_with_params_after_background_status(sql, params)
+            .await
     }
 
-    /// Verify that no child table references a row being deleted from `table_name`.
+    /// Discover residual child references after a row was deleted from `table_name`.
     ///
-    /// `row_values` are the column values of the row about to be deleted.
-    /// Returns `Ok(())` if deletion is allowed, or an error/cascade action.
+    /// `row_values` are the pre-delete parent values. Calling this after the
+    /// base delete excludes rows removed by that same statement, including a
+    /// sole self-reference, while preserving actions/errors for external child
+    /// rows that remain.
     async fn check_fk_on_delete(
         &self,
         table_name: &str,
         row_values: &[SqliteValue],
     ) -> Result<Vec<FkDeleteAction>> {
         let schema = self.schema.borrow();
+        let parent = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(table_name))
+            .ok_or_else(|| FrankenError::NoSuchTable {
+                name: table_name.to_owned(),
+            })?;
         // Find all child tables that have FK references to this parent table.
-        let mut actions: Vec<(String, FkDef, Vec<String>)> = Vec::new();
+        let mut actions: Vec<(String, FkDef, Vec<String>, Vec<String>)> = Vec::new();
         for table in schema.iter() {
             for fk in &table.foreign_keys {
                 if fk.parent_table.eq_ignore_ascii_case(table_name) {
@@ -45770,21 +48460,21 @@ impl Connection {
                         .iter()
                         .filter_map(|&idx| table.columns.get(idx).map(|c| c.name.clone()))
                         .collect();
-                    actions.push((table.name.clone(), fk.clone(), child_col_names));
+                    let parent_key_cols = Self::resolve_fk_parent_key_columns(
+                        parent,
+                        &fk.parent_columns,
+                        &table.name,
+                        child_col_names.len(),
+                    )?;
+                    actions.push((
+                        table.name.clone(),
+                        fk.clone(),
+                        child_col_names,
+                        parent_key_cols,
+                    ));
                 }
             }
         }
-        // Determine parent IPK column(s) for implicit FK references.
-        let parent = schema
-            .iter()
-            .find(|t| t.name.eq_ignore_ascii_case(table_name));
-        let parent_ipk_cols: Vec<String> = parent.map_or_else(Vec::new, |p| {
-            p.columns
-                .iter()
-                .find(|c| c.is_ipk)
-                .map(|c| vec![c.name.clone()])
-                .unwrap_or_default()
-        });
         drop(schema);
 
         if actions.is_empty() {
@@ -45793,39 +48483,33 @@ impl Connection {
 
         let mut result_actions = Vec::new();
 
-        for (child_table, fk, child_col_names) in &actions {
-            // Determine which parent column values to match.
-            // When fk.parent_columns is empty, the FK implicitly references
-            // the parent's rowid/IPK — NOT all columns.
-            let parent_key_cols: &[String] = if fk.parent_columns.is_empty() {
-                &parent_ipk_cols
-            } else {
-                &fk.parent_columns
-            };
-
+        for (child_table, fk, child_col_names, parent_key_cols) in &actions {
             // Get parent values for the FK columns.
             let parent_schema = self.schema.borrow();
             let parent_table = parent_schema
                 .iter()
-                .find(|t| t.name.eq_ignore_ascii_case(table_name));
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                .ok_or_else(|| FrankenError::NoSuchTable {
+                    name: table_name.to_owned(),
+                })?;
             let parent_values: Vec<SqliteValue> = parent_key_cols
                 .iter()
-                .filter_map(|col_name| {
-                    parent_table.and_then(|p| {
-                        p.columns
-                            .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                            .and_then(|idx| row_values.get(idx).cloned())
-                    })
+                .map(|col_name| {
+                    parent_table
+                        .columns
+                        .iter()
+                        .position(|column| column.name.eq_ignore_ascii_case(col_name))
+                        .and_then(|idx| row_values.get(idx).cloned())
+                        .ok_or_else(|| Self::foreign_key_mismatch_error(child_table, table_name))
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             drop(parent_schema);
 
             if parent_values.iter().any(|v| matches!(v, SqliteValue::Null)) {
                 continue;
             }
             if parent_values.len() != child_col_names.len() {
-                continue;
+                return Err(Self::foreign_key_mismatch_error(child_table, table_name));
             }
 
             // Check if any child rows reference this parent row.
@@ -45866,6 +48550,17 @@ impl Connection {
                             child_columns: child_col_names.clone(),
                             child_defaults,
                             parent_values: parent_values.clone(),
+                        });
+                    }
+                    // SQLite defers NO ACTION for a deferred FK, but RESTRICT
+                    // is always statement-immediate even when the constraint
+                    // itself is DEFERRABLE INITIALLY DEFERRED.
+                    FkActionType::NoAction if self.fk_should_defer(fk) => {
+                        self.record_deferred_fk_parent_action_relation(DeferredFkRelation {
+                            child_table: child_table.clone(),
+                            child_columns: child_col_names.clone(),
+                            parent_table: fk.parent_table.clone(),
+                            parent_columns: fk.parent_columns.clone(),
                         });
                     }
                     FkActionType::NoAction | FkActionType::Restrict => {
@@ -45919,11 +48614,11 @@ impl Connection {
                     quote_identifier(child_table),
                     where_parts.join(" AND ")
                 );
-                let result = {
-                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth);
-                    self.execute_with_params(&sql, parent_values).await
-                };
-                result?;
+                self.execute_trigger_program_work(TriggerProgramWork::ForeignKey {
+                    sql,
+                    params: parent_values.clone(),
+                })
+                .await?;
                 Ok(())
             }
             FkDeleteAction::SetNull {
@@ -45946,11 +48641,11 @@ impl Connection {
                     set_parts.join(", "),
                     where_parts.join(" AND ")
                 );
-                let result = {
-                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth);
-                    self.execute_with_params(&sql, parent_values).await
-                };
-                result?;
+                self.execute_trigger_program_work(TriggerProgramWork::ForeignKey {
+                    sql,
+                    params: parent_values.clone(),
+                })
+                .await?;
                 Ok(())
             }
             FkDeleteAction::SetDefault {
@@ -45975,20 +48670,21 @@ impl Connection {
                     set_parts.join(", "),
                     where_parts.join(" AND ")
                 );
-                let result = {
-                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth);
-                    self.execute_with_params(&sql, parent_values).await
-                };
-                result?;
+                self.execute_trigger_program_work(TriggerProgramWork::ForeignKey {
+                    sql,
+                    params: parent_values.clone(),
+                })
+                .await?;
                 Ok(())
             }
         }
     }
 
-    /// Verify that no child table references a row being updated in `table_name`.
+    /// Discover residual child references after a row was updated in `table_name`.
     ///
-    /// `old_values` are the column values before the update.
-    /// `new_values` are the column values after the update.
+    /// `old_values` and `new_values` are retained from before the base update.
+    /// Calling this after it avoids treating a self-reference rewritten by the
+    /// same statement as a remaining NO ACTION/RESTRICT violation or cascade.
     async fn check_fk_on_update(
         &self,
         table_name: &str,
@@ -45996,7 +48692,18 @@ impl Connection {
         new_values: &[SqliteValue],
     ) -> Result<Vec<FkUpdateAction>> {
         let schema = self.schema.borrow();
-        let mut actions: Vec<(String, fsqlite_vdbe::codegen::FkDef, Vec<String>)> = Vec::new();
+        let parent = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(table_name))
+            .ok_or_else(|| FrankenError::NoSuchTable {
+                name: table_name.to_owned(),
+            })?;
+        let mut actions: Vec<(
+            String,
+            fsqlite_vdbe::codegen::FkDef,
+            Vec<String>,
+            Vec<String>,
+        )> = Vec::new();
         for table in schema.iter() {
             for fk in &table.foreign_keys {
                 if fk.parent_table.eq_ignore_ascii_case(table_name) {
@@ -46005,20 +48712,21 @@ impl Connection {
                         .iter()
                         .filter_map(|&idx| table.columns.get(idx).map(|c| c.name.clone()))
                         .collect();
-                    actions.push((table.name.clone(), fk.clone(), child_col_names));
+                    let parent_key_cols = Self::resolve_fk_parent_key_columns(
+                        parent,
+                        &fk.parent_columns,
+                        &table.name,
+                        child_col_names.len(),
+                    )?;
+                    actions.push((
+                        table.name.clone(),
+                        fk.clone(),
+                        child_col_names,
+                        parent_key_cols,
+                    ));
                 }
             }
         }
-        let parent = schema
-            .iter()
-            .find(|t| t.name.eq_ignore_ascii_case(table_name));
-        let parent_ipk_cols: Vec<String> = parent.map_or_else(Vec::new, |p| {
-            p.columns
-                .iter()
-                .find(|c| c.is_ipk)
-                .map(|c| vec![c.name.clone()])
-                .unwrap_or_default()
-        });
         drop(schema);
 
         if actions.is_empty() {
@@ -46027,43 +48735,38 @@ impl Connection {
 
         let mut result_actions = Vec::new();
 
-        for (child_table, fk, child_col_names) in &actions {
-            // When fk.parent_columns is empty, the FK implicitly references
-            // the parent's rowid/IPK — NOT all columns.
-            let parent_key_cols: &[String] = if fk.parent_columns.is_empty() {
-                &parent_ipk_cols
-            } else {
-                &fk.parent_columns
-            };
-
+        for (child_table, fk, child_col_names, parent_key_cols) in &actions {
             let parent_schema = self.schema.borrow();
             let parent_table = parent_schema
                 .iter()
-                .find(|t| t.name.eq_ignore_ascii_case(table_name));
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                .ok_or_else(|| FrankenError::NoSuchTable {
+                    name: table_name.to_owned(),
+                })?;
 
             let old_parent_vals: Vec<SqliteValue> = parent_key_cols
                 .iter()
-                .filter_map(|col_name| {
-                    parent_table.and_then(|t| {
-                        t.columns
-                            .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                            .and_then(|idx| old_values.get(idx).cloned())
-                    })
+                .map(|col_name| {
+                    parent_table
+                        .columns
+                        .iter()
+                        .position(|column| column.name.eq_ignore_ascii_case(col_name))
+                        .and_then(|idx| old_values.get(idx).cloned())
+                        .ok_or_else(|| Self::foreign_key_mismatch_error(child_table, table_name))
                 })
-                .collect();
+                .collect::<Result<_>>()?;
 
             let new_parent_vals: Vec<SqliteValue> = parent_key_cols
                 .iter()
-                .filter_map(|col_name| {
-                    parent_table.and_then(|t| {
-                        t.columns
-                            .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                            .and_then(|idx| new_values.get(idx).cloned())
-                    })
+                .map(|col_name| {
+                    parent_table
+                        .columns
+                        .iter()
+                        .position(|column| column.name.eq_ignore_ascii_case(col_name))
+                        .and_then(|idx| new_values.get(idx).cloned())
+                        .ok_or_else(|| Self::foreign_key_mismatch_error(child_table, table_name))
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             drop(parent_schema);
 
             if old_parent_vals
@@ -46075,7 +48778,7 @@ impl Connection {
             if old_parent_vals.len() != child_col_names.len()
                 || new_parent_vals.len() != child_col_names.len()
             {
-                continue;
+                return Err(Self::foreign_key_mismatch_error(child_table, table_name));
             }
 
             if old_parent_vals == new_parent_vals {
@@ -46121,8 +48824,17 @@ impl Connection {
                             old_parent_values: old_parent_vals,
                         });
                     }
-                    fsqlite_vdbe::codegen::FkActionType::NoAction
-                    | fsqlite_vdbe::codegen::FkActionType::Restrict => {
+                    // See the DELETE path above: only deferred NO ACTION is
+                    // postponed to COMMIT; RESTRICT remains immediate.
+                    FkActionType::NoAction if self.fk_should_defer(fk) => {
+                        self.record_deferred_fk_parent_action_relation(DeferredFkRelation {
+                            child_table: child_table.clone(),
+                            child_columns: child_col_names.clone(),
+                            parent_table: fk.parent_table.clone(),
+                            parent_columns: fk.parent_columns.clone(),
+                        });
+                    }
+                    FkActionType::NoAction | FkActionType::Restrict => {
                         return Err(FrankenError::ForeignKeyViolation);
                     }
                 }
@@ -46165,11 +48877,8 @@ impl Connection {
                 );
                 let mut params = new_parent_values.clone();
                 params.extend_from_slice(old_parent_values);
-                let result = {
-                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth);
-                    self.execute_with_params(&sql, &params).await
-                };
-                result?;
+                self.execute_trigger_program_work(TriggerProgramWork::ForeignKey { sql, params })
+                    .await?;
                 Ok(())
             }
             FkUpdateAction::SetNull {
@@ -46192,11 +48901,11 @@ impl Connection {
                     set_parts.join(", "),
                     where_parts.join(" AND ")
                 );
-                let result = {
-                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth);
-                    self.execute_with_params(&sql, old_parent_values).await
-                };
-                result?;
+                self.execute_trigger_program_work(TriggerProgramWork::ForeignKey {
+                    sql,
+                    params: old_parent_values.clone(),
+                })
+                .await?;
                 Ok(())
             }
             FkUpdateAction::SetDefault {
@@ -46221,11 +48930,11 @@ impl Connection {
                     set_parts.join(", "),
                     where_parts.join(" AND ")
                 );
-                let result = {
-                    let _cascade = FkCascadeDepthGuard::enter(&self.fk_cascade_depth);
-                    self.execute_with_params(&sql, old_parent_values).await
-                };
-                result?;
+                self.execute_trigger_program_work(TriggerProgramWork::ForeignKey {
+                    sql,
+                    params: old_parent_values.clone(),
+                })
+                .await?;
                 Ok(())
             }
         }
@@ -46313,28 +49022,16 @@ impl Connection {
                     .to_owned(),
             });
         }
-        // bd-wymdl (defect 4a): this is the trigger recursion re-entry point --
-        // statement execution re-enters `fire_{before,after}_triggers`, which
-        // re-enters here.
-        //
-        // An extra `Box::pin` was tried here and REMOVED as a measured
-        // negative result. `execute_statement` already returns
-        // `Pin<Box<dyn Future>>`, so wrapping it only added a layer: the
-        // stored state moves to the heap, but polling still descends the
-        // native stack level by level.
-        //
-        // `diag_trigger_stack_bytes_per_level` measured it both ways (debug
-        // profile, so these are upper bounds -- an optimized build spills far
-        // less): 186,608 bytes/level with the box, 185,408 without. The box
-        // COST 1,200 bytes/level and an allocation per trigger body statement
-        // while buying no depth at all. The two dominant frames were identical
-        // in both runs (127,760 and 52,768 bytes), confirming it never touched
-        // the real cost. Depth is bounded by `trigger_depth_limit()` instead;
-        // reaching SQLite's 1000 needs an iterative/trampolined rewrite, not
-        // more boxing.
+        // This is the recursive re-entry boundary. Merely boxing another
+        // future here still recursively polls child futures on the native
+        // stack (the rejected experiment measured 186,608 bytes/level versus
+        // 185,408 without that box). The connection-local driver instead
+        // queues the child, lets the current poll unwind, and then polls the
+        // child from the driver's shallow loop.
         #[cfg(test)]
         record_trigger_stack_probe(trigger_probe_site::TRIGGER_REENTRY);
-        self.execute_statement(&statement, None).await?;
+        self.execute_trigger_program_work(TriggerProgramWork::Statement(statement))
+            .await?;
         Ok(TriggerStatementOutcome::Continue)
     }
 
@@ -46349,16 +49046,6 @@ impl Connection {
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
     ) -> Result<bool> {
-        // F-PGM.11: Enforce trigger recursion depth limit.
-        // SQLite uses SQLITE_MAX_TRIGGER_DEPTH=1000, but each Rust recursion
-        // level is heavier on the call stack than C. MAX_TRIGGER_DEPTH keeps a
-        // conservative safety margin below the regression-tested thread stack.
-        if self.trigger_frame_stack.borrow().len() >= trigger_depth_limit() {
-            return Err(FrankenError::Internal(
-                "too many levels of trigger recursion".to_owned(),
-            ));
-        }
-
         // NOTE: recursive_triggers guard moved into the per-trigger loop
         // below. C SQLite checks by trigger NAME (the same trigger cannot
         // re-enter itself), not by table name. This allows trigger A on
@@ -46394,18 +49081,20 @@ impl Connection {
             {
                 continue;
             }
-            let mut frame = base_frame.clone();
-            frame.trigger_name.clone_from(&trigger.name);
-            let _frame_guard = self.push_trigger_frame(frame.clone());
+            let frame = base_frame.for_trigger(&trigger.name);
+            let _frame_guard = self.push_trigger_frame(Rc::clone(&frame))?;
             // Evaluate the bound WHEN predicate against the current OLD/NEW frame.
-            if !trigger_when_matches(self, trigger.when_clause.as_ref(), Some(&frame)).await? {
+            if !trigger_when_matches(self, trigger.when_clause.as_deref(), Some(frame.as_ref()))
+                .await?
+            {
                 continue;
             }
 
             // Execute each statement in the trigger body.
-            for stmt in &trigger.body {
+            for stmt in trigger.body.iter() {
+                TriggerAstMemoryCounter::measure(stmt)?;
                 let mut bound_stmt = stmt.clone();
-                bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
+                bind_trigger_columns_in_statement(&mut bound_stmt, frame.as_ref());
                 match self.execute_bound_trigger_statement(bound_stmt).await? {
                     TriggerStatementOutcome::Continue => {}
                     TriggerStatementOutcome::SkipDml => return Ok(true),
@@ -46424,14 +49113,8 @@ impl Connection {
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
     ) -> Result<()> {
-        // F-PGM.11: Enforce trigger recursion depth limit (see fire_before_triggers).
         #[cfg(test)]
         record_trigger_stack_probe(trigger_probe_site::FIRE_TRIGGERS);
-        if self.trigger_frame_stack.borrow().len() >= trigger_depth_limit() {
-            return Err(FrankenError::Internal(
-                "too many levels of trigger recursion".to_owned(),
-            ));
-        }
 
         // NOTE: recursive_triggers guard moved into the per-trigger loop
         // below. C SQLite checks by trigger NAME, not table name.
@@ -46466,17 +49149,19 @@ impl Connection {
             {
                 continue;
             }
-            let mut frame = base_frame.clone();
-            frame.trigger_name.clone_from(&trigger.name);
-            let _frame_guard = self.push_trigger_frame(frame.clone());
-            if !trigger_when_matches(self, trigger.when_clause.as_ref(), Some(&frame)).await? {
+            let frame = base_frame.for_trigger(&trigger.name);
+            let _frame_guard = self.push_trigger_frame(Rc::clone(&frame))?;
+            if !trigger_when_matches(self, trigger.when_clause.as_deref(), Some(frame.as_ref()))
+                .await?
+            {
                 continue;
             }
 
             // Execute each statement in the trigger body.
-            for stmt in &trigger.body {
+            for stmt in trigger.body.iter() {
+                TriggerAstMemoryCounter::measure(stmt)?;
                 let mut bound_stmt = stmt.clone();
-                bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
+                bind_trigger_columns_in_statement(&mut bound_stmt, frame.as_ref());
                 match self.execute_bound_trigger_statement(bound_stmt).await? {
                     TriggerStatementOutcome::Continue => {}
                     TriggerStatementOutcome::SkipDml => return Ok(()),
@@ -46806,11 +49491,6 @@ impl Connection {
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
     ) -> Result<()> {
-        if self.trigger_frame_stack.borrow().len() >= trigger_depth_limit() {
-            return Err(FrankenError::Internal(
-                "too many levels of trigger recursion".to_owned(),
-            ));
-        }
         let triggers = self.triggers.borrow();
         let matching: Vec<_> = triggers
             .iter()
@@ -46826,12 +49506,12 @@ impl Connection {
             return Ok(());
         }
         let base_frame = TriggerFrame {
-            table_name: view_name.to_owned(),
-            trigger_name: String::new(),
-            column_names: column_names.to_vec(),
+            table_name: Rc::from(view_name),
+            trigger_name: Rc::from(""),
+            column_names: Rc::from(column_names),
             rowid_alias_col_idx: None,
-            old_row: old_values.map(<[SqliteValue]>::to_vec),
-            new_row: new_values.map(<[SqliteValue]>::to_vec),
+            old_row: old_values.map(Rc::from),
+            new_row: new_values.map(Rc::from),
         };
         for trigger in matching {
             if !self.pragma_state.borrow().recursive_triggers
@@ -46843,15 +49523,17 @@ impl Connection {
             {
                 continue;
             }
-            let mut frame = base_frame.clone();
-            frame.trigger_name.clone_from(&trigger.name);
-            let _frame_guard = self.push_trigger_frame(frame.clone());
-            if !trigger_when_matches(self, trigger.when_clause.as_ref(), Some(&frame)).await? {
+            let frame = base_frame.for_trigger(&trigger.name);
+            let _frame_guard = self.push_trigger_frame(Rc::clone(&frame))?;
+            if !trigger_when_matches(self, trigger.when_clause.as_deref(), Some(frame.as_ref()))
+                .await?
+            {
                 continue;
             }
-            for stmt in &trigger.body {
+            for stmt in trigger.body.iter() {
+                TriggerAstMemoryCounter::measure(stmt)?;
                 let mut bound_stmt = stmt.clone();
-                bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
+                bind_trigger_columns_in_statement(&mut bound_stmt, frame.as_ref());
                 match self.execute_bound_trigger_statement(bound_stmt).await? {
                     TriggerStatementOutcome::Continue => {}
                     TriggerStatementOutcome::SkipDml => return Ok(()),
@@ -46872,37 +49554,141 @@ impl Connection {
         }
     }
 
-    /// Check if a SELECT references any views in its FROM/JOIN sources.
+    fn direct_unmaterialized_view_references(
+        &self,
+        select: &SelectStatement,
+        view_defs: &[ViewDef],
+        real_table_names: &HashSet<String>,
+    ) -> Vec<usize> {
+        let view_by_name = view_defs
+            .iter()
+            .enumerate()
+            .map(|(index, view)| (view.name.to_ascii_lowercase(), index))
+            .collect::<HashMap<_, _>>();
+        let mut referenced = Vec::new();
+        let mut collect_from_core = |core: &SelectCore| {
+            let SelectCore::Select {
+                from: Some(from), ..
+            } = core
+            else {
+                return;
+            };
+            let mut collect_source = |source: &TableOrSubquery| {
+                let Some(name) = self.local_relation_name(source) else {
+                    return;
+                };
+                let key = name.to_ascii_lowercase();
+                if real_table_names.contains(&key) {
+                    return;
+                }
+                let Some(index) = view_by_name.get(&key).copied() else {
+                    return;
+                };
+                if !referenced.contains(&index) {
+                    referenced.push(index);
+                }
+            };
+            collect_source(&from.source);
+            for join in &from.joins {
+                collect_source(&join.table);
+            }
+        };
+        collect_from_core(&select.body.select);
+        for (_, core) in &select.body.compounds {
+            collect_from_core(core);
+        }
+        referenced
+    }
+
+    /// Check if a SELECT directly references any as-yet-unmaterialized views.
     fn has_view_references(&self, select: &SelectStatement) -> bool {
-        let views = self.views.borrow();
-        if views.is_empty() {
+        let view_defs = self.views.borrow();
+        if view_defs.is_empty() {
             return false;
         }
-        let schema = self.schema.borrow();
-        // A view reference only counts if there is no real table with that
-        // name already (which would mean the view is already materialized).
-        let is_unmaterialized_view = |source: &TableOrSubquery| -> bool {
-            let Some(name) = self.local_relation_name(source) else {
-                return false;
-            };
-            views.iter().any(|v| v.name.eq_ignore_ascii_case(name))
-                && !schema.iter().any(|t| t.name.eq_ignore_ascii_case(name))
-        };
-        if let SelectCore::Select {
-            from: Some(ref from),
-            ..
-        } = select.body.select
-        {
-            if is_unmaterialized_view(&from.source) {
-                return true;
+        let real_table_names = self
+            .schema
+            .borrow()
+            .iter()
+            .map(|table| table.name.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        !self
+            .direct_unmaterialized_view_references(select, &view_defs, &real_table_names)
+            .is_empty()
+    }
+
+    /// Return a dependency-first materialization order without recursively
+    /// executing one view while another view's future remains on the native
+    /// stack.
+    ///
+    /// The explicit DFS stack is also the cycle detector. SQLite accepts
+    /// storing forward references but rejects a circular view when it is
+    /// prepared for execution, so detection belongs at this boundary.
+    fn view_materialization_order(
+        &self,
+        select: &SelectStatement,
+        view_defs: &[ViewDef],
+    ) -> Result<Vec<usize>> {
+        const UNSEEN: u8 = 0;
+        const VISITING: u8 = 1;
+        const COMPLETE: u8 = 2;
+
+        let real_table_names = self
+            .schema
+            .borrow()
+            .iter()
+            .map(|table| table.name.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        let roots =
+            self.direct_unmaterialized_view_references(select, view_defs, &real_table_names);
+        let mut states = vec![UNSEEN; view_defs.len()];
+        let mut order = Vec::with_capacity(view_defs.len());
+
+        for root in roots {
+            if states[root] == COMPLETE {
+                continue;
             }
-            for join in &from.joins {
-                if is_unmaterialized_view(&join.table) {
-                    return true;
+            let mut stack = vec![(root, false)];
+            while let Some((index, expanded)) = stack.pop() {
+                if expanded {
+                    states[index] = COMPLETE;
+                    order.push(index);
+                    continue;
+                }
+                match states[index] {
+                    COMPLETE => continue,
+                    VISITING => {
+                        return Err(FrankenError::internal(format!(
+                            "view {} is circularly defined",
+                            view_defs[index].name
+                        )));
+                    }
+                    UNSEEN => {}
+                    _ => unreachable!("view visitation states are closed"),
+                }
+
+                states[index] = VISITING;
+                stack.push((index, true));
+                let dependencies = self.direct_unmaterialized_view_references(
+                    &view_defs[index].query,
+                    view_defs,
+                    &real_table_names,
+                );
+                for dependency in dependencies.into_iter().rev() {
+                    if states[dependency] == VISITING {
+                        return Err(FrankenError::internal(format!(
+                            "view {} is circularly defined",
+                            view_defs[dependency].name
+                        )));
+                    }
+                    if states[dependency] != COMPLETE {
+                        stack.push((dependency, false));
+                    }
                 }
             }
         }
-        false
+
+        Ok(order)
     }
 
     /// Materialize views referenced by a SELECT as temporary tables, execute
@@ -46918,32 +49704,11 @@ impl Connection {
             let view_defs: Vec<ViewDef> = self.views.borrow().clone();
             let mut materialized = MaterializedTablesCleanupGuard::new(self);
 
-            // Collect view names referenced in FROM/JOIN.
-            let schema = self.schema.borrow();
-            let mut referenced: Vec<String> = Vec::new();
-            let push_if_needed = |source: &TableOrSubquery, out: &mut Vec<String>| {
-                if let Some(name) = self.local_relation_name(source)
-                    && view_defs.iter().any(|v| v.name.eq_ignore_ascii_case(name))
-                    && !schema.iter().any(|t| t.name.eq_ignore_ascii_case(name))
-                    && !out.iter().any(|n| n.eq_ignore_ascii_case(name))
-                {
-                    out.push(name.to_owned());
-                }
-            };
-            if let SelectCore::Select {
-                from: Some(ref from),
-                ..
-            } = select.body.select
-            {
-                push_if_needed(&from.source, &mut referenced);
-                for join in &from.joins {
-                    push_if_needed(&join.table, &mut referenced);
-                }
-            }
-            drop(schema);
+            let materialization_order = self.view_materialization_order(select, &view_defs)?;
 
             let exec_result = async {
-                // CRITICAL: probe pager-side cleanliness for `referenced.len()`
+                // CRITICAL: probe pager-side cleanliness for the complete
+                // dependency closure's number of
                 // contiguous root pages before any `create_table()` call below.
                 //
                 // `MemDatabase::next_root_page` starts at 2 and is only bumped
@@ -46965,20 +49730,15 @@ impl Connection {
                 // sqlite_schema fix never extended. UNION queries reach this
                 // path through `execute_compound_select` recursing into each
                 // arm's `execute_statement`.
-                self.reserve_clean_memdb_root_pages(referenced.len())
+                self.reserve_clean_memdb_root_pages(materialization_order.len())
                     .await?;
 
-                // Materialize each referenced view as a temp table.
-                for ref_name in &referenced {
-                    let view = view_defs
-                        .iter()
-                        .find(|v| v.name.eq_ignore_ascii_case(ref_name))
-                        .ok_or_else(|| {
-                            FrankenError::internal(format!(
-                                "view {} not found in definitions",
-                                ref_name
-                            ))
-                        })?;
+                // Materialize dependencies before consumers. Because each
+                // dependency is installed as a real temporary table before
+                // its consumer executes, view-chain depth no longer adds
+                // native future-poll depth.
+                for view_index in materialization_order {
+                    let view = &view_defs[view_index];
                     let view_rows = self
                         .execute_statement(&Statement::Select(view.query.clone()), params)
                         .await?;
@@ -47603,15 +50363,25 @@ impl Connection {
         self.schema_generation.set(snap.schema_generation);
     }
 
+    fn allocate_transaction_generation(&self) -> Result<u64> {
+        let generation = self.next_transaction_generation.get();
+        let next = generation
+            .checked_add(1)
+            .ok_or_else(|| FrankenError::internal("transaction generation space exhausted"))?;
+        self.next_transaction_generation.set(next);
+        Ok(generation)
+    }
+
     /// Handle BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE|CONCURRENT].
-    async fn execute_begin(&self, begin: fsqlite_ast::BeginStatement) -> Result<()> {
+    async fn execute_begin(&self, begin: fsqlite_ast::BeginStatement) -> Result<u64> {
         if self.in_transaction.get() {
             return Err(FrankenError::Internal(
                 "cannot start a transaction within a transaction".to_owned(),
             ));
         }
-        // bd-do0d6: a new transaction starts with no pending deferred FK checks.
-        self.deferred_fk_checks.borrow_mut().clear();
+        let generation = self.allocate_transaction_generation()?;
+        // A new transaction starts with no pending deferred FK checks.
+        self.clear_deferred_fk_obligations();
         // AAC-P6: txn boundary — renew any prepared-DML micro-batch.
         self.stmt_microbatch_flush();
         let begin_setup_start = hot_path_profile_enabled().then(Instant::now);
@@ -47774,6 +50544,7 @@ impl Connection {
         self.db.borrow_mut().begin_undo();
         *self.txn_snapshot.borrow_mut() = Some(self.snapshot());
         self.in_transaction.set(true);
+        self.active_transaction_generation.set(Some(generation));
         // IMPL-28 / AG-O3: explicit transaction now active — open the
         // IN_TRANSACTION gate bit. Composite `fast_paths_enabled()` also
         // requires NO_STATEMENT_SAVEPOINT / TRACING_DISABLED / SCHEMA_STABLE
@@ -47782,7 +50553,7 @@ impl Connection {
         self.concurrent_txn.set(is_concurrent);
         self.txn_metrics_mark_started();
         record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
-        Ok(())
+        Ok(generation)
     }
 
     fn map_mvcc_commit_error(err: MvccError, fcw_result: FcwResult) -> FrankenError {
@@ -48501,6 +51272,7 @@ impl Connection {
                 *self.txn_snapshot.borrow_mut() = None;
                 self.savepoints.borrow_mut().clear();
                 self.in_transaction.set(false);
+                self.clear_deferred_fk_obligations();
                 // Issue #110: forced rollback tore down the txn — drop the
                 // transaction-scoped FK parent-validation cache.
                 self.clear_fk_parent_validation_cache();
@@ -48523,6 +51295,7 @@ impl Connection {
                 reload_result?;
                 vtab_rollback_result?;
                 registry_rollback_result?;
+                self.active_transaction_generation.set(None);
                 // bd-hjkbr.1: Record pre-txn time on vtab-sync-failure path
                 // (second commit path) so the wall-time ledger stays closed.
                 record_hot_path_duration(&FSQLITE_COMMIT_PRE_TXN_TIME_NS, commit_pre_txn_start);
@@ -48773,6 +51546,10 @@ impl Connection {
         *self.txn_snapshot.borrow_mut() = None;
         self.savepoints.borrow_mut().clear();
         self.in_transaction.set(false);
+        // The physical pager commit has succeeded. Only now may final-state
+        // deferred-FK markers be discarded; a prior Busy/error must leave
+        // them in place for the next COMMIT attempt.
+        self.clear_deferred_fk_obligations();
         // Issue #110: the transaction-scoped FK parent-validation cache is
         // bound to this transaction; drop it now that the txn is torn down.
         self.clear_fk_parent_validation_cache();
@@ -48825,18 +51602,24 @@ impl Connection {
             let will_capture_time_travel_snapshot = self.pager.is_memory()
                 && self.time_travel_capture_enabled.get()
                 && self.last_local_commit_seq.borrow().is_some();
+            let mut post_commit_memdb_ready = true;
             if will_capture_time_travel_snapshot
-                && self.memdb_requires_active_txn_reload.replace(false)
+                && self.memdb_requires_active_txn_reload.get()
+                && let Err(error) = self
+                    .reload_memdb_from_pager_with_mode(cx, self.should_eagerly_hydrate_memdb_rows())
+                    .await
             {
-                // The write transaction is already finished. If the pager-backed
-                // committed-state reload fails, leave recovery to the normal
-                // committed-state refresh path instead of preserving a stale
-                // "active txn dirty" marker with no active_txn left to reload.
-                self.reload_memdb_from_pager_with_mode(
-                    cx,
-                    self.should_eagerly_hydrate_memdb_rows(),
-                )
-                .await?;
+                // Pager commit has already published. Preserve the dirty
+                // marker and report commit success; returning an ordinary
+                // error here would falsely imply that retrying COMMIT is safe.
+                // The next data-plane boundary retries the authoritative
+                // committed-state refresh.
+                self.memdb_requires_active_txn_reload.set(true);
+                post_commit_memdb_ready = false;
+                tracing::warn!(
+                    target: "fsqlite.commit",
+                    "commit published but committed-state memdb refresh failed: {error}"
+                );
             }
             let commit_post_write_maintenance_start = hot_path_profile_enabled().then(Instant::now);
             if !self.should_defer_autocheckpoint_after_concurrent_commit(is_concurrent_txn) {
@@ -48847,7 +51630,7 @@ impl Connection {
             // handle is fully dropped and the pager can serve reads to reload_memdb.
             if let Some(committed_seq) = *self.last_local_commit_seq.borrow() {
                 self.emit_differential_commit_invalidations(committed_seq);
-                if self.time_travel_capture_enabled.get() {
+                if self.time_travel_capture_enabled.get() && post_commit_memdb_ready {
                     self.capture_time_travel_snapshot(committed_seq.get()).await;
                 }
             }
@@ -48864,6 +51647,7 @@ impl Connection {
             &FSQLITE_FINALIZE_POST_PUBLISH_TIME_NS,
             finalize_post_publish_start,
         );
+        self.active_transaction_generation.set(None);
         Ok(())
     }
 
@@ -48927,16 +51711,19 @@ impl Connection {
         cx: &Cx,
         rb: &fsqlite_ast::RollbackStatement,
     ) -> Result<()> {
-        // bd-do0d6: a full rollback discards any postponed deferred FK checks.
-        if rb.to_savepoint.is_none() {
-            self.deferred_fk_checks.borrow_mut().clear();
-        }
         // AAC-P6: any rollback invalidates the prepared-DML micro-batch.
         self.stmt_microbatch_flush();
         self.discard_cached_vdbe_engine();
         self.clear_prepared_direct_insert_append_hint();
         if let Some(ref sp_name) = rb.to_savepoint {
-            let (idx, snap, canonical_name, concurrent_snap) = {
+            let (
+                idx,
+                snap,
+                canonical_name,
+                concurrent_snap,
+                deferred_fk_checks_len,
+                deferred_fk_parent_action_checks_len,
+            ) = {
                 let savepoints = self.savepoints.borrow();
                 let idx = savepoints
                     .iter()
@@ -48950,6 +51737,8 @@ impl Connection {
                     entry.snapshot.clone(),
                     entry.name.clone(),
                     entry.concurrent_snapshot.clone(),
+                    entry.deferred_fk_checks_len,
+                    entry.deferred_fk_parent_action_checks_len,
                 )
             };
 
@@ -49026,6 +51815,12 @@ impl Connection {
             // savepoint-rollback committed view.
             self.invalidate_qfs_on_rollback();
             self.restore_snapshot(cx, &snap).await?;
+            self.deferred_fk_checks
+                .borrow_mut()
+                .truncate(deferred_fk_checks_len);
+            self.deferred_fk_parent_action_checks
+                .borrow_mut()
+                .truncate(deferred_fk_parent_action_checks_len);
             // MVCC GC (bd-3bql / 5E.5): After savepoint rollback, trigger GC if scheduler permits.
             self.maybe_gc_tick();
             live_vtab_result?;
@@ -49042,8 +51837,24 @@ impl Connection {
 
             self.clear_pending_direct_write_runs();
 
+            // Roll back the pager transaction: discard all dirty pages and
+            // release writer locks. Keep the handle installed across the
+            // await: if this future is dropped or rollback returns an error,
+            // the exact transaction generation remains available for a later
+            // cleanup retry rather than being silently destroyed.
+            {
+                let mut active_txn = self.active_txn.borrow_mut();
+                if let Some(txn) = active_txn.as_mut() {
+                    #[cfg(test)]
+                    self.run_transaction_cleanup_rollback_test_action().await?;
+                    txn.rollback(cx).await?;
+                }
+            }
+
             // MVCC concurrent-writer abort (bd-14zc / 5E.1):
-            // When in concurrent mode, call concurrent_abort to release page locks.
+            // Pager rollback is now conclusive, so release page locks and the
+            // session. If a later restoration step fails, retrying rollback is
+            // idempotent and this already-cleared session is harmless.
             if self.concurrent_txn.get() {
                 if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
                     let mut registry = lock_unpoisoned(&self.concurrent_registry);
@@ -49056,14 +51867,6 @@ impl Connection {
                 self.clear_memory_concurrent_synced_write_roots();
             }
 
-            // Roll back the pager transaction: discard all dirty pages and
-            // release writer locks. After this, the pager reflects the
-            // pre-transaction committed state.
-            let rollback_result = if let Some(mut txn) = self.active_txn.borrow_mut().take() {
-                txn.rollback(cx).await
-            } else {
-                Ok(())
-            };
             let live_vtab_result = self.live_vtab_rollback_all(cx);
             let live_vtab_registry_result = self.restore_live_vtab_registry_to(cx, 0);
             self.clear_pending_memdb_direct_upserts();
@@ -49071,21 +51874,25 @@ impl Connection {
             // Restore the BEGIN-time connection-local image before the pager
             // reload snapshots TEMP tables. Pager rollback cannot restore
             // TEMP roots because they never live in the main database.
-            if rollback_result.is_ok()
-                && let Some(snapshot) = self.txn_snapshot.borrow().as_ref().cloned()
-            {
+            if let Some(snapshot) = self.txn_snapshot.borrow().as_ref().cloned() {
                 self.restore_snapshot_state(&snapshot);
             }
 
-            // Reload MemDatabase from pager's committed state.
-            // This replaces the snapshot-restore approach with reading the
-            // authoritative state from the pager. Clear any deferred
-            // active-transaction marker first because the active_txn has
-            // already been taken and is no longer available for reload.
+            // Reload MemDatabase from pager's committed state. Keep the
+            // connection transaction markers and rolled-back handle installed
+            // until every restoration step succeeds; Pending cleanup then
+            // remains safely retryable after an error or hard future drop.
             self.memdb_requires_active_txn_reload.set(false);
             let reload_result = self.reload_memdb_from_pager(cx).await;
 
-            // Clear transaction state.
+            reload_result?;
+            live_vtab_result?;
+            live_vtab_registry_result?;
+
+            // Every rollback/restoration phase reached success. Only now may
+            // the connection publish the idle transaction state and discard
+            // the terminal pager handle.
+            *self.active_txn.borrow_mut() = None;
             *self.txn_snapshot.borrow_mut() = None;
             self.savepoints.borrow_mut().clear();
             self.in_transaction.set(false);
@@ -49110,10 +51917,13 @@ impl Connection {
             // End undo tracking (no longer needed since we reload from pager).
             self.db.borrow_mut().commit_undo();
 
-            rollback_result?;
-            reload_result?;
-            live_vtab_result?;
-            live_vtab_registry_result?;
+            // The pager rollback, state reload, and vtab rollback have all
+            // succeeded, so the transaction is conclusively gone. Do not
+            // clear these at function entry: cancellation or a rollback error
+            // must leave deferred obligations sticky rather than permitting a
+            // later COMMIT to forget a real FK violation.
+            self.clear_deferred_fk_obligations();
+            self.active_transaction_generation.set(None);
         }
         Ok(())
     }
@@ -49125,6 +51935,9 @@ impl Connection {
         self.flush_pending_direct_write_runs(cx).await?;
         // If no explicit transaction, implicitly begin one.
         let started_implicit_txn = !self.in_transaction.get();
+        let implicit_generation = started_implicit_txn
+            .then(|| self.allocate_transaction_generation())
+            .transpose()?;
         if started_implicit_txn {
             if self.retained_autocommit_txn.borrow().is_some() {
                 self.flush_retained_autocommit_txn(cx).await?;
@@ -49177,6 +51990,7 @@ impl Connection {
             self.db.borrow_mut().begin_undo();
             *self.txn_snapshot.borrow_mut() = Some(self.snapshot());
             self.in_transaction.set(true);
+            self.active_transaction_generation.set(implicit_generation);
             // IMPL-28 / AG-O3: SAVEPOINT implicitly started a transaction —
             // open the IN_TRANSACTION gate bit. `implicit_txn=true` below
             // means RELEASE of the outermost savepoint will auto-commit;
@@ -49285,6 +52099,11 @@ impl Connection {
             name: name.to_owned(),
             snapshot: self.snapshot(),
             concurrent_snapshot,
+            deferred_fk_checks_len: self.deferred_fk_checks.borrow().len(),
+            deferred_fk_parent_action_checks_len: self
+                .deferred_fk_parent_action_checks
+                .borrow()
+                .len(),
         });
         self.txn_metrics_set_savepoint_depth(self.savepoints.borrow().len());
         Ok(())
@@ -52708,7 +55527,9 @@ impl Connection {
                         "SELECT {child_q}.rowid FROM {child_q} WHERE {not_null} \
                          AND NOT EXISTS (SELECT 1 FROM {parent_q} AS p WHERE {join_eq})"
                     );
-                    let violating = self.query_with_params(&sql, &[]).await?;
+                    let violating = self
+                        .query_with_params_after_background_status(&sql, &[])
+                        .await?;
                     for row in &violating {
                         if let Some(rowid_val) = row.values().first().cloned() {
                             out.push(Row {
@@ -53306,6 +56127,9 @@ impl Connection {
         view_name: &str,
         sender: mpsc::Sender<DifferentialEvent>,
     ) -> Result<u64> {
+        let _public_operation = self.enter_public_operation()?;
+        self.settle_pending_transaction_cleanup().await?;
+        self.background_status()?;
         if !self.pragma_state.borrow().differential_views.is_enabled() {
             return Err(FrankenError::NotImplemented(
                 "differential subscribers require PRAGMA fsqlite_differential_views = ON"
@@ -53321,7 +56145,7 @@ impl Connection {
         let view = self.lookup_differential_view(view_name)?;
         let snapshot_seq = self.pager.published_snapshot().visible_commit_seq;
         let rows = self
-            .execute_statement(&Statement::Select(view.query.clone()), None)
+            .execute_statement_after_background_status(&Statement::Select(view.query.clone()), None)
             .await?;
         let stream_begin_seq = CommitSeq::new(snapshot_seq.get().saturating_add(1));
         let subscriber_id = self
@@ -58023,16 +60847,16 @@ impl Connection {
                 .find(|table| table.name.eq_ignore_ascii_case(&binding_name.name))
                 .map(|table| (table.root_page, table.clone()))?
         };
-        let cx = &self.root_cx;
+        let cx = self.current_operation_cx_or_root();
         let result: Result<Vec<Vec<SqliteValue>>> = async {
-            let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly).await?;
+            let mut txn = self.pager.begin(&cx, TransactionMode::ReadOnly).await?;
             let page_no = PageNumber::new(u32::try_from(root_page_num).unwrap_or(1))
                 .unwrap_or(PageNumber::ONE);
-            let mut cursor = Self::new_pager_btree_cursor(cx, &mut txn, page_no, true).await?;
+            let mut cursor = Self::new_pager_btree_cursor(&cx, &mut txn, page_no, true).await?;
             let mut rows = Vec::new();
-            if cursor.first(cx).await? {
+            if cursor.first(&cx).await? {
                 loop {
-                    let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
+                    let (rowid, payload) = cursor.rowid_and_payload_cow(&cx).await?;
                     let payload_values = parse_record(payload.as_ref()).ok_or_else(|| {
                         FrankenError::DatabaseCorrupt {
                             detail: format!(
@@ -58053,13 +60877,13 @@ impl Connection {
                         values.push(SqliteValue::Integer(rowid));
                     }
                     rows.push(values);
-                    if !cursor.next(cx).await? {
+                    if !cursor.next(&cx).await? {
                         break;
                     }
                 }
             }
             drop(cursor);
-            txn.commit(cx).await?;
+            txn.commit(&cx).await?;
             Ok(rows)
         }
         .await;
@@ -61484,7 +64308,7 @@ impl Connection {
                     if preserve_prior_changes_on_constraint_violation
                         && matches!(
                             result.as_ref(),
-                            Err(error) if error_is_constraint_violation(error)
+                            Err(error) if error_preserves_prior_changes_for_fail(error)
                         )
                     {
                         conn.record_last_insert_rowid(previous_last_insert_rowid);
@@ -61499,7 +64323,7 @@ impl Connection {
                 }
                 Err(error) => {
                     if preserve_prior_changes_on_constraint_violation
-                        && error_is_constraint_violation(&error)
+                        && error_preserves_prior_changes_for_fail(&error)
                     {
                         self.apply_attached_statement_tracking(changes);
                         self.record_table_program_error_state(changes, None);
@@ -61567,7 +64391,7 @@ impl Connection {
                 }
                 Err(error) => {
                     if preserve_prior_changes_on_constraint_violation
-                        && error_is_constraint_violation(&error)
+                        && error_preserves_prior_changes_for_fail(&error)
                     {
                         self.apply_attached_insert_tracking(changes, last_insert_rowid);
                         self.record_table_program_error_state(changes, last_insert_rowid);
@@ -62664,7 +65488,7 @@ impl Connection {
                     result?
                 } else {
                     let scan_sql = build_join_scan_sql(src);
-                    let rows = self.query(&scan_sql).await?;
+                    let rows = self.query_after_background_status(&scan_sql).await?;
                     rows.iter().map(|r| r.values().to_vec()).collect()
                 };
                 // Normalize every scanned row to the source's logical scan
@@ -65341,9 +68165,8 @@ impl Connection {
         rowid_alias_columns: &HashMap<String, usize>,
         specs: &[(String, String, Vec<ColumnInfo>)],
         preserve_existing_live_vtabs: bool,
-    ) -> Result<HashMap<String, Box<dyn ErasedVtabInstance>>> {
-        let mut reloaded = HashMap::new();
-
+        reloaded: &mut LiveVtabReloadGuard<'_>,
+    ) -> Result<()> {
         for (spec_index, (table_name, create_sql, _)) in specs.iter().enumerate() {
             let has_reloadable_duplicate_fts5_schema_row = specs.iter().enumerate().any(
                 |(candidate_index, (candidate_name, candidate_sql, _))| {
@@ -65376,8 +68199,9 @@ impl Connection {
             );
             let table_key = table_name.to_ascii_uppercase();
             if preserve_existing_live_vtabs {
-                if let Some(instance) = self.vtab_instances.borrow_mut().remove(&table_key) {
-                    reloaded.insert(table_key, instance);
+                if reloaded.preserve_existing(&table_key) {
+                    #[cfg(test)]
+                    run_live_vtab_reload_test_hook(&table_key).await?;
                     continue;
                 }
             }
@@ -65462,7 +68286,7 @@ impl Connection {
                         )
                         .await?;
                     fts5.mark_lazy_on_disk(doc_count);
-                    reloaded.insert(table_key, instance);
+                    reloaded.insert_rebuilt(table_key, instance);
                     continue;
                 }
 
@@ -65479,7 +68303,7 @@ impl Connection {
                     )
                     .await?;
                 fts5.apply_shadow_rows(&rows)?;
-                reloaded.insert(table_key, instance);
+                reloaded.insert_rebuilt(table_key, instance);
                 continue;
             }
 
@@ -65490,7 +68314,7 @@ impl Connection {
             );
         }
 
-        Ok(reloaded)
+        Ok(())
     }
 
     #[cfg(not(feature = "ext-fts5"))]
@@ -65504,9 +68328,10 @@ impl Connection {
         _rowid_alias_columns: &HashMap<String, usize>,
         _specs: &[(String, String, Vec<ColumnInfo>)],
         _preserve_existing_live_vtabs: bool,
-    ) -> Result<HashMap<String, Box<dyn ErasedVtabInstance>>> {
+        _reloaded: &mut LiveVtabReloadGuard<'_>,
+    ) -> Result<()> {
         let _ = self;
-        Ok(HashMap::new())
+        Ok(())
     }
 
     async fn rebuild_materialized_live_vtab_instances_from_reload(
@@ -65519,9 +68344,8 @@ impl Connection {
         rowid_alias_columns: &HashMap<String, usize>,
         specs: &[(String, String)],
         preserve_existing_live_vtabs: bool,
-    ) -> Result<HashMap<String, Box<dyn ErasedVtabInstance>>> {
-        let mut reloaded = HashMap::new();
-
+        reloaded: &mut LiveVtabReloadGuard<'_>,
+    ) -> Result<()> {
         #[cfg(not(any(feature = "ext-fts5", feature = "ext-rtree")))]
         {
             let _ = (
@@ -65535,12 +68359,13 @@ impl Connection {
             if preserve_existing_live_vtabs {
                 for (table_name, _) in specs {
                     let table_key = table_name.to_ascii_uppercase();
-                    if let Some(instance) = self.vtab_instances.borrow_mut().remove(&table_key) {
-                        reloaded.insert(table_key, instance);
+                    if reloaded.preserve_existing(&table_key) {
+                        #[cfg(test)]
+                        run_live_vtab_reload_test_hook(&table_key).await?;
                     }
                 }
             }
-            Ok(reloaded)
+            Ok(())
         }
 
         #[cfg(any(feature = "ext-fts5", feature = "ext-rtree"))]
@@ -65548,8 +68373,9 @@ impl Connection {
             for (table_name, create_sql) in specs {
                 let table_key = table_name.to_ascii_uppercase();
                 if preserve_existing_live_vtabs {
-                    if let Some(instance) = self.vtab_instances.borrow_mut().remove(&table_key) {
-                        reloaded.insert(table_key, instance);
+                    if reloaded.preserve_existing(&table_key) {
+                        #[cfg(test)]
+                        run_live_vtab_reload_test_hook(&table_key).await?;
                         continue;
                     }
                 }
@@ -65637,14 +68463,14 @@ impl Connection {
                         })
                         .collect::<Vec<_>>();
                     fts5.rebuild_documents(documents);
-                    reloaded.insert(table_key.clone(), instance);
+                    reloaded.insert_rebuilt(table_key.clone(), instance);
                     continue;
                 }
 
                 #[cfg(feature = "ext-rtree")]
                 if let Some(rtree) = instance.as_any_mut().downcast_mut::<RtreeVirtualTable>() {
                     rtree.rebuild_rows(&rows)?;
-                    reloaded.insert(table_key, instance);
+                    reloaded.insert_rebuilt(table_key, instance);
                     continue;
                 }
 
@@ -65655,7 +68481,7 @@ impl Connection {
                 );
             }
 
-            Ok(reloaded)
+            Ok(())
         }
     }
 
@@ -65683,7 +68509,8 @@ impl Connection {
             // path. Set on autocommit DDL rollback recovery, where the
             // connection-local schema Vec holds a rolled-back object whose eager
             // `schema_cookie` bump can coincidentally match the committed header.
-            let force_full_schema_reload = self.force_full_schema_reload_once.replace(false);
+            let (mut force_full_schema_reload_guard, force_full_schema_reload) =
+                OneShotBoolConsumptionGuard::consume(&self.force_full_schema_reload_once);
             if bound_visible_commit_seq > *self.memdb_visible_commit_seq.borrow() {
                 self.discard_cached_vdbe_engine();
             }
@@ -65733,6 +68560,7 @@ impl Connection {
                 self.memdb_requires_active_txn_reload.set(false);
                 self.memdb_storage_count_shortcuts_safe.set(hydrate_rows);
                 self.pending_local_live_vtab_preserve_once.set(false);
+                force_full_schema_reload_guard.commit();
                 return Ok(());
             }
 
@@ -65820,6 +68648,7 @@ impl Connection {
                 self.memdb_rows_loaded.set(false);
                 self.memdb_requires_active_txn_reload.set(false);
                 self.memdb_storage_count_shortcuts_safe.set(false);
+                force_full_schema_reload_guard.commit();
                 return Ok(());
             }
             let user_version = if page1_bytes.len() >= 64 {
@@ -65951,7 +68780,7 @@ impl Connection {
                         new_triggers.push(TriggerDef::from_create_statement(
                             &stmt,
                             create_sql.to_string(),
-                        ));
+                        )?);
                     }
                     continue;
                 }
@@ -66473,35 +69302,35 @@ impl Connection {
                 });
             }
 
-            let reloaded_live_vtabs = if self.transactional_live_vtab_registry_active() {
-                None
+            let mut live_vtab_reload_guard = LiveVtabReloadGuard::new(&self.vtab_instances);
+            let publish_reloaded_live_vtabs = if self.transactional_live_vtab_registry_active() {
+                false
             } else {
-                let mut reloaded = self
-                    .rebuild_materialized_live_vtab_instances_from_reload(
-                        cx,
-                        txn,
-                        page_size,
-                        reserved_per_page,
-                        &new_schema,
-                        &new_alias_map,
-                        &pending_materialized_live_vtabs,
-                        preserve_existing_live_vtabs,
-                    )
-                    .await?;
-                let rootpage_zero_live_vtabs = self
-                    .rebuild_rootpage_zero_live_vtab_instances_from_reload(
-                        cx,
-                        txn,
-                        page_size,
-                        reserved_per_page,
-                        &new_schema,
-                        &new_alias_map,
-                        &pending_rootpage_zero_virtual_tables,
-                        preserve_existing_live_vtabs,
-                    )
-                    .await?;
-                reloaded.extend(rootpage_zero_live_vtabs);
-                Some(reloaded)
+                self.rebuild_materialized_live_vtab_instances_from_reload(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    &new_schema,
+                    &new_alias_map,
+                    &pending_materialized_live_vtabs,
+                    preserve_existing_live_vtabs,
+                    &mut live_vtab_reload_guard,
+                )
+                .await?;
+                self.rebuild_rootpage_zero_live_vtab_instances_from_reload(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    &new_schema,
+                    &new_alias_map,
+                    &pending_rootpage_zero_virtual_tables,
+                    preserve_existing_live_vtabs,
+                    &mut live_vtab_reload_guard,
+                )
+                .await?;
+                true
             };
 
             // Capture structural fingerprints of old and new schemas BEFORE the
@@ -66609,8 +69438,7 @@ impl Connection {
             *self.autoincrement_tables.borrow_mut() = new_autoincrement_tables;
             *self.sqlite_sequence_cache.borrow_mut() = new_sqlite_sequence_cache;
             *self.original_ddl_sql.borrow_mut() = new_original_ddl_sql;
-            if let Some(mut reloaded_live_vtabs) = reloaded_live_vtabs {
-                let mut existing_live_vtabs = self.vtab_instances.borrow_mut();
+            if publish_reloaded_live_vtabs {
                 if self.pager.is_memory() {
                     // Preserve connection-local live VTAB instances for modules
                     // that do not yet support persisted-row hydration during
@@ -66619,15 +69447,13 @@ impl Connection {
                     // in-process live VTAB object between reloads.
                     for (table_name, _) in &pending_materialized_live_vtabs {
                         let key = table_name.to_ascii_uppercase();
-                        if reloaded_live_vtabs.contains_key(&key) {
+                        if live_vtab_reload_guard.contains_key(&key) {
                             continue;
                         }
-                        if let Some(instance) = existing_live_vtabs.remove(&key) {
-                            reloaded_live_vtabs.insert(key, instance);
-                        }
+                        live_vtab_reload_guard.preserve_existing(&key);
                     }
                 }
-                *existing_live_vtabs = reloaded_live_vtabs;
+                live_vtab_reload_guard.publish();
                 self.dropped_vtab_instances.borrow_mut().clear();
                 self.live_vtab_transactions.borrow_mut().clear();
                 self.live_vtab_registry_undo.borrow_mut().clear();
@@ -66665,6 +69491,7 @@ impl Connection {
             self.memdb_requires_active_txn_reload.set(false);
             self.memdb_storage_count_shortcuts_safe.set(hydrate_rows);
             self.pending_local_live_vtab_preserve_once.set(false);
+            force_full_schema_reload_guard.commit();
 
             Ok(())
         })
@@ -78575,8 +81402,8 @@ fn render_create_trigger_sql(trigger: &TriggerDef) -> String {
         event: trigger.event.clone(),
         table: trigger.table_name.clone(),
         for_each_row: trigger.for_each_row,
-        when: trigger.when_clause.clone(),
-        body: trigger.body.clone(),
+        when: trigger.when_clause.as_deref().cloned(),
+        body: trigger.body.as_ref().clone(),
     }
     .to_string()
 }
@@ -85236,12 +88063,22 @@ struct FkParentValidationKey {
 
 struct FkParentValidationCacheScope<'a> {
     cache: &'a RefCell<Option<FkParentValidationCache>>,
+    invalidation_epoch: &'a Cell<u64>,
+    captured_epoch: u64,
     previous: Option<FkParentValidationCache>,
 }
 
 impl Drop for FkParentValidationCacheScope<'_> {
     fn drop(&mut self) {
-        *self.cache.borrow_mut() = self.previous.take();
+        // A nested mutation may clear the statement scope and subsequently
+        // install a fresh transaction cache before this guard drops. A
+        // `None` sentinel alone cannot distinguish that case from a pristine
+        // scope, so restore prior evidence only when no invalidation happened
+        // since entry. On mismatch retain the current post-invalidation cache
+        // (or None), never the potentially stale `previous` cache.
+        if self.invalidation_epoch.get() == self.captured_epoch {
+            *self.cache.borrow_mut() = self.previous.take();
+        }
     }
 }
 
@@ -88311,7 +91148,7 @@ async fn execute_simple_join_lineage_query(
         left_tbl = spec.left_table,
         right_tbl = spec.right_table
     );
-    conn.query(&sql).await
+    conn.query_after_background_status(&sql).await
 }
 
 #[cfg(feature = "diagnostic-pragmas")]
@@ -92826,22 +95663,47 @@ fn statement_preserves_prior_changes_on_constraint(statement: &Statement) -> boo
     )
 }
 
-fn error_is_constraint_violation(error: &FrankenError) -> bool {
-    if error.error_code() == ErrorCode::Constraint {
-        return true;
+/// Whether SQLite's `ON CONFLICT` algorithm applies to `error`.
+///
+/// SQLite applies `ON CONFLICT` only to UNIQUE, PRIMARY KEY, NOT NULL, and
+/// CHECK constraint failures. FOREIGN KEY and STRICT-datatype failures ignore
+/// the conflict algorithm (including `OR FAIL` and `OR ROLLBACK`), and
+/// non-constraint execution failures must never inherit partial-write
+/// semantics. Keep this allow-list explicit so a new constraint-like error
+/// remains fail-closed until its SQLite behavior is audited.
+fn error_uses_on_conflict_algorithm(error: &FrankenError) -> bool {
+    match error {
+        FrankenError::UniqueViolation { .. }
+        | FrankenError::NotNullViolation { .. }
+        | FrankenError::CheckViolation { .. }
+        | FrankenError::PrimaryKeyViolation => true,
+        // The pager-backed VDBE currently returns its constraint failures in
+        // an `Internal` envelope. Only recognize the concrete constraint
+        // messages with documented `OR FAIL` semantics; code 19 by itself is
+        // deliberately insufficient because it can also represent FOREIGN KEY
+        // and future constraint categories whose partial-write behavior has
+        // not been audited.
+        FrankenError::Internal(message) => {
+            let prefix = format!("VDBE halted with code {}: ", ErrorCode::Constraint as i32);
+            message.strip_prefix(&prefix).is_some_and(|detail| {
+                detail.starts_with("PRIMARY KEY constraint failed")
+                    || detail.starts_with("UNIQUE constraint failed")
+                    || detail.starts_with("NOT NULL constraint failed")
+                    || detail.starts_with("CHECK constraint failed")
+            })
+        }
+        _ => false,
     }
-    matches!(
-        error,
-        FrankenError::Internal(message)
-            if message.starts_with(&format!(
-                "VDBE halted with code {}:",
-                ErrorCode::Constraint as i32
-            ))
-    )
+}
+
+/// Whether `OR FAIL` may preserve rows already written earlier in this
+/// statement for `error`.
+fn error_preserves_prior_changes_for_fail(error: &FrankenError) -> bool {
+    error_uses_on_conflict_algorithm(error)
 }
 
 fn error_triggers_conflict_action_rollback(error: &FrankenError) -> bool {
-    error_is_constraint_violation(error)
+    error_uses_on_conflict_algorithm(error)
 }
 
 fn reverse_vtab_constraint_op(op: BinaryOp) -> Option<ConstraintOp> {
@@ -96480,8 +99342,11 @@ mod tests {
         TransactionalVtabState, VirtualTable, VirtualTableCursor, VtabModuleFactory,
         module_factory_from,
     };
-    use fsqlite_pager::{PageCacheQueueKind, TransactionHandle, TransactionMode};
-    use fsqlite_types::cx::Cx;
+    use fsqlite_pager::{
+        CommitTerminalOutcome, MockTransaction, PageCacheQueueKind, TransactionCommitState,
+        TransactionHandle, TransactionKind, TransactionMode,
+    };
+    use fsqlite_types::cx::{CancelReason, Cx};
     use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::{SqlLikeFastPathKind, SqlLikeFastPathMatcher, SqliteValue};
@@ -96493,8 +99358,10 @@ mod tests {
     #[cfg(unix)]
     use fsqlite_vfs::UnixVfs;
     use fsqlite_vfs::traits::{Vfs, VfsFile};
+    use std::cell::Cell;
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::Ordering as AtomicOrdering;
 
@@ -96872,6 +99739,77 @@ mod tests {
     }
 
     #[test]
+    fn test_dedicated_worker_bootstrap_keeps_runtime_root_and_operation_lineage() {
+        let runtime = Arc::new(RuntimeContext::new(RuntimeConfig {
+            worker_threads: 1,
+            io_poll_strategy: IoPollStrategy::Auto,
+        }));
+        let caller = Cx::new().with_trace_context(0, 0, 0);
+        let (source, token) = caller.operation_cancellation();
+        let env =
+            ConnectionEnv::new(Arc::clone(&runtime)).with_dedicated_worker_open_operation(token);
+        let bootstrap = env.bootstrap_cx();
+
+        assert_ne!(
+            bootstrap.trace_id(),
+            0,
+            "a caller without trace metadata must receive a fresh open trace"
+        );
+        assert!(bootstrap.checkpoint().is_ok());
+
+        source.cancel_with_reason(CancelReason::Timeout);
+        assert_eq!(bootstrap.cancel_reason(), Some(CancelReason::Timeout));
+
+        let caller = Cx::new();
+        let (_source, token) = caller.operation_cancellation();
+        let env =
+            ConnectionEnv::new(Arc::clone(&runtime)).with_dedicated_worker_open_operation(token);
+        let bootstrap = env.bootstrap_cx();
+        runtime
+            .root_cx
+            .cancel_with_reason(CancelReason::RegionClose);
+        assert_eq!(
+            bootstrap.cancel_reason(),
+            Some(CancelReason::RegionClose),
+            "the bootstrap context must be a direct child of the runtime root"
+        );
+    }
+
+    #[test]
+    fn test_dedicated_worker_bootstrap_preserves_caller_trace_and_clears_stored_token() {
+        let runtime = Arc::new(RuntimeContext::new(RuntimeConfig {
+            worker_threads: 1,
+            io_poll_strategy: IoPollStrategy::Auto,
+        }));
+        let caller = Cx::new().with_trace_context(707, 7_070, 709);
+        let (_source, token) = caller.operation_cancellation();
+        let env = ConnectionEnv::new(runtime).with_dedicated_worker_open_operation(token);
+        let bootstrap = env.bootstrap_cx();
+        let stored = env.clone_for_connection_storage();
+
+        assert_eq!(bootstrap.trace_id(), 707);
+        assert_eq!(bootstrap.policy_id(), 709);
+        assert!(
+            stored.dedicated_worker_open_operation.is_none(),
+            "the connection's retained environment must not retain the open caller"
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    #[test]
+    fn test_runtime_context_dedicated_worker_detachment_contract() {
+        use asupersync::Cx as NativeCx;
+
+        let detached = RuntimeContext::new_process_global(RuntimeConfig::default());
+        assert!(detached.is_detached_for_dedicated_worker());
+
+        let parent = Cx::new();
+        parent.set_native_cx(NativeCx::for_testing());
+        let attached = RuntimeContext::new_with_root_cx(RuntimeConfig::default(), &parent);
+        assert!(!attached.is_detached_for_dedicated_worker());
+    }
+
+    #[test]
     fn test_open_with_env_uses_supplied_runtime() {
         asupersync::test_utils::run_test(|| async {
             let runtime = Arc::new(RuntimeContext::new(RuntimeConfig {
@@ -96884,6 +99822,43 @@ mod tests {
                     .expect("connection should open");
 
             assert!(Arc::ptr_eq(&conn._shared_mvcc_state._runtime, &runtime));
+        });
+    }
+
+    #[test]
+    fn test_operation_cancellation_guards_support_out_of_order_drop() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:")
+                .await
+                .expect("connection should open");
+            let caller = Cx::new();
+            let (source_a, token_a) = caller.operation_cancellation();
+            let (source_b, token_b) = caller.operation_cancellation();
+            let guard_a = conn.enter_operation_cancellation(&token_a);
+            let guard_b = conn.enter_operation_cancellation(&token_b);
+
+            drop(guard_a);
+            source_a.cancel_with_reason(CancelReason::Abort);
+            assert!(
+                conn.current_operation_cx_or_root().checkpoint().is_ok(),
+                "dropping an older guard must leave the newer operation current"
+            );
+
+            source_b.cancel_with_reason(CancelReason::Timeout);
+            assert_eq!(
+                conn.current_operation_cx_or_root().cancel_reason(),
+                Some(CancelReason::Timeout)
+            );
+
+            drop(guard_b);
+            assert!(
+                conn.current_operation_cx().is_none(),
+                "dropping the last exact registration must restore root dispatch"
+            );
+            assert!(
+                conn.current_operation_cx_or_root().checkpoint().is_ok(),
+                "operation cancellation must never poison the connection root"
+            );
         });
     }
 
@@ -97659,6 +100634,128 @@ mod tests {
 
     fn row_values(row: &Row) -> Vec<SqliteValue> {
         row.values().to_vec()
+    }
+
+    #[test]
+    fn or_fail_vdbe_constraint_allowlist_is_explicit_and_fail_closed() {
+        assert!(super::error_preserves_prior_changes_for_fail(
+            &FrankenError::PrimaryKeyViolation,
+        ));
+
+        for detail in [
+            "PRIMARY KEY constraint failed",
+            "UNIQUE constraint failed: table.column",
+            "NOT NULL constraint failed: table.column",
+            "CHECK constraint failed: value > 0",
+        ] {
+            let error = FrankenError::Internal(format!(
+                "VDBE halted with code {}: {detail}",
+                fsqlite_error::ErrorCode::Constraint as i32
+            ));
+            assert!(
+                super::error_preserves_prior_changes_for_fail(&error),
+                "expected allowed OR FAIL VDBE error: {detail}",
+            );
+        }
+
+        for detail in [
+            "FOREIGN KEY constraint failed",
+            "constraint failed",
+            "DATATYPE constraint failed",
+        ] {
+            let error = FrankenError::Internal(format!(
+                "VDBE halted with code {}: {detail}",
+                fsqlite_error::ErrorCode::Constraint as i32
+            ));
+            assert!(
+                !super::error_preserves_prior_changes_for_fail(&error),
+                "unexpected OR FAIL partial-write admission: {detail}",
+            );
+        }
+        assert!(!super::error_preserves_prior_changes_for_fail(
+            &FrankenError::ForeignKeyViolation,
+        ));
+        assert!(!super::error_preserves_prior_changes_for_fail(
+            &FrankenError::DatatypeViolation {
+                column: "strict_values.value".to_owned(),
+                column_type: "INTEGER".to_owned(),
+                actual: "TEXT".to_owned(),
+            },
+        ));
+        assert!(!super::error_preserves_prior_changes_for_fail(
+            &FrankenError::TriggerRecursionDepthExceeded,
+        ));
+    }
+
+    #[test]
+    fn insert_or_fail_strict_datatype_violation_rolls_back_like_sqlite() {
+        asupersync::test_utils::run_test(|| async {
+            const SCHEMA: &str = "CREATE TABLE strict_values (value INTEGER) STRICT;";
+            const INSERT: &str = "INSERT OR FAIL INTO strict_values VALUES (1), ('bad');";
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(SCHEMA).await.unwrap();
+            let error = conn
+                .execute(INSERT)
+                .await
+                .expect_err("STRICT datatype errors must ignore OR FAIL");
+            assert!(
+                matches!(error, FrankenError::DatatypeViolation { .. })
+                    || matches!(&error, FrankenError::Internal(message) if message.contains("STRICT type check")),
+                "expected a STRICT datatype error, got: {error}",
+            );
+            let fsqlite_count = conn
+                .query("SELECT COUNT(*) FROM strict_values;")
+                .await
+                .unwrap();
+            assert_eq!(fsqlite_count[0].values()[0], SqliteValue::Integer(0));
+
+            let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+            sqlite.execute_batch(SCHEMA).unwrap();
+            sqlite
+                .execute(INSERT, [])
+                .expect_err("SQLite must reject the STRICT datatype mismatch");
+            let sqlite_count: i64 = sqlite
+                .query_row("SELECT COUNT(*) FROM strict_values;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(sqlite_count, 0);
+            assert_eq!(
+                fsqlite_count[0].values()[0],
+                SqliteValue::Integer(sqlite_count),
+                "FrankenSQLite must match SQLite: no prior row is retained after STRICT datatype failure",
+            );
+        });
+    }
+
+    #[test]
+    fn invalidated_statement_fk_cache_does_not_restore_previous_cache() {
+        let cache = std::cell::RefCell::new(Some(
+            super::FkParentValidationCache::new_transaction_scoped(),
+        ));
+        let invalidation_epoch = std::cell::Cell::new(41_u64);
+        let previous = cache.replace(Some(super::FkParentValidationCache::new("child")));
+        let scope = super::FkParentValidationCacheScope {
+            cache: &cache,
+            invalidation_epoch: &invalidation_epoch,
+            captured_epoch: invalidation_epoch.get(),
+            previous,
+        };
+
+        // A nested parent mutation clears the statement cache, then subsequent
+        // nested DML creates a fresh transaction cache. The scope must retain
+        // that fresh cache rather than resurrecting the pre-mutation one.
+        *cache.borrow_mut() = None;
+        invalidation_epoch.set(invalidation_epoch.get() + 1);
+        *cache.borrow_mut() = Some(super::FkParentValidationCache::new_transaction_scoped());
+        drop(scope);
+
+        assert!(
+            cache
+                .borrow()
+                .as_ref()
+                .is_some_and(|cache| cache.target_table.is_none()),
+            "an invalidated statement scope must retain fresh evidence, not resurrect stale prior evidence",
+        );
     }
 
     fn live_vtab_instance_ptr(conn: &Connection, table_name: &str) -> *const () {
@@ -116567,6 +119664,100 @@ mod tests {
     }
 
     #[test]
+    fn test_view_cycles_and_deep_acyclic_chain_use_bounded_native_stack() {
+        std::thread::Builder::new()
+            .name("view-materialization-trampoline".to_owned())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                        .build()
+                        .expect("view-materialization runtime should build");
+                    // Drive one engine future at a time. A single test-only
+                    // async block containing every operation would itself
+                    // embed the largest child future in its state machine and
+                    // could exhaust this deliberately small stack before the
+                    // view executor is ever polled.
+                    let conn = runtime.block_on(Connection::open(":memory:")).unwrap();
+
+                    runtime
+                        .block_on(
+                            conn.execute("CREATE VIEW self_cycle AS SELECT * FROM self_cycle;"),
+                        )
+                        .unwrap();
+                    let error = runtime
+                        .block_on(conn.query("SELECT * FROM self_cycle;"))
+                        .expect_err("a self-referential view must be rejected");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("view self_cycle is circularly defined"),
+                        "unexpected self-cycle error: {error}"
+                    );
+                    runtime
+                        .block_on(conn.query("SELECT 1;"))
+                        .expect("connection must remain usable after rejecting a view cycle");
+                    runtime
+                        .block_on(conn.execute("DROP VIEW self_cycle;"))
+                        .unwrap();
+
+                    runtime
+                        .block_on(conn.execute("CREATE VIEW mutual_a AS SELECT * FROM mutual_b;"))
+                        .unwrap();
+                    runtime
+                        .block_on(conn.execute("CREATE VIEW mutual_b AS SELECT * FROM mutual_a;"))
+                        .unwrap();
+                    let error = runtime
+                        .block_on(conn.query("SELECT * FROM mutual_a;"))
+                        .expect_err("mutually recursive views must be rejected");
+                    assert!(
+                        error.to_string().contains("circularly defined"),
+                        "unexpected mutual-cycle error: {error}"
+                    );
+                    runtime
+                        .block_on(conn.query("SELECT 1;"))
+                        .expect("cycle rejection must not poison later statements");
+                    runtime
+                        .block_on(conn.execute("DROP VIEW mutual_a;"))
+                        .unwrap();
+                    runtime
+                        .block_on(conn.execute("DROP VIEW mutual_b;"))
+                        .unwrap();
+
+                    runtime
+                        .block_on(conn.execute("CREATE TABLE view_base (value INTEGER);"))
+                        .unwrap();
+                    runtime
+                        .block_on(conn.execute("INSERT INTO view_base VALUES (7);"))
+                        .unwrap();
+                    runtime
+                        .block_on(
+                            conn.execute("CREATE VIEW chain_0 AS SELECT value FROM view_base;"),
+                        )
+                        .unwrap();
+                    for depth in 1..128 {
+                        runtime
+                            .block_on(conn.execute(&format!(
+                                "CREATE VIEW chain_{depth} AS \
+                                 SELECT value FROM chain_{};",
+                                depth - 1
+                            )))
+                            .unwrap();
+                    }
+                    let rows = runtime
+                        .block_on(conn.query("SELECT value FROM chain_127;"))
+                        .expect("acyclic view depth must not consume native stack per level");
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(7));
+                });
+            })
+            .expect("spawn 1 MiB view-materialization regression thread")
+            .join()
+            .expect("view-materialization regression thread panicked");
+    }
+
+    #[test]
     fn test_create_view_if_not_exists() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
@@ -117025,15 +120216,15 @@ mod tests {
         )
         .unwrap();
         let frame = super::TriggerFrame {
-            table_name: "t".to_owned(),
-            trigger_name: "trg".to_owned(),
-            column_names: vec!["id".to_owned(), "name".to_owned()],
+            table_name: std::rc::Rc::from("t"),
+            trigger_name: std::rc::Rc::from("trg"),
+            column_names: std::rc::Rc::from(vec!["id".to_owned(), "name".to_owned()]),
             rowid_alias_col_idx: None,
             old_row: None,
-            new_row: Some(vec![
+            new_row: Some(std::rc::Rc::from(vec![
                 SqliteValue::Integer(1),
                 SqliteValue::Text("outer".into()),
-            ]),
+            ])),
         };
 
         super::bind_trigger_columns_in_statement(&mut stmt, &frame);
@@ -117767,16 +120958,23 @@ mod tests {
 
     #[test]
     fn test_recursive_trigger_depth_limit() {
-        asupersync::test_utils::run_test(|| async {
-            // F-PGM.11: Recursive triggers must be bounded at MAX_TRIGGER_DEPTH.
-            // Pin the regression to a 1 MiB stack so ordinary compiler frame
-            // growth cannot silently move the process-abort boundary below the
-            // configured error boundary again.
-            std::thread::Builder::new()
-                .name("recursive-trigger-depth-limit".to_owned())
-                .stack_size(1024 * 1024)
-                .spawn(|| {
-                    asupersync::test_utils::run_test(|| async {
+        // F-PGM.11: Recursive triggers must be bounded at MAX_TRIGGER_DEPTH.
+        // Pin the regression to a 1 MiB stack so ordinary compiler frame
+        // growth cannot silently move the process-abort boundary below the
+        // configured error boundary again. Use an isolated runtime instead of
+        // `run_test`: its global TRACE subscriber renders every ancestor span
+        // at every level and turns a depth-1000 safety test into gigabytes of
+        // diagnostic output.
+        std::thread::Builder::new()
+            .name("recursive-trigger-depth-limit".to_owned())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                        .build()
+                        .expect("trigger-depth runtime should build");
+                    runtime.block_on(async {
                         // Without recursive_triggers=ON, the default behavior suppresses
                         // same-table re-entry, so we test with two tables that ping-pong
                         // triggers between each other.
@@ -117807,12 +121005,20 @@ mod tests {
                             "unexpected error: {msg}",
                         );
                         assert!(conn.trigger_frame_stack.borrow().is_empty());
+                        assert_eq!(conn.fk_cascade_depth.get(), 0);
+                        assert_eq!(conn.trigger_program_active_driver.get(), None);
+                        assert!(conn.trigger_program_pending.borrow().is_empty());
+                        assert_eq!(conn.trigger_program_memory_bytes.get(), 0);
+                        assert!(
+                            (1..=super::TRIGGER_PROGRAM_MEMORY_BUDGET_BYTES)
+                                .contains(&conn.trigger_program_memory_peak_bytes.get())
+                        );
                     });
-                })
-                .expect("spawn 1 MiB trigger-depth regression thread")
-                .join()
-                .expect("trigger-depth regression thread panicked");
-        });
+                });
+            })
+            .expect("spawn 1 MiB trigger-depth regression thread")
+            .join()
+            .expect("trigger-depth regression thread panicked");
     }
 
     /// Build the two-table ping-pong trigger chain used by the depth
@@ -117840,6 +121046,802 @@ mod tests {
         .await
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn test_deep_bounded_trigger_chain_uses_constant_native_stack() {
+        std::thread::Builder::new()
+            .name("deep-trigger-trampoline".to_owned())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                        .build()
+                        .expect("deep-trigger runtime should build");
+                    runtime.block_on(async {
+                        let conn = build_bounded_trigger_chain(MAX_TRIGGER_DEPTH).await;
+                        conn.execute("UPDATE a SET n = 1;").await.unwrap();
+                        assert!(conn.trigger_frame_stack.borrow().is_empty());
+                        assert_eq!(conn.trigger_program_active_driver.get(), None);
+                        assert!(conn.trigger_program_pending.borrow().is_empty());
+                        assert_eq!(conn.trigger_program_memory_bytes.get(), 0);
+                        assert!(
+                            (1..=super::TRIGGER_PROGRAM_MEMORY_BUDGET_BYTES)
+                                .contains(&conn.trigger_program_memory_peak_bytes.get())
+                        );
+                    });
+                });
+            })
+            .expect("spawn 1 MiB deep-trigger thread")
+            .join()
+            .expect("deep-trigger thread panicked");
+    }
+
+    #[test]
+    fn test_trigger_statement_trace_is_linear_and_preserves_logical_lineage() {
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone)]
+        struct StatementTraceCapture(Arc<std::sync::Mutex<Vec<(u64, u64, usize, bool)>>>);
+
+        #[derive(Default)]
+        struct StatementTraceFields {
+            task_id: u64,
+            parent_task_id: u64,
+            logical_depth: usize,
+        }
+
+        impl tracing::field::Visit for StatementTraceFields {
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                match field.name() {
+                    "trigger_task_id" => self.task_id = value,
+                    "trigger_parent_task_id" => self.parent_task_id = value,
+                    "trigger_logical_depth" => {
+                        self.logical_depth = usize::try_from(value).unwrap_or(usize::MAX);
+                    }
+                    _ => {}
+                }
+            }
+
+            fn record_debug(
+                &mut self,
+                _field: &tracing::field::Field,
+                _value: &dyn std::fmt::Debug,
+            ) {
+            }
+        }
+
+        impl<S> tracing_subscriber::Layer<S> for StatementTraceCapture
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _id: &tracing::Id,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if attrs.metadata().target() != "fsqlite.statement" {
+                    return;
+                }
+                let mut fields = StatementTraceFields::default();
+                attrs.record(&mut fields);
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((
+                        fields.task_id,
+                        fields.parent_task_id,
+                        fields.logical_depth,
+                        attrs.is_contextual(),
+                    ));
+            }
+        }
+
+        const DEPTH: usize = 96;
+        asupersync::test_utils::run_test(|| async {
+            let conn = build_bounded_trigger_chain(DEPTH).await;
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::filter::Targets::new()
+                        .with_target("fsqlite.statement", tracing::Level::DEBUG),
+                )
+                .with(StatementTraceCapture(Arc::clone(&captured)));
+            {
+                let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+                conn.execute("UPDATE a SET n = 1;").await.unwrap();
+            }
+
+            let records = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                records.len() <= DEPTH * 4,
+                "statement trace growth must remain linear: {} spans for depth {DEPTH}",
+                records.len()
+            );
+            let nested: Vec<_> = records
+                .iter()
+                .copied()
+                .filter(|(task_id, _, _, _)| *task_id != 0)
+                .collect();
+            assert!(nested.len() >= DEPTH - 2, "missing nested statement spans");
+            assert!(
+                nested.iter().all(|(_, _, _, contextual)| !contextual),
+                "nested trigger spans must not form a physical contextual-parent chain"
+            );
+            let by_task: HashMap<u64, usize> = nested
+                .iter()
+                .map(|(task_id, _, depth, _)| (*task_id, *depth))
+                .collect();
+            assert!(by_task.values().copied().max().unwrap_or(0) >= DEPTH - 2);
+            for (task_id, parent_task_id, depth, _) in nested {
+                assert_ne!(task_id, 0);
+                if depth == 0 {
+                    assert_eq!(parent_task_id, 0);
+                } else {
+                    assert_eq!(
+                        by_task.get(&parent_task_id),
+                        Some(&(depth - 1)),
+                        "logical parent must be the preceding trigger task"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_trampolined_trigger_child_preserves_view_and_subquery_execution() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE source (id INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE log (id INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("CREATE VIEW source_view AS SELECT id FROM source;")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TRIGGER source_log AFTER INSERT ON source BEGIN
+                   INSERT INTO log
+                   SELECT id FROM source_view
+                   WHERE id = (SELECT NEW.id);
+                 END;",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO source VALUES (7);")
+                .await
+                .unwrap();
+            let rows = conn.query("SELECT id FROM log;").await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(7));
+            assert_eq!(conn.trigger_program_memory_bytes.get(), 0);
+        });
+    }
+
+    #[test]
+    fn test_public_operation_permit_is_held_while_pending_and_released_on_drop() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let (mock, controller) = MockTransaction::finalizing_for_test(None);
+            let mut transaction = TransactionKind::from(mock);
+            let resolution_cx = Cx::new();
+            let mut held = Box::pin(conn.hold_public_operation_while_resolving_commit_for_test(
+                &mut transaction,
+                &resolution_cx,
+            ));
+            let waker = std::task::Waker::noop();
+            let mut poll_cx = std::task::Context::from_waker(waker);
+            assert!(held.as_mut().poll(&mut poll_cx).is_pending());
+            assert!(conn.public_operation_active.get());
+
+            let mut competing = Box::pin(conn.query("SELECT 1;"));
+            let competing_result = competing.as_mut().poll(&mut poll_cx);
+            assert!(
+                matches!(
+                    competing_result,
+                    std::task::Poll::Ready(Err(FrankenError::Busy))
+                ),
+                "the second public future must fail before reaching connection RefCells"
+            );
+            drop(competing);
+            assert!(
+                conn.public_operation_active.get(),
+                "failed nested admission must not release the first future's permit"
+            );
+
+            drop(held);
+            assert!(
+                !conn.public_operation_active.get(),
+                "dropping the admitted future must release its permit"
+            );
+            assert_eq!(
+                conn.query("SELECT 1;").await.unwrap()[0].values()[0],
+                SqliteValue::Integer(1)
+            );
+
+            controller
+                .publish(CommitTerminalOutcome::RolledBack)
+                .unwrap();
+            assert_eq!(
+                transaction
+                    .resolve_commit_state(&resolution_cx)
+                    .await
+                    .unwrap(),
+                TransactionCommitState::RolledBack
+            );
+        });
+    }
+
+    #[test]
+    fn test_deferred_cleanup_drop_keeps_generation_pending_and_retry_rolls_back() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER);").await.unwrap();
+            let generation = conn.begin_transaction().await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
+            conn.mark_transaction_cleanup_required(generation);
+
+            let rollback_entered = Rc::new(Cell::new(false));
+            *conn.transaction_cleanup_rollback_test_action.borrow_mut() =
+                Some(super::TransactionCleanupRollbackTestAction::PendingOnce {
+                    entered: Rc::clone(&rollback_entered),
+                });
+
+            let mut first = Box::pin(conn.query("SELECT id FROM t;"));
+            let waker = std::task::Waker::noop();
+            let mut poll_cx = std::task::Context::from_waker(waker);
+            assert!(first.as_mut().poll(&mut poll_cx).is_pending());
+            assert!(rollback_entered.get());
+            assert_eq!(
+                *conn.transaction_cleanup_state.borrow(),
+                super::TransactionCleanupState::Pending(generation)
+            );
+            assert_eq!(conn.active_transaction_generation.get(), Some(generation));
+            assert!(conn.in_transaction.get());
+            assert!(
+                conn.active_txn.try_borrow().is_err(),
+                "the pending rollback future must retain the exact transaction handle"
+            );
+
+            drop(first);
+            assert!(!conn.public_operation_active.get());
+            assert_eq!(
+                *conn.transaction_cleanup_state.borrow(),
+                super::TransactionCleanupState::Pending(generation),
+                "dropping cleanup must preserve the retryable obligation"
+            );
+            assert_eq!(conn.active_transaction_generation.get(), Some(generation));
+            assert!(conn.in_transaction.get());
+            assert!(conn.active_txn.borrow().is_some());
+
+            let rows = conn.query("SELECT id FROM t;").await.unwrap();
+            assert!(rows.is_empty(), "retry must roll back the abandoned row");
+            assert_eq!(
+                *conn.transaction_cleanup_state.borrow(),
+                super::TransactionCleanupState::Idle
+            );
+            assert_eq!(conn.active_transaction_generation.get(), None);
+            assert!(!conn.in_transaction.get());
+            assert!(conn.active_txn.borrow().is_none());
+        });
+    }
+
+    #[test]
+    fn test_deferred_cleanup_rollback_error_stays_pending_and_retry_succeeds() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER);").await.unwrap();
+            let generation = conn.begin_transaction().await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
+            conn.mark_transaction_cleanup_required(generation);
+            *conn.transaction_cleanup_rollback_test_action.borrow_mut() =
+                Some(super::TransactionCleanupRollbackTestAction::ErrorOnce(
+                    FrankenError::internal("injected deferred rollback failure"),
+                ));
+
+            let error = conn
+                .query("SELECT id FROM t;")
+                .await
+                .expect_err("the injected rollback failure must surface");
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected deferred rollback failure")
+            );
+            assert!(!conn.public_operation_active.get());
+            assert_eq!(
+                *conn.transaction_cleanup_state.borrow(),
+                super::TransactionCleanupState::Pending(generation),
+                "a rollback error must preserve the same generation obligation"
+            );
+            assert_eq!(conn.active_transaction_generation.get(), Some(generation));
+            assert!(conn.in_transaction.get());
+            assert!(conn.active_txn.borrow().is_some());
+
+            let rows = conn.query("SELECT id FROM t;").await.unwrap();
+            assert!(rows.is_empty(), "retry must roll back the abandoned row");
+            assert_eq!(
+                *conn.transaction_cleanup_state.borrow(),
+                super::TransactionCleanupState::Idle
+            );
+            assert_eq!(conn.active_transaction_generation.get(), None);
+            assert!(!conn.in_transaction.get());
+            assert!(conn.active_txn.borrow().is_none());
+        });
+    }
+
+    #[test]
+    fn test_trigger_program_driver_fails_closed_and_drop_cleans_state() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let internal_statement_completed = Rc::new(Cell::new(false));
+            let mut first = Box::pin(conn.execute_trigger_program_work(
+                super::TriggerProgramWork::TestInternalStatementThenPending {
+                    internal_statement_completed: Rc::clone(&internal_statement_completed),
+                },
+            ));
+            std::future::poll_fn(|cx| {
+                assert!(first.as_mut().poll(cx).is_pending());
+                if internal_statement_completed.get() {
+                    std::task::Poll::Ready(())
+                } else {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            assert!(
+                internal_statement_completed.get(),
+                "the explicitly private trigger child path must remain executable"
+            );
+            assert!(conn.trigger_program_active_driver.get().is_some());
+            assert_eq!(conn.trigger_program_polling_driver.get(), None);
+            assert!(
+                matches!(
+                    conn.background_status_for_internal_driver(),
+                    Err(FrankenError::Busy)
+                ),
+                "a suspended driver cannot ambiently reuse the private background gate"
+            );
+
+            let active_id = conn
+                .trigger_program_active_driver
+                .get()
+                .expect("test driver must remain active");
+            {
+                let _matching_driver =
+                    super::TriggerProgramPollingGuard::enter(&conn, active_id, 1, None, 0);
+                conn.background_status_for_internal_driver()
+                    .expect("the exact actively-polled driver may use the private gate");
+                conn.trigger_program_polling_driver
+                    .set(Some(active_id.wrapping_add(1)));
+                assert!(
+                    matches!(
+                        conn.background_status_for_internal_driver(),
+                        Err(FrankenError::Busy)
+                    ),
+                    "a mismatched polling-driver id must fail closed"
+                );
+            }
+            assert_eq!(conn.trigger_program_polling_driver.get(), None);
+
+            let mut interleaved = Box::pin(conn.execute("SELECT 1;"));
+            let error = std::future::poll_fn(|cx| match interleaved.as_mut().poll(cx) {
+                std::task::Poll::Ready(result) => {
+                    std::task::Poll::Ready(result.expect_err("must fail closed"))
+                }
+                std::task::Poll::Pending => {
+                    panic!("interleaved driver unexpectedly joined active work");
+                }
+            })
+            .await;
+            assert!(matches!(error, FrankenError::Busy));
+
+            drop(interleaved);
+            drop(first);
+            assert_eq!(conn.trigger_program_active_driver.get(), None);
+            assert_eq!(conn.trigger_program_polling_driver.get(), None);
+            assert!(conn.trigger_program_pending.borrow().is_empty());
+            assert_eq!(conn.trigger_program_memory_bytes.get(), 0);
+        });
+    }
+
+    #[test]
+    fn test_trigger_program_panic_unwind_cleans_driver_state() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let mut future =
+                Box::pin(conn.execute_trigger_program_work(super::TriggerProgramWork::TestPanic));
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let waker = std::task::Waker::noop();
+                let mut cx = std::task::Context::from_waker(waker);
+                let _ = future.as_mut().poll(&mut cx);
+            }));
+            assert!(panic.is_err());
+            drop(future);
+            assert_eq!(conn.trigger_program_active_driver.get(), None);
+            assert_eq!(conn.trigger_program_polling_driver.get(), None);
+            assert!(conn.trigger_program_pending.borrow().is_empty());
+            assert_eq!(conn.trigger_program_memory_bytes.get(), 0);
+        });
+    }
+
+    #[test]
+    fn test_trigger_program_memory_budget_fails_before_retention() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let error = conn
+                .charge_trigger_program_memory(super::TRIGGER_PROGRAM_MEMORY_BUDGET_BYTES + 1)
+                .expect_err("oversized trigger state must fail deterministically");
+            assert!(matches!(error, FrankenError::OutOfMemory));
+            assert_eq!(conn.trigger_program_memory_bytes.get(), 0);
+
+            conn.charge_trigger_program_memory(super::TRIGGER_PROGRAM_MEMORY_BUDGET_BYTES)
+                .unwrap();
+            conn.release_trigger_program_memory(super::TRIGGER_PROGRAM_MEMORY_BUDGET_BYTES);
+            assert_eq!(conn.trigger_program_memory_bytes.get(), 0);
+        });
+    }
+
+    #[test]
+    fn test_trigger_program_driver_quantum_lineage_and_child_first_completion() {
+        asupersync::test_utils::run_test(|| async {
+            #[derive(Default)]
+            struct WakeCounter(std::sync::atomic::AtomicUsize);
+
+            impl std::task::Wake for WakeCounter {
+                fn wake(self: Arc<Self>) {
+                    self.0.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+
+                fn wake_by_ref(self: &Arc<Self>) {
+                    self.0.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            }
+
+            const DEPTH: usize = 1000;
+            let conn = Connection::open(":memory:").await.unwrap();
+            let lineage = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let drops = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let mut future = Box::pin(conn.execute_trigger_program_work(
+                super::TriggerProgramWork::TestChain {
+                    remaining: DEPTH,
+                    pending_leaf: false,
+                    lineage: std::rc::Rc::clone(&lineage),
+                    drops: std::rc::Rc::clone(&drops),
+                },
+            ));
+            let wakes = Arc::new(WakeCounter::default());
+            let waker = std::task::Waker::from(Arc::clone(&wakes));
+            let mut task_cx = std::task::Context::from_waker(&waker);
+            let mut polls = 0;
+            loop {
+                polls += 1;
+                match future.as_mut().poll(&mut task_cx) {
+                    std::task::Poll::Ready(result) => {
+                        result.expect("bounded test chain must complete");
+                        break;
+                    }
+                    std::task::Poll::Pending => {
+                        assert!(polls < 128, "finite chain failed to make progress");
+                    }
+                }
+            }
+            assert!(polls > 1, "a deep chain must yield at the poll quantum");
+            assert!(
+                wakes.0.load(AtomicOrdering::Relaxed) > 0,
+                "quantum yield must self-wake"
+            );
+
+            let observed = lineage.borrow();
+            assert_eq!(observed.len(), DEPTH + 1);
+            for (depth, (task_id, parent_task_id, logical_depth)) in
+                observed.iter().copied().enumerate()
+            {
+                assert_ne!(task_id, 0);
+                assert_eq!(logical_depth, depth);
+                if depth == 0 {
+                    assert_eq!(parent_task_id, None);
+                } else {
+                    assert_eq!(parent_task_id, Some(observed[depth - 1].0));
+                }
+            }
+            drop(observed);
+            assert_eq!(
+                drops.borrow().as_slice(),
+                (0..=DEPTH).collect::<Vec<_>>().as_slice(),
+                "completed futures must release deepest child first"
+            );
+
+            drop(future);
+            assert_eq!(conn.trigger_program_active_driver.get(), None);
+            assert_eq!(conn.trigger_program_polling_driver.get(), None);
+            assert_eq!(conn.trigger_program_polling_task.get(), None);
+            assert!(conn.trigger_program_pending.borrow().is_empty());
+            assert_eq!(conn.trigger_program_memory_bytes.get(), 0);
+        });
+    }
+
+    #[test]
+    fn test_trigger_program_driver_cancellation_is_bounded_and_child_first() {
+        asupersync::test_utils::run_test(|| async {
+            const DEPTH: usize = 1000;
+            let conn = Connection::open(":memory:").await.unwrap();
+            let lineage = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let drops = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let mut future = Box::pin(conn.execute_trigger_program_work(
+                super::TriggerProgramWork::TestChain {
+                    remaining: DEPTH,
+                    pending_leaf: true,
+                    lineage: std::rc::Rc::clone(&lineage),
+                    drops: std::rc::Rc::clone(&drops),
+                },
+            ));
+            let waker = std::task::Waker::noop();
+            let mut task_cx = std::task::Context::from_waker(waker);
+            assert!(future.as_mut().poll(&mut task_cx).is_pending());
+            assert_eq!(
+                lineage.borrow().len(),
+                super::TRIGGER_PROGRAM_POLL_TRANSITION_QUANTUM,
+                "one poll must admit no more than the configured quantum"
+            );
+            assert!(drops.borrow().is_empty());
+
+            conn.root_cx
+                .cancel_with_reason(super::CancelReason::UserInterrupt);
+            let error = match future.as_mut().poll(&mut task_cx) {
+                std::task::Poll::Ready(Err(error)) => error,
+                other => panic!("cancelled chain must terminate on its next poll: {other:?}"),
+            };
+            assert!(matches!(error, FrankenError::Interrupt));
+            let dropped = drops.borrow();
+            assert_eq!(
+                dropped.len(),
+                super::TRIGGER_PROGRAM_POLL_TRANSITION_QUANTUM
+            );
+            assert!(
+                dropped.windows(2).all(|pair| pair[0] + 1 == pair[1]),
+                "cancellation must drop the deepest retained child first: {dropped:?}"
+            );
+            drop(dropped);
+
+            drop(future);
+            assert_eq!(conn.trigger_program_active_driver.get(), None);
+            assert_eq!(conn.trigger_program_polling_driver.get(), None);
+            assert_eq!(conn.trigger_program_polling_task.get(), None);
+            assert!(conn.trigger_program_pending.borrow().is_empty());
+            assert_eq!(conn.trigger_program_memory_bytes.get(), 0);
+        });
+    }
+
+    #[test]
+    fn test_trigger_program_rejects_publish_and_complete_in_one_poll() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let mut future = Box::pin(
+                conn.execute_trigger_program_work(super::TriggerProgramWork::TestEnqueueThenReady),
+            );
+            let waker = std::task::Waker::noop();
+            let mut task_cx = std::task::Context::from_waker(waker);
+            let error = match future.as_mut().poll(&mut task_cx) {
+                std::task::Poll::Ready(Err(error)) => error,
+                other => panic!("invalid publish/complete task must fail closed: {other:?}"),
+            };
+            assert!(matches!(error, FrankenError::Internal(ref detail)
+                    if detail.contains("enqueued a child and completed")));
+            drop(future);
+            assert_eq!(conn.trigger_program_active_driver.get(), None);
+            assert!(conn.trigger_program_pending.borrow().is_empty());
+            assert_eq!(conn.trigger_program_memory_bytes.get(), 0);
+        });
+    }
+
+    #[test]
+    fn test_trigger_ast_sizing_is_iterative_and_accounting_fails_closed() {
+        fn nested_select(depth: usize) -> Statement {
+            let mut statement = super::parse_single_statement("SELECT 0;").unwrap();
+            let Statement::Select(select) = &mut statement else {
+                unreachable!("SELECT parser must return a SELECT");
+            };
+            let fsqlite_ast::SelectCore::Select { columns, .. } = &mut select.body.select else {
+                unreachable!("SELECT parser must return a SELECT core");
+            };
+            let fsqlite_ast::ResultColumn::Expr { expr, .. } = &mut columns[0] else {
+                unreachable!("SELECT 0 must have one expression result");
+            };
+            let mut nested = std::mem::replace(
+                expr,
+                fsqlite_ast::Expr::Literal(fsqlite_ast::Literal::Null, fsqlite_ast::Span::ZERO),
+            );
+            for _ in 0..depth {
+                nested = fsqlite_ast::Expr::UnaryOp {
+                    op: fsqlite_ast::UnaryOp::Not,
+                    expr: Box::new(nested),
+                    span: fsqlite_ast::Span::ZERO,
+                };
+            }
+            *expr = nested;
+            statement
+        }
+
+        let supported = nested_select(super::MAX_TRIGGER_PROGRAM_AST_DEPTH / 2);
+        let supported_result = super::TriggerAstMemoryCounter::measure(&supported);
+        std::mem::forget(supported);
+        assert!(supported_result.is_ok());
+
+        let too_deep = nested_select(10_000);
+        let too_deep_result = super::TriggerAstMemoryCounter::measure(&too_deep);
+        std::mem::forget(too_deep);
+        assert!(matches!(
+            too_deep_result,
+            Err(FrankenError::ExpressionTooDeep {
+                max: super::MAX_TRIGGER_PROGRAM_AST_DEPTH
+            })
+        ));
+
+        let unsupported = super::parse_single_statement("CREATE TABLE t(id INTEGER);").unwrap();
+        assert!(matches!(
+            super::TriggerAstMemoryCounter::measure(&unsupported),
+            Err(FrankenError::OutOfMemory)
+        ));
+
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.charge_trigger_program_memory(1).unwrap();
+            conn.release_trigger_program_memory(2);
+            assert_eq!(conn.trigger_program_memory_bytes.get(), usize::MAX);
+            assert!(matches!(
+                conn.charge_trigger_program_memory(1),
+                Err(FrankenError::OutOfMemory)
+            ));
+        });
+    }
+
+    #[test]
+    fn test_deepest_parser_accepted_trigger_ast_rejects_safely_on_small_stack() {
+        fn trigger_sql(depth: usize) -> String {
+            format!(
+                "CREATE TRIGGER deep_ast AFTER INSERT ON t BEGIN SELECT {}NEW.id; END;",
+                "NOT ".repeat(depth)
+            )
+        }
+
+        // Locate the exact parser boundary with logarithmic probes. The
+        // connection-layer cap must be lower so recursive clone/bind/drop glue
+        // is never entered at the parser's maximum depth.
+        let mut accepted = 0_usize;
+        let mut rejected = fsqlite_parser::parser::MAX_PARSE_DEPTH as usize + 1;
+        while accepted + 1 < rejected {
+            let candidate = accepted + (rejected - accepted) / 2;
+            if super::parse_single_statement(&trigger_sql(candidate)).is_ok() {
+                accepted = candidate;
+            } else {
+                rejected = candidate;
+            }
+        }
+        assert!(accepted > super::MAX_TRIGGER_PROGRAM_AST_DEPTH);
+        let sql = trigger_sql(accepted);
+
+        std::thread::Builder::new()
+            .name("deep-trigger-ast-lifecycle".to_owned())
+            .stack_size(1024 * 1024)
+            .spawn(move || {
+                // Prove the exact boundary statement can be parsed and dropped
+                // on the pinned stack before exercising the connection path.
+                let parsed = super::parse_single_statement(&sql)
+                    .expect("binary-searched deepest trigger expression must parse");
+                drop(parsed);
+
+                let dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                        .build()
+                        .expect("deep-AST runtime should build");
+                    runtime.block_on(async {
+                        let conn = Connection::open(":memory:").await.unwrap();
+                        conn.execute("CREATE TABLE t(id INTEGER);").await.unwrap();
+                        let error = conn
+                            .execute(&sql)
+                            .await
+                            .expect_err("unsafe recursive trigger AST must be rejected");
+                        assert!(matches!(
+                            error,
+                            FrankenError::ExpressionTooDeep {
+                                max: super::MAX_TRIGGER_PROGRAM_AST_DEPTH
+                            }
+                        ));
+                        assert!(conn.triggers.borrow().is_empty());
+                        assert_eq!(conn.trigger_program_active_driver.get(), None);
+                        assert!(conn.trigger_program_pending.borrow().is_empty());
+                        assert_eq!(conn.trigger_program_memory_bytes.get(), 0);
+                    });
+                });
+            })
+            .expect("spawn 1 MiB deep-trigger-AST thread")
+            .join()
+            .expect("deep-trigger-AST thread panicked");
+    }
+
+    #[test]
+    fn test_trigger_definition_clones_share_large_unused_tail() {
+        let statement = super::parse_single_statement(
+            "CREATE TRIGGER shared_tail AFTER INSERT ON t WHEN 1 \
+             BEGIN SELECT RAISE(IGNORE); END;",
+        )
+        .unwrap();
+        let Statement::CreateTrigger(mut create) = statement else {
+            unreachable!("expected CREATE TRIGGER");
+        };
+        let tail = super::parse_single_statement("SELECT 1;").unwrap();
+        create.body.extend(std::iter::repeat_n(tail, 4096));
+        let definition =
+            super::TriggerDef::from_create_statement(&create, "CREATE TRIGGER shared_tail".into())
+                .unwrap();
+        let clones: Vec<_> = (0..512).map(|_| definition.clone()).collect();
+        for clone in &clones {
+            assert!(std::rc::Rc::ptr_eq(&definition.body, &clone.body));
+            assert!(std::rc::Rc::ptr_eq(
+                definition.when_clause.as_ref().unwrap(),
+                clone.when_clause.as_ref().unwrap()
+            ));
+        }
+    }
+
+    #[test]
+    fn test_deep_fk_cascade_uses_constant_native_stack() {
+        std::thread::Builder::new()
+            .name("deep-fk-cascade-trampoline".to_owned())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                        .build()
+                        .expect("deep-FK runtime should build");
+                    runtime.block_on(async {
+                        let conn = Connection::open(":memory:").await.unwrap();
+                        conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+                        conn.execute(
+                            "CREATE TABLE node(
+                                id INTEGER PRIMARY KEY,
+                                parent_id INTEGER REFERENCES node(id) ON DELETE CASCADE
+                            );",
+                        )
+                        .await
+                        .unwrap();
+                        let mut insert =
+                            String::from("INSERT INTO node(id, parent_id) VALUES (1, NULL)");
+                        for id in 2..=MAX_TRIGGER_DEPTH + 1 {
+                            insert.push_str(&format!(", ({id}, {})", id - 1));
+                        }
+                        insert.push(';');
+                        conn.execute(&insert).await.unwrap();
+
+                        conn.execute("DELETE FROM node WHERE id = 1;")
+                            .await
+                            .expect("depth-1000 FK cascade must fit exactly");
+                        let rows = conn.query("SELECT COUNT(*) FROM node;").await.unwrap();
+                        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+                        assert_eq!(conn.fk_cascade_depth.get(), 0);
+                        assert_eq!(conn.trigger_program_active_driver.get(), None);
+                        assert!(conn.trigger_program_pending.borrow().is_empty());
+                        assert_eq!(conn.trigger_program_memory_bytes.get(), 0);
+                        assert!(
+                            (1..=super::TRIGGER_PROGRAM_MEMORY_BUDGET_BYTES)
+                                .contains(&conn.trigger_program_memory_peak_bytes.get())
+                        );
+                    });
+                });
+            })
+            .expect("spawn 1 MiB deep-FK thread")
+            .join()
+            .expect("deep-FK thread panicked");
     }
 
     /// Drive a probe workload, optionally without the TRACE-level test
@@ -137460,6 +141462,14 @@ mod transaction_lifecycle_tests {
         ptr.cast::<()>()
     }
 
+    struct LiveVtabReloadTestHookReset;
+
+    impl Drop for LiveVtabReloadTestHookReset {
+        fn drop(&mut self) {
+            set_live_vtab_reload_test_hook(None);
+        }
+    }
+
     fn row_values(row: &Row) -> Vec<SqliteValue> {
         row.values.clone()
     }
@@ -138038,6 +142048,213 @@ mod transaction_lifecycle_tests {
                 max_rows[0].get(0),
                 Some(&SqliteValue::Integer(1_024)),
                 "reload must keep table traversal semantics for rightmost rows"
+            );
+        });
+    }
+
+    #[test]
+    fn test_reload_memdb_vtab_error_restores_extracted_instances_and_one_shot_request() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let _hook_reset = LiveVtabReloadTestHookReset;
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(
+                "CREATE VIRTUAL TABLE cancel_atomic_error_primary USING fts5(body, tokenize='porter')",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE VIRTUAL TABLE cancel_atomic_error_secondary USING fts5(body, tokenize='porter')",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO cancel_atomic_error_primary(rowid, body) VALUES (1, 'running rust');",
+            )
+            .await
+            .unwrap();
+
+            let primary_before = live_vtab_instance_ptr(&conn, "cancel_atomic_error_primary");
+            let secondary_before = live_vtab_instance_ptr(&conn, "cancel_atomic_error_secondary");
+            let fired = Arc::new(AtomicBool::new(false));
+            set_live_vtab_reload_test_hook(Some(LiveVtabReloadTestHook::FailOnce {
+                table_key: "CANCEL_ATOMIC_ERROR_PRIMARY".to_owned(),
+                fired: Arc::clone(&fired),
+            }));
+            conn.force_full_schema_reload_once.set(true);
+
+            let reload_cx = conn.op_cx().unwrap();
+            let error = conn
+                .reload_memdb_from_pager(&reload_cx)
+                .await
+                .expect_err("the test hook must fail after extracting the first live vtab");
+            assert!(
+                matches!(error, FrankenError::Internal(ref detail)
+                    if detail == "test-only live-vtab reload failure"),
+                "unexpected reload error: {error}",
+            );
+            assert!(fired.load(AtomicOrdering::SeqCst));
+            assert_eq!(
+                live_vtab_instance_ptr(&conn, "cancel_atomic_error_primary"),
+                primary_before,
+                "an error after extraction must restore the exact primary instance",
+            );
+            assert_eq!(
+                live_vtab_instance_ptr(&conn, "cancel_atomic_error_secondary"),
+                secondary_before,
+                "a later live instance must remain untouched when an earlier rebuild fails",
+            );
+            assert!(
+                conn.force_full_schema_reload_once.get(),
+                "a failed reload must restore its one-shot full-schema request",
+            );
+            assert!(
+                conn.pending_local_live_vtab_preserve_once.get(),
+                "a failed reload must retain the local-preservation obligation for retry",
+            );
+
+            conn.reload_memdb_from_pager(&reload_cx)
+                .await
+                .expect("the one-shot hook must allow exactly one successful retry");
+            assert!(
+                !conn.force_full_schema_reload_once.get(),
+                "successful publication must consume the one-shot full-schema request",
+            );
+            assert_eq!(
+                live_vtab_instance_ptr(&conn, "cancel_atomic_error_primary"),
+                primary_before,
+                "the successful retry must publish the exact restored primary instance",
+            );
+            assert_eq!(
+                live_vtab_instance_ptr(&conn, "cancel_atomic_error_secondary"),
+                secondary_before,
+                "the successful retry must preserve the exact secondary instance",
+            );
+            let rows = conn
+                .query(
+                    "SELECT rowid FROM cancel_atomic_error_primary \
+                     WHERE cancel_atomic_error_primary MATCH 'run';",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter().map(row_values).collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(1)]],
+                "the restored instance must retain its tokenizer and row state",
+            );
+        });
+    }
+
+    #[test]
+    fn test_reload_memdb_vtab_hard_drop_restores_extracted_instances_and_retry_state() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let _hook_reset = LiveVtabReloadTestHookReset;
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(
+                "CREATE VIRTUAL TABLE cancel_atomic_drop_primary USING fts5(body, tokenize='porter')",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE VIRTUAL TABLE cancel_atomic_drop_secondary USING fts5(body, tokenize='porter')",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO cancel_atomic_drop_primary(rowid, body) VALUES (1, 'running rust');",
+            )
+            .await
+            .unwrap();
+
+            let primary_before = live_vtab_instance_ptr(&conn, "cancel_atomic_drop_primary");
+            let secondary_before = live_vtab_instance_ptr(&conn, "cancel_atomic_drop_secondary");
+            let reached = Arc::new(AtomicBool::new(false));
+            let released = Arc::new(AtomicBool::new(false));
+            set_live_vtab_reload_test_hook(Some(LiveVtabReloadTestHook::Pause {
+                table_key: "CANCEL_ATOMIC_DROP_PRIMARY".to_owned(),
+                reached: Arc::clone(&reached),
+                released,
+            }));
+            conn.force_full_schema_reload_once.set(true);
+
+            let reload_cx = conn.op_cx().unwrap();
+            let mut reload = Box::pin(conn.reload_memdb_from_pager(&reload_cx));
+            let waker = std::task::Waker::noop();
+            let mut task_cx = std::task::Context::from_waker(waker);
+            let mut paused_after_extraction = false;
+            for _ in 0..10_000 {
+                match reload.as_mut().poll(&mut task_cx) {
+                    Poll::Ready(result) => {
+                        panic!("reload completed before the test pause: {result:?}");
+                    }
+                    Poll::Pending if reached.load(AtomicOrdering::SeqCst) => {
+                        paused_after_extraction = true;
+                        break;
+                    }
+                    Poll::Pending => {}
+                }
+            }
+            assert!(
+                paused_after_extraction,
+                "reload did not reach the deterministic post-extraction pause",
+            );
+            assert!(
+                !conn
+                    .vtab_instances
+                    .borrow()
+                    .contains_key("CANCEL_ATOMIC_DROP_PRIMARY"),
+                "the pause must occur while the guard owns the extracted primary instance",
+            );
+            assert!(
+                conn.vtab_instances
+                    .borrow()
+                    .contains_key("CANCEL_ATOMIC_DROP_SECONDARY"),
+                "the later instance must not be extracted before the pause",
+            );
+            assert!(
+                !conn.force_full_schema_reload_once.get(),
+                "the in-flight future must own the one-shot reload request",
+            );
+
+            // Dropping a pending future is the runtime cancellation boundary.
+            drop(reload);
+            assert_eq!(
+                live_vtab_instance_ptr(&conn, "cancel_atomic_drop_primary"),
+                primary_before,
+                "hard-drop must restore the exact extracted primary instance",
+            );
+            assert_eq!(
+                live_vtab_instance_ptr(&conn, "cancel_atomic_drop_secondary"),
+                secondary_before,
+                "hard-drop must leave the later instance untouched",
+            );
+            assert!(
+                conn.force_full_schema_reload_once.get(),
+                "hard-drop must restore the one-shot full-schema request",
+            );
+            assert!(
+                conn.pending_local_live_vtab_preserve_once.get(),
+                "hard-drop must retain the local-preservation obligation for retry",
+            );
+
+            set_live_vtab_reload_test_hook(None);
+            conn.reload_memdb_from_pager(&reload_cx)
+                .await
+                .expect("retry after hard-drop must publish exactly once");
+            assert!(
+                !conn.force_full_schema_reload_once.get(),
+                "successful retry must consume the restored one-shot request",
+            );
+            assert_eq!(
+                live_vtab_instance_ptr(&conn, "cancel_atomic_drop_primary"),
+                primary_before,
+                "retry must publish the exact restored primary instance",
+            );
+            assert_eq!(
+                live_vtab_instance_ptr(&conn, "cancel_atomic_drop_secondary"),
+                secondary_before,
+                "retry must preserve the exact secondary instance",
             );
         });
     }
@@ -174267,6 +178484,91 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_cancelled_attached_open_is_operation_local_and_fresh_retry_succeeds() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let cancelled = Cx::new();
+            cancelled.cancel();
+
+            let Err(error) = conn
+                .open_attached_connection_with_cx(&cancelled, ":memory:".to_owned())
+                .await
+            else {
+                panic!("a pre-cancelled attached open must not succeed");
+            };
+            assert!(matches!(error, FrankenError::Interrupt));
+            assert!(
+                conn.root_cx().checkpoint().is_ok(),
+                "nested-open cancellation must not contaminate the connection root"
+            );
+
+            let fresh = Cx::new();
+            let attached = conn
+                .open_attached_connection_with_cx(&fresh, ":memory:".to_owned())
+                .await
+                .expect("a fresh operation must still be able to open an attachment");
+            conn.publish_attached_connection(
+                &fresh,
+                "aux".to_owned(),
+                ":memory:".to_owned(),
+                attached,
+            )
+            .expect("fresh attachment publication must succeed");
+            assert!(conn.attached_schemas.borrow().find("aux").is_some());
+            assert!(
+                conn.attached_connections
+                    .borrow()
+                    .contains_key(&attached_schema_key("aux"))
+            );
+        });
+    }
+
+    #[test]
+    fn test_cancelled_attached_publication_mutates_neither_registry() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let opener = Cx::new();
+            let attached = conn
+                .open_attached_connection_with_cx(&opener, ":memory:".to_owned())
+                .await
+                .expect("test attachment must open before publication");
+            let cancelled_publication = Cx::new();
+            cancelled_publication.cancel();
+
+            let error = conn
+                .publish_attached_connection(
+                    &cancelled_publication,
+                    "aux".to_owned(),
+                    ":memory:".to_owned(),
+                    attached,
+                )
+                .expect_err("pre-publication cancellation must win");
+            assert!(matches!(error, FrankenError::Interrupt));
+            assert!(conn.attached_schemas.borrow().find("aux").is_none());
+            assert!(
+                !conn
+                    .attached_connections
+                    .borrow()
+                    .contains_key(&attached_schema_key("aux")),
+                "publication cancellation must not leave an attached connection without schema metadata"
+            );
+
+            let retry_cx = Cx::new();
+            let retry = conn
+                .open_attached_connection_with_cx(&retry_cx, ":memory:".to_owned())
+                .await
+                .expect("a fresh attachment must open after cancelled publication");
+            conn.publish_attached_connection(
+                &retry_cx,
+                "aux".to_owned(),
+                ":memory:".to_owned(),
+                retry,
+            )
+            .expect("fresh publication must succeed after cancelled publication");
+        });
+    }
+
+    #[test]
     fn test_attach_duplicate_fails() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
@@ -210081,6 +214383,1774 @@ mod pager_routing_tests {
                 SqliteValue::Integer(0),
                 "cascade did not remove child rows"
             );
+        });
+    }
+
+    /// Keeps the test-only shared trigger-program depth override scoped to
+    /// this nested test module.
+    struct TriggerDepthLimitOverrideGuard;
+
+    impl TriggerDepthLimitOverrideGuard {
+        fn set(limit: usize) -> Self {
+            set_trigger_depth_limit_override(Some(limit));
+            Self
+        }
+    }
+
+    impl Drop for TriggerDepthLimitOverrideGuard {
+        fn drop(&mut self) {
+            set_trigger_depth_limit_override(None);
+        }
+    }
+
+    #[test]
+    fn fk_action_depth_guard_restores_after_rejected_entry_and_cancelled_future() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+
+            {
+                let _limit = TriggerDepthLimitOverrideGuard::set(0);
+                let error = match super::FkCascadeDepthGuard::enter(&conn) {
+                    Ok(_) => panic!("zero trigger-program depth must reject an FK action"),
+                    Err(error) => error,
+                };
+                assert!(matches!(error, FrankenError::TriggerRecursionDepthExceeded));
+                assert_eq!(conn.fk_cascade_depth.get(), 0);
+            }
+
+            // Dropping a pending future is the runtime's cancellation path. The
+            // guard must restore the depth even though its nested operation did
+            // not return normally.
+            let mut cancelled = Box::pin(async {
+                let _guard = super::FkCascadeDepthGuard::enter(&conn)
+                    .expect("default limit should admit one FK action");
+                std::future::pending::<()>().await;
+            });
+            let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(matches!(
+                std::future::Future::poll(cancelled.as_mut(), &mut task_cx),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(conn.fk_cascade_depth.get(), 1);
+            drop(cancelled);
+            assert_eq!(conn.fk_cascade_depth.get(), 0);
+        });
+    }
+
+    #[test]
+    fn fk_delete_cascade_depth_overflow_rolls_back_and_subsequent_fk_stays_enforced() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            conn.execute("CREATE TABLE grandparent (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE parent (
+                    id INTEGER PRIMARY KEY,
+                    grandparent_id INTEGER REFERENCES grandparent(id) ON DELETE CASCADE
+                );",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE child (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE
+                );",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO grandparent VALUES (1);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO parent VALUES (1, 1);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO child VALUES (1, 1);")
+                .await
+                .unwrap();
+
+            {
+                let _limit = TriggerDepthLimitOverrideGuard::set(1);
+                let error = conn
+                    .execute("DELETE FROM grandparent WHERE id = 1;")
+                    .await
+                    .expect_err("second cascade action must hit the shared depth limit");
+                assert!(matches!(error, FrankenError::TriggerRecursionDepthExceeded));
+            }
+
+            for table in ["grandparent", "parent", "child"] {
+                let rows = conn
+                    .query(&format!("SELECT COUNT(*) FROM {table};"))
+                    .await
+                    .unwrap();
+                assert_eq!(rows[0].values()[0], SqliteValue::Integer(1), "{table}");
+            }
+            assert_eq!(conn.fk_cascade_depth.get(), 0);
+
+            let error = conn
+                .execute("INSERT INTO child VALUES (2, 999);")
+                .await
+                .expect_err("FK enforcement must remain enabled after a depth error");
+            assert!(matches!(error, FrankenError::ForeignKeyViolation));
+            assert_eq!(conn.fk_cascade_depth.get(), 0);
+        });
+    }
+
+    #[test]
+    fn fk_update_cascade_depth_overflow_rolls_back_parent_and_children() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            conn.execute("CREATE TABLE grandparent (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE parent (
+                    id INTEGER PRIMARY KEY REFERENCES grandparent(id) ON UPDATE CASCADE
+                );",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE child (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES parent(id) ON UPDATE CASCADE
+                );",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO grandparent VALUES (1);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO parent VALUES (1);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO child VALUES (1, 1);")
+                .await
+                .unwrap();
+
+            {
+                let _limit = TriggerDepthLimitOverrideGuard::set(1);
+                let error = conn
+                    .execute("UPDATE OR FAIL grandparent SET id = 2 WHERE id = 1;")
+                    .await
+                    .expect_err("second UPDATE cascade action must hit the shared depth limit");
+                assert!(matches!(error, FrankenError::TriggerRecursionDepthExceeded));
+            }
+
+            let grandparent = conn.query("SELECT id FROM grandparent;").await.unwrap();
+            let parent = conn.query("SELECT id FROM parent;").await.unwrap();
+            let child = conn.query("SELECT parent_id FROM child;").await.unwrap();
+            assert_eq!(grandparent[0].values()[0], SqliteValue::Integer(1));
+            assert_eq!(parent[0].values()[0], SqliteValue::Integer(1));
+            assert_eq!(child[0].values()[0], SqliteValue::Integer(1));
+            assert_eq!(conn.fk_cascade_depth.get(), 0);
+        });
+    }
+
+    #[test]
+    fn trigger_and_fk_actions_share_the_exact_depth_budget() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            conn.execute("CREATE TABLE root (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, root_id INTEGER);")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE child (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE
+                );",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE TRIGGER root_after_delete AFTER DELETE ON root BEGIN
+                    DELETE FROM parent WHERE root_id = OLD.id;
+                END;",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO root VALUES (1);").await.unwrap();
+            conn.execute("INSERT INTO parent VALUES (1, 1);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO child VALUES (1, 1);")
+                .await
+                .unwrap();
+
+            {
+                let _limit = TriggerDepthLimitOverrideGuard::set(1);
+                let error = conn
+                    .execute("DELETE FROM root WHERE id = 1;")
+                    .await
+                    .expect_err("one trigger frame exhausts a limit of one before its FK action");
+                assert!(matches!(error, FrankenError::TriggerRecursionDepthExceeded));
+            }
+            assert!(conn.trigger_frame_stack.borrow().is_empty());
+            assert_eq!(conn.fk_cascade_depth.get(), 0);
+            for table in ["root", "parent", "child"] {
+                let rows = conn
+                    .query(&format!("SELECT COUNT(*) FROM {table};"))
+                    .await
+                    .unwrap();
+                assert_eq!(rows[0].values()[0], SqliteValue::Integer(1), "{table}");
+            }
+
+            {
+                let _limit = TriggerDepthLimitOverrideGuard::set(2);
+                conn.execute("DELETE FROM root WHERE id = 1;")
+                    .await
+                    .expect("one trigger frame plus one FK action fits exactly at depth two");
+            }
+            for table in ["root", "parent", "child"] {
+                let rows = conn
+                    .query(&format!("SELECT COUNT(*) FROM {table};"))
+                    .await
+                    .unwrap();
+                assert_eq!(rows[0].values()[0], SqliteValue::Integer(0), "{table}");
+            }
+        });
+    }
+
+    #[test]
+    fn fk_update_actions_run_after_parent_update_before_after_trigger() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE child (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER NOT NULL REFERENCES parent(id) ON UPDATE CASCADE
+                );",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE TRIGGER child_before_update_sees_new_parent
+                 BEFORE UPDATE ON child
+                 WHEN NOT EXISTS (SELECT 1 FROM parent WHERE id = NEW.parent_id)
+                 BEGIN SELECT RAISE(ABORT, 'cascade ran before parent update'); END;",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE TRIGGER parent_after_update_sees_cascade
+                 AFTER UPDATE ON parent
+                 WHEN EXISTS (SELECT 1 FROM child WHERE parent_id = OLD.id)
+                 BEGIN SELECT RAISE(ABORT, 'parent AFTER UPDATE ran before cascade'); END;",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO parent VALUES (1);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO child VALUES (1, 1);")
+                .await
+                .unwrap();
+
+            conn.execute("UPDATE parent SET id = 2 WHERE id = 1;")
+                .await
+                .expect("child cascade must validate against the new parent key");
+            let rows = conn.query("SELECT parent_id FROM child;").await.unwrap();
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+        });
+    }
+
+    #[test]
+    fn self_referential_update_fk_actions_match_sqlite() {
+        asupersync::test_utils::run_test(|| async {
+            for (label, action) in [
+                ("default NO ACTION", ""),
+                ("ON UPDATE CASCADE", "ON UPDATE CASCADE"),
+                ("ON UPDATE RESTRICT", "ON UPDATE RESTRICT"),
+            ] {
+                let schema = format!(
+                    "CREATE TABLE node (
+                        id INTEGER PRIMARY KEY,
+                        parent INTEGER REFERENCES node(id) {action}
+                    );"
+                );
+                let update = "UPDATE node SET id = 2, parent = 2 WHERE id = 1;";
+
+                let conn = Connection::open(":memory:").await.unwrap();
+                conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+                conn.execute(&schema).await.unwrap();
+                conn.execute("INSERT INTO node VALUES (1, 1);")
+                    .await
+                    .unwrap();
+                conn.execute(update)
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: self-update must succeed: {error}"));
+                let fsqlite_rows = conn.query("SELECT id, parent FROM node;").await.unwrap();
+                assert_eq!(
+                    fsqlite_rows[0].values(),
+                    &[SqliteValue::Integer(2), SqliteValue::Integer(2)],
+                    "{label}: FrankenSQLite result",
+                );
+
+                let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+                sqlite.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+                sqlite.execute_batch(&schema).unwrap();
+                sqlite
+                    .execute("INSERT INTO node VALUES (1, 1);", [])
+                    .unwrap();
+                sqlite
+                    .execute(update, [])
+                    .unwrap_or_else(|error| panic!("{label}: SQLite self-update failed: {error}"));
+                let sqlite_rows: (i64, i64) = sqlite
+                    .query_row("SELECT id, parent FROM node;", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })
+                    .unwrap();
+                assert_eq!(sqlite_rows, (2, 2), "{label}: SQLite control");
+            }
+        });
+    }
+
+    #[test]
+    fn update_with_residual_external_fk_reference_rolls_back_base_mutation() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            conn.execute(
+                "CREATE TABLE node (
+                    id INTEGER PRIMARY KEY,
+                    parent INTEGER REFERENCES node(id) ON UPDATE RESTRICT
+                );",
+            )
+            .await
+            .unwrap();
+            conn.execute("CREATE TABLE prior_work (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO node VALUES (1, 1), (2, 1);")
+                .await
+                .unwrap();
+
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO prior_work VALUES (7);")
+                .await
+                .unwrap();
+            let error = conn
+                .execute("UPDATE node SET id = 3, parent = 3 WHERE id = 1;")
+                .await
+                .expect_err("the residual external child must block the update");
+            assert!(matches!(error, FrankenError::ForeignKeyViolation));
+            assert!(conn.in_transaction());
+            let rows = conn
+                .query("SELECT id, parent FROM node ORDER BY id;")
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                vec![
+                    vec![SqliteValue::Integer(1), SqliteValue::Integer(1)],
+                    vec![SqliteValue::Integer(2), SqliteValue::Integer(1)],
+                ],
+                "post-mutation FK rejection must roll the base UPDATE back",
+            );
+            assert_eq!(
+                conn.query("SELECT id FROM prior_work;").await.unwrap()[0].values()[0],
+                SqliteValue::Integer(7),
+                "the outer transaction's older work must survive",
+            );
+            conn.execute("COMMIT;").await.unwrap();
+        });
+    }
+
+    #[test]
+    fn self_referential_delete_fk_actions_match_sqlite() {
+        asupersync::test_utils::run_test(|| async {
+            for (label, action) in [
+                ("default NO ACTION", ""),
+                ("ON DELETE RESTRICT", "ON DELETE RESTRICT"),
+                ("ON DELETE CASCADE", "ON DELETE CASCADE"),
+            ] {
+                let schema = format!(
+                    "CREATE TABLE node (
+                        id INTEGER PRIMARY KEY,
+                        parent INTEGER REFERENCES node(id) {action}
+                    );"
+                );
+
+                let conn = Connection::open(":memory:").await.unwrap();
+                conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+                conn.execute(&schema).await.unwrap();
+                conn.execute("INSERT INTO node VALUES (1, 1);")
+                    .await
+                    .unwrap();
+                conn.execute("DELETE FROM node WHERE id = 1;")
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: self-delete must succeed: {error}"));
+                let fsqlite_count = conn.query("SELECT COUNT(*) FROM node;").await.unwrap();
+                assert_eq!(fsqlite_count[0].values()[0], SqliteValue::Integer(0));
+
+                let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+                sqlite.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+                sqlite.execute_batch(&schema).unwrap();
+                sqlite
+                    .execute("INSERT INTO node VALUES (1, 1);", [])
+                    .unwrap();
+                sqlite
+                    .execute("DELETE FROM node WHERE id = 1;", [])
+                    .unwrap_or_else(|error| panic!("{label}: SQLite self-delete failed: {error}"));
+                let sqlite_count: i64 = sqlite
+                    .query_row("SELECT COUNT(*) FROM node;", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(sqlite_count, 0, "{label}: SQLite control");
+            }
+        });
+    }
+
+    #[test]
+    fn delete_with_residual_external_fk_reference_rolls_back_base_mutation() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            conn.execute(
+                "CREATE TABLE node (
+                    id INTEGER PRIMARY KEY,
+                    parent INTEGER REFERENCES node(id) ON DELETE RESTRICT
+                );",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO node VALUES (1, 1), (2, 1);")
+                .await
+                .unwrap();
+
+            let error = conn
+                .execute("DELETE FROM node WHERE id = 1;")
+                .await
+                .expect_err("the remaining external child must block the delete");
+            assert!(matches!(error, FrankenError::ForeignKeyViolation));
+            let rows = conn
+                .query("SELECT id, parent FROM node ORDER BY id;")
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                vec![
+                    vec![SqliteValue::Integer(1), SqliteValue::Integer(1)],
+                    vec![SqliteValue::Integer(2), SqliteValue::Integer(1)],
+                ],
+                "post-delete FK rejection must restore the base delete",
+            );
+        });
+    }
+
+    #[test]
+    fn deferred_no_action_parent_update_rechecks_after_failed_commit_and_child_repair() {
+        asupersync::test_utils::run_test(|| async {
+            const PARENT_SQL: &str = "CREATE TABLE parent (id INTEGER PRIMARY KEY);";
+            const CHILD_SQL: &str = "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES parent(id)
+                    ON UPDATE NO ACTION DEFERRABLE INITIALLY DEFERRED
+            );";
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            conn.execute(PARENT_SQL).await.unwrap();
+            conn.execute(CHILD_SQL).await.unwrap();
+            conn.execute("INSERT INTO parent VALUES (1);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO child VALUES (10, 1);")
+                .await
+                .unwrap();
+
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("UPDATE parent SET id = 2 WHERE id = 1;")
+                .await
+                .expect("deferred NO ACTION must allow the parent UPDATE until COMMIT");
+            assert_eq!(
+                conn.query("SELECT id FROM parent;").await.unwrap()[0].values()[0],
+                SqliteValue::Integer(2),
+            );
+            assert_eq!(
+                conn.query("SELECT parent_id FROM child;").await.unwrap()[0].values()[0],
+                SqliteValue::Integer(1),
+            );
+
+            for attempt in 1..=2 {
+                let error = conn
+                    .execute("COMMIT;")
+                    .await
+                    .expect_err("unrepaired deferred NO ACTION must reject COMMIT");
+                assert!(matches!(error, FrankenError::ForeignKeyViolation));
+                assert!(
+                    conn.in_transaction(),
+                    "failed COMMIT #{attempt} must keep the transaction active"
+                );
+                assert_eq!(
+                    conn.deferred_fk_parent_action_checks.borrow().len(),
+                    1,
+                    "failed COMMIT #{attempt} must retain the parent-action obligation",
+                );
+            }
+
+            conn.execute("UPDATE child SET parent_id = 2 WHERE id = 10;")
+                .await
+                .expect("the application must be able to repair a failed deferred FK");
+            conn.execute("COMMIT;")
+                .await
+                .expect("repairing the child must make the retrying COMMIT succeed");
+            assert!(conn.deferred_fk_parent_action_checks.borrow().is_empty());
+            let fsqlite_rows = conn
+                .query(
+                    "SELECT child.id, child.parent_id
+                     FROM child JOIN parent ON parent.id = child.parent_id;",
+                )
+                .await
+                .unwrap();
+            assert_eq!(fsqlite_rows.len(), 1);
+
+            // C SQLite is the semantic control for the crucial distinction:
+            // the UPDATE is deferred, repeated failed COMMITs retain the
+            // obligation, and repairing the child permits the same transaction
+            // to commit.
+            let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+            sqlite.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            sqlite.execute_batch(PARENT_SQL).unwrap();
+            sqlite.execute_batch(CHILD_SQL).unwrap();
+            sqlite
+                .execute("INSERT INTO parent VALUES (1);", [])
+                .unwrap();
+            sqlite
+                .execute("INSERT INTO child VALUES (10, 1);", [])
+                .unwrap();
+            sqlite.execute_batch("BEGIN;").unwrap();
+            sqlite
+                .execute("UPDATE parent SET id = 2 WHERE id = 1;", [])
+                .unwrap();
+            sqlite
+                .execute_batch("COMMIT;")
+                .expect_err("SQLite must reject the first unrepaired COMMIT");
+            sqlite
+                .execute_batch("COMMIT;")
+                .expect_err("SQLite must retain the deferred obligation for a retry");
+            sqlite
+                .execute("UPDATE child SET parent_id = 2 WHERE id = 10;", [])
+                .unwrap();
+            sqlite.execute_batch("COMMIT;").unwrap();
+            let sqlite_rows: i64 = sqlite
+                .query_row(
+                    "SELECT COUNT(*) FROM child JOIN parent ON parent.id = child.parent_id;",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(sqlite_rows, 1);
+        });
+    }
+
+    #[test]
+    fn deferred_no_action_parent_delete_rechecks_after_failed_commit_and_child_repair() {
+        asupersync::test_utils::run_test(|| async {
+            const PARENT_SQL: &str = "CREATE TABLE parent (id INTEGER PRIMARY KEY);";
+            const CHILD_SQL: &str = "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES parent(id)
+                    ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED
+            );";
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            conn.execute(PARENT_SQL).await.unwrap();
+            conn.execute(CHILD_SQL).await.unwrap();
+            conn.execute("INSERT INTO parent VALUES (1);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO child VALUES (10, 1);")
+                .await
+                .unwrap();
+
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("DELETE FROM parent WHERE id = 1;")
+                .await
+                .expect("deferred NO ACTION must allow the parent DELETE until COMMIT");
+            for attempt in 1..=2 {
+                let error = conn
+                    .execute("COMMIT;")
+                    .await
+                    .expect_err("unrepaired deferred NO ACTION must reject COMMIT");
+                assert!(matches!(error, FrankenError::ForeignKeyViolation));
+                assert!(
+                    conn.in_transaction(),
+                    "failed COMMIT #{attempt} must keep the transaction active"
+                );
+                assert_eq!(
+                    conn.deferred_fk_parent_action_checks.borrow().len(),
+                    1,
+                    "failed COMMIT #{attempt} must retain the parent-action obligation",
+                );
+            }
+
+            conn.execute("DELETE FROM child WHERE id = 10;")
+                .await
+                .expect("removing the remaining child must repair the deferred relationship");
+            conn.execute("COMMIT;")
+                .await
+                .expect("repairing the child must make the retrying COMMIT succeed");
+            assert!(conn.deferred_fk_parent_action_checks.borrow().is_empty());
+            assert!(
+                conn.query("SELECT * FROM parent;")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(conn.query("SELECT * FROM child;").await.unwrap().is_empty());
+
+            let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+            sqlite.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            sqlite.execute_batch(PARENT_SQL).unwrap();
+            sqlite.execute_batch(CHILD_SQL).unwrap();
+            sqlite
+                .execute("INSERT INTO parent VALUES (1);", [])
+                .unwrap();
+            sqlite
+                .execute("INSERT INTO child VALUES (10, 1);", [])
+                .unwrap();
+            sqlite.execute_batch("BEGIN;").unwrap();
+            sqlite
+                .execute("DELETE FROM parent WHERE id = 1;", [])
+                .unwrap();
+            sqlite
+                .execute_batch("COMMIT;")
+                .expect_err("SQLite must reject the first unrepaired COMMIT");
+            sqlite
+                .execute_batch("COMMIT;")
+                .expect_err("SQLite must retain the deferred obligation for a retry");
+            sqlite
+                .execute("DELETE FROM child WHERE id = 10;", [])
+                .unwrap();
+            sqlite.execute_batch("COMMIT;").unwrap();
+            let sqlite_parent_count: i64 = sqlite
+                .query_row("SELECT COUNT(*) FROM parent;", [], |row| row.get(0))
+                .unwrap();
+            let sqlite_child_count: i64 = sqlite
+                .query_row("SELECT COUNT(*) FROM child;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!((sqlite_parent_count, sqlite_child_count), (0, 0));
+        });
+    }
+
+    #[test]
+    fn deferred_child_fk_checks_final_state_after_delete_or_repair_like_sqlite() {
+        asupersync::test_utils::run_test(|| async {
+            const PARENT_SQL: &str = "CREATE TABLE parent (id INTEGER PRIMARY KEY);";
+            const CHILD_SQL: &str = "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+            );";
+
+            for (label, repair_sql, expected_child_count) in [
+                ("delete orphan", "DELETE FROM child WHERE id = 10;", 0_i64),
+                (
+                    "re-parent orphan",
+                    "UPDATE child SET parent_id = 1 WHERE id = 10;",
+                    1_i64,
+                ),
+                (
+                    "set orphan key to NULL",
+                    "UPDATE child SET parent_id = NULL WHERE id = 10;",
+                    1_i64,
+                ),
+            ] {
+                let conn = Connection::open(":memory:").await.unwrap();
+                conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+                conn.execute(PARENT_SQL).await.unwrap();
+                conn.execute(CHILD_SQL).await.unwrap();
+                conn.execute("INSERT INTO parent VALUES (1);")
+                    .await
+                    .unwrap();
+                conn.execute("BEGIN;").await.unwrap();
+                conn.execute("INSERT INTO child VALUES (10, 99);")
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("{label}: deferred child violation must reach COMMIT: {error}")
+                    });
+                assert_eq!(conn.deferred_fk_checks.borrow().len(), 1, "{label}");
+                for attempt in 1..=2 {
+                    let error = conn
+                        .execute("COMMIT;")
+                        .await
+                        .expect_err("unrepaired child-side deferred FK must reject COMMIT");
+                    assert!(matches!(error, FrankenError::ForeignKeyViolation));
+                    assert!(
+                        conn.in_transaction(),
+                        "{label}: failed child-side COMMIT #{attempt} must keep the transaction active",
+                    );
+                    assert_eq!(
+                        conn.deferred_fk_checks.borrow().len(),
+                        1,
+                        "{label}: failed child-side COMMIT #{attempt} must retain its obligation",
+                    );
+                }
+                conn.execute(repair_sql)
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: repair failed: {error}"));
+                conn.execute("COMMIT;").await.unwrap_or_else(|error| {
+                    panic!("{label}: final-state repair must commit: {error}")
+                });
+                assert!(
+                    conn.deferred_fk_checks.borrow().is_empty(),
+                    "{label}: successful COMMIT must consume the child-side obligation",
+                );
+                assert_eq!(
+                    conn.query("SELECT COUNT(*) FROM child;").await.unwrap()[0].values()[0],
+                    SqliteValue::Integer(expected_child_count),
+                    "{label}: FrankenSQLite final state",
+                );
+
+                let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+                sqlite.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+                sqlite.execute_batch(PARENT_SQL).unwrap();
+                sqlite.execute_batch(CHILD_SQL).unwrap();
+                sqlite
+                    .execute("INSERT INTO parent VALUES (1);", [])
+                    .unwrap();
+                sqlite.execute_batch("BEGIN;").unwrap();
+                sqlite
+                    .execute("INSERT INTO child VALUES (10, 99);", [])
+                    .unwrap_or_else(|error| {
+                        panic!("{label}: SQLite deferred child insert failed: {error}")
+                    });
+                sqlite
+                    .execute_batch("COMMIT;")
+                    .expect_err("SQLite must reject the first unrepaired child-side COMMIT");
+                sqlite
+                    .execute_batch("COMMIT;")
+                    .expect_err("SQLite must retain child-side deferred obligations for a retry");
+                sqlite
+                    .execute(repair_sql, [])
+                    .unwrap_or_else(|error| panic!("{label}: SQLite repair failed: {error}"));
+                sqlite.execute_batch("COMMIT;").unwrap_or_else(|error| {
+                    panic!("{label}: SQLite final-state repair failed: {error}")
+                });
+                let sqlite_child_count: i64 = sqlite
+                    .query_row("SELECT COUNT(*) FROM child;", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(
+                    sqlite_child_count, expected_child_count,
+                    "{label}: SQLite control"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn deferred_parent_update_allows_restoring_the_original_key_before_commit() {
+        asupersync::test_utils::run_test(|| async {
+            const PARENT_SQL: &str = "CREATE TABLE parent (id INTEGER PRIMARY KEY);";
+            const CHILD_SQL: &str = "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES parent(id)
+                    ON UPDATE NO ACTION DEFERRABLE INITIALLY DEFERRED
+            );";
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            conn.execute(PARENT_SQL).await.unwrap();
+            conn.execute(CHILD_SQL).await.unwrap();
+            conn.execute("INSERT INTO parent VALUES (1);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO child VALUES (10, 1);")
+                .await
+                .unwrap();
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("UPDATE parent SET id = 2 WHERE id = 1;")
+                .await
+                .unwrap();
+            assert_eq!(conn.deferred_fk_parent_action_checks.borrow().len(), 1);
+            conn.execute("UPDATE parent SET id = 1 WHERE id = 2;")
+                .await
+                .unwrap();
+            conn.execute("COMMIT;")
+                .await
+                .expect("restoring the original parent key must satisfy final FK state");
+            assert_eq!(
+                conn.query("SELECT parent_id FROM child;").await.unwrap()[0].values()[0],
+                SqliteValue::Integer(1),
+            );
+
+            let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+            sqlite.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            sqlite.execute_batch(PARENT_SQL).unwrap();
+            sqlite.execute_batch(CHILD_SQL).unwrap();
+            sqlite
+                .execute("INSERT INTO parent VALUES (1);", [])
+                .unwrap();
+            sqlite
+                .execute("INSERT INTO child VALUES (10, 1);", [])
+                .unwrap();
+            sqlite.execute_batch("BEGIN;").unwrap();
+            sqlite
+                .execute("UPDATE parent SET id = 2 WHERE id = 1;", [])
+                .unwrap();
+            sqlite
+                .execute("UPDATE parent SET id = 1 WHERE id = 2;", [])
+                .unwrap();
+            sqlite.execute_batch("COMMIT;").unwrap();
+            let sqlite_child_parent: i64 = sqlite
+                .query_row("SELECT parent_id FROM child;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(sqlite_child_parent, 1);
+        });
+    }
+
+    #[test]
+    fn deferred_parent_delete_allows_reinserting_the_original_key_before_commit() {
+        asupersync::test_utils::run_test(|| async {
+            const PARENT_SQL: &str = "CREATE TABLE parent (id INTEGER PRIMARY KEY);";
+            const CHILD_SQL: &str = "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES parent(id)
+                    ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED
+            );";
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            conn.execute(PARENT_SQL).await.unwrap();
+            conn.execute(CHILD_SQL).await.unwrap();
+            conn.execute("INSERT INTO parent VALUES (1);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO child VALUES (10, 1);")
+                .await
+                .unwrap();
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("DELETE FROM parent WHERE id = 1;")
+                .await
+                .unwrap();
+            assert_eq!(conn.deferred_fk_parent_action_checks.borrow().len(), 1);
+            conn.execute("INSERT INTO parent VALUES (1);")
+                .await
+                .unwrap();
+            conn.execute("COMMIT;")
+                .await
+                .expect("reinserting the parent must satisfy final FK state");
+            assert_eq!(
+                conn.query("SELECT COUNT(*) FROM parent;").await.unwrap()[0].values()[0],
+                SqliteValue::Integer(1),
+            );
+
+            let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+            sqlite.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            sqlite.execute_batch(PARENT_SQL).unwrap();
+            sqlite.execute_batch(CHILD_SQL).unwrap();
+            sqlite
+                .execute("INSERT INTO parent VALUES (1);", [])
+                .unwrap();
+            sqlite
+                .execute("INSERT INTO child VALUES (10, 1);", [])
+                .unwrap();
+            sqlite.execute_batch("BEGIN;").unwrap();
+            sqlite
+                .execute("DELETE FROM parent WHERE id = 1;", [])
+                .unwrap();
+            sqlite
+                .execute("INSERT INTO parent VALUES (1);", [])
+                .unwrap();
+            sqlite.execute_batch("COMMIT;").unwrap();
+            let sqlite_parent_count: i64 = sqlite
+                .query_row("SELECT COUNT(*) FROM parent;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(sqlite_parent_count, 1);
+        });
+    }
+
+    #[test]
+    fn deferred_fk_with_missing_parent_schema_fails_at_child_dml_like_sqlite() {
+        asupersync::test_utils::run_test(|| async {
+            const CHILD_SQL: &str = "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES missing_parent(id)
+                    DEFERRABLE INITIALLY DEFERRED
+            );";
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            conn.execute(CHILD_SQL).await.unwrap();
+
+            conn.execute("BEGIN;").await.unwrap();
+            let error = conn
+                .execute("INSERT INTO child VALUES (10, 99);")
+                .await
+                .expect_err("a missing parent schema is not deferrable");
+            assert!(matches!(
+                error,
+                FrankenError::NoSuchTable { ref name } if name == "missing_parent"
+            ));
+            assert!(conn.in_transaction());
+            assert!(conn.deferred_fk_checks.borrow().is_empty());
+            conn.execute("COMMIT;").await.unwrap();
+
+            let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+            sqlite.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            sqlite.execute_batch(CHILD_SQL).unwrap();
+            sqlite.execute_batch("BEGIN;").unwrap();
+            let error = sqlite
+                .execute("INSERT INTO child VALUES (10, 99);", [])
+                .expect_err("SQLite must reject missing parent schema at child DML");
+            assert!(
+                error.to_string().contains("no such table"),
+                "unexpected SQLite missing-parent error: {error}",
+            );
+            sqlite.execute_batch("COMMIT;").unwrap();
+        });
+    }
+
+    #[test]
+    fn shorthand_fk_uses_declared_non_ipk_and_without_rowid_primary_keys_like_sqlite() {
+        asupersync::test_utils::run_test(|| async {
+            for (
+                label,
+                parent_sql,
+                child_sql,
+                seed_sql,
+                update_sql,
+                child_state_sql,
+                expected_child_state,
+                orphan_sql,
+            ) in [
+                (
+                    "single non-IPK TEXT PRIMARY KEY",
+                    "CREATE TABLE parent (key TEXT PRIMARY KEY, payload TEXT);",
+                    "CREATE TABLE child (
+                        id INTEGER PRIMARY KEY,
+                        parent_key TEXT REFERENCES parent ON UPDATE CASCADE
+                    );",
+                    "INSERT INTO parent VALUES ('old', 'payload');
+                     INSERT INTO child VALUES (1, 'old');",
+                    "UPDATE parent SET key = 'new' WHERE key = 'old';",
+                    "SELECT parent_key FROM child WHERE id = 1;",
+                    vec![SqliteValue::Text("new".into())],
+                    "INSERT INTO child VALUES (2, 'orphan');",
+                ),
+                (
+                    "composite WITHOUT ROWID PRIMARY KEY",
+                    "CREATE TABLE parent (
+                        tenant TEXT,
+                        item TEXT,
+                        PRIMARY KEY(tenant, item)
+                    ) WITHOUT ROWID;",
+                    "CREATE TABLE child (
+                        id INTEGER PRIMARY KEY,
+                        tenant TEXT,
+                        item TEXT,
+                        FOREIGN KEY(tenant, item) REFERENCES parent ON UPDATE CASCADE
+                    );",
+                    "INSERT INTO parent VALUES ('tenant-old', 'item-old');
+                     INSERT INTO child VALUES (1, 'tenant-old', 'item-old');",
+                    "UPDATE parent
+                     SET tenant = 'tenant-new', item = 'item-new'
+                     WHERE tenant = 'tenant-old' AND item = 'item-old';",
+                    "SELECT tenant, item FROM child WHERE id = 1;",
+                    vec![
+                        SqliteValue::Text("tenant-new".into()),
+                        SqliteValue::Text("item-new".into()),
+                    ],
+                    "INSERT INTO child VALUES (2, 'tenant-orphan', 'item-orphan');",
+                ),
+            ] {
+                let conn = Connection::open(":memory:").await.unwrap();
+                conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+                conn.execute(parent_sql).await.unwrap_or_else(|error| {
+                    panic!("{label}: FrankenSQLite parent DDL failed: {error}")
+                });
+                conn.execute(child_sql).await.unwrap_or_else(|error| {
+                    panic!("{label}: FrankenSQLite child DDL failed: {error}")
+                });
+                conn.execute(seed_sql)
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: FrankenSQLite seed failed: {error}"));
+                conn.execute(update_sql).await.unwrap_or_else(|error| {
+                    panic!("{label}: shorthand parent-key cascade failed: {error}")
+                });
+                assert_eq!(
+                    conn.query(child_state_sql).await.unwrap()[0].values(),
+                    expected_child_state.as_slice(),
+                    "{label}: parent action must use the declared shorthand key",
+                );
+                let error = conn
+                    .execute(orphan_sql)
+                    .await
+                    .expect_err("the resolved shorthand key must reject an orphan");
+                assert!(
+                    matches!(error, FrankenError::ForeignKeyViolation),
+                    "{label}: unexpected FrankenSQLite orphan error: {error:?}",
+                );
+
+                let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+                sqlite.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+                sqlite.execute_batch(parent_sql).unwrap();
+                sqlite.execute_batch(child_sql).unwrap();
+                sqlite.execute_batch(seed_sql).unwrap();
+                sqlite.execute_batch(update_sql).unwrap_or_else(|error| {
+                    panic!("{label}: SQLite shorthand parent-key cascade failed: {error}")
+                });
+                let sqlite_state = sqlite
+                    .prepare(child_state_sql)
+                    .unwrap()
+                    .query_row([], |row| {
+                        (0..row.as_ref().column_count())
+                            .map(|index| row.get::<_, String>(index))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap()
+                    .into_iter()
+                    .map(|value| SqliteValue::Text(value.into()))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    sqlite_state, expected_child_state,
+                    "{label}: SQLite control"
+                );
+                let error = sqlite
+                    .execute(orphan_sql, [])
+                    .expect_err("SQLite must reject the same orphan");
+                assert!(
+                    error.to_string().contains("FOREIGN KEY constraint failed"),
+                    "{label}: unexpected SQLite orphan error: {error}",
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn shorthand_fk_missing_or_wrong_arity_parent_key_fails_closed_like_sqlite() {
+        asupersync::test_utils::run_test(|| async {
+            for (label, parent_sql, child_sql, insert_sql) in [
+                (
+                    "no declared parent key",
+                    "CREATE TABLE parent (value TEXT);",
+                    "CREATE TABLE child (id INTEGER PRIMARY KEY, value TEXT REFERENCES parent);",
+                    "INSERT INTO child VALUES (1, 'orphan');",
+                ),
+                (
+                    "composite parent key with one shorthand child column",
+                    "CREATE TABLE parent (
+                        first TEXT,
+                        second TEXT,
+                        PRIMARY KEY(first, second)
+                    ) WITHOUT ROWID;",
+                    "CREATE TABLE child (id INTEGER PRIMARY KEY, first TEXT REFERENCES parent);",
+                    "INSERT INTO child VALUES (1, 'orphan');",
+                ),
+            ] {
+                let conn = Connection::open(":memory:").await.unwrap();
+                conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+                conn.execute(parent_sql).await.unwrap();
+                conn.execute(child_sql).await.unwrap();
+                let error = conn
+                    .execute(insert_sql)
+                    .await
+                    .expect_err("an unresolvable shorthand parent key must not be skipped");
+                assert!(
+                    matches!(error, FrankenError::FunctionError(ref message)
+                        if message == "foreign key mismatch - \"child\" referencing \"parent\""),
+                    "{label}: unexpected FrankenSQLite mismatch error: {error:?}",
+                );
+
+                let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+                sqlite.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+                sqlite.execute_batch(parent_sql).unwrap();
+                sqlite.execute_batch(child_sql).unwrap();
+                let error = sqlite
+                    .execute(insert_sql, [])
+                    .expect_err("SQLite must reject an unresolvable shorthand parent key");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("foreign key mismatch - \"child\" referencing \"parent\""),
+                    "{label}: unexpected SQLite mismatch error: {error}",
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn deferred_restrict_parent_actions_remain_statement_immediate_like_sqlite() {
+        asupersync::test_utils::run_test(|| async {
+            for (label, action_clause, statement, parent_count_sql) in [
+                (
+                    "UPDATE",
+                    "ON UPDATE RESTRICT",
+                    "UPDATE parent SET id = 2 WHERE id = 1;",
+                    "SELECT COUNT(*) FROM parent WHERE id = 1;",
+                ),
+                (
+                    "DELETE",
+                    "ON DELETE RESTRICT",
+                    "DELETE FROM parent WHERE id = 1;",
+                    "SELECT COUNT(*) FROM parent WHERE id = 1;",
+                ),
+            ] {
+                let child_sql = format!(
+                    "CREATE TABLE child (
+                        id INTEGER PRIMARY KEY,
+                        parent_id INTEGER REFERENCES parent(id)
+                            {action_clause} DEFERRABLE INITIALLY DEFERRED
+                    );"
+                );
+
+                let conn = Connection::open(":memory:").await.unwrap();
+                conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+                conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+                    .await
+                    .unwrap();
+                conn.execute(&child_sql).await.unwrap();
+                conn.execute("INSERT INTO parent VALUES (1);")
+                    .await
+                    .unwrap();
+                conn.execute("INSERT INTO child VALUES (10, 1);")
+                    .await
+                    .unwrap();
+                conn.execute("BEGIN;").await.unwrap();
+                let error = conn
+                    .execute(statement)
+                    .await
+                    .expect_err("RESTRICT must reject at statement time even when deferred");
+                assert!(
+                    matches!(error, FrankenError::ForeignKeyViolation),
+                    "{label}"
+                );
+                assert_eq!(
+                    conn.query(parent_count_sql).await.unwrap()[0].values()[0],
+                    SqliteValue::Integer(1),
+                    "{label}: failed statement must restore the parent row",
+                );
+                conn.execute("ROLLBACK;").await.unwrap();
+
+                let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+                sqlite.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+                sqlite
+                    .execute_batch("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+                    .unwrap();
+                sqlite.execute_batch(&child_sql).unwrap();
+                sqlite
+                    .execute("INSERT INTO parent VALUES (1);", [])
+                    .unwrap();
+                sqlite
+                    .execute("INSERT INTO child VALUES (10, 1);", [])
+                    .unwrap();
+                sqlite.execute_batch("BEGIN;").unwrap();
+                sqlite
+                    .execute(statement, [])
+                    .expect_err("SQLite RESTRICT must reject at statement time");
+                let sqlite_parent_count: i64 = sqlite
+                    .query_row(parent_count_sql, [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(sqlite_parent_count, 1, "{label}: SQLite control");
+                sqlite.execute_batch("ROLLBACK;").unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn deferred_parent_action_obligation_rolls_back_with_named_and_statement_savepoints() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE child (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES parent(id)
+                        ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED
+                );",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO parent VALUES (1);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO child VALUES (10, 1);")
+                .await
+                .unwrap();
+
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("SAVEPOINT deferred_parent_action;")
+                .await
+                .unwrap();
+            conn.execute("DELETE FROM parent WHERE id = 1;")
+                .await
+                .unwrap();
+            assert_eq!(conn.deferred_fk_parent_action_checks.borrow().len(), 1);
+            conn.execute("ROLLBACK TO deferred_parent_action;")
+                .await
+                .unwrap();
+            assert!(conn.deferred_fk_parent_action_checks.borrow().is_empty());
+            conn.execute("COMMIT;").await.expect(
+                "rollback to the named savepoint must discard its deferred action obligation",
+            );
+
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute(
+                "CREATE TRIGGER parent_abort_after_update
+                 AFTER UPDATE ON parent
+                 BEGIN SELECT RAISE(ABORT, 'stop'); END;",
+            )
+            .await
+            .unwrap();
+            let error = conn
+                .execute("UPDATE parent SET id = 2 WHERE id = 1;")
+                .await
+                .expect_err(
+                    "the trigger must roll the statement back after recording its obligation",
+                );
+            assert!(matches!(error, FrankenError::FunctionError(_)));
+            assert!(conn.deferred_fk_parent_action_checks.borrow().is_empty());
+            conn.execute("COMMIT;")
+                .await
+                .expect("a rolled-back statement must not poison a later COMMIT");
+        });
+    }
+
+    #[test]
+    fn successful_full_rollback_clears_deferred_fk_obligations_after_teardown() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE child (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+                );",
+            )
+            .await
+            .unwrap();
+
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO child VALUES (1, 99);")
+                .await
+                .expect("the deferred violation belongs to the active transaction");
+            assert_eq!(conn.deferred_fk_checks.borrow().len(), 1);
+
+            conn.execute("ROLLBACK;")
+                .await
+                .expect("the physical rollback and state reload must succeed");
+            assert!(!conn.in_transaction());
+            assert!(
+                conn.deferred_fk_checks.borrow().is_empty(),
+                "only a completed full rollback may discard its deferred obligations",
+            );
+            assert!(conn.deferred_fk_parent_action_checks.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn fk_set_default_orphan_rolls_back_parent_and_all_children_in_autocommit_and_explicit_txn() {
+        asupersync::test_utils::run_test(|| async {
+            let autocommit = Connection::open(":memory:").await.unwrap();
+            autocommit
+                .execute("PRAGMA foreign_keys = ON;")
+                .await
+                .unwrap();
+            autocommit
+                .execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            autocommit
+                .execute(
+                    "CREATE TABLE child (
+                        id INTEGER PRIMARY KEY,
+                        parent_id INTEGER DEFAULT 999
+                            REFERENCES parent(id) ON DELETE SET DEFAULT
+                    );",
+                )
+                .await
+                .unwrap();
+            autocommit
+                .execute("INSERT INTO parent VALUES (1);")
+                .await
+                .unwrap();
+            autocommit
+                .execute("INSERT INTO child VALUES (10, 1), (11, 1);")
+                .await
+                .unwrap();
+
+            let error = autocommit
+                .execute("DELETE FROM parent WHERE id = 1;")
+                .await
+                .expect_err("SET DEFAULT without a matching default parent must fail");
+            assert!(matches!(error, FrankenError::ForeignKeyViolation));
+            let parent_rows = autocommit.query("SELECT id FROM parent;").await.unwrap();
+            let child_rows = autocommit
+                .query("SELECT id, parent_id FROM child ORDER BY id;")
+                .await
+                .unwrap();
+            assert_eq!(parent_rows[0].values()[0], SqliteValue::Integer(1));
+            assert_eq!(
+                child_rows
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                vec![
+                    vec![SqliteValue::Integer(10), SqliteValue::Integer(1)],
+                    vec![SqliteValue::Integer(11), SqliteValue::Integer(1)],
+                ],
+                "autocommit rollback must restore every child action and the parent",
+            );
+
+            let explicit = Connection::open(":memory:").await.unwrap();
+            explicit.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            explicit
+                .execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            explicit
+                .execute(
+                    "CREATE TABLE child (
+                        id INTEGER PRIMARY KEY,
+                        parent_id INTEGER DEFAULT 999
+                            REFERENCES parent(id) ON DELETE SET DEFAULT
+                    );",
+                )
+                .await
+                .unwrap();
+            explicit
+                .execute("INSERT INTO parent VALUES (1);")
+                .await
+                .unwrap();
+            explicit
+                .execute("INSERT INTO child VALUES (10, 1), (11, 1);")
+                .await
+                .unwrap();
+
+            explicit.execute("BEGIN;").await.unwrap();
+            explicit
+                .execute("INSERT INTO parent VALUES (2);")
+                .await
+                .unwrap();
+            let error = explicit
+                .execute("DELETE FROM parent WHERE id = 1;")
+                .await
+                .expect_err("SET DEFAULT orphan must abort only the failing statement");
+            assert!(matches!(error, FrankenError::ForeignKeyViolation));
+            assert!(explicit.in_transaction());
+            let parent_rows = explicit
+                .query("SELECT id FROM parent ORDER BY id;")
+                .await
+                .unwrap();
+            let child_rows = explicit
+                .query("SELECT id, parent_id FROM child ORDER BY id;")
+                .await
+                .unwrap();
+            assert_eq!(
+                parent_rows
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(2)]],
+                "the prior explicit-transaction write must survive while the failing DELETE rolls back",
+            );
+            assert_eq!(
+                child_rows
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                vec![
+                    vec![SqliteValue::Integer(10), SqliteValue::Integer(1)],
+                    vec![SqliteValue::Integer(11), SqliteValue::Integer(1)],
+                ],
+                "the explicit statement rollback must restore every child action",
+            );
+            explicit.execute("COMMIT;").await.unwrap();
+        });
+    }
+
+    #[test]
+    fn fk_action_rechecks_parent_despite_live_statement_scoped_cache() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE child (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER DEFAULT 999
+                        REFERENCES parent(id) ON DELETE SET DEFAULT
+                );",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE TRIGGER child_after_insert_removes_parent
+                 AFTER INSERT ON child
+                 BEGIN
+                    DELETE FROM parent WHERE id = NEW.parent_id;
+                 END;",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO parent VALUES (999);")
+                .await
+                .unwrap();
+
+            // INSERT ... SELECT installs a statement-scoped positive FK cache
+            // for child(parent_id=999). Its AFTER trigger then removes that
+            // parent and invokes SET DEFAULT back to 999. The nested action
+            // must issue a fresh probe, not reuse the now-stale cache entry.
+            let error = conn
+                .execute(
+                    "INSERT INTO child (id, parent_id)
+                     SELECT 1, id FROM parent WHERE id = 999;",
+                )
+                .await
+                .expect_err("nested SET DEFAULT must reject the deleted cached parent");
+            assert!(matches!(error, FrankenError::ForeignKeyViolation));
+            assert!(
+                conn.query("SELECT * FROM child;").await.unwrap().is_empty(),
+                "the outer INSERT and nested action must roll back together"
+            );
+            let rows = conn.query("SELECT id FROM parent;").await.unwrap();
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(999));
+            assert_eq!(conn.fk_cascade_depth.get(), 0);
+        });
+    }
+
+    #[test]
+    fn statement_scoped_fk_cache_invalidates_after_trigger_parent_mutation() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE src (seq INTEGER, parent_id INTEGER);")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE child (
+                    seq INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES parent(id)
+                );",
+            )
+            .await
+            .unwrap();
+            conn.execute("CREATE TABLE prior_work (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TRIGGER child_after_insert_mutates_parent
+                 AFTER INSERT ON child
+                 WHEN NEW.seq = 1
+                 BEGIN
+                    DELETE FROM child WHERE seq = NEW.seq;
+                    DELETE FROM parent WHERE id = NEW.parent_id;
+                 END;",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO parent VALUES (1);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO src VALUES (1, 1), (2, 1);")
+                .await
+                .unwrap();
+
+            let error = conn
+                .execute("INSERT INTO child SELECT seq, parent_id FROM src ORDER BY seq;")
+                .await
+                .expect_err("the second replay row must recheck the deleted parent");
+            assert!(matches!(error, FrankenError::ForeignKeyViolation));
+            assert!(
+                conn.query("SELECT * FROM child;").await.unwrap().is_empty(),
+                "autocommit rollback must remove both replay effects",
+            );
+            assert_eq!(
+                conn.query("SELECT id FROM parent;").await.unwrap()[0].values()[0],
+                SqliteValue::Integer(1),
+                "autocommit rollback must restore the parent deleted by row one",
+            );
+
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO prior_work VALUES (1);")
+                .await
+                .unwrap();
+            let error = conn
+                .execute("INSERT INTO child SELECT seq, parent_id FROM src ORDER BY seq;")
+                .await
+                .expect_err("the explicit transaction replay must also recheck row two");
+            assert!(matches!(error, FrankenError::ForeignKeyViolation));
+            assert!(conn.in_transaction());
+            assert!(
+                conn.query("SELECT * FROM child;").await.unwrap().is_empty(),
+                "the failing replay statement must leave no child rows",
+            );
+            assert_eq!(
+                conn.query("SELECT id FROM parent;").await.unwrap()[0].values()[0],
+                SqliteValue::Integer(1),
+                "the failing explicit statement must restore the parent",
+            );
+            assert_eq!(
+                conn.query("SELECT id FROM prior_work;").await.unwrap()[0].values()[0],
+                SqliteValue::Integer(1),
+                "the explicit transaction's earlier write must survive",
+            );
+            conn.execute("COMMIT;").await.unwrap();
+        });
+    }
+
+    #[test]
+    fn insert_or_fail_fk_violation_rolls_back_statement_in_autocommit_and_explicit_txn() {
+        asupersync::test_utils::run_test(|| async {
+            let autocommit = Connection::open(":memory:").await.unwrap();
+            autocommit
+                .execute("PRAGMA foreign_keys = ON;")
+                .await
+                .unwrap();
+            autocommit
+                .execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            autocommit
+                .execute(
+                    "CREATE TABLE child (
+                        id INTEGER PRIMARY KEY,
+                        parent_id INTEGER REFERENCES parent(id)
+                    );",
+                )
+                .await
+                .unwrap();
+            autocommit
+                .execute("INSERT INTO parent VALUES (1);")
+                .await
+                .unwrap();
+
+            let error = autocommit
+                .execute("INSERT OR FAIL INTO child VALUES (1, 1), (2, 999);")
+                .await
+                .expect_err("FK violations ignore the OR FAIL preserve-rows policy");
+            assert!(matches!(error, FrankenError::ForeignKeyViolation));
+            let rows = autocommit.query("SELECT * FROM child;").await.unwrap();
+            assert!(
+                rows.is_empty(),
+                "the valid first row must roll back with the FK failure"
+            );
+
+            let explicit = Connection::open(":memory:").await.unwrap();
+            explicit.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            explicit
+                .execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            explicit
+                .execute(
+                    "CREATE TABLE child (
+                        id INTEGER PRIMARY KEY,
+                        parent_id INTEGER REFERENCES parent(id)
+                    );",
+                )
+                .await
+                .unwrap();
+            explicit
+                .execute("INSERT INTO parent VALUES (1);")
+                .await
+                .unwrap();
+
+            explicit.execute("BEGIN;").await.unwrap();
+            explicit
+                .execute("INSERT INTO child VALUES (10, 1);")
+                .await
+                .unwrap();
+            let error = explicit
+                .execute("INSERT OR FAIL INTO child VALUES (11, 1), (12, 999);")
+                .await
+                .expect_err("FK violations must roll back the current OR FAIL statement");
+            assert!(matches!(error, FrankenError::ForeignKeyViolation));
+            assert!(explicit.in_transaction());
+            let rows = explicit
+                .query("SELECT id, parent_id FROM child ORDER BY id;")
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(10), SqliteValue::Integer(1)]],
+                "the transaction's older row survives, but neither row from the failing statement does",
+            );
+            explicit.execute("COMMIT;").await.unwrap();
+        });
+    }
+
+    #[test]
+    fn insert_or_rollback_fk_violation_keeps_explicit_transaction_open() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE child (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES parent(id)
+                );",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO parent VALUES (1);")
+                .await
+                .unwrap();
+
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO child VALUES (10, 1);")
+                .await
+                .unwrap();
+            let error = conn
+                .execute("INSERT OR ROLLBACK INTO child VALUES (11, 999);")
+                .await
+                .expect_err("FOREIGN KEY violations ignore OR ROLLBACK");
+            assert!(matches!(error, FrankenError::ForeignKeyViolation));
+            assert!(
+                conn.in_transaction(),
+                "an FK violation must not roll back the surrounding explicit transaction",
+            );
+            let rows = conn
+                .query("SELECT id, parent_id FROM child ORDER BY id;")
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(10), SqliteValue::Integer(1)]],
+                "the earlier transaction row must survive the FK failure",
+            );
+            conn.execute("COMMIT;").await.unwrap();
+        });
+    }
+
+    #[test]
+    fn insert_or_fail_runtime_trigger_error_rolls_back_in_autocommit_and_explicit_txn() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE protected (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE prior_work (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TRIGGER protected_after_insert AFTER INSERT ON protected BEGIN
+                    SELECT RAISE(ABORT, 'runtime trigger failure');
+                END;",
+            )
+            .await
+            .unwrap();
+
+            let error = conn
+                .execute("INSERT OR FAIL INTO protected VALUES (1), (2);")
+                .await
+                .expect_err("runtime failures cannot inherit OR FAIL partial-write semantics");
+            assert!(matches!(error, FrankenError::FunctionError(_)));
+            assert!(
+                conn.query("SELECT * FROM protected;")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO prior_work VALUES (1);")
+                .await
+                .unwrap();
+            let error = conn
+                .execute("INSERT OR FAIL INTO protected VALUES (3), (4);")
+                .await
+                .expect_err("runtime failure must roll back only the current statement");
+            assert!(matches!(error, FrankenError::FunctionError(_)));
+            assert!(conn.in_transaction());
+            assert!(
+                conn.query("SELECT * FROM protected;")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let prior_rows = conn.query("SELECT id FROM prior_work;").await.unwrap();
+            assert_eq!(prior_rows[0].values()[0], SqliteValue::Integer(1));
+            conn.execute("COMMIT;").await.unwrap();
+        });
+    }
+
+    #[test]
+    fn prepared_and_unprepared_delete_share_fk_cascade_semantics() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+            for (parent, child) in [
+                ("plain_parent", "plain_child"),
+                ("prepared_parent", "prepared_child"),
+            ] {
+                conn.execute(&format!("CREATE TABLE {parent} (id INTEGER PRIMARY KEY);"))
+                    .await
+                    .unwrap();
+                conn.execute(&format!(
+                    "CREATE TABLE {child} (
+                        id INTEGER PRIMARY KEY,
+                        parent_id INTEGER REFERENCES {parent}(id) ON DELETE CASCADE
+                    );"
+                ))
+                .await
+                .unwrap();
+                conn.execute(&format!("INSERT INTO {parent} VALUES (1);"))
+                    .await
+                    .unwrap();
+                conn.execute(&format!("INSERT INTO {child} VALUES (1, 1);"))
+                    .await
+                    .unwrap();
+            }
+
+            conn.execute("DELETE FROM plain_parent WHERE id = 1;")
+                .await
+                .unwrap();
+            let prepared = conn
+                .prepare("DELETE FROM prepared_parent WHERE id = ?1;")
+                .await
+                .unwrap();
+            assert_eq!(
+                conn.execute_prepared_with_params(&prepared, &[SqliteValue::Integer(1)])
+                    .await
+                    .unwrap(),
+                1
+            );
+            for table in [
+                "plain_parent",
+                "plain_child",
+                "prepared_parent",
+                "prepared_child",
+            ] {
+                let rows = conn
+                    .query(&format!("SELECT COUNT(*) FROM {table};"))
+                    .await
+                    .unwrap();
+                assert_eq!(rows[0].values()[0], SqliteValue::Integer(0), "{table}");
+            }
         });
     }
 

@@ -57,8 +57,10 @@ pub use s3_fifo::{
 pub use submodular_prefetch::{Candidate as PrefetchCandidate, expected_gain, greedy_select};
 pub use thompson_partitioner::{BetaArm, RESAMPLE_INTERVAL, ThompsonPartitioner};
 pub use traits::{
-    CheckpointMode, CheckpointPageWriter, CheckpointResult, JournalMode, MemoryMockMvccPager,
-    MemoryMockTransaction, MockCheckpointPageWriter, MockMvccPager, MockTransaction, MvccPager,
-    ParallelWalCommitReconciliation, TransactionHandle, TransactionKind, TransactionMode,
-    WalBackend, WalPublicationSnapshot,
+    CheckpointMode, CheckpointPageWriter, CheckpointResult, CommitTerminalCallback,
+    CommitTerminalOutcome, CommitTerminalOwner, JournalMode, MemoryMockMvccPager,
+    MemoryMockTransaction, MockCheckpointPageWriter, MockCommitFinalizationController,
+    MockMvccPager, MockTransaction, MvccPager, ParallelWalCommitReconciliation,
+    TransactionCommitState, TransactionHandle, TransactionKind, TransactionMode, WalBackend,
+    WalPublicationSnapshot,
 };

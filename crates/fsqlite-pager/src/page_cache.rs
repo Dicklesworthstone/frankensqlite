@@ -33,7 +33,7 @@ use fsqlite_observability::PageCacheEfficiencySnapshot;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::sync_primitives::Mutex;
 use fsqlite_types::{PageData, PageNumber, PageSize};
-use fsqlite_vfs::VfsFile;
+use fsqlite_vfs::{VfsFile, VfsWriteCompletion, VfsWriteCompletionState};
 
 use crate::arc_cache::{ArcEvictionModel, CacheLookup};
 use crate::page_buf::{PageBuf, PageBufPool};
@@ -1171,6 +1171,32 @@ const GOLDEN_RATIO_32: u32 = 2_654_435_769;
 /// 1024 pages = 4MB at default 4KB page size, covers most small databases.
 const FAST_ARRAY_INITIAL_CAPACITY: usize = 1024;
 
+/// Monotone identity assigned to each resident cache entry.
+///
+/// Mutation generations are local to one entry and restart when a whole page
+/// image is replaced. Pairing this token with the generation prevents an old
+/// writeback from marking a distinct replacement entry clean after an ABA
+/// transition through the same page number and generation.
+static NEXT_CACHED_PAGE_ENTRY_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn next_cached_page_entry_token() -> u64 {
+    NEXT_CACHED_PAGE_ENTRY_TOKEN
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("cached-page entry identity space exhausted")
+}
+
+#[inline]
+fn advance_cached_page_mutation_generation(generation: &AtomicU64) {
+    generation
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .expect("cached-page mutation generation exhausted");
+}
+
 // ---------------------------------------------------------------------------
 // FlatPageSlots constants (bd-eorms)
 // ---------------------------------------------------------------------------
@@ -1229,6 +1255,7 @@ fn normalize_page_cache_shard_count(requested: usize) -> usize {
 struct CachedPageEntry {
     buf: PageBuf,
     shared: Option<Arc<[u8]>>,
+    entry_token: u64,
     access_count: AtomicU64,
     dirty: AtomicBool,
     mutation_generation: AtomicU64,
@@ -1240,6 +1267,7 @@ impl CachedPageEntry {
         Self {
             buf,
             shared: None,
+            entry_token: next_cached_page_entry_token(),
             access_count: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
             mutation_generation: AtomicU64::new(0),
@@ -1251,6 +1279,7 @@ impl CachedPageEntry {
         Self {
             buf,
             shared: None,
+            entry_token: next_cached_page_entry_token(),
             access_count: AtomicU64::new(0),
             dirty: AtomicBool::new(true),
             mutation_generation: AtomicU64::new(1),
@@ -1306,8 +1335,16 @@ impl CachedPageEntry {
 
     #[inline]
     fn mark_dirty(&self) {
-        self.mutation_generation.fetch_add(1, Ordering::AcqRel);
+        advance_cached_page_mutation_generation(&self.mutation_generation);
         self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn mark_dirty_if_clean(&self) {
+        if !self.is_dirty() {
+            advance_cached_page_mutation_generation(&self.mutation_generation);
+            self.dirty.store(true, Ordering::Release);
+        }
     }
 
     #[inline]
@@ -1318,6 +1355,11 @@ impl CachedPageEntry {
     #[inline]
     fn mutation_generation(&self) -> u64 {
         self.mutation_generation.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn entry_token(&self) -> u64 {
+        self.entry_token
     }
 
     #[inline]
@@ -2020,6 +2062,46 @@ impl FlatPageSlots {
         Some(entry.buf)
     }
 
+    /// Remove exactly the clean entry certified by a completed writeback.
+    ///
+    /// The identity and generation checks share the payload lock with the
+    /// page-number CAS, so a whole-entry replacement or in-place mutation
+    /// cannot be mistaken for the image that reached the VFS.
+    fn take_if_clean_snapshot_from_pool(
+        &self,
+        page_no: PageNumber,
+        receipt: PageWriteReceipt,
+        pool: &PageBufPool,
+    ) -> Option<PageBuf> {
+        let idx = self.find_slot(page_no)?;
+        let pgno = page_no.get();
+        let mut data = self.slots[idx].data.lock();
+        let reclaimable = data.as_ref().is_some_and(|entry| {
+            entry.entry_token() == receipt.entry_token
+                && entry.mutation_generation() == receipt.mutation_generation
+                && !entry.is_dirty()
+                && entry.buf.returns_to_pool(pool)
+        });
+        if self.slots[idx].pgno.load(Ordering::Acquire) != pgno || !reclaimable {
+            return None;
+        }
+        if self.slots[idx]
+            .pgno
+            .compare_exchange(pgno, SLOT_TOMBSTONE, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+
+        let entry = data
+            .take()
+            .expect("certified flat cache entry must still be present");
+        self.count.fetch_sub(1, Ordering::Relaxed);
+        self.has_tombstones.store(true, Ordering::Release);
+        self.evictions.fetch_add(1, Ordering::Relaxed);
+        Some(entry.buf)
+    }
+
     /// Remove an arbitrary page (for eviction) and return its page number.
     fn remove_any_page(&self) -> Option<PageNumber> {
         let start = self.eviction_cursor.fetch_add(1, Ordering::Relaxed);
@@ -2334,6 +2416,27 @@ impl InFlightPageRead {
     }
 }
 
+struct PageWriteSnapshot {
+    page: PageData,
+    entry_token: u64,
+    mutation_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PageWriteReceipt {
+    entry_token: u64,
+    mutation_generation: u64,
+}
+
+impl PageWriteSnapshot {
+    fn receipt(&self) -> PageWriteReceipt {
+        PageWriteReceipt {
+            entry_token: self.entry_token,
+            mutation_generation: self.mutation_generation,
+        }
+    }
+}
+
 enum InFlightReadRole<'a> {
     Leader(InFlightReadLeader<'a>),
     Follower(Arc<InFlightPageRead>),
@@ -2375,6 +2478,101 @@ impl Drop for InFlightReadLeader<'_> {
     }
 }
 
+#[derive(Debug)]
+struct InFlightPageWrite {
+    completion: VfsWriteCompletion,
+    snapshot_identity: Mutex<Option<PageWriteReceipt>>,
+    dispatched: AtomicBool,
+}
+
+impl InFlightPageWrite {
+    fn new() -> Self {
+        Self {
+            completion: VfsWriteCompletion::new(),
+            snapshot_identity: Mutex::new(None),
+            dispatched: AtomicBool::new(false),
+        }
+    }
+
+    fn set_snapshot_identity(&self, receipt: PageWriteReceipt) {
+        *self.snapshot_identity.lock() = Some(receipt);
+    }
+
+    fn mark_dispatched(&self) {
+        self.dispatched.store(true, Ordering::Release);
+    }
+
+    fn was_dispatched(&self) -> bool {
+        self.dispatched.load(Ordering::Acquire)
+    }
+
+    fn complete_before_dispatch_error(&self) {
+        debug_assert!(!self.was_dispatched());
+        self.completion.complete_error();
+    }
+}
+
+struct WriteFlightDispatchGuard {
+    flight: Arc<InFlightPageWrite>,
+}
+
+impl WriteFlightDispatchGuard {
+    fn new(flight: Arc<InFlightPageWrite>) -> Self {
+        Self { flight }
+    }
+}
+
+impl Drop for WriteFlightDispatchGuard {
+    fn drop(&mut self) {
+        // The guard is constructed before a spawned closure or direct write
+        // can be suspended. If that work is discarded before VFS admission,
+        // no hidden side effect can exist and the flight may safely become
+        // terminal Error. Once dispatched, only the VFS source may complete
+        // the token.
+        if !self.flight.was_dispatched() {
+            self.flight.complete_before_dispatch_error();
+        }
+    }
+}
+
+enum InFlightWriteRole<'a> {
+    Leader(InFlightWriteLeader<'a>),
+    Follower(Arc<InFlightPageWrite>),
+}
+
+struct InFlightWriteLeader<'a> {
+    cache: &'a ShardedPageCache,
+    page_no: PageNumber,
+    flight: Arc<InFlightPageWrite>,
+    finished: bool,
+}
+
+impl InFlightWriteLeader<'_> {
+    fn flight(&self) -> Arc<InFlightPageWrite> {
+        Arc::clone(&self.flight)
+    }
+
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+
+        self.cache
+            .retire_terminal_write_flight(self.page_no, &self.flight);
+        self.finished = true;
+    }
+}
+
+impl Drop for InFlightWriteLeader<'_> {
+    fn drop(&mut self) {
+        // A dropped observer does not necessarily terminate the underlying
+        // VFS side effect. Keep the per-page gate installed while the
+        // source-owned completion remains Pending; the next waiter retires it
+        // only after the source reports Success or Error.
+        self.finish();
+    }
+}
+
 pub struct ShardedPageCache {
     /// CAS-based flat hash page cache (bd-eorms, pcache1 pattern).
     /// Tried first for all lookups; cache misses are lock-free.
@@ -2412,6 +2610,10 @@ pub struct ShardedPageCache {
     /// read; later tasks await the same completion notification and retry the
     /// cache instead of amplifying disk I/O.
     in_flight_reads: Mutex<HashMap<PageNumber, Arc<InFlightPageRead>>>,
+    /// Per-page writeback flights. At most one VFS write for a logical page
+    /// may be in flight, preventing an older snapshot from landing after a
+    /// newer snapshot and making the file image stale.
+    in_flight_writes: Mutex<HashMap<PageNumber, Arc<InFlightPageWrite>>>,
     /// Bayesian-mixture e-value evictor (IMPL-19 / AAC-P5).
     ///
     /// Present only when the `evalue-eviction` cargo feature is enabled.
@@ -2557,6 +2759,7 @@ impl ShardedPageCache {
             eviction_policy_enabled: AtomicBool::new(false),
             eviction_policy: Mutex::new(PageCacheEvictionTracker::default()),
             in_flight_reads: Mutex::new(HashMap::new()),
+            in_flight_writes: Mutex::new(HashMap::new()),
             #[cfg(feature = "evalue-eviction")]
             evalue_evictor: crate::evalue_eviction::EValueEvictor::new(),
             #[cfg(feature = "evalue-eviction")]
@@ -2571,6 +2774,10 @@ impl ShardedPageCache {
     /// of every cache tier so that hidden pages from a previous mode cannot
     /// later reappear and overwrite newer data.
     pub fn enable_fast_path(&mut self) {
+        assert!(
+            self.in_flight_writes.get_mut().is_empty(),
+            "cannot switch page-cache tiers while a write flight awaits retirement"
+        );
         if self.fast_array.is_none() {
             self.fast_array = Some(Mutex::new(FastPageArray::new()));
         }
@@ -2596,6 +2803,10 @@ impl ShardedPageCache {
     /// only waste memory and risk stale pages surfacing after later mode
     /// changes.
     pub fn disable_fast_path(&mut self) {
+        assert!(
+            self.in_flight_writes.get_mut().is_empty(),
+            "cannot switch page-cache tiers while a write flight awaits retirement"
+        );
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
                 fast.lock().cold_reset();
@@ -2744,39 +2955,93 @@ impl ShardedPageCache {
         }
     }
 
-    fn mark_page_clean_if_generation(&self, page_no: PageNumber, generation: u64) {
+    fn mark_page_clean_if_snapshot(
+        &self,
+        page_no: PageNumber,
+        entry_token: u64,
+        mutation_generation: u64,
+    ) -> bool {
         if self.use_fast_path.load(Ordering::Relaxed)
             && let Some(ref fast) = self.fast_array
         {
             let idx = FastPageArray::pgno_to_idx(page_no);
             if let Some(Some(entry)) = fast.lock().pages.get(idx)
-                && entry.mutation_generation() == generation
+                && entry.entry_token() == entry_token
+                && entry.mutation_generation() == mutation_generation
             {
                 entry.mark_clean();
+                return true;
             }
-            return;
+            return false;
         }
 
         if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
             let guard = self.flat_slots.slots[slot_idx].data.lock();
             if self.flat_slots.slots[slot_idx].pgno.load(Ordering::Acquire) == page_no.get()
                 && let Some(ref entry) = *guard
-                && entry.mutation_generation() == generation
+                && entry.entry_token() == entry_token
+                && entry.mutation_generation() == mutation_generation
             {
                 entry.mark_clean();
-                return;
+                return true;
             }
         }
 
         let idx = self.shard_index(page_no);
         if let Some(entry) = self.shards[idx].lock().pages.get(&page_no)
-            && entry.mutation_generation() == generation
+            && entry.entry_token() == entry_token
+            && entry.mutation_generation() == mutation_generation
         {
             entry.mark_clean();
+            return true;
+        }
+        false
+    }
+
+    fn mark_page_dirty_if_present(&self, page_no: PageNumber) -> bool {
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let idx = FastPageArray::pgno_to_idx(page_no);
+            if let Some(Some(entry)) = fast.lock().pages.get(idx) {
+                entry.mark_dirty_if_clean();
+                return true;
+            }
+            return false;
+        }
+
+        if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
+            let guard = self.flat_slots.slots[slot_idx].data.lock();
+            if self.flat_slots.slots[slot_idx].pgno.load(Ordering::Acquire) == page_no.get()
+                && let Some(ref entry) = *guard
+            {
+                entry.mark_dirty_if_clean();
+                return true;
+            }
+        }
+
+        let idx = self.shard_index(page_no);
+        if let Some(entry) = self.shards[idx].lock().pages.get(&page_no) {
+            entry.mark_dirty_if_clean();
+            return true;
+        }
+        false
+    }
+
+    fn reconcile_page_write_success(&self, page_no: PageNumber, receipt: PageWriteReceipt) {
+        if !self.mark_page_clean_if_snapshot(
+            page_no,
+            receipt.entry_token,
+            receipt.mutation_generation,
+        ) {
+            // The physical write completed for an older resident image. Any
+            // replacement must remain dirty: the just-completed bytes may
+            // have made its clean-on-disk claim stale.
+            self.mark_page_dirty_if_present(page_no);
         }
     }
 
-    fn page_write_snapshot(&self, page_no: PageNumber) -> Option<(PageData, u64)> {
+    fn page_write_snapshot(&self, page_no: PageNumber) -> Option<PageWriteSnapshot> {
         if self.use_fast_path.load(Ordering::Relaxed)
             && let Some(ref fast) = self.fast_array
         {
@@ -2786,7 +3051,11 @@ impl ShardedPageCache {
                 .get_mut(FastPageArray::pgno_to_idx(page_no))?
                 .as_mut()?;
             entry.record_access();
-            return Some((entry.shared_page(), entry.mutation_generation()));
+            return Some(PageWriteSnapshot {
+                page: entry.shared_page(),
+                entry_token: entry.entry_token(),
+                mutation_generation: entry.mutation_generation(),
+            });
         }
 
         if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
@@ -2795,7 +3064,11 @@ impl ShardedPageCache {
                 && let Some(ref mut entry) = *guard
             {
                 self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
-                return Some((entry.shared_page(), entry.mutation_generation()));
+                return Some(PageWriteSnapshot {
+                    page: entry.shared_page(),
+                    entry_token: entry.entry_token(),
+                    mutation_generation: entry.mutation_generation(),
+                });
             }
         }
 
@@ -2803,7 +3076,11 @@ impl ShardedPageCache {
         let mut shard = self.shards[idx].lock();
         shard.hits = shard.hits.saturating_add(1);
         let entry = shard.pages.get_mut(&page_no)?;
-        Some((entry.shared_page(), entry.mutation_generation()))
+        Some(PageWriteSnapshot {
+            page: entry.shared_page(),
+            entry_token: entry.entry_token(),
+            mutation_generation: entry.mutation_generation(),
+        })
     }
 
     fn claim_in_flight_read(&self, page_no: PageNumber) -> InFlightReadRole<'_> {
@@ -2821,6 +3098,65 @@ impl ShardedPageCache {
             flight,
             finished: false,
         })
+    }
+
+    fn claim_in_flight_write(&self, page_no: PageNumber) -> InFlightWriteRole<'_> {
+        loop {
+            let mut in_flight = self.in_flight_writes.lock();
+            if let Some(flight) = in_flight.get(&page_no).cloned() {
+                drop(in_flight);
+                if self.retire_terminal_write_flight(page_no, &flight) {
+                    continue;
+                }
+                return InFlightWriteRole::Follower(flight);
+            }
+
+            let flight = Arc::new(InFlightPageWrite::new());
+            in_flight.insert(page_no, Arc::clone(&flight));
+            drop(in_flight);
+            return InFlightWriteRole::Leader(InFlightWriteLeader {
+                cache: self,
+                page_no,
+                flight,
+                finished: false,
+            });
+        }
+    }
+
+    fn retire_terminal_write_flight(
+        &self,
+        page_no: PageNumber,
+        flight: &Arc<InFlightPageWrite>,
+    ) -> bool {
+        let completion_state = flight.completion.state();
+        if matches!(completion_state, VfsWriteCompletionState::Pending) {
+            return false;
+        }
+
+        let mut in_flight = self.in_flight_writes.lock();
+        if !in_flight
+            .get(&page_no)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            // A delayed observer of an old terminal flight must not
+            // reconcile against a replacement flight's resident image.
+            return true;
+        }
+
+        match completion_state {
+            VfsWriteCompletionState::Success => {
+                if let Some(receipt) = *flight.snapshot_identity.lock() {
+                    self.reconcile_page_write_success(page_no, receipt);
+                }
+            }
+            VfsWriteCompletionState::Error => {}
+            VfsWriteCompletionState::Pending => {
+                unreachable!("pending completion returned before retirement")
+            }
+        }
+
+        in_flight.remove(&page_no);
+        true
     }
 
     /// Remove an obsolete overflow copy after the authoritative insertion was
@@ -2876,6 +3212,24 @@ impl ShardedPageCache {
     ///
     /// Returns `true` if the miss-fill was admitted.
     fn insert_tiered_if_absent(&self, page_no: PageNumber, buf: PageBuf) -> bool {
+        // An installed write flight pins its resident image until retirement.
+        // Pending work rejects this clean miss-fill; terminal work is
+        // reconciled first so a delayed read cannot publish pre-write bytes.
+        // Holding the flight map through admission also orders a newly
+        // elected write leader after this clean image.
+        let in_flight = loop {
+            let in_flight = self.in_flight_writes.lock();
+            let Some(flight) = in_flight.get(&page_no).cloned() else {
+                break in_flight;
+            };
+            if matches!(flight.completion.state(), VfsWriteCompletionState::Pending) {
+                return false;
+            }
+            drop(in_flight);
+            self.retire_terminal_write_flight(page_no, &flight);
+        };
+        let _write_flight_admission_guard = in_flight;
+
         if self.use_fast_path.load(Ordering::Acquire)
             && let Some(ref fast) = self.fast_array
         {
@@ -3030,7 +3384,8 @@ impl ShardedPageCache {
     /// Access a cached page via a callback (zero-copy pattern).
     ///
     /// The callback receives a reference to the page data. Returns `None` if
-    /// the page is not cached.
+    /// the page is not cached. The callback executes while an internal cache
+    /// tier lock is held and therefore must not call back into this cache.
     #[inline]
     pub fn with_page<R>(&self, page_no: PageNumber, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
         // Fast path (bd-fzr07)
@@ -3069,6 +3424,9 @@ impl ShardedPageCache {
     }
 
     /// Access a cached page mutably via a callback.
+    ///
+    /// The callback executes while an internal cache tier lock is held and
+    /// therefore must not call back into this cache.
     #[inline]
     pub fn with_page_mut<R>(
         &self,
@@ -3189,16 +3547,81 @@ impl ShardedPageCache {
         file: &impl VfsFile,
         page_no: PageNumber,
     ) -> Result<()> {
-        let Some((page, generation)) = self.page_write_snapshot(page_no) else {
+        loop {
+            match self.claim_in_flight_write(page_no) {
+                InFlightWriteRole::Follower(flight) => {
+                    tracing::debug!(page = page_no.get(), "page-cache write coalesced");
+                    let _ = flight.completion.wait().await;
+                }
+                InFlightWriteRole::Leader(mut leader) => {
+                    let flight = leader.flight();
+                    let _dispatch_guard = WriteFlightDispatchGuard::new(Arc::clone(&flight));
+                    let result = self
+                        .write_page_uncoalesced(cx, file, page_no, flight)
+                        .await
+                        .map(|_| ());
+                    leader.finish();
+                    return result;
+                }
+            }
+        }
+    }
+
+    async fn write_page_uncoalesced(
+        &self,
+        cx: &Cx,
+        file: &impl VfsFile,
+        page_no: PageNumber,
+        flight: Arc<InFlightPageWrite>,
+    ) -> Result<PageWriteReceipt> {
+        // Enforce the cancellation contract at the cache/VFS boundary rather
+        // than relying on every backend to checkpoint before performing an
+        // externally visible write.
+        if cx.checkpoint().is_err() {
+            flight.complete_before_dispatch_error();
+            return Err(FrankenError::Abort);
+        }
+        let Some(snapshot) = self.page_write_snapshot(page_no) else {
+            flight.complete_before_dispatch_error();
             return Err(FrankenError::internal(format!(
                 "page {page_no} not in cache"
             )));
         };
+        let receipt = snapshot.receipt();
+        flight.set_snapshot_identity(receipt);
+        // Snapshotting can copy a full page. Re-check at the actual admission
+        // boundary so cancellation that arrives during that copy still wins
+        // before the VFS is allowed to publish any bytes.
+        if cx.checkpoint().is_err() {
+            flight.complete_before_dispatch_error();
+            return Err(FrankenError::Abort);
+        }
         let offset = page_offset(page_no, self.page_size);
-        file.write(cx, page.as_bytes(), offset).await?;
-        self.mark_page_clean_if_generation(page_no, generation);
-        self.record_eviction_access(page_no);
-        Ok(())
+        flight.mark_dispatched();
+        let observer_result = file
+            .write_tracked(
+                cx,
+                snapshot.page.as_bytes(),
+                offset,
+                flight.completion.clone(),
+            )
+            .await;
+        let source_result = flight.completion.wait().await;
+        match source_result {
+            VfsWriteCompletionState::Success => {
+                self.record_eviction_access(page_no);
+                Ok(receipt)
+            }
+            VfsWriteCompletionState::Error => match observer_result {
+                Ok(()) => Err(FrankenError::internal(format!(
+                    "page {page_no} write observer succeeded after the VFS source reported failure"
+                ))),
+                Err(error) => Err(error),
+            },
+            VfsWriteCompletionState::Pending => {
+                unreachable!("completion wait returns only a terminal VFS write state")
+            }
+        }
     }
 
     /// Insert a fresh (zeroed) page into the cache.
@@ -3257,10 +3680,37 @@ impl ShardedPageCache {
         buf: PageBuf,
         post_install: impl FnOnce(),
     ) {
+        // Serialize clean publication with write-flight election. If an older
+        // physical write is still unresolved, this replacement is logically
+        // current but cannot claim to match the file yet, so admit it dirty.
+        // A terminal flight is reconciled and retired first, avoiding an
+        // indefinite maintenance pin after its original observer was dropped.
+        let (in_flight, must_remain_dirty) = loop {
+            let in_flight = self.in_flight_writes.lock();
+            let Some(flight) = in_flight.get(&page_no).cloned() else {
+                break (in_flight, false);
+            };
+            if matches!(flight.completion.state(), VfsWriteCompletionState::Pending) {
+                break (in_flight, true);
+            }
+            drop(in_flight);
+            self.retire_terminal_write_flight(page_no, &flight);
+        };
+
         // Fast path (bd-fzr07)
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
-                let admitted_new = fast.lock().insert(page_no, buf);
+                let mut fast = fast.lock();
+                let admitted_new = fast.insert(page_no, buf);
+                if must_remain_dirty {
+                    let idx = FastPageArray::pgno_to_idx(page_no);
+                    fast.pages[idx]
+                        .as_ref()
+                        .expect("just-installed fast cache page must remain resident")
+                        .mark_dirty_if_clean();
+                }
+                drop(fast);
+                drop(in_flight);
                 // `FastPageArray::insert` constructs a clean entry. Do not
                 // reacquire the array lock to mark by page number: a newer
                 // dirty replacement may have won between those two critical
@@ -3275,10 +3725,11 @@ impl ShardedPageCache {
             }
         }
         // Flat slots first; overflow to shard.
-        let admitted_new = self.insert_tiered(page_no, buf, false);
-        // `insert_tiered(..., false)` atomically installs the clean state with
-        // the buffer. As above, a later page-number-only clean operation would
-        // be allowed to target a different, newer cache image.
+        let admitted_new = self.insert_tiered(page_no, buf, must_remain_dirty);
+        drop(in_flight);
+        // `insert_tiered` atomically installs both the buffer and its
+        // clean/dirty state. A later page-number-only clean operation would be
+        // allowed to target a different, newer cache image.
         post_install();
         if admitted_new {
             self.record_eviction_admit(page_no);
@@ -3289,6 +3740,23 @@ impl ShardedPageCache {
 
     /// Evict a specific page from the cache.
     pub fn evict(&self, page_no: PageNumber) -> bool {
+        loop {
+            let in_flight = self.in_flight_writes.lock();
+            if let Some(flight) = in_flight.get(&page_no).cloned() {
+                if matches!(flight.completion.state(), VfsWriteCompletionState::Pending) {
+                    return false;
+                }
+                drop(in_flight);
+                self.retire_terminal_write_flight(page_no, &flight);
+                continue;
+            }
+            let removed = self.evict_without_write_flight_check(page_no);
+            drop(in_flight);
+            return removed;
+        }
+    }
+
+    fn evict_without_write_flight_check(&self, page_no: PageNumber) -> bool {
         // Fast path (bd-fzr07)
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
@@ -3322,6 +3790,26 @@ impl ShardedPageCache {
     /// they own an independent `Arc<[u8]>`; evicting the cache's `PageBuf`
     /// cannot invalidate an already-published snapshot.
     fn take_clean_buffer_at(&self, page_no: PageNumber) -> Option<PageBuf> {
+        loop {
+            let in_flight = self.in_flight_writes.lock();
+            if let Some(flight) = in_flight.get(&page_no).cloned() {
+                if matches!(flight.completion.state(), VfsWriteCompletionState::Pending) {
+                    return None;
+                }
+                drop(in_flight);
+                self.retire_terminal_write_flight(page_no, &flight);
+                continue;
+            }
+            let buffer = self.take_clean_buffer_at_without_write_flight_check(page_no);
+            drop(in_flight);
+            return buffer;
+        }
+    }
+
+    fn take_clean_buffer_at_without_write_flight_check(
+        &self,
+        page_no: PageNumber,
+    ) -> Option<PageBuf> {
         if self.use_fast_path.load(Ordering::Relaxed)
             && let Some(ref fast) = self.fast_array
         {
@@ -3376,6 +3864,100 @@ impl ShardedPageCache {
         None
     }
 
+    /// Take only the clean resident image identified by `receipt`.
+    ///
+    /// This is the eviction half of the writeback linearization contract.
+    /// A newer clean replacement must remain resident even when an older
+    /// writeback completes successfully for the same page number.
+    fn take_clean_buffer_at_snapshot(
+        &self,
+        page_no: PageNumber,
+        receipt: PageWriteReceipt,
+    ) -> Option<PageBuf> {
+        loop {
+            let in_flight = self.in_flight_writes.lock();
+            if let Some(flight) = in_flight.get(&page_no).cloned() {
+                if matches!(flight.completion.state(), VfsWriteCompletionState::Pending) {
+                    return None;
+                }
+                drop(in_flight);
+                self.retire_terminal_write_flight(page_no, &flight);
+                continue;
+            }
+            let buffer =
+                self.take_clean_buffer_at_snapshot_without_write_flight_check(page_no, receipt);
+            drop(in_flight);
+            return buffer;
+        }
+    }
+
+    fn take_clean_buffer_at_snapshot_without_write_flight_check(
+        &self,
+        page_no: PageNumber,
+        receipt: PageWriteReceipt,
+    ) -> Option<PageBuf> {
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let mut fast = fast.lock();
+            let idx = FastPageArray::pgno_to_idx(page_no);
+            let reclaimable = fast
+                .pages
+                .get(idx)
+                .and_then(Option::as_ref)
+                .is_some_and(|entry| {
+                    entry.entry_token() == receipt.entry_token
+                        && entry.mutation_generation() == receipt.mutation_generation
+                        && !entry.is_dirty()
+                        && entry.buf.returns_to_pool(&self.pool)
+                });
+            let entry = reclaimable.then(|| fast.take(page_no)).flatten();
+            drop(fast);
+            if let Some(entry) = entry {
+                self.forget_eviction_page(page_no);
+                return Some(entry.buf);
+            }
+            return None;
+        }
+
+        let overflow_idx = self.shard_index(page_no);
+        {
+            let mut shard = self.shards[overflow_idx].lock();
+            if shard.pages.contains_key(&page_no) {
+                if self.flat_slots.contains_stable(page_no) {
+                    return None;
+                }
+
+                let reclaimable = shard.pages.get(&page_no).is_some_and(|entry| {
+                    entry.entry_token() == receipt.entry_token
+                        && entry.mutation_generation() == receipt.mutation_generation
+                        && !entry.is_dirty()
+                        && entry.buf.returns_to_pool(&self.pool)
+                });
+                if !reclaimable {
+                    return None;
+                }
+                let entry = shard
+                    .pages
+                    .remove(&page_no)
+                    .expect("certified overflow cache entry must still be present");
+                shard.evictions = shard.evictions.saturating_add(1);
+                drop(shard);
+                self.forget_eviction_page(page_no);
+                return Some(entry.buf);
+            }
+        }
+
+        if let Some(buffer) = self
+            .flat_slots
+            .take_if_clean_snapshot_from_pool(page_no, receipt, &self.pool)
+        {
+            self.forget_eviction_page(page_no);
+            return Some(buffer);
+        }
+        None
+    }
+
     /// Atomically remove and return one clean buffer from this cache's pool.
     ///
     /// This is the write-admission counterpart to [`Self::evict_any`]. It is
@@ -3422,49 +4004,93 @@ impl ShardedPageCache {
     where
         F: VfsFile + 'static,
     {
-        if self.take_clean_buffer().is_some() {
-            return Ok(true);
-        }
+        loop {
+            if self.take_clean_buffer().is_some() {
+                return Ok(true);
+            }
 
-        let Some(page_no) = self.dirty_writeback_victim() else {
-            return Ok(false);
-        };
+            let Some(page_no) = self.dirty_writeback_victim() else {
+                return Ok(false);
+            };
 
-        #[cfg(feature = "native")]
-        {
-            let native_cx = asupersync::Cx::current()
-                .or_else(|| cx.attached_native_cx())
-                .ok_or_else(|| {
-                    FrankenError::internal(
+            let mut leader = match self.claim_in_flight_write(page_no) {
+                InFlightWriteRole::Follower(flight) => {
+                    tracing::debug!(page = page_no.get(), "dirty eviction write coalesced");
+                    let _ = flight.completion.wait().await;
+                    continue;
+                }
+                InFlightWriteRole::Leader(leader) => leader,
+            };
+
+            let leader_flight = leader.flight();
+
+            #[cfg(feature = "native")]
+            let receipt = {
+                let Some(native_cx) = asupersync::Cx::current().or_else(|| cx.attached_native_cx())
+                else {
+                    leader_flight.complete_before_dispatch_error();
+                    return Err(FrankenError::internal(
                         "dirty page eviction requires an asupersync runtime region",
-                    )
-                })?;
-            let scope = native_cx.scope();
-            let task_cache = Arc::clone(self);
-            let mut writeback = native_cx
-                .spawn_in(&scope, move |task_native_cx| async move {
-                    let task_cx = Cx::new();
-                    task_cx.set_native_cx(task_native_cx);
-                    task_cache
-                        .write_page(&task_cx, file.as_ref(), page_no)
-                        .await
-                })
-                .map_err(|error| {
-                    FrankenError::internal(format!(
-                        "failed to dispatch dirty page {page_no} writeback: {error}"
-                    ))
-                })?;
-            writeback.join(&native_cx).await.map_err(|error| {
-                FrankenError::internal(format!(
-                    "dirty page {page_no} writeback task failed: {error}"
-                ))
-            })??;
+                    ));
+                };
+                let scope =
+                    native_cx.scope_with_budget(cx.native_budget_for_child_scope(&native_cx));
+                let task_cache = Arc::clone(self);
+                // Strip the caller's task-affine native handle before the
+                // context crosses the spawn boundary. The project parent
+                // link, budget, trace lineage, and cancellation state are
+                // retained; the spawned task installs its own native context.
+                let task_cx = cx.create_native_free_child();
+                let task_flight = Arc::clone(&leader_flight);
+                let dispatch_guard = WriteFlightDispatchGuard::new(Arc::clone(&leader_flight));
+                let mut writeback =
+                    match native_cx.spawn_in(&scope, move |task_native_cx| async move {
+                        let _dispatch_guard = dispatch_guard;
+                        task_cx.set_native_cx(task_native_cx);
+                        task_cache
+                            .write_page_uncoalesced(&task_cx, file.as_ref(), page_no, task_flight)
+                            .await
+                    }) {
+                        Ok(writeback) => writeback,
+                        Err(error) => {
+                            leader_flight.complete_before_dispatch_error();
+                            return Err(FrankenError::internal(format!(
+                                "failed to dispatch dirty page {page_no} writeback: {error}"
+                            )));
+                        }
+                    };
+                match writeback.join(&native_cx).await {
+                    Ok(result) => result?,
+                    Err(asupersync::runtime::JoinError::Cancelled(_)) => {
+                        if !leader_flight.was_dispatched() {
+                            leader_flight.complete_before_dispatch_error();
+                        }
+                        return Err(FrankenError::Abort);
+                    }
+                    Err(error) => {
+                        if !leader_flight.was_dispatched() {
+                            leader_flight.complete_before_dispatch_error();
+                        }
+                        return Err(FrankenError::internal(format!(
+                            "dirty page {page_no} writeback task failed: {error}"
+                        )));
+                    }
+                }
+            };
+
+            #[cfg(not(feature = "native"))]
+            let receipt = {
+                let _dispatch_guard = WriteFlightDispatchGuard::new(Arc::clone(&leader_flight));
+                self.write_page_uncoalesced(cx, file.as_ref(), page_no, Arc::clone(&leader_flight))
+                    .await?
+            };
+
+            leader.finish();
+            let removed = self
+                .take_clean_buffer_at_snapshot(page_no, receipt)
+                .is_some();
+            return Ok(removed);
         }
-
-        #[cfg(not(feature = "native"))]
-        self.write_page(cx, file.as_ref(), page_no).await?;
-
-        Ok(self.take_clean_buffer_at(page_no).is_some())
     }
 
     fn dirty_writeback_victim(&self) -> Option<PageNumber> {
@@ -3489,9 +4115,29 @@ impl ShardedPageCache {
     /// Tries flat slots first, then iterates shards.
     /// Returns `true` if a page was evicted.
     pub fn evict_any(&self) -> bool {
+        let in_flight = self.in_flight_writes.lock();
+        if !in_flight.is_empty() {
+            drop(in_flight);
+            let preferred = self.preferred_reconstructed_victim();
+            let mut candidates = self.page_snapshots();
+            candidates.sort_unstable_by_key(|snapshot| {
+                (
+                    usize::from(Some(snapshot.page_no) != preferred),
+                    snapshot.access_count,
+                    snapshot.page_no.get(),
+                )
+            });
+            for snapshot in candidates {
+                if self.evict(snapshot.page_no) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         let preferred_victim = self.preferred_reconstructed_victim();
         if let Some(page_no) = preferred_victim
-            && self.evict(page_no)
+            && self.evict_without_write_flight_check(page_no)
         {
             return true;
         }
@@ -3565,6 +4211,20 @@ impl ShardedPageCache {
     /// backing allocation so callers can cheaply reuse the same sparse working
     /// set after an explicit cache flush.
     pub fn clear(&self) {
+        let in_flight = self.in_flight_writes.lock();
+        if !in_flight.is_empty() {
+            drop(in_flight);
+            // Installed write flights pin their current logical page through
+            // terminal reconciliation. Remove every other resident through
+            // the ordinary tier-aware path, but retain pinned pages until the
+            // current flight is retired.
+            for snapshot in self.page_snapshots() {
+                self.evict(snapshot.page_no);
+            }
+            self.clear_eviction_history();
+            return;
+        }
+
         if let Some(ref fast) = self.fast_array {
             fast.lock().clear();
         }
@@ -3579,6 +4239,7 @@ impl ShardedPageCache {
                 shard.lock().clear();
             }
         }
+        drop(in_flight);
         self.clear_eviction_history();
     }
 
@@ -4040,6 +4701,8 @@ mod tests {
     use super::*;
     use crate::s3_fifo::{QueueKind, S3Fifo, S3FifoConfig, S3FifoEvent};
     use fsqlite_types::LockLevel;
+    #[cfg(feature = "native")]
+    use fsqlite_types::cx::Budget as ProjectBudget;
     use fsqlite_types::flags::{SyncFlags, VfsOpenFlags};
     use fsqlite_vfs::{MemoryVfs, ShmRegion, Vfs};
     use serde_json::json;
@@ -4464,34 +5127,59 @@ mod tests {
         }
     }
 
-    struct RegionWritebackFile {
-        bytes: std::sync::Mutex<Vec<u8>>,
-        write_calls: AtomicUsize,
-        parent_task:
-            std::sync::Mutex<Option<(asupersync::types::TaskId, asupersync::types::RegionId)>>,
-        observed_child_task: AtomicBool,
-        observed_parent_region: AtomicBool,
-        fail_writes: bool,
+    struct HiddenWrite {
+        bytes: Vec<u8>,
+        offset: u64,
+        completion: VfsWriteCompletion,
     }
 
-    impl RegionWritebackFile {
-        fn new(page_size: PageSize, fail_writes: bool) -> Self {
+    /// Deterministic VFS model whose first physical write outlives the Rust
+    /// future observing it. The test thread explicitly completes that source;
+    /// later writes complete inline.
+    struct HiddenCompletionWriteFile {
+        bytes: std::sync::Mutex<Vec<u8>>,
+        write_calls: AtomicUsize,
+        first_hidden: std::sync::Mutex<Option<HiddenWrite>>,
+    }
+
+    impl HiddenCompletionWriteFile {
+        fn new(page_size: PageSize) -> Self {
             Self {
                 bytes: std::sync::Mutex::new(vec![0; page_size.as_usize()]),
                 write_calls: AtomicUsize::new(0),
-                parent_task: std::sync::Mutex::new(None),
-                observed_child_task: AtomicBool::new(false),
-                observed_parent_region: AtomicBool::new(false),
-                fail_writes,
+                first_hidden: std::sync::Mutex::new(None),
             }
         }
 
-        fn set_parent(&self, native_cx: &asupersync::Cx) {
-            *self
-                .parent_task
+        fn complete_first_success(&self) {
+            let hidden = self
+                .first_hidden
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some((native_cx.task_id(), native_cx.region_id()));
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("first hidden write must have been dispatched");
+            self.apply(&hidden.bytes, hidden.offset)
+                .expect("controlled hidden write must fit");
+            hidden.completion.complete_success();
+        }
+
+        fn apply(&self, buf: &[u8], offset: u64) -> Result<()> {
+            let offset = usize::try_from(offset)
+                .map_err(|_| FrankenError::internal("hidden write offset does not fit usize"))?;
+            let end = offset
+                .checked_add(buf.len())
+                .ok_or_else(|| FrankenError::internal("hidden write range overflow"))?;
+            let mut bytes = self
+                .bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if end > bytes.len() {
+                return Err(FrankenError::internal(
+                    "hidden write extends past controlled file",
+                ));
+            }
+            bytes[offset..end].copy_from_slice(buf);
+            Ok(())
         }
 
         fn bytes(&self) -> Vec<u8> {
@@ -4502,6 +5190,294 @@ mod tests {
         }
     }
 
+    impl VfsFile for HiddenCompletionWriteFile {
+        fn close(&mut self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+
+        async fn read(&self, _cx: &Cx, _buf: &mut [u8], _offset: u64) -> Result<usize> {
+            Err(FrankenError::Unsupported)
+        }
+
+        async fn write(&self, _cx: &Cx, _buf: &[u8], _offset: u64) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        async fn write_tracked(
+            &self,
+            _cx: &Cx,
+            buf: &[u8],
+            offset: u64,
+            completion: VfsWriteCompletion,
+        ) -> Result<()> {
+            let call = self.write_calls.fetch_add(1, Ordering::AcqRel);
+            if call == 0 {
+                *self
+                    .first_hidden
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HiddenWrite {
+                    bytes: buf.to_vec(),
+                    offset,
+                    completion,
+                });
+                std::future::pending::<()>().await;
+                unreachable!("the first hidden write observer is intentionally dropped");
+            }
+
+            let result = self.apply(buf, offset);
+            if result.is_ok() {
+                completion.complete_success();
+            } else {
+                completion.complete_error();
+            }
+            result
+        }
+
+        fn truncate(&mut self, _cx: &Cx, _size: u64) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn sync(&mut self, _cx: &Cx, _flags: SyncFlags) -> Result<()> {
+            Ok(())
+        }
+
+        fn file_size(&self, _cx: &Cx) -> Result<u64> {
+            u64::try_from(
+                self.bytes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+            )
+            .map_err(|_| FrankenError::internal("controlled hidden file is too large"))
+        }
+
+        fn lock(&mut self, _cx: &Cx, _level: LockLevel) -> Result<()> {
+            Ok(())
+        }
+
+        fn unlock(&mut self, _cx: &Cx, _level: LockLevel) -> Result<()> {
+            Ok(())
+        }
+
+        fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn shm_map(
+            &mut self,
+            _cx: &Cx,
+            _region: u32,
+            _size: u32,
+            _extend: bool,
+        ) -> Result<ShmRegion> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn shm_lock(&mut self, _cx: &Cx, _offset: u32, _n: u32, _flags: u32) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn shm_barrier(&self) {}
+
+        fn shm_unmap(&mut self, _cx: &Cx, _delete: bool) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "native")]
+    struct WritebackPause {
+        reached_tx: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+        reached_rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        released: AtomicBool,
+        waker: std::sync::Mutex<Option<std::task::Waker>>,
+    }
+
+    #[cfg(feature = "native")]
+    impl WritebackPause {
+        fn new() -> Self {
+            let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+            Self {
+                reached_tx: std::sync::Mutex::new(Some(reached_tx)),
+                reached_rx: std::sync::Mutex::new(reached_rx),
+                released: AtomicBool::new(false),
+                waker: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn wait_until_reached(&self) {
+            self.reached_rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(Duration::from_secs(5))
+                .expect("writeback must reach the async pause within five seconds");
+        }
+
+        fn release(&self) {
+            self.released.store(true, Ordering::Release);
+            if let Some(waker) = self
+                .waker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                waker.wake();
+            }
+        }
+
+        async fn wait_for_release(&self) {
+            if let Some(reached_tx) = self
+                .reached_tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                reached_tx
+                    .try_send(())
+                    .expect("writeback pause observer must remain present");
+            }
+            std::future::poll_fn(|poll_cx| {
+                if self.released.load(Ordering::Acquire) {
+                    return std::task::Poll::Ready(());
+                }
+                *self
+                    .waker
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(poll_cx.waker().clone());
+                if self.released.load(Ordering::Acquire) {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+        }
+    }
+
+    #[cfg(feature = "native")]
+    struct PendingWriteback {
+        reached_tx: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+        reached_rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        polls: AtomicUsize,
+        dropped: AtomicBool,
+        waker: std::sync::Mutex<Option<std::task::Waker>>,
+    }
+
+    #[cfg(feature = "native")]
+    impl PendingWriteback {
+        fn new() -> Self {
+            let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+            Self {
+                reached_tx: std::sync::Mutex::new(Some(reached_tx)),
+                reached_rx: std::sync::Mutex::new(reached_rx),
+                polls: AtomicUsize::new(0),
+                dropped: AtomicBool::new(false),
+                waker: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn wait_until_reached(&self) {
+            self.reached_rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(Duration::from_secs(5))
+                .expect("pending writeback must be polled within five seconds");
+        }
+    }
+
+    #[cfg(feature = "native")]
+    struct PendingWritebackDrop(Arc<PendingWriteback>);
+
+    #[cfg(feature = "native")]
+    impl Drop for PendingWritebackDrop {
+        fn drop(&mut self) {
+            self.0.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    #[cfg(feature = "native")]
+    struct RegionWritebackFile {
+        bytes: std::sync::Mutex<Vec<u8>>,
+        write_calls: AtomicUsize,
+        parent_task:
+            std::sync::Mutex<Option<(asupersync::types::TaskId, asupersync::types::RegionId)>>,
+        expected_native_budget: std::sync::Mutex<Option<asupersync::Budget>>,
+        expected_project_budget: std::sync::Mutex<Option<ProjectBudget>>,
+        parent_trace_id: AtomicU64,
+        observed_child_task: AtomicBool,
+        observed_parent_region: AtomicBool,
+        write_pause: std::sync::Mutex<Option<Arc<WritebackPause>>>,
+        pending_write: std::sync::Mutex<Option<Arc<PendingWriteback>>>,
+        fail_writes: bool,
+    }
+
+    #[cfg(feature = "native")]
+    impl RegionWritebackFile {
+        fn new(page_size: PageSize, fail_writes: bool) -> Self {
+            Self {
+                bytes: std::sync::Mutex::new(vec![0; page_size.as_usize()]),
+                write_calls: AtomicUsize::new(0),
+                parent_task: std::sync::Mutex::new(None),
+                expected_native_budget: std::sync::Mutex::new(None),
+                expected_project_budget: std::sync::Mutex::new(None),
+                parent_trace_id: AtomicU64::new(0),
+                observed_child_task: AtomicBool::new(false),
+                observed_parent_region: AtomicBool::new(false),
+                write_pause: std::sync::Mutex::new(None),
+                pending_write: std::sync::Mutex::new(None),
+                fail_writes,
+            }
+        }
+
+        fn set_parent(&self, native_cx: &asupersync::Cx, project_cx: &Cx) {
+            *self
+                .parent_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((native_cx.task_id(), native_cx.region_id()));
+            *self
+                .expected_native_budget
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+                native_cx
+                    .scope_with_budget(project_cx.native_budget_for_child_scope(native_cx))
+                    .budget(),
+            );
+            *self
+                .expected_project_budget
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(project_cx.budget());
+            self.parent_trace_id
+                .store(project_cx.trace_id(), Ordering::Release);
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn pause_next_write(&self) -> Arc<WritebackPause> {
+            let pause = Arc::new(WritebackPause::new());
+            *self
+                .write_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&pause));
+            pause
+        }
+
+        fn pend_next_write(&self) -> Arc<PendingWriteback> {
+            let pending = Arc::new(PendingWriteback::new());
+            *self
+                .pending_write
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&pending));
+            pending
+        }
+    }
+
+    #[cfg(feature = "native")]
     impl VfsFile for RegionWritebackFile {
         fn close(&mut self, _cx: &Cx) -> Result<()> {
             Ok(())
@@ -4525,6 +5501,84 @@ mod tests {
                 .store(native_cx.task_id() != parent_task, Ordering::Release);
             self.observed_parent_region
                 .store(native_cx.region_id() == parent_region, Ordering::Release);
+            let expected_trace_id = self.parent_trace_id.load(Ordering::Acquire);
+            if cx.trace_id() != expected_trace_id {
+                return Err(FrankenError::internal(format!(
+                    "writeback task lost project Cx lineage: expected trace {expected_trace_id}, \
+                     observed {}",
+                    cx.trace_id()
+                )));
+            }
+            let expected_native_budget = self
+                .expected_native_budget
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ok_or_else(|| {
+                    FrankenError::internal("writeback native budget was not recorded")
+                })?;
+            if native_cx.budget() != expected_native_budget {
+                return Err(FrankenError::internal(format!(
+                    "writeback task lost the met native budget: expected \
+                     {expected_native_budget:?}, observed {:?}",
+                    native_cx.budget()
+                )));
+            }
+            let expected_project_budget = self
+                .expected_project_budget
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ok_or_else(|| {
+                    FrankenError::internal("writeback project budget was not recorded")
+                })?;
+            if cx.budget() != expected_project_budget {
+                return Err(FrankenError::internal(format!(
+                    "writeback task lost the project budget: expected \
+                     {expected_project_budget:?}, observed {:?}",
+                    cx.budget()
+                )));
+            }
+            let write_pause = self
+                .write_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(pause) = write_pause {
+                pause.wait_for_release().await;
+            }
+            let pending_write = self
+                .pending_write
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(pending) = pending_write {
+                let _drop_guard = PendingWritebackDrop(Arc::clone(&pending));
+                return std::future::poll_fn(|poll_cx| {
+                    *pending
+                        .waker
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(poll_cx.waker().clone());
+                    if pending.polls.fetch_add(1, Ordering::AcqRel) == 0 {
+                        if let Some(reached_tx) = pending
+                            .reached_tx
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                        {
+                            reached_tx
+                                .try_send(())
+                                .expect("pending writeback observer must remain present");
+                        }
+                    }
+                    if cx.checkpoint().is_err() {
+                        std::task::Poll::Ready(Err(FrankenError::Abort))
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+            }
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
 
             if self.fail_writes {
                 return Err(FrankenError::internal(
@@ -4695,6 +5749,418 @@ mod tests {
     }
 
     #[test]
+    fn bd_2jpu6_2_dropped_write_observer_holds_flight_until_source_terminal() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let page_size = PageSize::DEFAULT;
+        let page_no = PageNumber::ONE;
+        let cache = ShardedPageCache::with_max_buffers(page_size, 1);
+        cache
+            .insert_fresh(page_no, |bytes| bytes.fill(0x31))
+            .expect("admit first dirty page image");
+        let file = HiddenCompletionWriteFile::new(page_size);
+        let cx = Cx::new();
+        let waker = Waker::noop();
+        let mut task_cx = Context::from_waker(waker);
+
+        let mut first = Box::pin(cache.write_page(&cx, &file, page_no));
+        assert!(first.as_mut().poll(&mut task_cx).is_pending());
+        assert_eq!(file.write_calls.load(Ordering::Acquire), 1);
+        drop(first);
+        {
+            let in_flight = cache.in_flight_writes.lock();
+            let flight = in_flight
+                .get(&page_no)
+                .expect("dropped observer must retain its source-owned flight");
+            assert_eq!(
+                flight.completion.state(),
+                VfsWriteCompletionState::Pending,
+                "observer drop cannot pretend the hidden VFS source is terminal"
+            );
+        }
+
+        cache
+            .with_page_mut(page_no, |bytes| bytes.fill(0x72))
+            .expect("mutate page while first physical write remains pending");
+        let mut second = Box::pin(cache.write_page(&cx, &file, page_no));
+        assert!(
+            second.as_mut().poll(&mut task_cx).is_pending(),
+            "later write must wait for the dropped observer's source completion"
+        );
+        assert_eq!(
+            file.write_calls.load(Ordering::Acquire),
+            1,
+            "per-page flight must not dispatch the newer write early"
+        );
+        assert_eq!(
+            cache
+                .in_flight_writes
+                .lock()
+                .get(&page_no)
+                .expect("newer observer must follow the retained flight")
+                .completion
+                .state(),
+            VfsWriteCompletionState::Pending
+        );
+
+        file.complete_first_success();
+        assert_eq!(file.bytes(), vec![0x31; page_size.as_usize()]);
+
+        match second.as_mut().poll(&mut task_cx) {
+            Poll::Ready(Ok(())) => {}
+            other => panic!(
+                "newer write must run after the hidden older source becomes terminal, got \
+                 {other:?}"
+            ),
+        }
+        assert_eq!(file.write_calls.load(Ordering::Acquire), 2);
+        assert_eq!(
+            file.bytes(),
+            vec![0x72; page_size.as_usize()],
+            "the serialized newer write must be the final file image"
+        );
+        assert!(
+            cache
+                .page_snapshots()
+                .iter()
+                .any(|snapshot| snapshot.page_no == page_no && !snapshot.dirty),
+            "the exact newer cache image must become clean"
+        );
+        assert!(
+            !cache.in_flight_writes.lock().contains_key(&page_no),
+            "latest terminal write must retire its per-page gate"
+        );
+    }
+
+    #[test]
+    fn bd_2jpu6_2_pending_write_pins_removal_and_dirties_clean_replacement() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let page_size = PageSize::DEFAULT;
+        let page_no = PageNumber::ONE;
+        let cache = ShardedPageCache::with_max_buffers(page_size, 2);
+        cache
+            .insert_fresh(page_no, |bytes| bytes.fill(0x19))
+            .expect("admit old dirty image");
+        let file = HiddenCompletionWriteFile::new(page_size);
+        let cx = Cx::new();
+        let waker = Waker::noop();
+        let mut task_cx = Context::from_waker(waker);
+
+        let mut old_observer = Box::pin(cache.write_page(&cx, &file, page_no));
+        assert!(old_observer.as_mut().poll(&mut task_cx).is_pending());
+        assert!(
+            !cache.evict(page_no),
+            "specific eviction must retain a page with a pending physical write"
+        );
+        cache.clear();
+        assert!(
+            cache.contains(page_no),
+            "cache clear must retain a page with a pending physical write"
+        );
+
+        let mut replacement = cache.pool().acquire().expect("replacement buffer");
+        replacement.as_mut_slice().fill(0x91);
+        cache.insert_buffer(page_no, replacement);
+        assert!(
+            cache
+                .page_snapshots()
+                .iter()
+                .any(|snapshot| snapshot.page_no == page_no && snapshot.dirty),
+            "a nominally clean replacement must be dirty while an older write is unresolved"
+        );
+        assert!(
+            !cache.evict(page_no),
+            "replacement remains pinned by the older pending flight"
+        );
+        cache.clear();
+        assert!(cache.contains(page_no));
+
+        let old_flight = Arc::clone(
+            cache
+                .in_flight_writes
+                .lock()
+                .get(&page_no)
+                .expect("old write flight must remain installed"),
+        );
+        drop(old_observer);
+        file.complete_first_success();
+        assert_eq!(file.bytes(), vec![0x19; page_size.as_usize()]);
+        assert!(cache.retire_terminal_write_flight(page_no, &old_flight));
+        assert!(!cache.in_flight_writes.lock().contains_key(&page_no));
+        assert_eq!(
+            cache
+                .with_page(page_no, |bytes| bytes.to_vec())
+                .expect("replacement must remain resident"),
+            vec![0x91; page_size.as_usize()]
+        );
+        assert!(
+            cache
+                .page_snapshots()
+                .iter()
+                .any(|snapshot| snapshot.page_no == page_no && snapshot.dirty),
+            "terminal mismatch must preserve the replacement's dirty state"
+        );
+        assert!(
+            cache.take_clean_buffer().is_none(),
+            "generic clean eviction must not discard the replacement"
+        );
+    }
+
+    #[test]
+    fn bd_2jpu6_2_dropped_pre_dispatch_guard_terminalizes_flight_for_retry() {
+        let page_no = PageNumber::ONE;
+        let cache = ShardedPageCache::new(PageSize::DEFAULT);
+        let mut leader = match cache.claim_in_flight_write(page_no) {
+            InFlightWriteRole::Leader(leader) => leader,
+            InFlightWriteRole::Follower(_) => panic!("first claimant must lead"),
+        };
+        let flight = leader.flight();
+
+        // This is the deterministic equivalent of a spawned writeback closure
+        // being discarded before its first poll: the captured guard is
+        // dropped without VFS admission.
+        drop(WriteFlightDispatchGuard::new(Arc::clone(&flight)));
+        assert_eq!(flight.completion.state(), VfsWriteCompletionState::Error);
+        assert!(!flight.was_dispatched());
+        leader.finish();
+        assert!(!cache.in_flight_writes.lock().contains_key(&page_no));
+
+        match cache.claim_in_flight_write(page_no) {
+            InFlightWriteRole::Leader(mut retry) => {
+                assert!(
+                    !Arc::ptr_eq(&flight, &retry.flight()),
+                    "retry must own a fresh flight after pre-dispatch cancellation"
+                );
+                retry.flight().complete_before_dispatch_error();
+                retry.finish();
+            }
+            InFlightWriteRole::Follower(_) => {
+                panic!("terminal pre-dispatch flight must not strand retries")
+            }
+        }
+    }
+
+    #[test]
+    fn bd_2jpu6_2_delayed_old_retirement_cannot_dirty_replacement_flight_page() {
+        let page_no = PageNumber::ONE;
+        let cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 2);
+        cache
+            .insert_fresh(page_no, |bytes| bytes.fill(0x2A))
+            .expect("admit old image");
+        let old_receipt = cache
+            .page_write_snapshot(page_no)
+            .expect("snapshot old image")
+            .receipt();
+        let mut old_leader = match cache.claim_in_flight_write(page_no) {
+            InFlightWriteRole::Leader(leader) => leader,
+            InFlightWriteRole::Follower(_) => panic!("first claimant must lead"),
+        };
+        let old_flight = old_leader.flight();
+        old_flight.set_snapshot_identity(old_receipt);
+        old_flight.mark_dispatched();
+        old_flight.completion.complete_success();
+
+        let mut pre_retirement_replacement =
+            cache.pool().acquire().expect("pre-retirement replacement");
+        pre_retirement_replacement.as_mut_slice().fill(0x7A);
+        cache.insert_buffer(page_no, pre_retirement_replacement);
+        assert!(
+            !cache.in_flight_writes.lock().contains_key(&page_no),
+            "clean admission must opportunistically retire terminal old work"
+        );
+        assert!(
+            cache
+                .page_snapshots()
+                .iter()
+                .any(|snapshot| snapshot.page_no == page_no && !snapshot.dirty),
+            "replacement admitted after terminal reconciliation may be clean"
+        );
+        old_leader.finish();
+
+        let mut replacement_leader = match cache.claim_in_flight_write(page_no) {
+            InFlightWriteRole::Leader(leader) => leader,
+            InFlightWriteRole::Follower(_) => panic!("replacement claimant must lead"),
+        };
+        let replacement_flight = replacement_leader.flight();
+        assert!(cache.retire_terminal_write_flight(page_no, &old_flight));
+        assert!(
+            cache
+                .in_flight_writes
+                .lock()
+                .get(&page_no)
+                .is_some_and(|current| Arc::ptr_eq(current, &replacement_flight)),
+            "old retirement must not remove the replacement flight"
+        );
+        assert!(
+            cache
+                .page_snapshots()
+                .iter()
+                .any(|snapshot| snapshot.page_no == page_no && !snapshot.dirty),
+            "old retirement must not reconcile against the replacement page"
+        );
+
+        replacement_flight.complete_before_dispatch_error();
+        replacement_leader.finish();
+    }
+
+    #[test]
+    fn bd_2jpu6_2_fast_entry_identity_blocks_replacement_aba_cleanup() {
+        let page_no = PageNumber::ONE;
+        let cache = ShardedPageCache::new_single_connection(PageSize::DEFAULT);
+        cache
+            .insert_fresh(page_no, |bytes| bytes.fill(0x11))
+            .expect("admit old fast-tier image");
+        let old = cache
+            .page_write_snapshot(page_no)
+            .expect("snapshot old fast-tier image")
+            .receipt();
+
+        cache
+            .insert_fresh(page_no, |bytes| bytes.fill(0x22))
+            .expect("replace fast-tier image at the same generation");
+        cache.mark_page_clean_if_snapshot(page_no, old.entry_token, old.mutation_generation);
+        assert!(
+            cache
+                .page_snapshots()
+                .iter()
+                .any(|snapshot| snapshot.page_no == page_no && snapshot.dirty),
+            "old receipt must not clean a different fast-tier generation-1 entry"
+        );
+
+        let fast = cache.fast_array.as_ref().expect("fast array enabled");
+        fast.lock().pages[FastPageArray::pgno_to_idx(page_no)]
+            .as_ref()
+            .expect("replacement fast entry")
+            .mark_clean();
+        assert!(cache.take_clean_buffer_at_snapshot(page_no, old).is_none());
+        assert!(
+            cache.contains(page_no),
+            "old receipt must not evict a newer clean fast-tier entry"
+        );
+    }
+
+    #[test]
+    fn bd_2jpu6_2_flat_entry_identity_blocks_replacement_aba_cleanup() {
+        let page_no = PageNumber::ONE;
+        let cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 2);
+        cache
+            .insert_fresh(page_no, |bytes| bytes.fill(0x33))
+            .expect("admit old flat-tier image");
+        let old = cache
+            .page_write_snapshot(page_no)
+            .expect("snapshot old flat-tier image")
+            .receipt();
+
+        cache
+            .insert_fresh(page_no, |bytes| bytes.fill(0x44))
+            .expect("replace flat-tier image at the same generation");
+        cache.mark_page_clean_if_snapshot(page_no, old.entry_token, old.mutation_generation);
+        assert!(
+            cache
+                .page_snapshots()
+                .iter()
+                .any(|snapshot| snapshot.page_no == page_no && snapshot.dirty),
+            "old receipt must not clean a different flat-tier generation-1 entry"
+        );
+
+        let slot_idx = cache
+            .flat_slots
+            .find_slot(page_no)
+            .expect("replacement flat slot");
+        cache.flat_slots.slots[slot_idx]
+            .data
+            .lock()
+            .as_ref()
+            .expect("replacement flat entry")
+            .mark_clean();
+        assert!(cache.take_clean_buffer_at_snapshot(page_no, old).is_none());
+        assert!(
+            cache.contains(page_no),
+            "old receipt must not evict a newer clean flat-tier entry"
+        );
+    }
+
+    #[test]
+    fn bd_2jpu6_2_overflow_entry_identity_blocks_replacement_aba_cleanup() {
+        let page_no = PageNumber::ONE;
+        let cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 2);
+        let shard_idx = cache.shard_index(page_no);
+
+        let mut old_buf = cache.pool.acquire().expect("old overflow buffer");
+        old_buf.as_mut_slice().fill(0x55);
+        cache.shards[shard_idx]
+            .lock()
+            .insert_with_dirty_state(page_no, old_buf, true);
+        cache.shards_dirty.store(true, Ordering::Release);
+        let old = cache
+            .page_write_snapshot(page_no)
+            .expect("snapshot old overflow image")
+            .receipt();
+
+        let mut replacement_buf = cache.pool.acquire().expect("replacement overflow buffer");
+        replacement_buf.as_mut_slice().fill(0x66);
+        cache.shards[shard_idx]
+            .lock()
+            .insert_with_dirty_state(page_no, replacement_buf, true);
+        cache.mark_page_clean_if_snapshot(page_no, old.entry_token, old.mutation_generation);
+        assert!(
+            cache
+                .page_snapshots()
+                .iter()
+                .any(|snapshot| snapshot.page_no == page_no && snapshot.dirty),
+            "old receipt must not clean a different overflow generation-1 entry"
+        );
+
+        cache.shards[shard_idx]
+            .lock()
+            .pages
+            .get(&page_no)
+            .expect("replacement overflow entry")
+            .mark_clean();
+        assert!(cache.take_clean_buffer_at_snapshot(page_no, old).is_none());
+        assert!(
+            cache.contains(page_no),
+            "old receipt must not evict a newer clean overflow entry"
+        );
+    }
+
+    #[test]
+    fn bd_2jpu6_2_pre_cancelled_writeback_never_dispatches_vfs_effect() {
+        run_async_test(|| async {
+            let page_size = PageSize::DEFAULT;
+            let page_no = PageNumber::ONE;
+            let cache = ShardedPageCache::with_max_buffers(page_size, 1);
+            cache
+                .insert_fresh(page_no, |bytes| bytes.fill(0x87))
+                .expect("admit pre-cancelled dirty page");
+            let file = HiddenCompletionWriteFile::new(page_size);
+            let cx = Cx::new();
+            cx.cancel_with_reason(fsqlite_types::cx::CancelReason::Timeout);
+
+            let error = cache
+                .write_page(&cx, &file, page_no)
+                .await
+                .expect_err("pre-cancelled writeback must abort");
+            assert!(matches!(error, FrankenError::Abort));
+            assert_eq!(
+                file.write_calls.load(Ordering::Acquire),
+                0,
+                "cache-level checkpoint must reject cancellation before VFS dispatch"
+            );
+            assert!(
+                cache
+                    .page_snapshots()
+                    .iter()
+                    .any(|snapshot| snapshot.page_no == page_no && snapshot.dirty)
+            );
+        });
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
     fn bd_2jpu6_2_dirty_eviction_runs_in_parent_asupersync_region() {
         let page_size = PageSize::DEFAULT;
         let cache = Arc::new(ShardedPageCache::with_max_buffers(page_size, 1));
@@ -4712,8 +6178,14 @@ mod tests {
         let task_file = Arc::clone(&file);
         let writeback = runtime.handle().spawn(async move {
             let native_cx = asupersync::Cx::current().expect("runtime task must expose native Cx");
-            task_file.set_parent(&native_cx);
-            let cx = Cx::new();
+            let cx = Cx::with_budget(
+                ProjectBudget::INFINITE
+                    .with_poll_quota(37)
+                    .with_cost_quota(73)
+                    .with_priority(19),
+            )
+            .with_trace_context(0xD1_27, 0, 0);
+            task_file.set_parent(&native_cx, &cx);
             cx.set_native_cx(native_cx);
             task_cache.evict_any_async(&cx, task_file).await
         });
@@ -4737,6 +6209,7 @@ mod tests {
         assert_eq!(cache.pool().available(), 1);
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn bd_2jpu6_2_failed_dirty_writeback_preserves_resident_dirty_page() {
         let page_size = PageSize::DEFAULT;
@@ -4755,8 +6228,14 @@ mod tests {
         let task_file = Arc::clone(&file);
         let writeback = runtime.handle().spawn(async move {
             let native_cx = asupersync::Cx::current().expect("runtime task must expose native Cx");
-            task_file.set_parent(&native_cx);
-            let cx = Cx::new();
+            let cx = Cx::with_budget(
+                ProjectBudget::INFINITE
+                    .with_poll_quota(41)
+                    .with_cost_quota(79)
+                    .with_priority(23),
+            )
+            .with_trace_context(0xFA_17, 0, 0);
+            task_file.set_parent(&native_cx, &cx);
             cx.set_native_cx(native_cx);
             task_cache.evict_any_async(&cx, task_file).await
         });
@@ -4776,6 +6255,138 @@ mod tests {
                 .page_snapshots()
                 .iter()
                 .any(|snapshot| snapshot.page_no == PageNumber::ONE && snapshot.dirty)
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn bd_2jpu6_2_parent_cancel_reaches_spawned_dirty_writeback() {
+        let page_size = PageSize::DEFAULT;
+        let cache = Arc::new(ShardedPageCache::with_max_buffers(page_size, 1));
+        cache
+            .insert_fresh(PageNumber::ONE, |bytes| bytes.fill(0xC4))
+            .expect("admit dirty writeback candidate");
+        let file = Arc::new(RegionWritebackFile::new(page_size, false));
+        let pause = file.pause_next_write();
+        let project_cx = Cx::with_budget(
+            ProjectBudget::INFINITE
+                .with_poll_quota(43)
+                .with_cost_quota(83)
+                .with_priority(29),
+        )
+        .with_trace_context(0xCA_CE, 0, 0);
+
+        let runtime = asupersync::runtime::RuntimeBuilder::low_latency()
+            .worker_threads(2)
+            .blocking_threads(1, 1)
+            .build()
+            .expect("build dirty-eviction cancellation runtime");
+        let task_cache = Arc::clone(&cache);
+        let task_file = Arc::clone(&file);
+        let task_cx = project_cx.clone();
+        let writeback = runtime.handle().spawn(async move {
+            let native_cx = asupersync::Cx::current().expect("runtime task must expose native Cx");
+            task_file.set_parent(&native_cx, &task_cx);
+            task_cache.evict_any_async(&task_cx, task_file).await
+        });
+
+        pause.wait_until_reached();
+        project_cx.cancel_with_reason(fsqlite_types::cx::CancelReason::Timeout);
+        pause.release();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !writeback.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            writeback.is_finished(),
+            "cancelled dirty writeback must terminate within five seconds"
+        );
+        let result = runtime.block_on(writeback);
+        let error = result.expect_err("parent cancellation must abort spawned dirty writeback");
+        assert!(matches!(error, FrankenError::Abort));
+        assert_eq!(file.write_calls.load(Ordering::Acquire), 1);
+        assert!(cache.contains(PageNumber::ONE));
+        assert!(
+            cache
+                .page_snapshots()
+                .iter()
+                .any(|snapshot| snapshot.page_no == PageNumber::ONE && snapshot.dirty),
+            "cancelled writeback must leave the dirty page resident for retry"
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn bd_2jpu6_2_cancelled_pending_writeback_maps_to_abort_and_preserves_page() {
+        let page_size = PageSize::DEFAULT;
+        let cache = Arc::new(ShardedPageCache::with_max_buffers(page_size, 1));
+        cache
+            .insert_fresh(PageNumber::ONE, |bytes| bytes.fill(0xA9))
+            .expect("admit pending dirty writeback candidate");
+        let file = Arc::new(RegionWritebackFile::new(page_size, false));
+        let pending = file.pend_next_write();
+        let project_cx = Cx::with_budget(
+            ProjectBudget::INFINITE
+                .with_poll_quota(47)
+                .with_cost_quota(89)
+                .with_priority(31),
+        )
+        .with_trace_context(0xCA_11, 0, 0);
+
+        let runtime = asupersync::runtime::RuntimeBuilder::low_latency()
+            .worker_threads(2)
+            .blocking_threads(1, 1)
+            .build()
+            .expect("build pending dirty-eviction cancellation runtime");
+        let task_cache = Arc::clone(&cache);
+        let task_file = Arc::clone(&file);
+        let task_cx = project_cx.clone();
+        let writeback = runtime.handle().spawn(async move {
+            let native_cx = asupersync::Cx::current().expect("runtime task must expose native Cx");
+            task_file.set_parent(&native_cx, &task_cx);
+            task_cache.evict_any_async(&task_cx, task_file).await
+        });
+
+        pending.wait_until_reached();
+        assert_eq!(
+            pending.polls.load(Ordering::Acquire),
+            1,
+            "the controlled VFS write must be pending before cancellation"
+        );
+        assert!(
+            pending
+                .waker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            "the pending write must register the runtime task waker"
+        );
+        project_cx.cancel_with_reason(fsqlite_types::cx::CancelReason::Timeout);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !writeback.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            writeback.is_finished(),
+            "pending cancelled writeback must terminate within five seconds"
+        );
+        let result = runtime.block_on(writeback);
+        let error = result.expect_err("native task cancellation must surface as an engine abort");
+        assert!(matches!(error, FrankenError::Abort));
+        assert!(
+            pending.dropped.load(Ordering::Acquire),
+            "cancellation must wake and drop the pending VFS write future"
+        );
+        assert_eq!(file.write_calls.load(Ordering::Acquire), 1);
+        assert!(cache.contains(PageNumber::ONE));
+        assert!(
+            cache
+                .page_snapshots()
+                .iter()
+                .any(|snapshot| snapshot.page_no == PageNumber::ONE && snapshot.dirty),
+            "cancelled pending writeback must leave the dirty page resident for retry"
         );
     }
 

@@ -32,12 +32,13 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 #[cfg(feature = "native")]
+use asupersync::cx::cap as native_cap;
+#[cfg(feature = "native")]
 use asupersync::types::Time as NativeTime;
 #[cfg(feature = "native")]
 use asupersync::types::{CancelKind as NativeCancelKind, CancelReason as NativeCancelReason};
 #[cfg(feature = "native")]
 use asupersync::{Budget as NativeBudget, Cx as NativeCx};
-
 #[cfg(not(feature = "native"))]
 mod native_cx_shim {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -197,10 +198,26 @@ pub enum CancelState {
 /// reason wins and the reason can never get weaker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CancelReason {
-    Timeout = 0,
+    NativeSignal = 0,
     UserInterrupt = 1,
-    RegionClose = 2,
-    Abort = 3,
+    Timeout = 2,
+    RegionClose = 3,
+    Abort = 4,
+}
+
+/// Exact provenance retained when cancellation originates in Asupersync.
+///
+/// FrankenSQLite's [`CancelReason`] is intentionally a small behavioral
+/// classification. This sidecar preserves the complete native attribution
+/// and cause chain without ever reconstructing or writing a lossy reason back
+/// into the native context.
+#[cfg(feature = "native")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeCancellationProvenance {
+    /// The native cancellation flag was set without a native reason.
+    SignalWithoutReason,
+    /// The strongest fully attributed native reason observed so far.
+    Exact(NativeCancelReason),
 }
 
 /// Capability set definitions and subset reasoning.
@@ -428,13 +445,52 @@ impl Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[cfg(test)]
+#[derive(Debug)]
+struct TestInterleavingPause {
+    expected_reason: Option<CancelReason>,
+    armed: AtomicBool,
+    reached: std::sync::Barrier,
+    resume: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl TestInterleavingPause {
+    fn wait_if_armed(&self, reason: Option<CancelReason>) {
+        if self.expected_reason == reason && self.armed.swap(false, Ordering::SeqCst) {
+            self.reached.wait();
+            self.resume.wait();
+        }
+    }
+}
+
+#[cfg(test)]
+fn pause_at_test_interleaving(
+    slot: &Mutex<Option<Arc<TestInterleavingPause>>>,
+    reason: Option<CancelReason>,
+) {
+    let pause = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(pause) = pause {
+        pause.wait_if_armed(reason);
+    }
+}
+
 #[derive(Debug)]
 struct CxInner {
     cancel_requested: AtomicBool,
     cancel_state: Mutex<CancelState>,
     cancel_reason: Mutex<Option<CancelReason>>,
+    /// Strongest reason for which native signaling and descendant propagation
+    /// have both completed.
+    cancel_fully_propagated_reason: Mutex<Option<CancelReason>>,
+    #[cfg(test)]
+    accepted_cancel_propagations: AtomicU32,
     mask_depth: AtomicU32,
     children: Mutex<Vec<Weak<Self>>>,
+    child_registration_epoch: AtomicU32,
     last_checkpoint_msg: Mutex<Option<String>>,
     last_eprocess_decision: Mutex<Option<EProcessDecision>>,
     eprocess_oracle: std::sync::OnceLock<Arc<EProcessOracle>>,
@@ -442,18 +498,46 @@ struct CxInner {
     attached_native_cx: Mutex<Option<NativeCx>>,
     #[cfg(feature = "native")]
     fallback_native_cx: std::sync::OnceLock<NativeCx>,
+    /// Cancellation-only native relay for admission/open waiters.
+    ///
+    /// This remains `cap::None` at the type level and is never exposed as the
+    /// attached runtime context, so waking a project-Cx cancellation waiter
+    /// cannot mint spawn, timer, I/O, or remote authority.
+    #[cfg(feature = "native")]
+    native_cancel_relay: Mutex<Option<NativeCx<native_cap::None>>>,
+    #[cfg(feature = "native")]
+    native_cancel_provenance: Mutex<Option<NativeCancellationProvenance>>,
+    #[cfg(test)]
+    cancel_publication_pause: Mutex<Option<Arc<TestInterleavingPause>>>,
+    #[cfg(test)]
+    cancel_after_flag_pause: Mutex<Option<Arc<TestInterleavingPause>>>,
+    #[cfg(all(feature = "native", test))]
+    native_signal_pause: Mutex<Option<Arc<TestInterleavingPause>>>,
+    #[cfg(all(feature = "native", test))]
+    native_install_pause: Mutex<Option<Arc<TestInterleavingPause>>>,
+    // Strong, one-way cancellation source for an actor-admitted operation.
+    // Engine capabilities and native runtime authority still come from this
+    // Cx's ordinary root lineage; the source contributes only its atomic
+    // cancellation state.
+    operation_cancellation_source: Option<Arc<Self>>,
     // Deterministic clock: milliseconds since epoch for tests.
     unix_millis: AtomicU64,
 }
 
 impl CxInner {
-    fn new() -> Self {
+    fn new_with_operation_cancellation_source(
+        operation_cancellation_source: Option<Arc<Self>>,
+    ) -> Self {
         Self {
             cancel_requested: AtomicBool::new(false),
             cancel_state: Mutex::new(CancelState::Created),
             cancel_reason: Mutex::new(None),
+            cancel_fully_propagated_reason: Mutex::new(None),
+            #[cfg(test)]
+            accepted_cancel_propagations: AtomicU32::new(0),
             mask_depth: AtomicU32::new(0),
             children: Mutex::new(Vec::new()),
+            child_registration_epoch: AtomicU32::new(0),
             last_checkpoint_msg: Mutex::new(None),
             last_eprocess_decision: Mutex::new(None),
             eprocess_oracle: std::sync::OnceLock::new(),
@@ -461,19 +545,21 @@ impl CxInner {
             attached_native_cx: Mutex::new(None),
             #[cfg(feature = "native")]
             fallback_native_cx: std::sync::OnceLock::new(),
+            #[cfg(feature = "native")]
+            native_cancel_relay: Mutex::new(None),
+            #[cfg(feature = "native")]
+            native_cancel_provenance: Mutex::new(None),
+            #[cfg(test)]
+            cancel_publication_pause: Mutex::new(None),
+            #[cfg(test)]
+            cancel_after_flag_pause: Mutex::new(None),
+            #[cfg(all(feature = "native", test))]
+            native_signal_pause: Mutex::new(None),
+            #[cfg(all(feature = "native", test))]
+            native_install_pause: Mutex::new(None),
+            operation_cancellation_source,
             unix_millis: AtomicU64::new(0),
         }
-    }
-}
-
-#[cfg(feature = "native")]
-#[must_use]
-fn local_reason_to_native(reason: CancelReason) -> NativeCancelReason {
-    match reason {
-        CancelReason::Timeout => NativeCancelReason::timeout(),
-        CancelReason::UserInterrupt => NativeCancelReason::user("sqlite interrupt"),
-        CancelReason::RegionClose => NativeCancelReason::parent_cancelled(),
-        CancelReason::Abort => NativeCancelReason::resource_unavailable(),
     }
 }
 
@@ -489,14 +575,110 @@ fn native_reason_to_local(reason: &NativeCancelReason) -> CancelReason {
         NativeCancelKind::FailFast
         | NativeCancelKind::RaceLost
         | NativeCancelKind::ParentCancelled
-        | NativeCancelKind::Shutdown
         | NativeCancelKind::LinkedExit => CancelReason::RegionClose,
-        NativeCancelKind::ResourceUnavailable => CancelReason::Abort,
+        NativeCancelKind::ResourceUnavailable | NativeCancelKind::Shutdown => CancelReason::Abort,
     }
 }
 
 #[cfg(feature = "native")]
-fn sync_native_cx_cancel(inner: &CxInner, reason: CancelReason) {
+fn merge_native_cancel_provenance(inner: &CxInner, observed: NativeCancellationProvenance) -> bool {
+    let mut provenance = inner
+        .native_cancel_provenance
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match (&mut *provenance, observed) {
+        (None, observed) => {
+            *provenance = Some(observed);
+            true
+        }
+        (
+            Some(NativeCancellationProvenance::SignalWithoutReason),
+            NativeCancellationProvenance::Exact(reason),
+        ) => {
+            *provenance = Some(NativeCancellationProvenance::Exact(reason));
+            true
+        }
+        (
+            Some(NativeCancellationProvenance::Exact(current)),
+            NativeCancellationProvenance::Exact(observed),
+        ) => current.strengthen(&observed),
+        (
+            Some(
+                NativeCancellationProvenance::SignalWithoutReason
+                | NativeCancellationProvenance::Exact(_),
+            ),
+            NativeCancellationProvenance::SignalWithoutReason,
+        ) => false,
+    }
+}
+
+#[cfg(feature = "native")]
+fn propagate_native_cancel_provenance(inner: &CxInner, observed: NativeCancellationProvenance) {
+    if !merge_native_cancel_provenance(inner, observed.clone()) {
+        return;
+    }
+
+    let children = {
+        let mut children = inner
+            .children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        children.retain(|child| child.strong_count() > 0);
+        children
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>()
+    };
+    let mut pending: Vec<_> = children
+        .into_iter()
+        .map(|child| (child, observed.clone()))
+        .collect();
+    while let Some((next, inherited)) = pending.pop() {
+        if !merge_native_cancel_provenance(&next, inherited.clone()) {
+            continue;
+        }
+        let children = {
+            let mut children = next
+                .children
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            children.retain(|child| child.strong_count() > 0);
+            children
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>()
+        };
+        pending.extend(children.into_iter().map(|child| (child, inherited.clone())));
+    }
+}
+
+#[cfg(feature = "native")]
+fn signal_native_cancel_target<Caps>(native: &NativeCx<Caps>) {
+    // Asupersync 0.3.9's reason-setting APIs overwrite the existing reason
+    // rather than strengthening it conditionally. A read-compare-write loop
+    // cannot close the race with cancellation initiated by the runtime itself:
+    // it can overwrite a stronger native reason after that reason wakes an
+    // observer. Keep the exact FrankenSQLite reason in `CxInner` and use the
+    // native context only as a cancellation wake signal. This operation does
+    // not replace an existing native reason, so native attribution and cause
+    // chains remain authoritative on their originating plane.
+    if !native.is_cancel_requested() {
+        native.set_cancel_requested(true);
+    }
+}
+
+#[cfg(feature = "native")]
+fn retain_native_cancel_provenance<Caps>(inner: &CxInner, native: &NativeCx<Caps>) {
+    if let Some(reason) = native.cancel_reason() {
+        propagate_native_cancel_provenance(inner, NativeCancellationProvenance::Exact(reason));
+    }
+}
+
+#[cfg(feature = "native")]
+fn signal_native_cx_cancel(inner: &CxInner) {
+    #[cfg(test)]
+    pause_at_test_interleaving(&inner.native_signal_pause, None);
+
     let attached_native = inner
         .attached_native_cx
         .lock()
@@ -504,10 +686,22 @@ fn sync_native_cx_cancel(inner: &CxInner, reason: CancelReason) {
         .as_ref()
         .cloned();
     if let Some(native) = attached_native {
-        native.set_cancel_reason(local_reason_to_native(reason));
+        retain_native_cancel_provenance(inner, &native);
+        signal_native_cancel_target(&native);
     }
     if let Some(native) = inner.fallback_native_cx.get() {
-        native.set_cancel_reason(local_reason_to_native(reason));
+        retain_native_cancel_provenance(inner, native);
+        signal_native_cancel_target(native);
+    }
+    let cancel_relay = inner
+        .native_cancel_relay
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .cloned();
+    if let Some(relay) = cancel_relay {
+        retain_native_cancel_provenance(inner, &relay);
+        signal_native_cancel_target(&relay);
     }
 }
 
@@ -547,27 +741,47 @@ fn local_deadline_to_native_time(deadline: Duration) -> NativeTime {
     NativeTime::from_nanos(nanos)
 }
 
-/// Propagate cancellation to a `CxInner` node and all its descendants.
+/// Apply cancellation to one node and return a strong snapshot of its live
+/// children.
 ///
-/// We release each node's lock before recursing into children to avoid
-/// lock-ordering issues.
-fn propagate_cancel(inner: &CxInner, reason: CancelReason) {
-    // Set atomic flag (fast-path for checkpoint).
-    inner.cancel_requested.store(true, Ordering::Release);
-
-    // Monotone reason update.
-    {
-        let mut r = inner
+/// Every node lock is released before native cancellation callbacks or child
+/// traversal. This keeps arbitrary runtime-handle behavior outside project
+/// locks and lets the caller use an iterative worklist.
+fn cancel_node_and_snapshot_children(
+    inner: &CxInner,
+    reason: CancelReason,
+) -> Option<(CancelReason, Vec<Arc<CxInner>>)> {
+    let effective_reason = {
+        let mut current = inner
             .cancel_reason
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match *r {
-            Some(existing) if existing >= reason => {}
-            _ => *r = Some(reason),
+        match *current {
+            Some(existing) if existing >= reason => existing,
+            _ => {
+                *current = Some(reason);
+                #[cfg(test)]
+                inner
+                    .accepted_cancel_propagations
+                    .fetch_add(1, Ordering::Relaxed);
+                reason
+            }
         }
+    };
+    if inner
+        .cancel_fully_propagated_reason
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some_and(|completed| completed >= effective_reason)
+    {
+        return None;
     }
 
-    // State transition: Created/Running → CancelRequested.
+    // Publish both the exact reason and the requested lifecycle state before
+    // the fast bit. Any observer that acquires `cancel_requested == true` can
+    // therefore transition `CancelRequested -> Cancelling`; it can never
+    // return a cancellation error while the public lifecycle still says
+    // Created or Running.
     {
         let mut state = inner
             .cancel_state
@@ -578,22 +792,150 @@ fn propagate_cancel(inner: &CxInner, reason: CancelReason) {
         }
     }
 
-    // Keep attached native asupersync context in sync so downstream combinators
-    // observe equivalent cancellation semantics.
-    #[cfg(feature = "native")]
-    sync_native_cx_cancel(inner, reason);
+    #[cfg(test)]
+    pause_at_test_interleaving(&inner.cancel_publication_pause, Some(reason));
+    inner.cancel_requested.store(true, Ordering::Release);
+    #[cfg(test)]
+    pause_at_test_interleaving(&inner.cancel_after_flag_pause, Some(reason));
 
-    // Collect children (release lock before recursing).
-    let children: Vec<Arc<CxInner>> = {
-        let mut guard = inner
-            .children
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.retain(|child| child.strong_count() > 0);
-        guard.iter().filter_map(Weak::upgrade).collect()
+    let mut children = inner
+        .children
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    children.retain(|child| child.strong_count() > 0);
+    Some((
+        effective_reason,
+        children.iter().filter_map(Weak::upgrade).collect(),
+    ))
+}
+
+fn mark_cancel_fully_propagated(inner: &CxInner, reason: CancelReason) {
+    let mut completed = inner
+        .cancel_fully_propagated_reason
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if completed.is_none_or(|existing| existing < reason) {
+        *completed = Some(reason);
+    }
+}
+
+fn mark_cancellation_observed(inner: &CxInner) {
+    let mut state = inner
+        .cancel_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *state == CancelState::CancelRequested {
+        *state = CancelState::Cancelling;
+    }
+}
+
+/// Propagate cancellation to a `CxInner` node and all its descendants without
+/// consuming native stack per descendant.
+fn propagate_cancel(inner: &CxInner, reason: CancelReason) {
+    let Some((effective_reason, children)) = cancel_node_and_snapshot_children(inner, reason)
+    else {
+        return;
     };
-    for child in &children {
+    let mut processed = std::collections::HashMap::new();
+    processed.insert(std::ptr::from_ref(inner), effective_reason);
+    let mut touched_children: std::collections::HashMap<
+        *const CxInner,
+        (Arc<CxInner>, CancelReason),
+    > = std::collections::HashMap::new();
+    let mut pending: Vec<_> = children
+        .into_iter()
+        .map(|child| (child, effective_reason))
+        .collect();
+    while let Some((next, inherited_reason)) = pending.pop() {
+        if let Some((effective_reason, children)) =
+            cancel_node_and_snapshot_children(&next, inherited_reason)
+        {
+            let key = Arc::as_ptr(&next);
+            if processed
+                .get(&key)
+                .is_some_and(|processed_reason| *processed_reason >= effective_reason)
+            {
+                continue;
+            }
+            processed.insert(key, effective_reason);
+            touched_children
+                .entry(key)
+                .and_modify(|(_, touched_reason)| {
+                    *touched_reason = (*touched_reason).max(effective_reason);
+                })
+                .or_insert_with(|| (Arc::clone(&next), effective_reason));
+            pending.extend(children.into_iter().map(|child| (child, effective_reason)));
+        }
+    }
+
+    // Runtime wake signals are a second phase. Every reachable project context
+    // already carries its exact local reason before a shared native context is
+    // signaled, so a child cannot mistake this project-origin wake for an
+    // unexplained native cancellation.
+    #[cfg(feature = "native")]
+    {
+        signal_native_cx_cancel(inner);
+        for (child, _) in touched_children.values() {
+            signal_native_cx_cancel(child);
+        }
+    }
+
+    // Completion is published only after both descendant traversal and native
+    // signaling finish. Concurrent equal/weaker callers may duplicate an
+    // in-flight walk, but they cannot return early from a partially propagated
+    // cancellation.
+    for (child, propagated_reason) in touched_children.into_values() {
+        mark_cancel_fully_propagated(&child, propagated_reason);
+    }
+    mark_cancel_fully_propagated(inner, effective_reason);
+}
+
+const CHILD_LINK_PRUNE_INTERVAL: u32 = 64;
+
+/// Register a one-way parent-to-child cancellation link.
+///
+/// The parent deliberately stores only a `Weak` reference, so a completed
+/// operation never keeps its cancellation state alive. Opportunistic pruning
+/// every 64 registrations bounds dead slots left by repeatedly dropped
+/// admission futures without imposing an O(live-children) scan on every child
+/// creation.
+fn register_cancellation_child(parent: &CxInner, child: &Arc<CxInner>) {
+    let registration = parent
+        .child_registration_epoch
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    let mut children = parent
+        .children
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if registration % CHILD_LINK_PRUNE_INTERVAL == 0 {
+        children.retain(|registered| registered.strong_count() > 0);
+    }
+    children.push(Arc::downgrade(child));
+}
+
+fn inherit_existing_cancellation(parent: &CxInner, child: &CxInner) {
+    #[cfg(feature = "native")]
+    let native_provenance = {
+        parent
+            .native_cancel_provenance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    };
+    #[cfg(feature = "native")]
+    if let Some(provenance) = native_provenance {
+        propagate_native_cancel_provenance(child, provenance);
+    }
+
+    let reason = *parent
+        .cancel_reason
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(reason) = reason {
         propagate_cancel(child, reason);
+    } else if parent.cancel_requested.load(Ordering::Acquire) {
+        propagate_cancel(child, CancelReason::UserInterrupt);
     }
 }
 
@@ -611,6 +953,156 @@ pub struct Cx<Caps: cap::SubsetOf<cap::All> = FullCaps> {
     policy_id: u64,
     // fn() -> Caps ensures Send+Sync regardless of Caps marker type.
     _caps: PhantomData<fn() -> Caps>,
+}
+
+/// Caller-owned cancellation source for one admitted database operation.
+///
+/// This type carries no effect capability and no native runtime context. Its
+/// only authority is a one-way request to cancel the matching
+/// [`OperationCancellationToken`]. Dropping an armed source requests
+/// cancellation, which makes dropping an admitted public future
+/// cancel-correct without cancelling its parent context or sibling operations.
+#[derive(Debug)]
+#[must_use = "dropping an armed operation source requests cancellation"]
+pub struct OperationCancellationSource {
+    inner: Arc<CxInner>,
+    armed: bool,
+}
+
+impl OperationCancellationSource {
+    /// Request cancellation of this operation without affecting its parent or
+    /// siblings.
+    pub fn cancel(&self) {
+        self.cancel_with_reason(CancelReason::UserInterrupt);
+    }
+
+    /// Request cancellation with an explicit reason.
+    pub fn cancel_with_reason(&self, reason: CancelReason) {
+        propagate_cancel(&self.inner, reason);
+    }
+
+    /// Forward a project-context cancellation without transferring any of
+    /// that context's runtime or effect capabilities into the engine token.
+    pub fn cancel_from_cx<Caps: cap::SubsetOf<cap::All>>(&self, cx: &Cx<Caps>) {
+        #[cfg(feature = "native")]
+        if let Some(provenance) = cx.native_cancel_provenance() {
+            propagate_native_cancel_provenance(&self.inner, provenance);
+        }
+        self.cancel_with_reason(cx.cancel_reason().unwrap_or(CancelReason::UserInterrupt));
+    }
+
+    /// Forward cancellation observed on the native context polling the public
+    /// future. Only its pure-data reason and provenance are retained; the
+    /// task-affine native context itself never crosses the actor boundary.
+    #[cfg(feature = "native")]
+    pub fn cancel_from_native_cx<Caps>(&self, native: &NativeCx<Caps>) {
+        if let Some(reason) = native.cancel_reason() {
+            propagate_native_cancel_provenance(
+                &self.inner,
+                NativeCancellationProvenance::Exact(reason.clone()),
+            );
+            self.cancel_with_reason(native_reason_to_local(&reason));
+        } else {
+            propagate_native_cancel_provenance(
+                &self.inner,
+                NativeCancellationProvenance::SignalWithoutReason,
+            );
+            self.cancel_with_reason(CancelReason::NativeSignal);
+        }
+    }
+
+    /// Disarm Drop cancellation after the authoritative terminal result has
+    /// been observed.
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OperationCancellationSource {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancel();
+        }
+    }
+}
+
+/// Native-free, capability-free cancellation handoff retained by one engine
+/// operation.
+///
+/// The token cannot cancel its caller. It can only be inspected or linked to a
+/// root-derived engine [`Cx`], preserving a strict separation between caller
+/// cancellation authority and engine runtime/effect authority. It retains only
+/// scalar caller trace/policy metadata plus its pure-data [`Budget`]. Nonzero
+/// metadata may override the engine child's corresponding metadata, and the
+/// two budgets are met so constraints can only tighten; decision IDs and all
+/// runtime-bound state remain engine-owned.
+#[derive(Debug, Clone)]
+pub struct OperationCancellationToken {
+    inner: Arc<CxInner>,
+    caller_budget: Budget,
+    caller_trace_id: u64,
+    caller_policy_id: u64,
+}
+
+impl OperationCancellationToken {
+    /// Whether cancellation has been requested for this operation.
+    #[must_use]
+    pub fn is_cancel_requested(&self) -> bool {
+        self.inner.cancel_requested.load(Ordering::Acquire)
+    }
+
+    /// Strongest cancellation reason observed by this operation.
+    #[must_use]
+    pub fn cancel_reason(&self) -> Option<CancelReason> {
+        *self
+            .inner
+            .cancel_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether engine work has observed this operation's cancellation at a
+    /// checkpoint and begun cancellation handling.
+    ///
+    /// A mere request is intentionally insufficient: callers use this bit to
+    /// distinguish an engine `Abort` caused by this operation's cancellation
+    /// from an unrelated `Abort` that raced with a later cancellation request.
+    #[must_use]
+    pub fn cancellation_was_observed(&self) -> bool {
+        matches!(
+            *self
+                .inner
+                .cancel_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            CancelState::Cancelling | CancelState::Finalizing | CancelState::Completed
+        )
+    }
+
+    /// Exact native cancellation provenance observed by this context.
+    ///
+    /// This is separate from [`Self::cancel_reason`], which reports the
+    /// coarse behavioral class used by the engine.
+    #[cfg(feature = "native")]
+    #[must_use]
+    pub fn native_cancel_provenance(&self) -> Option<NativeCancellationProvenance> {
+        self.inner
+            .native_cancel_provenance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Check the operation signal without manufacturing an effect-capable
+    /// context.
+    pub fn checkpoint(&self) -> Result<()> {
+        if self.is_cancel_requested() {
+            mark_cancellation_observed(&self.inner);
+            Err(Error::cancelled())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl<Caps: cap::SubsetOf<cap::All>> Clone for Cx<Caps> {
@@ -655,19 +1147,18 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
             return native;
         }
 
-        self.inner
+        let native = self
+            .inner
             .fallback_native_cx
             .get_or_init(|| {
-                let native =
-                    NativeCx::for_request_with_budget(native_budget_from_local(self.budget));
-                if let Some(reason) = self.cancel_reason() {
-                    native.set_cancel_reason(local_reason_to_native(reason));
-                } else if self.is_cancel_requested() {
-                    native.set_cancel_requested(true);
-                }
-                native
+                NativeCx::for_request_with_budget(native_budget_from_local(self.budget))
             })
-            .clone()
+            .clone();
+
+        if self.is_cancel_requested() {
+            signal_native_cancel_target(&native);
+        }
+        native
     }
 
     #[cfg(feature = "native")]
@@ -685,8 +1176,17 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
 
     #[must_use]
     pub fn with_budget(budget: Budget) -> Self {
+        Self::with_budget_and_operation_cancellation_source(budget, None)
+    }
+
+    fn with_budget_and_operation_cancellation_source(
+        budget: Budget,
+        operation_cancellation_source: Option<Arc<CxInner>>,
+    ) -> Self {
         Self {
-            inner: Arc::new(CxInner::new()),
+            inner: Arc::new(CxInner::new_with_operation_cancellation_source(
+                operation_cancellation_source,
+            )),
             budget,
             trace_id: 0,
             decision_id: 0,
@@ -698,6 +1198,29 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     #[must_use]
     pub fn budget(&self) -> Budget {
         self.budget
+    }
+
+    /// Convert this project's effective budget into the native Asupersync
+    /// representation for a child scope.
+    ///
+    /// The project deadline is a relative timeout, so it must be anchored to
+    /// the current native context's clock. Using the process wall clock here
+    /// would be wrong for runtimes backed by a monotonic or virtual clock.
+    /// `NativeCx::scope_with_budget` subsequently meets this value with the
+    /// runtime-owned parent budget, so neither plane can loosen the other.
+    #[cfg(feature = "native")]
+    #[must_use]
+    pub fn native_budget_for_child_scope(&self, native_cx: &NativeCx) -> NativeBudget {
+        let mut native_budget = NativeBudget::new()
+            .with_poll_quota(self.budget.poll_quota)
+            .with_priority(self.budget.priority);
+        if let Some(cost_quota) = self.budget.cost_quota {
+            native_budget = native_budget.with_cost_quota(cost_quota);
+        }
+        if let Some(timeout) = self.budget.deadline {
+            native_budget = native_budget.with_timeout(native_cx.now(), timeout);
+        }
+        native_cx.budget().meet(native_budget)
     }
 
     // -----------------------------------------------------------------------
@@ -845,6 +1368,20 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Exact native cancellation provenance observed by this context.
+    ///
+    /// This is separate from [`Self::cancel_reason`], which reports the
+    /// coarse behavioral class used by the engine.
+    #[cfg(feature = "native")]
+    #[must_use]
+    pub fn native_cancel_provenance(&self) -> Option<NativeCancellationProvenance> {
+        self.inner
+            .native_cancel_provenance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Transition from `Created` to `Running`.
     pub fn transition_to_running(&self) {
         let mut state = self
@@ -895,16 +1432,47 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     /// Attach a native asupersync context used by [`Self::checkpoint`].
     #[cfg(feature = "native")]
     pub fn set_native_cx(&self, native_cx: NativeCx) {
-        if let Some(reason) = self.cancel_reason() {
-            native_cx.set_cancel_reason(local_reason_to_native(reason));
-        } else if self.is_cancel_requested() {
-            native_cx.set_cancel_requested(true);
+        #[cfg(test)]
+        pause_at_test_interleaving(&self.inner.native_install_pause, None);
+
+        let previous = {
+            let mut slot = self
+                .inner
+                .attached_native_cx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.replace(native_cx.clone())
+        };
+        drop(previous);
+
+        if self.is_cancel_requested() {
+            retain_native_cancel_provenance(&self.inner, &native_cx);
+            signal_native_cancel_target(&native_cx);
         }
-        *self
-            .inner
-            .attached_native_cx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(native_cx);
+    }
+
+    /// Attach a cancellation-only native relay without adding runtime effect
+    /// authority to this project context.
+    ///
+    /// The relay remains `cap::None` end-to-end. Installation is followed by
+    /// a cancellation recheck, closing the race where the project context is
+    /// cancelled immediately before the relay becomes visible.
+    #[cfg(feature = "native")]
+    pub fn set_native_cancel_relay(&self, relay: NativeCx<native_cap::None>) {
+        let previous = {
+            let mut slot = self
+                .inner
+                .native_cancel_relay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.replace(relay.clone())
+        };
+        drop(previous);
+
+        if self.is_cancel_requested() {
+            retain_native_cancel_provenance(&self.inner, &relay);
+            signal_native_cancel_target(&relay);
+        }
     }
 
     /// Attach a native context shim in non-native builds.
@@ -983,6 +1551,41 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     }
 
     #[cfg(feature = "native")]
+    fn ingest_native_cancellation(&self, native: &NativeCx) {
+        if let Some(reason) = native.cancel_reason() {
+            propagate_native_cancel_provenance(
+                &self.inner,
+                NativeCancellationProvenance::Exact(reason.clone()),
+            );
+            self.cancel_with_reason(native_reason_to_local(&reason));
+        } else if !self.is_cancel_requested() {
+            // A reasonless signal can be emitted by native code or can be the
+            // echo of this bridge's project-origin wake. The latter always
+            // publishes the project bit first, so only an otherwise-live
+            // context records an unexplained native signal.
+            propagate_native_cancel_provenance(
+                &self.inner,
+                NativeCancellationProvenance::SignalWithoutReason,
+            );
+            self.cancel_with_reason(CancelReason::NativeSignal);
+        }
+    }
+
+    #[cfg(feature = "native")]
+    fn capture_native_reason_if_present(&self) {
+        let Some(native) = self.native_cx_for_checkpoint() else {
+            return;
+        };
+        if let Some(reason) = native.cancel_reason() {
+            propagate_native_cancel_provenance(
+                &self.inner,
+                NativeCancellationProvenance::Exact(reason.clone()),
+            );
+            self.cancel_with_reason(native_reason_to_local(&reason));
+        }
+    }
+
+    #[cfg(feature = "native")]
     #[must_use]
     fn maybe_cancel_via_native_cx(&self, masked: bool) -> bool {
         let Some(native) = self.native_cx_for_checkpoint() else {
@@ -991,25 +1594,43 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
 
         if masked {
             if native.is_cancel_requested() {
-                let reason = native
-                    .cancel_reason()
-                    .as_ref()
-                    .map_or(CancelReason::Timeout, native_reason_to_local);
-                self.cancel_with_reason(reason);
+                self.ingest_native_cancellation(&native);
                 return true;
             }
             return false;
         }
 
         if native.checkpoint().is_err() {
-            let reason = native
-                .cancel_reason()
-                .as_ref()
-                .map_or(CancelReason::Timeout, native_reason_to_local);
-            self.cancel_with_reason(reason);
+            self.ingest_native_cancellation(&native);
             return true;
         }
         false
+    }
+
+    #[must_use]
+    fn maybe_cancel_via_operation_source(&self) -> bool {
+        let Some(source) = self.inner.operation_cancellation_source.as_ref() else {
+            return false;
+        };
+        if !source.cancel_requested.load(Ordering::Acquire) {
+            return false;
+        }
+        let reason = *source
+            .cancel_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(feature = "native")]
+        let native_provenance = source
+            .native_cancel_provenance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        #[cfg(feature = "native")]
+        if let Some(provenance) = native_provenance {
+            propagate_native_cancel_provenance(&self.inner, provenance);
+        }
+        self.cancel_with_reason(reason.unwrap_or(CancelReason::UserInterrupt));
+        true
     }
 
     // -----------------------------------------------------------------------
@@ -1035,8 +1656,9 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         let cancel_requested = self.inner.cancel_requested.load(Ordering::Acquire);
         if !cancel_requested {
             // Cheap path already proved we're not locally cancelled. Only
-            // the oracle + native cx can still observe a cancel signal.
-            if !self.maybe_cancel_via_eprocess() {
+            // the operation source, oracle, or native cx can still observe a
+            // cancel signal.
+            if !self.maybe_cancel_via_operation_source() && !self.maybe_cancel_via_eprocess() {
                 #[cfg(feature = "native")]
                 {
                     let masked = self.inner.mask_depth.load(Ordering::Acquire) > 0;
@@ -1049,6 +1671,14 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
                     return Ok(());
                 }
             }
+        } else {
+            // Once the project plane is cancelled the normal hot path is no
+            // longer relevant. Continue sampling both the durable operation
+            // source and an exact native reason so a later, stronger
+            // cancellation is not hidden by an earlier local request.
+            let _ = self.maybe_cancel_via_operation_source();
+            #[cfg(feature = "native")]
+            self.capture_native_reason_if_present();
         }
 
         // Either cancel_requested is set locally, or one of the async plane
@@ -1058,16 +1688,12 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
             return Ok(());
         }
 
-        // Slow path: transition CancelRequested → Cancelling.
-        {
-            let mut state = self
-                .inner
-                .cancel_state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if *state == CancelState::CancelRequested {
-                *state = CancelState::Cancelling;
-            }
+        // Slow path: transition both the engine context and its exact
+        // operation source from CancelRequested → Cancelling. The latter is
+        // the provenance receipt used at the actor response boundary.
+        mark_cancellation_observed(&self.inner);
+        if let Some(source) = self.inner.operation_cancellation_source.as_ref() {
+            mark_cancellation_observed(source);
         }
         Err(Error::cancelled())
     }
@@ -1189,29 +1815,146 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     /// to this child. Tracing IDs propagate to the child.
     #[must_use]
     pub fn create_child(&self) -> Self {
-        let mut child = Self::with_budget(self.budget);
+        self.create_child_impl(true)
+    }
+
+    /// Create a same-capability child without copying an attached native
+    /// runtime context.
+    ///
+    /// This is the safe construction primitive for caller-local cancellation
+    /// relays that may later cross an OS-thread boundary. Unlike
+    /// `create_child().clear_native_cx()`, the task-affine native handle is
+    /// never transiently cloned into the new child.
+    #[must_use]
+    pub fn create_native_free_child(&self) -> Self {
+        self.create_child_impl(false)
+    }
+
+    /// Create the one-way cancellation source/token pair for a database
+    /// operation.
+    ///
+    /// The token is constructed natively free and without changing the
+    /// caller's capability type. Parent cancellation propagates into the
+    /// token, while source cancellation never propagates back into the parent.
+    pub fn operation_cancellation(
+        &self,
+    ) -> (OperationCancellationSource, OperationCancellationToken) {
+        // Build the handoff directly instead of using the generic child
+        // constructor. The latter intentionally copies the parent's
+        // e-process oracle, which is caller-side policy state and must not
+        // cross the actor boundary inside an otherwise capability-free token.
+        let operation = Self::with_budget_and_operation_cancellation_source(self.budget, None);
+        register_cancellation_child(&self.inner, &operation.inner);
+        inherit_existing_cancellation(&self.inner, &operation.inner);
+        if let Some(source) = self.inner.operation_cancellation_source.as_ref() {
+            register_cancellation_child(source, &operation.inner);
+            inherit_existing_cancellation(source, &operation.inner);
+        }
+        let inner = operation.inner;
+        (
+            OperationCancellationSource {
+                inner: Arc::clone(&inner),
+                armed: true,
+            },
+            OperationCancellationToken {
+                inner,
+                caller_budget: self.budget,
+                caller_trace_id: self.trace_id,
+                caller_policy_id: self.policy_id,
+            },
+        )
+    }
+
+    /// Derive an engine context from this root and link it to an opaque
+    /// per-operation cancellation token.
+    ///
+    /// Runtime handles, budgets, tracing, and effect capabilities come only
+    /// from `self`. The token contributes cancellation in one direction and
+    /// cannot widen or replace the engine context's capability type.
+    #[must_use]
+    pub fn create_child_linked_to_operation(&self, operation: &OperationCancellationToken) -> Self {
+        // A cloned asupersync NativeCx shares cancellation state with its
+        // parent. Operation children therefore never inherit the engine
+        // root's attachment: cancelling one command must not contaminate the
+        // root or siblings. Dedicated-worker-compatible roots are detached,
+        // and actor engine work observes this project Cx directly.
+        let mut child =
+            self.create_child_impl_with_operation_source(false, Some(Arc::clone(&operation.inner)));
+        child.budget = self.budget.meet(operation.caller_budget);
+        if operation.caller_trace_id != 0 {
+            child.trace_id = operation.caller_trace_id;
+        }
+        if operation.caller_policy_id != 0 {
+            child.policy_id = operation.caller_policy_id;
+        }
+        if let Some(source) = self.inner.operation_cancellation_source.as_ref()
+            && !Arc::ptr_eq(source, &operation.inner)
+        {
+            register_cancellation_child(source, &child.inner);
+            inherit_existing_cancellation(source, &child.inner);
+        }
+        child
+    }
+
+    /// Derive an operation-linked child directly from this root while using a
+    /// fresh trace ID only when the caller did not supply one.
+    ///
+    /// This avoids creating a disposable intermediate parent merely to carry
+    /// fallback trace metadata. Parent links are weak, so dropping such an
+    /// intermediate would sever root cancellation propagation.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn create_child_linked_to_operation_with_fallback_trace(
+        &self,
+        operation: &OperationCancellationToken,
+        fallback_trace_id: u64,
+    ) -> Self {
+        let caller_has_trace = operation.caller_trace_id != 0;
+        let mut child = self.create_child_linked_to_operation(operation);
+        if !caller_has_trace {
+            child.trace_id = fallback_trace_id;
+        }
+        child
+    }
+
+    fn create_child_impl(&self, inherit_native: bool) -> Self {
+        self.create_child_impl_with_operation_source(
+            inherit_native,
+            self.inner.operation_cancellation_source.clone(),
+        )
+    }
+
+    fn create_child_impl_with_operation_source(
+        &self,
+        _inherit_native: bool,
+        operation_cancellation_source: Option<Arc<CxInner>>,
+    ) -> Self {
+        let mut child = Self::with_budget_and_operation_cancellation_source(
+            self.budget,
+            operation_cancellation_source,
+        );
         child.trace_id = self.trace_id;
         child.decision_id = self.decision_id;
         child.policy_id = self.policy_id;
         if let Some(oracle) = self.inner.eprocess_oracle.get().cloned() {
             child.set_eprocess_oracle(oracle);
         }
-        #[cfg(feature = "native")]
-        if let Some(native_cx) = self.attached_native_cx() {
-            child.set_native_cx(native_cx);
-        }
+        register_cancellation_child(&self.inner, &child.inner);
+        inherit_existing_cancellation(&self.inner, &child.inner);
+        if let Some(source) = child.inner.operation_cancellation_source.as_ref()
+            && !Arc::ptr_eq(source, &self.inner)
         {
-            let mut children = self
-                .inner
-                .children
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            children.push(Arc::downgrade(&child.inner));
+            register_cancellation_child(source, &child.inner);
+            inherit_existing_cancellation(source, &child.inner);
         }
-        if let Some(reason) = self.cancel_reason() {
-            child.cancel_with_reason(reason);
-        } else if self.is_cancel_requested() {
-            child.cancel();
+        #[cfg(feature = "native")]
+        if _inherit_native {
+            if let Some(native_cx) = self.attached_native_cx() {
+                // Publish every project-plane parent/source link and recheck
+                // inherited cancellation before exposing the child to a shared
+                // native wake signal.
+                child.set_native_cx(native_cx);
+            }
         }
         child
     }
@@ -1299,6 +2042,17 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Weak};
 
+    fn test_interleaving_pause(
+        expected_reason: Option<CancelReason>,
+    ) -> Arc<TestInterleavingPause> {
+        Arc::new(TestInterleavingPause {
+            expected_reason,
+            armed: AtomicBool::new(true),
+            reached: std::sync::Barrier::new(2),
+            resume: std::sync::Barrier::new(2),
+        })
+    }
+
     #[test]
     fn test_cx_checkpoint_observes_cancellation() {
         let cx = Cx::new();
@@ -1339,6 +2093,67 @@ mod tests {
         let child = Budget::INFINITE.with_deadline(Duration::from_millis(100));
         let scoped = cx.scope_with_budget(child);
         assert_eq!(scoped.budget().deadline, Some(Duration::from_millis(50)));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_native_child_scope_deadline_uses_parent_runtime_clock() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build native-budget test runtime");
+        runtime.block_on(async {
+            let native_cx =
+                NativeCx::current().expect("runtime task must expose its native context");
+            let timeout = Duration::from_millis(25);
+            let project_cx = Cx::<FullCaps>::with_budget(
+                Budget::INFINITE
+                    .with_deadline(timeout)
+                    .with_poll_quota(41)
+                    .with_cost_quota(73)
+                    .with_priority(9),
+            );
+
+            let before = native_cx.now();
+            let native_budget = project_cx.native_budget_for_child_scope(&native_cx);
+            let after = native_cx.now();
+            let expected_priority = native_cx.budget().priority.max(9);
+            let deadline = native_budget
+                .deadline
+                .expect("relative project deadline must become a native deadline");
+
+            assert!(
+                deadline >= before + timeout && deadline <= after + timeout,
+                "native deadline must be anchored to the active runtime clock: \
+                 before={before:?}, deadline={deadline:?}, after={after:?}"
+            );
+            assert_eq!(native_budget.poll_quota, 41);
+            assert_eq!(native_budget.cost_quota, Some(73));
+            assert_eq!(native_budget.priority, expected_priority);
+        });
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_native_child_scope_priority_is_monotonic_across_both_planes() {
+        let native_high = NativeCx::for_request_with_budget(
+            NativeBudget::INFINITE
+                .with_poll_quota(500)
+                .with_priority(200),
+        );
+        let project_low =
+            Cx::<FullCaps>::with_budget(Budget::INFINITE.with_priority(19).with_poll_quota(400));
+        let high_parent_effective = project_low.native_budget_for_child_scope(&native_high);
+        assert_eq!(high_parent_effective.priority, 200);
+        assert_eq!(high_parent_effective.poll_quota, 400);
+
+        let native_low = NativeCx::for_request_with_budget(
+            NativeBudget::INFINITE.with_poll_quota(300).with_priority(7),
+        );
+        let project_high =
+            Cx::<FullCaps>::with_budget(Budget::INFINITE.with_priority(211).with_poll_quota(600));
+        let high_project_effective = project_high.native_budget_for_child_scope(&native_low);
+        assert_eq!(high_project_effective.priority, 211);
+        assert_eq!(high_project_effective.poll_quota, 300);
     }
 
     #[test]
@@ -1620,6 +2435,275 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::Cancelled);
     }
 
+    #[test]
+    fn test_cancel_reason_precedes_flag_and_linked_child_never_invents_reason() {
+        let parent = Cx::<FullCaps>::new();
+        let pause = test_interleaving_pause(Some(CancelReason::Timeout));
+        *parent
+            .inner
+            .cancel_publication_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&pause));
+
+        let cancelling_parent = parent.clone();
+        let cancellation = std::thread::spawn(move || {
+            cancelling_parent.cancel_with_reason(CancelReason::Timeout);
+        });
+
+        pause.reached.wait();
+        assert_eq!(parent.cancel_reason(), Some(CancelReason::Timeout));
+        assert_eq!(
+            parent.cancel_state(),
+            CancelState::CancelRequested,
+            "the lifecycle state must precede the fast cancellation bit"
+        );
+        assert!(
+            !parent.is_cancel_requested(),
+            "the test must stop between reason/state publication and the Release flag"
+        );
+
+        let child = parent.create_child();
+        assert_eq!(
+            child.cancel_reason(),
+            Some(CancelReason::Timeout),
+            "a child linked in the publication window must inherit the exact reason"
+        );
+
+        pause.resume.wait();
+        cancellation
+            .join()
+            .expect("cancellation publisher should finish");
+        assert!(parent.is_cancel_requested());
+        assert_eq!(child.cancel_reason(), Some(CancelReason::Timeout));
+    }
+
+    #[test]
+    fn test_equal_cancel_assists_inflight_publication_before_returning() {
+        let cx = Cx::<FullCaps>::new();
+        let pause = test_interleaving_pause(Some(CancelReason::Timeout));
+        *cx.inner
+            .cancel_publication_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&pause));
+
+        let first_cx = cx.clone();
+        let first = std::thread::spawn(move || {
+            first_cx.cancel_with_reason(CancelReason::Timeout);
+        });
+
+        pause.reached.wait();
+        assert_eq!(cx.cancel_reason(), Some(CancelReason::Timeout));
+        assert!(!cx.is_cancel_requested());
+
+        cx.cancel_with_reason(CancelReason::Timeout);
+
+        assert!(
+            cx.is_cancel_requested(),
+            "an equal caller must finish the in-flight Release publication before returning"
+        );
+        assert_eq!(
+            cx.inner
+                .accepted_cancel_propagations
+                .load(Ordering::Relaxed),
+            1,
+            "helping publication must not count as a second accepted reason"
+        );
+
+        let child = cx.create_child();
+        assert_eq!(child.cancel_reason(), Some(CancelReason::Timeout));
+        assert!(child.is_cancel_requested());
+
+        pause.resume.wait();
+        first
+            .join()
+            .expect("the original cancellation publisher should finish");
+    }
+
+    #[test]
+    fn test_equal_cancel_completes_descendant_propagation_after_flag_publication() {
+        let parent = Cx::<FullCaps>::new();
+        #[cfg(feature = "native")]
+        let native = NativeCx::for_testing();
+        #[cfg(feature = "native")]
+        parent.set_native_cx(native.clone());
+        let child = parent.create_child();
+        let pause = test_interleaving_pause(Some(CancelReason::Timeout));
+        *parent
+            .inner
+            .cancel_after_flag_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&pause));
+
+        let first_parent = parent.clone();
+        let first = std::thread::spawn(move || {
+            first_parent.cancel_with_reason(CancelReason::Timeout);
+        });
+
+        pause.reached.wait();
+        assert!(parent.is_cancel_requested());
+        assert!(
+            !child.is_cancel_requested(),
+            "the test must stop after the parent flag but before descendant propagation"
+        );
+
+        parent.cancel_with_reason(CancelReason::Timeout);
+
+        assert!(
+            child.is_cancel_requested(),
+            "an equal caller must complete the in-flight descendant walk before returning"
+        );
+        assert_eq!(child.cancel_reason(), Some(CancelReason::Timeout));
+        #[cfg(feature = "native")]
+        assert!(
+            native.checkpoint().is_err(),
+            "the helping caller must also finish native wake signaling"
+        );
+
+        pause.resume.wait();
+        first
+            .join()
+            .expect("the original cancellation publisher should finish");
+    }
+
+    #[test]
+    fn test_diamond_reprocesses_shared_descendant_for_stronger_effective_reason() {
+        let root = Cx::<FullCaps>::new();
+        let strong_branch = Cx::<FullCaps>::new();
+        let weak_branch = Cx::<FullCaps>::new();
+        let shared = Cx::<FullCaps>::new();
+        register_cancellation_child(&root.inner, &strong_branch.inner);
+        register_cancellation_child(&root.inner, &weak_branch.inner);
+        register_cancellation_child(&strong_branch.inner, &shared.inner);
+        register_cancellation_child(&weak_branch.inner, &shared.inner);
+
+        let pause = test_interleaving_pause(Some(CancelReason::Abort));
+        *strong_branch
+            .inner
+            .cancel_after_flag_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&pause));
+        let cancelling_branch = strong_branch.clone();
+        let stronger = std::thread::spawn(move || {
+            cancelling_branch.cancel_with_reason(CancelReason::Abort);
+        });
+
+        pause.reached.wait();
+        root.cancel_with_reason(CancelReason::Timeout);
+
+        assert_eq!(
+            shared.cancel_reason(),
+            Some(CancelReason::Abort),
+            "a node first reached through the weak branch must be revisited when the other branch \
+             exposes a stronger effective reason"
+        );
+        assert_eq!(
+            *strong_branch
+                .inner
+                .cancel_fully_propagated_reason
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(CancelReason::Abort),
+            "strong-branch completion is valid only after its shared descendant is upgraded"
+        );
+
+        pause.resume.wait();
+        stronger
+            .join()
+            .expect("the original strong publisher should finish");
+        assert_eq!(shared.cancel_reason(), Some(CancelReason::Abort));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_project_wake_never_becomes_reasonless_native_child_provenance() {
+        let parent = Cx::<FullCaps>::new();
+        let native = NativeCx::for_testing();
+        parent.set_native_cx(native.clone());
+        let child = parent.create_child();
+        let pause = test_interleaving_pause(None);
+        *parent
+            .inner
+            .native_signal_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&pause));
+
+        let cancelling_parent = parent.clone();
+        let cancellation = std::thread::spawn(move || {
+            cancelling_parent.cancel_with_reason(CancelReason::RegionClose);
+        });
+
+        pause.reached.wait();
+        assert!(
+            child.is_cancel_requested(),
+            "the entire project lineage must be marked before the first native wake"
+        );
+        assert!(
+            child.checkpoint().is_err(),
+            "the child must observe the project cancellation while signaling is paused"
+        );
+        assert_eq!(
+            child.native_cancel_provenance(),
+            None,
+            "a project-origin wake must not be recorded as unexplained native provenance"
+        );
+
+        pause.resume.wait();
+        cancellation
+            .join()
+            .expect("two-phase cancellation propagation should finish");
+        assert!(native.checkpoint().is_err());
+        assert_eq!(child.native_cancel_provenance(), None);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_native_wake_reentrant_equal_cancel_is_edge_triggered() {
+        struct ReentrantCancel {
+            cx: Cx<FullCaps>,
+            wake_count: AtomicU32,
+        }
+
+        impl std::task::Wake for ReentrantCancel {
+            fn wake(self: Arc<Self>) {
+                self.wake_count.fetch_add(1, Ordering::Relaxed);
+                self.cx.cancel_with_reason(CancelReason::Timeout);
+            }
+        }
+
+        std::thread::Builder::new()
+            .name("cx-reentrant-wake".to_string())
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                use std::future::Future;
+                use std::task::{Context, Poll, Waker};
+
+                let cx = Cx::<FullCaps>::new();
+                let native = NativeCx::for_testing();
+                cx.set_native_cx(native.clone());
+                let waiter = asupersync::sync::OnceCell::<()>::new();
+                let wake_state = Arc::new(ReentrantCancel {
+                    cx: cx.clone(),
+                    wake_count: AtomicU32::new(0),
+                });
+                let waker = Waker::from(Arc::clone(&wake_state));
+                let mut task_cx = Context::from_waker(&waker);
+                let mut wait = Box::pin(waiter.wait(&native));
+                assert_eq!(wait.as_mut().poll(&mut task_cx), Poll::Pending);
+
+                cx.cancel_with_reason(CancelReason::Timeout);
+
+                assert_eq!(
+                    wake_state.wake_count.load(Ordering::Relaxed),
+                    1,
+                    "the native cancellation edge must wake a reentrant waiter exactly once"
+                );
+                assert_eq!(cx.cancel_reason(), Some(CancelReason::Timeout));
+            })
+            .expect("spawn small-stack reentrant cancellation test")
+            .join()
+            .expect("reentrant cancellation must not recurse or overflow");
+    }
+
     #[cfg(feature = "native")]
     #[test]
     fn test_cx_checkpoint_native_cx_cancellation_maps_reason() {
@@ -1631,20 +2715,210 @@ mod tests {
         let err = cx.checkpoint().unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Cancelled);
         assert_eq!(cx.cancel_reason(), Some(CancelReason::Timeout));
+        assert_eq!(
+            cx.native_cancel_provenance(),
+            Some(NativeCancellationProvenance::Exact(
+                NativeCancelReason::timeout()
+            ))
+        );
     }
 
     #[cfg(feature = "native")]
     #[test]
-    fn test_cx_cancel_reason_propagates_to_native_cx() {
+    fn test_cx_cancel_signals_native_without_fabricating_native_attribution() {
         let cx = Cx::<FullCaps>::new();
         let native = NativeCx::for_testing();
         cx.set_native_cx(native.clone());
 
         cx.cancel_with_reason(CancelReason::RegionClose);
-        let reason = native
-            .cancel_reason()
-            .expect("native cancel reason must be set");
-        assert_eq!(reason.kind, NativeCancelKind::ParentCancelled);
+        assert!(native.checkpoint().is_err());
+        assert!(
+            native.cancel_reason().is_none(),
+            "the project bridge must not manufacture or overwrite native attribution"
+        );
+        let err = cx
+            .checkpoint()
+            .expect_err("the project cancellation must remain observable");
+        assert_eq!(err.kind(), ErrorKind::Cancelled);
+        assert_eq!(cx.cancel_reason(), Some(CancelReason::RegionClose));
+        assert_eq!(
+            cx.native_cancel_provenance(),
+            None,
+            "a reasonless echo of the project's own wake is not native provenance"
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_native_install_rechecks_cancellation_after_publication_gap() {
+        let cx = Cx::<FullCaps>::new();
+        let native = NativeCx::for_testing();
+        let pause = test_interleaving_pause(None);
+        *cx.inner
+            .native_install_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&pause));
+
+        let installing_cx = cx.clone();
+        let installing_native = native.clone();
+        let installation = std::thread::spawn(move || {
+            installing_cx.set_native_cx(installing_native);
+        });
+
+        pause.reached.wait();
+        cx.cancel_with_reason(CancelReason::RegionClose);
+        assert!(
+            native.checkpoint().is_ok(),
+            "the unpublished native context must not be reachable by cancellation"
+        );
+        pause.resume.wait();
+        installation
+            .join()
+            .expect("native-context installation should finish");
+
+        assert!(
+            native.checkpoint().is_err(),
+            "post-publication recheck must signal cancellation"
+        );
+        assert!(
+            native.cancel_reason().is_none(),
+            "a project-origin signal must not fabricate native attribution"
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_local_cancellation_never_overwrites_native_reason_or_cause() {
+        let cx = Cx::<FullCaps>::new();
+        let attached = NativeCx::for_testing();
+        let expected = NativeCancelReason::shutdown()
+            .with_message("runtime shutdown")
+            .with_cause(NativeCancelReason::cost_budget());
+        attached.set_cancel_reason(expected.clone());
+        cx.set_native_cx(attached.clone());
+
+        cx.cancel_with_reason(CancelReason::UserInterrupt);
+        cx.cancel_with_reason(CancelReason::Timeout);
+        cx.cancel_with_reason(CancelReason::Abort);
+
+        assert_eq!(cx.cancel_reason(), Some(CancelReason::Abort));
+        assert_eq!(
+            cx.native_cancel_provenance(),
+            Some(NativeCancellationProvenance::Exact(expected.clone()))
+        );
+        assert_eq!(
+            attached.cancel_reason(),
+            Some(expected),
+            "project cancellation must preserve native severity, attribution, and cause"
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_native_install_after_local_cancel_retains_preexisting_exact_reason() {
+        let attached_cx = Cx::<FullCaps>::new();
+        attached_cx.cancel_with_reason(CancelReason::RegionClose);
+        let attached = NativeCx::for_testing();
+        let attached_reason =
+            NativeCancelReason::shutdown().with_message("preexisting attached shutdown");
+        attached.set_cancel_reason(attached_reason.clone());
+
+        attached_cx.set_native_cx(attached.clone());
+
+        assert_eq!(
+            attached_cx.native_cancel_provenance(),
+            Some(NativeCancellationProvenance::Exact(attached_reason.clone()))
+        );
+        assert_eq!(attached.cancel_reason(), Some(attached_reason));
+
+        let relay_cx = Cx::<FullCaps>::new();
+        relay_cx.cancel_with_reason(CancelReason::Timeout);
+        let relay = NativeCx::<native_cap::None>::detached_cancel_context();
+        let relay_reason =
+            NativeCancelReason::deadline().with_message("preexisting relay deadline");
+        relay.set_cancel_reason(relay_reason.clone());
+
+        relay_cx.set_native_cancel_relay(relay.clone());
+
+        assert_eq!(
+            relay_cx.native_cancel_provenance(),
+            Some(NativeCancellationProvenance::Exact(relay_reason.clone()))
+        );
+        assert_eq!(relay.cancel_reason(), Some(relay_reason));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_native_shutdown_maps_to_strongest_local_reason_without_feedback() {
+        let cx = Cx::<FullCaps>::new();
+        let native = NativeCx::for_testing();
+        let expected = NativeCancelReason::shutdown().with_message("runtime shutdown");
+        cx.set_native_cx(native.clone());
+        native.set_cancel_reason(expected.clone());
+
+        let err = cx.checkpoint().unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::Cancelled);
+        assert_eq!(cx.cancel_reason(), Some(CancelReason::Abort));
+        assert_eq!(
+            cx.native_cancel_provenance(),
+            Some(NativeCancellationProvenance::Exact(expected.clone()))
+        );
+        assert_eq!(
+            native.cancel_reason(),
+            Some(expected),
+            "lossy project mapping must never be written back to the native context"
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_reasonless_external_native_signal_is_explicit_not_timeout() {
+        let cx = Cx::<FullCaps>::new();
+        let native = NativeCx::for_testing();
+        cx.set_native_cx(native.clone());
+        native.set_cancel_requested(true);
+
+        let err = cx.checkpoint().unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::Cancelled);
+        assert_eq!(cx.cancel_reason(), Some(CancelReason::NativeSignal));
+        assert_eq!(
+            cx.native_cancel_provenance(),
+            Some(NativeCancellationProvenance::SignalWithoutReason)
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_native_provenance_strengthens_deterministically_across_observations() {
+        fn observe_in_order(
+            first: NativeCancelReason,
+            second: NativeCancelReason,
+        ) -> NativeCancellationProvenance {
+            let cx = Cx::<FullCaps>::new();
+            let native = NativeCx::for_testing();
+            cx.set_native_cx(native.clone());
+
+            native.set_cancel_reason(first);
+            let _ = cx.checkpoint();
+            native.set_cancel_reason(second);
+            let _ = cx.checkpoint();
+
+            cx.native_cancel_provenance()
+                .expect("native cancellation must retain provenance")
+        }
+
+        let user = NativeCancelReason::user("operator request");
+        let shutdown = NativeCancelReason::shutdown().with_message("runtime shutdown");
+        let forward = observe_in_order(user.clone(), shutdown.clone());
+        let reverse = observe_in_order(shutdown.clone(), user);
+
+        assert_eq!(
+            forward,
+            NativeCancellationProvenance::Exact(shutdown.clone())
+        );
+        assert_eq!(reverse, NativeCancellationProvenance::Exact(shutdown));
     }
 
     #[cfg(feature = "native")]
@@ -1709,11 +2983,15 @@ mod tests {
         parent.cancel_with_reason(CancelReason::RegionClose);
 
         let child = parent.create_child();
-        let reason = child
-            .effective_native_cx()
-            .cancel_reason()
-            .expect("fallback native cx should mirror inherited cancellation");
-        assert_eq!(reason.kind, NativeCancelKind::ParentCancelled);
+        let native = child.effective_native_cx();
+        assert!(
+            native.checkpoint().is_err(),
+            "fallback native cx must observe inherited project cancellation"
+        );
+        assert!(
+            native.cancel_reason().is_none(),
+            "fallback wake signaling must not fabricate native attribution"
+        );
     }
 
     #[cfg(feature = "native")]
@@ -1732,6 +3010,635 @@ mod tests {
             .expect_err("child should observe inherited native cancel");
         assert_eq!(err.kind(), ErrorKind::Cancelled);
         assert_eq!(child.cancel_reason(), Some(CancelReason::Timeout));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_native_free_child_never_copies_task_affine_native_context() {
+        let parent = Cx::<FullCaps>::new();
+        let native = NativeCx::for_testing();
+        parent.set_native_cx(native);
+
+        let child = parent.create_native_free_child();
+
+        assert!(parent.attached_native_cx().is_some());
+        assert!(
+            child.attached_native_cx().is_none(),
+            "native-free construction must not copy and then clear a task-affine handle"
+        );
+        parent.cancel_with_reason(CancelReason::RegionClose);
+        assert!(
+            child.checkpoint().is_err(),
+            "native-free children must retain project cancellation lineage"
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_native_cancel_relay_stays_capability_free_and_closes_install_race() {
+        let before_install = Cx::<FullCaps>::new();
+        before_install.cancel_with_reason(CancelReason::Timeout);
+        let before_relay = NativeCx::<native_cap::None>::detached_cancel_context();
+        before_install.set_native_cancel_relay(before_relay.clone());
+        assert!(
+            before_relay.checkpoint().is_err(),
+            "installation must recheck cancellation that happened before publication"
+        );
+
+        let after_install = Cx::<FullCaps>::new();
+        let after_relay = NativeCx::<native_cap::None>::detached_cancel_context();
+        after_install.set_native_cancel_relay(after_relay.clone());
+        assert!(after_relay.checkpoint().is_ok());
+        after_install.cancel_with_reason(CancelReason::RegionClose);
+        assert!(
+            after_relay.checkpoint().is_err(),
+            "later project cancellation must wake the capability-free relay"
+        );
+        assert!(
+            after_install.attached_native_cx().is_none(),
+            "a cancellation relay must never become attached runtime authority"
+        );
+    }
+
+    #[test]
+    fn test_operation_cancellation_is_one_way_and_source_drop_is_authoritative() {
+        let caller = Cx::<FullCaps>::new();
+        let engine_root = Cx::<FullCaps>::new();
+        let (source_a, token_a) = caller.operation_cancellation();
+        let (mut source_b, token_b) = caller.operation_cancellation();
+        let engine_a = engine_root.create_child_linked_to_operation(&token_a);
+        let engine_b = engine_root.create_child_linked_to_operation(&token_b);
+
+        drop(source_a);
+
+        assert!(token_a.checkpoint().is_err());
+        assert!(
+            engine_a.checkpoint().is_err(),
+            "a linked engine checkpoint must observe source Drop"
+        );
+        assert!(
+            token_b.checkpoint().is_ok() && engine_b.checkpoint().is_ok(),
+            "cancelling one operation must not poison a sibling"
+        );
+        assert!(
+            caller.checkpoint().is_ok() && engine_root.checkpoint().is_ok(),
+            "operation cancellation must not propagate into either root"
+        );
+
+        source_b.disarm();
+        drop(source_b);
+        assert!(
+            token_b.checkpoint().is_ok(),
+            "terminal success must disarm the source instead of overwriting it with cancellation"
+        );
+    }
+
+    #[test]
+    fn test_operation_cancellation_request_is_distinct_from_checkpoint_observation() {
+        let caller = Cx::<FullCaps>::new();
+        let (source, token) = caller.operation_cancellation();
+
+        source.cancel();
+
+        assert!(token.is_cancel_requested());
+        assert!(
+            !token.cancellation_was_observed(),
+            "request publication alone must not claim that engine work observed cancellation"
+        );
+        assert!(token.checkpoint().is_err());
+        assert!(
+            token.cancellation_was_observed(),
+            "the exact token checkpoint must publish cancellation observation"
+        );
+    }
+
+    #[test]
+    fn test_linked_engine_checkpoint_marks_exact_operation_observed() {
+        let caller = Cx::<FullCaps>::new();
+        let engine_root = Cx::<FullCaps>::new();
+        let (source, token) = caller.operation_cancellation();
+        let engine = engine_root.create_child_linked_to_operation(&token);
+
+        source.cancel_with_reason(CancelReason::Timeout);
+
+        assert!(!token.cancellation_was_observed());
+        assert!(engine.checkpoint().is_err());
+        assert!(
+            token.cancellation_was_observed(),
+            "an engine checkpoint linked to the token must mark the exact source observed"
+        );
+        assert!(
+            engine_root.checkpoint().is_ok(),
+            "operation observation must not contaminate the engine root"
+        );
+    }
+
+    #[test]
+    fn test_explicit_operation_timeout_survives_armed_source_drop() {
+        let caller = Cx::<FullCaps>::new();
+        let engine_root = Cx::<FullCaps>::new();
+        let (source, token) = caller.operation_cancellation();
+        let engine = engine_root.create_child_linked_to_operation(&token);
+
+        source.cancel_with_reason(CancelReason::Timeout);
+        drop(source);
+
+        assert_eq!(token.cancel_reason(), Some(CancelReason::Timeout));
+        assert_eq!(engine.cancel_reason(), Some(CancelReason::Timeout));
+        assert!(engine.checkpoint().is_err());
+    }
+
+    #[test]
+    fn test_operation_token_does_not_retain_caller_eprocess_oracle() {
+        let caller = Cx::<FullCaps>::new();
+        caller.set_eprocess_oracle(Arc::new(EProcessOracle::new(
+            EProcessConfig {
+                p0: 0.1,
+                lambda: 5.0,
+                alpha: 0.05,
+                max_evalue: 1e12,
+            },
+            1,
+        )));
+
+        let (_source, token) = caller.operation_cancellation();
+
+        assert!(
+            token.inner.eprocess_oracle.get().is_none(),
+            "an operation token must retain only cancellation state and scalar metadata"
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_operation_token_inherits_exact_native_cancel_provenance() {
+        let caller = Cx::<FullCaps>::new();
+        let native = NativeCx::for_testing();
+        caller.set_native_cx(native.clone());
+        let (_source, token) = caller.operation_cancellation();
+        let expected = NativeCancelReason::shutdown()
+            .with_message("runtime shutdown")
+            .with_cause(NativeCancelReason::deadline());
+
+        native.set_cancel_reason(expected.clone());
+        let _ = caller.checkpoint();
+
+        assert_eq!(token.cancel_reason(), Some(CancelReason::Abort));
+        assert_eq!(
+            token.native_cancel_provenance(),
+            Some(NativeCancellationProvenance::Exact(expected))
+        );
+    }
+
+    #[test]
+    fn test_operation_source_forwards_exact_project_cancel_reason() {
+        let operation_owner = Cx::<FullCaps>::new();
+        let (source, token) = operation_owner.operation_cancellation();
+        let caller = Cx::<FullCaps>::new();
+        caller.cancel_with_reason(CancelReason::RegionClose);
+
+        source.cancel_from_cx(&caller);
+
+        assert_eq!(token.cancel_reason(), Some(CancelReason::RegionClose));
+        assert!(token.checkpoint().is_err());
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_operation_source_forwards_exact_native_reason_and_provenance() {
+        let operation_owner = Cx::<FullCaps>::new();
+        let (source, token) = operation_owner.operation_cancellation();
+        let native = NativeCx::for_testing();
+        let expected = NativeCancelReason::shutdown()
+            .with_message("dedicated worker shutdown")
+            .with_cause(NativeCancelReason::cost_budget());
+        native.set_cancel_reason(expected.clone());
+
+        source.cancel_from_native_cx(&native);
+
+        assert_eq!(token.cancel_reason(), Some(CancelReason::Abort));
+        assert_eq!(
+            token.native_cancel_provenance(),
+            Some(NativeCancellationProvenance::Exact(expected))
+        );
+        assert!(token.checkpoint().is_err());
+    }
+
+    #[test]
+    fn test_context_and_operation_cancellation_handles_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<Cx<FullCaps>>();
+        assert_send_sync::<OperationCancellationSource>();
+        assert_send_sync::<OperationCancellationToken>();
+    }
+
+    #[test]
+    fn test_operation_source_drop_cancels_across_threads() {
+        let caller = Cx::<FullCaps>::new();
+        let (source, token) = caller.operation_cancellation();
+
+        std::thread::spawn(move || drop(source))
+            .join()
+            .expect("cross-thread source Drop must complete");
+
+        assert_eq!(token.cancel_reason(), Some(CancelReason::UserInterrupt));
+        assert!(token.checkpoint().is_err());
+    }
+
+    #[test]
+    fn test_operation_link_then_recheck_closes_preexisting_cancel_race() {
+        let caller = Cx::<FullCaps>::new();
+        let engine_root = Cx::<FullCaps>::new();
+        let (source, token) = caller.operation_cancellation();
+        source.cancel_with_reason(CancelReason::Timeout);
+
+        let engine = engine_root.create_child_linked_to_operation(&token);
+
+        assert_eq!(token.cancel_reason(), Some(CancelReason::Timeout));
+        assert!(
+            engine.checkpoint().is_err(),
+            "a source cancelled before link publication must be observed by the first checkpoint"
+        );
+        assert_eq!(engine.cancel_reason(), Some(CancelReason::Timeout));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_surviving_descendant_retains_stronger_operation_reason_and_provenance() {
+        let caller = Cx::<FullCaps>::new();
+        let native = NativeCx::for_testing();
+        caller.set_native_cx(native.clone());
+        let (_source, token) = caller.operation_cancellation();
+        let engine_root = Cx::<FullCaps>::new();
+        let engine = engine_root.create_child_linked_to_operation(&token);
+        let descendant = engine.create_child();
+        drop(engine);
+
+        descendant.cancel_with_reason(CancelReason::UserInterrupt);
+        let expected = NativeCancelReason::shutdown()
+            .with_message("operation runtime shutdown")
+            .with_cause(NativeCancelReason::deadline());
+        native.set_cancel_reason(expected.clone());
+        assert!(caller.checkpoint().is_err());
+
+        assert!(descendant.checkpoint().is_err());
+        assert_eq!(token.cancel_reason(), Some(CancelReason::Abort));
+        assert_eq!(descendant.cancel_reason(), Some(CancelReason::Abort));
+        assert_eq!(
+            descendant.native_cancel_provenance(),
+            Some(NativeCancellationProvenance::Exact(expected))
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_nested_operation_token_survives_dropped_operation_link() {
+        let caller = Cx::<FullCaps>::new();
+        let (outer_source, outer_token) = caller.operation_cancellation();
+        let engine_root = Cx::<FullCaps>::new();
+        let intermediate = engine_root.create_child_linked_to_operation(&outer_token);
+        let (mut nested_source, nested_token) = intermediate.operation_cancellation();
+        drop(intermediate);
+        let expected = NativeCancelReason::shutdown()
+            .with_message("outer operation shutdown")
+            .with_cause(NativeCancelReason::cost_budget());
+
+        propagate_native_cancel_provenance(
+            &outer_source.inner,
+            NativeCancellationProvenance::Exact(expected.clone()),
+        );
+        outer_source.cancel_with_reason(CancelReason::Abort);
+
+        assert_eq!(nested_token.cancel_reason(), Some(CancelReason::Abort));
+        assert_eq!(
+            nested_token.native_cancel_provenance(),
+            Some(NativeCancellationProvenance::Exact(expected))
+        );
+        nested_source.disarm();
+    }
+
+    #[test]
+    fn test_linked_child_retains_outer_and_supplied_operation_sources() {
+        let outer_caller = Cx::<FullCaps>::new();
+        let (outer_source, outer_token) = outer_caller.operation_cancellation();
+        let engine_root = Cx::<FullCaps>::new();
+        let operation_root = engine_root.create_child_linked_to_operation(&outer_token);
+        let inner_caller = Cx::<FullCaps>::new();
+        let (inner_source, inner_token) = inner_caller.operation_cancellation();
+        let child = operation_root.create_child_linked_to_operation(&inner_token);
+        drop(operation_root);
+
+        outer_source.cancel_with_reason(CancelReason::Timeout);
+        assert_eq!(child.cancel_reason(), Some(CancelReason::Timeout));
+
+        inner_source.cancel_with_reason(CancelReason::Abort);
+        assert_eq!(child.cancel_reason(), Some(CancelReason::Abort));
+        assert!(engine_root.checkpoint().is_ok());
+        assert!(outer_caller.checkpoint().is_ok());
+        assert!(inner_caller.checkpoint().is_ok());
+    }
+
+    #[test]
+    fn test_operation_token_inherits_later_parent_cancel_without_poisoning_root() {
+        let caller = Cx::<FullCaps>::new();
+        let engine_root = Cx::<FullCaps>::new();
+        let (_source, token) = caller.operation_cancellation();
+        let engine = engine_root.create_child_linked_to_operation(&token);
+
+        caller.cancel_with_reason(CancelReason::RegionClose);
+
+        assert!(token.checkpoint().is_err());
+        assert!(engine.checkpoint().is_err());
+        assert!(
+            engine_root.checkpoint().is_ok(),
+            "caller cancellation must not poison the connection root"
+        );
+    }
+
+    #[test]
+    fn test_operation_metadata_zero_preserves_engine_lineage_and_decision() {
+        let caller = Cx::<FullCaps>::new().with_trace_context(0, 0, 0);
+        let engine_root = Cx::<FullCaps>::new().with_trace_context(71, 72, 73);
+        let (_source, token) = caller.operation_cancellation();
+
+        let engine = engine_root.create_child_linked_to_operation(&token);
+
+        assert_eq!(engine.trace_id(), 71);
+        assert_eq!(engine.policy_id(), 73);
+        assert_eq!(
+            engine.decision_id(),
+            72,
+            "caller decision metadata must never cross the actor boundary"
+        );
+    }
+
+    #[test]
+    fn test_operation_metadata_nonzero_trace_and_policy_override_engine_lineage() {
+        let caller = Cx::<FullCaps>::new().with_trace_context(81, 8_001, 83);
+        let engine_root = Cx::<FullCaps>::new().with_trace_context(91, 92, 93);
+        let (_source, token) = caller.operation_cancellation();
+
+        let engine = engine_root.create_child_linked_to_operation(&token);
+
+        assert_eq!(engine.trace_id(), 81);
+        assert_eq!(engine.policy_id(), 83);
+        assert_eq!(
+            engine.decision_id(),
+            92,
+            "fresh engine decision allocation happens after metadata merge; caller decision is ignored"
+        );
+    }
+
+    #[test]
+    fn test_operation_fallback_trace_keeps_direct_engine_root_lineage() {
+        let caller = Cx::<FullCaps>::new().with_trace_context(0, 0, 0);
+        let engine_root = Cx::<FullCaps>::new().with_trace_context(91, 92, 93);
+        let (_source, token) = caller.operation_cancellation();
+        let engine = engine_root.create_child_linked_to_operation_with_fallback_trace(&token, 101);
+
+        assert_eq!(engine.trace_id(), 101);
+        assert_eq!(engine.decision_id(), 92);
+        assert_eq!(engine.policy_id(), 93);
+
+        engine_root.cancel_with_reason(CancelReason::RegionClose);
+        assert_eq!(engine.cancel_reason(), Some(CancelReason::RegionClose));
+    }
+
+    #[test]
+    fn test_operation_caller_trace_wins_over_fallback_trace() {
+        let caller = Cx::<FullCaps>::new().with_trace_context(81, 8_001, 83);
+        let engine_root = Cx::<FullCaps>::new().with_trace_context(91, 92, 93);
+        let (_source, token) = caller.operation_cancellation();
+        let engine = engine_root.create_child_linked_to_operation_with_fallback_trace(&token, 101);
+
+        assert_eq!(engine.trace_id(), 81);
+        assert_eq!(engine.decision_id(), 92);
+        assert_eq!(engine.policy_id(), 83);
+    }
+
+    #[test]
+    fn test_operation_budget_meets_engine_deadline_quotas_and_priority() {
+        let caller_budget = Budget::INFINITE
+            .with_deadline(Duration::from_millis(25))
+            .with_poll_quota(40)
+            .with_cost_quota(400)
+            .with_priority(3);
+        let engine_budget = Budget::INFINITE
+            .with_deadline(Duration::from_millis(10))
+            .with_poll_quota(80)
+            .with_cost_quota(200)
+            .with_priority(7);
+        let caller = Cx::<FullCaps>::with_budget(caller_budget);
+        let engine_root = Cx::<FullCaps>::with_budget(engine_budget);
+        let (_source, token) = caller.operation_cancellation();
+
+        let engine = engine_root.create_child_linked_to_operation(&token);
+
+        assert_eq!(
+            engine.budget(),
+            Budget {
+                deadline: Some(Duration::from_millis(10)),
+                poll_quota: 40,
+                cost_quota: Some(200),
+                priority: 7,
+            }
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_operation_cancel_immediately_marks_and_wakes_linked_engine_child() {
+        let caller = Cx::<FullCaps>::new();
+        let engine_root = Cx::<FullCaps>::new();
+        let (source, token) = caller.operation_cancellation();
+        let engine = engine_root.create_child_linked_to_operation(&token);
+        let native_relay = NativeCx::<native_cap::None>::detached_cancel_context();
+        engine.set_native_cancel_relay(native_relay.clone());
+
+        source.cancel_with_reason(CancelReason::Timeout);
+
+        assert!(
+            engine.is_cancel_requested(),
+            "the source weak link must mark the engine child without a checkpoint poll"
+        );
+        assert_eq!(engine.cancel_reason(), Some(CancelReason::Timeout));
+        assert!(
+            native_relay.checkpoint().is_err(),
+            "linked cancellation must wake the child's cancellation-only native waiter"
+        );
+        assert!(
+            engine_root.checkpoint().is_ok(),
+            "the engine root must remain independent from one operation"
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_linked_operation_never_shares_native_cancel_state_with_root_or_sibling() {
+        let caller = Cx::<FullCaps>::new();
+        let engine_root = Cx::<FullCaps>::new();
+        let root_native = NativeCx::for_testing();
+        engine_root.set_native_cx(root_native.clone());
+        let (source_a, token_a) = caller.operation_cancellation();
+        let (_source_b, token_b) = caller.operation_cancellation();
+        let engine_a = engine_root.create_child_linked_to_operation(&token_a);
+        let engine_b = engine_root.create_child_linked_to_operation(&token_b);
+
+        assert!(engine_a.attached_native_cx().is_none());
+        assert!(engine_b.attached_native_cx().is_none());
+        source_a.cancel();
+
+        assert!(engine_a.is_cancel_requested());
+        assert!(!engine_b.is_cancel_requested());
+        assert!(root_native.checkpoint().is_ok());
+        assert!(engine_root.checkpoint().is_ok());
+        assert!(engine_b.checkpoint().is_ok());
+    }
+
+    fn nested_operation_diamonds(
+        depth: usize,
+    ) -> (
+        Cx<FullCaps>,
+        Vec<Cx<FullCaps>>,
+        Vec<OperationCancellationToken>,
+    ) {
+        let root = Cx::<FullCaps>::new();
+        let mut current = root.clone();
+        let mut engine_nodes = vec![root.clone()];
+        let mut operation_nodes = Vec::with_capacity(depth);
+
+        for _ in 0..depth {
+            let (mut source, operation) = current.operation_cancellation();
+            source.disarm();
+            let next = current.create_child_linked_to_operation(&operation);
+            operation_nodes.push(operation);
+            engine_nodes.push(next.clone());
+            current = next;
+        }
+
+        (root, engine_nodes, operation_nodes)
+    }
+
+    fn assert_accepted_cancel_propagations(
+        engine_nodes: &[Cx<FullCaps>],
+        operation_nodes: &[OperationCancellationToken],
+        expected: u32,
+    ) {
+        for (depth, node) in engine_nodes.iter().enumerate() {
+            assert_eq!(
+                node.inner
+                    .accepted_cancel_propagations
+                    .load(Ordering::Relaxed),
+                expected,
+                "engine node at depth {depth} accepted an unexpected number of propagations"
+            );
+        }
+        for (depth, operation) in operation_nodes.iter().enumerate() {
+            assert_eq!(
+                operation
+                    .inner
+                    .accepted_cancel_propagations
+                    .load(Ordering::Relaxed),
+                expected,
+                "operation node at depth {depth} accepted an unexpected number of propagations"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nested_operation_diamonds_equal_and_weaker_cancel_do_not_revisit() {
+        let (root, engine_nodes, operation_nodes) = nested_operation_diamonds(12);
+
+        root.cancel_with_reason(CancelReason::RegionClose);
+        assert_accepted_cancel_propagations(&engine_nodes, &operation_nodes, 1);
+
+        root.cancel_with_reason(CancelReason::RegionClose);
+        root.cancel_with_reason(CancelReason::Timeout);
+        assert_accepted_cancel_propagations(&engine_nodes, &operation_nodes, 1);
+    }
+
+    #[test]
+    fn test_nested_operation_diamonds_stronger_cancel_propagates_once() {
+        let (root, engine_nodes, operation_nodes) = nested_operation_diamonds(12);
+
+        root.cancel_with_reason(CancelReason::Timeout);
+        root.cancel_with_reason(CancelReason::Abort);
+        assert_accepted_cancel_propagations(&engine_nodes, &operation_nodes, 2);
+        assert!(
+            engine_nodes
+                .iter()
+                .all(|node| node.cancel_reason() == Some(CancelReason::Abort))
+        );
+        assert!(
+            operation_nodes
+                .iter()
+                .all(|operation| operation.cancel_reason() == Some(CancelReason::Abort))
+        );
+
+        root.cancel_with_reason(CancelReason::Abort);
+        root.cancel_with_reason(CancelReason::RegionClose);
+        assert_accepted_cancel_propagations(&engine_nodes, &operation_nodes, 2);
+    }
+
+    #[test]
+    fn test_dead_operation_and_admission_children_remain_bounded() {
+        let caller = Cx::<FullCaps>::new();
+
+        // Model a permanently full mailbox: every attempt creates one opaque
+        // operation token and one native-free admission child, then the
+        // pending future is dropped before capacity ever becomes available.
+        for _ in 0..4_096 {
+            let (source, token) = caller.operation_cancellation();
+            let admission = caller.create_native_free_child();
+            drop(admission);
+            drop(token);
+            drop(source);
+        }
+
+        let slots = caller
+            .inner
+            .children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert!(
+            slots <= usize::try_from(CHILD_LINK_PRUNE_INTERVAL).unwrap_or(usize::MAX) * 2,
+            "amortized pruning must bound dead child links, found {slots}"
+        );
+    }
+
+    #[test]
+    fn test_deep_cancellation_chain_uses_bounded_native_stack() {
+        let worker = std::thread::Builder::new()
+            .name("cx-deep-cancel".to_owned())
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                const DEPTH: usize = 10_000;
+
+                // Keep every intermediate child alive so the root really has
+                // to traverse the entire parent-to-child chain.
+                let mut chain = Vec::with_capacity(DEPTH + 1);
+                chain.push(Cx::<FullCaps>::new());
+                for _ in 0..DEPTH {
+                    let child = chain
+                        .last()
+                        .expect("the chain always contains its root")
+                        .create_child();
+                    chain.push(child);
+                }
+
+                chain[0].cancel_with_reason(CancelReason::Abort);
+                let leaf = chain.last().expect("the chain contains its leaf");
+                assert!(leaf.is_cancel_requested());
+                assert_eq!(leaf.cancel_reason(), Some(CancelReason::Abort));
+                assert!(leaf.checkpoint().is_err());
+            })
+            .expect("small-stack cancellation worker should spawn");
+
+        worker
+            .join()
+            .expect("iterative cancellation must not overflow a small stack");
     }
 
     #[test]

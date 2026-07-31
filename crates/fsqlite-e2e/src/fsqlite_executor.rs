@@ -1724,9 +1724,9 @@ impl<'conn> PreparedOpExecutor<'conn> {
             OpKind::Update { table, key, values } => {
                 self.execute_update(table, *key, values, rec.expected.as_ref())
             }
-            OpKind::Begin => {
-                crate::block_on(self.conn.begin_transaction()).map_err(classify_fsqlite_error_as_op)
-            }
+            OpKind::Begin => crate::block_on(self.conn.begin_transaction())
+                .map(drop)
+                .map_err(classify_fsqlite_error_as_op),
             OpKind::Commit => crate::block_on(self.conn.commit_transaction())
                 .map_err(classify_fsqlite_error_as_op),
             OpKind::Rollback => crate::block_on(self.conn.rollback_transaction())

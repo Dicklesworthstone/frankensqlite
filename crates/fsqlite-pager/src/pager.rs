@@ -7,7 +7,7 @@
 #[cfg(target_arch = "x86_64")]
 use core::intrinsics::prefetch_read_data;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
@@ -18,6 +18,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use asupersync::sync::{Notify, RwLock as AsyncRwLock};
+use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_observability::PageCacheEfficiencySnapshot;
@@ -46,7 +47,8 @@ use crate::page_cache::{
 };
 use crate::s3_fifo::S3FifoConfig;
 use crate::traits::{
-    self, JournalMode, MvccPager, TransactionHandle, TransactionMode, WalBackend, WalFuture,
+    self, CommitTerminalOutcome, CommitTerminalOwner, JournalMode, MvccPager,
+    TransactionCommitState, TransactionHandle, TransactionMode, WalBackend, WalFuture,
 };
 
 /// Identity-hashed `HashMap<PageNumber, V>` used on the INSERT hot path.
@@ -789,11 +791,16 @@ impl KeyedWaitSlot {
     }
 
     fn signal(&self) {
-        let mut generation = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *generation = generation.wrapping_add(1);
+        {
+            let mut generation = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *generation = generation.wrapping_add(1);
+        }
+        // Waking may synchronously run a custom waker. The generation is the
+        // lost-wakeup predicate, so notification is safe after releasing its
+        // mutex and must not expose a re-entrant waiter to that lock.
         self.cv.notify_all();
         self.notify.notify_waiters();
     }
@@ -870,6 +877,14 @@ struct GroupCommitQueue {
     /// handoff: every waiter must bind its batch id to the certificate before
     /// Phase C may expose pager visibility.
     persisted_epochs: Mutex<HashMap<u64, PersistedGroupCommitEpoch>>,
+    /// Weak index from an admitted epoch to the exact member finalizers that
+    /// must observe an abort of that epoch.
+    ///
+    /// Strong ownership remains exclusively in `pending_pager_cleanups`.  The
+    /// index exists only so an exact successful `abort_filling`/`abort_flush`
+    /// can publish per-member `NotCommitted` evidence without deriving a
+    /// logical outcome from the diagnostic `failed_epochs` map.
+    pending_wal_members: Mutex<HashMap<u64, Vec<Weak<PendingWalCommitSubmissionState>>>>,
     /// Lazily seeded from the pager's current visible commit clock at the
     /// first physical flush for this database identity.
     durability_combiner: Mutex<Option<Arc<ParallelWalDurabilityCombiner>>>,
@@ -889,6 +904,26 @@ struct GroupCommitQueue {
     /// removes exactly one entry and returns it on Drop until restoration is
     /// terminal; no detached cleanup task is required.
     pending_external_unlocks: Mutex<VecDeque<PendingExternalUnlock>>,
+    /// Persistent pager-lifecycle obligations.  Producers never wait on this
+    /// mutex: they publish into `pager_cleanup_inbox` and a structured
+    /// claimant drains that inbox into this ordered state.
+    pending_pager_cleanups: Mutex<PagerCleanupQueueState>,
+    /// Lock-free producer handoff into the ordered cleanup queue.  A
+    /// `SegQueue` keeps ordinary producer enqueue paths out of the consumer's
+    /// FIFO bookkeeping mutex. A cancelled claimant takes that mutex only to
+    /// atomically move its active ticket back into the ordered map: releasing
+    /// `active` before that ordered reinsertion creates an admission-visible
+    /// gap.
+    pager_cleanup_inbox: SegQueue<PagerCleanupInboxEntry>,
+    /// Monotonic ticket source.  The consumer only claims the next contiguous
+    /// ticket, so a requeued older obligation cannot be overtaken by later
+    /// work even when producers race.
+    next_pager_cleanup_id: AtomicU64,
+    /// Generation event for a caller waiting for a particular cleanup ticket.
+    /// The waiter samples this before checking completion; publication bumps
+    /// it after pushing the inbox record, which makes a registration race a
+    /// generation mismatch rather than a lost wakeup.
+    pager_cleanup_waiters: KeyedWaitSlot,
     /// Shared ownership records for queued external locks.
     ///
     /// The record remains present while a cleanup claimant temporarily owns
@@ -902,6 +937,89 @@ struct GroupCommitQueue {
     /// retained so a waiter, subsequent commit, or future lower-layer
     /// reconciler can publish the epoch once durability becomes terminal.
     in_doubt_epochs: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+}
+
+/// Ordered identity of a persistent pager-cleanup obligation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PagerCleanupId(u64);
+
+/// Consumer-owned state for the lock-free producer inbox.
+///
+/// `completed_through` and `active` are protected together.  The active
+/// operation is removed from the queued map only while a claimant owns it;
+/// dropping the claimant returns the same ticket to the ordered map before
+/// another ticket may be claimed.
+struct PagerCleanupQueueState {
+    completed_through: u64,
+    active: Option<PagerCleanupId>,
+    queued: BTreeMap<PagerCleanupId, PendingPagerCleanup>,
+    /// Tickets synchronously withdrawn by the originating transaction before
+    /// their operation crossed its recovery boundary.  A withdrawn ticket is
+    /// intentionally treated as an ordered no-op, rather than being removed
+    /// from the sequence without a record: otherwise a later ticket could be
+    /// permanently blocked behind a missing predecessor.
+    ///
+    /// This set is protected by the same mutex as `completed_through` and
+    /// `active`.  It is therefore impossible for a consumer to claim a ticket
+    /// while its originating transaction is withdrawing it.
+    withdrawn: BTreeSet<PagerCleanupId>,
+    /// An invariant-violating inbox record must remain owned by the queue.
+    /// Quarantine is fail-closed: no later ticket is claimed until an operator
+    /// diagnoses the duplicate/stale publication, but no cleanup operation is
+    /// silently dropped while reporting the error.
+    quarantined: Vec<(PagerCleanupId, PendingPagerCleanup)>,
+    quarantine_detail: Option<String>,
+}
+
+impl PagerCleanupQueueState {
+    const fn new() -> Self {
+        Self {
+            completed_through: 0,
+            active: None,
+            queued: BTreeMap::new(),
+            withdrawn: BTreeSet::new(),
+            quarantined: Vec::new(),
+            quarantine_detail: None,
+        }
+    }
+
+    fn next_expected(&self) -> Result<PagerCleanupId> {
+        self.completed_through
+            .checked_add(1)
+            .map(PagerCleanupId)
+            .ok_or_else(|| FrankenError::internal("pager cleanup ticket counter overflow"))
+    }
+
+    /// Advance over tickets that were deliberately reclaimed by their
+    /// originating transaction before any recovery-visible mutation.  This is
+    /// the only way a withdrawn ticket may stop blocking later FIFO work.
+    fn advance_withdrawn_prefix(&mut self) -> Result<()> {
+        while self.withdrawn.remove(&self.next_expected()?) {
+            self.completed_through = self
+                .completed_through
+                .checked_add(1)
+                .ok_or_else(|| FrankenError::internal("pager cleanup ticket counter overflow"))?;
+        }
+        Ok(())
+    }
+}
+
+enum PagerCleanupInboxEntry {
+    New(PagerCleanupId, PendingPagerCleanup),
+}
+
+/// Result of attempting to take back a provisional cleanup ticket.
+///
+/// The originating commit may restore its retryable transaction state only
+/// after `Withdrawn`.  `Active`, `Completed`, and `Missing` deliberately do
+/// not expose the original pre-hot error as retryable: another owner may
+/// already have observed or finalized the ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PagerCleanupWithdrawal {
+    Withdrawn,
+    Active,
+    Completed,
+    Missing,
 }
 
 type LaneStagedPreparedBatch = ParallelWalLaneBatch<traits::PreparedWalFrameBatch>;
@@ -1051,6 +1169,9 @@ impl PendingGroupCommitPublication {
                     durability_receipt: durability_receipt.clone(),
                 },
             );
+        // Retain exact per-member proof in the FIFO-owned finalizer before
+        // bounded epoch metadata can be pruned by later commits.
+        queue.mark_wal_epoch_durable(prepared.epoch, &durability_receipt);
         if group_commit_trace_enabled() {
             trace_group_commit(format_args!(
                 "batch epoch={} members=[{members_display}] frames_written_range={}..={} fsync_seq={} commit_certificate={} durability_seq={} publication_generation={} ordered_region_ns={} batch_size={} lookup_mode={:?} control_mode={} shadow_certificate_verdict={} compatibility_selector={} fallback_reason={}",
@@ -1107,6 +1228,20 @@ enum WaitForEpochOutcome {
         batches: Vec<TransactionFrameBatch>,
         flush_epoch: u64,
     },
+}
+
+struct GroupCommitAdmission {
+    outcome: SubmitOutcome,
+    epoch_at_queue: u64,
+    target_epoch: u64,
+    waiter_id: u64,
+    waiter_frames_contributed: usize,
+    batch_build_us: u64,
+    conflict_snapshot_us: u64,
+    lane_prepare_us: u64,
+    prepare_us: u64,
+    consolidator_lock_wait_us: u64,
+    flushing_wait_us: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1188,15 +1323,374 @@ impl GroupCommitQueue {
             completed_epoch: AtomicU64::new(0),
             failed_epochs: Mutex::new(HashMap::new()),
             persisted_epochs: Mutex::new(HashMap::new()),
+            pending_wal_members: Mutex::new(HashMap::new()),
             durability_combiner: Mutex::new(None),
             epoch_waiters: KeyedWaitRegistry::new(),
             commit_service_control_epoch: AtomicU64::new(0),
             commit_service_mode: AtomicU8::new(CommitServiceMode::Balanced.as_u8()),
             parallel_wal_lanes: ParallelWalLaneStager::new(parallel_wal_control),
             pending_external_unlocks: Mutex::new(VecDeque::new()),
+            pending_pager_cleanups: Mutex::new(PagerCleanupQueueState::new()),
+            pager_cleanup_inbox: SegQueue::new(),
+            next_pager_cleanup_id: AtomicU64::new(1),
+            pager_cleanup_waiters: KeyedWaitSlot::default(),
             pending_external_unlock_ownership: Mutex::new(HashMap::new()),
             in_doubt_epochs: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn next_pager_cleanup_id(&self) -> PagerCleanupId {
+        let mut current = self.next_pager_cleanup_id.load(AtomicOrdering::Acquire);
+        loop {
+            let next = current
+                .checked_add(1)
+                .expect("pager cleanup ticket space must not be exhausted");
+            match self.next_pager_cleanup_id.compare_exchange_weak(
+                current,
+                next,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => return PagerCleanupId(current),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Highest cleanup ticket handed out by a producer, including a ticket
+    /// whose record has not reached the lock-free inbox yet.  Admission uses
+    /// this issued watermark rather than just the drained map so reserve then
+    /// publish cannot create a writer-admission gap.
+    fn issued_pager_cleanup_through(&self) -> u64 {
+        self.next_pager_cleanup_id
+            .load(AtomicOrdering::Acquire)
+            .saturating_sub(1)
+    }
+
+    fn publish_pager_cleanup_inbox_entry(&self, entry: PagerCleanupInboxEntry) {
+        self.pager_cleanup_inbox.push(entry);
+        // The inbox publication linearizes before the generation increment.
+        // A waiter that sees the old generation rechecks completion/ownership
+        // after waking; a waiter that registers after this increment observes
+        // the changed generation immediately.  Thus cancellation can abandon
+        // a waiter but cannot lose an obligation or its wakeup.
+        self.pager_cleanup_waiters.signal();
+    }
+
+    fn drain_pager_cleanup_inbox(&self, state: &mut PagerCleanupQueueState) -> Result<()> {
+        if let Some(detail) = state.quarantine_detail.as_ref() {
+            // Do not pop another lock-free inbox record after detecting an
+            // invariant violation.  The already-popped malformed operation
+            // is retained in `quarantined`, and later producer records remain
+            // in the inbox for an explicit recovery/diagnostic path.
+            return Err(FrankenError::internal(format!(
+                "pager cleanup inbox is quarantined: {detail}"
+            )));
+        }
+        while let Some(entry) = self.pager_cleanup_inbox.pop() {
+            let PagerCleanupInboxEntry::New(id, pending) = entry;
+            if id.0 <= state.completed_through {
+                return Err(Self::quarantine_pager_cleanup(
+                    state,
+                    id,
+                    pending,
+                    format!(
+                        "pager cleanup ticket {} was published after completion",
+                        id.0
+                    ),
+                ));
+            }
+            if state.active == Some(id) {
+                return Err(Self::quarantine_pager_cleanup(
+                    state,
+                    id,
+                    pending,
+                    format!(
+                        "pager cleanup ticket {} was published while still actively claimed",
+                        id.0
+                    ),
+                ));
+            }
+            if state.queued.contains_key(&id) {
+                return Err(Self::quarantine_pager_cleanup(
+                    state,
+                    id,
+                    pending,
+                    format!("pager cleanup new record duplicated ticket {}", id.0),
+                ));
+            }
+            state.queued.insert(id, pending);
+        }
+        Ok(())
+    }
+
+    /// Retain an invalid inbox record rather than letting a failed drain drop
+    /// the operation by unwinding out of the consumer loop.  The first detail
+    /// is stable diagnostic state; every malformed operation remains owned by
+    /// the queue until an explicit repair path can account for it.
+    fn quarantine_pager_cleanup(
+        state: &mut PagerCleanupQueueState,
+        id: PagerCleanupId,
+        pending: PendingPagerCleanup,
+        detail: String,
+    ) -> FrankenError {
+        state.quarantined.push((id, pending));
+        if state.quarantine_detail.is_none() {
+            state.quarantine_detail = Some(detail.clone());
+        }
+        FrankenError::internal(format!("pager cleanup inbox quarantined: {detail}"))
+    }
+
+    /// Queue a drop-safe pager obligation without contending on the ordered
+    /// consumer state.  The monotonic id is the FIFO proof: claimers accept
+    /// only `completed_through + 1`.
+    fn enqueue_pending_pager_cleanup(&self, pending: PendingPagerCleanup) -> PagerCleanupId {
+        let id = self.next_pager_cleanup_id();
+        self.publish_pager_cleanup_inbox_entry(PagerCleanupInboxEntry::New(id, pending));
+        id
+    }
+
+    /// Atomically reclaim an unclaimed provisional ticket by identity.
+    ///
+    /// This is intentionally stronger than simply removing an entry from the
+    /// queue: the queue first drains the producer inbox under the same mutex
+    /// used by claimers, verifies the ticket is still queued (not active), and
+    /// records a FIFO no-op tombstone.  A later cleanup may therefore advance
+    /// past a legitimately reclaimed predecessor, but can never overtake an
+    /// operation whose ownership was already claimed.
+    ///
+    /// The caller may restore transaction-owned resources only after receiving
+    /// `Withdrawn`.  Any other result must be surfaced as `BusyRecovery` or a
+    /// terminal outcome by the caller; returning the original retryable commit
+    /// error in those states could restore the same allocation/lease twice.
+    fn withdraw_pending_pager_cleanup(&self, id: PagerCleanupId) -> Result<PagerCleanupWithdrawal> {
+        // `PendingPagerCleanup` is type-erased user/engine work.  Its Drop
+        // may be expensive or re-enter this queue for diagnostics, so move
+        // ownership out while locked but destroy it only after releasing the
+        // FIFO mutex.  The same rule applies on every invariant-error branch:
+        // retain the operation in quarantine rather than dropping it under a
+        // lock or silently discarding a recovery obligation.
+        let (outcome, removed) = {
+            let mut state = self
+                .pending_pager_cleanups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.drain_pager_cleanup_inbox(&mut state)?;
+
+            if id.0 <= state.completed_through {
+                (PagerCleanupWithdrawal::Completed, None)
+            } else if state.active == Some(id) {
+                (PagerCleanupWithdrawal::Active, None)
+            } else if let Some(pending) = state.queued.remove(&id) {
+                if !state.withdrawn.insert(id) {
+                    let detail = format!("pager cleanup ticket {} was withdrawn twice", id.0);
+                    state.quarantined.push((id, pending));
+                    if state.quarantine_detail.is_none() {
+                        state.quarantine_detail = Some(detail.clone());
+                    }
+                    return Err(FrankenError::internal(format!(
+                        "{detail}; duplicate operation retained in quarantine"
+                    )));
+                }
+                if let Err(error) = state.advance_withdrawn_prefix() {
+                    let detail = format!(
+                        "pager cleanup ticket {} withdrawal could not advance its FIFO tombstone: {error}",
+                        id.0
+                    );
+                    state.quarantined.push((id, pending));
+                    if state.quarantine_detail.is_none() {
+                        state.quarantine_detail = Some(detail.clone());
+                    }
+                    return Err(FrankenError::internal(detail));
+                }
+                (PagerCleanupWithdrawal::Withdrawn, Some(pending))
+            } else {
+                (PagerCleanupWithdrawal::Missing, None)
+            }
+        };
+        drop(removed);
+        if matches!(outcome, PagerCleanupWithdrawal::Withdrawn) {
+            self.pager_cleanup_waiters.signal();
+        }
+        Ok(outcome)
+    }
+
+    fn claim_pending_pager_cleanup(self: &Arc<Self>) -> Result<Option<PendingPagerCleanupClaim>> {
+        let pending = {
+            let mut state = self
+                .pending_pager_cleanups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.drain_pager_cleanup_inbox(&mut state)?;
+            if state.active.is_some() {
+                return Ok(None);
+            }
+            let expected = state.next_expected()?;
+            let Some(pending) = state.queued.remove(&expected) else {
+                return Ok(None);
+            };
+            state.active = Some(expected);
+            (expected, pending)
+        };
+        Ok(Some(PendingPagerCleanupClaim {
+            queue: Arc::clone(self),
+            id: pending.0,
+            pending: Some(pending.1),
+        }))
+    }
+
+    fn finish_pending_pager_cleanup_claim(&self, id: PagerCleanupId) -> Result<()> {
+        {
+            let mut state = self
+                .pending_pager_cleanups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.drain_pager_cleanup_inbox(&mut state)?;
+            if state.active != Some(id) {
+                return Err(FrankenError::internal(format!(
+                    "pager cleanup ticket {} is not the active FIFO claimant",
+                    id.0
+                )));
+            }
+            let expected = state.next_expected()?;
+            if expected != id {
+                return Err(FrankenError::internal(format!(
+                    "pager cleanup completed out of FIFO order: expected {}, got {}",
+                    expected.0, id.0
+                )));
+            }
+            state.active = None;
+            state.completed_through = id.0;
+            state.advance_withdrawn_prefix()?;
+        }
+        self.pager_cleanup_waiters.signal();
+        Ok(())
+    }
+
+    fn requeue_claimed_pager_cleanup_front(
+        &self,
+        id: PagerCleanupId,
+        pending: PendingPagerCleanup,
+    ) {
+        {
+            let mut state = self
+                .pending_pager_cleanups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Requeue under the same FIFO mutex that protects `active`.
+            // Clearing active and publishing into a separate SegQueue used to
+            // leave a window where admission saw neither an active nor a
+            // queued obligation and could overtake this cleanup.
+            if state.active == Some(id) && !state.queued.contains_key(&id) {
+                let replaced = state.queued.insert(id, pending);
+                debug_assert!(replaced.is_none());
+                state.active = None;
+            } else {
+                // Drop cannot return an error. Retain the operation and fail
+                // every later admission closed rather than silently losing it
+                // or allowing a later ticket to pass an ownership violation.
+                let detail = format!(
+                    "pager cleanup claimant {} could not atomically requeue active ownership",
+                    id.0
+                );
+                state.quarantined.push((id, pending));
+                if state.quarantine_detail.is_none() {
+                    state.quarantine_detail = Some(detail.clone());
+                }
+                tracing::error!(ticket = id.0, "{detail}");
+            }
+        }
+        self.pager_cleanup_waiters.signal();
+    }
+
+    fn pager_cleanup_ticket_completed(&self, id: PagerCleanupId) -> Result<bool> {
+        let mut state = self
+            .pending_pager_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.drain_pager_cleanup_inbox(&mut state)?;
+        Ok(id.0 <= state.completed_through)
+    }
+
+    fn has_pending_or_claimed_pager_cleanup(&self) -> bool {
+        let mut state = self
+            .pending_pager_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.drain_pager_cleanup_inbox(&mut state).is_err() {
+            // A malformed handoff must fail closed: admitting another writer
+            // could otherwise overtake an obligation whose owner is unknown.
+            return true;
+        }
+        state.active.is_some()
+            || !state.queued.is_empty()
+            || self.issued_pager_cleanup_through() > state.completed_through
+    }
+
+    async fn resolve_one_pending_pager_cleanup(self: &Arc<Self>) -> Result<bool> {
+        let Some(mut claim) = self.claim_pending_pager_cleanup()? else {
+            return Ok(false);
+        };
+        claim.resolve().await?;
+        claim.finish()?;
+        Ok(true)
+    }
+
+    /// Bind an opener to the identity queue before it inspects or mutates any
+    /// rollback-journal state.  A dropped direct commit can leave a tracked
+    /// VFS source alive after its pager/transaction disappear; only this exact
+    /// queue owns its completion token and may classify the journal once that
+    /// source is terminal.  A fresh opener must therefore either drain the
+    /// predecessor or fail closed, never run independent open-time recovery
+    /// against a still-pending source.
+    async fn resolve_pager_cleanups_before_open(self: &Arc<Self>) -> Result<()> {
+        while self.resolve_one_pending_pager_cleanup().await? {}
+        if self.has_pending_or_claimed_pager_cleanup() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        Ok(())
+    }
+
+    async fn resolve_pager_cleanups_through(self: &Arc<Self>, id: PagerCleanupId) -> Result<()> {
+        loop {
+            if self.pager_cleanup_ticket_completed(id)? {
+                return Ok(());
+            }
+            let observed_generation = self.pager_cleanup_waiters.generation();
+            if self.pager_cleanup_ticket_completed(id)? {
+                return Ok(());
+            }
+            if self.resolve_one_pending_pager_cleanup().await? {
+                continue;
+            }
+            if self.pager_cleanup_ticket_completed(id)? {
+                return Ok(());
+            }
+            let _ = self
+                .pager_cleanup_waiters
+                .wait_for_change_async(observed_generation)
+                .await;
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_pager_cleanup_count(&self) -> Result<usize> {
+        let mut state = self
+            .pending_pager_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.drain_pager_cleanup_inbox(&mut state)?;
+        Ok(state.queued.len())
+    }
+
+    #[cfg(test)]
+    fn claimed_pager_cleanup_count(&self) -> Result<usize> {
+        let mut state = self
+            .pending_pager_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.drain_pager_cleanup_inbox(&mut state)?;
+        Ok(usize::from(state.active.is_some()))
     }
 
     fn parallel_wal_control(&self) -> &ParallelWalControlSurface {
@@ -1411,17 +1905,79 @@ impl GroupCommitQueue {
             .cloned()
     }
 
-    /// Publish a completed epoch and wake all waiters.
+    /// Register an exact admitted member while the caller still holds the
+    /// consolidator mutex that accepted its batch.
     ///
-    /// We take the consolidator mutex before publishing so a waiter cannot
-    /// observe an incomplete epoch, race with notify, and then go to sleep
-    /// forever on a lost wakeup.
-    fn publish_completed_epoch(&self, epoch: u64, wake_next_epoch: bool) {
-        let _guard = self
-            .consolidator
+    /// Keeping registration inside that critical section closes the only
+    /// possible submit-vs-abort gap: an epoch cannot be aborted between
+    /// `submit_batch` and this weak-index publication.
+    fn register_wal_member(&self, epoch: u64, submission: &Arc<PendingWalCommitSubmissionState>) {
+        let mut members = self
+            .pending_wal_members
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.completed_epoch.store(epoch, AtomicOrdering::Release);
+        let epoch_members = members.entry(epoch).or_default();
+        epoch_members.retain(|member| member.strong_count() != 0);
+        epoch_members.push(Arc::downgrade(submission));
+    }
+
+    /// Publish terminal not-committed evidence for exactly one epoch after
+    /// the consolidator has synchronously confirmed that its member batches
+    /// were withdrawn before durable mutation.
+    fn mark_wal_epoch_not_committed(&self, epoch: u64) {
+        let members = self
+            .pending_wal_members
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&epoch)
+            .unwrap_or_default();
+        for member in members {
+            if let Some(member) = member.upgrade() {
+                member.mark_exact_epoch_not_committed(epoch);
+            }
+        }
+    }
+
+    /// Transfer certificate-backed terminal proof into every exact member
+    /// state before the queue's bounded persisted-epoch history can age out.
+    fn mark_wal_epoch_durable(&self, epoch: u64, receipt: &ParallelWalDurabilityReceipt) {
+        let members = self
+            .pending_wal_members
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&epoch)
+            .unwrap_or_default();
+        for member in members {
+            if let Some(member) = member.upgrade() {
+                if let Err(error) = member.mark_exact_epoch_durable(epoch, receipt) {
+                    tracing::error!(
+                        %error,
+                        epoch,
+                        "durable WAL member receipt could not be transferred to its finalizer"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Publish a completed epoch and wake all waiters.
+    ///
+    /// We take the consolidator mutex while publishing the predicate so a
+    /// waiter cannot observe an incomplete epoch and then park. The guard is
+    /// released before signaling: keyed waiters sample their generation before
+    /// checking this predicate, and legacy condition-variable waiters check it
+    /// while holding the same mutex, so neither path can lose the wake.
+    ///
+    /// Keeping signaling outside the mutex is also required for custom async
+    /// wakers, which may immediately re-enter the queue.
+    fn publish_completed_epoch(&self, epoch: u64, wake_next_epoch: bool) {
+        {
+            let _guard = self
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.completed_epoch.store(epoch, AtomicOrdering::Release);
+        }
 
         // H11 fault hook: suppress only the legacy Condvar notification while
         // still storing the completed epoch. Async waiters use the keyed,
@@ -1447,19 +2003,19 @@ impl GroupCommitQueue {
 
     /// Publish a failed epoch and wake all waiters.
     ///
-    /// This uses the same mutex discipline as `publish_completed_epoch` so
-    /// waiter condition checks and condvar parking stay synchronized.
+    /// This uses the same predicate-under-lock, signal-after-unlock discipline
+    /// as `publish_completed_epoch`.
     fn publish_failed_epoch(&self, epoch: u64, error: &FrankenError, wake_next_epoch: bool) {
-        let _guard = self
-            .consolidator
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut failed_epochs = self
-            .failed_epochs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        failed_epochs.insert(epoch, GroupCommitEpochFailure::from_error(error));
-        drop(failed_epochs);
+        {
+            let _guard = self
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.failed_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(epoch, GroupCommitEpochFailure::from_error(error));
+        }
         self.signal_failed_epoch_waiters(epoch, wake_next_epoch);
     }
 
@@ -1483,6 +2039,7 @@ impl GroupCommitQueue {
             }
             consolidator.has_flusher_vacancy()
         };
+        self.mark_wal_epoch_not_committed(epoch);
         self.publish_failed_epoch(epoch, &FrankenError::Abort, wake_next_epoch);
     }
 
@@ -1623,7 +2180,17 @@ impl GroupCommitQueue {
             // ordered WAL residue. The recovery object first waits for both
             // source tokens, then validates the exact on-disk interval while
             // RESERVED remains held.
-            if claim.reconcile_durability().await? == GroupCommitFlushDurability::InDoubt {
+            let reconciliation = match claim.reconcile_durability().await {
+                Ok(reconciliation) => reconciliation,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "in-doubt group-commit recovery remains queued without a terminal verdict"
+                    );
+                    return Err(FrankenError::BusyRecovery);
+                }
+            };
+            if reconciliation == GroupCommitFlushDurability::InDoubt {
                 return Ok(false);
             }
         }
@@ -1717,6 +2284,27 @@ impl GroupCommitQueue {
             .any(|pending| pending.durability_state() == GroupCommitFlushDurability::InDoubt)
     }
 
+    /// True while a dropped group-commit owner has handed an external lock
+    /// transition to this queue, including the brief interval in which a
+    /// claimant owns the operation outside the deque.  The ownership map is
+    /// retained until terminal `finish`, so it closes the pop/requeue gap for
+    /// registry-retention decisions.
+    fn has_pending_or_claimed_external_unlock(&self) -> bool {
+        if !self
+            .pending_external_unlocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+        {
+            return true;
+        }
+        !self
+            .pending_external_unlock_ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
     fn abort_cancelled_filling(&self, target_epoch: u64) {
         let failed_epoch = {
             let mut consolidator = self
@@ -1735,6 +2323,7 @@ impl GroupCommitQueue {
                 }
             }
         };
+        self.mark_wal_epoch_not_committed(failed_epoch);
         self.publish_failed_epoch(failed_epoch, &FrankenError::Abort, false);
     }
 
@@ -1754,6 +2343,17 @@ impl GroupCommitQueue {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|&epoch, _| epoch > cutoff);
+        self.pending_wal_members
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|_, members| {
+                members.retain(|member| member.strong_count() != 0);
+                // This is a correctness-ownership index, not bounded
+                // diagnostic history. An old submitted member must remain
+                // reachable until exact durable or not-committed evidence
+                // removes its epoch entry.
+                !members.is_empty()
+            });
     }
 
     /// Check if a given epoch has completed (for waiters).
@@ -2260,11 +2860,11 @@ impl<F: VfsFile + 'static> PendingGroupCommitRecovery<F> {
 impl<F: VfsFile + 'static> PendingGroupCommitRecoveryOperation for PendingGroupCommitRecovery<F> {
     fn reconcile<'a>(&'a self) -> LocalPagerFuture<'a, GroupCommitFlushDurability> {
         Box::pin(async move {
-            if let Some(resolution) = *self
+            let completed_resolution = *self
                 .resolution
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-            {
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(resolution) = completed_resolution {
                 return Ok(match resolution {
                     PendingGroupCommitRecoveryResolution::Authorized => {
                         GroupCommitFlushDurability::Durable
@@ -2644,6 +3244,64 @@ type WalBackendHandle = Arc<AsyncRwLock<Box<dyn WalBackend>>>;
 pub type SharedWalBackend = Arc<std::sync::RwLock<Option<WalBackendHandle>>>;
 type SharedDbFile<F> = Arc<AsyncRwLock<F>>;
 type LocalPagerFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + 'a>>;
+
+/// Type-erased, connection-local cleanup work.  It must be `Send` because a
+/// queue is identity-bound rather than transaction-bound; its future remains
+/// local because VFS handles intentionally need not be `Send` across polls.
+trait PendingPagerCleanupOperation: Send {
+    fn resolve(&mut self) -> LocalPagerFuture<'_, ()>;
+}
+
+struct PendingPagerCleanup {
+    operation: Box<dyn PendingPagerCleanupOperation>,
+}
+
+impl PendingPagerCleanup {
+    fn new(operation: Box<dyn PendingPagerCleanupOperation>) -> Self {
+        Self { operation }
+    }
+}
+
+struct PendingPagerCleanupClaim {
+    queue: Arc<GroupCommitQueue>,
+    id: PagerCleanupId,
+    pending: Option<PendingPagerCleanup>,
+}
+
+impl PendingPagerCleanupClaim {
+    async fn resolve(&mut self) -> Result<()> {
+        self.pending
+            .as_mut()
+            .expect("pager cleanup claim must own its operation")
+            .operation
+            .resolve()
+            .await
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        // Mark FIFO completion before discarding the operation.  If the queue
+        // detects an invariant failure, Drop still owns the complete
+        // operation and requeues it rather than silently losing cleanup.
+        self.queue.finish_pending_pager_cleanup_claim(self.id)?;
+        self.pending
+            .take()
+            .expect("completed pager cleanup claim must own its operation");
+        Ok(())
+    }
+}
+
+impl Drop for PendingPagerCleanupClaim {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            // This is the only non-producer cleanup path that takes the FIFO
+            // state mutex: it atomically relinquishes an active claim and
+            // restores the same ticket to the ordered FIFO map. Ordinary
+            // Drop-originating producers never contend on that mutex.
+            self.queue
+                .requeue_claimed_pager_cleanup_front(self.id, pending);
+        }
+    }
+}
 
 async fn async_rwlock_read<'a, T>(
     lock: &'a AsyncRwLock<T>,
@@ -3250,14 +3908,30 @@ fn identity_bound_group_commit_queue<V: Vfs>(
 /// Called when the last connection using this path closes, to prevent stale
 /// consolidator state (epoch, db_size) from leaking into future connections
 /// that open a different file at the same path.
+///
+/// The path map is the authoritative registry for VFS backends without a
+/// stable [`FileIdentity`].  It must keep an entry discoverable while that
+/// queue owns any pager cleanup, external-unlock transition, or in-doubt WAL
+/// epoch; otherwise a reopen could construct a fresh queue and overtake a
+/// tracked source whose originating pager has already been dropped.
 pub fn remove_group_commit_queue(db_path: &Path) {
-    if let Some(queues) = GROUP_COMMIT_QUEUES.get() {
+    let removed = if let Some(queues) = GROUP_COMMIT_QUEUES.get() {
         let key = shared_file_state_key(db_path);
         let mut queues = queues
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        queues.remove(&key);
-    }
+        let may_remove = queues.get(&key).is_some_and(|queue| {
+            !queue.has_pending_or_claimed_pager_cleanup()
+                && !queue.has_pending_or_claimed_external_unlock()
+                && !queue.has_unresolved_in_doubt_epoch()
+        });
+        may_remove.then(|| queues.remove(&key)).flatten()
+    } else {
+        None
+    };
+    // Removing the last path-map Arc can destroy type-erased cleanup work.
+    // Never run that destruction while holding the registry mutex.
+    drop(removed);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3367,11 +4041,72 @@ async fn durable_invalidate_journal<F: VfsFile>(
     journal_file: &mut F,
     invalidation: JournalInvalidation,
 ) -> Result<()> {
+    durable_invalidate_journal_with_direct_handoff(cx, journal_file, invalidation, None).await
+}
+
+/// Durably make a rollback journal non-hot and, when this is the direct
+/// commit's own marker, publish the terminal decision to its persistent
+/// outcome record only after verification succeeds.
+///
+/// When a direct rollback-journal handoff exists, the completion token is
+/// installed in its persistent submission record before the VFS future is
+/// polled.  This makes a hidden blocking/actor write observable after the
+/// Rust observer future is dropped; Phase C may not classify or replay until
+/// every such source reaches a terminal state.
+async fn write_with_direct_commit_submission<F: VfsFile>(
+    cx: &Cx,
+    file: &F,
+    bytes: &[u8],
+    offset: u64,
+    direct_commit_submission: Option<&PendingDirectCommitSubmissionState>,
+) -> Result<()> {
+    let Some(submission) = direct_commit_submission else {
+        return file.write(cx, bytes, offset).await;
+    };
+
+    let completion = submission.register_write_completion();
+    let result = file.write_tracked(cx, bytes, offset, completion).await;
+    // Successful and error-terminal writes no longer need to occupy the
+    // ticket's small pending set. A cancellation at the await leaves the
+    // token retained, which is exactly the state a future cleanup claimant
+    // must observe as in-doubt.
+    submission.retire_terminal_write_completions();
+    result
+}
+
+async fn write_with_direct_commit_handoff<F: VfsFile>(
+    cx: &Cx,
+    file: &F,
+    bytes: &[u8],
+    offset: u64,
+    direct_commit_handoff: Option<&PendingDirectCommitHandoff>,
+) -> Result<()> {
+    write_with_direct_commit_submission(
+        cx,
+        file,
+        bytes,
+        offset,
+        direct_commit_handoff.map(|handoff| handoff.submission.as_ref()),
+    )
+    .await
+}
+
+async fn durable_invalidate_journal_with_direct_handoff<F: VfsFile>(
+    cx: &Cx,
+    journal_file: &mut F,
+    invalidation: JournalInvalidation,
+    mut direct_commit_handoff: Option<&mut PendingDirectCommitHandoff>,
+) -> Result<()> {
     match invalidation {
         JournalInvalidation::ZeroMagic => {
-            journal_file
-                .write(cx, &[0_u8; JOURNAL_MAGIC.len()], 0)
-                .await?;
+            write_with_direct_commit_handoff(
+                cx,
+                journal_file,
+                &[0_u8; JOURNAL_MAGIC.len()],
+                0,
+                direct_commit_handoff.as_deref(),
+            )
+            .await?;
             journal_file.durable_sync(cx, SyncKind::FullDurable)?;
             let mut observed = [0_u8; JOURNAL_MAGIC.len()];
             let bytes_read = journal_file.read(cx, &mut observed, 0).await?;
@@ -3381,6 +4116,9 @@ async fn durable_invalidate_journal<F: VfsFile>(
                         "rollback-journal invalidation did not persist zero magic: read {bytes_read} bytes, prefix={observed:02x?}"
                     ),
                 });
+            }
+            if let Some(handoff) = direct_commit_handoff.as_deref_mut() {
+                handoff.mark_durable();
             }
         }
         JournalInvalidation::Truncate => {
@@ -3394,6 +4132,9 @@ async fn durable_invalidate_journal<F: VfsFile>(
                     ),
                 });
             }
+            if let Some(handoff) = direct_commit_handoff.as_deref_mut() {
+                handoff.mark_durable();
+            }
         }
     }
     Ok(())
@@ -3404,7 +4145,36 @@ async fn durable_write_and_verify_journal_header<F: VfsFile>(
     journal_file: &mut F,
     header: &[u8],
 ) -> Result<()> {
-    journal_file.write(cx, header, 0).await?;
+    durable_write_and_verify_journal_header_with_direct_handoff(cx, journal_file, header, None)
+        .await
+}
+
+/// Write and verify a hot rollback-journal header.
+///
+/// The handoff changes to `RecoveryRequired` *before* the first header write.
+/// A backend can make bytes visible and then report an error or lose the
+/// observing future, so marking only after the durable barrier would let an
+/// explicitly returned error reclaim a ticket whose journal may already be
+/// hot.  The conservative marker means a failed header write is resolved
+/// through the persistent classification path rather than being mislabeled as
+/// an ordinary retryable pre-hot error.
+async fn durable_write_and_verify_journal_header_with_direct_handoff<F: VfsFile>(
+    cx: &Cx,
+    journal_file: &mut F,
+    header: &[u8],
+    mut direct_commit_handoff: Option<&mut PendingDirectCommitHandoff>,
+) -> Result<()> {
+    if let Some(handoff) = direct_commit_handoff.as_deref_mut() {
+        handoff.mark_recovery_required();
+    }
+    write_with_direct_commit_handoff(
+        cx,
+        journal_file,
+        header,
+        0,
+        direct_commit_handoff.as_deref(),
+    )
+    .await?;
     journal_file.durable_sync(cx, SyncKind::FullDurable)?;
     let mut observed = vec![0_u8; header.len()];
     let bytes_read = journal_file.read(cx, &mut observed, 0).await?;
@@ -7072,7 +7842,7 @@ fn bootstrap_header_from_stale_main_file(
 
 impl<V> MvccPager for SimplePager<V>
 where
-    V: Vfs + Send + Sync,
+    V: Vfs + Send + Sync + 'static,
     V::File: Send + Sync + 'static,
 {
     type Txn = SimpleTransaction<V>;
@@ -7088,6 +7858,23 @@ where
                 .resolve_one_pending_external_unlock()
                 .await?
             {}
+            // A dropped direct-commit future may outlive its transaction
+            // value.  Its identity-bound ticket is the sole owner of the
+            // writer baton, allocator state, and final snapshot unlock, so
+            // admission must drain it before a later transaction can proceed.
+            // If recovery cannot reach a terminal result, fail closed rather
+            // than silently stranding the lock or overtaking its publication.
+            while self
+                .group_commit_queue
+                .resolve_one_pending_pager_cleanup()
+                .await?
+            {}
+            if self
+                .group_commit_queue
+                .has_pending_or_claimed_pager_cleanup()
+            {
+                return Err(FrankenError::BusyRecovery);
+            }
             if self.group_commit_queue.has_unresolved_in_doubt_epoch() {
                 return Err(FrankenError::BusyRecovery);
             }
@@ -7187,7 +7974,10 @@ where
                     std::cmp::max(published_snapshot.visible_commit_seq, inner.commit_seq);
                 let bound_db_size = published_snapshot.db_size.max(original_db_size);
                 let pool = self.pool.clone();
-                let cleanup_cx = cx.clone();
+                // Direct-commit finalization can outlive the caller future and
+                // may be resumed on a different executor thread. Never retain
+                // a task-affine native runtime context in that obligation.
+                let cleanup_cx = cx.create_native_free_child().cleanup_scope();
                 let memory_db_bump_alloc =
                     self.vfs.is_memory() && self.db_path == Path::new("/:memory:");
                 return Ok(SimpleTransaction {
@@ -7219,6 +8009,14 @@ where
                     is_writer: eager_writer,
                     committed: false,
                     finished: false,
+                    commit_terminal_owner: None,
+                    commit_phase: Cell::new(TransactionCommitPhase::Open),
+                    pending_direct_submission: None,
+                    pending_direct_commit_resolution: None,
+                    pending_direct_transferred_state: None,
+                    pending_wal_submission: None,
+                    pending_wal_commit_resolution: None,
+                    pending_wal_cleanup_ticket: None,
                     original_db_size,
                     savepoint_stack: Vec::new(),
                     journal_mode,
@@ -7380,7 +8178,10 @@ where
             let journal_mode = inner.journal_mode;
             let pool = self.pool.clone();
             let published_snapshot = self.published.snapshot();
-            let cleanup_cx = cleanup_child_cx(cx);
+            // Direct-commit finalization can outlive the caller future and may
+            // be resumed on a different executor thread. Keep its mandatory
+            // cleanup context capability-preserving but natively detached.
+            let cleanup_cx = cx.create_native_free_child().cleanup_scope();
             let memory_db_bump_alloc =
                 self.vfs.is_memory() && self.db_path == Path::new("/:memory:");
             let read_only_pager = inner.access_mode.is_readonly();
@@ -7415,6 +8216,14 @@ where
                 is_writer: eager_writer,
                 committed: false,
                 finished: false,
+                commit_terminal_owner: None,
+                commit_phase: Cell::new(TransactionCommitPhase::Open),
+                pending_direct_submission: None,
+                pending_direct_commit_resolution: None,
+                pending_direct_transferred_state: None,
+                pending_wal_submission: None,
+                pending_wal_commit_resolution: None,
+                pending_wal_cleanup_ticket: None,
                 original_db_size,
                 savepoint_stack: Vec::new(),
                 journal_mode,
@@ -9558,6 +10367,9 @@ where
             identity_bound_maintenance_gate(&*vfs, &path_maintenance_gate, &db_file)?;
         let recovery_fence = identity_bound_recovery_fence(&*vfs, &db_path, &db_file)?;
         let group_commit_queue = identity_bound_group_commit_queue(&*vfs, &db_path, &db_file)?;
+        group_commit_queue
+            .resolve_pager_cleanups_before_open()
+            .await?;
         let mut maintenance_open_lease = if Arc::ptr_eq(&maintenance_gate, &path_maintenance_gate) {
             path_maintenance_lease
         } else {
@@ -10161,6 +10973,9 @@ where
             identity_bound_maintenance_gate(&*vfs, &path_maintenance_gate, &db_file)?;
         let recovery_fence = identity_bound_recovery_fence(&*vfs, &db_path, &db_file)?;
         let group_commit_queue = identity_bound_group_commit_queue(&*vfs, &db_path, &db_file)?;
+        group_commit_queue
+            .resolve_pager_cleanups_before_open()
+            .await?;
         let maintenance_open_lease = if Arc::ptr_eq(&maintenance_gate, &path_maintenance_gate) {
             path_maintenance_lease
         } else {
@@ -10411,6 +11226,33 @@ where
     where
         Validate: for<'a> FnOnce(&'a Cx, &'a V::File, PageSize) -> WalFuture<'a, ()>,
     {
+        Self::replay_journal_with_optional_page_size_validator_and_direct_submission(
+            cx,
+            vfs,
+            db_file,
+            journal_path,
+            expected_page_size,
+            validate_restored,
+            None,
+        )
+        .await
+    }
+
+    /// Variant used by the persistent direct-commit resolver.  It keeps every
+    /// replay write source visible to the same ticket so a cancelled replay
+    /// cannot be retried concurrently with a still-running blocking write.
+    async fn replay_journal_with_optional_page_size_validator_and_direct_submission<Validate>(
+        cx: &Cx,
+        vfs: &V,
+        db_file: &mut V::File,
+        journal_path: &Path,
+        expected_page_size: Option<PageSize>,
+        validate_restored: Validate,
+        direct_commit_submission: Option<&PendingDirectCommitSubmissionState>,
+    ) -> Result<RollbackJournalReplayOutcome>
+    where
+        Validate: for<'a> FnOnce(&'a Cx, &'a V::File, PageSize) -> WalFuture<'a, ()>,
+    {
         let jrnl_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
         let (mut jrnl_file, _) = vfs.open(cx, Some(journal_path), jrnl_flags)?;
 
@@ -10646,7 +11488,14 @@ where
                 });
             }
             let page_offset = u64::from(page_no.get() - 1) * ps as u64;
-            db_file.write(cx, &record.content, page_offset).await?;
+            write_with_direct_commit_submission(
+                cx,
+                db_file,
+                &record.content,
+                page_offset,
+                direct_commit_submission,
+            )
+            .await?;
 
             offset += record_size as u64;
         }
@@ -11096,6 +11945,1575 @@ fn acquire_page_buf_with_clean_cache_recovery(
     })
 }
 
+/// Lifecycle of a transaction whose physical direct-commit outcome has moved
+/// into the identity-bound pager cleanup queue.
+///
+/// `DirectOutcomeFinalizing` is deliberately distinct from a durable Phase-C
+/// ticket: a hot rollback journal may still require replay, while a non-hot
+/// journal is only a durable proof after the fresh certification path has
+/// established both the main-image and marker barriers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransactionCommitPhase {
+    Open,
+    DirectOutcomeFinalizing { ticket: PagerCleanupId },
+    WalOutcomeFinalizing,
+    DurableFinalized,
+    RolledBackFinalized,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingWalCommitStatus {
+    /// The physical batch has not been admitted to the consolidator.
+    Preparing,
+    /// Exact successful admission, recorded at the submit linearization point.
+    Submitted { batch_id: u64, target_epoch: u64 },
+    /// Exact terminal evidence that this member was never durably committed.
+    NotCommitted {
+        batch_id: Option<u64>,
+        target_epoch: Option<u64>,
+    },
+    /// Exact certificate-backed membership retained independently of the
+    /// queue's bounded epoch-history maps.
+    Durable {
+        batch_id: u64,
+        target_epoch: u64,
+        assigned_commit_seq: CommitSeq,
+    },
+}
+
+/// Shared handoff between the stack-local submitter and its FIFO-owned member
+/// finalizer.
+///
+/// `status` is protected by one mutex so `{batch_id,target_epoch}` is observed
+/// atomically. `submission_complete` separately seals the producer: an empty
+/// or preparing state is never treated as rollback while the group future can
+/// still admit the batch on a later poll.
+struct PendingWalCommitSubmissionState {
+    status: Mutex<PendingWalCommitStatus>,
+    durable_receipt: Mutex<Option<ParallelWalDurabilityReceipt>>,
+    submission_complete: AtomicBool,
+}
+
+impl PendingWalCommitSubmissionState {
+    fn new() -> Self {
+        Self {
+            status: Mutex::new(PendingWalCommitStatus::Preparing),
+            durable_receipt: Mutex::new(None),
+            submission_complete: AtomicBool::new(false),
+        }
+    }
+
+    fn status(&self) -> PendingWalCommitStatus {
+        *self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn mark_submitted(&self, batch_id: u64, target_epoch: u64) {
+        let mut status = self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            *status,
+            PendingWalCommitStatus::Preparing,
+            "WAL member submission must linearize exactly once"
+        );
+        *status = PendingWalCommitStatus::Submitted {
+            batch_id,
+            target_epoch,
+        };
+    }
+
+    fn mark_exact_epoch_not_committed(&self, epoch: u64) {
+        let mut status = self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let PendingWalCommitStatus::Submitted {
+            batch_id,
+            target_epoch,
+        } = *status
+            && target_epoch == epoch
+        {
+            *status = PendingWalCommitStatus::NotCommitted {
+                batch_id: Some(batch_id),
+                target_epoch: Some(target_epoch),
+            };
+        }
+    }
+
+    fn mark_exact_epoch_durable(
+        &self,
+        epoch: u64,
+        receipt: &ParallelWalDurabilityReceipt,
+    ) -> Result<()> {
+        let mut status = self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let PendingWalCommitStatus::Submitted {
+            batch_id,
+            target_epoch,
+        } = *status
+        else {
+            return Ok(());
+        };
+        if target_epoch != epoch {
+            return Ok(());
+        }
+        let assigned_commit_seq = receipt.commit_seq_for_batch(batch_id).ok_or_else(|| {
+            FrankenError::internal(format!(
+                "durable group-commit receipt for epoch {epoch} omitted admitted batch {batch_id}"
+            ))
+        })?;
+        *self
+            .durable_receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(receipt.clone());
+        *status = PendingWalCommitStatus::Durable {
+            batch_id,
+            target_epoch,
+            assigned_commit_seq,
+        };
+        Ok(())
+    }
+
+    fn durable_authorization(&self) -> Result<Option<ParallelWalPublicationAuthorization>> {
+        let PendingWalCommitStatus::Durable {
+            batch_id,
+            assigned_commit_seq,
+            ..
+        } = self.status()
+        else {
+            return Ok(None);
+        };
+        let durability_receipt = self
+            .durable_receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                FrankenError::internal("durable WAL member lost its retained certificate receipt")
+            })?;
+        Ok(Some(ParallelWalPublicationAuthorization {
+            durability_receipt,
+            batch_id,
+            assigned_commit_seq,
+        }))
+    }
+
+    fn mark_unsubmitted_not_committed(&self) {
+        let mut status = self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *status == PendingWalCommitStatus::Preparing {
+            *status = PendingWalCommitStatus::NotCommitted {
+                batch_id: None,
+                target_epoch: None,
+            };
+        }
+    }
+
+    fn mark_submission_complete(&self) {
+        self.submission_complete
+            .store(true, AtomicOrdering::Release);
+    }
+
+    fn submission_complete(&self) -> bool {
+        self.submission_complete.load(AtomicOrdering::Acquire)
+    }
+}
+
+/// Stack-local guard for the exact group-commit admission boundary.
+///
+/// Drop can prove rollback only while the batch is still unsubmitted. Once
+/// `mark_submitted` succeeds, the FIFO ticket and physical group machinery
+/// remain the only owners allowed to classify its outcome.
+struct PendingWalCommitHandoff {
+    submission: Arc<PendingWalCommitSubmissionState>,
+    armed: bool,
+}
+
+impl PendingWalCommitHandoff {
+    fn new(submission: Arc<PendingWalCommitSubmissionState>) -> Self {
+        Self {
+            submission,
+            armed: true,
+        }
+    }
+
+    fn mark_submitted(&mut self, queue: &GroupCommitQueue, batch_id: u64, target_epoch: u64) {
+        self.submission.mark_submitted(batch_id, target_epoch);
+        queue.register_wal_member(target_epoch, &self.submission);
+        self.armed = false;
+    }
+
+    fn finish_submission(&self) {
+        self.submission.mark_submission_complete();
+    }
+
+    fn can_reclaim_pre_submit(&self) -> bool {
+        self.armed
+            && self.submission.status() == PendingWalCommitStatus::Preparing
+            && self.submission.submission_complete()
+    }
+
+    fn disarm_for_pre_submit_reclaim(&mut self) {
+        debug_assert!(self.can_reclaim_pre_submit());
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingWalCommitHandoff {
+    fn drop(&mut self) {
+        if self.armed {
+            self.submission.mark_unsubmitted_not_committed();
+        }
+        self.submission.mark_submission_complete();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum PendingDirectCommitStatus {
+    /// The caller still owns pre-journal rollback authority.
+    Preparing = 0,
+    /// The pre-durable owner disappeared before a hot journal was installed.
+    Abandoned = 1,
+    /// A hot journal may govern already-mutated main-file bytes.
+    RecoveryRequired = 2,
+    /// The non-hot journal marker was freshly durably certified.
+    Durable = 3,
+}
+
+/// Durable-outcome evidence shared by the direct I/O caller and its persistent
+/// cleanup ticket.
+///
+/// `direct_db_durable` is intentionally not the terminal commit decision. It
+/// records only that the main database's `FullDurable` barrier succeeded. A
+/// later recovery claimant must still perform a fresh read-write journal sync
+/// and re-read the non-hot marker before it can classify the commit durable.
+struct PendingDirectCommitSubmissionState {
+    status: AtomicU8,
+    direct_mutation_started: AtomicBool,
+    direct_db_durable: AtomicBool,
+    /// The physical journal protocol exhausted every durable-outcome proof.
+    /// A later cleanup attempt may still fail while the ticket remains queued,
+    /// but it must not overwrite this already-established caller-visible
+    /// indeterminate outcome with its secondary cleanup error.
+    outcome_indeterminate: AtomicBool,
+    /// Every direct rollback-journal write retains one source-owned VFS
+    /// completion token here before its observer future is polled.  A cleanup
+    /// claimant must never classify, replay, delete, or publish while one of
+    /// these sources can still mutate bytes after its caller was cancelled.
+    pending_write_completions: Mutex<Vec<VfsWriteCompletion>>,
+    /// The stack-local submitter sets this only after it has registered its
+    /// final direct write (or its Drop has recorded abandonment).  This closes
+    /// the registration-vs-recovery race: an empty completion list alone is
+    /// not proof that the still-running submitter will not submit another
+    /// write on its next poll.
+    submission_complete: AtomicBool,
+}
+
+impl PendingDirectCommitSubmissionState {
+    fn new() -> Self {
+        Self {
+            status: AtomicU8::new(PendingDirectCommitStatus::Preparing as u8),
+            direct_mutation_started: AtomicBool::new(false),
+            direct_db_durable: AtomicBool::new(false),
+            outcome_indeterminate: AtomicBool::new(false),
+            pending_write_completions: Mutex::new(Vec::new()),
+            submission_complete: AtomicBool::new(false),
+        }
+    }
+
+    fn status(&self) -> PendingDirectCommitStatus {
+        match self.status.load(AtomicOrdering::Acquire) {
+            0 => PendingDirectCommitStatus::Preparing,
+            1 => PendingDirectCommitStatus::Abandoned,
+            2 => PendingDirectCommitStatus::RecoveryRequired,
+            3 => PendingDirectCommitStatus::Durable,
+            other => panic!("invalid pending direct-commit status {other}"),
+        }
+    }
+
+    fn mark_recovery_required(&self) {
+        let _ = self.status.compare_exchange(
+            PendingDirectCommitStatus::Preparing as u8,
+            PendingDirectCommitStatus::RecoveryRequired as u8,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        );
+    }
+
+    fn mark_direct_mutation_started(&self) {
+        self.direct_mutation_started
+            .store(true, AtomicOrdering::Release);
+    }
+
+    fn direct_mutation_started(&self) -> bool {
+        self.direct_mutation_started.load(AtomicOrdering::Acquire)
+    }
+
+    /// Record the successful main-database durability barrier.  This bit is
+    /// set before any post-sync test hook or journal invalidation, so dropped
+    /// futures cannot mistake a merely visible write for a stable main image.
+    fn mark_direct_db_durable(&self) {
+        self.direct_db_durable.store(true, AtomicOrdering::Release);
+    }
+
+    fn direct_db_durable(&self) -> bool {
+        self.direct_db_durable.load(AtomicOrdering::Acquire)
+    }
+
+    fn mark_outcome_indeterminate(&self) {
+        self.outcome_indeterminate
+            .store(true, AtomicOrdering::Release);
+    }
+
+    fn outcome_indeterminate(&self) -> bool {
+        self.outcome_indeterminate.load(AtomicOrdering::Acquire)
+    }
+
+    /// Register a source-owned completion token before constructing the VFS
+    /// future that can submit the write.  Terminal tokens are pruned on every
+    /// registration so ordinary successful commits retain no per-page state
+    /// after their writes have completed.
+    fn register_write_completion(&self) -> VfsWriteCompletion {
+        let completion = VfsWriteCompletion::new();
+        let mut completions = self
+            .pending_write_completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::retain_pending_write_completions(&mut completions);
+        completions.push(completion.clone());
+        completion
+    }
+
+    fn retire_terminal_write_completions(&self) {
+        let mut completions = self
+            .pending_write_completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::retain_pending_write_completions(&mut completions);
+    }
+
+    /// Whether any accepted write source can still mutate a journal or main
+    /// database byte.  `Error` is terminal evidence, not evidence that zero
+    /// bytes were written, so it is deliberately pruned here and resolved by
+    /// conservative journal classification afterwards.
+    fn has_pending_write_completion(&self) -> bool {
+        let mut completions = self
+            .pending_write_completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::retain_pending_write_completions(&mut completions);
+        !completions.is_empty()
+    }
+
+    fn retain_pending_write_completions(completions: &mut Vec<VfsWriteCompletion>) {
+        completions.retain(|completion| completion.state() == VfsWriteCompletionState::Pending);
+    }
+
+    fn mark_submission_complete(&self) {
+        self.submission_complete
+            .store(true, AtomicOrdering::Release);
+    }
+
+    fn submission_complete(&self) -> bool {
+        self.submission_complete.load(AtomicOrdering::Acquire)
+    }
+
+    fn mark_durable(&self) {
+        self.status.store(
+            PendingDirectCommitStatus::Durable as u8,
+            AtomicOrdering::Release,
+        );
+    }
+
+    fn mark_abandoned(&self) {
+        let _ = self.status.compare_exchange(
+            PendingDirectCommitStatus::Preparing as u8,
+            PendingDirectCommitStatus::Abandoned as u8,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        );
+    }
+}
+
+/// Stack-local handle used while direct journal I/O is in flight.  Its Drop
+/// records only the safe pre-journal abandonment case; once a hot journal has
+/// been durably installed, the ordered ticket owns classification instead.
+struct PendingDirectCommitHandoff {
+    submission: Arc<PendingDirectCommitSubmissionState>,
+    armed: bool,
+}
+
+impl PendingDirectCommitHandoff {
+    fn new(submission: Arc<PendingDirectCommitSubmissionState>) -> Self {
+        Self {
+            submission,
+            armed: true,
+        }
+    }
+
+    fn mark_recovery_required(&mut self) {
+        self.submission.mark_recovery_required();
+        self.armed = false;
+    }
+
+    fn mark_direct_mutation_started(&self) {
+        self.submission.mark_direct_mutation_started();
+    }
+
+    fn mark_direct_db_durable(&self) {
+        self.submission.mark_direct_db_durable();
+    }
+
+    fn mark_outcome_indeterminate(&self) {
+        self.submission.mark_outcome_indeterminate();
+    }
+
+    fn finish_submission(&self) {
+        self.submission.mark_submission_complete();
+    }
+
+    /// True only while no recovery-visible direct-commit submission has
+    /// started.  This is the sole state in which an explicitly returned
+    /// commit error may restore the live transaction for retry.
+    fn can_reclaim_pre_hot(&self) -> bool {
+        self.armed
+            && self.submission.status() == PendingDirectCommitStatus::Preparing
+            && !self.submission.direct_mutation_started()
+            && self.submission.submission_complete()
+            && !self.submission.has_pending_write_completion()
+    }
+
+    /// Disarm Drop after the queue atomically removed this still-provisional
+    /// ticket.  Callers must perform queue withdrawal first; otherwise a
+    /// claimant could own the same allocator/lease state.
+    fn disarm_for_pre_hot_reclaim(&mut self) {
+        debug_assert!(
+            self.can_reclaim_pre_hot(),
+            "pre-hot handoff must be checked before queue withdrawal"
+        );
+        self.armed = false;
+    }
+
+    fn mark_durable(&mut self) {
+        self.submission.mark_durable();
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingDirectCommitHandoff {
+    fn drop(&mut self) {
+        if self.armed {
+            self.submission.mark_abandoned();
+        }
+        self.submission.mark_submission_complete();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum PendingDirectCommitResolution {
+    Pending = 0,
+    RolledBack = 1,
+    Durable = 2,
+}
+
+impl PendingDirectCommitResolution {
+    fn load(state: &AtomicU8) -> Self {
+        match state.load(AtomicOrdering::Acquire) {
+            0 => Self::Pending,
+            1 => Self::RolledBack,
+            2 => Self::Durable,
+            other => panic!("invalid pending direct-commit resolution {other}"),
+        }
+    }
+
+    fn publish(self, state: &AtomicU8) {
+        state.store(self as u8, AtomicOrdering::Release);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistentDirectCommitState {
+    AwaitingOutcome,
+    DurableMetadata,
+    DurableSnapshot,
+    DurablePublication,
+    DurableCache,
+    DurableExit,
+    RollbackExit,
+    Resolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectCommitOutcome {
+    Durable,
+    RolledBack,
+}
+
+/// Transaction state transferred to a provisional direct-commit ticket.
+///
+/// The slot is shared with the originating transaction only until the queue
+/// atomically confirms that the ticket is still unclaimed.  A cleanup claimant
+/// takes it at the beginning of resolution, making later restoration by the
+/// caller impossible.  Keeping this state separate from the type-erased queue
+/// operation avoids downcasting and makes the ownership transfer auditable.
+struct DirectCommitTransferredState {
+    pending_returned_pages: Vec<PageNumber>,
+    pending_freed_pages: Vec<PageNumber>,
+    allocated_from_freelist: Vec<PageNumber>,
+    allocated_from_eof: Vec<PageNumber>,
+    page_lease: Vec<PageNumber>,
+    maintenance_lease: Option<PagerMaintenanceLease>,
+    commit_terminal_owner: Option<CommitTerminalOwner>,
+}
+
+/// Queue-owned direct-commit finalization.
+///
+/// The transaction installs this *before* a rollback journal can become hot.
+/// It owns enough state to make the physical outcome, Phase C publication, and
+/// logical transaction exit exact-once even if the originating future and then
+/// the transaction value are dropped.  It intentionally uses the clean
+/// checkout's existing `Mutex`/`Condvar` substrate; unlike the frozen branch,
+/// no pager-wide lock migration is required for this cancellation boundary.
+struct PersistentDirectCommitFinalization<V: Vfs> {
+    vfs: Arc<V>,
+    journal_path: PathBuf,
+    /// Strong self-liveness while this operation is still queued.  Identity
+    /// registries intentionally retain only `Weak` queue entries, so a direct
+    /// ticket must keep its exact queue alive when its originating pager and
+    /// transaction are both dropped.  This temporary queue -> ticket -> queue
+    /// cycle is broken by successful FIFO finish or pre-source withdrawal;
+    /// a quarantined ticket deliberately retains it fail-closed rather than
+    /// letting a later opener create a fresh queue past an unresolved source.
+    _group_commit_queue: GroupCommitQueueRef,
+    inner: Arc<Mutex<PagerInner<V::File>>>,
+    writer_idle: Arc<Condvar>,
+    cache: Arc<ShardedPageCache>,
+    published: Arc<PublishedPagerState>,
+    committed_snapshot: Arc<RwLock<Arc<PagerCommittedSnapshot>>>,
+    wal_backend: SharedWalBackend,
+    submission: Arc<PendingDirectCommitSubmissionState>,
+    resolution: Arc<AtomicU8>,
+    write_set: PagePageMap<StagedPage>,
+    /// Shared only while queued in the provisional pre-hot state.  Once a
+    /// claimant begins resolution, `owned_state` is populated and the
+    /// transaction can no longer reclaim it.
+    transferred_state: Arc<Mutex<Option<DirectCommitTransferredState>>>,
+    owned_state: Option<DirectCommitTransferredState>,
+    committed_db_size: u32,
+    metadata_only_single_connection_fast_path: bool,
+    mode: TransactionMode,
+    is_writer: bool,
+    original_db_size: u32,
+    cleanup_cx: Cx,
+    state: PersistentDirectCommitState,
+    publish_update: Option<PublishedPagerUpdate>,
+    exit_accounted: bool,
+    notify_writer_idle: bool,
+    /// Once set, this ticket is committed to the rollback outcome.  It is
+    /// deliberately latched before replay I/O begins: a replay can restore
+    /// pages and leave metadata refresh suspended, at which point a later
+    /// non-hot journal observation must never resurrect the original commit.
+    replay_started: bool,
+}
+
+impl<V> PersistentDirectCommitFinalization<V>
+where
+    V: Vfs + 'static,
+    V::File: 'static,
+{
+    /// Claim the transferred transaction state exactly once.
+    ///
+    /// Queue withdrawal removes the operation before this method can run.  If
+    /// a claimant has started, it takes the shared slot under its mutex before
+    /// any async recovery work; an originating caller that lost the queue race
+    /// therefore cannot put the same allocator/lease state back a second time.
+    fn claim_transferred_state(&mut self) -> Result<()> {
+        if self.owned_state.is_none() {
+            let mut slot = self
+                .transferred_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.owned_state = Some(slot.take().ok_or_else(|| {
+                FrankenError::internal(
+                    "persistent direct commit lost its transferred transaction state",
+                )
+            })?);
+        }
+        Ok(())
+    }
+
+    async fn classify_journal(&self) -> Result<Option<RollbackJournalPrefixState>> {
+        if !self
+            .vfs
+            .access(&self.cleanup_cx, &self.journal_path, AccessFlags::EXISTS)?
+        {
+            return Ok(None);
+        }
+        let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_JOURNAL;
+        let (mut journal_file, _) =
+            self.vfs
+                .open(&self.cleanup_cx, Some(&self.journal_path), flags)?;
+        let classification =
+            classify_rollback_journal_prefix(&self.cleanup_cx, &journal_file).await;
+        let close_result = journal_file.close(&self.cleanup_cx);
+        match (classification, close_result) {
+            (Ok((state, _)), Ok(())) => Ok(Some(state)),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(classification_error), Err(close_error)) => Err(FrankenError::internal(format!(
+                "direct commit journal classification failed and its handle could not close: classification={classification_error}; close={close_error}"
+            ))),
+        }
+    }
+
+    /// Force the currently visible journal marker through a fresh read-write
+    /// `FullDurable` barrier and then classify it again.  A stale local
+    /// non-hot observation never proves a commit: if this barrier fails, or
+    /// the re-read is hot, the resolver must replay or remain fail-closed.
+    async fn freshly_certify_journal_marker(&self) -> Result<RollbackJournalPrefixState> {
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+        let (mut journal_file, _) =
+            self.vfs
+                .open(&self.cleanup_cx, Some(&self.journal_path), flags)?;
+        let certification = async {
+            journal_file.durable_sync(&self.cleanup_cx, SyncKind::FullDurable)?;
+            classify_rollback_journal_prefix(&self.cleanup_cx, &journal_file)
+                .await
+                .map(|(state, _)| state)
+        }
+        .await;
+        let close_result = journal_file.close(&self.cleanup_cx);
+        match (certification, close_result) {
+            (Ok(state), Ok(())) => Ok(state),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(certification_error), Err(close_error)) => Err(FrankenError::internal(format!(
+                "fresh direct-commit marker certification and journal close both failed: certification={certification_error}; close={close_error}"
+            ))),
+        }
+    }
+
+    async fn finish_replayed_metadata(&self, inner: &mut PagerInner<V::File>) -> Result<()> {
+        self.cache.clear();
+        inner
+            .refresh_committed_state_after_recovery(
+                &self.cleanup_cx,
+                &self.cache,
+                &self.wal_backend,
+            )
+            .await?;
+        inner.rollback_journal_recovery_state = RollbackJournalRecoveryState::Clean;
+        self.published.publish_clear_if(
+            &self.cleanup_cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: inner.commit_seq,
+                db_size: inner.db_size,
+                journal_mode: inner.journal_mode,
+                freelist_count: inner.freelist.len(),
+                checkpoint_active: inner.checkpoint_active,
+            },
+            true,
+        );
+        let mut snapshot = self
+            .committed_snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *snapshot = Arc::new(PagerCommittedSnapshot::from_inner(inner));
+        Ok(())
+    }
+
+    /// Complete rollback recovery after this ticket selected the replay path.
+    ///
+    /// `replay_started` is a durable-in-ticket outcome latch, not a statement
+    /// that the replay syscall already completed.  If cancellation occurs
+    /// during replay, retrying the replay is safe and still cannot become a
+    /// commit.  Once pager metadata says `MetadataRefreshPending`, retries
+    /// complete only that metadata work; they do not classify the journal
+    /// again.
+    async fn replay_hot_journal(&mut self) -> Result<()> {
+        self.replay_started = true;
+        // This is the inherited pager recovery critical section: the existing
+        // runtime rollback-journal recovery path holds `PagerInner` while it
+        // replays the main file and refreshes recovery metadata. The state
+        // transition and retained-snapshot accounting must remain atomic.
+        //
+        // Awaited callees use the already-borrowed inner state, the main-file
+        // lock, or the WAL backend; none re-locks `self.inner`. The order is
+        // PagerInner -> main-file -> WAL when refresh needs it, and this path
+        // never acquires PagerInner after holding a main-file guard. The
+        // resolver runs masked; if a future is still dropped, Rust releases
+        // this guard and the cleanup claim's Drop requeues the exact ticket.
+        let mut inner = self.inner.lock().map_err(|_| {
+            FrankenError::internal("direct commit recovery PagerInner lock poisoned")
+        })?;
+        if inner.rollback_journal_recovery_state
+            == RollbackJournalRecoveryState::MetadataRefreshPending
+        {
+            self.finish_replayed_metadata(&mut inner).await?;
+            drop(inner);
+            if let Err(error) = self.vfs.delete(&self.cleanup_cx, &self.journal_path, true) {
+                tracing::warn!(
+                    %error,
+                    journal = %self.journal_path.display(),
+                    "direct commit recovery left a durable non-hot rollback journal"
+                );
+            }
+            return Ok(());
+        }
+        let mut db_file = shared_db_file_write(&inner.db_file, &self.cleanup_cx).await?;
+        let replay = SimplePager::<V>::replay_journal_with_optional_page_size_validator_and_direct_submission(
+                &self.cleanup_cx,
+                &*self.vfs,
+                &mut *db_file,
+                &self.journal_path,
+                Some(inner.page_size),
+                |_, _, _| Box::pin(async { Ok(()) }),
+                Some(self.submission.as_ref()),
+            )
+            .await?;
+        drop(db_file);
+        if !matches!(replay, RollbackJournalReplayOutcome::Replayed(_)) {
+            return Err(FrankenError::BusyRecovery);
+        }
+        inner.rollback_journal_recovery_state =
+            RollbackJournalRecoveryState::MetadataRefreshPending;
+        self.finish_replayed_metadata(&mut inner).await?;
+        drop(inner);
+        if let Err(error) = self.vfs.delete(&self.cleanup_cx, &self.journal_path, true) {
+            tracing::warn!(
+                %error,
+                journal = %self.journal_path.display(),
+                "direct commit recovery left a durable non-hot rollback journal"
+            );
+        }
+        Ok(())
+    }
+
+    async fn reconcile_outcome(&mut self) -> Result<DirectCommitOutcome> {
+        // Do this before *any* journal read, replay, delete, or durable
+        // classification. A direct caller can have registered a future source
+        // write but not yet reached its next await; and a dropped Unix/Windows
+        // observer can leave that source mutating after its Rust future is
+        // gone. The stack submitter seals registration only at its terminal
+        // handoff/Drop, while each retained token proves source termination.
+        if !self.submission.submission_complete() || self.submission.has_pending_write_completion()
+        {
+            return Err(FrankenError::BusyRecovery);
+        }
+
+        // A replay attempt, or a replay whose data restoration completed but
+        // metadata refresh did not, irrevocably selects rollback.  In
+        // particular, never allow a later NonHot + direct_db_durable
+        // observation to take the durable-certification branch below.
+        let metadata_refresh_pending = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("direct commit recovery PagerInner lock poisoned"))?
+            .rollback_journal_recovery_state
+            == RollbackJournalRecoveryState::MetadataRefreshPending;
+        if self.replay_started || metadata_refresh_pending {
+            self.replay_started = true;
+            self.replay_hot_journal().await?;
+            return Ok(DirectCommitOutcome::RolledBack);
+        }
+
+        match self.submission.status() {
+            PendingDirectCommitStatus::Durable => return Ok(DirectCommitOutcome::Durable),
+            PendingDirectCommitStatus::Abandoned => return Ok(DirectCommitOutcome::RolledBack),
+            PendingDirectCommitStatus::Preparing => return Err(FrankenError::BusyRecovery),
+            PendingDirectCommitStatus::RecoveryRequired => {}
+        }
+
+        let journal_state = self.classify_journal().await?;
+        match journal_state {
+            Some(RollbackJournalPrefixState::Hot) => {
+                self.replay_hot_journal().await?;
+                Ok(DirectCommitOutcome::RolledBack)
+            }
+            Some(RollbackJournalPrefixState::NonHot) => {
+                // A terminal source error after the initial zero-magic
+                // journal submission can leave a non-hot journal file even
+                // though no main-database write was ever submitted.  That
+                // marker is not durable-commit evidence, but it also cannot
+                // justify holding this ticket in `BusyRecovery` forever:
+                // with no main-image mutation, deleting the non-hot journal
+                // and returning the transaction's resources is a definite
+                // rollback.  Hot remains replay-selecting above.
+                if !self.submission.direct_mutation_started() {
+                    return Ok(DirectCommitOutcome::RolledBack);
+                }
+                // The old migration incorrectly inferred durability from this
+                // local observation plus `direct_mutation_started`.  Main-file
+                // writes can be visible yet volatile after a failed barrier.
+                if !self.submission.direct_db_durable() {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                match self.freshly_certify_journal_marker().await {
+                    Ok(RollbackJournalPrefixState::NonHot) => {
+                        self.submission.mark_durable();
+                        Ok(DirectCommitOutcome::Durable)
+                    }
+                    Ok(RollbackJournalPrefixState::Hot) => {
+                        self.replay_hot_journal().await?;
+                        Ok(DirectCommitOutcome::RolledBack)
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            direct_db_durable = self.submission.direct_db_durable(),
+                            direct_mutation_started = self.submission.direct_mutation_started(),
+                            "fresh direct-commit marker certification failed; retaining same ticket"
+                        );
+                        Err(FrankenError::BusyRecovery)
+                    }
+                }
+            }
+            None if !self.submission.direct_mutation_started() => {
+                Ok(DirectCommitOutcome::RolledBack)
+            }
+            None => Err(FrankenError::BusyRecovery),
+        }
+    }
+
+    fn apply_durable_metadata(&mut self) -> Result<()> {
+        let (pending_returned_pages, pending_freed_pages) = {
+            let state = self.owned_state.as_mut().ok_or_else(|| {
+                FrankenError::internal("durable direct commit has no claimed transaction state")
+            })?;
+            (
+                std::mem::take(&mut state.pending_returned_pages),
+                std::mem::take(&mut state.pending_freed_pages),
+            )
+        };
+        let (update, snapshot) = {
+            let mut inner = self.inner.lock().map_err(|_| {
+                FrankenError::internal("durable direct commit PagerInner lock poisoned")
+            })?;
+            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+            return_pages_to_freelist(&mut inner.freelist, pending_freed_pages);
+            inner.db_size = inner.db_size.max(self.committed_db_size);
+            inner.record_local_commit();
+            let committed_extent_bytes =
+                u64::from(inner.db_size) * u64::from(inner.page_size.get());
+            inner.committed_db_file_size_bytes = inner
+                .committed_db_file_size_bytes
+                .max(committed_extent_bytes);
+            let update = PublishedPagerUpdate {
+                visible_commit_seq: inner.commit_seq,
+                db_size: inner.db_size,
+                journal_mode: inner.journal_mode,
+                freelist_count: inner.freelist.len(),
+                checkpoint_active: inner.checkpoint_active,
+            };
+            (update, Arc::new(PagerCommittedSnapshot::from_inner(&inner)))
+        };
+        self.publish_update = Some(update);
+        let mut committed_snapshot = self
+            .committed_snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *committed_snapshot = snapshot;
+        self.state = PersistentDirectCommitState::DurableSnapshot;
+        Ok(())
+    }
+
+    fn publish_durable_state(&mut self) -> Result<()> {
+        let update = self.publish_update.ok_or_else(|| {
+            FrankenError::internal("durable direct commit lost its publication metadata")
+        })?;
+        if self.metadata_only_single_connection_fast_path {
+            let clear_pages = self.published.page_set_size.load(AtomicOrdering::Acquire) != 0;
+            self.published.publish_single_connection_metadata_update(
+                &self.cleanup_cx,
+                update,
+                clear_pages,
+            );
+        } else {
+            self.published
+                .publish_commit(&self.cleanup_cx, update, &self.write_set);
+        }
+        self.state = PersistentDirectCommitState::DurablePublication;
+        Ok(())
+    }
+
+    fn resolve_durable_cache(&mut self) -> Result<()> {
+        let update = self.publish_update.ok_or_else(|| {
+            FrankenError::internal("durable direct commit lost its cache metadata")
+        })?;
+        if update.journal_mode == JournalMode::Wal
+            && !self.metadata_only_single_connection_fast_path
+        {
+            self.write_set.clear();
+        } else {
+            for (page_no, staged) in self.write_set.drain() {
+                match staged.into_cache_buf(self.cache.pool(), &self.cache) {
+                    Ok(buffer) => self.cache.insert_buffer(page_no, buffer),
+                    Err(error) => {
+                        let evicted_stale = self.cache.evict(page_no);
+                        tracing::debug!(
+                            page_no = page_no.get(),
+                            %error,
+                            evicted_stale,
+                            "durable direct commit cache admission failed; invalidated stale image"
+                        );
+                    }
+                }
+            }
+        }
+        self.state = PersistentDirectCommitState::DurableCache;
+        Ok(())
+    }
+
+    async fn account_and_release_exit(&mut self) -> Result<()> {
+        let cleanup_cx = self.cleanup_cx.clone();
+        let _cleanup_mask = cleanup_cx.masked();
+        // Match normal transaction commit and rollback: retained-snapshot
+        // release is atomic with transaction-count and writer-baton updates,
+        // so this keeps the inherited PagerInner -> main-file order while the
+        // async unlock runs. The helper receives `&mut PagerInner` and never
+        // re-locks `self.inner`; a dropped resolver releases this guard before
+        // its claim Drop requeues the exact FIFO ticket.
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("persistent direct commit exit lock poisoned"))?;
+        if !self.exit_accounted {
+            inner.active_transactions = inner.active_transactions.saturating_sub(1);
+            self.notify_writer_idle = self.mode != TransactionMode::Concurrent
+                && self.is_writer
+                && release_single_writer_baton(&mut inner);
+            self.exit_accounted = true;
+        }
+        release_retained_snapshot_after_txn_exit(&cleanup_cx, &mut inner).await?;
+        drop(inner);
+        if self.notify_writer_idle {
+            self.writer_idle.notify_one();
+            self.notify_writer_idle = false;
+        }
+        self.owned_state
+            .as_mut()
+            .ok_or_else(|| {
+                FrankenError::internal("persistent direct commit exit has no claimed state")
+            })?
+            .maintenance_lease
+            .take();
+        Ok(())
+    }
+
+    async fn prepare_rollback_exit(&mut self) -> Result<()> {
+        if self.replay_started {
+            let state = self.owned_state.as_mut().ok_or_else(|| {
+                FrankenError::internal("replayed direct rollback has no claimed transaction state")
+            })?;
+            state.allocated_from_freelist.clear();
+            state.allocated_from_eof.clear();
+            state.page_lease.clear();
+        } else {
+            let mode = self.mode;
+            let original_db_size = self.original_db_size;
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("persistent direct rollback lock poisoned"))?;
+            // A pre-hot/failed direct commit may have popped committed
+            // freelist pages before handing terminal ownership to this ticket.
+            // Return those pages in *both* transaction modes.  The previous
+            // non-concurrent branch merely cleared the vectors, permanently
+            // leaking reusable pages even though normal `Drop` restores them.
+            let state = self.owned_state.as_mut().ok_or_else(|| {
+                FrankenError::internal("direct rollback has no claimed transaction state")
+            })?;
+            if mode == TransactionMode::Concurrent {
+                return_pages_to_freelist(
+                    &mut inner.freelist,
+                    state.pending_returned_pages.drain(..),
+                );
+            } else {
+                // Phase A combines unused committed-freelist pages with
+                // unused EOF allocations and lease pages in
+                // `pending_returned_pages`. A non-concurrent rollback rewinds
+                // `db_size` and `next_page` to the transaction's original
+                // extent, so only pages that already belonged to that extent
+                // may re-enter the freelist. Returning a higher EOF/lease page
+                // would create a sparse allocation beyond the restored EOF.
+                return_pages_to_freelist(
+                    &mut inner.freelist,
+                    state
+                        .pending_returned_pages
+                        .drain(..)
+                        .filter(|page| page.get() <= original_db_size),
+                );
+            }
+            return_pages_to_freelist(&mut inner.freelist, state.allocated_from_freelist.drain(..));
+            if mode == TransactionMode::Concurrent {
+                return_pages_to_freelist(&mut inner.freelist, state.page_lease.drain(..));
+                return_pages_to_freelist(&mut inner.freelist, state.allocated_from_eof.drain(..));
+            } else {
+                state.allocated_from_eof.clear();
+                state.page_lease.clear();
+                inner.db_size = original_db_size;
+                inner.next_page = if inner.db_size >= 2 {
+                    inner.db_size.saturating_add(1)
+                } else {
+                    2
+                };
+            }
+        }
+        self.owned_state
+            .as_mut()
+            .ok_or_else(|| {
+                FrankenError::internal("direct rollback has no claimed transaction state")
+            })?
+            .pending_freed_pages
+            .clear();
+        self.write_set.clear();
+        let _ = self.vfs.delete(&self.cleanup_cx, &self.journal_path, true);
+        self.account_and_release_exit().await
+    }
+
+    fn take_commit_terminal_owner(&mut self) -> Option<CommitTerminalOwner> {
+        self.owned_state
+            .as_mut()
+            .expect("persistent direct commit terminal exit has claimed transaction state")
+            .commit_terminal_owner
+            .take()
+    }
+
+    async fn resolve_async(&mut self) -> Result<()> {
+        let cleanup_cx = self.cleanup_cx.clone();
+        let _cleanup_mask = cleanup_cx.masked();
+        self.claim_transferred_state()?;
+        loop {
+            match self.state {
+                PersistentDirectCommitState::AwaitingOutcome => {
+                    match self.reconcile_outcome().await? {
+                        DirectCommitOutcome::Durable => {
+                            self.state = PersistentDirectCommitState::DurableMetadata;
+                        }
+                        DirectCommitOutcome::RolledBack => {
+                            self.state = PersistentDirectCommitState::RollbackExit;
+                        }
+                    }
+                }
+                PersistentDirectCommitState::DurableMetadata => self.apply_durable_metadata()?,
+                PersistentDirectCommitState::DurableSnapshot => self.publish_durable_state()?,
+                PersistentDirectCommitState::DurablePublication => self.resolve_durable_cache()?,
+                PersistentDirectCommitState::DurableCache => {
+                    self.state = PersistentDirectCommitState::DurableExit;
+                }
+                PersistentDirectCommitState::DurableExit => {
+                    self.account_and_release_exit().await?;
+                    PendingDirectCommitResolution::Durable.publish(&self.resolution);
+                    self.state = PersistentDirectCommitState::Resolved;
+                    let terminal_owner = self.take_commit_terminal_owner();
+                    if let Some(owner) = terminal_owner {
+                        owner.complete(CommitTerminalOutcome::Durable);
+                    }
+                }
+                PersistentDirectCommitState::RollbackExit => {
+                    self.prepare_rollback_exit().await?;
+                    PendingDirectCommitResolution::RolledBack.publish(&self.resolution);
+                    self.state = PersistentDirectCommitState::Resolved;
+                    let terminal_owner = self.take_commit_terminal_owner();
+                    if let Some(owner) = terminal_owner {
+                        owner.complete(CommitTerminalOutcome::RolledBack);
+                    }
+                }
+                PersistentDirectCommitState::Resolved => return Ok(()),
+            }
+        }
+    }
+}
+
+impl<V> PendingPagerCleanupOperation for PersistentDirectCommitFinalization<V>
+where
+    V: Vfs + 'static,
+    V::File: 'static,
+{
+    fn resolve(&mut self) -> LocalPagerFuture<'_, ()> {
+        Box::pin(self.resolve_async())
+    }
+}
+
+struct WalCommitTransferredState {
+    write_set: PagePageMap<StagedPage>,
+    write_pages_sorted: Vec<PageNumber>,
+    pending_returned_pages: Vec<PageNumber>,
+    pending_freed_pages: Vec<PageNumber>,
+    allocated_from_freelist: Vec<PageNumber>,
+    allocated_from_eof: Vec<PageNumber>,
+    page_lease: Vec<PageNumber>,
+    maintenance_lease: Option<PagerMaintenanceLease>,
+    commit_terminal_owner: Option<CommitTerminalOwner>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistentWalCommitState {
+    AwaitingOutcome,
+    DurableMetadata,
+    DurablePublication,
+    DurableCache,
+    DurableExit,
+    RollbackExit,
+    Resolved,
+}
+
+enum WalCommitOutcome {
+    Durable(ParallelWalPublicationAuthorization),
+    RolledBack,
+}
+
+/// Locally-owned until its foreground future disappears, then FIFO-owned.
+///
+/// This object contains the transaction's actual staged pages and all logical
+/// exit resources before the first group-commit await. The consolidator owns
+/// a separately prebuilt frame batch after admission, so either side can
+/// survive cancellation without borrowing the transaction handle.
+#[allow(clippy::struct_excessive_bools)]
+struct PersistentWalCommitFinalization<V>
+where
+    V: Vfs + Send + 'static,
+    V::File: Send + Sync + 'static,
+{
+    group_commit_queue: GroupCommitQueueRef,
+    inner: Arc<Mutex<PagerInner<V::File>>>,
+    writer_idle: Arc<Condvar>,
+    cache: Arc<ShardedPageCache>,
+    published: Arc<PublishedPagerState>,
+    committed_snapshot: Arc<RwLock<Arc<PagerCommittedSnapshot>>>,
+    wal_backend: SharedWalBackend,
+    submission: Arc<PendingWalCommitSubmissionState>,
+    resolution: Arc<AtomicU8>,
+    transferred: WalCommitTransferredState,
+    current_db_size: u32,
+    committed_db_size: u32,
+    sync_policy: WalCommitSyncPolicy,
+    metadata_only_single_connection_fast_path: bool,
+    mode: TransactionMode,
+    is_writer: bool,
+    original_db_size: u32,
+    cleanup_cx: Cx,
+    state: PersistentWalCommitState,
+    authorization: Option<ParallelWalPublicationAuthorization>,
+    publication_intent: Option<ParallelWalPublicationIntent>,
+    publish_update: Option<PublishedPagerUpdate>,
+    exit_accounted: bool,
+    notify_writer_idle: bool,
+}
+
+impl<V> PersistentWalCommitFinalization<V>
+where
+    V: Vfs + Send + 'static,
+    V::File: Send + Sync + 'static,
+{
+    async fn reconcile_outcome(&self) -> Result<WalCommitOutcome> {
+        if !self.submission.submission_complete() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        if let Some(authorization) = self.submission.durable_authorization()? {
+            return Ok(WalCommitOutcome::Durable(authorization));
+        }
+        match self.submission.status() {
+            PendingWalCommitStatus::NotCommitted { .. } => {
+                return Ok(WalCommitOutcome::RolledBack);
+            }
+            PendingWalCommitStatus::Preparing => return Err(FrankenError::BusyRecovery),
+            PendingWalCommitStatus::Durable { .. } => {
+                return Err(FrankenError::internal(
+                    "durable WAL member lacked its retained authorization",
+                ));
+            }
+            PendingWalCommitStatus::Submitted { .. } => {}
+        }
+
+        // Resume only the exact admitted member. The group function recognizes
+        // `Submitted`, skips batch construction/submission, and either waits or
+        // claims the existing promoted-epoch flusher vacancy.
+        let empty_write_set = PagePageMap::<StagedPage>::default();
+        let mut authorization = None;
+        let physical_result = SimpleTransaction::<V>::commit_wal_group_commit_with_snapshot(
+            &self.cleanup_cx,
+            &self.wal_backend,
+            &self.inner,
+            Some(Arc::clone(&self.published)),
+            self.current_db_size,
+            self.sync_policy,
+            None,
+            &empty_write_set,
+            &[],
+            &[],
+            &[],
+            &self.group_commit_queue,
+            Some(&self.submission),
+            None,
+            &mut authorization,
+        )
+        .await;
+
+        if let Some(authorization) = self.submission.durable_authorization()? {
+            return Ok(WalCommitOutcome::Durable(authorization));
+        }
+        if matches!(
+            self.submission.status(),
+            PendingWalCommitStatus::NotCommitted { .. }
+        ) {
+            return Ok(WalCommitOutcome::RolledBack);
+        }
+        match physical_result {
+            Ok(()) => Err(FrankenError::internal(
+                "WAL member resumed without a retained terminal receipt",
+            )),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "submitted WAL member remains fail-closed without terminal physical proof"
+                );
+                Err(FrankenError::BusyRecovery)
+            }
+        }
+    }
+
+    async fn apply_durable_metadata(&mut self) -> Result<()> {
+        let authorization = self.authorization.as_ref().ok_or_else(|| {
+            FrankenError::internal("durable WAL finalizer lost its member authorization")
+        })?;
+        // Resolve the only cancellation point before mutating replay-visible
+        // pager metadata.  In particular, `record_local_wal_commit_at`
+        // increments the connection-local visible-WAL count and must run
+        // exactly once even when a cleanup resolver is dropped and requeued.
+        let db_file = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("durable WAL finalizer lock poisoned"))?;
+            Arc::clone(&inner.db_file)
+        };
+        let committed_file_size = match shared_db_file_read(&db_file, &self.cleanup_cx).await {
+            Ok(db_file) => db_file.file_size(&self.cleanup_cx).ok(),
+            Err(_) => None,
+        };
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("durable WAL finalizer lock poisoned"))?;
+        return_pages_to_freelist(
+            &mut inner.freelist,
+            self.transferred.pending_returned_pages.drain(..),
+        );
+        return_pages_to_freelist(
+            &mut inner.freelist,
+            self.transferred.pending_freed_pages.drain(..),
+        );
+        inner.db_size = inner.db_size.max(self.committed_db_size);
+        let intent = parallel_wal_publication_intent(
+            authorization,
+            inner.db_size,
+            inner.journal_mode,
+            inner.freelist.len(),
+            inner.checkpoint_active,
+        )?;
+        inner.record_local_wal_commit_at(intent.visible_commit_seq);
+        if let Some(file_size) = committed_file_size {
+            inner.committed_db_file_size_bytes = file_size;
+        }
+        let update = PublishedPagerUpdate {
+            visible_commit_seq: intent.visible_commit_seq,
+            db_size: inner.db_size,
+            journal_mode: inner.journal_mode,
+            freelist_count: inner.freelist.len(),
+            checkpoint_active: inner.checkpoint_active,
+        };
+        let snapshot = Arc::new(PagerCommittedSnapshot::from_inner(&inner));
+        drop(inner);
+        *self
+            .committed_snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot;
+        self.publication_intent = Some(intent);
+        self.publish_update = Some(update);
+        self.state = PersistentWalCommitState::DurablePublication;
+
+        // H4 remains a boundary between durable metadata and shared page-plane
+        // publication after Phase C moved into this persistent finalizer. Move
+        // the state machine forward before injecting so a later cleanup owner
+        // resumes at publication and cannot apply metadata twice.
+        #[cfg(any(test, feature = "fault-injection"))]
+        crate::fault_hooks::maybe_inject_during_phase_c(
+            update.visible_commit_seq.get(),
+            update.db_size,
+        )?;
+        Ok(())
+    }
+
+    fn publish_durable_state(&mut self) -> Result<()> {
+        let intent = self.publication_intent.ok_or_else(|| {
+            FrankenError::internal("durable WAL finalizer lost its publication intent")
+        })?;
+        // The physical group publisher already installed the certificate's
+        // full last-frame-wins page plane. Per-member Phase C binds metadata
+        // only; publishing this subset could overwrite a later member image.
+        self.published.bind_parallel_wal_publication(intent);
+        self.state = PersistentWalCommitState::DurableCache;
+        Ok(())
+    }
+
+    fn finish_durable_cache(&mut self) -> Result<()> {
+        let update = self.publish_update.ok_or_else(|| {
+            FrankenError::internal("durable WAL finalizer lost its cache metadata")
+        })?;
+        if !self.metadata_only_single_connection_fast_path {
+            self.transferred.write_set.clear();
+        } else {
+            for (page_no, staged) in self.transferred.write_set.drain() {
+                match staged.into_cache_buf(self.cache.pool(), &self.cache) {
+                    Ok(buffer) => self.cache.insert_buffer(page_no, buffer),
+                    Err(error) => {
+                        let evicted_stale = self.cache.evict(page_no);
+                        tracing::debug!(
+                            page_no = page_no.get(),
+                            %error,
+                            evicted_stale,
+                            "durable WAL finalizer cache admission failed; invalidated stale image"
+                        );
+                    }
+                }
+            }
+        }
+        self.transferred.write_pages_sorted.clear();
+        debug_assert_eq!(update.journal_mode, JournalMode::Wal);
+        self.state = PersistentWalCommitState::DurableExit;
+        Ok(())
+    }
+
+    async fn account_and_release_exit(&mut self) -> Result<()> {
+        let cleanup_cx = self.cleanup_cx.clone();
+        let _cleanup_mask = cleanup_cx.masked();
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("persistent WAL exit lock poisoned"))?;
+        if !self.exit_accounted {
+            inner.active_transactions = inner.active_transactions.saturating_sub(1);
+            self.notify_writer_idle = self.mode != TransactionMode::Concurrent
+                && self.is_writer
+                && release_single_writer_baton(&mut inner);
+            self.exit_accounted = true;
+        }
+        release_retained_snapshot_after_txn_exit(&cleanup_cx, &mut inner).await?;
+        drop(inner);
+        if self.notify_writer_idle {
+            self.writer_idle.notify_one();
+            self.notify_writer_idle = false;
+        }
+        self.transferred.maintenance_lease.take();
+        Ok(())
+    }
+
+    async fn prepare_rollback_exit(&mut self) -> Result<()> {
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("persistent WAL rollback lock poisoned"))?;
+            if self.mode == TransactionMode::Concurrent {
+                return_pages_to_freelist(
+                    &mut inner.freelist,
+                    self.transferred.pending_returned_pages.drain(..),
+                );
+            } else {
+                return_pages_to_freelist(
+                    &mut inner.freelist,
+                    self.transferred
+                        .pending_returned_pages
+                        .drain(..)
+                        .filter(|page| page.get() <= self.original_db_size),
+                );
+            }
+            return_pages_to_freelist(
+                &mut inner.freelist,
+                self.transferred.allocated_from_freelist.drain(..),
+            );
+            if self.mode == TransactionMode::Concurrent {
+                return_pages_to_freelist(
+                    &mut inner.freelist,
+                    self.transferred.page_lease.drain(..),
+                );
+                return_pages_to_freelist(
+                    &mut inner.freelist,
+                    self.transferred.allocated_from_eof.drain(..),
+                );
+            } else {
+                self.transferred.allocated_from_eof.clear();
+                self.transferred.page_lease.clear();
+                inner.db_size = self.original_db_size;
+                inner.next_page = if inner.db_size >= 2 {
+                    inner.db_size.saturating_add(1)
+                } else {
+                    2
+                };
+            }
+            self.transferred.pending_freed_pages.clear();
+            self.transferred.write_set.clear();
+            self.transferred.write_pages_sorted.clear();
+        }
+        self.account_and_release_exit().await
+    }
+
+    fn take_terminal_owner(&mut self) -> Option<CommitTerminalOwner> {
+        self.transferred.commit_terminal_owner.take()
+    }
+
+    async fn resolve_async(&mut self) -> Result<()> {
+        let cleanup_cx = self.cleanup_cx.clone();
+        let _cleanup_mask = cleanup_cx.masked();
+        loop {
+            match self.state {
+                PersistentWalCommitState::AwaitingOutcome => {
+                    match self.reconcile_outcome().await? {
+                        WalCommitOutcome::Durable(authorization) => {
+                            self.authorization = Some(authorization);
+                            self.state = PersistentWalCommitState::DurableMetadata;
+                        }
+                        WalCommitOutcome::RolledBack => {
+                            self.state = PersistentWalCommitState::RollbackExit;
+                        }
+                    }
+                }
+                PersistentWalCommitState::DurableMetadata => {
+                    self.apply_durable_metadata().await?;
+                }
+                PersistentWalCommitState::DurablePublication => {
+                    self.publish_durable_state()?;
+                }
+                PersistentWalCommitState::DurableCache => self.finish_durable_cache()?,
+                PersistentWalCommitState::DurableExit => {
+                    self.account_and_release_exit().await?;
+                    PendingDirectCommitResolution::Durable.publish(&self.resolution);
+                    self.state = PersistentWalCommitState::Resolved;
+                    if let Some(owner) = self.take_terminal_owner() {
+                        owner.complete(CommitTerminalOutcome::Durable);
+                    }
+                }
+                PersistentWalCommitState::RollbackExit => {
+                    self.prepare_rollback_exit().await?;
+                    PendingDirectCommitResolution::RolledBack.publish(&self.resolution);
+                    self.state = PersistentWalCommitState::Resolved;
+                    if let Some(owner) = self.take_terminal_owner() {
+                        owner.complete(CommitTerminalOutcome::RolledBack);
+                    }
+                }
+                PersistentWalCommitState::Resolved => return Ok(()),
+            }
+        }
+    }
+}
+
+impl<V> PendingPagerCleanupOperation for PersistentWalCommitFinalization<V>
+where
+    V: Vfs + Send + 'static,
+    V::File: Send + Sync + 'static,
+{
+    fn resolve(&mut self) -> LocalPagerFuture<'_, ()> {
+        Box::pin(self.resolve_async())
+    }
+}
+
+/// Strong local owner that publishes to the identity FIFO only if foreground
+/// ownership disappears before terminal Phase C.
+struct PendingWalFinalizationHandoff<V>
+where
+    V: Vfs + Send + 'static,
+    V::File: Send + Sync + 'static,
+{
+    queue: GroupCommitQueueRef,
+    admission: PendingWalCommitHandoff,
+    finalization: Option<PersistentWalCommitFinalization<V>>,
+    ticket_slot: Arc<Mutex<Option<PagerCleanupId>>>,
+}
+
+impl<V> PendingWalFinalizationHandoff<V>
+where
+    V: Vfs + Send + 'static,
+    V::File: Send + Sync + 'static,
+{
+    fn submission(&self) -> &Arc<PendingWalCommitSubmissionState> {
+        &self.admission.submission
+    }
+
+    fn admission_mut(&mut self) -> &mut PendingWalCommitHandoff {
+        &mut self.admission
+    }
+
+    fn finish_submission(&self) {
+        self.admission.finish_submission();
+    }
+
+    fn can_reclaim_pre_submit(&self) -> bool {
+        self.admission.can_reclaim_pre_submit()
+    }
+
+    fn reclaim_pre_submit(&mut self) -> Result<WalCommitTransferredState> {
+        if !self.can_reclaim_pre_submit() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        self.admission.disarm_for_pre_submit_reclaim();
+        let finalization = self.finalization.take().ok_or_else(|| {
+            FrankenError::internal("pre-submit WAL finalizer lost local ownership")
+        })?;
+        Ok(finalization.transferred)
+    }
+
+    async fn resolve_locally(&mut self) -> Result<()> {
+        self.finalization
+            .as_mut()
+            .ok_or_else(|| FrankenError::internal("local WAL finalizer was already consumed"))?
+            .resolve_async()
+            .await
+    }
+
+    fn finish_terminal(&mut self) {
+        self.admission.armed = false;
+        self.admission.finish_submission();
+        self.finalization.take();
+    }
+
+    fn publish_to_fifo(&mut self) {
+        let Some(finalization) = self.finalization.take() else {
+            return;
+        };
+        if self.admission.armed {
+            self.admission.submission.mark_unsubmitted_not_committed();
+            self.admission.armed = false;
+        }
+        self.admission.finish_submission();
+        let ticket = self
+            .queue
+            .enqueue_pending_pager_cleanup(PendingPagerCleanup::new(Box::new(finalization)));
+        *self
+            .ticket_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ticket);
+    }
+}
+
+impl<V> Drop for PendingWalFinalizationHandoff<V>
+where
+    V: Vfs + Send + 'static,
+    V::File: Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        self.publish_to_fifo();
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub struct SimpleTransaction<V: Vfs> {
     vfs: Arc<V>,
@@ -11147,6 +13565,25 @@ pub struct SimpleTransaction<V: Vfs> {
     is_writer: bool,
     committed: bool,
     finished: bool,
+    /// Exact one-shot notification obligation. Direct rollback-journal commit
+    /// transfers this owner to its persistent finalizer before the journal can
+    /// become hot.
+    commit_terminal_owner: Option<CommitTerminalOwner>,
+    /// A non-open phase means a persistent cleanup ticket owns finalization;
+    /// ordinary Drop must not recycle pages, unlock the database, or release
+    /// the maintenance lease a second time.
+    commit_phase: Cell<TransactionCommitPhase>,
+    pending_direct_submission: Option<Arc<PendingDirectCommitSubmissionState>>,
+    pending_direct_commit_resolution: Option<Arc<AtomicU8>>,
+    /// Shared only while an unclaimed provisional direct-commit ticket may be
+    /// withdrawn after an explicitly returned pre-hot error.  Once a claimant
+    /// takes the slot, this handle must fail closed rather than restore it.
+    pending_direct_transferred_state: Option<Arc<Mutex<Option<DirectCommitTransferredState>>>>,
+    pending_wal_submission: Option<Arc<PendingWalCommitSubmissionState>>,
+    pending_wal_commit_resolution: Option<Arc<AtomicU8>>,
+    /// Filled only if the locally-owned WAL finalizer is abandoned and
+    /// published into the identity cleanup FIFO.
+    pending_wal_cleanup_ticket: Option<Arc<Mutex<Option<PagerCleanupId>>>>,
     original_db_size: u32,
     /// Stack of savepoints, pushed on SAVEPOINT and popped on RELEASE.
     savepoint_stack: Vec<SavepointEntry>,
@@ -11349,7 +13786,7 @@ impl<V: Vfs> SimpleTransaction<V> {
     /// Whether this transaction has been upgraded to a writer.
     #[must_use]
     pub fn is_writer(&self) -> bool {
-        self.is_writer
+        !self.finished && self.commit_phase.get() == TransactionCommitPhase::Open && self.is_writer
     }
 
     /// Access the per-transaction bumpalo scratch arena (IMPL-3 / AG-4B).
@@ -11409,6 +13846,9 @@ impl<V: Vfs> SimpleTransaction<V> {
         budget: usize,
         penalty: f64,
     ) {
+        if self.finished || self.commit_phase.get() != TransactionCommitPhase::Open {
+            return;
+        }
         let selected = crate::submodular_prefetch::greedy_select(candidates, budget, penalty);
         if selected.is_empty() {
             return;
@@ -12137,11 +14577,539 @@ fn cleanup_child_cx(cx: &Cx) -> Cx {
 
 impl<V> SimpleTransaction<V>
 where
-    V: Vfs + Send,
+    V: Vfs + Send + 'static,
     V::File: Send + Sync + 'static,
 {
-    async fn invalidate_journal_after_commit(cx: &Cx, journal_file: &mut V::File) -> Result<()> {
-        durable_invalidate_journal(cx, journal_file, JournalInvalidation::ZeroMagic).await
+    /// Transfer direct-commit outcome, Phase C, and terminal transaction exit
+    /// to one FIFO ticket before a rollback journal can become hot.
+    ///
+    /// The transaction retains its staging buffers for the physical write,
+    /// while the ticket receives immutable `PageData` snapshots for later
+    /// publication/cache admission.  This avoids moving a live `&mut self`
+    /// through the direct I/O future while keeping the ticket independent of
+    /// that future's lifetime.
+    fn install_persistent_direct_commit_finalization(
+        &mut self,
+        pending_returned_pages: &[PageNumber],
+        pending_freed_pages: &[PageNumber],
+        committed_db_size: u32,
+        metadata_only_single_connection_fast_path: bool,
+    ) -> PendingDirectCommitHandoff {
+        if self.commit_phase.get() != TransactionCommitPhase::Open {
+            panic!("direct commit finalization installed outside the open transaction phase");
+        }
+        let mut finalization_write_set = PagePageMap::default();
+        finalization_write_set.extend(self.write_set.iter().map(|(&page_no, staged)| {
+            (page_no, StagedPage::from_page_data(staged.published_page()))
+        }));
+
+        let submission = Arc::new(PendingDirectCommitSubmissionState::new());
+        let resolution = Arc::new(AtomicU8::new(PendingDirectCommitResolution::Pending as u8));
+        let transferred_state = Arc::new(Mutex::new(Some(DirectCommitTransferredState {
+            pending_returned_pages: pending_returned_pages.to_vec(),
+            pending_freed_pages: pending_freed_pages.to_vec(),
+            allocated_from_freelist: std::mem::take(&mut self.allocated_from_freelist),
+            allocated_from_eof: std::mem::take(&mut self.allocated_from_eof),
+            page_lease: std::mem::take(&mut self.page_lease),
+            maintenance_lease: self.maintenance_lease.take(),
+            commit_terminal_owner: self.commit_terminal_owner.take(),
+        })));
+        let pending = PersistentDirectCommitFinalization {
+            vfs: Arc::clone(&self.vfs),
+            journal_path: self.journal_path.clone(),
+            _group_commit_queue: Arc::clone(&self.group_commit_queue),
+            inner: Arc::clone(&self.inner),
+            writer_idle: Arc::clone(&self.writer_idle),
+            cache: Arc::clone(&self.cache),
+            published: Arc::clone(&self.published),
+            committed_snapshot: Arc::clone(&self.committed_snapshot),
+            wal_backend: Arc::clone(&self.wal_backend),
+            submission: Arc::clone(&submission),
+            resolution: Arc::clone(&resolution),
+            write_set: finalization_write_set,
+            transferred_state: Arc::clone(&transferred_state),
+            owned_state: None,
+            committed_db_size,
+            metadata_only_single_connection_fast_path,
+            mode: self.mode,
+            is_writer: self.is_writer,
+            original_db_size: self.original_db_size,
+            cleanup_cx: self.cleanup_cx.clone(),
+            state: PersistentDirectCommitState::AwaitingOutcome,
+            publish_update: None,
+            exit_accounted: false,
+            notify_writer_idle: false,
+            replay_started: false,
+        };
+        let ticket = self
+            .group_commit_queue
+            .enqueue_pending_pager_cleanup(PendingPagerCleanup::new(Box::new(pending)));
+        self.pending_direct_submission = Some(Arc::clone(&submission));
+        self.pending_direct_commit_resolution = Some(resolution);
+        self.pending_direct_transferred_state = Some(transferred_state);
+        self.commit_phase
+            .set(TransactionCommitPhase::DirectOutcomeFinalizing { ticket });
+        PendingDirectCommitHandoff::new(submission)
+    }
+
+    /// Restore a still-provisional direct commit after its physical future
+    /// explicitly returned before the hot-header boundary.
+    ///
+    /// This is deliberately synchronous and identity-bound.  The queue removal
+    /// happens under the same state mutex used by claimers; only after that
+    /// removal succeeds do we take the shared allocator/lease slot and return
+    /// the original retryable error to the caller.  If a claimant has already
+    /// become active (or queue state is otherwise not exact), no state is
+    /// restored and the caller receives `BusyRecovery` instead.
+    fn reclaim_pre_hot_direct_commit(
+        &mut self,
+        ticket: PagerCleanupId,
+        handoff: &mut PendingDirectCommitHandoff,
+        inner: &mut PagerInner<V::File>,
+    ) -> Result<()> {
+        if !handoff.can_reclaim_pre_hot() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        match self
+            .group_commit_queue
+            .withdraw_pending_pager_cleanup(ticket)?
+        {
+            PagerCleanupWithdrawal::Withdrawn => {}
+            PagerCleanupWithdrawal::Active
+            | PagerCleanupWithdrawal::Completed
+            | PagerCleanupWithdrawal::Missing => return Err(FrankenError::BusyRecovery),
+        }
+
+        // No claimant can now reach the ticket's type-erased operation.  The
+        // status cannot advance concurrently either: only this stack-local
+        // handoff drives the pre-hot -> recovery transition.
+        handoff.disarm_for_pre_hot_reclaim();
+        let slot = self
+            .pending_direct_transferred_state
+            .take()
+            .ok_or_else(|| {
+                FrankenError::internal(
+                    "withdrawn direct commit ticket had no transaction state slot",
+                )
+            })?;
+        let mut slot = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = slot.take().ok_or_else(|| {
+            FrankenError::internal("withdrawn direct commit ticket had no transferable state")
+        })?;
+        drop(slot);
+
+        // Mirror the legacy ordinary-error path: never-written allocations are
+        // immediately reusable, while written allocation provenance remains on
+        // the live transaction for a retry or explicit rollback.
+        return_pages_to_freelist(&mut inner.freelist, state.pending_returned_pages);
+        self.restore_pending_freed_pages(state.pending_freed_pages);
+        self.allocated_from_freelist = state.allocated_from_freelist;
+        self.allocated_from_eof = state.allocated_from_eof;
+        self.page_lease = state.page_lease;
+        self.maintenance_lease = state.maintenance_lease;
+        self.commit_terminal_owner = state.commit_terminal_owner;
+        self.pending_direct_submission = None;
+        self.pending_direct_commit_resolution = None;
+        self.commit_phase.set(TransactionCommitPhase::Open);
+        Ok(())
+    }
+
+    /// Move the complete WAL member exit state into a local persistent owner
+    /// before the first group-commit await.
+    ///
+    /// The owner is deliberately not published to the global cleanup FIFO
+    /// while this foreground future remains live. That preserves independent
+    /// concurrent-writer admission; only `PendingWalFinalizationHandoff::Drop`
+    /// transfers abandoned work into the identity queue.
+    #[allow(clippy::too_many_arguments)]
+    fn install_persistent_wal_commit_finalization(
+        &mut self,
+        pending_returned_pages: Vec<PageNumber>,
+        pending_freed_pages: Vec<PageNumber>,
+        current_db_size: u32,
+        committed_db_size: u32,
+        sync_policy: WalCommitSyncPolicy,
+        metadata_only_single_connection_fast_path: bool,
+    ) -> Result<(TransactionFrameBatch, PendingWalFinalizationHandoff<V>)> {
+        if self.commit_phase.get() != TransactionCommitPhase::Open {
+            return Err(FrankenError::internal(
+                "WAL commit finalization installed outside the open transaction phase",
+            ));
+        }
+        let (batch, _) =
+            build_group_commit_batch(current_db_size, &self.write_set, &self.write_pages_sorted)?
+                .ok_or_else(|| {
+                FrankenError::internal("WAL finalizer installed without a physical frame batch")
+            })?;
+        let submission = Arc::new(PendingWalCommitSubmissionState::new());
+        let resolution = Arc::new(AtomicU8::new(PendingDirectCommitResolution::Pending as u8));
+        let ticket_slot = Arc::new(Mutex::new(None));
+        let transferred = WalCommitTransferredState {
+            write_set: std::mem::take(&mut self.write_set),
+            write_pages_sorted: std::mem::take(&mut self.write_pages_sorted),
+            pending_returned_pages,
+            pending_freed_pages,
+            allocated_from_freelist: std::mem::take(&mut self.allocated_from_freelist),
+            allocated_from_eof: std::mem::take(&mut self.allocated_from_eof),
+            page_lease: std::mem::take(&mut self.page_lease),
+            maintenance_lease: self.maintenance_lease.take(),
+            commit_terminal_owner: self.commit_terminal_owner.take(),
+        };
+        let finalization = PersistentWalCommitFinalization {
+            group_commit_queue: Arc::clone(&self.group_commit_queue),
+            inner: Arc::clone(&self.inner),
+            writer_idle: Arc::clone(&self.writer_idle),
+            cache: Arc::clone(&self.cache),
+            published: Arc::clone(&self.published),
+            committed_snapshot: Arc::clone(&self.committed_snapshot),
+            wal_backend: Arc::clone(&self.wal_backend),
+            submission: Arc::clone(&submission),
+            resolution: Arc::clone(&resolution),
+            transferred,
+            current_db_size,
+            committed_db_size,
+            sync_policy,
+            metadata_only_single_connection_fast_path,
+            mode: self.mode,
+            is_writer: self.is_writer,
+            original_db_size: self.original_db_size,
+            cleanup_cx: self.cleanup_cx.clone(),
+            state: PersistentWalCommitState::AwaitingOutcome,
+            authorization: None,
+            publication_intent: None,
+            publish_update: None,
+            exit_accounted: false,
+            notify_writer_idle: false,
+        };
+        self.pending_wal_submission = Some(Arc::clone(&submission));
+        self.pending_wal_commit_resolution = Some(resolution);
+        self.pending_wal_cleanup_ticket = Some(Arc::clone(&ticket_slot));
+        self.commit_phase
+            .set(TransactionCommitPhase::WalOutcomeFinalizing);
+        Ok((
+            batch,
+            PendingWalFinalizationHandoff {
+                queue: Arc::clone(&self.group_commit_queue),
+                admission: PendingWalCommitHandoff::new(submission),
+                finalization: Some(finalization),
+                ticket_slot,
+            },
+        ))
+    }
+
+    fn reclaim_pre_submit_wal_commit(
+        &mut self,
+        handoff: &mut PendingWalFinalizationHandoff<V>,
+        inner: &mut PagerInner<V::File>,
+    ) -> Result<()> {
+        let state = handoff.reclaim_pre_submit()?;
+        return_pages_to_freelist(&mut inner.freelist, state.pending_returned_pages);
+        self.restore_pending_freed_pages(state.pending_freed_pages);
+        self.write_set = state.write_set;
+        self.write_pages_sorted = state.write_pages_sorted;
+        self.allocated_from_freelist = state.allocated_from_freelist;
+        self.allocated_from_eof = state.allocated_from_eof;
+        self.page_lease = state.page_lease;
+        self.maintenance_lease = state.maintenance_lease;
+        self.commit_terminal_owner = state.commit_terminal_owner;
+        self.pending_wal_submission = None;
+        self.pending_wal_commit_resolution = None;
+        self.pending_wal_cleanup_ticket = None;
+        self.commit_phase.set(TransactionCommitPhase::Open);
+        Ok(())
+    }
+
+    fn apply_wal_terminal_resolution_to_handle(&mut self) -> Result<TransactionCommitState> {
+        let resolution = self.pending_wal_commit_resolution.as_ref().ok_or_else(|| {
+            FrankenError::internal("WAL finalizer completed without resolution state")
+        })?;
+        match PendingDirectCommitResolution::load(resolution) {
+            PendingDirectCommitResolution::Pending => Err(FrankenError::BusyRecovery),
+            PendingDirectCommitResolution::Durable => {
+                let published = self.published.snapshot();
+                self.published_visible_commit_seq
+                    .set(published.visible_commit_seq);
+                self.published_db_size.set(published.db_size);
+                self.committed = true;
+                self.finished = true;
+                self.pending_wal_submission = None;
+                self.pending_wal_cleanup_ticket = None;
+                self.commit_phase
+                    .set(TransactionCommitPhase::DurableFinalized);
+                self.scratch_arena.reset();
+                Ok(TransactionCommitState::Durable)
+            }
+            PendingDirectCommitResolution::RolledBack => {
+                self.finished = true;
+                self.pending_wal_submission = None;
+                self.pending_wal_cleanup_ticket = None;
+                self.commit_phase
+                    .set(TransactionCommitPhase::RolledBackFinalized);
+                self.scratch_arena.reset();
+                Ok(TransactionCommitState::RolledBack)
+            }
+        }
+    }
+
+    async fn resolve_persistent_wal_commit_state(&mut self) -> Result<TransactionCommitState> {
+        if self.commit_phase.get() != TransactionCommitPhase::WalOutcomeFinalizing {
+            return Ok(self.current_commit_state());
+        }
+        if self
+            .pending_wal_commit_resolution
+            .as_ref()
+            .is_some_and(|resolution| {
+                PendingDirectCommitResolution::load(resolution)
+                    != PendingDirectCommitResolution::Pending
+            })
+        {
+            return self.apply_wal_terminal_resolution_to_handle();
+        }
+        let ticket_slot = self.pending_wal_cleanup_ticket.as_ref().ok_or_else(|| {
+            FrankenError::internal("WAL finalizing phase lost its cleanup ticket slot")
+        })?;
+        let ticket = *ticket_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ticket = ticket.ok_or_else(|| {
+            FrankenError::internal(
+                "WAL finalizing phase has neither a local owner nor a published cleanup ticket",
+            )
+        })?;
+        self.group_commit_queue
+            .resolve_pager_cleanups_through(ticket)
+            .await?;
+        self.apply_wal_terminal_resolution_to_handle()
+    }
+
+    fn current_commit_state(&self) -> TransactionCommitState {
+        match self.commit_phase.get() {
+            TransactionCommitPhase::Open if self.finished && self.committed => {
+                TransactionCommitState::Durable
+            }
+            TransactionCommitPhase::Open if self.finished => TransactionCommitState::RolledBack,
+            TransactionCommitPhase::Open => TransactionCommitState::Open,
+            TransactionCommitPhase::DirectOutcomeFinalizing { .. }
+            | TransactionCommitPhase::WalOutcomeFinalizing => TransactionCommitState::Finalizing,
+            TransactionCommitPhase::DurableFinalized => TransactionCommitState::Durable,
+            TransactionCommitPhase::RolledBackFinalized => TransactionCommitState::RolledBack,
+        }
+    }
+
+    fn complete_commit_terminal_owner(&mut self, outcome: CommitTerminalOutcome) {
+        if let Some(owner) = self.commit_terminal_owner.take() {
+            owner.complete(outcome);
+        }
+    }
+
+    /// Fail closed for synchronous mutation entry points.  They cannot drive
+    /// the async cleanup queue, so a finalizing ticket must be resolved by an
+    /// async operation first rather than letting stale transaction fields be
+    /// modified under ownership that has moved to the ticket.
+    fn require_open_commit_state_for_sync_mutation(&self) -> Result<()> {
+        match self.commit_phase.get() {
+            TransactionCommitPhase::Open if self.finished => Err(FrankenError::Abort),
+            TransactionCommitPhase::Open => Ok(()),
+            TransactionCommitPhase::DirectOutcomeFinalizing { .. }
+            | TransactionCommitPhase::WalOutcomeFinalizing => Err(FrankenError::BusyRecovery),
+            TransactionCommitPhase::DurableFinalized
+            | TransactionCommitPhase::RolledBackFinalized => Err(FrankenError::Abort),
+        }
+    }
+
+    /// Resolve an exact ticket before an asynchronous non-terminal operation.
+    /// A terminal outcome intentionally does not reopen the handle: callers
+    /// must begin a new transaction rather than read or mutate through stale
+    /// allocator/write-set state.
+    async fn resolve_direct_phase_for_async_access(&mut self) -> Result<()> {
+        match self.commit_phase.get() {
+            TransactionCommitPhase::Open if self.finished => Err(FrankenError::Abort),
+            TransactionCommitPhase::Open => Ok(()),
+            TransactionCommitPhase::DirectOutcomeFinalizing { .. } => {
+                match self.resolve_persistent_direct_commit_state().await? {
+                    TransactionCommitState::Durable | TransactionCommitState::RolledBack => {
+                        Err(FrankenError::Abort)
+                    }
+                    TransactionCommitState::Open | TransactionCommitState::Finalizing => {
+                        Err(FrankenError::internal(
+                            "direct commit ticket resolved without a terminal state",
+                        ))
+                    }
+                }
+            }
+            TransactionCommitPhase::WalOutcomeFinalizing => {
+                match self.resolve_persistent_wal_commit_state().await? {
+                    TransactionCommitState::Durable | TransactionCommitState::RolledBack => {
+                        Err(FrankenError::Abort)
+                    }
+                    TransactionCommitState::Open | TransactionCommitState::Finalizing => {
+                        Err(FrankenError::internal(
+                            "WAL commit finalizer resolved without a terminal state",
+                        ))
+                    }
+                }
+            }
+            TransactionCommitPhase::DurableFinalized
+            | TransactionCommitPhase::RolledBackFinalized => Err(FrankenError::Abort),
+        }
+    }
+
+    /// `get_page` has only `&self`, so it can drive the queue but cannot clear
+    /// the handle's phase fields.  It therefore returns a terminal `Abort`
+    /// after a ticket resolves, leaving a later mutable terminal operation to
+    /// record the final phase exactly once.
+    async fn resolve_direct_phase_for_read(&self) -> Result<()> {
+        let (ticket, resolution) = match self.commit_phase.get() {
+            TransactionCommitPhase::Open if self.finished => return Err(FrankenError::Abort),
+            TransactionCommitPhase::Open => return Ok(()),
+            TransactionCommitPhase::DirectOutcomeFinalizing { ticket } => (
+                ticket,
+                self.pending_direct_commit_resolution
+                    .as_ref()
+                    .ok_or_else(|| {
+                        FrankenError::internal(
+                            "direct commit read gate lost its resolution evidence",
+                        )
+                    })?,
+            ),
+            TransactionCommitPhase::WalOutcomeFinalizing => {
+                let resolution = self.pending_wal_commit_resolution.as_ref().ok_or_else(|| {
+                    FrankenError::internal("WAL commit read gate lost its resolution evidence")
+                })?;
+                if PendingDirectCommitResolution::load(resolution)
+                    != PendingDirectCommitResolution::Pending
+                {
+                    return Err(FrankenError::Abort);
+                }
+                let ticket_slot = self.pending_wal_cleanup_ticket.as_ref().ok_or_else(|| {
+                    FrankenError::internal("WAL commit read gate lost its cleanup ticket slot")
+                })?;
+                let ticket = *ticket_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (ticket.ok_or(FrankenError::BusyRecovery)?, resolution)
+            }
+            TransactionCommitPhase::DurableFinalized
+            | TransactionCommitPhase::RolledBackFinalized => return Err(FrankenError::Abort),
+        };
+        self.group_commit_queue
+            .resolve_pager_cleanups_through(ticket)
+            .await?;
+        match PendingDirectCommitResolution::load(resolution) {
+            PendingDirectCommitResolution::Pending => Err(FrankenError::BusyRecovery),
+            PendingDirectCommitResolution::Durable | PendingDirectCommitResolution::RolledBack => {
+                Err(FrankenError::Abort)
+            }
+        }
+    }
+
+    /// Complete an already-owned direct-commit ticket and return its exact
+    /// typed outcome.
+    ///
+    /// This is the authoritative conversion from queue-owned
+    /// `PendingDirectCommitResolution` into handle-owned terminal state.
+    /// Callers must not reconstruct this result from `FrankenError::Abort`.
+    async fn resolve_persistent_direct_commit_state(&mut self) -> Result<TransactionCommitState> {
+        let ticket = match self.commit_phase.get() {
+            TransactionCommitPhase::DirectOutcomeFinalizing { ticket } => ticket,
+            TransactionCommitPhase::WalOutcomeFinalizing => {
+                return Ok(self.current_commit_state());
+            }
+            TransactionCommitPhase::Open
+            | TransactionCommitPhase::DurableFinalized
+            | TransactionCommitPhase::RolledBackFinalized => return Ok(self.current_commit_state()),
+        };
+        self.group_commit_queue
+            .resolve_pager_cleanups_through(ticket)
+            .await?;
+        let resolution = self
+            .pending_direct_commit_resolution
+            .as_ref()
+            .ok_or_else(|| {
+                FrankenError::internal(
+                    "direct commit cleanup completed without resolution evidence",
+                )
+            })?;
+        match PendingDirectCommitResolution::load(resolution) {
+            PendingDirectCommitResolution::Pending => Err(FrankenError::internal(
+                "direct commit cleanup ticket completed while outcome remained pending",
+            )),
+            PendingDirectCommitResolution::Durable => {
+                let published = self.published.snapshot();
+                self.published_visible_commit_seq
+                    .set(published.visible_commit_seq);
+                self.published_db_size.set(published.db_size);
+                self.write_set.clear();
+                self.write_pages_sorted.clear();
+                self.clear_freed_pages();
+                self.savepoint_stack.clear();
+                self.rolled_back_pages.clear();
+                self.writes_observed = false;
+                self.pending_direct_submission = None;
+                self.pending_direct_transferred_state = None;
+                self.commit_phase
+                    .set(TransactionCommitPhase::DurableFinalized);
+                Ok(TransactionCommitState::Durable)
+            }
+            PendingDirectCommitResolution::RolledBack => {
+                self.write_set.clear();
+                self.write_pages_sorted.clear();
+                self.clear_freed_pages();
+                self.savepoint_stack.clear();
+                self.rolled_back_pages.clear();
+                self.writes_observed = false;
+                self.pending_direct_submission = None;
+                self.pending_direct_transferred_state = None;
+                self.commit_phase
+                    .set(TransactionCommitPhase::RolledBackFinalized);
+                Ok(TransactionCommitState::RolledBack)
+            }
+        }
+    }
+
+    /// A backend `Ok` must not replay SQL if later Phase C is still in doubt.
+    /// The exact FIFO ticket remains the sole owner, but this method must not
+    /// spin forever on a quarantined queue, permanent I/O fault, or pending
+    /// source-owned VFS completion. Callers receive the bounded
+    /// `BusyRecovery`/terminal error and may drive the same ticket again.
+    async fn finish_successful_direct_commit_finalization(&mut self) -> Result<()> {
+        match self.resolve_persistent_direct_commit_state().await {
+            Ok(TransactionCommitState::Durable) => Ok(()),
+            Ok(TransactionCommitState::RolledBack) => Err(FrankenError::internal(
+                "successful direct commit resolved as rolled back",
+            )),
+            Ok(TransactionCommitState::Open | TransactionCommitState::Finalizing) => {
+                Err(FrankenError::internal(
+                    "successful direct commit ticket resolved without a terminal state",
+                ))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "successful direct commit remains owned by its exact Phase-C ticket"
+                );
+                Err(error)
+            }
+        }
+    }
+
+    async fn invalidate_journal_after_commit(
+        cx: &Cx,
+        journal_file: &mut V::File,
+        direct_commit_handoff: Option<&mut PendingDirectCommitHandoff>,
+    ) -> Result<()> {
+        // The direct outcome ticket needs a synchronous post-barrier
+        // verification surface.  Truncation provides that without another
+        // asynchronous marker-read gap between durable decision and handoff.
+        durable_invalidate_journal_with_direct_handoff(
+            cx,
+            journal_file,
+            JournalInvalidation::Truncate,
+            direct_commit_handoff,
+        )
+        .await
     }
 
     /// Commit using the rollback journal protocol.
@@ -12159,6 +15127,7 @@ where
         write_set: &HashMap<PageNumber, StagedPage, S>,
         original_db_size: u32,
         allocated_from_freelist: &[PageNumber],
+        mut direct_commit_handoff: Option<&mut PendingDirectCommitHandoff>,
     ) -> Result<()> {
         if !write_set.is_empty() {
             // Escalate to EXCLUSIVE before writing to the database file.
@@ -12342,7 +15311,23 @@ where
             mark_local_journal_header(&mut hdr_bytes);
             hdr_bytes[..JOURNAL_MAGIC.len()].fill(0);
             jrnl_file.truncate(cx, 0)?;
-            jrnl_file.write(cx, &hdr_bytes, 0).await?;
+            if let Some(handoff) = direct_commit_handoff.as_deref_mut() {
+                // This is the first source submission that can create or
+                // alter a recovery-visible journal file.  Mark the ticket
+                // before registering/polling its write future: on Unix and
+                // Windows the source may outlive a cancelled observer, so a
+                // Drop after this point must never reinterpret the ticket as
+                // a pre-journal `Abandoned` rollback.
+                handoff.mark_recovery_required();
+            }
+            write_with_direct_commit_handoff(
+                cx,
+                &jrnl_file,
+                &hdr_bytes,
+                0,
+                direct_commit_handoff.as_deref(),
+            )
+            .await?;
 
             let mut jrnl_offset = hdr_bytes.len() as u64;
             for &page_no in &journal_pages {
@@ -12373,7 +15358,14 @@ where
 
                 let record = JournalPageRecord::new(page_no.get(), pre_image, nonce);
                 let rec_bytes = record.encode();
-                jrnl_file.write(cx, &rec_bytes, jrnl_offset).await?;
+                write_with_direct_commit_handoff(
+                    cx,
+                    &jrnl_file,
+                    &rec_bytes,
+                    jrnl_offset,
+                    direct_commit_handoff.as_deref(),
+                )
+                .await?;
                 jrnl_offset += rec_bytes.len() as u64;
             }
 
@@ -12384,7 +15376,13 @@ where
             vfs.sync_parent_directory(cx, journal_path)?;
             let mut final_hdr_bytes = header.encode_padded();
             mark_local_journal_header(&mut final_hdr_bytes);
-            durable_write_and_verify_journal_header(cx, &mut jrnl_file, &final_hdr_bytes).await?;
+            durable_write_and_verify_journal_header_with_direct_handoff(
+                cx,
+                &mut jrnl_file,
+                &final_hdr_bytes,
+                direct_commit_handoff.as_deref_mut(),
+            )
+            .await?;
             inner.rollback_journal_recovery_state = RollbackJournalRecoveryState::ReplayPending;
 
             // Phase 2: Write dirty pages to database. Once the journal is hot,
@@ -12393,11 +15391,22 @@ where
             let cleanup_cx = cleanup_child_cx(cx);
             let _mask = cleanup_cx.masked();
             let saved_db_size = inner.db_size;
+            if let Some(handoff) = direct_commit_handoff.as_deref_mut() {
+                // Select recovery before the first main-file write is polled.
+                // If it has not mutated yet, replay is harmless; if it has,
+                // the already-hot journal makes rollback authoritative.
+                handoff.mark_direct_mutation_started();
+            }
             for (page_no, staged) in write_set {
                 let offset = u64::from(page_no.get() - 1) * u64::from(inner.page_size.get());
-                if let Err(e) = db_file
-                    .write(&cleanup_cx, staged.as_page_bytes(), offset)
-                    .await
+                if let Err(e) = write_with_direct_commit_handoff(
+                    &cleanup_cx,
+                    &*db_file,
+                    staged.as_page_bytes(),
+                    offset,
+                    direct_commit_handoff.as_deref(),
+                )
+                .await
                 {
                     inner.db_size = saved_db_size;
                     return Err(e);
@@ -12406,28 +15415,48 @@ where
             }
 
             db_file.durable_sync(&cleanup_cx, SyncKind::FullDurable)?;
+            if let Some(handoff) = direct_commit_handoff.as_deref_mut() {
+                // This is intentionally before any post-sync suspension or
+                // journal-marker work.  It says only the main image is durable;
+                // terminal commit still requires fresh non-hot certification.
+                handoff.mark_direct_db_durable();
+            }
 
             // Phase 3: Make the journal non-hot before best-effort deletion.
             // If invalidation fails, restore and sync the complete hot header
             // so rollback is definite. Only if restoration itself fails may a
             // truncate+sync choose the already-durable database as committed.
-            if let Err(invalidate_err) =
-                Self::invalidate_journal_after_commit(&cleanup_cx, &mut jrnl_file).await
+            if let Err(invalidate_err) = Self::invalidate_journal_after_commit(
+                &cleanup_cx,
+                &mut jrnl_file,
+                direct_commit_handoff.as_deref_mut(),
+            )
+            .await
             {
-                let restore_result = durable_write_and_verify_journal_header(
+                let restore_result = durable_write_and_verify_journal_header_with_direct_handoff(
                     &cleanup_cx,
                     &mut jrnl_file,
                     &final_hdr_bytes,
+                    direct_commit_handoff.as_deref_mut(),
                 )
                 .await;
                 if let Err(restore_err) = restore_result {
-                    let truncate_commit_result = durable_invalidate_journal(
+                    let truncate_commit_result = durable_invalidate_journal_with_direct_handoff(
                         &cleanup_cx,
                         &mut jrnl_file,
                         JournalInvalidation::Truncate,
+                        direct_commit_handoff.as_deref_mut(),
                     )
                     .await;
                     if let Err(truncate_err) = truncate_commit_result {
+                        if let Some(handoff) = direct_commit_handoff.as_deref() {
+                            // Every terminal marker proof failed. Preserve this
+                            // physical outcome for the caller even if a later
+                            // ticket-owned replay attempt also fails; the
+                            // cleanup ticket remains queued until that later
+                            // failure can be resolved.
+                            handoff.mark_outcome_indeterminate();
+                        }
                         return Err(FrankenError::internal(format!(
                             "rollback-journal commit outcome is indeterminate: invalidate={invalidate_err}; restore={restore_err}; truncate_commit={truncate_err}"
                         )));
@@ -12543,11 +15572,14 @@ where
             None,
             current_db_size,
             sync_policy,
+            None,
             write_set,
             write_pages_sorted,
             conflict_pages,
             &[],
             queue,
+            None,
+            None,
             &mut publication_authorization,
         )
         .await
@@ -12562,11 +15594,14 @@ where
         published: Option<Arc<PublishedPagerState>>,
         current_db_size: u32,
         sync_policy: WalCommitSyncPolicy,
+        prebuilt_batch: Option<TransactionFrameBatch>,
         write_set: &HashMap<PageNumber, StagedPage, S>,
         write_pages_sorted: &[PageNumber],
         conflict_pages: &[PageNumber],
         conflict_page_baselines: &[TransactionConflictPageBaseline],
         queue: &GroupCommitQueueRef,
+        wal_submission: Option<&Arc<PendingWalCommitSubmissionState>>,
+        mut wal_handoff: Option<&mut PendingWalCommitHandoff>,
         publication_authorization: &mut Option<ParallelWalPublicationAuthorization>,
     ) -> Result<()> {
         // A prior flusher may have been dropped while the shared database-file
@@ -12576,6 +15611,14 @@ where
         while queue.resolve_one_pending_external_unlock().await? {}
         if queue.has_unresolved_in_doubt_epoch() {
             return Err(FrankenError::BusyRecovery);
+        }
+        if let Some(authorization) = wal_submission
+            .map(|submission| submission.durable_authorization())
+            .transpose()?
+            .flatten()
+        {
+            *publication_authorization = Some(authorization);
+            return Ok(());
         }
 
         let detailed_metrics = detailed_consolidation_metrics_enabled();
@@ -12588,169 +15631,241 @@ where
 
         // ── Phase timing instrumentation ──
         let t_start = phase_timing.then(Instant::now);
-
-        // Step 1: Build our batch with OWNED frame data.
-        // The caller supplies the Phase A snapshot so production commits do not
-        // re-acquire the pager mutex before entering the group-commit queue.
-
-        let t_batch_build_start = detailed_metrics.then(Instant::now);
-        let (batch, _our_new_db_size) =
-            match build_group_commit_batch(current_db_size, write_set, write_pages_sorted)? {
-                Some(b) => b,
-                None => {
-                    *publication_authorization = None;
-                    return Ok(());
-                } // Nothing to commit
-            };
-        let batch_build_us = elapsed_profile_us(t_batch_build_start);
-
-        let t_conflict_snapshot_start = detailed_metrics.then(Instant::now);
-        let conflict_snapshot = with_wal_backend_read(wal_backend, cx, |wal, _| {
-            Box::pin(async move { Ok(wal.pinned_read_snapshot()) })
-        })
-        .await?;
-        let batch = attach_group_commit_conflict_metadata(
-            batch,
-            conflict_pages,
-            conflict_snapshot,
-            conflict_page_baselines,
-        );
-        let conflict_snapshot_us = elapsed_profile_us(t_conflict_snapshot_start);
-
         let parallel_wal_control = queue.parallel_wal_control().clone();
-        let batch_id = queue.next_parallel_wal_batch_id();
-        let lane_id = queue.current_parallel_wal_lane_id();
-        let mut staging_fallback_reason = if matches!(
-            parallel_wal_control.mode,
-            ParallelWalOperatingMode::Conservative
-        ) {
-            Some(ParallelWalFallbackReason::OperatorForced)
-        } else if let Some(limit) = parallel_wal_control.max_parallel_commit_bytes {
-            if group_commit_batch_staged_bytes(&batch) > limit {
-                Some(ParallelWalFallbackReason::LaneOverflow)
+
+        // A requeued member finalizer resumes from the exact synchronous
+        // admission receipt. It must never rebuild or resubmit the batch:
+        // ownership of the physical frames already lives in the consolidator.
+        let resumed_submission = wal_submission.map(|submission| submission.status());
+        let admission = if let Some(PendingWalCommitStatus::Submitted {
+            batch_id,
+            target_epoch,
+        }) = resumed_submission
+        {
+            GroupCommitAdmission {
+                outcome: SubmitOutcome::Waiter,
+                epoch_at_queue: target_epoch.saturating_sub(1),
+                target_epoch,
+                waiter_id: batch_id,
+                waiter_frames_contributed: 0,
+                batch_build_us: 0,
+                conflict_snapshot_us: 0,
+                lane_prepare_us: 0,
+                prepare_us: 0,
+                consolidator_lock_wait_us: 0,
+                flushing_wait_us: 0,
+            }
+        } else {
+            if matches!(
+                resumed_submission,
+                Some(PendingWalCommitStatus::NotCommitted { .. })
+            ) {
+                return Err(FrankenError::Abort);
+            }
+            if wal_submission.is_some() && wal_handoff.is_none() {
+                return Err(FrankenError::internal(
+                    "pre-submit WAL member continuation lost its admission handoff",
+                ));
+            }
+
+            // Step 1: Build our batch with OWNED frame data.
+            // The caller supplies the Phase A snapshot so production commits do not
+            // re-acquire the pager mutex before entering the group-commit queue.
+
+            let t_batch_build_start = detailed_metrics.then(Instant::now);
+            let batch = if let Some(batch) = prebuilt_batch {
+                batch
+            } else {
+                match build_group_commit_batch(current_db_size, write_set, write_pages_sorted)? {
+                    Some((batch, _)) => batch,
+                    None => {
+                        *publication_authorization = None;
+                        return Ok(());
+                    }
+                }
+            };
+            let batch_build_us = elapsed_profile_us(t_batch_build_start);
+
+            let t_conflict_snapshot_start = detailed_metrics.then(Instant::now);
+            let conflict_snapshot = with_wal_backend_read(wal_backend, cx, |wal, _| {
+                Box::pin(async move { Ok(wal.pinned_read_snapshot()) })
+            })
+            .await?;
+            let batch = attach_group_commit_conflict_metadata(
+                batch,
+                conflict_pages,
+                conflict_snapshot,
+                conflict_page_baselines,
+            );
+            let conflict_snapshot_us = elapsed_profile_us(t_conflict_snapshot_start);
+
+            let batch_id = queue.next_parallel_wal_batch_id();
+            let lane_id = queue.current_parallel_wal_lane_id();
+            let mut staging_fallback_reason = if matches!(
+                parallel_wal_control.mode,
+                ParallelWalOperatingMode::Conservative
+            ) {
+                Some(ParallelWalFallbackReason::OperatorForced)
+            } else if let Some(limit) = parallel_wal_control.max_parallel_commit_bytes {
+                if group_commit_batch_staged_bytes(&batch) > limit {
+                    Some(ParallelWalFallbackReason::LaneOverflow)
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
-        let mut lane_shadow_verdict = ParallelWalShadowVerdict::NotRun;
-        let mut lane_backlog = if lane_staging_debug_enabled {
-            Some(queue.current_lane_backlog(lane_id))
-        } else {
-            None
-        };
-        let mut batch = batch.with_context(TransactionFrameBatchContext {
-            batch_id,
-            lane_id,
-            staged_frame_count: 0,
-            staging_elapsed_ns: 0,
-        });
-
-        let mut lane_prepare_us = 0;
-        if staging_fallback_reason.is_none() {
-            let t_lane_prepare_start = detailed_metrics.then(Instant::now);
-            let staged_prepared = prepare_group_commit_batch_for_lane(
-                cx,
-                wal_backend,
-                &batch,
+            };
+            let mut lane_shadow_verdict = ParallelWalShadowVerdict::NotRun;
+            let mut lane_backlog = if lane_staging_debug_enabled {
+                Some(queue.current_lane_backlog(lane_id))
+            } else {
+                None
+            };
+            let mut batch = batch.with_context(TransactionFrameBatchContext {
                 batch_id,
                 lane_id,
-                &parallel_wal_control,
-            )
-            .await?;
-            lane_prepare_us = elapsed_profile_us(t_lane_prepare_start);
-            if let Some(staged_prepared) = staged_prepared {
-                let staged_frame_count = staged_prepared.staged_frame_count;
-                let staging_elapsed_ns = staged_prepared.staging_elapsed_ns;
-                lane_shadow_verdict = staged_prepared.shadow_verdict;
-                let new_lane_backlog = queue.record_prepared_batch(staged_prepared);
-                if lane_staging_debug_enabled {
-                    lane_backlog = Some(new_lane_backlog);
-                }
-                batch = batch.with_context(TransactionFrameBatchContext {
+                staged_frame_count: 0,
+                staging_elapsed_ns: 0,
+            });
+
+            let mut lane_prepare_us = 0;
+            if staging_fallback_reason.is_none() {
+                let t_lane_prepare_start = detailed_metrics.then(Instant::now);
+                let staged_prepared = prepare_group_commit_batch_for_lane(
+                    cx,
+                    wal_backend,
+                    &batch,
                     batch_id,
                     lane_id,
-                    staged_frame_count,
-                    staging_elapsed_ns,
-                });
-            } else {
-                staging_fallback_reason = Some(ParallelWalFallbackReason::ControllerEvidenceLost);
+                    &parallel_wal_control,
+                )
+                .await?;
+                lane_prepare_us = elapsed_profile_us(t_lane_prepare_start);
+                if let Some(staged_prepared) = staged_prepared {
+                    let staged_frame_count = staged_prepared.staged_frame_count;
+                    let staging_elapsed_ns = staged_prepared.staging_elapsed_ns;
+                    lane_shadow_verdict = staged_prepared.shadow_verdict;
+                    let new_lane_backlog = queue.record_prepared_batch(staged_prepared);
+                    if lane_staging_debug_enabled {
+                        lane_backlog = Some(new_lane_backlog);
+                    }
+                    batch = batch.with_context(TransactionFrameBatchContext {
+                        batch_id,
+                        lane_id,
+                        staged_frame_count,
+                        staging_elapsed_ns,
+                    });
+                } else {
+                    staging_fallback_reason =
+                        Some(ParallelWalFallbackReason::ControllerEvidenceLost);
+                }
             }
-        }
 
-        if lane_staging_debug_enabled {
-            let queue_submit_max_wait = {
-                let consolidator = queue
+            if lane_staging_debug_enabled {
+                let queue_submit_max_wait = {
+                    let consolidator = queue
+                        .consolidator
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    consolidator.max_group_delay()
+                };
+                let queue_submit_batch_membership = batch.context.batch_id.to_string();
+                let queue_submit_rollback_mode_active = physical_writer_rollback_mode_active(
+                    parallel_wal_control.mode,
+                    staging_fallback_reason,
+                );
+                tracing::debug!(
+                    target: "fsqlite::wal::lane_staging",
+                    trace_id = cx.trace_id(),
+                    run_id = PHYSICAL_WRITER_LANE_RUN_ID,
+                    scenario_id = PARALLEL_WAL_STAGE_SCENARIO_ID,
+                    batch_id = batch.context.batch_id,
+                    batch_membership = queue_submit_batch_membership.as_str(),
+                    queue_delay_ns = 0_u64,
+                    target_wait_ns = 0_u64,
+                    max_wait_ns =
+                        u64::try_from(queue_submit_max_wait.as_nanos()).unwrap_or(u64::MAX),
+                    fsync_boundary = physical_writer_fsync_boundary(sync_policy),
+                    ordering_phase = "queue_submit",
+                    rollback_mode_active = queue_submit_rollback_mode_active,
+                    wal_lane_id = lane_id,
+                    lane_backlog = lane_backlog.unwrap_or(0),
+                    staged_frame_count = batch.context.staged_frame_count,
+                    flush_trigger = "queue_submit",
+                    control_mode = parallel_wal_mode_name(parallel_wal_control.mode),
+                    lane_policy_version = PARALLEL_WAL_LANE_POLICY_VERSION,
+                    shadow_verdict = parallel_wal_shadow_verdict_name(lane_shadow_verdict),
+                    compatibility_selector = PARALLEL_WAL_COMPATIBILITY_SELECTOR,
+                    fallback_reason = parallel_wal_fallback_reason_name(staging_fallback_reason),
+                    elapsed_ns = batch.context.staging_elapsed_ns,
+                    "queued lane-local WAL staging candidate"
+                );
+            }
+
+            let prepare_us = elapsed_profile_us(t_start);
+            let waiter_id = batch.context.batch_id;
+            let waiter_frames_contributed = batch.frames.len();
+
+            // Step 2: Submit batch to consolidator, get Flusher or Waiter role and
+            // the exact epoch that will make this batch durable.
+            let t_consolidator_lock_start = phase_timing.then(Instant::now);
+            let (outcome, our_epoch, target_epoch, consolidator_lock_wait_us, flushing_wait_us) = {
+                let mut consolidator = queue
                     .consolidator
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                consolidator.max_group_delay()
+
+                let lock_wait_us = elapsed_profile_us(t_consolidator_lock_start);
+
+                // ── Epoch pipelining: NO waiting during FLUSHING ──
+                // The consolidator now accepts submissions during FLUSHING,
+                // queuing them for the next epoch. This eliminates the
+                // flushing_wait bottleneck that was 1-2.7ms at 16 threads.
+                let flushing_wait = 0u64; // No longer blocks
+
+                let epoch_at_queue = consolidator.epoch();
+                let receipt = consolidator.submit_batch(batch)?;
+                if wal_submission.is_some() {
+                    wal_handoff
+                        .as_deref_mut()
+                        .expect("persistent WAL submission checked its handoff above")
+                        .mark_submitted(queue, waiter_id, receipt.target_epoch);
+                }
+                (
+                    receipt.outcome,
+                    epoch_at_queue,
+                    receipt.target_epoch,
+                    lock_wait_us,
+                    flushing_wait,
+                )
             };
-            let queue_submit_batch_membership = batch.context.batch_id.to_string();
-            let queue_submit_rollback_mode_active = physical_writer_rollback_mode_active(
-                parallel_wal_control.mode,
-                staging_fallback_reason,
-            );
-            tracing::debug!(
-                target: "fsqlite::wal::lane_staging",
-                trace_id = cx.trace_id(),
-                run_id = PHYSICAL_WRITER_LANE_RUN_ID,
-                scenario_id = PARALLEL_WAL_STAGE_SCENARIO_ID,
-                batch_id = batch.context.batch_id,
-                batch_membership = queue_submit_batch_membership.as_str(),
-                queue_delay_ns = 0_u64,
-                target_wait_ns = 0_u64,
-                max_wait_ns =
-                    u64::try_from(queue_submit_max_wait.as_nanos()).unwrap_or(u64::MAX),
-                fsync_boundary = physical_writer_fsync_boundary(sync_policy),
-                ordering_phase = "queue_submit",
-                rollback_mode_active = queue_submit_rollback_mode_active,
-                wal_lane_id = lane_id,
-                lane_backlog = lane_backlog.unwrap_or(0),
-                staged_frame_count = batch.context.staged_frame_count,
-                flush_trigger = "queue_submit",
-                control_mode = parallel_wal_mode_name(parallel_wal_control.mode),
-                lane_policy_version = PARALLEL_WAL_LANE_POLICY_VERSION,
-                shadow_verdict = parallel_wal_shadow_verdict_name(lane_shadow_verdict),
-                compatibility_selector = PARALLEL_WAL_COMPATIBILITY_SELECTOR,
-                fallback_reason = parallel_wal_fallback_reason_name(staging_fallback_reason),
-                elapsed_ns = batch.context.staging_elapsed_ns,
-                "queued lane-local WAL staging candidate"
-            );
-        }
-
-        let prepare_us = elapsed_profile_us(t_start);
-        let waiter_id = batch.context.batch_id;
-        let waiter_frames_contributed = batch.frames.len();
-
-        // Step 2: Submit batch to consolidator, get Flusher or Waiter role and
-        // the exact epoch that will make this batch durable.
-        let t_consolidator_lock_start = phase_timing.then(Instant::now);
-        let (outcome, our_epoch, target_epoch, consolidator_lock_wait_us, flushing_wait_us) = {
-            let mut consolidator = queue
-                .consolidator
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-            let lock_wait_us = elapsed_profile_us(t_consolidator_lock_start);
-
-            // ── Epoch pipelining: NO waiting during FLUSHING ──
-            // The consolidator now accepts submissions during FLUSHING,
-            // queuing them for the next epoch. This eliminates the
-            // flushing_wait bottleneck that was 1-2.7ms at 16 threads.
-            let flushing_wait = 0u64; // No longer blocks
-
-            let epoch_at_queue = consolidator.epoch();
-            let receipt = consolidator.submit_batch(batch)?;
-            (
-                receipt.outcome,
-                epoch_at_queue,
-                receipt.target_epoch,
-                lock_wait_us,
-                flushing_wait,
-            )
+            GroupCommitAdmission {
+                outcome,
+                epoch_at_queue: our_epoch,
+                target_epoch,
+                waiter_id,
+                waiter_frames_contributed,
+                batch_build_us,
+                conflict_snapshot_us,
+                lane_prepare_us,
+                prepare_us,
+                consolidator_lock_wait_us,
+                flushing_wait_us,
+            }
         };
+        let GroupCommitAdmission {
+            outcome,
+            epoch_at_queue: our_epoch,
+            target_epoch,
+            waiter_id,
+            waiter_frames_contributed,
+            batch_build_us,
+            conflict_snapshot_us,
+            lane_prepare_us,
+            prepare_us,
+            consolidator_lock_wait_us,
+            flushing_wait_us,
+        } = admission;
         trace_group_commit(format_args!(
             "waiter waiter_id={waiter_id} role={outcome:?} epoch_at_queue={our_epoch} target_epoch={target_epoch} frames_i_contributed={waiter_frames_contributed}"
         ));
@@ -12921,6 +16036,9 @@ where
                             abort_result.is_ok() && consolidator.has_flusher_vacancy();
                         (abort_result, wake_next_epoch)
                     };
+                    if abort_result.is_ok() {
+                        queue.mark_wal_epoch_not_committed(flush_epoch);
+                    }
                     queue.publish_failed_epoch(flush_epoch, &error, wake_next_epoch);
                     if abort_result.is_ok() {
                         flush_obligation.disarm();
@@ -13694,6 +16812,9 @@ where
                                 abort_result.is_ok() && consolidator.has_flusher_vacancy();
                             (abort_result, wake_next_epoch)
                         };
+                        if abort_result.is_ok() {
+                            queue.mark_wal_epoch_not_committed(flush_epoch);
+                        }
                         queue.publish_failed_epoch(flush_epoch, &error, wake_next_epoch);
                         if abort_result.is_ok() {
                             flush_obligation.disarm();
@@ -13835,6 +16956,16 @@ where
             }
         }
 
+        if let Some(submission) = wal_submission {
+            let authorization = submission.durable_authorization()?.ok_or_else(|| {
+                FrankenError::internal(format!(
+                    "group commit epoch {target_epoch} completed without retained member proof"
+                ))
+            })?;
+            *publication_authorization = Some(authorization);
+            return Ok(());
+        }
+
         let persisted = queue.persisted_epoch_for(target_epoch).ok_or_else(|| {
             FrankenError::internal(format!(
                 "group commit epoch {target_epoch} completed without a durability certificate"
@@ -13867,6 +16998,7 @@ where
     }
 
     async fn ensure_writer(&mut self, cx: &Cx) -> Result<()> {
+        self.resolve_direct_phase_for_async_access().await?;
         if self.read_only_pager {
             return Err(FrankenError::ReadOnly);
         }
@@ -14010,7 +17142,7 @@ async fn release_retained_snapshot_after_txn_exit<F: VfsFile>(
 
 impl<V> TransactionHandle for SimpleTransaction<V>
 where
-    V: Vfs + Send,
+    V: Vfs + Send + 'static,
     V::File: Send + Sync + 'static,
 {
     fn get_page<'a>(
@@ -14019,6 +17151,7 @@ where
         page_no: PageNumber,
     ) -> impl Future<Output = Result<PageData>> + 'a {
         async move {
+            self.resolve_direct_phase_for_read().await?;
             if self.contains_freed_page(page_no) {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -14231,6 +17364,9 @@ where
     }
 
     fn prefetch_page_hint(&self, _cx: &Cx, page_no: PageNumber) {
+        if self.finished || self.commit_phase.get() != TransactionCommitPhase::Open {
+            return;
+        }
         if let Some(staged) = self.write_set.get(&page_no) {
             prefetch_l1_read(staged.as_page_bytes().as_ptr());
             return;
@@ -14336,6 +17472,9 @@ where
     }
 
     fn try_take_staged_page_data(&mut self, page_no: PageNumber) -> Option<PageData> {
+        if self.require_open_commit_state_for_sync_mutation().is_err() {
+            return None;
+        }
         let staged = self.write_set.remove(&page_no)?;
         match staged.try_into_unpublished_owned_page_data() {
             Ok(data) => {
@@ -14354,6 +17493,9 @@ where
         page_no: PageNumber,
         f: &mut dyn FnMut(&mut PageData),
     ) -> bool {
+        if self.require_open_commit_state_for_sync_mutation().is_err() {
+            return false;
+        }
         let Some(staged) = self.write_set.get_mut(&page_no) else {
             return false;
         };
@@ -14520,11 +17662,92 @@ where
         }
     }
 
+    fn commit_state(&self) -> TransactionCommitState {
+        self.current_commit_state()
+    }
+
+    fn try_install_commit_terminal_owner(
+        &mut self,
+        owner: CommitTerminalOwner,
+    ) -> std::result::Result<(), CommitTerminalOwner> {
+        if self.current_commit_state() != TransactionCommitState::Open
+            || self.commit_terminal_owner.is_some()
+        {
+            return Err(owner);
+        }
+        self.commit_terminal_owner = Some(owner);
+        Ok(())
+    }
+
+    fn resolve_commit_state<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+    ) -> impl Future<Output = Result<TransactionCommitState>> + 'a {
+        async move {
+            match self.commit_phase.get() {
+                TransactionCommitPhase::DirectOutcomeFinalizing { .. } => {
+                    self.resolve_persistent_direct_commit_state().await
+                }
+                TransactionCommitPhase::WalOutcomeFinalizing => {
+                    self.resolve_persistent_wal_commit_state().await
+                }
+                TransactionCommitPhase::Open
+                | TransactionCommitPhase::DurableFinalized
+                | TransactionCommitPhase::RolledBackFinalized => Ok(self.current_commit_state()),
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn commit<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
         async move {
+            match self.commit_phase.get() {
+                TransactionCommitPhase::Open => {}
+                TransactionCommitPhase::DirectOutcomeFinalizing { .. } => {
+                    match self.resolve_persistent_direct_commit_state().await? {
+                        TransactionCommitState::Durable => {
+                            self.finished = true;
+                            return Ok(());
+                        }
+                        TransactionCommitState::RolledBack => {
+                            self.finished = true;
+                            return Err(FrankenError::Abort);
+                        }
+                        TransactionCommitState::Open | TransactionCommitState::Finalizing => {
+                            return Err(FrankenError::internal(
+                                "direct commit ticket resolved without a terminal state",
+                            ));
+                        }
+                    }
+                }
+                TransactionCommitPhase::WalOutcomeFinalizing => {
+                    match self.resolve_persistent_wal_commit_state().await? {
+                        TransactionCommitState::Durable => return Ok(()),
+                        TransactionCommitState::RolledBack => {
+                            return Err(FrankenError::Abort);
+                        }
+                        TransactionCommitState::Open | TransactionCommitState::Finalizing => {
+                            return Err(FrankenError::internal(
+                                "WAL commit finalizer resolved without a terminal state",
+                            ));
+                        }
+                    }
+                }
+                TransactionCommitPhase::DurableFinalized => {
+                    self.finished = true;
+                    return Ok(());
+                }
+                TransactionCommitPhase::RolledBackFinalized => {
+                    self.finished = true;
+                    return Err(FrankenError::Abort);
+                }
+            }
             if self.finished {
-                return Ok(());
+                return if self.committed {
+                    Ok(())
+                } else {
+                    Err(FrankenError::Abort)
+                };
             }
             // Rollback/close is another structured owner for a lock
             // restoration stranded by a dropped commit future.
@@ -14553,6 +17776,7 @@ where
                 self.finished = true;
                 // IMPL-3 / AG-4B: reset scratch arena on read-only commit path.
                 self.scratch_arena.reset();
+                self.complete_commit_terminal_owner(CommitTerminalOutcome::Durable);
                 return Ok(());
             }
             if self.vfs.is_memory()
@@ -14595,6 +17819,7 @@ where
                 self.finished = true;
                 // IMPL-3 / AG-4B: reset scratch arena on no-writes commit path.
                 self.scratch_arena.reset();
+                self.complete_commit_terminal_owner(CommitTerminalOutcome::Durable);
                 return Ok(());
             }
 
@@ -14773,53 +17998,88 @@ where
             // D1-CRITICAL: For WAL mode, we release inner.lock() here so other
             // threads can start their Phase A (prepare) while we wait for
             // the consolidator lock. This is the key parallelization win.
-            let mut wal_publication_authorization = None;
-            let commit_result = if self.journal_mode == JournalMode::Wal {
-                // Drop inner lock BEFORE acquiring consolidator lock.
-                // This allows other threads to run Phase A concurrently.
+            if self.journal_mode == JournalMode::Wal {
+                let metadata_only_single_connection_fast_path =
+                    self.single_connection_fast_path_enabled();
+                let (prebuilt_batch, mut wal_handoff) = self
+                    .install_persistent_wal_commit_finalization(
+                        pending_returned_pages,
+                        pending_freed,
+                        wal_current_db_size,
+                        committed_db_size,
+                        wal_sync_policy,
+                        metadata_only_single_connection_fast_path,
+                    )?;
+                // From this point the handoff is the strong local owner. Its
+                // Drop publishes the same finalizer into the FIFO only if this
+                // foreground future disappears before terminal Phase C.
                 drop(inner);
-
-                // WAL mode: Use group commit for same-process batching.
-                // commit_wal_group_commit will acquire consolidator.lock() first,
-                // then briefly inner.lock() for the actual WAL I/O.
+                let submission = Arc::clone(wal_handoff.submission());
+                let mut wal_publication_authorization = None;
                 let t_wal_commit_start = pager_commit_profile_start(pager_commit_profile_active);
-                let result = Self::commit_wal_group_commit_with_snapshot(
+                let physical_result = Self::commit_wal_group_commit_with_snapshot(
                     cx,
                     &self.wal_backend,
                     &self.inner,
                     Some(Arc::clone(&self.published)),
                     wal_current_db_size,
                     wal_sync_policy,
+                    Some(prebuilt_batch),
                     &self.write_set,
                     &self.write_pages_sorted,
                     &cross_process_conflict_pages,
                     &cross_process_conflict_page_baselines,
                     &self.group_commit_queue,
+                    Some(&submission),
+                    Some(wal_handoff.admission_mut()),
                     &mut wal_publication_authorization,
                 )
                 .await;
+                wal_handoff.finish_submission();
                 record_pager_commit_duration(&PAGER_COMMIT_WAL_TIME_NS, t_wal_commit_start);
 
-                // Re-acquire inner lock for Phase C (finalize).
-                inner = match inner_arc
-                    .lock()
-                    .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))
-                {
-                    Ok(guard) => guard,
-                    Err(e) => {
-                        self.restore_pending_freed_pages(pending_freed);
-                        if let Ok(mut recovery_inner) = inner_arc.lock() {
-                            return_pages_to_freelist(
-                                &mut recovery_inner.freelist,
-                                pending_returned_pages,
-                            );
-                        }
-                        return Err(e);
+                if physical_result.is_err() && wal_handoff.can_reclaim_pre_submit() {
+                    let commit_error = physical_result
+                        .expect_err("pre-submit reclaim requires a physical commit error");
+                    let mut reclaim_inner = inner_arc
+                        .lock()
+                        .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+                    let reclaim_result =
+                        self.reclaim_pre_submit_wal_commit(&mut wal_handoff, &mut reclaim_inner);
+                    drop(reclaim_inner);
+                    return match reclaim_result {
+                        Ok(()) => Err(commit_error),
+                        Err(_) => Err(FrankenError::BusyRecovery),
+                    };
+                }
+
+                if let Err(finalization_error) = wal_handoff.resolve_locally().await {
+                    // Dropping the still-armed handoff below transfers the same
+                    // operation into the FIFO for a later structured owner.
+                    tracing::warn!(
+                        %finalization_error,
+                        "WAL member finalization deferred to its persistent cleanup owner"
+                    );
+                    return Err(finalization_error);
+                }
+                wal_handoff.finish_terminal();
+                let terminal_state = self.apply_wal_terminal_resolution_to_handle()?;
+                return match (terminal_state, physical_result) {
+                    (TransactionCommitState::Durable, _) => Ok(()),
+                    (TransactionCommitState::RolledBack, Err(error)) => Err(error),
+                    (TransactionCommitState::RolledBack, Ok(())) => Err(FrankenError::internal(
+                        "successful WAL physical commit resolved as rolled back",
+                    )),
+                    (TransactionCommitState::Open | TransactionCommitState::Finalizing, _) => {
+                        Err(FrankenError::internal(
+                            "WAL member finalization did not reach a terminal state",
+                        ))
                     }
                 };
+            }
 
-                result
-            } else if self.memory_db_bump_alloc {
+            let wal_publication_authorization = None;
+            let commit_result = if self.memory_db_bump_alloc {
                 // Private `:memory:` commits do not need rollback-journal
                 // creation/sync. Page 1 has already been staged above, so flush
                 // the final committed image directly once at the release boundary.
@@ -14849,6 +18109,18 @@ where
                 // (EOF-origin entries are filtered out by the db-size bound).
                 let mut alias_check_restored = self.allocated_from_freelist.clone();
                 alias_check_restored.extend_from_slice(&pending_returned_pages);
+                let metadata_only_single_connection_fast_path =
+                    self.single_connection_fast_path_enabled();
+                // Install the identity-bound ticket before the first journal
+                // await. From this point, a dropped commit future cannot leave
+                // `commit_phase=Open` while a hot journal or visible main-file
+                // mutation lacks an exact-once exit owner.
+                let mut direct_handoff = self.install_persistent_direct_commit_finalization(
+                    &pending_returned_pages,
+                    &pending_freed,
+                    committed_db_size,
+                    metadata_only_single_connection_fast_path,
+                );
                 let result = Self::commit_journal(
                     cx,
                     &self.vfs,
@@ -14857,13 +18129,123 @@ where
                     &self.write_set,
                     self.original_db_size,
                     &alias_check_restored,
+                    Some(&mut direct_handoff),
                 )
                 .await;
-                record_pager_commit_duration(&PAGER_COMMIT_JOURNAL_TIME_NS, t_journal_commit_start);
-                result
+                // No recovery claimant may infer an empty currently-pending
+                // token set means the submitter is finished until this exact
+                // handoff seals registration.  On cancellation, `Drop` seals
+                // it instead while retaining any source token that outlives
+                // the observer future.
+                direct_handoff.finish_submission();
+                if let Err(commit_error) = result {
+                    // An ordinary error before the hot-header submission is
+                    // still retryable, but only if this exact ticket remains
+                    // queued and withdrawable.  Never let the generic Phase-C
+                    // failure path run after restoration: it would return the
+                    // same free pages or lease twice.
+                    if direct_handoff.can_reclaim_pre_hot() {
+                        let ticket = match self.commit_phase.get() {
+                            TransactionCommitPhase::DirectOutcomeFinalizing { ticket } => ticket,
+                            _ => {
+                                drop(direct_handoff);
+                                return Err(FrankenError::internal(
+                                    "pre-hot direct commit lost its finalization phase",
+                                ));
+                            }
+                        };
+                        let reclaim_result = self.reclaim_pre_hot_direct_commit(
+                            ticket,
+                            &mut direct_handoff,
+                            &mut inner,
+                        );
+                        drop(direct_handoff);
+                        record_pager_commit_duration(
+                            &PAGER_COMMIT_JOURNAL_TIME_NS,
+                            t_journal_commit_start,
+                        );
+                        return match reclaim_result {
+                            Ok(()) => Err(commit_error),
+                            Err(_) => Err(FrankenError::BusyRecovery),
+                        };
+                    }
+                    drop(direct_handoff);
+                    record_pager_commit_duration(
+                        &PAGER_COMMIT_JOURNAL_TIME_NS,
+                        t_journal_commit_start,
+                    );
+                    Err(commit_error)
+                } else {
+                    drop(direct_handoff);
+                    record_pager_commit_duration(
+                        &PAGER_COMMIT_JOURNAL_TIME_NS,
+                        t_journal_commit_start,
+                    );
+                    Ok(())
+                }
             };
 
             let t_phase_b_done = phase_timing.then(Instant::now);
+
+            if matches!(
+                self.commit_phase.get(),
+                TransactionCommitPhase::DirectOutcomeFinalizing { .. }
+            ) {
+                // Direct journal I/O transferred all terminal ownership to the
+                // ticket above. Do not run the legacy inline Phase C or its
+                // failure-side allocation restoration: both would race/double
+                // the persistent operation after a cancellation boundary.
+                drop(inner);
+                return match commit_result {
+                    Ok(()) => {
+                        self.finish_successful_direct_commit_finalization().await?;
+                        self.finished = true;
+                        Ok(())
+                    }
+                    Err(commit_error) => {
+                        match self.resolve_persistent_direct_commit_state().await {
+                            Ok(TransactionCommitState::Durable) => {
+                                // The physical call reported an error only after
+                                // a durable marker. Replaying SQL would duplicate
+                                // the already-published effect.
+                                self.finished = true;
+                                Ok(())
+                            }
+                            Ok(TransactionCommitState::RolledBack) => {
+                                self.finished = true;
+                                Err(commit_error)
+                            }
+                            Ok(
+                                TransactionCommitState::Open | TransactionCommitState::Finalizing,
+                            ) => Err(FrankenError::internal(
+                                "direct commit ticket resolved without a terminal state",
+                            )),
+                            Err(recovery_error) => {
+                                let outcome_indeterminate = self
+                                    .pending_direct_submission
+                                    .as_ref()
+                                    .is_some_and(|submission| submission.outcome_indeterminate());
+                                if outcome_indeterminate {
+                                    // The physical protocol has already
+                                    // proven its outcome indeterminate. Keep
+                                    // the exact ticket pending so a later
+                                    // rollback can retry cleanup, but do not
+                                    // replace the primary caller-visible
+                                    // outcome with that secondary error.
+                                    tracing::warn!(
+                                        %commit_error,
+                                        %recovery_error,
+                                        "indeterminate direct commit retained its Phase-C cleanup ticket after recovery failure"
+                                    );
+                                    Err(commit_error)
+                                } else {
+                                    Err(recovery_error)
+                                }
+                            }
+                        }
+                    }
+                };
+            }
 
             if commit_result.is_ok() {
                 let t_phase_c_metadata_start =
@@ -15058,6 +18440,7 @@ where
                     &PAGER_COMMIT_CACHE_FINISH_TIME_NS,
                     t_cache_finish_start,
                 );
+                self.complete_commit_terminal_owner(CommitTerminalOutcome::Durable);
             } else {
                 // Keep the writer lock held on commit failure so no other writer
                 // can interleave while the caller decides to retry or roll back.
@@ -15095,8 +18478,67 @@ where
 
     fn commit_and_retain<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<bool>> + 'a {
         async move {
+            match self.commit_phase.get() {
+                TransactionCommitPhase::Open if self.finished => {
+                    return if self.committed {
+                        Ok(false)
+                    } else {
+                        Err(FrankenError::Abort)
+                    };
+                }
+                TransactionCommitPhase::Open => {}
+                TransactionCommitPhase::DirectOutcomeFinalizing { .. } => {
+                    match self.resolve_persistent_direct_commit_state().await? {
+                        TransactionCommitState::Durable => {
+                            // Rollback-journal retention is unsupported by the
+                            // existing public contract; a resolved terminal
+                            // direct commit is exactly the normal `Ok(false)`
+                            // fallback, not a newly introduced behavior.
+                            self.finished = true;
+                            return Ok(false);
+                        }
+                        TransactionCommitState::RolledBack => {
+                            self.finished = true;
+                            return Err(FrankenError::Abort);
+                        }
+                        TransactionCommitState::Open | TransactionCommitState::Finalizing => {
+                            return Err(FrankenError::internal(
+                                "direct commit ticket resolved without a terminal state",
+                            ));
+                        }
+                    }
+                }
+                TransactionCommitPhase::WalOutcomeFinalizing => {
+                    match self.resolve_persistent_wal_commit_state().await? {
+                        TransactionCommitState::Durable => return Ok(false),
+                        TransactionCommitState::RolledBack => {
+                            return Err(FrankenError::Abort);
+                        }
+                        TransactionCommitState::Open | TransactionCommitState::Finalizing => {
+                            return Err(FrankenError::internal(
+                                "WAL commit finalizer resolved without a terminal state",
+                            ));
+                        }
+                    }
+                }
+                TransactionCommitPhase::DurableFinalized => {
+                    self.finished = true;
+                    return Ok(false);
+                }
+                TransactionCommitPhase::RolledBackFinalized => {
+                    self.finished = true;
+                    return Err(FrankenError::Abort);
+                }
+            }
+
+            if self.commit_terminal_owner.is_some() {
+                self.commit(cx).await?;
+                return Ok(false);
+            }
+
             // Only supported for in-memory pagers where we can skip I/O.
-            if !self.vfs.is_memory() {
+            let is_memory = self.vfs.is_memory();
+            if !is_memory {
                 self.commit(cx).await?;
                 return Ok(false);
             }
@@ -15131,7 +18573,7 @@ where
                 && !self.write_set.contains_key(&PageNumber::ONE);
             let mut defer_private_memory_flush =
                 self.memory_db_bump_alloc && metadata_only_single_connection_fast_path;
-            if self.vfs.is_memory()
+            if is_memory
                 && self.memory_db_bump_alloc
                 && !defer_private_memory_flush
                 && !self.retained_memory_overlay_dirty_pages.is_empty()
@@ -15200,7 +18642,7 @@ where
                 let must_write_page1 = if self.journal_mode == JournalMode::Wal {
                     wal_page1_plan.requires_page_one_rewrite()
                         || wal_page1_plan.requires_page_count_advance()
-                } else if self.vfs.is_memory() {
+                } else if is_memory {
                     // B3.4: :memory: journal mode skips page 1 header update unless:
                     // 1. freelist_dirty (freelist count in header must match), OR
                     // 2. page 1 is explicitly dirty in write_set
@@ -15271,11 +18713,14 @@ where
                         Some(Arc::clone(&self.published)),
                         wal_current_db_size,
                         wal_sync_policy,
+                        None,
                         &self.write_set,
                         &self.write_pages_sorted,
                         &cross_process_conflict_pages,
                         &cross_process_conflict_page_baselines,
                         &self.group_commit_queue,
+                        None,
+                        None,
                         &mut wal_publication_authorization,
                     )
                     .await;
@@ -15296,7 +18741,7 @@ where
                         }
                     };
                     result
-                } else if self.vfs.is_memory() {
+                } else if is_memory {
                     if defer_private_memory_flush {
                         // For a real private `:memory:` database, a retained
                         // single-connection metadata-only commit does not need to
@@ -15326,20 +18771,14 @@ where
                     }
                     Ok(())
                 } else {
-                    // See commit(): restore drained never-written freelist pops
-                    // (`pending_returned_pages`) for the freelist-alias check.
-                    let mut alias_check_restored = self.allocated_from_freelist.clone();
-                    alias_check_restored.extend_from_slice(&pending_returned_pages);
-                    Self::commit_journal(
-                        cx,
-                        &self.vfs,
-                        &self.journal_path,
-                        &mut inner,
-                        &self.write_set,
-                        self.original_db_size,
-                        &alias_check_restored,
-                    )
-                    .await
+                    // `is_memory` was captured before any await and the
+                    // non-memory branch returned through `commit()` above.
+                    // Keeping this as an invariant error eliminates the old
+                    // rollback-journal `commit_journal(..., None)` callsite:
+                    // retention must never bypass persistent finalization.
+                    Err(FrankenError::internal(
+                        "commit_and_retain reached non-memory path after memory admission",
+                    ))
                 }
             };
 
@@ -15372,7 +18811,7 @@ where
                     inner.record_local_commit();
                 }
                 // B3.4: :memory: derives file size from db_size * page_size — skip VFS roundtrip
-                if self.vfs.is_memory() {
+                if is_memory {
                     inner.committed_db_file_size_bytes =
                         u64::from(inner.db_size) * u64::from(inner.page_size.get());
                 } else {
@@ -15454,18 +18893,25 @@ where
     }
 
     fn is_writer(&self) -> bool {
-        self.is_writer
+        !self.finished && self.commit_phase.get() == TransactionCommitPhase::Open && self.is_writer
     }
 
     fn has_pending_writes(&self) -> bool {
-        !self.write_set.is_empty() || self.freelist_metadata_dirty()
+        !self.finished
+            && self.commit_phase.get() == TransactionCommitPhase::Open
+            && (!self.write_set.is_empty() || self.freelist_metadata_dirty())
     }
 
     fn published_visible_commit_seq_hint(&self) -> Option<CommitSeq> {
-        Some(self.published_visible_commit_seq.get())
+        matches!(
+            self.current_commit_state(),
+            TransactionCommitState::Open | TransactionCommitState::Durable
+        )
+        .then(|| self.published_visible_commit_seq.get())
     }
 
     fn pending_commit_pages(&self) -> Result<Vec<PageNumber>> {
+        self.require_open_commit_state_for_sync_mutation()?;
         if !self.has_pending_writes() {
             return Ok(Vec::new());
         }
@@ -15477,6 +18923,7 @@ where
     }
 
     fn pending_conflict_pages(&self) -> Result<Vec<PageNumber>> {
+        self.require_open_commit_state_for_sync_mutation()?;
         if !self.has_pending_writes() {
             return Ok(Vec::new());
         }
@@ -15488,6 +18935,9 @@ where
     }
 
     fn pending_conflict_pages_conservative(&self) -> Vec<PageNumber> {
+        if self.finished || self.commit_phase.get() != TransactionCommitPhase::Open {
+            return Vec::new();
+        }
         let mut pages = Vec::with_capacity(
             self.write_pages_sorted
                 .len()
@@ -15522,7 +18972,11 @@ where
     }
 
     fn write_set_page_numbers(&self) -> Vec<PageNumber> {
-        self.write_pages_sorted.clone()
+        if !self.finished && self.commit_phase.get() == TransactionCommitPhase::Open {
+            self.write_pages_sorted.clone()
+        } else {
+            Vec::new()
+        }
     }
 
     fn page_size(&self) -> PageSize {
@@ -15531,6 +18985,7 @@ where
     }
 
     fn page_one_in_pending_commit_surface(&self) -> Result<bool> {
+        self.require_open_commit_state_for_sync_mutation()?;
         if !self.has_pending_writes() {
             return Ok(false);
         }
@@ -15542,6 +18997,7 @@ where
     }
 
     fn allocate_page_requires_page_one_conflict_tracking(&self) -> Result<bool> {
+        self.require_open_commit_state_for_sync_mutation()?;
         let inner = self
             .inner
             .lock()
@@ -15550,6 +19006,7 @@ where
     }
 
     fn free_page_requires_page_one_conflict_tracking(&self, page_no: PageNumber) -> Result<bool> {
+        self.require_open_commit_state_for_sync_mutation()?;
         let inner = self
             .inner
             .lock()
@@ -15558,6 +19015,7 @@ where
     }
 
     fn write_page_requires_page_one_conflict_tracking(&self, page_no: PageNumber) -> Result<bool> {
+        self.require_open_commit_state_for_sync_mutation()?;
         let inner = self
             .inner
             .lock()
@@ -15567,8 +19025,59 @@ where
 
     fn rollback<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
         async move {
-            if self.finished {
-                return Ok(());
+            match self.commit_phase.get() {
+                TransactionCommitPhase::Open if self.finished => {
+                    return if self.committed {
+                        Err(FrankenError::Abort)
+                    } else {
+                        Ok(())
+                    };
+                }
+                TransactionCommitPhase::Open => {}
+                TransactionCommitPhase::DirectOutcomeFinalizing { .. } => {
+                    match self.resolve_persistent_direct_commit_state().await? {
+                        TransactionCommitState::Durable => {
+                            // The exact ticket proved the direct commit
+                            // durable. A later rollback cannot truthfully
+                            // report success: its write remains committed.
+                            self.finished = true;
+                            return Err(FrankenError::Abort);
+                        }
+                        TransactionCommitState::RolledBack => {
+                            // Replay/rollback already completed by the
+                            // ticket, so this is the idempotent rollback
+                            // terminal outcome.
+                            self.finished = true;
+                            return Ok(());
+                        }
+                        TransactionCommitState::Open | TransactionCommitState::Finalizing => {
+                            return Err(FrankenError::internal(
+                                "direct commit ticket resolved without a terminal state",
+                            ));
+                        }
+                    }
+                }
+                TransactionCommitPhase::WalOutcomeFinalizing => {
+                    match self.resolve_persistent_wal_commit_state().await? {
+                        TransactionCommitState::Durable => {
+                            return Err(FrankenError::Abort);
+                        }
+                        TransactionCommitState::RolledBack => return Ok(()),
+                        TransactionCommitState::Open | TransactionCommitState::Finalizing => {
+                            return Err(FrankenError::internal(
+                                "WAL commit finalizer resolved without a terminal state",
+                            ));
+                        }
+                    }
+                }
+                TransactionCommitPhase::DurableFinalized => {
+                    self.finished = true;
+                    return Err(FrankenError::Abort);
+                }
+                TransactionCommitPhase::RolledBackFinalized => {
+                    self.finished = true;
+                    return Ok(());
+                }
             }
             self.validate_namespace_binding()?;
 
@@ -15684,6 +19193,7 @@ where
             // IMPL-3 / AG-4B: reset scratch arena so transient allocations do not
             // carry across transaction boundaries.
             self.scratch_arena.reset();
+            self.complete_commit_terminal_owner(CommitTerminalOutcome::RolledBack);
             Ok(())
         }
     }
@@ -15691,6 +19201,7 @@ where
     fn record_write_witness(&mut self, _cx: &Cx, _key: fsqlite_types::WitnessKey) {}
 
     fn savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        self.require_open_commit_state_for_sync_mutation()?;
         let inner = self
             .inner
             .lock()
@@ -15715,6 +19226,7 @@ where
     }
 
     fn release_savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        self.require_open_commit_state_for_sync_mutation()?;
         let pos = self
             .savepoint_stack
             .iter()
@@ -15727,6 +19239,7 @@ where
     }
 
     fn rollback_to_savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        self.require_open_commit_state_for_sync_mutation()?;
         let pos = self
             .savepoint_stack
             .iter()
@@ -15833,6 +19346,14 @@ where
 impl<V: Vfs> Drop for SimpleTransaction<V> {
     fn drop(&mut self) {
         if self.finished {
+            return;
+        }
+        if self.commit_phase.get() != TransactionCommitPhase::Open {
+            // A persistent ticket owns all allocator, lease, journal, and
+            // transaction-exit state once direct finalization has started.
+            // Drop cannot await that ticket and must not race it by restoring
+            // pages or releasing locks a second time; pager admission will
+            // resolve the identity-bound obligation or fail BusyRecovery.
             return;
         }
         if let Err(error) = self
@@ -16489,6 +20010,7 @@ mod tests {
 
     static FAULT_HOOK_TEST_GUARD: crate::fault_hooks::FaultInjectionSessionLock =
         crate::fault_hooks::FaultInjectionSessionLock::new();
+    static WAL_FINALIZER_TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
     const BEAD_ID: &str = "bd-bca.1";
     const DB300_E3_3_BEAD_ID: &str = "bd-db300.5.3.3";
@@ -16503,6 +20025,1809 @@ mod tests {
         ObservedLockLevel,
         ObservedUnlockTraceIds,
     );
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct TerminalResourceObservation {
+        outcome: CommitTerminalOutcome,
+        active_transactions: u32,
+        writer_active: bool,
+        maintenance_transactions: usize,
+    }
+
+    fn resource_observing_terminal_owner(
+        pager: &SimplePager<MemoryVfs>,
+        observations: &Arc<Mutex<Vec<TerminalResourceObservation>>>,
+    ) -> CommitTerminalOwner {
+        let inner = Arc::clone(&pager.inner);
+        let maintenance_gate = Arc::clone(&pager.maintenance_gate);
+        let group_commit_queue = Arc::clone(&pager.group_commit_queue);
+        let observations = Arc::clone(observations);
+        CommitTerminalOwner::new(move |outcome| {
+            let inner = inner
+                .try_lock()
+                .expect("terminal callback must not run under the pager-inner lock");
+            let active_transactions = inner.active_transactions;
+            let writer_active = inner.writer_active;
+            drop(inner);
+
+            let maintenance_state = maintenance_gate
+                .state
+                .try_lock()
+                .expect("terminal callback must not run under the maintenance-gate lock");
+            let maintenance_transactions = maintenance_state.active_transactions;
+            drop(maintenance_state);
+
+            let cleanup_queue = group_commit_queue
+                .pending_pager_cleanups
+                .try_lock()
+                .expect("terminal callback must not run under the pager-cleanup queue lock");
+            drop(cleanup_queue);
+
+            let consolidator = group_commit_queue
+                .consolidator
+                .try_lock()
+                .expect("terminal callback must not run under the consolidator lock");
+            drop(consolidator);
+
+            let wal_member_registry = group_commit_queue
+                .pending_wal_members
+                .try_lock()
+                .expect("terminal callback must not run under the WAL-member registry lock");
+            drop(wal_member_registry);
+
+            observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(TerminalResourceObservation {
+                    outcome,
+                    active_transactions,
+                    writer_active,
+                    maintenance_transactions,
+                });
+        })
+    }
+
+    async fn wal_finalizer_test_pager(cx: &Cx, label: &str) -> SimplePager<MemoryVfs> {
+        let sequence = WAL_FINALIZER_TEST_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+        let path = PathBuf::from(format!("/{label}-{sequence}.db"));
+        let pager = SimplePager::open(MemoryVfs::new(), &path, PageSize::DEFAULT)
+            .await
+            .expect("WAL finalizer test pager should open");
+        let (backend, _, _, _) = MockWalBackend::new();
+        pager
+            .set_wal_backend(Box::new(backend))
+            .expect("WAL finalizer test backend should install");
+        pager
+            .set_journal_mode(cx, JournalMode::Wal)
+            .await
+            .expect("WAL finalizer test pager should enter WAL mode");
+        pager
+    }
+
+    async fn wal_finalizer_test_transaction(
+        pager: &SimplePager<MemoryVfs>,
+        cx: &Cx,
+        fill: u8,
+    ) -> SimpleTransaction<MemoryVfs> {
+        let mut txn = pager
+            .begin(cx, TransactionMode::Concurrent)
+            .await
+            .expect("WAL finalizer test transaction should begin");
+        txn.write_page(
+            cx,
+            PageNumber::ONE,
+            &vec![fill; PageSize::DEFAULT.as_usize()],
+        )
+        .await
+        .expect("WAL finalizer test page should stage");
+        txn
+    }
+
+    fn install_test_wal_finalizer(
+        txn: &mut SimpleTransaction<MemoryVfs>,
+    ) -> (
+        TransactionFrameBatch,
+        PendingWalFinalizationHandoff<MemoryVfs>,
+    ) {
+        let (current_db_size, sync_policy) = {
+            let inner = txn
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (inner.db_size, inner.wal_commit_sync_policy)
+        };
+        txn.install_persistent_wal_commit_finalization(
+            Vec::new(),
+            Vec::new(),
+            current_db_size,
+            current_db_size,
+            sync_policy,
+            false,
+        )
+        .expect("WAL finalizer should install before physical admission")
+    }
+
+    fn assign_test_wal_batch(
+        queue: &GroupCommitQueueRef,
+        batch: TransactionFrameBatch,
+    ) -> (u64, TransactionFrameBatch) {
+        let batch_id = queue.next_parallel_wal_batch_id();
+        let frame_count = batch.frames.len();
+        (
+            batch_id,
+            batch.with_context(TransactionFrameBatchContext {
+                batch_id,
+                lane_id: 0,
+                staged_frame_count: u32::try_from(frame_count).unwrap_or(u32::MAX),
+                staging_elapsed_ns: 0,
+            }),
+        )
+    }
+
+    async fn submit_and_certify_test_wal_member(
+        cx: &Cx,
+        queue: &GroupCommitQueueRef,
+        batch: TransactionFrameBatch,
+        handoff: &mut PendingWalFinalizationHandoff<MemoryVfs>,
+    ) -> (u64, u64, ParallelWalDurabilityReceipt) {
+        let (batch_id, batch) = assign_test_wal_batch(queue, batch);
+        let (target_epoch, batches) = {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let receipt = consolidator
+                .submit_batch(batch)
+                .expect("test member should enter the consolidator");
+            handoff
+                .admission_mut()
+                .mark_submitted(queue, batch_id, receipt.target_epoch);
+            let batches = consolidator
+                .begin_flush()
+                .expect("test flusher should claim its admitted epoch");
+            (receipt.target_epoch, batches)
+        };
+        let frame_count = batches
+            .iter()
+            .map(|batch| batch.frames.len())
+            .sum::<usize>();
+        let db_size_pages = batches
+            .iter()
+            .flat_map(|batch| batch.frames.iter())
+            .filter_map(|frame| (frame.db_size_if_commit != 0).then_some(frame.db_size_if_commit))
+            .max()
+            .unwrap_or(1);
+        let publication = queue
+            .prepare_persisted_epoch(
+                cx,
+                PersistedGroupCommitInput {
+                    trace_id: cx.trace_id(),
+                    epoch: target_epoch,
+                    batches: &batches,
+                    frames_start: 1,
+                    frames_end: u64::try_from(frame_count).unwrap_or(u64::MAX),
+                    fsync_seq: 1,
+                    initial_visible_commit_seq: CommitSeq::ZERO,
+                    db_size_pages,
+                    page_set_size: frame_count,
+                    checkpoint_active: false,
+                    fallback_reason: None,
+                    authorized_seed: None,
+                    wal_frame_payload_digest: [0xA5; 32],
+                },
+            )
+            .await
+            .expect("test member publication should prepare");
+        let durability_receipt = publication
+            .finalize(queue)
+            .expect("test member publication should become durable");
+        let wake_next_epoch = {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            consolidator
+                .complete_flush()
+                .expect("test durable epoch should complete")
+        };
+        queue.publish_completed_epoch(target_epoch, wake_next_epoch);
+        handoff.finish_submission();
+        (batch_id, target_epoch, durability_receipt)
+    }
+
+    struct RecordedPagerCleanup {
+        id: u64,
+        record: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl PendingPagerCleanupOperation for RecordedPagerCleanup {
+        fn resolve(&mut self) -> LocalPagerFuture<'_, ()> {
+            Box::pin(async move {
+                self.record
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(self.id);
+                Ok(())
+            })
+        }
+    }
+
+    /// Test operation whose first asynchronously-polled resolution remains
+    /// pending until its caller is cancelled.  The exact same operation must
+    /// then be returned by `PendingPagerCleanupClaim::Drop` and completed by
+    /// the next resolver; this distinguishes an in-flight cancellation from
+    /// merely dropping an unpolled claim.
+    struct PausedPagerCleanup {
+        id: u64,
+        record: Arc<Mutex<Vec<u64>>>,
+        resolve_entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl PendingPagerCleanupOperation for PausedPagerCleanup {
+        fn resolve(&mut self) -> LocalPagerFuture<'_, ()> {
+            let id = self.id;
+            let record = Arc::clone(&self.record);
+            let resolve_entered = Arc::clone(&self.resolve_entered);
+            let release = Arc::clone(&self.release);
+            let polls = Arc::clone(&self.polls);
+            Box::pin(std::future::poll_fn(move |_| {
+                polls.fetch_add(1, AtomicOrdering::AcqRel);
+                resolve_entered.store(true, AtomicOrdering::Release);
+                if release.load(AtomicOrdering::Acquire) {
+                    record
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(id);
+                    std::task::Poll::Ready(Ok(()))
+                } else {
+                    std::task::Poll::Pending
+                }
+            }))
+        }
+    }
+
+    /// A destructor probe for the withdrawal path.  Cleanup work is
+    /// type-erased and may itself need queue state, so dropping it while the
+    /// FIFO mutex is held would turn a benign ticket withdrawal into a
+    /// reentrant deadlock.
+    struct LockProbePagerCleanup {
+        queue: Weak<GroupCommitQueue>,
+        dropped_while_fifo_locked: Arc<AtomicBool>,
+    }
+
+    impl PendingPagerCleanupOperation for LockProbePagerCleanup {
+        fn resolve(&mut self) -> LocalPagerFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl Drop for LockProbePagerCleanup {
+        fn drop(&mut self) {
+            let Some(queue) = self.queue.upgrade() else {
+                return;
+            };
+            let fifo_mutex_was_available = match queue.pending_pager_cleanups.try_lock() {
+                Ok(guard) => {
+                    drop(guard);
+                    true
+                }
+                Err(_) => false,
+            };
+            if !fifo_mutex_was_available {
+                self.dropped_while_fifo_locked
+                    .store(true, AtomicOrdering::Release);
+            }
+        }
+    }
+
+    /// Models a cleanup whose lower VFS source was accepted but has not yet
+    /// reported a terminal completion.  It lets the path-registry test drive
+    /// the exact same fail-closed admission result an opener observes without
+    /// relying on a platform-specific file-identity implementation.
+    struct CompletionGatedPagerCleanup {
+        completion: VfsWriteCompletion,
+    }
+
+    impl PendingPagerCleanupOperation for CompletionGatedPagerCleanup {
+        fn resolve(&mut self) -> LocalPagerFuture<'_, ()> {
+            Box::pin(async move {
+                if self.completion.state() == VfsWriteCompletionState::Pending {
+                    Err(FrankenError::BusyRecovery)
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn wal_finalizer_pre_submit_hard_drop_resolves_exact_rollback_once() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let pager = wal_finalizer_test_pager(&cx, "wal-finalizer-pre-submit-drop").await;
+            let observations = Arc::new(Mutex::new(Vec::new()));
+            let mut txn = wal_finalizer_test_transaction(&pager, &cx, 0x41).await;
+            txn.try_install_commit_terminal_owner(resource_observing_terminal_owner(
+                &pager,
+                &observations,
+            ))
+            .expect("terminal owner should install before WAL finalization");
+            let (_batch, handoff) = install_test_wal_finalizer(&mut txn);
+            let submission = Arc::clone(
+                txn.pending_wal_submission
+                    .as_ref()
+                    .expect("installed finalizer should expose its submission state"),
+            );
+
+            assert_eq!(submission.status(), PendingWalCommitStatus::Preparing);
+            assert_eq!(
+                pager
+                    .group_commit_queue
+                    .pending_pager_cleanup_count()
+                    .unwrap(),
+                0,
+                "a live foreground finalizer must not enter the cleanup FIFO"
+            );
+            drop(handoff);
+
+            assert!(submission.submission_complete());
+            assert_eq!(
+                submission.status(),
+                PendingWalCommitStatus::NotCommitted {
+                    batch_id: None,
+                    target_epoch: None,
+                },
+                "hard Drop before admission is exact not-committed evidence"
+            );
+            assert_eq!(
+                pager
+                    .group_commit_queue
+                    .pending_pager_cleanup_count()
+                    .unwrap(),
+                1,
+                "hard Drop must transfer the exact finalizer to the cleanup FIFO"
+            );
+            assert_eq!(
+                txn.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::RolledBack
+            );
+            assert_eq!(
+                *observations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                vec![TerminalResourceObservation {
+                    outcome: CommitTerminalOutcome::RolledBack,
+                    active_transactions: 0,
+                    writer_active: false,
+                    maintenance_transactions: 0,
+                }],
+                "resource release must precede the one terminal callback"
+            );
+            assert_eq!(
+                pager
+                    .group_commit_queue
+                    .pending_pager_cleanup_count()
+                    .unwrap(),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn wal_finalizer_submitted_waiter_hard_drop_retains_one_terminal_owner() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let pager = wal_finalizer_test_pager(&cx, "wal-finalizer-waiter-drop").await;
+            let observations = Arc::new(Mutex::new(Vec::new()));
+            let mut txn = wal_finalizer_test_transaction(&pager, &cx, 0x42).await;
+            txn.try_install_commit_terminal_owner(resource_observing_terminal_owner(
+                &pager,
+                &observations,
+            ))
+            .expect("terminal owner should install before WAL finalization");
+            let (batch, mut handoff) = install_test_wal_finalizer(&mut txn);
+            let queue = Arc::clone(&pager.group_commit_queue);
+            let submission = Arc::clone(handoff.submission());
+            let (leader_id, leader) = assign_test_wal_batch(
+                &queue,
+                TransactionFrameBatch::new(vec![FrameSubmission {
+                    page_number: 2,
+                    page_data: sample_page(0x91),
+                    db_size_if_commit: 2,
+                }]),
+            );
+            let (member_id, member) = assign_test_wal_batch(&queue, batch);
+            let target_epoch = {
+                let mut consolidator = queue
+                    .consolidator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let leader_receipt = consolidator.submit_batch(leader).unwrap();
+                assert_eq!(leader_receipt.outcome, SubmitOutcome::Flusher);
+                assert_eq!(leader_receipt.target_epoch, 1);
+                assert_ne!(leader_id, member_id);
+                let member_receipt = consolidator.submit_batch(member).unwrap();
+                assert_eq!(member_receipt.outcome, SubmitOutcome::Waiter);
+                handoff.admission_mut().mark_submitted(
+                    &queue,
+                    member_id,
+                    member_receipt.target_epoch,
+                );
+                member_receipt.target_epoch
+            };
+
+            drop(handoff);
+            assert_eq!(
+                submission.status(),
+                PendingWalCommitStatus::Submitted {
+                    batch_id: member_id,
+                    target_epoch,
+                },
+                "dropping an admitted waiter must not fabricate rollback"
+            );
+            assert_eq!(queue.pending_pager_cleanup_count().unwrap(), 1);
+
+            drop(GroupCommitFillingObligation::new(&queue, target_epoch));
+            assert!(matches!(
+                submission.status(),
+                PendingWalCommitStatus::NotCommitted {
+                    batch_id: Some(id),
+                    target_epoch: Some(epoch),
+                } if id == member_id && epoch == target_epoch
+            ));
+            assert_eq!(
+                txn.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::RolledBack
+            );
+            assert_eq!(
+                observations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_slice(),
+                &[TerminalResourceObservation {
+                    outcome: CommitTerminalOutcome::RolledBack,
+                    active_transactions: 0,
+                    writer_active: false,
+                    maintenance_transactions: 0,
+                }],
+                "the dropped waiter must complete its transferred owner once"
+            );
+            assert_eq!(queue.pending_pager_cleanup_count().unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn wal_finalizer_flusher_drop_maps_rollback_only_after_exact_abort_succeeds() {
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+        let submission = Arc::new(PendingWalCommitSubmissionState::new());
+        let mut handoff = PendingWalCommitHandoff::new(Arc::clone(&submission));
+        let target_epoch = {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let batch_id = queue.next_parallel_wal_batch_id();
+            let receipt = consolidator
+                .submit_batch(
+                    TransactionFrameBatch::new(vec![FrameSubmission {
+                        page_number: 1,
+                        page_data: sample_page(0x43),
+                        db_size_if_commit: 1,
+                    }])
+                    .with_context(TransactionFrameBatchContext {
+                        batch_id,
+                        lane_id: 0,
+                        staged_frame_count: 1,
+                        staging_elapsed_ns: 0,
+                    }),
+                )
+                .unwrap();
+            handoff.mark_submitted(&queue, batch_id, receipt.target_epoch);
+            let _ = consolidator.begin_flush().unwrap();
+            receipt.target_epoch
+        };
+        queue.publish_failed_epoch(
+            target_epoch,
+            &FrankenError::internal("generic failure is not terminal proof"),
+            false,
+        );
+        assert!(matches!(
+            submission.status(),
+            PendingWalCommitStatus::Submitted { .. }
+        ));
+        drop(GroupCommitFlushObligation::new(&queue, target_epoch));
+        assert!(matches!(
+            submission.status(),
+            PendingWalCommitStatus::NotCommitted { .. }
+        ));
+        drop(handoff);
+
+        let unresolved_queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+        let unresolved = Arc::new(PendingWalCommitSubmissionState::new());
+        let mut unresolved_handoff = PendingWalCommitHandoff::new(Arc::clone(&unresolved));
+        let unresolved_epoch = {
+            let mut consolidator = unresolved_queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let batch_id = unresolved_queue.next_parallel_wal_batch_id();
+            let receipt = consolidator
+                .submit_batch(
+                    TransactionFrameBatch::new(vec![FrameSubmission {
+                        page_number: 1,
+                        page_data: sample_page(0x44),
+                        db_size_if_commit: 1,
+                    }])
+                    .with_context(TransactionFrameBatchContext {
+                        batch_id,
+                        lane_id: 0,
+                        staged_frame_count: 1,
+                        staging_elapsed_ns: 0,
+                    }),
+                )
+                .unwrap();
+            unresolved_handoff.mark_submitted(&unresolved_queue, batch_id, receipt.target_epoch);
+            receipt.target_epoch
+        };
+        unresolved_queue.publish_failed_epoch(unresolved_epoch, &FrankenError::Abort, false);
+        drop(GroupCommitFlushObligation::new(
+            &unresolved_queue,
+            unresolved_epoch,
+        ));
+        assert!(matches!(
+            unresolved.status(),
+            PendingWalCommitStatus::Submitted { .. }
+        ));
+        drop(GroupCommitFillingObligation::new(
+            &unresolved_queue,
+            unresolved_epoch,
+        ));
+        assert!(matches!(
+            unresolved.status(),
+            PendingWalCommitStatus::NotCommitted { .. }
+        ));
+        drop(unresolved_handoff);
+    }
+
+    #[test]
+    fn wal_finalizer_live_submitted_member_survives_epoch_history_pruning() {
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+        let submission = Arc::new(PendingWalCommitSubmissionState::new());
+        let mut handoff = PendingWalCommitHandoff::new(Arc::clone(&submission));
+        let target_epoch = {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let batch_id = queue.next_parallel_wal_batch_id();
+            let receipt = consolidator
+                .submit_batch(
+                    TransactionFrameBatch::new(vec![FrameSubmission {
+                        page_number: 1,
+                        page_data: sample_page(0x5A),
+                        db_size_if_commit: 1,
+                    }])
+                    .with_context(TransactionFrameBatchContext {
+                        batch_id,
+                        lane_id: 0,
+                        staged_frame_count: 1,
+                        staging_elapsed_ns: 0,
+                    }),
+                )
+                .expect("test member should enter the consolidator");
+            handoff.mark_submitted(&queue, batch_id, receipt.target_epoch);
+            receipt.target_epoch
+        };
+        let filling_obligation = GroupCommitFillingObligation::new(&queue, target_epoch);
+
+        queue.prune_stale_epoch_metadata(target_epoch.saturating_add(129));
+        assert!(
+            queue
+                .pending_wal_members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&target_epoch),
+            "live terminal-evidence routing must not inherit diagnostic-history retention"
+        );
+
+        drop(filling_obligation);
+        assert!(
+            matches!(
+                submission.status(),
+                PendingWalCommitStatus::NotCommitted {
+                    batch_id: Some(_),
+                    target_epoch: Some(epoch),
+                } if epoch == target_epoch
+            ),
+            "the retained live member must receive exact successful-abort evidence"
+        );
+        handoff.finish_submission();
+        drop(handoff);
+    }
+
+    #[test]
+    fn wal_finalizer_durable_receipt_survives_drop_and_epoch_history_pruning() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let pager = wal_finalizer_test_pager(&cx, "wal-finalizer-durable-drop").await;
+            let observations = Arc::new(Mutex::new(Vec::new()));
+            let mut txn = wal_finalizer_test_transaction(&pager, &cx, 0x45).await;
+            txn.try_install_commit_terminal_owner(resource_observing_terminal_owner(
+                &pager,
+                &observations,
+            ))
+            .expect("terminal owner should install before WAL finalization");
+            let (batch, mut handoff) = install_test_wal_finalizer(&mut txn);
+            let queue = Arc::clone(&pager.group_commit_queue);
+            let (batch_id, target_epoch, receipt) =
+                submit_and_certify_test_wal_member(&cx, &queue, batch, &mut handoff).await;
+            assert_eq!(
+                handoff
+                    .submission()
+                    .durable_authorization()
+                    .unwrap()
+                    .expect("member should retain its certificate")
+                    .assigned_commit_seq,
+                receipt
+                    .commit_seq_for_batch(batch_id)
+                    .expect("receipt should contain the exact member")
+            );
+            assert!(queue.persisted_epoch_for(target_epoch).is_some());
+
+            queue.prune_stale_epoch_metadata(target_epoch.saturating_add(129));
+            assert!(
+                queue.persisted_epoch_for(target_epoch).is_none(),
+                "bounded queue history should be pruned in this scenario"
+            );
+            assert!(
+                handoff
+                    .submission()
+                    .durable_authorization()
+                    .unwrap()
+                    .is_some(),
+                "the FIFO member must own durable proof independently of bounded history"
+            );
+
+            drop(handoff);
+            assert_eq!(
+                txn.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::Durable,
+                "certificate membership must win after hard Drop before member Phase C"
+            );
+            assert_eq!(
+                observations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_slice(),
+                &[TerminalResourceObservation {
+                    outcome: CommitTerminalOutcome::Durable,
+                    active_transactions: 0,
+                    writer_active: false,
+                    maintenance_transactions: 0,
+                }],
+                "durable terminal callback must run once after resource exit"
+            );
+        });
+    }
+
+    #[test]
+    fn wal_finalizer_durable_metadata_drop_retry_does_not_double_count_commit() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let pager = wal_finalizer_test_pager(&cx, "wal-finalizer-metadata-retry").await;
+            let mut txn = wal_finalizer_test_transaction(&pager, &cx, 0x46).await;
+            let (batch, mut handoff) = install_test_wal_finalizer(&mut txn);
+            let queue = Arc::clone(&pager.group_commit_queue);
+            let _ = submit_and_certify_test_wal_member(&cx, &queue, batch, &mut handoff).await;
+            let (db_file, initial_visible_wal_commits) = {
+                let inner = txn
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (
+                    Arc::clone(&inner.db_file),
+                    inner.committed_wal_visible_commit_count,
+                )
+            };
+            let held_file = db_file
+                .try_write()
+                .expect("test should hold the database-file write guard");
+
+            let mut first_resolution = Box::pin(handoff.resolve_locally());
+            let waker = std::task::Waker::noop();
+            let mut task_cx = std::task::Context::from_waker(waker);
+            assert!(
+                Future::poll(first_resolution.as_mut(), &mut task_cx).is_pending(),
+                "durable metadata should pause before mutation while the file handle is held"
+            );
+            drop(first_resolution);
+            assert_eq!(
+                handoff
+                    .finalization
+                    .as_ref()
+                    .expect("local finalizer should remain owned")
+                    .state,
+                PersistentWalCommitState::DurableMetadata
+            );
+            drop(held_file);
+            assert_eq!(
+                txn.inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .committed_wal_visible_commit_count,
+                initial_visible_wal_commits,
+                "no replay-visible metadata may change before the awaited file read"
+            );
+
+            handoff
+                .resolve_locally()
+                .await
+                .expect("retry should finish the same durable member");
+            assert_eq!(
+                txn.inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .committed_wal_visible_commit_count,
+                initial_visible_wal_commits.saturating_add(1),
+                "retry must account the member exactly once"
+            );
+            handoff.finish_terminal();
+            assert_eq!(
+                txn.apply_wal_terminal_resolution_to_handle().unwrap(),
+                TransactionCommitState::Durable
+            );
+        });
+    }
+
+    #[test]
+    fn wal_finalizer_ordinary_live_members_do_not_enter_cleanup_fifo_or_block_each_other() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let pager = wal_finalizer_test_pager(&cx, "wal-finalizer-live-members").await;
+            let queue = Arc::clone(&pager.group_commit_queue);
+            let mut first = wal_finalizer_test_transaction(&pager, &cx, 0x47).await;
+            let mut second = wal_finalizer_test_transaction(&pager, &cx, 0x48).await;
+            let (first_batch, mut first_handoff) = install_test_wal_finalizer(&mut first);
+            let (second_batch, mut second_handoff) = install_test_wal_finalizer(&mut second);
+            let (first_id, first_batch) = assign_test_wal_batch(&queue, first_batch);
+            let (second_id, second_batch) = assign_test_wal_batch(&queue, second_batch);
+            let target_epoch = {
+                let mut consolidator = queue
+                    .consolidator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let first_receipt = consolidator.submit_batch(first_batch).unwrap();
+                assert_eq!(first_receipt.outcome, SubmitOutcome::Flusher);
+                first_handoff.admission_mut().mark_submitted(
+                    &queue,
+                    first_id,
+                    first_receipt.target_epoch,
+                );
+                let second_receipt = consolidator.submit_batch(second_batch).unwrap();
+                assert_eq!(second_receipt.outcome, SubmitOutcome::Waiter);
+                assert_eq!(second_receipt.target_epoch, first_receipt.target_epoch);
+                second_handoff.admission_mut().mark_submitted(
+                    &queue,
+                    second_id,
+                    second_receipt.target_epoch,
+                );
+                first_receipt.target_epoch
+            };
+            first_handoff.finish_submission();
+            second_handoff.finish_submission();
+
+            assert_eq!(queue.pending_pager_cleanup_count().unwrap(), 0);
+            assert!(
+                !queue.has_pending_or_claimed_pager_cleanup(),
+                "ordinary admitted members must not acquire FIFO admission blockers"
+            );
+            for ticket_slot in [
+                first
+                    .pending_wal_cleanup_ticket
+                    .as_ref()
+                    .expect("first ticket slot"),
+                second
+                    .pending_wal_cleanup_ticket
+                    .as_ref()
+                    .expect("second ticket slot"),
+            ] {
+                assert!(
+                    ticket_slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_none(),
+                    "a live local finalizer must not allocate a cleanup ticket"
+                );
+            }
+
+            drop(GroupCommitFillingObligation::new(&queue, target_epoch));
+            first_handoff.resolve_locally().await.unwrap();
+            second_handoff.resolve_locally().await.unwrap();
+            first_handoff.finish_terminal();
+            second_handoff.finish_terminal();
+            assert_eq!(
+                first.apply_wal_terminal_resolution_to_handle().unwrap(),
+                TransactionCommitState::RolledBack
+            );
+            assert_eq!(
+                second.apply_wal_terminal_resolution_to_handle().unwrap(),
+                TransactionCommitState::RolledBack
+            );
+            assert_eq!(queue.pending_pager_cleanup_count().unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn pager_cleanup_fifo_requeues_claim_without_overtake() {
+        asupersync::test_utils::run_test(|| async {
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let record = Arc::new(Mutex::new(Vec::new()));
+            let enqueue = |id| {
+                queue.enqueue_pending_pager_cleanup(PendingPagerCleanup::new(Box::new(
+                    RecordedPagerCleanup {
+                        id,
+                        record: Arc::clone(&record),
+                    },
+                )))
+            };
+
+            let first = enqueue(1);
+            let second = enqueue(2);
+            let third = enqueue(3);
+            assert_eq!(first, PagerCleanupId(1));
+            assert_eq!(second, PagerCleanupId(2));
+            assert_eq!(third, PagerCleanupId(3));
+
+            // A cancelled claimant owns only ticket one. Its Drop returns
+            // that exact ticket to the ordered FIFO map; ticket two must not
+            // pass it even though its New record is already queued.
+            let claim = queue
+                .claim_pending_pager_cleanup()
+                .expect("claim state")
+                .expect("first cleanup claim");
+            drop(claim);
+            queue
+                .resolve_pager_cleanups_through(third)
+                .await
+                .expect("all cleanup tickets resolve in FIFO order");
+
+            assert_eq!(
+                *record
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                vec![1, 2, 3]
+            );
+            assert_eq!(queue.pending_pager_cleanup_count().unwrap(), 0);
+            assert_eq!(queue.claimed_pager_cleanup_count().unwrap(), 0);
+            assert!(queue.pager_cleanup_ticket_completed(first).unwrap());
+            assert!(queue.pager_cleanup_ticket_completed(third).unwrap());
+        });
+    }
+
+    #[test]
+    fn pager_cleanup_cancelled_inflight_resolver_requeues_exact_ticket_fifo() {
+        asupersync::test_utils::run_test(|| async {
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let record = Arc::new(Mutex::new(Vec::new()));
+            let resolve_entered = Arc::new(AtomicBool::new(false));
+            let release = Arc::new(AtomicBool::new(false));
+            let polls = Arc::new(AtomicUsize::new(0));
+
+            let first = queue.enqueue_pending_pager_cleanup(PendingPagerCleanup::new(Box::new(
+                PausedPagerCleanup {
+                    id: 1,
+                    record: Arc::clone(&record),
+                    resolve_entered: Arc::clone(&resolve_entered),
+                    release: Arc::clone(&release),
+                    polls: Arc::clone(&polls),
+                },
+            )));
+            let second = queue.enqueue_pending_pager_cleanup(PendingPagerCleanup::new(Box::new(
+                RecordedPagerCleanup {
+                    id: 2,
+                    record: Arc::clone(&record),
+                },
+            )));
+
+            let mut claim = queue
+                .claim_pending_pager_cleanup()
+                .expect("claim queue state")
+                .expect("first cleanup claim");
+            assert_eq!(claim.id, first);
+
+            // This is the important cancellation boundary: poll the actual
+            // claim resolver until the operation is in flight, rather than
+            // testing only an unpolled claim Drop.
+            let mut resolver = Box::pin(claim.resolve());
+            let waker = std::task::Waker::noop();
+            let mut task_context = std::task::Context::from_waker(waker);
+            assert!(matches!(
+                Future::poll(resolver.as_mut(), &mut task_context),
+                std::task::Poll::Pending
+            ));
+            assert!(resolve_entered.load(AtomicOrdering::Acquire));
+            assert_eq!(polls.load(AtomicOrdering::Acquire), 1);
+            assert_eq!(queue.claimed_pager_cleanup_count().unwrap(), 1);
+            assert!(queue.has_pending_or_claimed_pager_cleanup());
+
+            // Cancelling the resolver releases its borrow before the claim
+            // itself drops.  Claim Drop must atomically replace `active` with
+            // ticket one in the ordered map, leaving ticket two unable to
+            // overtake it.
+            drop(resolver);
+            drop(claim);
+            {
+                let state = queue
+                    .pending_pager_cleanups
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert_eq!(state.active, None);
+                assert_eq!(
+                    state.queued.keys().copied().collect::<Vec<_>>(),
+                    vec![first, second],
+                    "the cancelled in-flight ticket must be requeued exactly once ahead of its successor"
+                );
+                assert!(state.quarantined.is_empty());
+            }
+
+            release.store(true, AtomicOrdering::Release);
+            queue
+                .resolve_pager_cleanups_through(second)
+                .await
+                .expect("the next resolver completes the requeued FIFO prefix");
+
+            assert_eq!(
+                *record
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                vec![1, 2],
+                "the cancelled operation must complete once, before its successor"
+            );
+            assert_eq!(polls.load(AtomicOrdering::Acquire), 2);
+            assert_eq!(queue.pending_pager_cleanup_count().unwrap(), 0);
+            assert_eq!(queue.claimed_pager_cleanup_count().unwrap(), 0);
+            assert!(queue.pager_cleanup_ticket_completed(first).unwrap());
+            assert!(queue.pager_cleanup_ticket_completed(second).unwrap());
+        });
+    }
+
+    #[test]
+    fn pager_cleanup_quarantines_duplicate_inbox_record_without_dropping_it() {
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+        let record = Arc::new(Mutex::new(Vec::new()));
+        let first = queue.enqueue_pending_pager_cleanup(PendingPagerCleanup::new(Box::new(
+            RecordedPagerCleanup {
+                id: 1,
+                record: Arc::clone(&record),
+            },
+        )));
+
+        // The atomic ticket source makes this impossible for normal
+        // producers.  Inject it here to prove a malformed popped record stays
+        // owned by the queue instead of being dropped on the error path.
+        queue.publish_pager_cleanup_inbox_entry(PagerCleanupInboxEntry::New(
+            first,
+            PendingPagerCleanup::new(Box::new(RecordedPagerCleanup { id: 99, record })),
+        ));
+
+        assert!(queue.claim_pending_pager_cleanup().is_err());
+        {
+            let state = queue
+                .pending_pager_cleanups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(state.queued.len(), 1);
+            assert_eq!(state.quarantined.len(), 1);
+            assert_eq!(state.quarantined[0].0, first);
+            assert!(state.quarantine_detail.is_some());
+        }
+        assert!(queue.has_pending_or_claimed_pager_cleanup());
+    }
+
+    #[test]
+    fn pager_cleanup_issued_ticket_blocks_admission_before_inbox_publication() {
+        asupersync::test_utils::run_test(|| async {
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let record = Arc::new(Mutex::new(Vec::new()));
+
+            // Model the exact producer interval after the monotonic id is
+            // reserved but before its lock-free inbox record is published.
+            // Writer admission must fail closed during that interval; merely
+            // inspecting `active` and the drained map would return false.
+            let ticket = queue.next_pager_cleanup_id();
+            assert_eq!(ticket, PagerCleanupId(1));
+            assert!(queue.has_pending_or_claimed_pager_cleanup());
+            assert!(
+                queue
+                    .claim_pending_pager_cleanup()
+                    .expect("issued watermark is not an inbox corruption")
+                    .is_none(),
+                "a claimant cannot run an obligation before its producer publishes it"
+            );
+
+            queue.publish_pager_cleanup_inbox_entry(PagerCleanupInboxEntry::New(
+                ticket,
+                PendingPagerCleanup::new(Box::new(RecordedPagerCleanup { id: 1, record })),
+            ));
+            queue
+                .resolve_pager_cleanups_through(ticket)
+                .await
+                .expect("published ticket resolves");
+            assert!(!queue.has_pending_or_claimed_pager_cleanup());
+        });
+    }
+
+    #[test]
+    fn pager_cleanup_withdrawal_keeps_fifo_progress_without_running_reclaimed_work() {
+        asupersync::test_utils::run_test(|| async {
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let record = Arc::new(Mutex::new(Vec::new()));
+            let enqueue = |id| {
+                queue.enqueue_pending_pager_cleanup(PendingPagerCleanup::new(Box::new(
+                    RecordedPagerCleanup {
+                        id,
+                        record: Arc::clone(&record),
+                    },
+                )))
+            };
+
+            let first = enqueue(1);
+            let withdrawn = enqueue(2);
+            let third = enqueue(3);
+
+            assert_eq!(
+                queue
+                    .withdraw_pending_pager_cleanup(withdrawn)
+                    .expect("withdraw queued ticket"),
+                PagerCleanupWithdrawal::Withdrawn
+            );
+
+            queue
+                .resolve_pager_cleanups_through(third)
+                .await
+                .expect("later ticket must advance past the reclaimed predecessor");
+
+            assert_eq!(
+                *record
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                vec![1, 3],
+                "withdrawn ticket must not be resolved as cleanup work"
+            );
+            assert!(queue.pager_cleanup_ticket_completed(first).unwrap());
+            assert!(queue.pager_cleanup_ticket_completed(withdrawn).unwrap());
+            assert!(queue.pager_cleanup_ticket_completed(third).unwrap());
+            assert_eq!(queue.pending_pager_cleanup_count().unwrap(), 0);
+            assert_eq!(queue.claimed_pager_cleanup_count().unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn pager_cleanup_withdrawal_drops_type_erased_operation_after_fifo_unlock() {
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+        let dropped_while_fifo_locked = Arc::new(AtomicBool::new(false));
+        let ticket = queue.enqueue_pending_pager_cleanup(PendingPagerCleanup::new(Box::new(
+            LockProbePagerCleanup {
+                queue: Arc::downgrade(&queue),
+                dropped_while_fifo_locked: Arc::clone(&dropped_while_fifo_locked),
+            },
+        )));
+
+        assert_eq!(
+            queue
+                .withdraw_pending_pager_cleanup(ticket)
+                .expect("withdraw the unclaimed probe ticket"),
+            PagerCleanupWithdrawal::Withdrawn
+        );
+        assert!(
+            !dropped_while_fifo_locked.load(AtomicOrdering::Acquire),
+            "withdrawing a type-erased operation must release the FIFO mutex before its destructor runs"
+        );
+    }
+
+    #[test]
+    fn path_queue_removal_retains_pending_source_for_reopen_then_releases_after_terminal() {
+        asupersync::test_utils::run_test(|| async {
+            let path = PathBuf::from("/path-queue-pending-source-retention.db");
+            // Isolate this path from an earlier run in the process-wide map.
+            remove_group_commit_queue(&path);
+            let queue = group_commit_queue_for_path(&path);
+            let source_completion = VfsWriteCompletion::new();
+            let ticket = queue.enqueue_pending_pager_cleanup(PendingPagerCleanup::new(Box::new(
+                CompletionGatedPagerCleanup {
+                    completion: source_completion.clone(),
+                },
+            )));
+
+            // This models `Connection::close_internal` seeing its last
+            // connection.  Path-keyed backends have no identity registry to
+            // fall back on, so removal must leave the exact queue published.
+            remove_group_commit_queue(&path);
+            let reopened_queue = group_commit_queue_for_path(&path);
+            assert!(Arc::ptr_eq(&queue, &reopened_queue));
+            let reopen_error = reopened_queue
+                .resolve_pager_cleanups_before_open()
+                .await
+                .expect_err(
+                    "path-based reopen must fail closed while source completion is pending",
+                );
+            assert!(matches!(reopen_error, FrankenError::BusyRecovery));
+            assert!(reopened_queue.has_pending_or_claimed_pager_cleanup());
+            assert!(
+                !reopened_queue
+                    .pager_cleanup_ticket_completed(ticket)
+                    .unwrap()
+            );
+
+            assert!(source_completion.complete_success());
+            reopened_queue
+                .resolve_pager_cleanups_before_open()
+                .await
+                .expect("terminal source lets the exact path queue resolve before reopen");
+            assert!(
+                reopened_queue
+                    .pager_cleanup_ticket_completed(ticket)
+                    .unwrap()
+            );
+            assert!(!reopened_queue.has_pending_or_claimed_pager_cleanup());
+
+            // Once terminal, last-close removal may discard the stale path
+            // entry. Keeping external Arcs alive here proves this is registry
+            // removal rather than merely Arc destruction.
+            remove_group_commit_queue(&path);
+            let replacement_queue = group_commit_queue_for_path(&path);
+            assert!(
+                !Arc::ptr_eq(&queue, &replacement_queue),
+                "terminal path queue must be removable so a recreated database does not inherit stale epochs"
+            );
+            drop(replacement_queue);
+            remove_group_commit_queue(&path);
+        });
+    }
+
+    #[test]
+    fn pager_cleanup_withdrawal_refuses_an_active_ticket_until_claim_relinquishes_it() {
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+        let record = Arc::new(Mutex::new(Vec::new()));
+        let ticket = queue.enqueue_pending_pager_cleanup(PendingPagerCleanup::new(Box::new(
+            RecordedPagerCleanup { id: 1, record },
+        )));
+        let claim = queue
+            .claim_pending_pager_cleanup()
+            .expect("claim queue state")
+            .expect("claim ticket");
+
+        assert_eq!(
+            queue
+                .withdraw_pending_pager_cleanup(ticket)
+                .expect("active check"),
+            PagerCleanupWithdrawal::Active,
+            "a pre-hot caller must not restore resources while another owner has the ticket"
+        );
+
+        drop(claim);
+        assert_eq!(
+            queue
+                .withdraw_pending_pager_cleanup(ticket)
+                .expect("withdraw after claim Drop requeues it"),
+            PagerCleanupWithdrawal::Withdrawn
+        );
+    }
+
+    #[test]
+    fn direct_submission_error_completion_requires_conservative_recovery_classification() {
+        let submission = Arc::new(PendingDirectCommitSubmissionState::new());
+        let mut handoff = PendingDirectCommitHandoff::new(Arc::clone(&submission));
+
+        // Model the first rollback-journal header submission.  The status
+        // changes before the VFS future is polled, because a native VFS source
+        // may continue that write after its observer is cancelled.
+        handoff.mark_recovery_required();
+        let completion = submission.register_write_completion();
+        handoff.finish_submission();
+
+        assert!(submission.has_pending_write_completion());
+        assert_eq!(
+            submission.status(),
+            PendingDirectCommitStatus::RecoveryRequired,
+            "a registered recovery-visible write may not remain eligible for Abandoned"
+        );
+        assert!(
+            !handoff.can_reclaim_pre_hot(),
+            "a source-owned write prevents returning the ticket's state to the caller"
+        );
+
+        // An error only proves that the source became terminal.  It does not
+        // prove that it wrote zero bytes, so it must not convert directly to
+        // either `Abandoned` or `Durable`; the queue resolver must inspect
+        // the on-disk journal state next.
+        assert!(completion.complete_error());
+        assert!(!submission.has_pending_write_completion());
+        assert_eq!(
+            submission.status(),
+            PendingDirectCommitStatus::RecoveryRequired,
+            "terminal VFS error is not a direct rollback or durability proof"
+        );
+        assert!(!submission.direct_db_durable());
+        assert!(
+            !handoff.can_reclaim_pre_hot(),
+            "terminal error still requires journal classification rather than pre-hot reclaim"
+        );
+
+        drop(handoff);
+        assert_eq!(
+            submission.status(),
+            PendingDirectCommitStatus::RecoveryRequired,
+            "handoff Drop must not downgrade a recovery-visible ticket to Abandoned"
+        );
+    }
+
+    #[test]
+    fn simple_transaction_commit_state_tracks_open_and_terminal_paths() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+
+            let mut committed = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(committed.commit_state(), TransactionCommitState::Open);
+            assert_eq!(
+                committed.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::Open
+            );
+            committed.commit(&cx).await.unwrap();
+            assert_eq!(committed.commit_state(), TransactionCommitState::Durable);
+            committed
+                .commit(&cx)
+                .await
+                .expect("ordinary durable commit must be idempotent");
+            assert!(
+                !committed.commit_and_retain(&cx).await.unwrap(),
+                "an already terminal durable transaction cannot be retained"
+            );
+            assert!(matches!(
+                committed.rollback(&cx).await,
+                Err(FrankenError::Abort)
+            ));
+            assert!(matches!(
+                committed.get_page(&cx, PageNumber::ONE).await,
+                Err(FrankenError::Abort)
+            ));
+            assert!(matches!(
+                committed.allocate_page(&cx).await,
+                Err(FrankenError::Abort)
+            ));
+            assert!(matches!(
+                committed.savepoint(&cx, "terminal"),
+                Err(FrankenError::Abort)
+            ));
+            assert!(matches!(
+                committed.pending_commit_pages(),
+                Err(FrankenError::Abort)
+            ));
+            assert!(
+                committed.published_visible_commit_seq_hint().is_some(),
+                "a durable transaction may still report its published sequence"
+            );
+            assert_eq!(
+                committed.commit_state(),
+                TransactionCommitState::Durable,
+                "terminal access must not overwrite an ordinary durable state"
+            );
+
+            let mut rolled_back = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            rolled_back.rollback(&cx).await.unwrap();
+            assert_eq!(
+                rolled_back.commit_state(),
+                TransactionCommitState::RolledBack
+            );
+            assert_eq!(
+                rolled_back.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::RolledBack
+            );
+            rolled_back
+                .rollback(&cx)
+                .await
+                .expect("ordinary rollback must be idempotent");
+            assert!(matches!(
+                rolled_back.commit(&cx).await,
+                Err(FrankenError::Abort)
+            ));
+            assert!(matches!(
+                rolled_back.commit_and_retain(&cx).await,
+                Err(FrankenError::Abort)
+            ));
+            assert!(matches!(
+                rolled_back.get_page(&cx, PageNumber::ONE).await,
+                Err(FrankenError::Abort)
+            ));
+            assert!(matches!(
+                rolled_back.allocate_page(&cx).await,
+                Err(FrankenError::Abort)
+            ));
+            assert!(matches!(
+                rolled_back.savepoint(&cx, "terminal"),
+                Err(FrankenError::Abort)
+            ));
+            assert!(matches!(
+                rolled_back.pending_commit_pages(),
+                Err(FrankenError::Abort)
+            ));
+            assert!(
+                rolled_back.published_visible_commit_seq_hint().is_none(),
+                "a rolled-back transaction has no published commit sequence"
+            );
+            assert_eq!(
+                rolled_back.commit_state(),
+                TransactionCommitState::RolledBack,
+                "terminal access must not overwrite an ordinary rolled-back state"
+            );
+        });
+    }
+
+    #[test]
+    fn direct_durable_ticket_resolves_to_typed_terminal_state() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let committed_db_size = txn
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .db_size;
+            let mut handoff = txn.install_persistent_direct_commit_finalization(
+                &[],
+                &[],
+                committed_db_size,
+                false,
+            );
+            handoff.mark_durable();
+            handoff.finish_submission();
+            drop(handoff);
+
+            assert_eq!(
+                txn.commit_state(),
+                TransactionCommitState::Finalizing,
+                "a terminal source still requires exact ticket adoption by the handle"
+            );
+            assert_eq!(
+                txn.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::Durable
+            );
+            assert_eq!(txn.commit_state(), TransactionCommitState::Durable);
+            assert_eq!(
+                txn.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::Durable
+            );
+        });
+    }
+
+    #[test]
+    fn direct_terminal_error_with_nonhot_journal_and_no_main_mutation_rolls_back() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let committed_db_size = {
+                txn.inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .db_size
+            };
+            let abandoned_eof_page = PageNumber::new(committed_db_size.saturating_add(1)).unwrap();
+            let abandoned_lease_page =
+                PageNumber::new(committed_db_size.saturating_add(2)).unwrap();
+            let mut handoff = txn.install_persistent_direct_commit_finalization(
+                &[abandoned_eof_page, abandoned_lease_page],
+                &[],
+                committed_db_size,
+                false,
+            );
+            let submission = txn
+                .pending_direct_submission
+                .as_ref()
+                .expect("direct ticket retains submission state")
+                .clone();
+
+            // Model the first zero-magic header source: it reached terminal
+            // Error after creating a non-hot journal prefix, but before the
+            // first main-database write was submitted.  The resolver must
+            // inspect that file and finish a definite rollback, not infer
+            // Durable and not retain BusyRecovery indefinitely.
+            handoff.mark_recovery_required();
+            let completion = submission.register_write_completion();
+            handoff.finish_submission();
+            let journal_path = txn.journal_path.clone();
+            let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+            let (mut journal, _) = txn.vfs.open(&cx, Some(&journal_path), flags).unwrap();
+            journal.write(&cx, &[0], 0).await.unwrap();
+            journal.close(&cx).unwrap();
+            assert!(completion.complete_error());
+            drop(handoff);
+
+            assert_eq!(
+                txn.commit_state(),
+                TransactionCommitState::Finalizing,
+                "installing the direct ticket must expose a typed in-doubt state"
+            );
+            cx.cancel();
+            let outcome = txn
+                .resolve_commit_state(&cx)
+                .await
+                .expect("mandatory ticket resolution must ignore caller cancellation");
+            assert_eq!(outcome, TransactionCommitState::RolledBack);
+            assert_eq!(txn.commit_state(), TransactionCommitState::RolledBack);
+            assert_eq!(
+                txn.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::RolledBack,
+                "terminal typed resolution must be idempotent"
+            );
+            assert!(matches!(
+                txn.commit_phase.get(),
+                TransactionCommitPhase::RolledBackFinalized
+            ));
+            {
+                let inner = txn
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert_eq!(inner.db_size, committed_db_size);
+                assert_eq!(
+                    inner.next_page,
+                    committed_db_size.max(1).saturating_add(1).max(2),
+                    "non-concurrent rollback must rewind allocation to the original EOF"
+                );
+                assert!(
+                    !inner.freelist.contains(&abandoned_eof_page)
+                        && !inner.freelist.contains(&abandoned_lease_page),
+                    "unused EOF and lease pages above the restored extent must not enter the freelist"
+                );
+            }
+            assert!(
+                !txn.vfs
+                    .access(&cx, &journal_path, AccessFlags::EXISTS)
+                    .unwrap(),
+                "rollback exit deletes the non-hot journal after classification"
+            );
+        });
+    }
+
+    #[test]
+    fn direct_terminal_owner_success_is_exact_once_after_phase_c_and_resource_release() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let observations = Arc::new(Mutex::new(Vec::new()));
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            txn.try_install_commit_terminal_owner(resource_observing_terminal_owner(
+                &pager,
+                &observations,
+            ))
+            .unwrap();
+            let committed_db_size = txn
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .db_size;
+            let mut handoff = txn.install_persistent_direct_commit_finalization(
+                &[],
+                &[],
+                committed_db_size,
+                false,
+            );
+
+            assert!(matches!(
+                txn.resolve_commit_state(&cx).await,
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(
+                observations.lock().unwrap().is_empty(),
+                "a retryable finalization attempt must retain the owner"
+            );
+
+            handoff.mark_durable();
+            handoff.finish_submission();
+            drop(handoff);
+            assert_eq!(
+                txn.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::Durable
+            );
+            assert_eq!(
+                txn.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::Durable
+            );
+            assert_eq!(
+                *observations.lock().unwrap(),
+                [TerminalResourceObservation {
+                    outcome: CommitTerminalOutcome::Durable,
+                    active_transactions: 0,
+                    writer_active: false,
+                    maintenance_transactions: 0,
+                }]
+            );
+        });
+    }
+
+    #[test]
+    fn terminal_owner_ordinary_drop_does_not_infer_rollback() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let dropped_observations = Arc::new(Mutex::new(Vec::new()));
+            let mut dropped = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            dropped
+                .try_install_commit_terminal_owner(resource_observing_terminal_owner(
+                    &pager,
+                    &dropped_observations,
+                ))
+                .unwrap();
+            drop(dropped);
+            assert!(
+                dropped_observations.lock().unwrap().is_empty(),
+                "ordinary Drop must not invent a conclusive rollback outcome"
+            );
+
+            let rollback_observations = Arc::new(Mutex::new(Vec::new()));
+            let mut explicit = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            explicit
+                .try_install_commit_terminal_owner(resource_observing_terminal_owner(
+                    &pager,
+                    &rollback_observations,
+                ))
+                .unwrap();
+            explicit.rollback(&cx).await.unwrap();
+            explicit.rollback(&cx).await.unwrap();
+            assert_eq!(
+                *rollback_observations.lock().unwrap(),
+                [TerminalResourceObservation {
+                    outcome: CommitTerminalOutcome::RolledBack,
+                    active_transactions: 0,
+                    writer_active: false,
+                    maintenance_transactions: 0,
+                }]
+            );
+        });
+    }
+
+    #[test]
+    fn direct_terminal_owner_pre_hot_reclaim_restores_exact_owner_for_retry() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let observations = Arc::new(Mutex::new(Vec::new()));
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            txn.try_install_commit_terminal_owner(resource_observing_terminal_owner(
+                &pager,
+                &observations,
+            ))
+            .unwrap();
+            let committed_db_size = txn
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .db_size;
+            let mut first_handoff = txn.install_persistent_direct_commit_finalization(
+                &[],
+                &[],
+                committed_db_size,
+                false,
+            );
+            first_handoff.finish_submission();
+            let first_ticket = match txn.commit_phase.get() {
+                TransactionCommitPhase::DirectOutcomeFinalizing { ticket } => ticket,
+                other => panic!("expected provisional direct ticket, got {other:?}"),
+            };
+            let inner = Arc::clone(&txn.inner);
+            let mut inner = inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            txn.reclaim_pre_hot_direct_commit(first_ticket, &mut first_handoff, &mut inner)
+                .unwrap();
+            drop(inner);
+            drop(first_handoff);
+
+            assert_eq!(txn.commit_state(), TransactionCommitState::Open);
+            assert!(
+                txn.commit_terminal_owner.is_some(),
+                "pre-hot withdrawal must restore the exact owner to the live transaction"
+            );
+            assert!(
+                observations.lock().unwrap().is_empty(),
+                "pre-hot failure is not a terminal outcome"
+            );
+
+            let mut retry_handoff = txn.install_persistent_direct_commit_finalization(
+                &[],
+                &[],
+                committed_db_size,
+                false,
+            );
+            assert!(
+                txn.commit_terminal_owner.is_none(),
+                "retry must transfer the restored owner back to its exact ticket"
+            );
+            retry_handoff.mark_durable();
+            retry_handoff.finish_submission();
+            drop(retry_handoff);
+            assert_eq!(
+                txn.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::Durable
+            );
+            assert_eq!(
+                *observations.lock().unwrap(),
+                [TerminalResourceObservation {
+                    outcome: CommitTerminalOutcome::Durable,
+                    active_transactions: 0,
+                    writer_active: false,
+                    maintenance_transactions: 0,
+                }]
+            );
+        });
+    }
+
+    #[test]
+    fn direct_terminal_owner_recovery_outcomes_are_exact_once_after_cleanup() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let observations = Arc::new(Mutex::new(Vec::new()));
+
+            let mut rolled_back = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            rolled_back
+                .try_install_commit_terminal_owner(resource_observing_terminal_owner(
+                    &pager,
+                    &observations,
+                ))
+                .unwrap();
+            let (committed_db_size, page_size) = {
+                let inner = rolled_back
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (inner.db_size, inner.page_size)
+            };
+            let mut rollback_handoff = rolled_back.install_persistent_direct_commit_finalization(
+                &[],
+                &[],
+                committed_db_size,
+                false,
+            );
+            rollback_handoff.mark_recovery_required();
+            rollback_handoff.finish_submission();
+
+            let mut hot_header = JournalHeader {
+                page_count: 0,
+                nonce: 0xC0DE_CAFE,
+                initial_db_size: committed_db_size,
+                sector_size: 512,
+                page_size: page_size.get(),
+            }
+            .encode_padded();
+            mark_local_journal_header(&mut hot_header);
+            let journal_path = rolled_back.journal_path.clone();
+            let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+            let (mut journal, _) = rolled_back
+                .vfs
+                .open(&cx, Some(&journal_path), flags)
+                .unwrap();
+            journal.write(&cx, &hot_header, 0).await.unwrap();
+            journal.durable_sync(&cx, SyncKind::FullDurable).unwrap();
+            journal.close(&cx).unwrap();
+            drop(rollback_handoff);
+
+            assert_eq!(
+                rolled_back.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::RolledBack
+            );
+            assert_eq!(
+                rolled_back.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::RolledBack
+            );
+            assert!(
+                !rolled_back
+                    .vfs
+                    .access(&cx, &journal_path, AccessFlags::EXISTS)
+                    .unwrap(),
+                "hot-journal rollback must finish cleanup before notification"
+            );
+
+            let mut durable = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            durable
+                .try_install_commit_terminal_owner(resource_observing_terminal_owner(
+                    &pager,
+                    &observations,
+                ))
+                .unwrap();
+            let committed_db_size = durable
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .db_size;
+            let mut durable_handoff = durable.install_persistent_direct_commit_finalization(
+                &[],
+                &[],
+                committed_db_size,
+                false,
+            );
+            durable_handoff.mark_recovery_required();
+            durable_handoff.mark_direct_mutation_started();
+            durable_handoff.mark_direct_db_durable();
+            durable_handoff.finish_submission();
+            let (mut journal, _) = durable.vfs.open(&cx, Some(&journal_path), flags).unwrap();
+            journal.write(&cx, &[0], 0).await.unwrap();
+            journal.durable_sync(&cx, SyncKind::FullDurable).unwrap();
+            journal.close(&cx).unwrap();
+            drop(durable_handoff);
+
+            assert_eq!(
+                durable.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::Durable
+            );
+            assert_eq!(
+                durable.resolve_commit_state(&cx).await.unwrap(),
+                TransactionCommitState::Durable
+            );
+            assert_eq!(
+                *observations.lock().unwrap(),
+                [
+                    TerminalResourceObservation {
+                        outcome: CommitTerminalOutcome::RolledBack,
+                        active_transactions: 0,
+                        writer_active: false,
+                        maintenance_transactions: 0,
+                    },
+                    TerminalResourceObservation {
+                        outcome: CommitTerminalOutcome::Durable,
+                        active_transactions: 0,
+                        writer_active: false,
+                        maintenance_transactions: 0,
+                    },
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn commit_and_retain_with_terminal_owner_forces_full_commit() {
+        asupersync::test_utils::run_test(|| async {
+            let pager = private_memory_pager().await;
+            let cx = Cx::new();
+            let observations = Arc::new(Mutex::new(Vec::new()));
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, page, &sample_page(0xA7)).await.unwrap();
+            txn.try_install_commit_terminal_owner(resource_observing_terminal_owner(
+                &pager,
+                &observations,
+            ))
+            .unwrap();
+
+            assert!(
+                !txn.commit_and_retain(&cx).await.unwrap(),
+                "a terminal owner requires a full terminal commit"
+            );
+            assert_eq!(txn.commit_state(), TransactionCommitState::Durable);
+            assert!(
+                !txn.commit_and_retain(&cx).await.unwrap(),
+                "a completed transaction cannot be retained"
+            );
+            assert_eq!(
+                *observations.lock().unwrap(),
+                [TerminalResourceObservation {
+                    outcome: CommitTerminalOutcome::Durable,
+                    active_transactions: 0,
+                    writer_active: false,
+                    maintenance_transactions: 0,
+                }]
+            );
+
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(reader.get_page(&cx, page).await.unwrap().as_ref()[0], 0xA7);
+            reader.rollback(&cx).await.unwrap();
+        });
+    }
 
     fn init_publication_test_tracing() {
         static TRACING_INIT: OnceLock<()> = OnceLock::new();
@@ -17986,7 +23311,13 @@ mod tests {
         target_journal: PathBuf,
         plan: JournalDurabilityFaultPlan,
         armed: bool,
+        zero_magic_write_attempts: usize,
         hot_header_writes: usize,
+        /// Test-only model of a VFS source that has accepted the initial
+        /// local journal header but whose terminal completion notification
+        /// outlives the caller future observing `write_tracked`.
+        defer_zero_prefixed_header_completion: bool,
+        deferred_zero_prefixed_header_completion: Option<VfsWriteCompletion>,
     }
 
     #[derive(Clone)]
@@ -18004,7 +23335,10 @@ mod tests {
                     target_journal,
                     plan: JournalDurabilityFaultPlan::default(),
                     armed: false,
+                    zero_magic_write_attempts: 0,
                     hot_header_writes: 0,
+                    defer_zero_prefixed_header_completion: false,
+                    deferred_zero_prefixed_header_completion: None,
                 })),
                 memory_fast_path: Arc::new(AtomicBool::new(true)),
             }
@@ -18014,6 +23348,10 @@ mod tests {
             self.memory_fast_path.store(false, AtomicOrdering::Release);
         }
 
+        fn enable_memory_fast_path(&self) {
+            self.memory_fast_path.store(true, AtomicOrdering::Release);
+        }
+
         fn arm(&self, plan: JournalDurabilityFaultPlan) {
             let mut state = self
                 .state
@@ -18021,6 +23359,7 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.plan = plan;
             state.armed = true;
+            state.zero_magic_write_attempts = 0;
             state.hot_header_writes = 0;
         }
 
@@ -18031,7 +23370,61 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.armed = false;
             state.plan = JournalDurabilityFaultPlan::default();
+            state.zero_magic_write_attempts = 0;
             state.hot_header_writes = 0;
+        }
+
+        fn zero_magic_write_attempts(&self) -> usize {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .zero_magic_write_attempts
+        }
+
+        fn reset_write_observations(&self) {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .zero_magic_write_attempts = 0;
+        }
+
+        /// Make the next complete, zero-prefixed journal header write mutate
+        /// the underlying file but keep its tracked source completion pending.
+        /// The test later completes that exact token after the originating
+        /// pager and transaction have both been dropped.
+        fn defer_next_zero_prefixed_header_completion(&self) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                state.deferred_zero_prefixed_header_completion.is_none(),
+                "test VFS already has a deferred header completion"
+            );
+            state.defer_zero_prefixed_header_completion = true;
+        }
+
+        fn deferred_zero_prefixed_header_completion_is_pending(&self) -> bool {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .deferred_zero_prefixed_header_completion
+                .as_ref()
+                .is_some_and(|completion| completion.state() == VfsWriteCompletionState::Pending)
+        }
+
+        fn complete_deferred_zero_prefixed_header_success(&self) {
+            let completion = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .deferred_zero_prefixed_header_completion
+                .take()
+                .expect("test VFS must own the deferred header completion");
+            assert!(
+                completion.complete_success(),
+                "deferred header completion must still be pending"
+            );
         }
     }
 
@@ -18122,11 +23515,21 @@ mod tests {
                         .state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let has_zero_magic_prefix = buf.len() >= JOURNAL_MAGIC.len()
+                        && buf[..JOURNAL_MAGIC.len()].iter().all(|byte| *byte == 0);
+                    // The first direct-journal source is a complete padded
+                    // header with a zeroed magic prefix.  The later durable
+                    // invalidation write is exactly the magic width.  Count
+                    // both for source-admission assertions, but only fault
+                    // the latter when a test asks to ignore invalidation.
+                    let is_zero_magic_invalidation =
+                        buf.len() == JOURNAL_MAGIC.len() && has_zero_magic_prefix;
+                    if has_zero_magic_prefix {
+                        state.zero_magic_write_attempts =
+                            state.zero_magic_write_attempts.saturating_add(1);
+                    }
                     if state.armed {
-                        if state.plan.ignore_zero_magic_write
-                            && buf.len() == JOURNAL_MAGIC.len()
-                            && buf.iter().all(|byte| *byte == 0)
-                        {
+                        if state.plan.ignore_zero_magic_write && is_zero_magic_invalidation {
                             return Ok(());
                         }
                         if buf.starts_with(&JOURNAL_MAGIC) {
@@ -18144,6 +23547,58 @@ mod tests {
                 self.inner
                     .write(cx, corrupted.as_deref().unwrap_or(buf), offset)
                     .await
+            }
+        }
+
+        fn write_tracked<'a>(
+            &'a self,
+            cx: &'a Cx,
+            buf: &'a [u8],
+            offset: u64,
+            completion: VfsWriteCompletion,
+        ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+            async move {
+                if let Err(error) = self.write(cx, buf, offset).await {
+                    completion.complete_error();
+                    return Err(error);
+                }
+
+                let defer_completion = if self.is_target_journal && offset == 0 {
+                    let has_zero_magic_prefix = buf.len() >= JOURNAL_MAGIC.len()
+                        && buf[..JOURNAL_MAGIC.len()].iter().all(|byte| *byte == 0);
+                    if has_zero_magic_prefix {
+                        let mut state = self
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if state.defer_zero_prefixed_header_completion
+                            && state.deferred_zero_prefixed_header_completion.is_none()
+                        {
+                            state.defer_zero_prefixed_header_completion = false;
+                            state.deferred_zero_prefixed_header_completion =
+                                Some(completion.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if defer_completion {
+                    // Model an accepted source whose completion arrives from
+                    // a lower I/O owner after this observer future is dropped.
+                    // The retained clone in `JournalDurabilityFaultState`
+                    // provides the deterministic terminal notification.
+                    std::future::pending::<()>().await;
+                    unreachable!("pending test source cannot resume its dropped observer")
+                }
+
+                completion.complete_success();
+                Ok(())
             }
         }
 
@@ -18209,6 +23664,115 @@ mod tests {
         fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()> {
             self.inner.shm_unmap(cx, delete)
         }
+    }
+
+    #[test]
+    fn dropped_direct_ticket_keeps_identity_queue_alive_until_tracked_source_is_terminal() {
+        asupersync::test_utils::run_test(|| async {
+            let path = PathBuf::from("/dropped-direct-ticket-queue-liveness.db");
+            let journal_path = SimplePager::<JournalDurabilityFaultVfs>::journal_path(&path);
+            let vfs = JournalDurabilityFaultVfs::new(journal_path.clone());
+            let cx = Cx::new();
+            let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+                .await
+                .expect("open initial pager");
+            vfs.enable_file_backed_protocol();
+
+            let mut txn = pager
+                .begin(&cx, TransactionMode::Immediate)
+                .await
+                .expect("begin direct writer");
+            let mut page_one = txn
+                .get_page(&cx, PageNumber::ONE)
+                .await
+                .expect("read page one")
+                .into_vec();
+            let last_byte = page_one.len().saturating_sub(1);
+            page_one[last_byte] ^= 0x01;
+            txn.write_page(&cx, PageNumber::ONE, &page_one)
+                .await
+                .expect("stage direct write");
+
+            // The VFS writes the local zero-prefixed header, then holds the
+            // source completion after the observer commit future is dropped.
+            // This models a lower I/O owner that can still mutate/complete
+            // after the Rust caller is gone.
+            vfs.defer_next_zero_prefixed_header_completion();
+            let mut commit = Box::pin(txn.commit(&cx));
+            let waker = std::task::Waker::noop();
+            let mut task_context = std::task::Context::from_waker(waker);
+            assert!(matches!(
+                Future::poll(commit.as_mut(), &mut task_context),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(vfs.zero_magic_write_attempts(), 1);
+            assert!(vfs.deferred_zero_prefixed_header_completion_is_pending());
+
+            let old_queue = Arc::downgrade(&pager.group_commit_queue);
+            drop(commit);
+            drop(txn);
+            drop(pager);
+
+            // The identity registry itself is weak.  The queued ticket must
+            // therefore retain this exact queue, or a reopen would create a
+            // fresh queue and race an unobserved source.
+            let retained_queue = old_queue
+                .upgrade()
+                .expect("pending direct ticket keeps its identity queue alive");
+            assert!(retained_queue.has_pending_or_claimed_pager_cleanup());
+
+            // This wrapper begins as an in-memory VFS so the initial fixture
+            // can bootstrap without native namespace sidecars; it is switched
+            // to file-backed only for the direct-journal commit itself.
+            // Restore the fixture's in-memory open mode here so this test
+            // isolates identity-queue/source ownership rather than the
+            // unrelated native namespace adapter.
+            vfs.enable_memory_fast_path();
+
+            let reopen_error = match SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).await
+            {
+                Ok(_) => panic!("open must not classify/replay a still-pending tracked source"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(reopen_error, FrankenError::BusyRecovery),
+                "a pending tracked source must fail reopen as BusyRecovery, got: {reopen_error}"
+            );
+            assert_eq!(
+                vfs.zero_magic_write_attempts(),
+                1,
+                "reopen must not submit or race another journal source while the old source remains pending"
+            );
+            assert!(
+                vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
+                "open must leave the pending source's journal untouched"
+            );
+
+            // Once the lower source reports a terminal result, the same
+            // identity queue resolves the exact ticket before the next open
+            // is allowed to inspect the journal or admit a writer.
+            vfs.complete_deferred_zero_prefixed_header_success();
+            let reopened = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+                .await
+                .expect("terminal source permits exact queued recovery before reopen");
+            assert!(Arc::ptr_eq(&retained_queue, &reopened.group_commit_queue));
+            assert!(!retained_queue.has_pending_or_claimed_pager_cleanup());
+            assert!(
+                !vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
+                "the exact non-hot ticket must clean up before a new opener proceeds"
+            );
+            let next_writer = reopened
+                .begin(&cx, TransactionMode::Immediate)
+                .await
+                .expect("resolved ticket releases writer admission");
+            drop(next_writer);
+            drop(reopened);
+            drop(retained_queue);
+            assert!(
+                old_queue.upgrade().is_none(),
+                "terminal ticket completion must break its temporary queue self-liveness"
+            );
+        });
     }
 
     #[test]
@@ -19095,6 +24659,21 @@ mod tests {
                     .contains("commit outcome is indeterminate"),
                 "all three failed readback proofs must surface an indeterminate outcome: {commit_error}"
             );
+            assert!(
+                txn.pending_direct_submission
+                    .as_ref()
+                    .is_some_and(|submission| submission.outcome_indeterminate()),
+                "a later ticket-owned recovery failure must not erase the physical indeterminate outcome"
+            );
+            assert!(matches!(
+                txn.commit_phase.get(),
+                TransactionCommitPhase::DirectOutcomeFinalizing { .. }
+            ));
+            assert!(
+                txn.group_commit_queue
+                    .has_pending_or_claimed_pager_cleanup(),
+                "the cleanup ticket must remain owned after its retryable recovery error"
+            );
 
             let journal_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
             let (mut retained_journal, _) =
@@ -19125,13 +24704,15 @@ mod tests {
     #[test]
     fn test_commit_journal_short_preimage_read_errors() {
         asupersync::test_utils::run_test(|| async {
-            let vfs = MemoryVfs::new();
             let path = PathBuf::from("/short_preimage.db");
+            let journal_path = SimplePager::<JournalDurabilityFaultVfs>::journal_path(&path);
+            let vfs = JournalDurabilityFaultVfs::new(journal_path.clone());
             let cx = Cx::new();
             let ps = PageSize::DEFAULT.as_usize();
             let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
                 .await
                 .unwrap();
+            vfs.enable_file_backed_protocol();
 
             // Establish page 2 so the next commit must read a pre-image for it.
             let page_two = {
@@ -19141,13 +24722,16 @@ mod tests {
                 txn.commit(&cx).await.unwrap();
                 p
             };
+            vfs.reset_write_observations();
 
             let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
             txn.write_page(&cx, page_two, &vec![0x22; ps])
                 .await
                 .unwrap();
 
-            // Simulate external truncation: pre-image read for page 2 becomes short.
+            // Simulate external truncation: the later page-2 journal pre-image
+            // read becomes short after the direct path has written its local,
+            // zero-magic source header.
             let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
             let (mut db_file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
             db_file
@@ -19159,16 +24743,38 @@ mod tests {
                 matches!(err, FrankenError::DatabaseCorrupt { .. }),
                 "bead_id={BEAD_ID} case=short_preimage_read_is_corruption"
             );
-
-            // Commit failure should keep the writer lock held on commit failure so no other writer
-            // can interleave while the caller decides to retry or roll back.
-            let Err(busy) = pager.begin(&cx, TransactionMode::Immediate).await else {
-                panic!("expected begin to fail while writer lock is still held");
-            };
             assert!(
-                matches!(busy, FrankenError::Busy),
-                "bead_id={BEAD_ID} case=commit_error_keeps_writer_lock"
+                err.to_string()
+                    .contains("short read while journaling pre-image for page 2"),
+                "the failure must occur after the zero-magic source header but before the hot-header boundary: {err}"
             );
+
+            // The pre-image failure is post-source but pre-hot.  Its local
+            // zero-magic journal header is recovery-visible, so Phase C must
+            // classify it rather than reclaim the ticket as an ordinary
+            // retryable pre-source error.  Classification proves this journal
+            // non-hot, completes a definite rollback, and only then releases
+            // the writer baton.
+            assert_eq!(
+                vfs.zero_magic_write_attempts(),
+                1,
+                "the zero-prefixed initial journal header must be source-admitted before the page-2 pre-image read"
+            );
+            assert!(matches!(
+                txn.commit_phase.get(),
+                TransactionCommitPhase::RolledBackFinalized
+            ));
+            assert!(
+                !vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
+                "definite non-hot rollback must delete the transient journal before writer admission"
+            );
+
+            {
+                let _next_writer = pager
+                    .begin(&cx, TransactionMode::Immediate)
+                    .await
+                    .expect("terminal non-hot rollback releases the writer baton");
+            }
 
             txn.rollback(&cx).await.unwrap();
             let _next_writer = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
@@ -19410,19 +25016,22 @@ mod tests {
 
             let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
             let (journal_file, _) = vfs.open(&cx, Some(&journal_path), flags).unwrap();
+            let journal_size = journal_file.file_size(&cx).unwrap();
             assert!(
-                journal_file.file_size(&cx).unwrap() >= JOURNAL_MAGIC.len() as u64,
-                "bead_id={BEAD_ID} case=delete_failure_retains_persist_journal_inode"
+                journal_size == 0 || journal_size >= JOURNAL_MAGIC.len() as u64,
+                "bead_id={BEAD_ID} case=delete_failure_retains_valid_invalidation_surface"
             );
-            let mut commit_marker = [0xFF_u8; 1];
-            assert_eq!(
-                journal_file.read(&cx, &mut commit_marker, 0).await.unwrap(),
-                1
-            );
-            assert_eq!(
-                commit_marker[0], 0,
-                "bead_id={BEAD_ID} case=delete_failure_still_durably_invalidates_journal"
-            );
+            if journal_size != 0 {
+                let mut commit_marker = [0xFF_u8; 1];
+                assert_eq!(
+                    journal_file.read(&cx, &mut commit_marker, 0).await.unwrap(),
+                    1
+                );
+                assert_eq!(
+                    commit_marker[0], 0,
+                    "bead_id={BEAD_ID} case=delete_failure_still_durably_invalidates_journal"
+                );
+            }
             assert_eq!(
                 classify_rollback_journal_prefix(&cx, &journal_file)
                     .await
@@ -24171,11 +29780,27 @@ mod tests {
             let ps = PageSize::DEFAULT.as_usize();
 
             let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let before = pager.published_snapshot();
+            assert_eq!(
+                txn.published_visible_commit_seq_hint(),
+                Some(before.visible_commit_seq),
+                "WAL transaction hint must begin at its published snapshot, not a speculative sequence"
+            );
             let p1 = txn.allocate_page(&cx).await.unwrap();
             let data = vec![0xAA_u8; ps];
             txn.write_page(&cx, p1, &data).await.unwrap();
             txn.commit(&cx).await.unwrap();
 
+            let after = pager.published_snapshot();
+            assert!(
+                after.visible_commit_seq > before.visible_commit_seq,
+                "WAL group commit must advance the published sequence"
+            );
+            assert_eq!(
+                txn.published_visible_commit_seq_hint(),
+                Some(after.visible_commit_seq),
+                "completed WAL group commit must expose exactly its published sequence"
+            );
             let locked_frames = frames.lock().unwrap();
             assert_eq!(
                 locked_frames.len(),
@@ -27285,6 +32910,90 @@ mod tests {
             slot.wait_for_change(observed_generation, Duration::from_millis(1)),
             KeyedWaitResult::Signaled,
             "bead_id={BEAD_ID} case=keyed_wait_slot_pre_signaled_generation_must_not_timeout"
+        );
+    }
+
+    #[test]
+    fn wal_finalizer_epoch_signal_wakes_outside_queue_mutexes() {
+        struct ReentrantEpochWake {
+            queue: Weak<GroupCommitQueue>,
+            slot: Arc<KeyedWaitSlot>,
+            wake_count: AtomicUsize,
+            consolidator_available: AtomicBool,
+            registry_available: AtomicBool,
+            generation_available: AtomicBool,
+        }
+
+        impl std::task::Wake for ReentrantEpochWake {
+            fn wake(self: Arc<Self>) {
+                self.observe_locks();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.observe_locks();
+            }
+        }
+
+        impl ReentrantEpochWake {
+            fn observe_locks(&self) {
+                let queue = self
+                    .queue
+                    .upgrade()
+                    .expect("group-commit queue must outlive its registered waiter");
+                self.consolidator_available.store(
+                    queue.consolidator.try_lock().is_ok(),
+                    AtomicOrdering::Release,
+                );
+                self.registry_available.store(
+                    queue.epoch_waiters.slots.try_lock().is_ok(),
+                    AtomicOrdering::Release,
+                );
+                self.generation_available
+                    .store(self.slot.state.try_lock().is_ok(), AtomicOrdering::Release);
+                self.wake_count.fetch_add(1, AtomicOrdering::AcqRel);
+            }
+        }
+
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+        let slot = queue.epoch_waiters.slot(1);
+        let mut notified = Box::pin(slot.notify.notified());
+        let probe = Arc::new(ReentrantEpochWake {
+            queue: Arc::downgrade(&queue),
+            slot: Arc::clone(&slot),
+            wake_count: AtomicUsize::new(0),
+            consolidator_available: AtomicBool::new(false),
+            registry_available: AtomicBool::new(false),
+            generation_available: AtomicBool::new(false),
+        });
+        let waker = std::task::Waker::from(Arc::clone(&probe));
+        let mut task_context = std::task::Context::from_waker(&waker);
+        assert!(
+            Future::poll(notified.as_mut(), &mut task_context).is_pending(),
+            "epoch waiter must register before publication"
+        );
+
+        queue.publish_completed_epoch(1, false);
+
+        assert_eq!(
+            probe.wake_count.load(AtomicOrdering::Acquire),
+            1,
+            "completion publication must wake the registered waiter exactly once"
+        );
+        assert!(
+            probe.consolidator_available.load(AtomicOrdering::Acquire),
+            "custom waiter wake must run after releasing the consolidator"
+        );
+        assert!(
+            probe.registry_available.load(AtomicOrdering::Acquire),
+            "custom waiter wake must run after releasing the keyed registry"
+        );
+        assert!(
+            probe.generation_available.load(AtomicOrdering::Acquire),
+            "custom waiter wake must run after releasing the generation mutex"
+        );
+        assert!(
+            Future::poll(notified.as_mut(), &mut task_context).is_ready(),
+            "the registered waiter must observe the published signal"
         );
     }
 
@@ -32909,6 +38618,11 @@ mod tests {
             assert!(
                 txn.commit_and_retain(&cx).await.unwrap(),
                 "bead_id={BEAD_ID} case=single_connection_commit_and_retain_should_retain_writer"
+            );
+            assert_eq!(
+                txn.commit_state(),
+                TransactionCommitState::Open,
+                "a retained transaction remains reusable after its durable subcommit"
             );
             assert_eq!(
                 pager.publication_write_count(),

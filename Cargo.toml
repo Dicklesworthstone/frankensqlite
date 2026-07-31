@@ -162,6 +162,7 @@ crc32c = "0.6"
 blake3 = "1.8"
 crossbeam-epoch = "0.9"
 crossbeam-deque = "0.8"
+crossbeam-queue = "0.3"
 sha2 = "0.11"
 nix = { version = "0.31", default-features = false, features = ["fs", "process", "signal", "socket", "uio", "user"] }
 libc = "0.2"
