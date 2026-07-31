@@ -20,7 +20,7 @@ const UNIT_TEST_IDS: [&str; 5] = [
 const E2E_TEST_IDS: [&str; 2] = ["test_e2e_bd_3kp_1", "test_e2e_bd_3kp_1_compliance"];
 const LOG_LEVEL_MARKERS: [&str; 4] = ["DEBUG", "INFO", "WARN", "ERROR"];
 const LOG_STANDARD_REF: &str = "bd-1fpm";
-const EXPECTED_QUESTIONS: [&str; 8] = ["Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7", "Q8"];
+const EXPECTED_QUESTIONS: [&str; 9] = ["Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7", "Q8", "Q9"];
 const REQUIRED_TOKENS: [&str; 12] = [
     "test_bd_3kp_1_unit_compliance_gate",
     "prop_bd_3kp_1_structure_compliance",
@@ -416,6 +416,17 @@ fn test_decision_register_append_only() -> Result<(), String> {
     if seen_questions != expected {
         return Err(format!(
             "decision_register_question_set_mismatch actual={seen_questions:?} expected={expected:?}"
+        ));
+    }
+
+    let q9 = entries
+        .iter()
+        .find(|entry| entry.question_id == "Q9")
+        .ok_or_else(|| "decision_register_q9_missing".to_owned())?;
+    if q9.status != "accepted" || !q9.blocks_implementation {
+        return Err(format!(
+            "decision_register_q9_guard_invalid status={} blocks_implementation={}",
+            q9.status, q9.blocks_implementation
         ));
     }
 
