@@ -15,6 +15,7 @@
     allow(dead_code, unused_imports)
 )]
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use std::collections::{HashMap, HashSet};
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use std::hash::BuildHasher;
@@ -23,7 +24,7 @@ use std::path::Path;
 
 use fsqlite_ast::{
     ColumnConstraintKind, CreateTableBody, CreateTableStatement, DefaultValue, Expr,
-    GeneratedStorage, Literal, SortDirection, Statement, TableConstraintKind, TriggerTiming,
+    GeneratedStorage, IndexedColumn, Literal, SortDirection, Statement, TableConstraintKind,
     UnaryOp,
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -43,15 +44,11 @@ use fsqlite_types::record::{
 };
 use fsqlite_types::value::SqliteValue;
 
-use crate::connection::{
-    ImplicitAutoindexSlot, column_def_is_exact_integer, implicit_autoindex_layout,
-    validate_builtin_persisted_index_expr_functions,
-};
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use crate::connection::{eval_join_expr, is_sqlite_truthy};
 use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{
-    CheckConstraint, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema, bind_explicit_index,
+    CheckConstraint, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema,
 };
 use fsqlite_vdbe::engine::MemDatabase;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native", unix))]
@@ -108,809 +105,12 @@ fn parse_autoindex_ordinal(index_name: &str, table_name: &str) -> Option<usize> 
     {
         return None;
     }
-    suffix.parse::<usize>().ok()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BoundImplicitAutoindexStorage {
-    /// The logical WITHOUT ROWID primary-key index is stored in the table
-    /// B-tree itself and therefore has no separate sqlite_master row.
-    TableRoot,
-    /// A physical implicit index backed by its own B-tree root.
-    IndexRoot(i32),
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct BoundImplicitAutoindexSlot {
-    ordinal: usize,
-    slot: ImplicitAutoindexSlot,
-    storage: BoundImplicitAutoindexStorage,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct BoundTableAutoindexes {
-    slots: Vec<BoundImplicitAutoindexSlot>,
-}
-
-impl BoundTableAutoindexes {
-    pub(crate) fn implicit_slots(&self) -> impl Iterator<Item = &ImplicitAutoindexSlot> {
-        self.slots.iter().map(|bound| &bound.slot)
-    }
-
-    pub(crate) fn physical_index_schemas(&self, table_name: &str) -> Vec<IndexSchema> {
-        self.slots
-            .iter()
-            .filter_map(|bound| match bound.storage {
-                BoundImplicitAutoindexStorage::TableRoot => None,
-                BoundImplicitAutoindexStorage::IndexRoot(root_page) => Some(
-                    bound
-                        .slot
-                        .clone()
-                        .into_index_schema(table_name, bound.ordinal, root_page),
-                ),
-            })
-            .collect()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct BoundImplicitAutoindexCatalog {
-    by_table: HashMap<String, BoundTableAutoindexes>,
-    canonical_virtual_table_rows: HashSet<usize>,
-}
-
-impl BoundImplicitAutoindexCatalog {
-    pub(crate) fn table(&self, table_name: &str) -> Option<&BoundTableAutoindexes> {
-        self.by_table.get(&table_name.to_ascii_lowercase())
-    }
-
-    pub(crate) fn is_canonical_virtual_table_row(&self, row_index: usize) -> bool {
-        self.canonical_virtual_table_rows.contains(&row_index)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DecodedSqliteMasterEntry<'a> {
-    entry_type: &'a str,
-    name: &'a str,
-    table_name: &'a str,
-    root_page: i64,
-    sql: Option<&'a str>,
-}
-
-#[derive(Debug)]
-struct PendingTableAutoindexes {
-    table_name: String,
-    slots: Vec<ImplicitAutoindexSlot>,
-    physical_roots: Vec<Option<i32>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SqliteMasterSchemaNameKind {
-    Table,
-    VirtualTable,
-    View,
-    Index,
-}
-
-impl SqliteMasterSchemaNameKind {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Table => "table",
-            Self::VirtualTable => "virtual table",
-            Self::View => "view",
-            Self::Index => "index",
-        }
-    }
-}
-
-#[derive(Debug)]
-struct SqliteMasterSchemaNameOwner {
-    name: String,
-    kind: SqliteMasterSchemaNameKind,
-}
-
-#[derive(Debug)]
-struct VirtualTableCatalogVariant {
-    row_index: usize,
-    name: String,
-    root_page: i64,
-    module: String,
-    args: Vec<String>,
-}
-
-fn sqlite_master_corrupt(detail: impl Into<String>) -> FrankenError {
-    FrankenError::DatabaseCorrupt {
-        detail: detail.into(),
-    }
-}
-
-fn qualified_catalog_name_targets_main(schema: Option<&str>) -> bool {
-    schema.is_none_or(|schema| schema.eq_ignore_ascii_case("main"))
-}
-
-fn claim_sqlite_master_schema_name(
-    name: &str,
-    kind: SqliteMasterSchemaNameKind,
-    schema_names: &mut HashMap<String, SqliteMasterSchemaNameOwner>,
-) -> Result<()> {
-    let key = name.to_ascii_lowercase();
-    if let Some(existing) = schema_names.get(&key) {
-        return Err(sqlite_master_corrupt(format!(
-            "sqlite_master schema name `{name}` is shared by {} `{}` and {} `{name}`",
-            existing.kind.label(),
-            existing.name,
-            kind.label()
-        )));
-    }
-    schema_names.insert(
-        key,
-        SqliteMasterSchemaNameOwner {
-            name: name.to_owned(),
-            kind,
-        },
-    );
-    Ok(())
-}
-
-fn normalize_virtual_table_option_token(token: &str) -> String {
-    let trimmed = token.trim();
-    if trimmed.len() >= 2 {
-        let bytes = trimmed.as_bytes();
-        let first = bytes[0];
-        let last = bytes[bytes.len() - 1];
-        if matches!((first, last), (b'\'', b'\'') | (b'"', b'"') | (b'`', b'`')) {
-            let body = &trimmed[1..trimmed.len() - 1];
-            let quote = char::from(first);
-            return body
-                .replace(&format!("{quote}{quote}"), &quote.to_string())
-                .to_ascii_lowercase();
-        }
-        if first == b'[' && last == b']' {
-            return trimmed[1..trimmed.len() - 1].to_ascii_lowercase();
-        }
-    }
-    trimmed.to_ascii_lowercase()
-}
-
-fn fts5_content_variant(args: &[String]) -> Option<(Option<String>, Vec<&str>)> {
-    let mut content = None;
-    let mut non_content = Vec::with_capacity(args.len());
-    for arg in args {
-        let is_content_option = arg
-            .split_once('=')
-            .is_some_and(|(key, _)| normalize_virtual_table_option_token(key) == "content");
-        if is_content_option {
-            let (_, value) = arg
-                .split_once('=')
-                .expect("content option was identified by an equals sign");
-            if content
-                .replace(normalize_virtual_table_option_token(value))
-                .is_some()
-            {
-                return None;
-            }
-        } else {
-            non_content.push(arg.trim());
-        }
-    }
-    Some((content, non_content))
-}
-
-fn supported_virtual_table_duplicate(
-    existing: &VirtualTableCatalogVariant,
-    root_page: i64,
-    module: &str,
-    args: &[String],
-) -> bool {
-    // Two positive roots are rejected by the caller. An otherwise identical
-    // positive/root-zero pair is the legacy materialized-vtab migration shape;
-    // two root-zero rows are accepted only for FTS5's repair path.
-    if existing.module.eq_ignore_ascii_case(module) && existing.args == args {
-        return existing.root_page > 0 || root_page > 0 || module.eq_ignore_ascii_case("fts5");
-    }
-    if existing.root_page != 0
-        || root_page != 0
-        || !existing.module.eq_ignore_ascii_case("fts5")
-        || !module.eq_ignore_ascii_case("fts5")
-    {
-        return false;
-    }
-    // A historical FTS5 repair can leave the authoritative contentless row
-    // beside a stale default-content declaration. The non-content arguments
-    // must still be identical, and no third catalog row is accepted.
-    let Some((existing_content, existing_non_content)) = fts5_content_variant(&existing.args)
-    else {
-        return false;
-    };
-    let Some((candidate_content, candidate_non_content)) = fts5_content_variant(args) else {
-        return false;
-    };
-    existing_non_content == candidate_non_content
-        && matches!(
-            (existing_content.as_deref(), candidate_content.as_deref()),
-            (None, Some("")) | (Some(""), None)
-        )
-}
-
-fn canonical_virtual_table_variant(
-    variants: &[VirtualTableCatalogVariant],
-) -> &VirtualTableCatalogVariant {
-    variants
-        .iter()
-        .find(|variant| variant.root_page > 0)
-        .or_else(|| {
-            variants.iter().find(|variant| {
-                variant.module.eq_ignore_ascii_case("fts5")
-                    && fts5_content_variant(&variant.args)
-                        .is_some_and(|(content, _)| content.as_deref() == Some(""))
-            })
-        })
-        .unwrap_or_else(|| {
-            variants
-                .first()
-                .expect("validated virtual-table variant set is non-empty")
-        })
-}
-
-fn claim_sqlite_master_virtual_table(
-    row_index: usize,
-    name: &str,
-    root_page: i64,
-    module: &str,
-    args: &[String],
-    schema_names: &mut HashMap<String, SqliteMasterSchemaNameOwner>,
-    variants: &mut HashMap<String, Vec<VirtualTableCatalogVariant>>,
-) -> Result<()> {
-    let key = name.to_ascii_lowercase();
-    if let Some(existing_variants) = variants.get_mut(&key) {
-        let Some(existing) = existing_variants.first() else {
-            unreachable!("virtual-table variant map entries are never empty");
-        };
-        if existing_variants.len() != 1
-            || (existing.root_page > 0 && root_page > 0)
-            || !supported_virtual_table_duplicate(existing, root_page, module, args)
-        {
-            return Err(sqlite_master_corrupt(format!(
-                "sqlite_master contains conflicting virtual-table entries for `{}` and `{name}`",
-                existing.name
-            )));
-        }
-        existing_variants.push(VirtualTableCatalogVariant {
-            row_index,
-            name: name.to_owned(),
-            root_page,
-            module: module.to_owned(),
-            args: args.to_vec(),
-        });
-        return Ok(());
-    }
-
-    claim_sqlite_master_schema_name(name, SqliteMasterSchemaNameKind::VirtualTable, schema_names)?;
-    variants.insert(
-        key,
-        vec![VirtualTableCatalogVariant {
-            row_index,
-            name: name.to_owned(),
-            root_page,
-            module: module.to_owned(),
-            args: args.to_vec(),
-        }],
-    );
-    Ok(())
-}
-
-fn decode_sqlite_master_entry(
-    entry: &[SqliteValue],
-    row_index: usize,
-) -> Result<DecodedSqliteMasterEntry<'_>> {
-    if entry.len() != 5 {
-        return Err(sqlite_master_corrupt(format!(
-            "sqlite_master row {} has {} columns instead of 5",
-            row_index + 1,
-            entry.len()
-        )));
-    }
-    let text_column = |column_index: usize, column_name: &str| match &entry[column_index] {
-        SqliteValue::Text(value) => Ok(value.as_ref()),
-        value => Err(sqlite_master_corrupt(format!(
-            "sqlite_master row {} column `{column_name}` must be TEXT, found {value:?}",
-            row_index + 1
-        ))),
-    };
-    let entry_type = text_column(0, "type")?;
-    let name = text_column(1, "name")?;
-    let table_name = text_column(2, "tbl_name")?;
-    let root_page = match &entry[3] {
-        SqliteValue::Integer(value) => *value,
-        value => {
-            return Err(sqlite_master_corrupt(format!(
-                "sqlite_master row {} column `rootpage` must be INTEGER, found {value:?}",
-                row_index + 1
-            )));
-        }
-    };
-    let sql = match &entry[4] {
-        SqliteValue::Text(value) => Some(value.as_ref()),
-        SqliteValue::Null => None,
-        value => {
-            return Err(sqlite_master_corrupt(format!(
-                "sqlite_master row {} column `sql` must be TEXT or NULL, found {value:?}",
-                row_index + 1
-            )));
-        }
-    };
-    Ok(DecodedSqliteMasterEntry {
-        entry_type,
-        name,
-        table_name,
-        root_page,
-        sql,
-    })
-}
-
-fn claim_sqlite_master_root(
-    entry_kind: &str,
-    entry_name: &str,
-    root_page: i64,
-    max_root_page: u32,
-    header: &DatabaseHeader,
-    free_pages: &HashSet<PageNumber>,
-    root_owners: &mut HashMap<i32, String>,
-) -> Result<i32> {
-    let root_page_u32 = validate_sqlite_master_root_page(entry_name, root_page)?;
-    let root_page_i32 = i32::try_from(root_page_u32).map_err(|_| {
-        sqlite_master_corrupt(format!(
-            "sqlite_master {entry_kind} `{entry_name}` has unsupported rootpage {root_page}"
-        ))
-    })?;
-    if root_page_i32 >= i32::MAX - 1 {
-        return Err(sqlite_master_corrupt(format!(
-            "sqlite_master {entry_kind} `{entry_name}` has terminal rootpage {root_page}, which leaves no safe MemDatabase allocation sentinel"
-        )));
-    }
-    if root_page_u32 > max_root_page {
-        return Err(sqlite_master_corrupt(format!(
-            "sqlite_master {entry_kind} `{entry_name}` has rootpage {root_page}, which exceeds the visible database page count {max_root_page}"
-        )));
-    }
-    if root_page_u32 == fsqlite_pager::lock_byte_page(header.page_size) {
-        return Err(sqlite_master_corrupt(format!(
-            "sqlite_master {entry_kind} `{entry_name}` uses reserved lock-byte rootpage {root_page}"
-        )));
-    }
-    let root_page_number =
-        PageNumber::new(root_page_u32).expect("validated positive rootpage must be nonzero");
-    if header.largest_root_page != 0
-        && fsqlite_btree::freelist::is_ptrmap_page(
-            root_page_number,
-            header.page_size.usable(header.reserved_per_page),
-            header.page_size.get(),
-        )
-    {
-        return Err(sqlite_master_corrupt(format!(
-            "sqlite_master {entry_kind} `{entry_name}` uses auto-vacuum pointer-map rootpage {root_page}"
-        )));
-    }
-    if free_pages.contains(&root_page_number) {
-        return Err(sqlite_master_corrupt(format!(
-            "sqlite_master {entry_kind} `{entry_name}` uses free rootpage {root_page}"
-        )));
-    }
-    let owner = format!("{entry_kind} `{entry_name}`");
-    if let Some(existing_owner) = root_owners.insert(root_page_i32, owner.clone()) {
-        return Err(sqlite_master_corrupt(format!(
-            "sqlite_master rootpage {root_page_i32} is shared by {existing_owner} and {owner}"
-        )));
-    }
-    Ok(root_page_i32)
-}
-
-/// Validate and bind every implicit autoindex row in a sqlite_master snapshot.
-///
-/// This is deliberately a global, failure-atomic prepass. Both schema reload
-/// paths must prove the complete expected implicit-index set and root ownership
-/// before either mutates `MemDatabase`, because `create_table_at` replaces an
-/// existing root on collision.
-pub(crate) fn bind_implicit_autoindex_catalog(
-    master_entries: &[Vec<SqliteValue>],
-    max_root_page: u32,
-    header: &DatabaseHeader,
-    free_pages: &HashSet<PageNumber>,
-) -> Result<BoundImplicitAutoindexCatalog> {
-    if max_root_page == 0 {
-        return Err(sqlite_master_corrupt(
-            "sqlite_master cannot be bound without a visible database page",
-        ));
-    }
-    let decoded = master_entries
-        .iter()
-        .enumerate()
-        .map(|(row_index, entry)| decode_sqlite_master_entry(entry, row_index))
-        .collect::<Result<Vec<_>>>()?;
-    let mut root_owners = HashMap::new();
-    root_owners.insert(1, "sqlite_master".to_owned());
-    let mut pending_by_table = HashMap::<String, PendingTableAutoindexes>::new();
-    let mut schema_names = HashMap::<String, SqliteMasterSchemaNameOwner>::new();
-    let mut trigger_names = HashMap::<String, String>::new();
-    let mut virtual_table_variants = HashMap::<String, Vec<VirtualTableCatalogVariant>>::new();
-    let mut logical_autoindex_names = HashMap::<String, String>::new();
-    let mut pending_trigger_parents = Vec::<(String, String, bool)>::new();
-
-    // Claim every table root before any index root, independent of catalog row
-    // order, so an index can never replace a table placeholder during reload.
-    for (row_index, entry) in decoded.iter().enumerate() {
-        if entry.entry_type.eq_ignore_ascii_case("view") {
-            if entry.root_page != 0 || entry.sql.is_none() {
-                return Err(sqlite_master_corrupt(format!(
-                    "sqlite_master view `{}` must have rootpage 0 and non-NULL sql",
-                    entry.name
-                )));
-            }
-            if !entry.name.eq_ignore_ascii_case(entry.table_name) {
-                return Err(sqlite_master_corrupt(format!(
-                    "sqlite_master view `{}` has mismatched tbl_name `{}`",
-                    entry.name, entry.table_name
-                )));
-            }
-            let create_sql = entry.sql.expect("view sql was validated above");
-            let Some(Statement::CreateView(create)) = parse_single_statement(create_sql) else {
-                return Err(sqlite_master_corrupt(format!(
-                    "could not parse CREATE VIEW SQL for `{}`",
-                    entry.name
-                )));
-            };
-            if create.temporary
-                || !qualified_catalog_name_targets_main(create.name.schema.as_deref())
-                || !create.name.name.eq_ignore_ascii_case(entry.name)
-            {
-                return Err(sqlite_master_corrupt(format!(
-                    "CREATE VIEW SQL for `{}` declares a temporary, non-main, or differently named view `{}`",
-                    entry.name, create.name.name
-                )));
-            }
-            claim_sqlite_master_schema_name(
-                entry.name,
-                SqliteMasterSchemaNameKind::View,
-                &mut schema_names,
-            )?;
-            continue;
-        }
-        if entry.entry_type.eq_ignore_ascii_case("trigger") {
-            if entry.root_page != 0 || entry.sql.is_none() {
-                return Err(sqlite_master_corrupt(format!(
-                    "sqlite_master trigger `{}` must have rootpage 0 and non-NULL sql",
-                    entry.name
-                )));
-            }
-            let create_sql = entry.sql.expect("trigger sql was validated above");
-            let Some(Statement::CreateTrigger(create)) = parse_single_statement(create_sql) else {
-                return Err(sqlite_master_corrupt(format!(
-                    "could not parse CREATE TRIGGER SQL for `{}`",
-                    entry.name
-                )));
-            };
-            if create.temporary
-                || !qualified_catalog_name_targets_main(create.name.schema.as_deref())
-                || !create.name.name.eq_ignore_ascii_case(entry.name)
-                || !create.table.eq_ignore_ascii_case(entry.table_name)
-            {
-                return Err(sqlite_master_corrupt(format!(
-                    "CREATE TRIGGER SQL for `{}` does not match its main-catalog name or target `{}`",
-                    entry.name, entry.table_name
-                )));
-            }
-            let trigger_key = entry.name.to_ascii_lowercase();
-            if let Some(existing) = trigger_names.insert(trigger_key, entry.name.to_owned()) {
-                return Err(sqlite_master_corrupt(format!(
-                    "sqlite_master contains duplicate trigger entries for `{existing}` and `{}`",
-                    entry.name
-                )));
-            }
-            pending_trigger_parents.push((
-                entry.name.to_owned(),
-                entry.table_name.to_owned(),
-                matches!(create.timing, TriggerTiming::InsteadOf),
-            ));
-            continue;
-        }
-        if entry.entry_type.eq_ignore_ascii_case("index") {
-            continue;
-        }
-        if !entry.entry_type.eq_ignore_ascii_case("table") {
-            return Err(sqlite_master_corrupt(format!(
-                "sqlite_master entry `{}` has unsupported type `{}`",
-                entry.name, entry.entry_type
-            )));
-        }
-        let Some(create_sql) = entry.sql else {
-            return Err(sqlite_master_corrupt(format!(
-                "sqlite_master table `{}` has NULL sql",
-                entry.name
-            )));
-        };
-        if !entry.name.eq_ignore_ascii_case(entry.table_name) {
-            return Err(sqlite_master_corrupt(format!(
-                "sqlite_master table `{}` has mismatched tbl_name `{}`",
-                entry.name, entry.table_name
-            )));
-        }
-
-        if is_virtual_table_sql(create_sql) {
-            if entry.root_page < 0 {
-                return Err(sqlite_master_corrupt(format!(
-                    "sqlite_master virtual table `{}` has invalid rootpage {}",
-                    entry.name, entry.root_page
-                )));
-            }
-            let Some(Statement::CreateVirtualTable(create)) = parse_single_statement(create_sql)
-            else {
-                return Err(sqlite_master_corrupt(format!(
-                    "could not parse CREATE VIRTUAL TABLE SQL for `{}`",
-                    entry.name
-                )));
-            };
-            if !create.name.name.eq_ignore_ascii_case(entry.name) {
-                return Err(sqlite_master_corrupt(format!(
-                    "CREATE VIRTUAL TABLE SQL for `{}` declares `{}`",
-                    entry.name, create.name.name
-                )));
-            }
-            if !qualified_catalog_name_targets_main(create.name.schema.as_deref()) {
-                return Err(sqlite_master_corrupt(format!(
-                    "CREATE VIRTUAL TABLE SQL for `{}` targets a non-main schema",
-                    entry.name
-                )));
-            }
-            if entry.root_page > 0 {
-                claim_sqlite_master_root(
-                    "virtual table",
-                    entry.name,
-                    entry.root_page,
-                    max_root_page,
-                    header,
-                    free_pages,
-                    &mut root_owners,
-                )?;
-            }
-            claim_sqlite_master_virtual_table(
-                row_index,
-                entry.name,
-                entry.root_page,
-                &create.module,
-                &create.args,
-                &mut schema_names,
-                &mut virtual_table_variants,
-            )?;
-            continue;
-        }
-
-        claim_sqlite_master_root(
-            "table",
-            entry.name,
-            entry.root_page,
-            max_root_page,
-            header,
-            free_pages,
-            &mut root_owners,
-        )?;
-        let Some(Statement::CreateTable(create)) = parse_single_statement(create_sql) else {
-            return Err(sqlite_master_corrupt(format!(
-                "could not parse CREATE TABLE SQL for `{}`",
-                entry.name
-            )));
-        };
-        if create.temporary
-            || !qualified_catalog_name_targets_main(create.name.schema.as_deref())
-            || !create.name.name.eq_ignore_ascii_case(entry.name)
-            || !create.name.name.eq_ignore_ascii_case(entry.table_name)
-        {
-            return Err(sqlite_master_corrupt(format!(
-                "CREATE TABLE SQL for `{}` declares a temporary, non-main, or differently named table `{}`",
-                entry.name, create.name.name
-            )));
-        }
-        let slots = match &create.body {
-            CreateTableBody::Columns {
-                columns,
-                constraints,
-            } => implicit_autoindex_layout(columns, constraints, create.without_rowid).map_err(
-                |error| {
-                    sqlite_master_corrupt(format!(
-                        "invalid implicit autoindex layout for table `{}`: {error}",
-                        entry.name
-                    ))
-                },
-            )?,
-            CreateTableBody::AsSelect(_) => {
-                return Err(sqlite_master_corrupt(format!(
-                    "sqlite_master table `{}` stores CREATE TABLE AS SELECT instead of a normalized column definition",
-                    entry.name
-                )));
-            }
-        };
-        let slot_count = slots.len();
-        for ordinal in 1..=slot_count {
-            let logical_name = format!("sqlite_autoindex_{}_{ordinal}", entry.name);
-            logical_autoindex_names.insert(logical_name.to_ascii_lowercase(), logical_name);
-        }
-        let key = entry.name.to_ascii_lowercase();
-        let pending = PendingTableAutoindexes {
-            table_name: entry.name.to_owned(),
-            slots,
-            physical_roots: vec![None; slot_count],
-        };
-        if let Some(existing) = pending_by_table.insert(key, pending) {
-            return Err(sqlite_master_corrupt(format!(
-                "sqlite_master contains duplicate table entries for `{}` and `{}`",
-                existing.table_name, entry.name
-            )));
-        }
-        claim_sqlite_master_schema_name(
-            entry.name,
-            SqliteMasterSchemaNameKind::Table,
-            &mut schema_names,
-        )?;
-    }
-
-    for (trigger_name, table_name, requires_view) in pending_trigger_parents {
-        let target = schema_names.get(&table_name.to_ascii_lowercase());
-        let target_is_view =
-            target.is_some_and(|owner| owner.kind == SqliteMasterSchemaNameKind::View);
-        let target_is_table = target.is_some_and(|owner| {
-            matches!(
-                owner.kind,
-                SqliteMasterSchemaNameKind::Table | SqliteMasterSchemaNameKind::VirtualTable
-            )
-        });
-        if (!requires_view && !target_is_table) || (requires_view && !target_is_view) {
-            let expected_kind = if requires_view { "view" } else { "table" };
-            return Err(sqlite_master_corrupt(format!(
-                "trigger `{trigger_name}` refers to missing or incompatible {expected_kind} `{table_name}`"
-            )));
-        }
-    }
-
-    let mut index_names = HashMap::<String, String>::new();
-    for entry in &decoded {
-        if !entry.entry_type.eq_ignore_ascii_case("index") {
-            continue;
-        }
-        let index_key = entry.name.to_ascii_lowercase();
-        let logical_autoindex_name = logical_autoindex_names.get(&index_key);
-        if let Some(existing_name) = index_names.insert(index_key, entry.name.to_owned()) {
-            return Err(sqlite_master_corrupt(format!(
-                "sqlite_master contains duplicate index entries for `{existing_name}` and `{}`",
-                entry.name
-            )));
-        }
-        claim_sqlite_master_schema_name(
-            entry.name,
-            SqliteMasterSchemaNameKind::Index,
-            &mut schema_names,
-        )?;
-        let root_page = claim_sqlite_master_root(
-            "index",
-            entry.name,
-            entry.root_page,
-            max_root_page,
-            header,
-            free_pages,
-            &mut root_owners,
-        )?;
-        let table_key = entry.table_name.to_ascii_lowercase();
-        if !pending_by_table.contains_key(&table_key) {
-            return Err(sqlite_master_corrupt(format!(
-                "index `{}` refers to missing ordinary table `{}`",
-                entry.name, entry.table_name
-            )));
-        }
-        // A stored CREATE INDEX statement is authoritative even when its name
-        // resembles SQLite's reserved autoindex naming convention, unless a
-        // real declaration slot (including a hidden WITHOUT ROWID PK slot)
-        // already owns that logical name.
-        if let Some(create_sql) = entry.sql {
-            if let Some(logical_name) = logical_autoindex_name {
-                return Err(sqlite_master_corrupt(format!(
-                    "explicit index `{}` collides with logical implicit index `{logical_name}`",
-                    entry.name
-                )));
-            }
-            let Some(Statement::CreateIndex(create)) = parse_single_statement(create_sql) else {
-                return Err(sqlite_master_corrupt(format!(
-                    "could not parse CREATE INDEX SQL for `{}`",
-                    entry.name
-                )));
-            };
-            if !create.name.name.eq_ignore_ascii_case(entry.name)
-                || !create.table.eq_ignore_ascii_case(entry.table_name)
-                || !qualified_catalog_name_targets_main(create.name.schema.as_deref())
-            {
-                return Err(sqlite_master_corrupt(format!(
-                    "CREATE INDEX SQL for `{}` declares index `{}` on table `{}` instead of `{}`",
-                    entry.name, create.name.name, create.table, entry.table_name
-                )));
-            }
-            continue;
-        }
-
-        let Some(table) = pending_by_table.get_mut(&table_key) else {
-            unreachable!("ordinary index parent was validated above");
-        };
-        let Some(ordinal) = parse_autoindex_ordinal(entry.name, entry.table_name) else {
-            return Err(sqlite_master_corrupt(format!(
-                "implicit index `{}` does not have a canonical autoindex name for table `{}`",
-                entry.name, entry.table_name
-            )));
-        };
-        let Some(slot_index) = ordinal.checked_sub(1) else {
-            return Err(sqlite_master_corrupt(format!(
-                "implicit index `{}` has invalid ordinal {ordinal}",
-                entry.name
-            )));
-        };
-        let Some(slot) = table.slots.get(slot_index) else {
-            return Err(sqlite_master_corrupt(format!(
-                "implicit index `{}` selects nonexistent declaration slot {ordinal} on table `{}`",
-                entry.name, table.table_name
-            )));
-        };
-        if slot.is_hidden_without_rowid_primary_key() {
-            return Err(sqlite_master_corrupt(format!(
-                "implicit index `{}` illegally materializes hidden WITHOUT ROWID primary-key slot {ordinal}",
-                entry.name
-            )));
-        }
-        let root = table
-            .physical_roots
-            .get_mut(slot_index)
-            .expect("validated implicit autoindex slot must have a root binding");
-        if root.replace(root_page).is_some() {
-            return Err(sqlite_master_corrupt(format!(
-                "implicit autoindex slot {ordinal} on table `{}` is bound more than once",
-                table.table_name
-            )));
-        }
-    }
-
-    let mut by_table = HashMap::with_capacity(pending_by_table.len());
-    for (table_key, pending) in pending_by_table {
-        let mut bound_slots = Vec::with_capacity(pending.slots.len());
-        for (slot_index, slot) in pending.slots.into_iter().enumerate() {
-            let ordinal = slot_index + 1;
-            let storage = if slot.is_hidden_without_rowid_primary_key() {
-                BoundImplicitAutoindexStorage::TableRoot
-            } else {
-                let root_page = pending.physical_roots[slot_index].ok_or_else(|| {
-                    sqlite_master_corrupt(format!(
-                        "sqlite_master is missing implicit autoindex slot {ordinal} for table `{}`",
-                        pending.table_name
-                    ))
-                })?;
-                BoundImplicitAutoindexStorage::IndexRoot(root_page)
-            };
-            bound_slots.push(BoundImplicitAutoindexSlot {
-                ordinal,
-                slot,
-                storage,
-            });
-        }
-        by_table.insert(table_key, BoundTableAutoindexes { slots: bound_slots });
-    }
-
-    let canonical_virtual_table_rows = virtual_table_variants
-        .values()
-        .map(|variants| canonical_virtual_table_variant(variants).row_index)
-        .collect();
-
-    Ok(BoundImplicitAutoindexCatalog {
-        by_table,
-        canonical_virtual_table_rows,
-    })
+    let ordinal = suffix.parse::<usize>().ok()?;
+    (ordinal.to_string() == suffix).then_some(ordinal)
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-fn load_sqlite_header_from_page1(page1_bytes: &[u8]) -> Result<DatabaseHeader> {
+fn load_sqlite_cursor_sizes_from_page1(page1_bytes: &[u8]) -> Result<(u32, u32)> {
     let header_bytes: &[u8; DATABASE_HEADER_SIZE] = page1_bytes
         .get(..DATABASE_HEADER_SIZE)
         .ok_or_else(|| FrankenError::DatabaseCorrupt {
@@ -923,9 +123,15 @@ fn load_sqlite_header_from_page1(page1_bytes: &[u8]) -> Result<DatabaseHeader> {
         .map_err(|_| FrankenError::DatabaseCorrupt {
             detail: "database header is not a fixed-size 100-byte prefix".to_owned(),
         })?;
-    DatabaseHeader::from_bytes(header_bytes).map_err(|error| FrankenError::DatabaseCorrupt {
-        detail: format!("invalid database header: {error}"),
-    })
+    let header = DatabaseHeader::from_bytes(header_bytes).map_err(|error| {
+        FrankenError::DatabaseCorrupt {
+            detail: format!("invalid database header: {error}"),
+        }
+    })?;
+    Ok((
+        header.page_size.usable(header.reserved_per_page),
+        header.page_size.get(),
+    ))
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -980,7 +186,7 @@ pub fn is_sqlite_format(path: &Path) -> bool {
 /// insertion (e.g. duplicate rowid in sqlite_master).
 #[allow(clippy::too_many_lines)]
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-pub async fn persist_to_sqlite(
+pub fn persist_to_sqlite(
     cx: &Cx,
     path: &Path,
     schema: &[TableSchema],
@@ -998,7 +204,7 @@ pub async fn persist_to_sqlite(
     header.change_counter = effective_counter;
     header.schema_cookie = header.schema_cookie.max(1);
     header.version_valid_for = effective_counter;
-    persist_to_sqlite_with_header(cx, path, schema, db, &header).await
+    persist_to_sqlite_with_header(cx, path, schema, db, &header)
 }
 
 /// Persist `schema` + `db` using the provided database header template.
@@ -1007,7 +213,7 @@ pub async fn persist_to_sqlite(
 /// metadata that must survive rebuild flows like `VACUUM`.
 #[allow(clippy::too_many_lines)]
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-pub async fn persist_to_sqlite_with_header(
+pub fn persist_to_sqlite_with_header(
     cx: &Cx,
     path: &Path,
     schema: &[TableSchema],
@@ -1023,14 +229,13 @@ pub async fn persist_to_sqlite_with_header(
         &[],
         &HashMap::new(),
     )
-    .await
 }
 
 /// Persist `schema` + `db` plus additional sqlite_master rows using the
 /// provided database header template.
 #[allow(clippy::too_many_lines)]
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-pub async fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
+pub fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
     cx: &Cx,
     path: &Path,
     schema: &[TableSchema],
@@ -1049,7 +254,6 @@ pub async fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
         original_ddl,
         None,
     )
-    .await
 }
 
 /// Persist into an atomically caller-reserved empty file.
@@ -1059,7 +263,7 @@ pub async fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
 /// rejected before any database byte is initialized.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-pub async fn persist_to_reserved_sqlite_with_header_and_master_entries<S: BuildHasher>(
+pub fn persist_to_reserved_sqlite_with_header_and_master_entries<S: BuildHasher>(
     cx: &Cx,
     path: &Path,
     expected_identity: FileIdentity,
@@ -1079,12 +283,11 @@ pub async fn persist_to_reserved_sqlite_with_header_and_master_entries<S: BuildH
         original_ddl,
         Some(expected_identity),
     )
-    .await
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
+fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
     cx: &Cx,
     path: &Path,
     schema: &[TableSchema],
@@ -1109,12 +312,11 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             header_template.page_size,
             expected_identity,
             None,
-        )
-        .await?
+        )?
     } else {
-        SimplePager::open_with_cx(cx, vfs, path, header_template.page_size).await?
+        SimplePager::open_with_cx(cx, vfs, path, header_template.page_size)?
     };
-    let mut txn = pager.begin(cx, TransactionMode::Immediate).await?;
+    let mut txn = pager.begin(cx, TransactionMode::Immediate)?;
 
     let page_size = header_template.page_size;
     let page_size_usize = page_size.as_usize();
@@ -1134,10 +336,10 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
         };
 
         // Allocate a fresh root page for this table in the on-disk file.
-        let root_page = txn.allocate_page(cx).await?;
+        let root_page = txn.allocate_page(cx)?;
 
         // Initialize the root page as an empty leaf table B-tree.
-        init_leaf_table_page(cx, &mut txn, root_page, page_size_usize, usable_size).await?;
+        init_leaf_table_page(cx, &mut txn, root_page, page_size_usize, usable_size)?;
 
         // Insert all rows.
         {
@@ -1150,7 +352,7 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             configure_btree_cursor_page_size(&mut cursor, usable_size, full_page_size);
             for (rowid, values) in mem_table.iter_rows() {
                 let payload = serialize_record(values);
-                cursor.table_insert(cx, rowid, &payload).await?;
+                cursor.table_insert(cx, rowid, &payload)?;
             }
         }
 
@@ -1212,8 +414,8 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                 Vec::new()
             };
             // Allocate and initialize root page as leaf index page (0x0A).
-            let idx_root = txn.allocate_page(cx).await?;
-            init_leaf_index_page(cx, &mut txn, idx_root, page_size_usize, usable_size).await?;
+            let idx_root = txn.allocate_page(cx)?;
+            init_leaf_index_page(cx, &mut txn, idx_root, page_size_usize, usable_size)?;
 
             // Parse the partial index WHERE clause (if any) so we can skip
             // rows that don't satisfy the predicate.
@@ -1227,121 +429,23 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
 
             // Populate the index B-tree from table rows.
             {
-                // GH #304: carry the declared key semantics into the physical
-                // builder. `key_sort_directions` / `key_collations` were
-                // previously consumed only when regenerating CREATE INDEX text,
-                // so a DESC or non-BINARY term produced a b-tree whose physical
-                // order contradicted its own sqlite_master declaration. Stock
-                // SQLite then reads the index with the declared semantics and
-                // reports the image as malformed.
-                //
-                // Scope of the trailing entry, stated exactly: the key loop
-                // below emits a *synthetic* integer rowid as the suffix
-                // (`key_values.push(SqliteValue::Integer(rowid))`). That layout
-                // is correct only for rowid tables. A WITHOUT ROWID index takes
-                // its primary-key columns as the suffix instead, and this
-                // builder does not produce that shape at all — so the single
-                // trailing ASC/BINARY entry pushed here describes the synthetic
-                // rowid this code actually writes, and must NOT be read as
-                // implementing SQLite's general index-suffix rule. WITHOUT
-                // ROWID suffix semantics remain unfixed (GH #304 acceptance).
-                //
-                // Collations resolve against the cursor's default registry
-                // (BINARY/NOCASE/RTRIM only). A collation registered on the
-                // source connection is still not reachable from this function,
-                // but it no longer falls back silently: an unresolvable *name* is
-                // refused below, before any row is inserted, so a mis-ordered
-                // image is never produced for it.
-                //
-                // What remains unresolved for GH #304 is narrower and is a
-                // name-collision problem rather than a missing-name one: a source
-                // connection that overrides a built-in — registering its own
-                // implementation under BINARY, NOCASE, or RTRIM — still passes
-                // the name check and is then built with the default
-                // implementation. See the guard below for the full statement.
-                //
-                // Derive arity from the SAME discriminator the key loop below
-                // uses, not from `key_term_count()`: that helper prefers
-                // `key_expressions` whenever it is non-empty, while the loop
-                // only takes the expression branch when `columns` is empty.
-                // If both were ever populated the two would disagree and the
-                // metadata vectors would silently mis-align with the key.
-                let key_terms = if is_expression_index {
-                    index.key_expressions.len()
-                } else {
-                    index.columns.len()
-                };
-                let mut index_desc_flags: Vec<bool> = (0..key_terms)
-                    .map(|term| {
-                        index.key_sort_directions.get(term).copied() == Some(SortDirection::Desc)
-                    })
-                    .collect();
-                index_desc_flags.push(false);
-                let mut index_collations: Vec<Option<String>> = (0..key_terms)
-                    .map(|term| index.key_collations.get(term).cloned().flatten())
-                    .collect();
-                index_collations.push(None);
-
+                // bd-vacuum-desc-index-self-reject-y2aog: the insert cursor
+                // MUST carry the index's declared sort directions — a bare
+                // cursor positions every entry ASC/binary, so a DESC term
+                // yields a physically mis-ordered leaf that the (schema-
+                // driven, correct) integrity checker then rejects. All-ASC
+                // binary indexes only worked by coincidence.
                 let mut idx_cursor = fsqlite_btree::BtCursor::new_with_index_desc(
                     TransactionPageIo::new(&mut txn),
                     idx_root,
                     usable_size,
                     true,
-                    index_desc_flags,
+                    index
+                        .key_sort_directions
+                        .iter()
+                        .map(|direction| matches!(direction, SortDirection::Desc))
+                        .collect(),
                 );
-                let collation_registry = idx_cursor.collation_registry();
-                // GH #304: a collation the builder cannot resolve silently
-                // degrades to BINARY inside the cursor comparator, producing an
-                // index whose physical order contradicts the `COLLATE` term in
-                // its own regenerated DDL — exactly the malformed-image class
-                // this issue was filed for, but without the DESC symptom that
-                // made the original report visible. The source connection's
-                // registry is not reachable from this function, so the honest
-                // outcome is refusal rather than a quietly mis-ordered rebuild.
-                // This mirrors the hidden WITHOUT ROWID primary-key slot, which
-                // is likewise refused instead of approximated.
-                //
-                // This is a supported-schema limitation, not a violated internal
-                // invariant, so it is reported as `NotImplemented`: the schema is
-                // legitimate and the caller can act on it (register the collation
-                // on the rebuilding path, or export without that index).
-                //
-                // KNOWN GAP (GH #304, unresolved): this guard keys on the
-                // presence of a *name*, so it cannot see a source connection that
-                // overrides a built-in — registering its own implementation under
-                // `BINARY`, `NOCASE`, or `RTRIM`. `contains()` answers true, the
-                // guard admits the index, and the builder then orders it with the
-                // default implementation instead of the caller's. That is the
-                // same silently-wrong-order defect this guard exists to prevent,
-                // reachable through a name the guard trusts. Closing it needs the
-                // source connection's registry (or a per-collation identity, not
-                // just a name), which is not reachable from this function.
-                //
-                // Cleanup of the partially written candidate is NOT performed
-                // here — this function never removes its own output on any error
-                // path. The enclosing VACUUM caller owns that through
-                // `VacuumTargetReservation`, which is identity-bound; returning
-                // early simply leaves the reservation to clean up as it already
-                // does for every other failure in this function.
-                {
-                    let registry = collation_registry.lock().map_err(|_| {
-                        FrankenError::internal(
-                            "collation registry lock poisoned while rebuilding an index".to_owned(),
-                        )
-                    })?;
-                    for collation in index_collations.iter().flatten() {
-                        if !registry.contains(collation) {
-                            return Err(FrankenError::not_implemented(format!(
-                                "index `{}` declares collation `{collation}`, which is not \
-                                 available to the compatibility index builder; rebuilding it \
-                                 would order the index by BINARY and contradict its own \
-                                 declaration",
-                                index.name
-                            )));
-                        }
-                    }
-                }
-                idx_cursor.set_index_collation_context(index_collations, collation_registry);
                 configure_btree_cursor_page_size(&mut idx_cursor, usable_size, full_page_size);
                 if let Some(mem_table) = db.get_table(table.root_page) {
                     for (rowid, values) in mem_table.iter_rows() {
@@ -1379,7 +483,7 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                         }
                         key_values.push(SqliteValue::Integer(rowid));
                         let key = serialize_record(&key_values);
-                        idx_cursor.index_insert(cx, &key).await?;
+                        idx_cursor.index_insert(cx, &key)?;
                     }
                 }
             }
@@ -1441,7 +545,7 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
     // Write sqlite_master entries into page 1's B-tree.
     // sqlite_master columns: type TEXT, name TEXT, tbl_name TEXT, rootpage INTEGER, sql TEXT
     {
-        let mut page1 = txn.get_page(cx, PageNumber::ONE).await?.into_vec();
+        let mut page1 = txn.get_page(cx, PageNumber::ONE)?.into_vec();
         if page1.len() < DATABASE_HEADER_SIZE + 8 {
             return Err(FrankenError::internal(format!(
                 "page 1 too short for sqlite_master root header: {} bytes",
@@ -1462,7 +566,7 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
         };
         page1[DATABASE_HEADER_SIZE + 5..DATABASE_HEADER_SIZE + 7]
             .copy_from_slice(&master_content_start.to_be_bytes());
-        txn.write_page(cx, PageNumber::ONE, &page1).await?;
+        txn.write_page(cx, PageNumber::ONE, &page1)?;
 
         let master_root = PageNumber::ONE;
         let mut cursor = fsqlite_btree::BtCursor::new(
@@ -1489,21 +593,21 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             ]);
             #[allow(clippy::cast_possible_wrap)]
             let rid = (rowid as i64) + 1;
-            cursor.table_insert(cx, rid, &record).await?;
+            cursor.table_insert(cx, rid, &record)?;
         }
     }
 
     // Fix up the database header on page 1: update page_count,
     // change_counter, and schema_cookie so sqlite3 validates the file.
     {
-        let mut hdr_page = txn.get_page(cx, PageNumber::ONE).await?.into_vec();
+        let mut hdr_page = txn.get_page(cx, PageNumber::ONE)?.into_vec();
 
         // Discover the current page count by allocating one more page.
         // The extra page is included in the commit (the pager does not
         // support free_page), so the exported file has one trailing empty
         // page. This is benign: SQLite tolerates pages beyond the last
         // B-tree node, and the page_count header excludes it.
-        let next_page = txn.allocate_page(cx).await?.get();
+        let next_page = txn.allocate_page(cx)?.get();
         let max_page = next_page.saturating_sub(1).max(1);
 
         let mut final_header = header_template.clone();
@@ -1519,10 +623,10 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
         })?;
         hdr_page[..DATABASE_HEADER_SIZE].copy_from_slice(&encoded_header);
 
-        txn.write_page(cx, PageNumber::ONE, &hdr_page).await?;
+        txn.write_page(cx, PageNumber::ONE, &hdr_page)?;
     }
 
-    txn.commit(cx).await?;
+    txn.commit(cx)?;
     Ok(())
 }
 
@@ -1539,16 +643,13 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
 /// I/O / B-tree navigation failures.
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
+pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
     let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreCompatPersist);
     let vfs = PlatformVfs::new();
-    let pager = SimplePager::open_with_cx(cx, vfs, path, DEFAULT_PAGE_SIZE).await?;
-    let mut txn = pager.begin(cx, TransactionMode::ReadOnly).await?;
-    let max_root_page = txn.snapshot_db_size();
-    let page1 = txn.get_page(cx, PageNumber::ONE).await?;
-    let header = load_sqlite_header_from_page1(page1.as_ref())?;
-    let usable_size = header.page_size.usable(header.reserved_per_page);
-    let page_size = header.page_size.get();
+    let pager = SimplePager::open_with_cx(cx, vfs, path, DEFAULT_PAGE_SIZE)?;
+    let mut txn = pager.begin(cx, TransactionMode::ReadOnly)?;
+    let page1 = txn.get_page(cx, PageNumber::ONE)?;
+    let (usable_size, page_size) = load_sqlite_cursor_sizes_from_page1(page1.as_ref())?;
 
     // Read sqlite_master entries from page 1.
     let master_entries = {
@@ -1562,7 +663,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
         );
         configure_btree_cursor_page_size(&mut cursor, usable_size, page_size);
 
-        if cursor.first(cx).await? {
+        if cursor.first(cx)? {
             let mut payload_buf: Vec<u8> = Vec::new();
             loop {
                 // bd-9e3xf.6: fuse rowid+payload via the cursor accessor
@@ -1570,7 +671,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                 // the schema replay path, where N can be the full count of
                 // sqlite_master rows in the database.
                 payload_buf.clear();
-                let rowid = cursor.rowid_and_payload_into(cx, &mut payload_buf).await?;
+                let rowid = cursor.rowid_and_payload_into(cx, &mut payload_buf)?;
                 let values =
                     parse_record(&payload_buf).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -1578,17 +679,13 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                         ),
                     })?;
                 entries.push(values);
-                if !cursor.next(cx).await? {
+                if !cursor.next(cx)? {
                     break;
                 }
             }
         }
         entries
     };
-
-    let free_pages = txn.live_freelist_pages().into_iter().collect();
-    let bound_implicit_autoindexes =
-        bind_implicit_autoindex_catalog(&master_entries, max_root_page, &header, &free_pages)?;
 
     // Parse each sqlite_master row.
     // Columns: type(0), name(1), tbl_name(2), rootpage(3), sql(4)
@@ -1635,7 +732,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             SqliteValue::Text(s) => s,
             _ => continue,
         };
-        if !entry_type.eq_ignore_ascii_case("table") {
+        if &**entry_type != "table" {
             continue; // Skip indexes, views, triggers for now.
         }
 
@@ -1656,8 +753,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
         // declarations have no materialized root page to load, so skip them.
         // Positive-rootpage virtual tables are real B-trees and must remain
         // visible on reopen just like ordinary tables.
-        let is_virtual_table = is_virtual_table_sql(&create_sql);
-        if root_page_num == 0 && is_virtual_table {
+        if root_page_num == 0 && is_virtual_table_sql(&create_sql) {
             let _shadowed_by_materialized =
                 materialized_virtual_tables.contains(&name.to_ascii_lowercase());
             continue;
@@ -1666,17 +762,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
 
         // Parse the CREATE TABLE to extract column info and schema decorations.
         let columns = parse_columns_from_sqlite_master_sql(&create_sql);
-        let bound_table_autoindexes = if is_virtual_table {
-            None
-        } else {
-            Some(bound_implicit_autoindexes.table(&name).ok_or_else(|| {
-                sqlite_master_corrupt(format!(
-                    "validated ordinary table `{name}` has no bound autoindex layout"
-                ))
-            })?)
-        };
-        let indexes = bound_table_autoindexes
-            .map_or_else(Vec::new, |bound| bound.physical_index_schemas(&name));
+        let indexes = extract_unique_constraint_indexes_from_sql(&create_sql, &name);
         let primary_key_constraints = extract_primary_key_constraints_from_sql(&create_sql);
         let foreign_keys = extract_foreign_keys_from_sql(&create_sql, &columns);
         let check_constraints = extract_check_constraints_with_owners_from_sql(&create_sql);
@@ -1688,9 +774,6 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
         let real_root_page =
             i32::try_from(root_page_u32).expect("validated root page must fit MemDatabase");
         db.create_table_at(real_root_page, num_columns);
-        for index in &indexes {
-            db.create_table_at(index.root_page, 0);
-        }
 
         let table_name_for_err = name.to_string();
         schema.push(TableSchema {
@@ -1723,41 +806,53 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
         configure_btree_cursor_page_size(&mut cursor, usable_size, page_size);
 
         if let Some(mem_table) = db.tables.get_mut(&real_root_page) {
-            for slot in bound_table_autoindexes
-                .into_iter()
-                .flat_map(BoundTableAutoindexes::implicit_slots)
-            {
-                let Some(column_indices) = slot
-                    .columns()
+            let mut unique_groups = Vec::<(Vec<usize>, Vec<Option<String>>)>::new();
+            for (column_index, column) in current_table_schema.columns.iter().enumerate() {
+                if column.unique && !column.is_ipk {
+                    unique_groups.push((vec![column_index], vec![column.collation.clone()]));
+                }
+            }
+            for index in &indexes {
+                if !index.is_unique || index.columns.is_empty() {
+                    continue;
+                }
+                let (group, collations): (Vec<_>, Vec<_>) = index
+                    .columns
                     .iter()
-                    .map(|column_name| {
+                    .enumerate()
+                    .filter_map(|(term_idx, column_name)| {
                         current_table_schema
                             .columns
                             .iter()
                             .position(|column| column.name.eq_ignore_ascii_case(column_name))
+                            .map(|column_index| {
+                                (
+                                    column_index,
+                                    index.key_collations.get(term_idx).cloned().flatten(),
+                                )
+                            })
                     })
-                    .collect::<Option<Vec<_>>>()
-                else {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "canonical autoindex layout for `{table_name_for_err}` references a missing column"
-                        ),
-                    });
-                };
-                if !column_indices.is_empty() {
-                    mem_table.add_unique_column_group_with_collations(
-                        column_indices,
-                        slot.key_collations().to_vec(),
-                    );
+                    .unzip();
+                if group.is_empty()
+                    || group
+                        .iter()
+                        .all(|&column_index| current_table_schema.columns[column_index].is_ipk)
+                    || unique_groups.iter().any(|(existing, _)| existing == &group)
+                {
+                    continue;
                 }
+                unique_groups.push((group, collations));
             }
-            if cursor.first(cx).await? {
+            for (group, collations) in unique_groups {
+                mem_table.add_unique_column_group_with_collations(group, collations);
+            }
+            if cursor.first(cx)? {
                 if without_rowid {
                     let mut synthetic_rowid = 1_i64;
                     let mut payload_buf: Vec<u8> = Vec::new();
                     loop {
                         payload_buf.clear();
-                        cursor.payload_into(cx, &mut payload_buf).await?;
+                        cursor.payload_into(cx, &mut payload_buf)?;
                         let mut values = parse_record(&payload_buf).ok_or_else(|| {
                             FrankenError::DatabaseCorrupt {
                                 detail: format!(
@@ -1774,7 +869,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                         )?;
                         mem_table.insert_row(synthetic_rowid, values);
                         synthetic_rowid = synthetic_rowid.saturating_add(1);
-                        if !cursor.next(cx).await? {
+                        if !cursor.next(cx)? {
                             break;
                         }
                     }
@@ -1786,7 +881,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                     // parse_cell_at on every row of the legacy table-replay
                     // hot path used by file-backed schema hydration.
                     payload_buf.clear();
-                    let rowid = cursor.rowid_and_payload_into(cx, &mut payload_buf).await?;
+                    let rowid = cursor.rowid_and_payload_into(cx, &mut payload_buf)?;
                     let mut values = parse_record(&payload_buf).ok_or_else(|| {
                         FrankenError::DatabaseCorrupt {
                             detail: format!(
@@ -1802,7 +897,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                         &table_name_for_err,
                     )?;
                     mem_table.insert_row(rowid, values);
-                    if !cursor.next(cx).await? {
+                    if !cursor.next(cx)? {
                         break;
                     }
                 }
@@ -1821,7 +916,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             SqliteValue::Text(s) => s,
             _ => continue,
         };
-        if !entry_type.eq_ignore_ascii_case("index") {
+        if &**entry_type != "index" {
             continue;
         }
         let index_name = match &entry[1] {
@@ -1849,66 +944,29 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                 ),
             })?;
 
-        // Find the parent table in the schema and bind the authoritative SQL
-        // against it before mutating either schema or MemDatabase state.
-        let Some(table_position) = schema
-            .iter()
-            .position(|table| table.name.eq_ignore_ascii_case(&tbl_name))
+        // Find the parent table in the schema.
+        let Some(table) = schema
+            .iter_mut()
+            .find(|t| t.name.eq_ignore_ascii_case(&tbl_name))
         else {
-            return Err(sqlite_master_corrupt(format!(
-                "validated index `{index_name}` lost parent table `{tbl_name}` during load"
-            )));
+            continue;
         };
 
-        let Some(Statement::CreateIndex(create_stmt)) = parse_single_statement(&create_sql) else {
-            return Err(sqlite_master_corrupt(format!(
-                "validated CREATE INDEX SQL for `{index_name}` could not be parsed during load"
-            )));
-        };
-        if let Some(schema_name) = create_stmt.name.schema.as_deref() {
-            return Err(sqlite_master_corrupt(format!(
-                "explicit index `{index_name}` on table `{tbl_name}` has non-canonical schema-qualified CREATE INDEX SQL (`{schema_name}`) during load"
-            )));
-        }
-        let table = &schema[table_position];
-        if table
-            .indexes
-            .iter()
-            .any(|index| index.name.eq_ignore_ascii_case(&index_name))
+        // Parse the CREATE INDEX SQL to extract column names, collations,
+        // sort directions, and WHERE clause.
+        if let Some(idx_schema) =
+            self::parse_create_index_sql_to_schema(&index_name, root_page_i32, &create_sql)
         {
-            return Err(sqlite_master_corrupt(format!(
-                "validated explicit index `{index_name}` duplicates an existing index on table `{tbl_name}` during load"
-            )));
+            // Only add if not already present (avoid duplicates with autoindexes).
+            if !table.indexes.iter().any(|i| i.name == index_name) {
+                table.indexes.push(idx_schema);
+            }
         }
-        let bound_index = bind_explicit_index(&create_stmt, &index_name, &tbl_name, table)
-            .map_err(|error| {
-                sqlite_master_corrupt(format!(
-                    "invalid explicit index `{index_name}` on table `{tbl_name}` during load: {error}"
-                ))
-            })?;
-        for indexed in &create_stmt.columns {
-            validate_builtin_persisted_index_expr_functions(&indexed.expr).map_err(|error| {
-                sqlite_master_corrupt(format!(
-                    "invalid explicit index `{index_name}` on table `{tbl_name}` during load: {error}"
-                ))
-            })?;
-        }
-        if let Some(predicate) = create_stmt.where_clause.as_ref() {
-            validate_builtin_persisted_index_expr_functions(predicate).map_err(|error| {
-                sqlite_master_corrupt(format!(
-                    "invalid explicit index `{index_name}` on table `{tbl_name}` during load: {error}"
-                ))
-            })?;
-        }
-        schema[table_position]
-            .indexes
-            .push(bound_index.into_index_schema(root_page_i32));
-        db.create_table_at(root_page_i32, 0);
     }
 
     // Read schema_cookie and change_counter from the database header (page 1).
     let (schema_cookie, change_counter) = {
-        let header_buf = txn.get_page(cx, PageNumber::ONE).await?;
+        let header_buf = txn.get_page(cx, PageNumber::ONE)?;
         let hdr = header_buf.as_ref();
         let cookie = if hdr.len() >= 44 {
             u32::from_be_bytes([hdr[40], hdr[41], hdr[42], hdr[43]])
@@ -1938,7 +996,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
 
 /// Initialize a page as an empty leaf table B-tree page (type 0x0D).
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-async fn init_leaf_table_page(
+fn init_leaf_table_page(
     cx: &Cx,
     txn: &mut impl TransactionHandle,
     page_no: PageNumber,
@@ -1962,11 +1020,11 @@ async fn init_leaf_table_page(
         })?
     };
     page[5..7].copy_from_slice(&content_start.to_be_bytes());
-    txn.write_page(cx, page_no, &page).await
+    txn.write_page(cx, page_no, &page)
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-async fn init_leaf_index_page(
+fn init_leaf_index_page(
     cx: &Cx,
     txn: &mut impl TransactionHandle,
     page_no: PageNumber,
@@ -1986,7 +1044,152 @@ async fn init_leaf_index_page(
         })?
     };
     page[5..7].copy_from_slice(&content_start.to_be_bytes());
-    txn.write_page(cx, page_no, &page).await
+    txn.write_page(cx, page_no, &page)
+}
+
+/// Parse a `CREATE INDEX` SQL string into an `IndexSchema`.
+/// Returns `None` if the SQL cannot be parsed.
+fn parse_create_index_sql_to_schema(
+    index_name: &str,
+    root_page: i32,
+    sql: &str,
+) -> Option<IndexSchema> {
+    if let Some(Statement::CreateIndex(create)) = parse_single_statement(sql) {
+        return Some(create_index_statement_to_index_schema(
+            index_name, root_page, &create,
+        ));
+    }
+
+    // Simple regex-free parser: look for "ON table_name (col1, col2 COLLATE NOCASE DESC)"
+    // while preserving quoted names and comments inside the indexed term list.
+    let keyword_tokens = unquoted_sql_keyword_tokens(sql);
+    let is_unique = unquoted_tokens_contain_phrase(&keyword_tokens, &["CREATE", "UNIQUE", "INDEX"]);
+    // Find the indexed-term list between the unquoted '(' after ON and its
+    // matching ')'.
+    let on_pos = find_unquoted_sql_keyword(sql, "ON")?;
+    let after_on_pos = on_pos + "ON".len();
+    let paren_start = after_on_pos + find_unquoted_sql_char(&sql[after_on_pos..], '(')?;
+    let paren_end = find_matching_sql_paren(sql, paren_start)?;
+    let col_list = &sql[paren_start + 1..paren_end];
+
+    let mut columns = Vec::new();
+    let mut collations = Vec::new();
+    let mut directions = Vec::new();
+
+    for part in split_top_level_csv_items(col_list) {
+        let (col_name, remainder) = parse_column_name_and_remainder(&part)?;
+        columns.push(col_name);
+        collations.push(extract_collation_name(remainder));
+        directions.push(extract_index_term_direction(remainder));
+    }
+
+    // WHERE clause for partial indexes (everything after the closing paren).
+    let after_paren = trim_leading_sql_space_and_comments(&sql[paren_end + 1..]);
+    let where_clause = if collect_unquoted_sql_keyword_tokens(after_paren)
+        .first()
+        .is_some_and(|(token, start)| token == "WHERE" && *start == 0)
+    {
+        let expr = trim_leading_sql_space_and_comments(&after_paren["WHERE".len()..]);
+        Some(expr.to_owned())
+    } else {
+        None
+    };
+
+    Some(IndexSchema {
+        name: index_name.to_owned(),
+        root_page,
+        columns,
+        key_expressions: Vec::new(),
+        key_sort_directions: directions,
+        where_clause,
+        is_unique,
+        key_collations: collations,
+        conflict_action: None,
+    })
+}
+
+fn create_index_statement_to_index_schema(
+    index_name: &str,
+    root_page: i32,
+    create: &fsqlite_ast::CreateIndexStatement,
+) -> IndexSchema {
+    let normalized_terms = create
+        .columns
+        .iter()
+        .map(|indexed| {
+            Some((
+                indexed_column_name(indexed)?.to_owned(),
+                normalized_indexed_column_collation(indexed),
+            ))
+        })
+        .collect::<Option<Vec<_>>>();
+    let (columns, key_expressions, key_collations) =
+        if let Some(normalized_terms) = normalized_terms {
+            (
+                normalized_terms
+                    .iter()
+                    .map(|(column_name, _)| column_name.clone())
+                    .collect(),
+                Vec::new(),
+                normalized_terms
+                    .into_iter()
+                    .map(|(_, collation)| collation)
+                    .collect(),
+            )
+        } else {
+            (
+                Vec::new(),
+                create
+                    .columns
+                    .iter()
+                    .map(|indexed| indexed.expr.to_string())
+                    .collect(),
+                create
+                    .columns
+                    .iter()
+                    .map(normalized_indexed_column_collation)
+                    .collect(),
+            )
+        };
+
+    IndexSchema {
+        name: index_name.to_owned(),
+        root_page,
+        columns,
+        key_expressions,
+        key_sort_directions: create
+            .columns
+            .iter()
+            .map(|indexed| indexed.direction.unwrap_or(SortDirection::Asc))
+            .collect(),
+        where_clause: create.where_clause.as_ref().map(ToString::to_string),
+        is_unique: create.unique,
+        key_collations,
+        conflict_action: None,
+    }
+}
+
+fn normalized_indexed_column_collation(indexed: &IndexedColumn) -> Option<String> {
+    indexed_column_collation(indexed).map(|collation| collation.to_ascii_uppercase())
+}
+
+fn extract_index_term_direction(remainder: &str) -> SortDirection {
+    let collation_name_range = find_collation_name_range(remainder);
+    let mut direction = SortDirection::Asc;
+    for (token, start) in collect_unquoted_sql_keyword_tokens(remainder) {
+        if collation_name_range
+            .as_ref()
+            .is_some_and(|range| range.contains(&start))
+        {
+            continue;
+        }
+        match token.as_str() {
+            "DESC" => direction = SortDirection::Desc,
+            "ASC" => direction = SortDirection::Asc,
+            _ => {}
+        }
+    }
+    direction
 }
 
 fn quote_identifier(identifier: &str) -> String {
@@ -2242,46 +1445,130 @@ pub(crate) fn extract_primary_key_constraints_from_sql(sql: &str) -> Vec<Vec<Str
     primary_keys
 }
 
-#[cfg(test)]
-fn extract_unique_constraint_indexes_from_sql(
-    sql: &str,
-    table_name: &str,
-) -> Result<Vec<IndexSchema>> {
-    let slots = extract_implicit_autoindex_slots_from_sql(sql, table_name)?;
-    Ok(slots
-        .into_iter()
-        .enumerate()
-        .filter(|(_, slot)| !slot.is_hidden_without_rowid_primary_key())
-        .map(|(slot_index, slot)| slot.into_index_schema(table_name, slot_index + 1, 0))
-        .collect())
-}
-
-#[cfg(test)]
-fn extract_implicit_autoindex_slots_from_sql(
-    sql: &str,
-    table_name: &str,
-) -> Result<Vec<ImplicitAutoindexSlot>> {
+fn extract_unique_constraint_indexes_from_sql(sql: &str, table_name: &str) -> Vec<IndexSchema> {
     let Some(Statement::CreateTable(create)) = parse_single_statement(sql) else {
-        return Err(FrankenError::DatabaseCorrupt {
-            detail: format!("could not parse CREATE TABLE SQL for `{table_name}`"),
-        });
+        return Vec::new();
     };
-    if !create.name.name.eq_ignore_ascii_case(table_name) {
-        return Err(FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "CREATE TABLE SQL for `{table_name}` declares `{}`",
-                create.name.name
-            ),
-        });
-    }
     let CreateTableBody::Columns {
         columns,
         constraints,
     } = &create.body
     else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
-    implicit_autoindex_layout(columns, constraints, create.without_rowid)
+
+    let mut indexes = Vec::new();
+    let mut autoindex_ordinal = 1_usize;
+
+    for column in columns {
+        let has_unique_constraint = column.constraints.iter().any(|constraint| {
+            matches!(
+                constraint.kind,
+                ColumnConstraintKind::Unique { .. } | ColumnConstraintKind::PrimaryKey { .. }
+            )
+        });
+        let is_ipk = column.type_name.as_ref().is_some_and(|type_name| {
+            type_name.name.eq_ignore_ascii_case("INTEGER")
+                && column.constraints.iter().any(|constraint| {
+                    matches!(
+                        constraint.kind,
+                        ColumnConstraintKind::PrimaryKey {
+                            direction: None | Some(SortDirection::Asc),
+                            ..
+                        }
+                    )
+                })
+        });
+        if has_unique_constraint && !is_ipk {
+            indexes.push(IndexSchema {
+                name: format!("sqlite_autoindex_{table_name}_{autoindex_ordinal}"),
+                root_page: 0,
+                columns: vec![column.name.clone()],
+                key_expressions: Vec::new(),
+                key_sort_directions: vec![SortDirection::Asc],
+                where_clause: None,
+                is_unique: true,
+                key_collations: vec![column.constraints.iter().find_map(|constraint| {
+                    if let ColumnConstraintKind::Collate(name) = &constraint.kind {
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                })],
+                conflict_action: column
+                    .constraints
+                    .iter()
+                    .find_map(|constraint| match &constraint.kind {
+                        ColumnConstraintKind::Unique { conflict }
+                        | ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
+                        _ => None,
+                    }),
+            });
+            autoindex_ordinal += 1;
+        }
+    }
+
+    for constraint in constraints {
+        let (indexed_columns, is_primary_key) = match &constraint.kind {
+            TableConstraintKind::Unique {
+                columns: indexed_columns,
+                ..
+            } => (indexed_columns, false),
+            TableConstraintKind::PrimaryKey {
+                columns: indexed_columns,
+                ..
+            } => (indexed_columns, true),
+            _ => continue,
+        };
+        if is_primary_key
+            && table_primary_key_is_rowid_alias(columns, indexed_columns, create.without_rowid)
+        {
+            continue;
+        }
+        let Some(normalized_terms) = indexed_columns
+            .iter()
+            .map(|indexed_column| {
+                Some((
+                    indexed_column_name(indexed_column)?.to_owned(),
+                    indexed_column_collation(indexed_column),
+                ))
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let columns = normalized_terms
+            .iter()
+            .map(|(column_name, _)| column_name.clone())
+            .collect::<Vec<_>>();
+        if columns.is_empty() {
+            continue;
+        }
+        indexes.push(IndexSchema {
+            name: format!("sqlite_autoindex_{table_name}_{autoindex_ordinal}"),
+            root_page: 0,
+            columns,
+            key_expressions: Vec::new(),
+            key_sort_directions: indexed_columns
+                .iter()
+                .map(|indexed| indexed.direction.unwrap_or(SortDirection::Asc))
+                .collect(),
+            where_clause: None,
+            is_unique: true,
+            key_collations: normalized_terms
+                .into_iter()
+                .map(|(_, collation)| collation)
+                .collect(),
+            conflict_action: match &constraint.kind {
+                TableConstraintKind::Unique { conflict, .. }
+                | TableConstraintKind::PrimaryKey { conflict, .. } => *conflict,
+                _ => None,
+            },
+        });
+        autoindex_ordinal += 1;
+    }
+
+    indexes
 }
 
 pub(crate) fn extract_foreign_keys_from_sql(sql: &str, columns: &[ColumnInfo]) -> Vec<FkDef> {
@@ -3045,19 +2332,32 @@ fn format_default_value(dv: &DefaultValue) -> String {
     }
 }
 
-fn indexed_column_name(indexed_column: &fsqlite_ast::IndexedColumn) -> Option<&str> {
+fn indexed_column_name(indexed_column: &IndexedColumn) -> Option<&str> {
     fn extract(expr: &Expr) -> Option<&str> {
         match expr {
-            Expr::Column(column, _) if column.table.is_none() => Some(&column.column),
-            // SQLite accepts a legacy single-quoted identifier in table-level
-            // PRIMARY KEY and UNIQUE constraints.
-            Expr::Literal(Literal::String(name), _) => Some(name),
+            Expr::Column(col_ref, _) if col_ref.table.is_none() => Some(&col_ref.column),
             Expr::Collate { expr, .. } => extract(expr),
             _ => None,
         }
     }
 
     extract(&indexed_column.expr)
+}
+
+fn indexed_column_collation(indexed_column: &IndexedColumn) -> Option<String> {
+    fn extract(expr: &Expr) -> Option<&str> {
+        match expr {
+            Expr::Collate {
+                expr, collation, ..
+            } => extract(expr).or(Some(collation.as_str())),
+            _ => None,
+        }
+    }
+
+    indexed_column
+        .collation
+        .clone()
+        .or_else(|| extract(&indexed_column.expr).map(str::to_owned))
 }
 
 fn strip_wrapping_default_parens(mut default_sql: &str) -> &str {
@@ -3397,6 +2697,24 @@ fn loaded_row_values_satisfy_notnull(columns: &[ColumnInfo], values: &[SqliteVal
         })
 }
 
+fn table_primary_key_is_rowid_alias(
+    columns: &[fsqlite_ast::ColumnDef],
+    indexed_columns: &[IndexedColumn],
+    without_rowid: bool,
+) -> bool {
+    if without_rowid || indexed_columns.len() != 1 {
+        return false;
+    }
+    let Some(column_name) = indexed_column_name(&indexed_columns[0]) else {
+        return false;
+    };
+    columns
+        .iter()
+        .find(|column| column.name.eq_ignore_ascii_case(column_name))
+        .and_then(|column| column.type_name.as_ref())
+        .is_some_and(|type_name| type_name.name.eq_ignore_ascii_case("INTEGER"))
+}
+
 fn try_parse_columns_from_create_sql_ast(sql: &str) -> Option<Vec<ColumnInfo>> {
     let Statement::CreateTable(create) = parse_single_statement(sql)? else {
         return None;
@@ -3411,14 +2729,14 @@ pub(crate) fn columns_from_create_table_statement(
         return None;
     };
 
-    let mut table_pk_rowid = None;
+    let mut table_pk_rowid_col_idx = None;
 
     if let CreateTableBody::Columns { constraints, .. } = &create.body {
         for constraint in constraints {
             match &constraint.kind {
                 TableConstraintKind::PrimaryKey {
                     columns: pk_columns,
-                    conflict,
+                    ..
                 } if pk_columns.len() == 1 => {
                     let Some(column_name) = indexed_column_name(&pk_columns[0]) else {
                         continue;
@@ -3430,9 +2748,12 @@ pub(crate) fn columns_from_create_table_statement(
                         continue;
                     };
 
-                    let is_integer = column_def_is_exact_integer(&columns[index]);
+                    let is_integer = columns[index]
+                        .type_name
+                        .as_ref()
+                        .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
                     if is_integer && !create.without_rowid {
-                        table_pk_rowid = Some((index, *conflict));
+                        table_pk_rowid_col_idx = Some(index);
                     }
                 }
                 _ => {}
@@ -3444,7 +2765,10 @@ pub(crate) fn columns_from_create_table_statement(
         .iter()
         .enumerate()
         .find_map(|(index, col)| {
-            let is_integer = column_def_is_exact_integer(col);
+            let is_integer = col
+                .type_name
+                .as_ref()
+                .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
             let pk = col.constraints.iter().find_map(|constraint| {
                 if let ColumnConstraintKind::PrimaryKey { direction, .. } = &constraint.kind {
                     if *direction != Some(SortDirection::Desc) {
@@ -3462,7 +2786,7 @@ pub(crate) fn columns_from_create_table_statement(
                 None
             }
         })
-        .or_else(|| table_pk_rowid.map(|(index, _)| index));
+        .or(table_pk_rowid_col_idx);
 
     Some(
         columns
@@ -3514,7 +2838,7 @@ pub(crate) fn columns_from_create_table_statement(
                         _ => None,
                     })
                     .unwrap_or((None, None));
-                let collation = col.constraints.iter().rev().find_map(|constraint| {
+                let collation = col.constraints.iter().find_map(|constraint| {
                     if let ColumnConstraintKind::Collate(name) = &constraint.kind {
                         Some(name.clone())
                     } else {
@@ -3530,11 +2854,6 @@ pub(crate) fn columns_from_create_table_statement(
                         .find_map(|constraint| match &constraint.kind {
                             ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
                             _ => None,
-                        })
-                        .or_else(|| {
-                            table_pk_rowid.and_then(|(pk_index, conflict)| {
-                                (pk_index == index).then_some(conflict).flatten()
-                            })
                         })
                 } else {
                     col.constraints
@@ -4188,7 +3507,7 @@ mod tests {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    async fn persist_test_db(
+    fn persist_test_db(
         path: &Path,
         schema: &[TableSchema],
         db: &MemDatabase,
@@ -4196,29 +3515,12 @@ mod tests {
         change_counter: u32,
     ) -> Result<()> {
         let cx = Cx::new();
-        persist_to_sqlite(&cx, path, schema, db, schema_cookie, change_counter).await
+        persist_to_sqlite(&cx, path, schema, db, schema_cookie, change_counter)
     }
 
-    async fn load_test_db(path: &Path) -> Result<LoadedState> {
+    fn load_test_db(path: &Path) -> Result<LoadedState> {
         let cx = Cx::new();
-        load_from_sqlite(&cx, path).await
-    }
-
-    fn bare_table_schema(name: &str, columns: &[&str]) -> TableSchema {
-        TableSchema {
-            name: name.to_owned(),
-            root_page: 2,
-            columns: columns
-                .iter()
-                .map(|column| ColumnInfo::basic(*column, 'A', false))
-                .collect(),
-            indexes: Vec::new(),
-            strict: false,
-            without_rowid: false,
-            primary_key_constraints: Vec::new(),
-            foreign_keys: Vec::new(),
-            check_constraints: Vec::new(),
-        }
+        load_from_sqlite(&cx, path)
     }
 
     #[test]
@@ -4332,74 +3634,68 @@ mod tests {
 
     #[test]
     fn test_roundtrip_persist_and_load() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("test.db");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
 
-            let (schema, db) = make_test_schema_and_db();
-            persist_test_db(&db_path, &schema, &db, 0, 0).await.unwrap();
+        let (schema, db) = make_test_schema_and_db();
+        persist_test_db(&db_path, &schema, &db, 0, 0).unwrap();
 
-            assert!(db_path.exists(), "db file should exist");
-            assert!(is_sqlite_format(&db_path), "should have SQLite magic");
+        assert!(db_path.exists(), "db file should exist");
+        assert!(is_sqlite_format(&db_path), "should have SQLite magic");
 
-            let loaded = load_test_db(&db_path).await.unwrap();
-            assert_eq!(loaded.schema.len(), 1);
-            assert_eq!(loaded.schema[0].name, "test_table");
-            assert_eq!(loaded.schema[0].columns.len(), 2);
+        let loaded = load_test_db(&db_path).unwrap();
+        assert_eq!(loaded.schema.len(), 1);
+        assert_eq!(loaded.schema[0].name, "test_table");
+        assert_eq!(loaded.schema[0].columns.len(), 2);
 
-            let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
-            let rows: Vec<_> = table.iter_rows().collect();
-            assert_eq!(rows.len(), 2);
-            assert_eq!(rows[0].0, 1); // rowid
-            assert_eq!(rows[0].1[0], SqliteValue::Integer(42));
-            assert_eq!(rows[0].1[1], SqliteValue::Text("hello".into()));
-            assert_eq!(rows[1].0, 2);
-            assert_eq!(rows[1].1[0], SqliteValue::Integer(99));
-            assert_eq!(rows[1].1[1], SqliteValue::Text("world".into()));
-        });
+        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+        let rows: Vec<_> = table.iter_rows().collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 1); // rowid
+        assert_eq!(rows[0].1[0], SqliteValue::Integer(42));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("hello".into()));
+        assert_eq!(rows[1].0, 2);
+        assert_eq!(rows[1].1[0], SqliteValue::Integer(99));
+        assert_eq!(rows[1].1[1], SqliteValue::Text("world".into()));
     }
 
     #[test]
     fn test_empty_database_roundtrip() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("empty.db");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("empty.db");
 
-            let schema: Vec<TableSchema> = Vec::new();
-            let db = MemDatabase::new();
-            persist_test_db(&db_path, &schema, &db, 0, 0).await.unwrap();
+        let schema: Vec<TableSchema> = Vec::new();
+        let db = MemDatabase::new();
+        persist_test_db(&db_path, &schema, &db, 0, 0).unwrap();
 
-            assert!(is_sqlite_format(&db_path));
+        assert!(is_sqlite_format(&db_path));
 
-            let loaded = load_test_db(&db_path).await.unwrap();
-            assert!(loaded.schema.is_empty());
-        });
+        let loaded = load_test_db(&db_path).unwrap();
+        assert!(loaded.schema.is_empty());
     }
 
     #[test]
     fn test_persist_creates_sqlite3_readable_file() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("readable.db");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("readable.db");
 
-            let (schema, db) = make_test_schema_and_db();
-            persist_test_db(&db_path, &schema, &db, 0, 0).await.unwrap();
+        let (schema, db) = make_test_schema_and_db();
+        persist_test_db(&db_path, &schema, &db, 0, 0).unwrap();
 
-            // Verify with rusqlite (C SQLite) that the file is valid.
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            let mut stmt = conn
-                .prepare("SELECT id, name FROM test_table ORDER BY id")
-                .unwrap();
-            let rows: Vec<(i64, String)> = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap();
+        // Verify with rusqlite (C SQLite) that the file is valid.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, name FROM test_table ORDER BY id")
+            .unwrap();
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
 
-            assert_eq!(rows.len(), 2);
-            assert_eq!(rows[0], (42, "hello".to_owned()));
-            assert_eq!(rows[1], (99, "world".to_owned()));
-        });
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (42, "hello".to_owned()));
+        assert_eq!(rows[1], (99, "world".to_owned()));
     }
 
     #[test]
@@ -4413,116 +3709,109 @@ mod tests {
 
     #[test]
     fn test_load_sqlite3_created_file() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("from_c.db");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c.db");
 
-            // Create with C SQLite via rusqlite.
-            {
-                let conn = rusqlite::Connection::open(&db_path).unwrap();
-                conn.execute_batch(
-                    "CREATE TABLE items (val INTEGER, label TEXT);
+        // Create with C SQLite via rusqlite.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (val INTEGER, label TEXT);
                  INSERT INTO items VALUES (10, 'alpha');
                  INSERT INTO items VALUES (20, 'beta');",
-                )
-                .unwrap();
-            }
+            )
+            .unwrap();
+        }
 
-            // Load with our compat loader.
-            let loaded = load_test_db(&db_path).await.unwrap();
-            assert_eq!(loaded.schema.len(), 1);
-            assert_eq!(loaded.schema[0].name, "items");
+        // Load with our compat loader.
+        let loaded = load_test_db(&db_path).unwrap();
+        assert_eq!(loaded.schema.len(), 1);
+        assert_eq!(loaded.schema[0].name, "items");
 
-            let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
-            let rows: Vec<_> = table.iter_rows().collect();
-            assert_eq!(rows.len(), 2);
-            assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
-            assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
-            assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
-            assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
-        });
+        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+        let rows: Vec<_> = table.iter_rows().collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
+        assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
     }
 
     #[test]
     fn test_load_sqlite3_created_file_restores_integer_primary_key_alias_values() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("from_c_ipk.db");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_ipk.db");
 
-            {
-                let conn = rusqlite::Connection::open(&db_path).unwrap();
-                conn.execute_batch(
-                    "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT);
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT);
                  INSERT INTO items (id, label) VALUES (10, 'alpha');
                  INSERT INTO items (id, label) VALUES (20, 'beta');",
-                )
-                .unwrap();
-            }
+            )
+            .unwrap();
+        }
 
-            let loaded = load_test_db(&db_path).await.unwrap();
-            assert_eq!(loaded.schema.len(), 1);
-            assert_eq!(loaded.schema[0].name, "items");
-            assert!(loaded.schema[0].columns[0].is_ipk);
-            assert!(
-                loaded.schema[0].indexes.is_empty(),
-                "table-level INTEGER PRIMARY KEY rowid aliases must not synthesize autoindexes"
-            );
+        let loaded = load_test_db(&db_path).unwrap();
+        assert_eq!(loaded.schema.len(), 1);
+        assert_eq!(loaded.schema[0].name, "items");
+        assert!(loaded.schema[0].columns[0].is_ipk);
+        assert!(
+            loaded.schema[0].indexes.is_empty(),
+            "table-level INTEGER PRIMARY KEY rowid aliases must not synthesize autoindexes"
+        );
 
-            let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
-            let rows: Vec<_> = table.iter_rows().collect();
-            assert_eq!(rows.len(), 2);
-            assert_eq!(rows[0].0, 10);
-            assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
-            assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
-            assert_eq!(rows[1].0, 20);
-            assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
-            assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
-        });
+        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+        let rows: Vec<_> = table.iter_rows().collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 10);
+        assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[1].0, 20);
+        assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
+        assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
     }
 
     #[test]
     fn test_load_sqlite3_created_file_restores_table_level_integer_primary_key_alias_values() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("from_c_table_pk.db");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_table_pk.db");
 
-            {
-                let conn = rusqlite::Connection::open(&db_path).unwrap();
-                conn.execute_batch(
-                    "CREATE TABLE items (id INTEGER, label TEXT, PRIMARY KEY(id));
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (id INTEGER, label TEXT, PRIMARY KEY(id));
                  INSERT INTO items (id, label) VALUES (10, 'alpha');
                  INSERT INTO items (id, label) VALUES (20, 'beta');",
-                )
-                .unwrap();
-            }
+            )
+            .unwrap();
+        }
 
-            let loaded = load_test_db(&db_path).await.unwrap();
-            assert_eq!(loaded.schema.len(), 1);
-            assert_eq!(loaded.schema[0].name, "items");
-            assert!(loaded.schema[0].columns[0].is_ipk);
+        let loaded = load_test_db(&db_path).unwrap();
+        assert_eq!(loaded.schema.len(), 1);
+        assert_eq!(loaded.schema[0].name, "items");
+        assert!(loaded.schema[0].columns[0].is_ipk);
 
-            let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
-            let rows: Vec<_> = table.iter_rows().collect();
-            assert_eq!(rows.len(), 2);
-            assert_eq!(rows[0].0, 10);
-            assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
-            assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
-            assert_eq!(rows[1].0, 20);
-            assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
-            assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
-        });
+        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+        let rows: Vec<_> = table.iter_rows().collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 10);
+        assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[1].0, 20);
+        assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
+        assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
     }
 
     #[test]
     fn test_load_sqlite3_rowid_alias_multi_alter_short_rows_preserves_alignment() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("from_c_ipk_multi_alter.db");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_ipk_multi_alter.db");
 
-            {
-                let conn = rusqlite::Connection::open(&db_path).unwrap();
-                conn.execute_batch(
-                    "CREATE TABLE items (
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (
                     prefix TEXT,
                     id INTEGER PRIMARY KEY,
                     nullable TEXT,
@@ -4532,87 +3821,82 @@ mod tests {
                  VALUES ('p', 7, NULL, 'keep');
                  ALTER TABLE items ADD COLUMN extra TEXT DEFAULT 'x';
                  ALTER TABLE items ADD COLUMN note INTEGER DEFAULT 9;",
-                )
-                .unwrap();
-            }
+            )
+            .unwrap();
+        }
 
-            let loaded = load_test_db(&db_path).await.unwrap();
-            assert_eq!(loaded.schema.len(), 1);
-            assert_eq!(loaded.schema[0].name, "items");
+        let loaded = load_test_db(&db_path).unwrap();
+        assert_eq!(loaded.schema.len(), 1);
+        assert_eq!(loaded.schema[0].name, "items");
 
-            let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
-            let rows: Vec<_> = table.iter_rows().collect();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].0, 7);
-            assert_eq!(rows[0].1[0], SqliteValue::Text("p".into()));
-            assert_eq!(rows[0].1[1], SqliteValue::Integer(7));
-            assert_eq!(rows[0].1[2], SqliteValue::Null);
-            assert_eq!(rows[0].1[3], SqliteValue::Text("keep".into()));
-            assert_eq!(rows[0].1[4], SqliteValue::Text("x".into()));
-            assert_eq!(rows[0].1[5], SqliteValue::Integer(9));
-        });
+        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+        let rows: Vec<_> = table.iter_rows().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 7);
+        assert_eq!(rows[0].1[0], SqliteValue::Text("p".into()));
+        assert_eq!(rows[0].1[1], SqliteValue::Integer(7));
+        assert_eq!(rows[0].1[2], SqliteValue::Null);
+        assert_eq!(rows[0].1[3], SqliteValue::Text("keep".into()));
+        assert_eq!(rows[0].1[4], SqliteValue::Text("x".into()));
+        assert_eq!(rows[0].1[5], SqliteValue::Integer(9));
     }
 
     #[test]
     fn test_load_sqlite3_rowid_alias_parenthesized_added_defaults() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("from_c_ipk_parenthesized_defaults.db");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_ipk_parenthesized_defaults.db");
 
-            {
-                let conn = rusqlite::Connection::open(&db_path).unwrap();
-                conn.execute_batch(
-                    "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
                  INSERT INTO items(id, name) VALUES (3, 'alpha');
                  ALTER TABLE items ADD COLUMN score INTEGER DEFAULT (9);
                  ALTER TABLE items ADD COLUMN tag TEXT DEFAULT ('fallback');",
-                )
-                .unwrap();
-            }
+            )
+            .unwrap();
+        }
 
-            let loaded = load_test_db(&db_path).await.unwrap();
-            let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
-            let rows: Vec<_> = table.iter_rows().collect();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].0, 3);
-            assert_eq!(rows[0].1[0], SqliteValue::Integer(3));
-            assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
-            assert_eq!(rows[0].1[2], SqliteValue::Integer(9));
-            assert_eq!(rows[0].1[3], SqliteValue::Text("fallback".into()));
-        });
+        let loaded = load_test_db(&db_path).unwrap();
+        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+        let rows: Vec<_> = table.iter_rows().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 3);
+        assert_eq!(rows[0].1[0], SqliteValue::Integer(3));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[0].1[2], SqliteValue::Integer(9));
+        assert_eq!(rows[0].1[3], SqliteValue::Text("fallback".into()));
     }
 
     #[test]
     fn test_load_sqlite3_altered_short_rows_parse_boolean_blob_and_quoted_defaults() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("from_c_ipk_literal_defaults.db");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_ipk_literal_defaults.db");
 
-            {
-                let conn = rusqlite::Connection::open(&db_path).unwrap();
-                conn.execute_batch(
-                    r#"CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
                  INSERT INTO items(id, name) VALUES (5, 'alpha');
                  ALTER TABLE items ADD COLUMN active BOOLEAN DEFAULT TRUE;
                  ALTER TABLE items ADD COLUMN disabled BOOLEAN DEFAULT FALSE;
                  ALTER TABLE items ADD COLUMN payload BLOB DEFAULT X'6162';
                  ALTER TABLE items ADD COLUMN tag TEXT DEFAULT "fallback";"#,
-                )
-                .unwrap();
-            }
+            )
+            .unwrap();
+        }
 
-            let loaded = load_test_db(&db_path).await.unwrap();
-            let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
-            let rows: Vec<_> = table.iter_rows().collect();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].0, 5);
-            assert_eq!(rows[0].1[0], SqliteValue::Integer(5));
-            assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
-            assert_eq!(rows[0].1[2], SqliteValue::Integer(1));
-            assert_eq!(rows[0].1[3], SqliteValue::Integer(0));
-            assert_eq!(rows[0].1[4], SqliteValue::from(vec![0x61, 0x62]));
-            assert_eq!(rows[0].1[5], SqliteValue::Text("fallback".into()));
-        });
+        let loaded = load_test_db(&db_path).unwrap();
+        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+        let rows: Vec<_> = table.iter_rows().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 5);
+        assert_eq!(rows[0].1[0], SqliteValue::Integer(5));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[0].1[2], SqliteValue::Integer(1));
+        assert_eq!(rows[0].1[3], SqliteValue::Integer(0));
+        assert_eq!(rows[0].1[4], SqliteValue::from(vec![0x61, 0x62]));
+        assert_eq!(rows[0].1[5], SqliteValue::Text("fallback".into()));
     }
 
     #[test]
@@ -4663,30 +3947,29 @@ mod tests {
 
     #[test]
     fn test_load_sqlite3_created_file_with_nondefault_page_size_and_reserved_bytes() {
-        asupersync::test_utils::run_test(|| async {
-            if Command::new("sqlite3").arg("--version").output().is_err() {
-                eprintln!("skipping: sqlite3 binary not found");
-                return;
-            }
+        if Command::new("sqlite3").arg("--version").output().is_err() {
+            eprintln!("skipping: sqlite3 binary not found");
+            return;
+        }
 
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("from_c_reserved_bytes.db");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_reserved_bytes.db");
 
-            let mut child = Command::new("sqlite3")
-                .arg(&db_path)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("sqlite3 process should start");
-            {
-                let mut stdin = child
-                    .stdin
-                    .take()
-                    .expect("sqlite3 stdin should be available");
-                stdin
-                    .write_all(
-                        br"PRAGMA journal_mode=DELETE;
+        let mut child = Command::new("sqlite3")
+            .arg(&db_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("sqlite3 process should start");
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .expect("sqlite3 stdin should be available");
+            stdin
+                .write_all(
+                    br"PRAGMA journal_mode=DELETE;
 PRAGMA page_size=8192;
 VACUUM;
 .filectrl reserve_bytes 32
@@ -4696,50 +3979,49 @@ INSERT INTO items VALUES (10, 'alpha');
 INSERT INTO items VALUES (20, 'beta');
 PRAGMA integrity_check;
 ",
-                    )
-                    .expect("sqlite3 setup should accept the script");
-            }
-            let output = child
-                .wait_with_output()
-                .expect("sqlite3 process should finish");
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !output.status.success()
-                && (stdout.contains("unknown")
-                    || stdout.contains("Usage:")
-                    || stderr.contains("unknown")
-                    || stderr.contains("Usage:"))
-            {
-                eprintln!(
-                    "skipping: sqlite3 shell does not support .filectrl reserve_bytes: stdout={stdout} stderr={stderr}"
-                );
-                return;
-            }
-            assert!(
-                output.status.success(),
-                "sqlite3 reserved-byte setup failed: stdout={stdout} stderr={stderr}"
+                )
+                .expect("sqlite3 setup should accept the script");
+        }
+        let output = child
+            .wait_with_output()
+            .expect("sqlite3 process should finish");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success()
+            && (stdout.contains("unknown")
+                || stdout.contains("Usage:")
+                || stderr.contains("unknown")
+                || stderr.contains("Usage:"))
+        {
+            eprintln!(
+                "skipping: sqlite3 shell does not support .filectrl reserve_bytes: stdout={stdout} stderr={stderr}"
             );
-            assert!(
-                stdout.lines().any(|line| line.trim() == "ok"),
-                "sqlite3 should report integrity_check=ok for the reserved-byte database: stdout={stdout} stderr={stderr}"
-            );
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "sqlite3 reserved-byte setup failed: stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stdout.lines().any(|line| line.trim() == "ok"),
+            "sqlite3 should report integrity_check=ok for the reserved-byte database: stdout={stdout} stderr={stderr}"
+        );
 
-            let loaded = load_test_db(&db_path).await.unwrap_or_else(|error| {
+        let loaded = load_test_db(&db_path).unwrap_or_else(|error| {
             panic!(
                 "compat loader must read valid C SQLite files with non-default page sizes and reserved bytes: {error}"
             )
         });
-            assert_eq!(loaded.schema.len(), 1);
-            assert_eq!(loaded.schema[0].name, "items");
+        assert_eq!(loaded.schema.len(), 1);
+        assert_eq!(loaded.schema[0].name, "items");
 
-            let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
-            let rows: Vec<_> = table.iter_rows().collect();
-            assert_eq!(rows.len(), 2);
-            assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
-            assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
-            assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
-            assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
-        });
+        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+        let rows: Vec<_> = table.iter_rows().collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
+        assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
     }
 
     #[test]
@@ -4759,89 +4041,87 @@ PRAGMA integrity_check;
 
     #[test]
     fn test_multiple_tables_roundtrip() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("multi.db");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("multi.db");
 
-            let mut db = MemDatabase::new();
-            let root_a = db.create_table(1);
-            db.tables
-                .get_mut(&root_a)
-                .unwrap()
-                .insert_row(1, vec![SqliteValue::Text("row_a".into())]);
+        let mut db = MemDatabase::new();
+        let root_a = db.create_table(1);
+        db.tables
+            .get_mut(&root_a)
+            .unwrap()
+            .insert_row(1, vec![SqliteValue::Text("row_a".into())]);
 
-            let root_b = db.create_table(1);
-            db.tables
-                .get_mut(&root_b)
-                .unwrap()
-                .insert_row(1, vec![SqliteValue::Integer(777)]);
+        let root_b = db.create_table(1);
+        db.tables
+            .get_mut(&root_b)
+            .unwrap()
+            .insert_row(1, vec![SqliteValue::Integer(777)]);
 
-            let schema = vec![
-                TableSchema {
-                    name: "alpha".to_owned(),
-                    root_page: root_a,
-                    columns: vec![ColumnInfo {
-                        name: "val".to_owned(),
-                        affinity: 'C',
-                        is_ipk: false,
-                        type_name: None,
-                        notnull: false,
-                        unique: false,
-                        default_value: None,
-                        strict_type: None,
-                        generated_expr: None,
-                        generated_stored: None,
-                        collation: None,
-                        conflict_action: None,
-                    }],
-                    indexes: Vec::new(),
-                    strict: false,
-                    without_rowid: false,
-                    primary_key_constraints: Vec::new(),
-                    foreign_keys: Vec::new(),
-                    check_constraints: Vec::new(),
-                },
-                TableSchema {
-                    name: "beta".to_owned(),
-                    root_page: root_b,
-                    columns: vec![ColumnInfo {
-                        name: "num".to_owned(),
-                        affinity: 'd',
-                        is_ipk: false,
-                        type_name: None,
-                        notnull: false,
-                        unique: false,
-                        default_value: None,
-                        strict_type: None,
-                        generated_expr: None,
-                        generated_stored: None,
-                        collation: None,
-                        conflict_action: None,
-                    }],
-                    indexes: Vec::new(),
-                    strict: false,
-                    without_rowid: false,
-                    primary_key_constraints: Vec::new(),
-                    foreign_keys: Vec::new(),
-                    check_constraints: Vec::new(),
-                },
-            ];
+        let schema = vec![
+            TableSchema {
+                name: "alpha".to_owned(),
+                root_page: root_a,
+                columns: vec![ColumnInfo {
+                    name: "val".to_owned(),
+                    affinity: 'C',
+                    is_ipk: false,
+                    type_name: None,
+                    notnull: false,
+                    unique: false,
+                    default_value: None,
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                    conflict_action: None,
+                }],
+                indexes: Vec::new(),
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+            TableSchema {
+                name: "beta".to_owned(),
+                root_page: root_b,
+                columns: vec![ColumnInfo {
+                    name: "num".to_owned(),
+                    affinity: 'd',
+                    is_ipk: false,
+                    type_name: None,
+                    notnull: false,
+                    unique: false,
+                    default_value: None,
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                    conflict_action: None,
+                }],
+                indexes: Vec::new(),
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+        ];
 
-            persist_test_db(&db_path, &schema, &db, 0, 0).await.unwrap();
-            let loaded = load_test_db(&db_path).await.unwrap();
+        persist_test_db(&db_path, &schema, &db, 0, 0).unwrap();
+        let loaded = load_test_db(&db_path).unwrap();
 
-            assert_eq!(loaded.schema.len(), 2);
-            assert_eq!(loaded.schema[0].name, "alpha");
-            assert_eq!(loaded.schema[1].name, "beta");
+        assert_eq!(loaded.schema.len(), 2);
+        assert_eq!(loaded.schema[0].name, "alpha");
+        assert_eq!(loaded.schema[1].name, "beta");
 
-            let tbl_a = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
-            let rows_a: Vec<_> = tbl_a.iter_rows().collect();
-            assert_eq!(rows_a[0].1[0], SqliteValue::Text("row_a".into()));
+        let tbl_a = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+        let rows_a: Vec<_> = tbl_a.iter_rows().collect();
+        assert_eq!(rows_a[0].1[0], SqliteValue::Text("row_a".into()));
 
-            let tbl_b = loaded.db.get_table(loaded.schema[1].root_page).unwrap();
-            let rows_b: Vec<_> = tbl_b.iter_rows().collect();
-            assert_eq!(rows_b[0].1[0], SqliteValue::Integer(777));
-        });
+        let tbl_b = loaded.db.get_table(loaded.schema[1].root_page).unwrap();
+        let rows_b: Vec<_> = tbl_b.iter_rows().collect();
+        assert_eq!(rows_b[0].1[0], SqliteValue::Integer(777));
     }
 
     #[test]
@@ -4887,20 +4167,6 @@ PRAGMA integrity_check;
     }
 
     #[test]
-    fn test_parse_columns_from_create_sql_legacy_quoted_integer_primary_key_is_ipk() {
-        let sql = "CREATE TABLE metrics (id INTEGER, body TEXT, PRIMARY KEY('id'))";
-        let cols = parse_columns_from_create_sql(sql);
-        assert_eq!(cols.len(), 2);
-        assert_eq!(cols[0].name, "id");
-        assert!(cols[0].is_ipk);
-        assert_eq!(cols[1].name, "body");
-        assert_eq!(
-            extract_primary_key_constraints_from_sql(sql),
-            vec![vec!["id".to_owned()]]
-        );
-    }
-
-    #[test]
     fn test_parse_columns_distinguishes_column_and_table_unique_ownership() {
         let column_owned = parse_columns_from_create_sql(
             "CREATE TABLE column_owned (id INTEGER UNIQUE, body TEXT)",
@@ -4914,8 +4180,7 @@ PRAGMA integrity_check;
         let indexes = extract_unique_constraint_indexes_from_sql(
             "CREATE TABLE table_owned (id INTEGER, body TEXT, UNIQUE(id))",
             "table_owned",
-        )
-        .unwrap();
+        );
         assert_eq!(indexes.len(), 1);
         assert_eq!(indexes[0].columns, vec!["id"]);
     }
@@ -5575,8 +4840,7 @@ PRAGMA integrity_check;
         let indexes = extract_unique_constraint_indexes_from_sql(
             "CREATE TABLE child (tenant TEXT, slug TEXT, UNIQUE(tenant, slug))",
             "child",
-        )
-        .unwrap();
+        );
         assert_eq!(indexes.len(), 1);
         assert_eq!(indexes[0].columns, vec!["tenant", "slug"]);
         assert!(indexes[0].is_unique);
@@ -5587,53 +4851,8 @@ PRAGMA integrity_check;
         let indexes = extract_unique_constraint_indexes_from_sql(
             "CREATE TABLE metrics (id INTEGER, body TEXT, PRIMARY KEY(id COLLATE NOCASE DESC))",
             "metrics",
-        )
-        .unwrap();
-        assert!(indexes.is_empty(), "{indexes:?}");
-    }
-
-    #[test]
-    fn test_extract_implicit_autoindexes_preserves_without_rowid_slots_and_exact_integer_rules() {
-        let indexes = extract_unique_constraint_indexes_from_sql(
-            "CREATE TABLE wr(
-                pk TEXT PRIMARY KEY,
-                u TEXT COLLATE NOCASE COLLATE RTRIM UNIQUE
-             ) WITHOUT ROWID",
-            "wr",
-        )
-        .unwrap();
-        assert_eq!(indexes.len(), 1);
-        assert_eq!(indexes[0].name, "sqlite_autoindex_wr_2");
-        assert_eq!(indexes[0].columns, ["u"]);
-        assert_eq!(indexes[0].key_collations, [Some("RTRIM".to_owned())]);
-
-        let typed = extract_unique_constraint_indexes_from_sql(
-            "CREATE TABLE typed(id INTEGER(8) PRIMARY KEY, u TEXT UNIQUE)",
-            "typed",
-        )
-        .unwrap();
-        assert_eq!(
-            typed
-                .iter()
-                .map(|index| index.name.as_str())
-                .collect::<Vec<_>>(),
-            ["sqlite_autoindex_typed_1", "sqlite_autoindex_typed_2"]
         );
-    }
-
-    #[test]
-    fn test_autoindex_followup_explicit_index_uses_final_repeated_collation() {
-        let Some(Statement::CreateIndex(create)) =
-            parse_single_statement("CREATE INDEX idx_t_a ON t(a COLLATE NOCASE COLLATE RTRIM)")
-        else {
-            panic!("expected CREATE INDEX");
-        };
-        let table = bare_table_schema("t", &["a"]);
-        let index = bind_explicit_index(&create, "idx_t_a", "t", &table)
-            .expect("authoritative index binder should accept repeated COLLATE syntax")
-            .into_index_schema(7);
-        assert_eq!(index.columns, ["a"]);
-        assert_eq!(index.key_collations, [Some("RTRIM".to_owned())]);
+        assert!(indexes.is_empty(), "{indexes:?}");
     }
 
     #[test]
@@ -5786,16 +5005,7 @@ PRAGMA integrity_check;
             ord COLLATE [DESC] DESC
         ) /* index tail */ WHERE active = 1"#;
 
-        let Some(Statement::CreateIndex(create)) = parse_single_statement(sql) else {
-            panic!("expected CREATE INDEX");
-        };
-        let table = bare_table_schema(
-            "items(table)",
-            &["last, name", "code", "tag", "ord", "active"],
-        );
-        let idx = bind_explicit_index(&create, "idx(words)", "items(table)", &table)
-            .expect("authoritative index binder should preserve quoted metadata")
-            .into_index_schema(7);
+        let idx = parse_create_index_sql_to_schema("idx(words)", 7, sql).unwrap();
 
         assert_eq!(
             idx.columns,
@@ -5806,29 +5016,15 @@ PRAGMA integrity_check;
                 "ord".to_owned()
             ]
         );
-        // Collation names are compared case-insensitively by SQLite
-        // (`sqlite3_strnicmp`), so `key_collations` carries semantic schema
-        // state rather than source spelling. Assert the identity of all four
-        // names — including that `COLLATE DESC` binds a collation *named*
-        // `DESC` rather than being absorbed as a sort direction — without
-        // pinning the case a binder happens to emit. The length and `Some`
-        // checks stay explicit so a dropped or `None` term still fails.
-        let expected_collations = ["RTRIM", "BINARY", "DESC", "DESC"];
         assert_eq!(
-            idx.key_collations.len(),
-            expected_collations.len(),
-            "every key term must bind a collation: {:?}",
-            idx.key_collations
+            idx.key_collations,
+            vec![
+                Some("RTRIM".to_owned()),
+                Some("BINARY".to_owned()),
+                Some("DESC".to_owned()),
+                Some("DESC".to_owned())
+            ]
         );
-        for (term, expected) in expected_collations.iter().enumerate() {
-            let actual = idx.key_collations[term].as_deref().unwrap_or_else(|| {
-                panic!("term {term} must bind collation `{expected}`, found None")
-            });
-            assert!(
-                actual.eq_ignore_ascii_case(expected),
-                "term {term} must bind collation `{expected}` (case-insensitively), found `{actual}`"
-            );
-        }
         assert_eq!(
             idx.key_sort_directions,
             vec![
@@ -5846,13 +5042,7 @@ PRAGMA integrity_check;
         let sql =
             "CREATE UNIQUE INDEX uq_agents_name_ci ON agents(lower(name) DESC) WHERE is_active = 1";
 
-        let Some(Statement::CreateIndex(create)) = parse_single_statement(sql) else {
-            panic!("expected CREATE INDEX");
-        };
-        let table = bare_table_schema("agents", &["name", "is_active"]);
-        let idx = bind_explicit_index(&create, "uq_agents_name_ci", "agents", &table)
-            .expect("authoritative index binder should preserve expression metadata")
-            .into_index_schema(7);
+        let idx = parse_create_index_sql_to_schema("uq_agents_name_ci", 7, sql).unwrap();
 
         assert!(idx.columns.is_empty());
         assert_eq!(idx.key_expressions.len(), 1);
@@ -5968,943 +5158,6 @@ PRAGMA integrity_check;
         assert_eq!(parse_autoindex_ordinal(&overflowing, "link_table"), None);
     }
 
-    fn implicit_autoindex_catalog_row(
-        entry_type: &str,
-        name: &str,
-        table_name: &str,
-        root_page: i64,
-        sql: Option<&str>,
-    ) -> Vec<SqliteValue> {
-        vec![
-            SqliteValue::Text(entry_type.into()),
-            SqliteValue::Text(name.into()),
-            SqliteValue::Text(table_name.into()),
-            SqliteValue::Integer(root_page),
-            sql.map_or(SqliteValue::Null, |value| SqliteValue::Text(value.into())),
-        ]
-    }
-
-    fn assert_implicit_autoindex_catalog_corrupt(
-        case_name: &str,
-        entries: &[Vec<SqliteValue>],
-        detail_needle: &str,
-    ) {
-        assert_implicit_autoindex_catalog_corrupt_with_page_bound(
-            case_name,
-            entries,
-            i32::MAX.unsigned_abs(),
-            detail_needle,
-        );
-    }
-
-    fn assert_implicit_autoindex_catalog_corrupt_with_page_bound(
-        case_name: &str,
-        entries: &[Vec<SqliteValue>],
-        max_root_page: u32,
-        detail_needle: &str,
-    ) {
-        let header = DatabaseHeader::default();
-        assert_implicit_autoindex_catalog_corrupt_with_root_context(
-            case_name,
-            entries,
-            max_root_page,
-            &header,
-            &HashSet::new(),
-            detail_needle,
-        );
-    }
-
-    fn assert_implicit_autoindex_catalog_corrupt_with_root_context(
-        case_name: &str,
-        entries: &[Vec<SqliteValue>],
-        max_root_page: u32,
-        header: &DatabaseHeader,
-        free_pages: &HashSet<PageNumber>,
-        detail_needle: &str,
-    ) {
-        let error = bind_implicit_autoindex_catalog(entries, max_root_page, header, free_pages)
-            .unwrap_err();
-        let FrankenError::DatabaseCorrupt { detail } = error else {
-            panic!("{case_name}: expected DatabaseCorrupt, found {error:?}");
-        };
-        assert!(
-            detail.contains(detail_needle),
-            "{case_name}: expected `{detail_needle}` in corruption detail, found `{detail}`"
-        );
-    }
-
-    #[test]
-    fn virtual_table_catalog_canonical_row_is_order_independent() {
-        let cases = [
-            (
-                "contentless before stale default",
-                vec![
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "vt",
-                        "vt",
-                        0,
-                        Some("CREATE VIRTUAL TABLE vt USING fts5(body, content='')"),
-                    ),
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "vt",
-                        "vt",
-                        0,
-                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
-                    ),
-                ],
-                0,
-            ),
-            (
-                "contentless after stale default",
-                vec![
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "vt",
-                        "vt",
-                        0,
-                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
-                    ),
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "vt",
-                        "vt",
-                        0,
-                        Some("CREATE VIRTUAL TABLE vt USING fts5(body, content='')"),
-                    ),
-                ],
-                1,
-            ),
-            (
-                "equivalent root-zero rows",
-                vec![
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "vt",
-                        "vt",
-                        0,
-                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
-                    ),
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "VT",
-                        "VT",
-                        0,
-                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
-                    ),
-                ],
-                0,
-            ),
-            (
-                "positive row before migration row",
-                vec![
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "vt",
-                        "vt",
-                        2,
-                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
-                    ),
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "vt",
-                        "vt",
-                        0,
-                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
-                    ),
-                ],
-                0,
-            ),
-            (
-                "positive row after migration row",
-                vec![
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "vt",
-                        "vt",
-                        0,
-                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
-                    ),
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "vt",
-                        "vt",
-                        2,
-                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
-                    ),
-                ],
-                1,
-            ),
-        ];
-
-        for (case_name, entries, expected_row) in cases {
-            let catalog = bind_implicit_autoindex_catalog(
-                &entries,
-                2,
-                &DatabaseHeader::default(),
-                &HashSet::new(),
-            )
-            .unwrap_or_else(|error| panic!("{case_name}: unexpected bind failure: {error}"));
-            for row_index in 0..entries.len() {
-                assert_eq!(
-                    catalog.is_canonical_virtual_table_row(row_index),
-                    row_index == expected_row,
-                    "{case_name}: wrong canonical status for row {row_index}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn implicit_autoindex_catalog_binds_complete_layout_and_real_roots() {
-        let entries = vec![
-            implicit_autoindex_catalog_row(
-                "table",
-                "t",
-                "t",
-                2,
-                Some("CREATE TABLE t(a TEXT UNIQUE, b TEXT UNIQUE)"),
-            ),
-            // Deliberately reverse the physical rows: declaration ordinals,
-            // not sqlite_master scan order, determine the canonical result.
-            implicit_autoindex_catalog_row("index", "sqlite_autoindex_t_2", "t", 4, None),
-            implicit_autoindex_catalog_row("index", "sqlite_autoindex_t_1", "t", 3, None),
-            implicit_autoindex_catalog_row(
-                "table",
-                "wr",
-                "wr",
-                5,
-                Some("CREATE TABLE wr(pk TEXT PRIMARY KEY, u TEXT UNIQUE) WITHOUT ROWID"),
-            ),
-            implicit_autoindex_catalog_row("index", "sqlite_autoindex_wr_2", "wr", 6, None),
-            implicit_autoindex_catalog_row(
-                "table",
-                "plain",
-                "plain",
-                7,
-                Some("CREATE TABLE plain(x TEXT)"),
-            ),
-            implicit_autoindex_catalog_row(
-                "index",
-                "sqlite_autoindex_plain_1",
-                "plain",
-                8,
-                Some("CREATE INDEX sqlite_autoindex_plain_1 ON plain(x)"),
-            ),
-        ];
-
-        let catalog = bind_implicit_autoindex_catalog(
-            &entries,
-            8,
-            &DatabaseHeader::default(),
-            &HashSet::new(),
-        )
-        .unwrap();
-        let ordinary = catalog.table("T").unwrap();
-        let physical = ordinary.physical_index_schemas("t");
-        assert_eq!(
-            physical
-                .iter()
-                .map(|index| (index.name.as_str(), index.root_page))
-                .collect::<Vec<_>>(),
-            vec![("sqlite_autoindex_t_1", 3), ("sqlite_autoindex_t_2", 4)]
-        );
-
-        let without_rowid = catalog.table("wr").unwrap();
-        assert_eq!(
-            without_rowid
-                .slots
-                .iter()
-                .map(|bound| bound.storage)
-                .collect::<Vec<_>>(),
-            vec![
-                BoundImplicitAutoindexStorage::TableRoot,
-                BoundImplicitAutoindexStorage::IndexRoot(6)
-            ]
-        );
-        let wr_physical = without_rowid.physical_index_schemas("wr");
-        assert_eq!(wr_physical.len(), 1);
-        assert_eq!(wr_physical[0].name, "sqlite_autoindex_wr_2");
-        assert_eq!(wr_physical[0].root_page, 6);
-
-        let plain = catalog.table("plain").unwrap();
-        assert_eq!(plain.implicit_slots().count(), 0);
-        assert!(plain.physical_index_schemas("plain").is_empty());
-    }
-
-    #[test]
-    fn implicit_autoindex_catalog_accepts_valid_views_triggers_and_supported_fts5_repair() {
-        let entries = vec![
-            implicit_autoindex_catalog_row(
-                "TaBlE",
-                "plain",
-                "plain",
-                2,
-                Some("CREATE TABLE main.plain(x TEXT)"),
-            ),
-            implicit_autoindex_catalog_row(
-                "ViEw",
-                "v",
-                "v",
-                0,
-                Some("CREATE VIEW main.v AS SELECT x FROM plain"),
-            ),
-            implicit_autoindex_catalog_row(
-                "TrIgGeR",
-                "plain",
-                "plain",
-                0,
-                Some("CREATE TRIGGER main.plain AFTER INSERT ON plain BEGIN SELECT 1; END"),
-            ),
-            implicit_autoindex_catalog_row(
-                "trigger",
-                "v",
-                "v",
-                0,
-                Some("CREATE TRIGGER main.v INSTEAD OF INSERT ON v BEGIN SELECT 1; END"),
-            ),
-            implicit_autoindex_catalog_row(
-                "table",
-                "docs",
-                "docs",
-                0,
-                Some("CREATE VIRTUAL TABLE main.docs USING fts5(title, body, content='')"),
-            ),
-            implicit_autoindex_catalog_row(
-                "TABLE",
-                "DOCS",
-                "DOCS",
-                0,
-                Some("CREATE VIRTUAL TABLE docs USING fts5(title, body)"),
-            ),
-            implicit_autoindex_catalog_row(
-                "table",
-                "legacy_docs",
-                "legacy_docs",
-                3,
-                Some("CREATE VIRTUAL TABLE legacy_docs USING fts5(title, body)"),
-            ),
-            implicit_autoindex_catalog_row(
-                "table",
-                "LEGACY_DOCS",
-                "LEGACY_DOCS",
-                0,
-                Some("CREATE VIRTUAL TABLE legacy_docs USING fts5(title, body)"),
-            ),
-        ];
-
-        let catalog = bind_implicit_autoindex_catalog(
-            &entries,
-            3,
-            &DatabaseHeader::default(),
-            &HashSet::new(),
-        )
-        .unwrap();
-        assert!(catalog.table("PLAIN").is_some());
-        assert!(catalog.table("docs").is_none());
-    }
-
-    #[test]
-    fn implicit_autoindex_catalog_rejects_invalid_row_shapes_and_storage_classes() {
-        let mut short_row =
-            implicit_autoindex_catalog_row("table", "t", "t", 2, Some("CREATE TABLE t(a)"));
-        short_row.pop();
-        let mut non_text_type =
-            implicit_autoindex_catalog_row("table", "t", "t", 2, Some("CREATE TABLE t(a)"));
-        non_text_type[0] = SqliteValue::Integer(1);
-        let mut non_text_name =
-            implicit_autoindex_catalog_row("table", "t", "t", 2, Some("CREATE TABLE t(a)"));
-        non_text_name[1] = SqliteValue::Null;
-        let mut non_text_table_name =
-            implicit_autoindex_catalog_row("table", "t", "t", 2, Some("CREATE TABLE t(a)"));
-        non_text_table_name[2] = SqliteValue::Blob(vec![1].into());
-        let mut invalid_sql_storage =
-            implicit_autoindex_catalog_row("table", "t", "t", 2, Some("CREATE TABLE t(a)"));
-        invalid_sql_storage[4] = SqliteValue::Integer(1);
-
-        for (case_name, entries, detail_needle) in [
-            ("short row", vec![short_row], "columns instead of 5"),
-            (
-                "non-text type",
-                vec![non_text_type],
-                "column `type` must be TEXT",
-            ),
-            (
-                "non-text name",
-                vec![non_text_name],
-                "column `name` must be TEXT",
-            ),
-            (
-                "non-text table name",
-                vec![non_text_table_name],
-                "column `tbl_name` must be TEXT",
-            ),
-            (
-                "invalid sql storage",
-                vec![invalid_sql_storage],
-                "column `sql` must be TEXT or NULL",
-            ),
-            (
-                "table NULL sql",
-                vec![implicit_autoindex_catalog_row("table", "t", "t", 2, None)],
-                "has NULL sql",
-            ),
-        ] {
-            assert_implicit_autoindex_catalog_corrupt(case_name, &entries, detail_needle);
-        }
-
-        assert_implicit_autoindex_catalog_corrupt_with_page_bound(
-            "zero visible bound",
-            &[],
-            0,
-            "without a visible database page",
-        );
-    }
-
-    #[test]
-    fn implicit_autoindex_catalog_rejects_incomplete_ambiguous_or_unsafe_catalogs() {
-        let unique_table = || {
-            implicit_autoindex_catalog_row(
-                "table",
-                "t",
-                "t",
-                2,
-                Some("CREATE TABLE t(a TEXT UNIQUE)"),
-            )
-        };
-        let unique_index = |name: &str, root_page: i64| {
-            implicit_autoindex_catalog_row("index", name, "t", root_page, None)
-        };
-
-        let mut non_integer_root = unique_table();
-        non_integer_root[3] = SqliteValue::Text("two".into());
-        let cases = vec![
-            (
-                "missing expected row",
-                vec![unique_table()],
-                "missing implicit autoindex",
-            ),
-            (
-                "unexpected ordinal",
-                vec![unique_table(), unique_index("sqlite_autoindex_t_2", 3)],
-                "nonexistent declaration slot 2",
-            ),
-            (
-                "duplicate row",
-                vec![
-                    unique_table(),
-                    unique_index("sqlite_autoindex_t_1", 3),
-                    unique_index("SQLITE_AUTOINDEX_T_1", 4),
-                ],
-                "duplicate index entries",
-            ),
-            (
-                "hidden WITHOUT ROWID PK row",
-                vec![
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "wr",
-                        "wr",
-                        2,
-                        Some("CREATE TABLE wr(pk TEXT PRIMARY KEY) WITHOUT ROWID"),
-                    ),
-                    implicit_autoindex_catalog_row("index", "sqlite_autoindex_wr_1", "wr", 3, None),
-                ],
-                "illegally materializes hidden",
-            ),
-            (
-                "missing implicit parent",
-                vec![implicit_autoindex_catalog_row(
-                    "index",
-                    "sqlite_autoindex_absent_1",
-                    "absent",
-                    3,
-                    None,
-                )],
-                "missing ordinary table",
-            ),
-            (
-                "missing explicit parent",
-                vec![implicit_autoindex_catalog_row(
-                    "index",
-                    "idx_absent",
-                    "absent",
-                    3,
-                    Some("CREATE INDEX idx_absent ON absent(a)"),
-                )],
-                "missing ordinary table",
-            ),
-            (
-                "table name mismatch",
-                vec![implicit_autoindex_catalog_row(
-                    "table",
-                    "t",
-                    "other",
-                    2,
-                    Some("CREATE TABLE t(a)"),
-                )],
-                "mismatched tbl_name",
-            ),
-            (
-                "CREATE TABLE name mismatch",
-                vec![implicit_autoindex_catalog_row(
-                    "table",
-                    "t",
-                    "t",
-                    2,
-                    Some("CREATE TABLE other(a)"),
-                )],
-                // The CREATE TABLE arm names the rejection class before the
-                // offending name (compat_persist.rs:709), unlike the virtual
-                // table arm below, which still renders `declares \`{}\``.
-                "differently named table `other`",
-            ),
-            (
-                "layout conflict mapping",
-                vec![implicit_autoindex_catalog_row(
-                    "table",
-                    "t",
-                    "t",
-                    2,
-                    Some(
-                        "CREATE TABLE t(a TEXT UNIQUE ON CONFLICT IGNORE, UNIQUE(a) ON CONFLICT REPLACE)",
-                    ),
-                )],
-                "invalid implicit autoindex layout",
-            ),
-            (
-                "non-integer root",
-                vec![non_integer_root],
-                "must be INTEGER",
-            ),
-            (
-                "zero root",
-                vec![implicit_autoindex_catalog_row(
-                    "table",
-                    "t",
-                    "t",
-                    0,
-                    Some("CREATE TABLE t(a)"),
-                )],
-                "invalid rootpage 0",
-            ),
-            (
-                "negative root",
-                vec![implicit_autoindex_catalog_row(
-                    "table",
-                    "t",
-                    "t",
-                    -2,
-                    Some("CREATE TABLE t(a)"),
-                )],
-                "invalid rootpage -2",
-            ),
-            (
-                "above i32 root",
-                vec![implicit_autoindex_catalog_row(
-                    "table",
-                    "t",
-                    "t",
-                    i64::from(i32::MAX) + 1,
-                    Some("CREATE TABLE t(a)"),
-                )],
-                "exceeds supported range",
-            ),
-            (
-                "penultimate i32 root",
-                vec![implicit_autoindex_catalog_row(
-                    "table",
-                    "t",
-                    "t",
-                    i64::from(i32::MAX - 1),
-                    Some("CREATE TABLE t(a)"),
-                )],
-                "no safe MemDatabase allocation sentinel",
-            ),
-            (
-                "terminal i32 root",
-                vec![implicit_autoindex_catalog_row(
-                    "table",
-                    "t",
-                    "t",
-                    i64::from(i32::MAX),
-                    Some("CREATE TABLE t(a)"),
-                )],
-                "no safe MemDatabase allocation sentinel",
-            ),
-            (
-                "page one collision",
-                vec![implicit_autoindex_catalog_row(
-                    "table",
-                    "t",
-                    "t",
-                    1,
-                    Some("CREATE TABLE t(a)"),
-                )],
-                "shared by sqlite_master",
-            ),
-            (
-                "table index root collision",
-                vec![unique_table(), unique_index("sqlite_autoindex_t_1", 2)],
-                "rootpage 2 is shared",
-            ),
-            (
-                "two index root collision",
-                vec![
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "t",
-                        "t",
-                        2,
-                        Some("CREATE TABLE t(a UNIQUE, b UNIQUE)"),
-                    ),
-                    unique_index("sqlite_autoindex_t_1", 3),
-                    unique_index("sqlite_autoindex_t_2", 3),
-                ],
-                "rootpage 3 is shared",
-            ),
-            (
-                "explicit index identity mismatch",
-                vec![
-                    implicit_autoindex_catalog_row("table", "t", "t", 2, Some("CREATE TABLE t(a)")),
-                    implicit_autoindex_catalog_row(
-                        "index",
-                        "idx_t",
-                        "t",
-                        3,
-                        Some("CREATE INDEX idx_other ON t(a)"),
-                    ),
-                ],
-                "declares index `idx_other`",
-            ),
-            (
-                "virtual table identity mismatch",
-                vec![implicit_autoindex_catalog_row(
-                    "table",
-                    "vt",
-                    "vt",
-                    0,
-                    Some("CREATE VIRTUAL TABLE other USING fts5(body)"),
-                )],
-                "declares `other`",
-            ),
-            (
-                "unsupported schema type",
-                vec![implicit_autoindex_catalog_row(
-                    "bogus",
-                    "x",
-                    "x",
-                    0,
-                    Some("bogus"),
-                )],
-                "unsupported type",
-            ),
-            (
-                "view owns a root",
-                vec![implicit_autoindex_catalog_row(
-                    "view",
-                    "v",
-                    "v",
-                    2,
-                    Some("CREATE VIEW v AS SELECT 1"),
-                )],
-                "must have rootpage 0",
-            ),
-        ];
-
-        for (case_name, entries, detail_needle) in cases {
-            assert_implicit_autoindex_catalog_corrupt(case_name, &entries, detail_needle);
-        }
-
-        assert_implicit_autoindex_catalog_corrupt_with_page_bound(
-            "root past visible database",
-            &[
-                implicit_autoindex_catalog_row(
-                    "table",
-                    "t",
-                    "t",
-                    2,
-                    Some("CREATE TABLE t(a TEXT UNIQUE)"),
-                ),
-                implicit_autoindex_catalog_row("index", "sqlite_autoindex_t_1", "t", 4, None),
-            ],
-            3,
-            "exceeds the visible database page count 3",
-        );
-    }
-
-    #[test]
-    fn implicit_autoindex_catalog_rejects_schema_identity_and_namespace_corruption() {
-        let ordinary_table =
-            || implicit_autoindex_catalog_row("table", "t", "t", 2, Some("CREATE TABLE t(a TEXT)"));
-        let cases = vec![
-            (
-                "ordinary CREATE parse failure",
-                vec![implicit_autoindex_catalog_row(
-                    "table",
-                    "t",
-                    "t",
-                    2,
-                    Some("CREATE TABLE t("),
-                )],
-                "could not parse CREATE TABLE",
-            ),
-            (
-                "stored CTAS",
-                vec![implicit_autoindex_catalog_row(
-                    "table",
-                    "t",
-                    "t",
-                    2,
-                    Some("CREATE TABLE t AS SELECT 1 AS a"),
-                )],
-                "CREATE TABLE AS SELECT",
-            ),
-            (
-                "duplicate ordinary table",
-                vec![
-                    ordinary_table(),
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "T",
-                        "T",
-                        3,
-                        Some("CREATE TABLE T(a TEXT)"),
-                    ),
-                ],
-                "duplicate table entries",
-            ),
-            (
-                "table view namespace collision",
-                vec![
-                    ordinary_table(),
-                    implicit_autoindex_catalog_row(
-                        "view",
-                        "T",
-                        "T",
-                        0,
-                        Some("CREATE VIEW T AS SELECT 1"),
-                    ),
-                ],
-                "schema name `T` is shared",
-            ),
-            (
-                "view NULL sql",
-                vec![implicit_autoindex_catalog_row("view", "v", "v", 0, None)],
-                "non-NULL sql",
-            ),
-            (
-                "view name mismatch",
-                vec![implicit_autoindex_catalog_row(
-                    "view",
-                    "v",
-                    "v",
-                    0,
-                    Some("CREATE VIEW other AS SELECT 1"),
-                )],
-                "differently named view",
-            ),
-            (
-                "temporary view",
-                vec![implicit_autoindex_catalog_row(
-                    "view",
-                    "v",
-                    "v",
-                    0,
-                    Some("CREATE TEMP VIEW v AS SELECT 1"),
-                )],
-                "temporary, non-main, or differently named view",
-            ),
-            (
-                "missing trigger target",
-                vec![implicit_autoindex_catalog_row(
-                    "trigger",
-                    "tr",
-                    "missing",
-                    0,
-                    Some("CREATE TRIGGER tr AFTER INSERT ON missing BEGIN SELECT 1; END"),
-                )],
-                "missing or incompatible table `missing`",
-            ),
-            (
-                "INSTEAD OF trigger on table",
-                vec![
-                    ordinary_table(),
-                    implicit_autoindex_catalog_row(
-                        "trigger",
-                        "tr",
-                        "t",
-                        0,
-                        Some("CREATE TRIGGER tr INSTEAD OF INSERT ON t BEGIN SELECT 1; END"),
-                    ),
-                ],
-                "missing or incompatible view `t`",
-            ),
-            (
-                "AFTER trigger on view",
-                vec![
-                    implicit_autoindex_catalog_row(
-                        "view",
-                        "v",
-                        "v",
-                        0,
-                        Some("CREATE VIEW v AS SELECT 1"),
-                    ),
-                    implicit_autoindex_catalog_row(
-                        "trigger",
-                        "tr",
-                        "v",
-                        0,
-                        Some("CREATE TRIGGER tr AFTER INSERT ON v BEGIN SELECT 1; END"),
-                    ),
-                ],
-                "missing or incompatible table `v`",
-            ),
-            (
-                "explicit index parse failure",
-                vec![
-                    ordinary_table(),
-                    implicit_autoindex_catalog_row(
-                        "index",
-                        "idx_t",
-                        "t",
-                        3,
-                        Some("CREATE INDEX idx_t ON"),
-                    ),
-                ],
-                "could not parse CREATE INDEX",
-            ),
-            (
-                "explicit index table mismatch",
-                vec![
-                    ordinary_table(),
-                    implicit_autoindex_catalog_row(
-                        "index",
-                        "idx_t",
-                        "t",
-                        3,
-                        Some("CREATE INDEX idx_t ON other(a)"),
-                    ),
-                ],
-                "on table `other` instead of `t`",
-            ),
-            (
-                "hidden logical autoindex name claimed explicitly",
-                vec![
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "wr",
-                        "wr",
-                        2,
-                        Some("CREATE TABLE wr(pk TEXT PRIMARY KEY, u TEXT) WITHOUT ROWID"),
-                    ),
-                    implicit_autoindex_catalog_row(
-                        "index",
-                        "sqlite_autoindex_wr_1",
-                        "wr",
-                        3,
-                        Some("CREATE INDEX sqlite_autoindex_wr_1 ON wr(u)"),
-                    ),
-                ],
-                "collides with logical implicit index",
-            ),
-            (
-                "conflicting rootpage-zero virtual tables",
-                vec![
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "vt",
-                        "vt",
-                        0,
-                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
-                    ),
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "VT",
-                        "VT",
-                        0,
-                        Some("CREATE VIRTUAL TABLE vt USING rtree(id, min_x, max_x)"),
-                    ),
-                ],
-                "conflicting virtual-table entries",
-            ),
-            (
-                "third duplicate virtual table",
-                vec![
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "vt",
-                        "vt",
-                        0,
-                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
-                    ),
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "VT",
-                        "VT",
-                        0,
-                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
-                    ),
-                    implicit_autoindex_catalog_row(
-                        "table",
-                        "vt",
-                        "vt",
-                        0,
-                        Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
-                    ),
-                ],
-                "conflicting virtual-table entries",
-            ),
-        ];
-
-        for (case_name, entries, detail_needle) in cases {
-            assert_implicit_autoindex_catalog_corrupt(case_name, &entries, detail_needle);
-        }
-    }
-
-    #[test]
-    fn implicit_autoindex_catalog_rejects_reserved_or_free_root_pages() {
-        let table_at = |root_page| {
-            vec![implicit_autoindex_catalog_row(
-                "table",
-                "t",
-                "t",
-                root_page,
-                Some("CREATE TABLE t(a)"),
-            )]
-        };
-
-        let lock_byte_page = fsqlite_pager::lock_byte_page(PageSize::DEFAULT);
-        assert_implicit_autoindex_catalog_corrupt_with_page_bound(
-            "lock-byte root",
-            &table_at(i64::from(lock_byte_page)),
-            lock_byte_page,
-            "reserved lock-byte rootpage",
-        );
-
-        let mut auto_vacuum_header = DatabaseHeader::default();
-        auto_vacuum_header.largest_root_page = 3;
-        assert_implicit_autoindex_catalog_corrupt_with_root_context(
-            "auto-vacuum pointer-map root",
-            &table_at(2),
-            3,
-            &auto_vacuum_header,
-            &HashSet::new(),
-            "pointer-map rootpage 2",
-        );
-
-        let free_page = PageNumber::new(2).unwrap();
-        assert_implicit_autoindex_catalog_corrupt_with_root_context(
-            "freelist root",
-            &table_at(2),
-            2,
-            &DatabaseHeader::default(),
-            &HashSet::from([free_page]),
-            "uses free rootpage 2",
-        );
-    }
-
     #[test]
     fn test_index_sql_synthesizes_unrecorded_explicit_index() {
         let original_ddl = HashMap::<String, String>::new();
@@ -6944,25 +5197,24 @@ PRAGMA integrity_check;
 
     #[test]
     fn test_reserved_prefix_explicit_index_survives_without_original_table_ddl() {
-        asupersync::test_utils::run_test(|| async {
-            const TABLE_SQL: &str = "CREATE TABLE link_table(\
+        const TABLE_SQL: &str = "CREATE TABLE link_table(\
             a INTEGER NOT NULL,\
             b INTEGER NOT NULL,\
             PRIMARY KEY(a,b)\
         )";
-            const INDEX_NAME: &str = "sqlite_autoindex_link_table_v23_1";
-            const INDEX_SQL: &str = "CREATE UNIQUE INDEX \
+        const INDEX_NAME: &str = "sqlite_autoindex_link_table_v23_1";
+        const INDEX_SQL: &str = "CREATE UNIQUE INDEX \
             \"sqlite_autoindex_link_table_v23_1\" ON \"link_table\"(a,b)";
 
-            let dir = tempfile::tempdir().unwrap();
-            let source_path = dir.path().join("reserved-prefix-source.db");
-            let rebuilt_path = dir.path().join("reserved-prefix-rebuilt.db");
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("reserved-prefix-source.db");
+        let rebuilt_path = dir.path().join("reserved-prefix-rebuilt.db");
 
-            {
-                let sqlite = rusqlite::Connection::open(&source_path).unwrap();
-                sqlite
-                    .execute_batch(&format!(
-                        r"
+        {
+            let sqlite = rusqlite::Connection::open(&source_path).unwrap();
+            sqlite
+                .execute_batch(&format!(
+                    r"
                     {TABLE_SQL};
                     CREATE UNIQUE INDEX legacy_unique ON link_table(a,b);
                     INSERT INTO link_table VALUES (1,2), (3,4);
@@ -6972,99 +5224,97 @@ PRAGMA integrity_check;
                      WHERE type='index' AND name='legacy_unique';
                     PRAGMA schema_version=2;
                     "
-                    ))
-                    .unwrap();
-            }
-
-            {
-                let sqlite = rusqlite::Connection::open(&source_path).unwrap();
-                let quick_check: String = sqlite
-                    .query_row("PRAGMA quick_check;", [], |row| row.get(0))
-                    .unwrap();
-                let integrity_check: String = sqlite
-                    .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
-                    .unwrap();
-                assert_eq!(quick_check, "ok");
-                assert_eq!(integrity_check, "ok");
-            }
-
-            let loaded = load_test_db(&source_path).await.unwrap();
-            let table = loaded
-                .schema
-                .iter()
-                .find(|table| table.name == "link_table")
+                ))
                 .unwrap();
-            assert!(
-                table.indexes.iter().any(|index| index.name == INDEX_NAME),
-                "a non-NULL CREATE INDEX entry is explicit even with a reserved-prefix name"
-            );
+        }
 
-            let mut original_ddl = HashMap::new();
-            // Deliberately omit the table DDL so persistence must reconstruct it
-            // from TableSchema. The explicit reserved-prefix index DDL remains the
-            // provenance signal that prevents a phantom UNIQUE table constraint.
-            original_ddl.insert(INDEX_NAME.to_owned(), INDEX_SQL.to_owned());
-            let header = DatabaseHeader {
-                page_size: DEFAULT_PAGE_SIZE,
-                schema_cookie: loaded.schema_cookie,
-                change_counter: loaded.change_counter,
-                version_valid_for: loaded.change_counter,
-                ..DatabaseHeader::default()
-            };
-            persist_to_sqlite_with_header_and_master_entries(
-                &Cx::new(),
-                &rebuilt_path,
-                &loaded.schema,
-                &loaded.db,
-                &header,
-                &[],
-                &original_ddl,
-            )
-            .await
-            .unwrap();
-
-            let sqlite = rusqlite::Connection::open(&rebuilt_path).unwrap();
-            let stored_table_sql: String = sqlite
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='link_table';",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            let stored_sql: String = sqlite
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1;",
-                    [INDEX_NAME],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            let row_count: i64 = sqlite
-                .query_row("SELECT COUNT(*) FROM link_table;", [], |row| row.get(0))
-                .unwrap();
+        {
+            let sqlite = rusqlite::Connection::open(&source_path).unwrap();
             let quick_check: String = sqlite
                 .query_row("PRAGMA quick_check;", [], |row| row.get(0))
                 .unwrap();
             let integrity_check: String = sqlite
                 .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
                 .unwrap();
-            assert!(
-                !stored_table_sql.to_ascii_uppercase().contains("UNIQUE"),
-                "reconstructed table DDL must not duplicate the explicit reserved-prefix index: {stored_table_sql}"
-            );
-            assert_eq!(stored_sql, INDEX_SQL);
-            assert_eq!(row_count, 2);
             assert_eq!(quick_check, "ok");
             assert_eq!(integrity_check, "ok");
-            drop(sqlite);
+        }
 
-            let reopened = load_test_db(&rebuilt_path).await.unwrap();
-            let table = reopened
-                .schema
-                .iter()
-                .find(|table| table.name == "link_table")
-                .unwrap();
-            assert!(table.indexes.iter().any(|index| index.name == INDEX_NAME));
-        });
+        let loaded = load_test_db(&source_path).unwrap();
+        let table = loaded
+            .schema
+            .iter()
+            .find(|table| table.name == "link_table")
+            .unwrap();
+        assert!(
+            table.indexes.iter().any(|index| index.name == INDEX_NAME),
+            "a non-NULL CREATE INDEX entry is explicit even with a reserved-prefix name"
+        );
+
+        let mut original_ddl = HashMap::new();
+        // Deliberately omit the table DDL so persistence must reconstruct it
+        // from TableSchema. The explicit reserved-prefix index DDL remains the
+        // provenance signal that prevents a phantom UNIQUE table constraint.
+        original_ddl.insert(INDEX_NAME.to_owned(), INDEX_SQL.to_owned());
+        let header = DatabaseHeader {
+            page_size: DEFAULT_PAGE_SIZE,
+            schema_cookie: loaded.schema_cookie,
+            change_counter: loaded.change_counter,
+            version_valid_for: loaded.change_counter,
+            ..DatabaseHeader::default()
+        };
+        persist_to_sqlite_with_header_and_master_entries(
+            &Cx::new(),
+            &rebuilt_path,
+            &loaded.schema,
+            &loaded.db,
+            &header,
+            &[],
+            &original_ddl,
+        )
+        .unwrap();
+
+        let sqlite = rusqlite::Connection::open(&rebuilt_path).unwrap();
+        let stored_table_sql: String = sqlite
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='link_table';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored_sql: String = sqlite
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1;",
+                [INDEX_NAME],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let row_count: i64 = sqlite
+            .query_row("SELECT COUNT(*) FROM link_table;", [], |row| row.get(0))
+            .unwrap();
+        let quick_check: String = sqlite
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            !stored_table_sql.to_ascii_uppercase().contains("UNIQUE"),
+            "reconstructed table DDL must not duplicate the explicit reserved-prefix index: {stored_table_sql}"
+        );
+        assert_eq!(stored_sql, INDEX_SQL);
+        assert_eq!(row_count, 2);
+        assert_eq!(quick_check, "ok");
+        assert_eq!(integrity_check, "ok");
+        drop(sqlite);
+
+        let reopened = load_test_db(&rebuilt_path).unwrap();
+        let table = reopened
+            .schema
+            .iter()
+            .find(|table| table.name == "link_table")
+            .unwrap();
+        assert!(table.indexes.iter().any(|index| index.name == INDEX_NAME));
     }
 
     #[test]
@@ -7091,1358 +5341,371 @@ PRAGMA integrity_check;
 
     #[test]
     fn test_persist_to_sqlite_keeps_expression_index_btree_and_schema() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("expression-index-persist.db");
-            let cx = Cx::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("expression-index-persist.db");
+        let cx = Cx::new();
 
-            let mut db = MemDatabase::new();
-            db.create_table_at(2, 3);
-            let table_data = db.get_table_mut(2).unwrap();
-            table_data.insert_row(
-                1,
-                vec![
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("Alpha".into()),
-                    SqliteValue::Integer(1),
-                ],
-            );
-            table_data.insert_row(
-                2,
-                vec![
-                    SqliteValue::Integer(2),
-                    SqliteValue::Text("Dormant".into()),
-                    SqliteValue::Integer(0),
-                ],
-            );
+        let mut db = MemDatabase::new();
+        db.create_table_at(2, 3);
+        let table_data = db.get_table_mut(2).unwrap();
+        table_data.insert_row(
+            1,
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("Alpha".into()),
+                SqliteValue::Integer(1),
+            ],
+        );
+        table_data.insert_row(
+            2,
+            vec![
+                SqliteValue::Integer(2),
+                SqliteValue::Text("Dormant".into()),
+                SqliteValue::Integer(0),
+            ],
+        );
 
-            let schema = vec![TableSchema {
-                name: "agents".to_owned(),
-                root_page: 2,
-                columns: vec![
-                    ColumnInfo {
-                        name: "id".to_owned(),
-                        affinity: 'D',
-                        is_ipk: true,
-                        type_name: Some("INTEGER".to_owned()),
-                        notnull: false,
-                        unique: false,
-                        default_value: None,
-                        strict_type: None,
-                        generated_expr: None,
-                        generated_stored: None,
-                        collation: None,
-                        conflict_action: None,
-                    },
-                    ColumnInfo {
-                        name: "name".to_owned(),
-                        affinity: 'B',
-                        is_ipk: false,
-                        type_name: Some("TEXT".to_owned()),
-                        notnull: true,
-                        unique: false,
-                        default_value: None,
-                        strict_type: None,
-                        generated_expr: None,
-                        generated_stored: None,
-                        collation: None,
-                        conflict_action: None,
-                    },
-                    ColumnInfo {
-                        name: "is_active".to_owned(),
-                        affinity: 'D',
-                        is_ipk: false,
-                        type_name: Some("INTEGER".to_owned()),
-                        notnull: true,
-                        unique: false,
-                        default_value: Some("1".to_owned()),
-                        strict_type: None,
-                        generated_expr: None,
-                        generated_stored: None,
-                        collation: None,
-                        conflict_action: None,
-                    },
-                ],
-                indexes: vec![IndexSchema {
-                    name: "uq_agents_name_ci".to_owned(),
-                    root_page: 3,
-                    columns: Vec::new(),
-                    key_expressions: vec!["lower(name)".to_owned()],
-                    key_sort_directions: vec![SortDirection::Asc],
-                    where_clause: Some("is_active = 1".to_owned()),
-                    is_unique: true,
-                    key_collations: vec![None],
+        let schema = vec![TableSchema {
+            name: "agents".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "id".to_owned(),
+                    affinity: 'D',
+                    is_ipk: true,
+                    type_name: Some("INTEGER".to_owned()),
+                    notnull: false,
+                    unique: false,
+                    default_value: None,
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
                     conflict_action: None,
-                }],
-                strict: false,
-                without_rowid: false,
-                primary_key_constraints: vec![vec!["id".to_owned()]],
-                foreign_keys: Vec::new(),
-                check_constraints: Vec::new(),
-            }];
-            let header = DatabaseHeader {
-                page_size: DEFAULT_PAGE_SIZE,
-                schema_cookie: 1,
-                change_counter: 1,
-                version_valid_for: 1,
-                ..DatabaseHeader::default()
-            };
-            let mut original_ddl = HashMap::new();
-            original_ddl.insert(
+                },
+                ColumnInfo {
+                    name: "name".to_owned(),
+                    affinity: 'B',
+                    is_ipk: false,
+                    type_name: Some("TEXT".to_owned()),
+                    notnull: true,
+                    unique: false,
+                    default_value: None,
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                    conflict_action: None,
+                },
+                ColumnInfo {
+                    name: "is_active".to_owned(),
+                    affinity: 'D',
+                    is_ipk: false,
+                    type_name: Some("INTEGER".to_owned()),
+                    notnull: true,
+                    unique: false,
+                    default_value: Some("1".to_owned()),
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                    conflict_action: None,
+                },
+            ],
+            indexes: vec![IndexSchema {
+                name: "uq_agents_name_ci".to_owned(),
+                root_page: 3,
+                columns: Vec::new(),
+                key_expressions: vec!["lower(name)".to_owned()],
+                key_sort_directions: vec![SortDirection::Asc],
+                where_clause: Some("is_active = 1".to_owned()),
+                is_unique: true,
+                key_collations: vec![None],
+                conflict_action: None,
+            }],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: vec![vec!["id".to_owned()]],
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }];
+        let header = DatabaseHeader {
+            page_size: DEFAULT_PAGE_SIZE,
+            schema_cookie: 1,
+            change_counter: 1,
+            version_valid_for: 1,
+            ..DatabaseHeader::default()
+        };
+        let mut original_ddl = HashMap::new();
+        original_ddl.insert(
             "agents".to_owned(),
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 1)"
                 .to_owned(),
         );
-            original_ddl.insert(
-                "uq_agents_name_ci".to_owned(),
-                "CREATE UNIQUE INDEX uq_agents_name_ci ON agents(lower(name)) WHERE is_active = 1"
-                    .to_owned(),
-            );
+        original_ddl.insert(
+            "uq_agents_name_ci".to_owned(),
+            "CREATE UNIQUE INDEX uq_agents_name_ci ON agents(lower(name)) WHERE is_active = 1"
+                .to_owned(),
+        );
 
-            persist_to_sqlite_with_header_and_master_entries(
-                &cx,
-                &db_path,
-                &schema,
-                &db,
-                &header,
-                &[],
-                &original_ddl,
-            )
-            .await
+        persist_to_sqlite_with_header_and_master_entries(
+            &cx,
+            &db_path,
+            &schema,
+            &db,
+            &header,
+            &[],
+            &original_ddl,
+        )
+        .unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
             .unwrap();
-
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            let integrity: String = conn
-                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(integrity, "ok");
-            let index_sql: String = conn
+        assert_eq!(integrity, "ok");
+        let index_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_agents_name_ci';",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-            assert!(
-                index_sql.to_ascii_lowercase().contains("lower(name)")
-                    && index_sql
-                        .to_ascii_lowercase()
-                        .contains("where is_active = 1"),
-                "expression index SQL should be preserved: {index_sql}"
-            );
-            let duplicate = conn.execute(
-                "INSERT INTO agents(name, is_active) VALUES ('ALPHA', 1);",
-                [],
-            );
-            assert!(
-                duplicate.is_err(),
-                "persisted expression index should still enforce active-name uniqueness"
-            );
-        });
-    }
-
-    /// GH #304: the physical index builder must honor declared per-term sort
-    /// directions, not just echo them back into the `CREATE INDEX` DDL.
-    ///
-    /// Before the fix the builder inserted every index record through a plain
-    /// ascending `BtCursor`, so a `DESC` term produced a b-tree whose physical
-    /// order contradicted its own `sqlite_master` declaration. Stock SQLite
-    /// reads the index with `DESC` comparison semantics, so it either reports
-    /// the image as malformed or silently misses rows on a forced-index scan.
-    #[test]
-    fn test_persist_to_sqlite_builds_desc_index_in_declared_key_order() {
-        asupersync::test_utils::run_test(|| async {
-            const ROW_COUNT: i64 = 2_000;
-            const GROUP_COUNT: i64 = 20;
-            const PROBE_GROUP: i64 = 7;
-
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("desc-index-persist.db");
-            let cx = Cx::new();
-
-            let mut db = MemDatabase::new();
-            db.create_table_at(2, 3);
-            let table_data = db.get_table_mut(2).unwrap();
-            for id in 1..=ROW_COUNT {
-                table_data.insert_row(
-                    id,
-                    vec![
-                        SqliteValue::Integer(id),
-                        SqliteValue::Integer(id % GROUP_COUNT),
-                        // Wide enough that the table b-tree spans many pages and
-                        // the index spans multiple leaves under an interior node.
-                        SqliteValue::Text(format!("payload-{id:0>200}").into()),
-                    ],
-                );
-            }
-
-            let schema = vec![TableSchema {
-                name: "live".to_owned(),
-                root_page: 2,
-                columns: vec![
-                    ColumnInfo {
-                        name: "id".to_owned(),
-                        affinity: 'D',
-                        is_ipk: true,
-                        type_name: Some("INTEGER".to_owned()),
-                        notnull: false,
-                        unique: false,
-                        default_value: None,
-                        strict_type: None,
-                        generated_expr: None,
-                        generated_stored: None,
-                        collation: None,
-                        conflict_action: None,
-                    },
-                    ColumnInfo {
-                        name: "grp".to_owned(),
-                        affinity: 'D',
-                        is_ipk: false,
-                        type_name: Some("INTEGER".to_owned()),
-                        notnull: true,
-                        unique: false,
-                        default_value: None,
-                        strict_type: None,
-                        generated_expr: None,
-                        generated_stored: None,
-                        collation: None,
-                        conflict_action: None,
-                    },
-                    ColumnInfo {
-                        name: "payload".to_owned(),
-                        affinity: 'B',
-                        is_ipk: false,
-                        type_name: Some("TEXT".to_owned()),
-                        notnull: true,
-                        unique: false,
-                        default_value: None,
-                        strict_type: None,
-                        generated_expr: None,
-                        generated_stored: None,
-                        collation: None,
-                        conflict_action: None,
-                    },
-                ],
-                indexes: vec![IndexSchema {
-                    name: "idx_live_grp_desc".to_owned(),
-                    root_page: 3,
-                    columns: vec!["grp".to_owned(), "id".to_owned()],
-                    key_expressions: Vec::new(),
-                    key_sort_directions: vec![SortDirection::Asc, SortDirection::Desc],
-                    where_clause: None,
-                    is_unique: false,
-                    key_collations: vec![None, None],
-                    conflict_action: None,
-                }],
-                strict: false,
-                without_rowid: false,
-                primary_key_constraints: vec![vec!["id".to_owned()]],
-                foreign_keys: Vec::new(),
-                check_constraints: Vec::new(),
-            }];
-            let header = DatabaseHeader {
-                page_size: DEFAULT_PAGE_SIZE,
-                schema_cookie: 1,
-                change_counter: 1,
-                version_valid_for: 1,
-                ..DatabaseHeader::default()
-            };
-            let mut original_ddl = HashMap::new();
-            original_ddl.insert(
-                "live".to_owned(),
-                "CREATE TABLE live (id INTEGER PRIMARY KEY, grp INTEGER NOT NULL, payload TEXT NOT NULL)"
-                    .to_owned(),
-            );
-            original_ddl.insert(
-                "idx_live_grp_desc".to_owned(),
-                "CREATE INDEX idx_live_grp_desc ON live(grp, id DESC)".to_owned(),
-            );
-
-            persist_to_sqlite_with_header_and_master_entries(
-                &cx,
-                &db_path,
-                &schema,
-                &db,
-                &header,
-                &[],
-                &original_ddl,
-            )
-            .await
-            .unwrap();
-
-            // Stock SQLite is the oracle here: it reads the index using the
-            // DESC semantics declared in sqlite_master.
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-
-            let integrity: String = conn
-                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(
-                integrity, "ok",
-                "stock SQLite must accept a persisted DESC index as structurally sound"
-            );
-
-            let declared_sql: String = conn
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_live_grp_desc';",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(
-                declared_sql.to_ascii_lowercase().contains("id desc"),
-                "persisted DDL must keep the DESC term: {declared_sql}"
-            );
-
-            let collect = |sql: &str| -> Vec<i64> {
-                let mut stmt = conn.prepare(sql).unwrap();
-                let rows = stmt
-                    .query_map([PROBE_GROUP], |row| row.get::<_, i64>(0))
-                    .unwrap()
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .unwrap();
-                rows
-            };
-
-            let forced = collect(
-                "SELECT id FROM live INDEXED BY idx_live_grp_desc \
-                 WHERE grp = ?1 ORDER BY id DESC",
-            );
-            let scanned =
-                collect("SELECT id FROM live NOT INDEXED WHERE grp = ?1 ORDER BY id DESC");
-
-            assert!(
-                !scanned.is_empty(),
-                "probe group must actually contain rows"
-            );
-            assert_eq!(
-                forced,
-                scanned,
-                "forced DESC-index lookup must return the same rows as the table scan \
-                 (missing {} of {} rows)",
-                scanned.len().saturating_sub(forced.len()),
-                scanned.len()
-            );
-        });
-    }
-
-    /// GH #304 (collation + partial-index arm): a `DESC` term carrying a
-    /// non-BINARY built-in collation must also be built in declared order.
-    ///
-    /// `NOCASE` is the discriminating case: under BINARY every uppercase
-    /// prefix sorts before every lowercase one, while under NOCASE they
-    /// interleave alphabetically. An index declared `COLLATE NOCASE DESC` but
-    /// physically built BINARY/ASC is therefore doubly out of order, and stock
-    /// SQLite rejects it. The partial predicate exercises the same builder
-    /// loop with row filtering active.
-    #[test]
-    fn test_persist_to_sqlite_builds_collated_desc_partial_index_in_declared_order() {
-        asupersync::test_utils::run_test(|| async {
-            const ROW_COUNT: i64 = 400;
-
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("collated-desc-partial-index.db");
-            let cx = Cx::new();
-
-            // Case-varying prefixes: BINARY and NOCASE disagree on their order.
-            let prefixes = ["a", "B", "c", "D"];
-
-            let mut db = MemDatabase::new();
-            db.create_table_at(2, 3);
-            let table_data = db.get_table_mut(2).unwrap();
-            for id in 1..=ROW_COUNT {
-                let prefix = prefixes[usize::try_from(id - 1).unwrap() % prefixes.len()];
-                table_data.insert_row(
-                    id,
-                    vec![
-                        SqliteValue::Integer(id),
-                        SqliteValue::Text(format!("{prefix}{id:04}").into()),
-                        // Only two thirds of the rows satisfy the predicate.
-                        SqliteValue::Integer(i64::from(id % 3 != 0)),
-                    ],
-                );
-            }
-
-            let schema = vec![TableSchema {
-                name: "docs".to_owned(),
-                root_page: 2,
-                columns: vec![
-                    ColumnInfo {
-                        name: "id".to_owned(),
-                        affinity: 'D',
-                        is_ipk: true,
-                        type_name: Some("INTEGER".to_owned()),
-                        notnull: false,
-                        unique: false,
-                        default_value: None,
-                        strict_type: None,
-                        generated_expr: None,
-                        generated_stored: None,
-                        collation: None,
-                        conflict_action: None,
-                    },
-                    ColumnInfo {
-                        name: "name".to_owned(),
-                        affinity: 'B',
-                        is_ipk: false,
-                        type_name: Some("TEXT".to_owned()),
-                        notnull: true,
-                        unique: false,
-                        default_value: None,
-                        strict_type: None,
-                        generated_expr: None,
-                        generated_stored: None,
-                        collation: None,
-                        conflict_action: None,
-                    },
-                    ColumnInfo {
-                        name: "active".to_owned(),
-                        affinity: 'D',
-                        is_ipk: false,
-                        type_name: Some("INTEGER".to_owned()),
-                        notnull: true,
-                        unique: false,
-                        default_value: Some("1".to_owned()),
-                        strict_type: None,
-                        generated_expr: None,
-                        generated_stored: None,
-                        collation: None,
-                        conflict_action: None,
-                    },
-                ],
-                indexes: vec![IndexSchema {
-                    name: "idx_docs_name_ci_desc".to_owned(),
-                    root_page: 3,
-                    columns: vec!["name".to_owned()],
-                    key_expressions: Vec::new(),
-                    key_sort_directions: vec![SortDirection::Desc],
-                    where_clause: Some("active = 1".to_owned()),
-                    is_unique: false,
-                    key_collations: vec![Some("NOCASE".to_owned())],
-                    conflict_action: None,
-                }],
-                strict: false,
-                without_rowid: false,
-                primary_key_constraints: vec![vec!["id".to_owned()]],
-                foreign_keys: Vec::new(),
-                check_constraints: Vec::new(),
-            }];
-            let header = DatabaseHeader {
-                page_size: DEFAULT_PAGE_SIZE,
-                schema_cookie: 1,
-                change_counter: 1,
-                version_valid_for: 1,
-                ..DatabaseHeader::default()
-            };
-            let mut original_ddl = HashMap::new();
-            original_ddl.insert(
-                "docs".to_owned(),
-                "CREATE TABLE docs (id INTEGER PRIMARY KEY, name TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1)"
-                    .to_owned(),
-            );
-            original_ddl.insert(
-                "idx_docs_name_ci_desc".to_owned(),
-                "CREATE INDEX idx_docs_name_ci_desc ON docs(name COLLATE NOCASE DESC) WHERE active = 1"
-                    .to_owned(),
-            );
-
-            persist_to_sqlite_with_header_and_master_entries(
-                &cx,
-                &db_path,
-                &schema,
-                &db,
-                &header,
-                &[],
-                &original_ddl,
-            )
-            .await
-            .unwrap();
-
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-
-            let integrity: String = conn
-                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(
-                integrity, "ok",
-                "stock SQLite must accept a persisted COLLATE NOCASE DESC partial index"
-            );
-
-            let collect = |sql: &str| -> Vec<String> {
-                let mut stmt = conn.prepare(sql).unwrap();
-                stmt.query_map([], |row| row.get::<_, String>(0))
-                    .unwrap()
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .unwrap()
-            };
-
-            let forced = collect(
-                "SELECT name FROM docs INDEXED BY idx_docs_name_ci_desc \
-                 WHERE active = 1 ORDER BY name COLLATE NOCASE DESC",
-            );
-            let scanned = collect(
-                "SELECT name FROM docs NOT INDEXED \
-                 WHERE active = 1 ORDER BY name COLLATE NOCASE DESC",
-            );
-
-            assert!(
-                !scanned.is_empty(),
-                "partial predicate must retain some rows"
-            );
-            assert!(
-                scanned.len() < usize::try_from(ROW_COUNT).unwrap(),
-                "partial predicate must actually exclude some rows"
-            );
-            assert_eq!(
-                forced, scanned,
-                "forced collated-DESC partial-index scan must match the table scan"
-            );
-        });
-    }
-
-    /// GH #304 (UNIQUE + three-term mixed-direction + RTRIM arm): the facets
-    /// `398bab01` explicitly left unverified.
-    ///
-    /// `398bab01` covered rowid tables, built-in collations, and single or
-    /// composite ASC/DESC terms, but stated that the unique/auto arms,
-    /// `quick_check`, and source-versus-candidate record parity were not
-    /// covered. This exercises all of them at once:
-    ///
-    /// * a `UNIQUE` index, whose `is_unique` flag reaches only the regenerated
-    ///   DDL and never the physical builder;
-    /// * three key terms with mixed directions, so a single shared direction
-    ///   flag cannot accidentally satisfy the ordering;
-    /// * `RTRIM`, where `'c0007'` and `'c0007   '` compare equal but sort
-    ///   differently from BINARY, so a builder that ignored the declared
-    ///   collation would place trailing-space rows in the wrong leaf;
-    /// * both `quick_check` and full `integrity_check` under stock SQLite;
-    /// * index-versus-table row-count parity, which catches entries silently
-    ///   dropped or duplicated during the rebuild.
-    #[test]
-    fn test_persist_to_sqlite_builds_unique_mixed_direction_rtrim_index() {
-        asupersync::test_utils::run_test(|| async {
-            const ROW_COUNT: i64 = 1_500;
-            const CODE_GROUPS: i64 = 300;
-            const TIER_COUNT: i64 = 7;
-
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("unique-mixed-rtrim.db");
-            let cx = Cx::new();
-
-            let text_column = |name: &str| ColumnInfo {
-                name: name.to_owned(),
-                affinity: 'B',
-                is_ipk: false,
-                type_name: Some("TEXT".to_owned()),
-                notnull: false,
-                unique: false,
-                default_value: None,
-                strict_type: None,
-                generated_expr: None,
-                generated_stored: None,
-                collation: None,
-                conflict_action: None,
-            };
-            let int_column = |name: &str, is_ipk: bool| ColumnInfo {
-                name: name.to_owned(),
-                affinity: 'D',
-                is_ipk,
-                type_name: Some("INTEGER".to_owned()),
-                notnull: false,
-                unique: false,
-                default_value: None,
-                strict_type: None,
-                generated_expr: None,
-                generated_stored: None,
-                collation: None,
-                conflict_action: None,
-            };
-
-            let mut db = MemDatabase::new();
-            db.create_table_at(2, 4);
-            let table_data = db.get_table_mut(2).unwrap();
-            for id in 1..=ROW_COUNT {
-                // Trailing spaces must alternate across *recurrences of the same
-                // base*, so the rule keys on the occurrence (the quotient), not
-                // on `id`. Any rule of the form `id % k` where `k` divides
-                // `CODE_GROUPS` gives every recurrence of a base an identical
-                // spelling — the base repeats every `CODE_GROUPS` rows and
-                // `id % k` is invariant under that step — so RTRIM would never
-                // diverge from BINARY and a BINARY rebuild would satisfy the
-                // ordering assertions below. Alternating by occurrence puts both
-                // `c0007` and `c0007   ` in the table, which RTRIM folds together
-                // and BINARY orders apart.
-                let base = format!("c{:0>4}", id % CODE_GROUPS);
-                let occurrence = id / CODE_GROUPS;
-                let code = if occurrence % 2 == 1 {
-                    format!("{base}   ")
-                } else {
-                    base
-                };
-                table_data.insert_row(
-                    id,
-                    vec![
-                        SqliteValue::Integer(id),
-                        SqliteValue::Text(code.into()),
-                        SqliteValue::Integer(id % TIER_COUNT),
-                        SqliteValue::Text(format!("note-{id:0>200}").into()),
-                    ],
-                );
-            }
-
-            let schema = vec![TableSchema {
-                name: "catalog".to_owned(),
-                root_page: 2,
-                columns: vec![
-                    int_column("id", true),
-                    text_column("code"),
-                    int_column("tier", false),
-                    text_column("note"),
-                ],
-                indexes: vec![IndexSchema {
-                    name: "idx_catalog_mixed".to_owned(),
-                    root_page: 3,
-                    columns: vec!["code".to_owned(), "tier".to_owned(), "id".to_owned()],
-                    key_expressions: Vec::new(),
-                    key_sort_directions: vec![
-                        SortDirection::Asc,
-                        SortDirection::Desc,
-                        SortDirection::Asc,
-                    ],
-                    where_clause: None,
-                    is_unique: true,
-                    key_collations: vec![Some("RTRIM".to_owned()), None, None],
-                    conflict_action: None,
-                }],
-                strict: false,
-                without_rowid: false,
-                primary_key_constraints: vec![vec!["id".to_owned()]],
-                foreign_keys: Vec::new(),
-                check_constraints: Vec::new(),
-            }];
-            let header = DatabaseHeader {
-                page_size: DEFAULT_PAGE_SIZE,
-                schema_cookie: 1,
-                change_counter: 1,
-                version_valid_for: 1,
-                ..DatabaseHeader::default()
-            };
-            let mut original_ddl = HashMap::new();
-            original_ddl.insert(
-                "catalog".to_owned(),
-                "CREATE TABLE catalog (id INTEGER PRIMARY KEY, code TEXT, tier INTEGER, note TEXT)"
-                    .to_owned(),
-            );
-            original_ddl.insert(
-                "idx_catalog_mixed".to_owned(),
-                "CREATE UNIQUE INDEX idx_catalog_mixed \
-                 ON catalog(code COLLATE RTRIM, tier DESC, id)"
-                    .to_owned(),
-            );
-
-            persist_to_sqlite_with_header_and_master_entries(
-                &cx,
-                &db_path,
-                &schema,
-                &db,
-                &header,
-                &[],
-                &original_ddl,
-            )
-            .await
-            .unwrap();
-
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-
-            let quick: String = conn
-                .query_row("PRAGMA quick_check;", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(
-                quick, "ok",
-                "stock SQLite quick_check must accept the rebuilt UNIQUE index"
-            );
-            let integrity: String = conn
-                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(
-                integrity, "ok",
-                "stock SQLite integrity_check must accept the rebuilt UNIQUE index"
-            );
-
-            let declared_sql: String = conn
-                .query_row(
-                    "SELECT sql FROM sqlite_master \
-                     WHERE type='index' AND name='idx_catalog_mixed';",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            let lowered = declared_sql.to_ascii_lowercase();
-            assert!(
-                lowered.contains("unique") && lowered.contains("rtrim") && lowered.contains("desc"),
-                "persisted DDL must keep UNIQUE, RTRIM and DESC: {declared_sql}"
-            );
-
-            // Every table row must be reachable through the index; a dropped or
-            // duplicated entry shows up here even when integrity_check passes.
-            let indexed_count: i64 = conn
-                .query_row(
-                    "SELECT count(*) FROM catalog INDEXED BY idx_catalog_mixed;",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            let scanned_count: i64 = conn
-                .query_row("SELECT count(*) FROM catalog NOT INDEXED;", [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(scanned_count, ROW_COUNT, "fixture must persist every row");
-            assert_eq!(
-                indexed_count, scanned_count,
-                "index must contain exactly one entry per table row"
-            );
-
-            // Compare over ALL rows rather than a `tier` cohort. Same-base rows
-            // recur every `CODE_GROUPS` ids, and `CODE_GROUPS % TIER_COUNT` is 6,
-            // so the five occurrences of a base land on five *distinct* tiers:
-            // any `WHERE tier = ?` cohort therefore contains at most one row per
-            // base, no trimmed/untrimmed pair survives the filter, and RTRIM and
-            // BINARY can agree on the filtered set. An unfiltered traversal keeps
-            // both spellings of every base in the comparison and is also the most
-            // direct exercise of the whole declared key shape — ASC+RTRIM, then
-            // DESC, then ASC.
-            let collect = |sql: &str| -> Vec<i64> {
-                let mut stmt = conn.prepare(sql).unwrap();
-                stmt.query_map([], |row| row.get::<_, i64>(0))
-                    .unwrap()
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .unwrap()
-            };
-
-            // The fixture must actually be able to tell RTRIM from BINARY,
-            // otherwise the ordering assertion below passes for an index that
-            // was rebuilt with the wrong collation. Prove it on the table scan,
-            // where neither ordering can come from the index under test: if the
-            // two collations agree on this data the fixture is not
-            // discriminatory and the rest of this test proves nothing.
-            let rtrim_scan = collect(
-                "SELECT id FROM catalog NOT INDEXED \
-                 ORDER BY code COLLATE RTRIM, tier DESC, id",
-            );
-            let binary_scan = collect(
-                "SELECT id FROM catalog NOT INDEXED \
-                 ORDER BY code COLLATE BINARY, tier DESC, id",
-            );
-            assert_ne!(
-                rtrim_scan, binary_scan,
-                "fixture must distinguish RTRIM from BINARY, otherwise a BINARY \
-                 rebuild would satisfy the index-order assertion below"
-            );
-            let both_spellings: i64 = conn
-                .query_row(
-                    "SELECT count(*) FROM (SELECT rtrim(code) AS b FROM catalog \
-                     GROUP BY b HAVING count(DISTINCT code) > 1);",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(
-                both_spellings > 0,
-                "at least one base must appear both trimmed and untrimmed"
-            );
-
-            let forced = collect(
-                "SELECT id FROM catalog INDEXED BY idx_catalog_mixed \
-                 ORDER BY code COLLATE RTRIM, tier DESC, id",
-            );
-            assert_eq!(
-                forced.len(),
-                usize::try_from(ROW_COUNT).unwrap(),
-                "the forced index traversal must visit every row"
-            );
-            assert_eq!(
-                forced, rtrim_scan,
-                "forced UNIQUE mixed-direction RTRIM index traversal must match the table scan"
-            );
-        });
-    }
-
-    /// GH #304 (custom-collation arm): an index whose declared collation is not
-    /// resolvable by the builder must be refused, not rebuilt under BINARY.
-    ///
-    /// The source connection's collation registry is not reachable from the
-    /// persist path, so a `COLLATE MYCOLL` term previously fell back to BINARY
-    /// while the regenerated DDL kept saying `MYCOLL`. That produces the same
-    /// malformed-image class GH #304 was filed for, minus the DESC symptom that
-    /// made the original report visible — a silently wrong ordering rather than
-    /// a loud one. Refusing keeps the source image intact and surfaces the gap.
-    ///
-    /// Deliberately NOT covered here, and still open on GH #304:
-    ///
-    /// * **Built-in name override.** A source connection may register its own
-    ///   implementation under `BINARY`/`NOCASE`/`RTRIM`. The guard sees the name
-    ///   present and admits the index, which is then built with the *default*
-    ///   implementation — silently mis-ordered. No test asserts this, because
-    ///   provoking it means mutating the process-wide default registry, which
-    ///   would leak into every other test in this binary (the exact global-state
-    ///   hazard tracked by GH #299). It needs registry identity, not a name.
-    /// * **Candidate cleanup.** The `db_path.exists()` assertion below documents
-    ///   *ownership* only — it pins that this function does not delete its own
-    ///   output. It is not a cleanup proof. The release evidence still requires a
-    ///   keeper over the enclosing `VacuumTargetReservation` in `vacuum.rs`
-    ///   showing the partial candidate is actually removed on this failure path
-    ///   and that no caller-owned path is touched.
-    #[test]
-    fn test_persist_to_sqlite_refuses_unresolvable_index_collation() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("unresolvable-collation.db");
-            let cx = Cx::new();
-
-            let mut db = MemDatabase::new();
-            db.create_table_at(2, 2);
-            let table_data = db.get_table_mut(2).unwrap();
-            for id in 1..=8_i64 {
-                table_data.insert_row(
-                    id,
-                    vec![
-                        SqliteValue::Integer(id),
-                        SqliteValue::Text(format!("v{id}").into()),
-                    ],
-                );
-            }
-
-            let schema = vec![TableSchema {
-                name: "t".to_owned(),
-                root_page: 2,
-                columns: vec![
-                    ColumnInfo {
-                        name: "id".to_owned(),
-                        affinity: 'D',
-                        is_ipk: true,
-                        type_name: Some("INTEGER".to_owned()),
-                        notnull: false,
-                        unique: false,
-                        default_value: None,
-                        strict_type: None,
-                        generated_expr: None,
-                        generated_stored: None,
-                        collation: None,
-                        conflict_action: None,
-                    },
-                    ColumnInfo {
-                        name: "label".to_owned(),
-                        affinity: 'B',
-                        is_ipk: false,
-                        type_name: Some("TEXT".to_owned()),
-                        notnull: false,
-                        unique: false,
-                        default_value: None,
-                        strict_type: None,
-                        generated_expr: None,
-                        generated_stored: None,
-                        collation: None,
-                        conflict_action: None,
-                    },
-                ],
-                indexes: vec![IndexSchema {
-                    name: "idx_t_label_custom".to_owned(),
-                    root_page: 3,
-                    columns: vec!["label".to_owned()],
-                    key_expressions: Vec::new(),
-                    key_sort_directions: vec![SortDirection::Asc],
-                    where_clause: None,
-                    is_unique: false,
-                    key_collations: vec![Some("MYCOLL".to_owned())],
-                    conflict_action: None,
-                }],
-                strict: false,
-                without_rowid: false,
-                primary_key_constraints: vec![vec!["id".to_owned()]],
-                foreign_keys: Vec::new(),
-                check_constraints: Vec::new(),
-            }];
-            let header = DatabaseHeader {
-                page_size: DEFAULT_PAGE_SIZE,
-                schema_cookie: 1,
-                change_counter: 1,
-                version_valid_for: 1,
-                ..DatabaseHeader::default()
-            };
-            let mut original_ddl = HashMap::new();
-            original_ddl.insert(
-                "t".to_owned(),
-                "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)".to_owned(),
-            );
-            original_ddl.insert(
-                "idx_t_label_custom".to_owned(),
-                "CREATE INDEX idx_t_label_custom ON t(label COLLATE MYCOLL)".to_owned(),
-            );
-
-            let error = persist_to_sqlite_with_header_and_master_entries(
-                &cx,
-                &db_path,
-                &schema,
-                &db,
-                &header,
-                &[],
-                &original_ddl,
-            )
-            .await
-            .expect_err("an unresolvable index collation must fail closed");
-            let rendered = error.to_string();
-            assert!(
-                rendered.contains("MYCOLL") && rendered.contains("contradict its own declaration"),
-                "refusal must name the unresolvable collation and why it is refused: {rendered}"
-            );
-            // A legitimate schema this builder cannot honour is a supported-
-            // schema limitation, not a violated internal invariant.
-            assert!(
-                matches!(error, FrankenError::NotImplemented(_)),
-                "refusal must be typed as NotImplemented, found {error:?}"
-            );
-
-            // Candidate cleanup is deliberately NOT this function's job: it never
-            // removes its own output on any error path, and the enclosing VACUUM
-            // caller owns removal through its identity-bound
-            // `VacuumTargetReservation`. Pin the actual post-failure state so a
-            // future change to that ownership boundary is caught here rather than
-            // silently leaking or silently starting to delete caller-owned paths.
-            let candidate_exists_after_refusal = db_path.exists();
-
-            // A built-in collation on the same shape must still succeed, so the
-            // guard rejects only what it genuinely cannot order. The DDL must be
-            // regenerated to match: reusing the MYCOLL text would persist an
-            // index whose declaration contradicts the key metadata actually
-            // built, which is the very defect this test exists to prevent, and
-            // stock SQLite would reject the unknown collation on open.
-            let mut ok_schema = schema;
-            ok_schema[0].indexes[0].key_collations = vec![Some("NOCASE".to_owned())];
-            let mut ok_ddl = HashMap::new();
-            ok_ddl.insert(
-                "t".to_owned(),
-                "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)".to_owned(),
-            );
-            ok_ddl.insert(
-                "idx_t_label_custom".to_owned(),
-                "CREATE INDEX idx_t_label_custom ON t(label COLLATE NOCASE)".to_owned(),
-            );
-            let ok_path = dir.path().join("resolvable-collation.db");
-            persist_to_sqlite_with_header_and_master_entries(
-                &cx,
-                &ok_path,
-                &ok_schema,
-                &db,
-                &header,
-                &[],
-                &ok_ddl,
-            )
-            .await
-            .expect("a built-in collation must still rebuild");
-            let conn = rusqlite::Connection::open(&ok_path).unwrap();
-            let integrity: String = conn
-                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(integrity, "ok");
-            let declared: String = conn
-                .query_row(
-                    "SELECT sql FROM sqlite_master \
-                     WHERE type='index' AND name='idx_t_label_custom';",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(
-                declared.to_ascii_uppercase().contains("NOCASE")
-                    && !declared.to_ascii_uppercase().contains("MYCOLL"),
-                "persisted DDL must declare the collation actually built: {declared}"
-            );
-
-            // Reported after the success path so a leak is described precisely
-            // rather than aborting the more informative assertions above.
-            assert!(
-                candidate_exists_after_refusal,
-                "refusal leaves the partial candidate for the caller's reservation to remove; \
-                 if this now fails, cleanup ownership moved into the persist path and the \
-                 comment above it must be updated"
-            );
-        });
+        assert!(
+            index_sql.to_ascii_lowercase().contains("lower(name)")
+                && index_sql
+                    .to_ascii_lowercase()
+                    .contains("where is_active = 1"),
+            "expression index SQL should be preserved: {index_sql}"
+        );
+        let duplicate = conn.execute(
+            "INSERT INTO agents(name, is_active) VALUES ('ALPHA', 1);",
+            [],
+        );
+        assert!(
+            duplicate.is_err(),
+            "persisted expression index should still enforce active-name uniqueness"
+        );
     }
 
     #[test]
     fn test_overwrite_existing_file() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("overwrite.db");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("overwrite.db");
 
-            // Write once.
-            let (schema, db) = make_test_schema_and_db();
-            persist_test_db(&db_path, &schema, &db, 0, 0).await.unwrap();
+        // Write once.
+        let (schema, db) = make_test_schema_and_db();
+        persist_test_db(&db_path, &schema, &db, 0, 0).unwrap();
 
-            // Overwrite with empty.
-            persist_test_db(&db_path, &[], &MemDatabase::new(), 0, 0)
-                .await
-                .unwrap();
+        // Overwrite with empty.
+        persist_test_db(&db_path, &[], &MemDatabase::new(), 0, 0).unwrap();
 
-            let loaded = load_test_db(&db_path).await.unwrap();
-            assert!(loaded.schema.is_empty());
-        });
+        let loaded = load_test_db(&db_path).unwrap();
+        assert!(loaded.schema.is_empty());
     }
 
     #[test]
     fn test_load_from_sqlite_keeps_materialized_virtual_tables_with_real_root_page() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("materialized_vtab_load.db");
-            let db_str = db_path.to_string_lossy().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("materialized_vtab_load.db");
+        let db_str = db_path.to_string_lossy().to_string();
 
-            {
-                let conn = crate::connection::Connection::open(&db_str).await.unwrap();
-                conn.execute(
-                    "CREATE VIRTUAL TABLE docs USING fts5(subject, body, tokenize='porter')",
-                )
-                .await
+        {
+            let conn = crate::connection::Connection::open(&db_str).unwrap();
+            conn.execute("CREATE VIRTUAL TABLE docs USING fts5(subject, body, tokenize='porter')")
                 .unwrap();
-                conn.execute(
-                    "INSERT INTO docs(rowid, subject, body) VALUES (1, 'Hello', 'Rust world')",
-                )
-                .await
+            conn.execute(
+                "INSERT INTO docs(rowid, subject, body) VALUES (1, 'Hello', 'Rust world')",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO docs(rowid, subject, body) VALUES (2, 'Other', 'Nothing')")
                 .unwrap();
-                conn.execute(
-                    "INSERT INTO docs(rowid, subject, body) VALUES (2, 'Other', 'Nothing')",
-                )
-                .await
-                .unwrap();
-                conn.close().await.unwrap();
-            }
+            conn.close().unwrap();
+        }
 
-            let loaded = load_test_db(&db_path).await.unwrap();
-            // FrankenSQLite-created FTS5 tables are now stock-compatible
-            // rootpage=0 virtual tables. The low-level compat loader deliberately
-            // skips rootpage=0 virtual-table catalog rows (they have no
-            // materialized root b-tree of their own; the live vtab is reconstructed
-            // at the higher connection-reload layer instead), so the `docs` row is
-            // NOT present here — but the durable document content it persisted DOES
-            // survive, in the positive-rootpage `docs_content` shadow table.
-            assert!(
-                loaded
-                    .schema
-                    .iter()
-                    .all(|table| !table.name.eq_ignore_ascii_case("docs")),
-                "rootpage=0 FTS5 virtual-table catalog row must be skipped by the low-level loader"
-            );
-
-            // The persisted document content lives in the `docs_content` shadow
-            // table, laid out as (id INTEGER PRIMARY KEY, c0=subject, c1=body).
-            let content = loaded
+        let loaded = load_test_db(&db_path).unwrap();
+        // FrankenSQLite-created FTS5 tables are now stock-compatible
+        // rootpage=0 virtual tables. The low-level compat loader deliberately
+        // skips rootpage=0 virtual-table catalog rows (they have no
+        // materialized root b-tree of their own; the live vtab is reconstructed
+        // at the higher connection-reload layer instead), so the `docs` row is
+        // NOT present here — but the durable document content it persisted DOES
+        // survive, in the positive-rootpage `docs_content` shadow table.
+        assert!(
+            loaded
                 .schema
                 .iter()
-                .find(|table| table.name.eq_ignore_ascii_case("docs_content"))
-                .expect("FTS5 content shadow table should survive direct load");
-            let content_columns: Vec<&str> = content
-                .columns
-                .iter()
-                .map(|column| column.name.as_str())
-                .collect();
-            assert_eq!(content_columns, vec!["id", "c0", "c1"]);
-            assert!(
-                content.root_page > 0,
-                "the _content shadow table is a real positive-rootpage b-tree"
-            );
-            let mem_table = loaded
-                .db
-                .get_table(content.root_page)
-                .expect("loaded content shadow table should exist in MemDatabase");
-            // The _content shadow b-tree stores the full record (id, c0, c1): the
-            // INTEGER PRIMARY KEY `id` is both the rowid and the first record value,
-            // followed by the document columns subject (c0) and body (c1).
-            let rows: Vec<_> = mem_table.iter_rows().collect();
-            assert_eq!(rows.len(), 2);
-            assert_eq!(rows[0].0, 1);
-            assert_eq!(rows[0].1[0], SqliteValue::Integer(1));
-            assert_eq!(rows[0].1[1], SqliteValue::Text("Hello".into()));
-            assert_eq!(rows[0].1[2], SqliteValue::Text("Rust world".into()));
-            assert_eq!(rows[1].0, 2);
-            assert_eq!(rows[1].1[0], SqliteValue::Integer(2));
-            assert_eq!(rows[1].1[1], SqliteValue::Text("Other".into()));
-            assert_eq!(rows[1].1[2], SqliteValue::Text("Nothing".into()));
-        });
+                .all(|table| !table.name.eq_ignore_ascii_case("docs")),
+            "rootpage=0 FTS5 virtual-table catalog row must be skipped by the low-level loader"
+        );
+
+        // The persisted document content lives in the `docs_content` shadow
+        // table, laid out as (id INTEGER PRIMARY KEY, c0=subject, c1=body).
+        let content = loaded
+            .schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case("docs_content"))
+            .expect("FTS5 content shadow table should survive direct load");
+        let content_columns: Vec<&str> = content
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        assert_eq!(content_columns, vec!["id", "c0", "c1"]);
+        assert!(
+            content.root_page > 0,
+            "the _content shadow table is a real positive-rootpage b-tree"
+        );
+        let mem_table = loaded
+            .db
+            .get_table(content.root_page)
+            .expect("loaded content shadow table should exist in MemDatabase");
+        // The _content shadow b-tree stores the full record (id, c0, c1): the
+        // INTEGER PRIMARY KEY `id` is both the rowid and the first record value,
+        // followed by the document columns subject (c0) and body (c1).
+        let rows: Vec<_> = mem_table.iter_rows().collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows[0].1[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("Hello".into()));
+        assert_eq!(rows[0].1[2], SqliteValue::Text("Rust world".into()));
+        assert_eq!(rows[1].0, 2);
+        assert_eq!(rows[1].1[0], SqliteValue::Integer(2));
+        assert_eq!(rows[1].1[1], SqliteValue::Text("Other".into()));
+        assert_eq!(rows[1].1[2], SqliteValue::Text("Nothing".into()));
     }
 
     #[test]
     fn test_load_from_sqlite_rejects_non_virtual_table_with_rootpage_zero() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("compat_corrupt_rootpage_zero.db");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("compat_corrupt_rootpage_zero.db");
 
-            {
-                let conn = rusqlite::Connection::open(&db_path).unwrap();
-                conn.execute_batch(
-                    r"
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r"
                 CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
                 INSERT INTO docs VALUES (1, 'hello');
                 PRAGMA writable_schema = ON;
                 UPDATE sqlite_master SET rootpage = 0 WHERE name = 'docs';
                 PRAGMA writable_schema = OFF;
                 ",
-                )
-                .unwrap();
-            }
+            )
+            .unwrap();
+        }
 
-            let err = match load_test_db(&db_path).await {
-                Ok(_) => panic!("corrupt rootpage should fail load"),
-                Err(err) => err,
-            };
-            let message = err.to_string();
-            assert!(
-                message.contains("rootpage 0") || message.contains("root page"),
-                "unexpected load error: {message}"
-            );
-        });
+        let err = match load_test_db(&db_path) {
+            Ok(_) => panic!("corrupt rootpage should fail load"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("rootpage 0") || message.contains("root page"),
+            "unexpected load error: {message}"
+        );
     }
 
     #[test]
     fn test_load_from_sqlite_rejects_negative_rootpage() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("compat_corrupt_rootpage_negative.db");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("compat_corrupt_rootpage_negative.db");
 
-            {
-                let conn = rusqlite::Connection::open(&db_path).unwrap();
-                conn.execute_batch(
-                    r"
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r"
                 CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
                 INSERT INTO docs VALUES (1, 'hello');
                 PRAGMA writable_schema = ON;
                 UPDATE sqlite_master SET rootpage = -7 WHERE name = 'docs';
                 PRAGMA writable_schema = OFF;
                 ",
-                )
-                .unwrap();
-            }
+            )
+            .unwrap();
+        }
 
-            let err = match load_test_db(&db_path).await {
-                Ok(_) => panic!("negative rootpage should fail load"),
-                Err(err) => err,
-            };
-            let message = err.to_string();
-            assert!(
-                message.contains("rootpage -7") || message.contains("invalid rootpage"),
-                "unexpected load error: {message}"
-            );
-        });
+        let err = match load_test_db(&db_path) {
+            Ok(_) => panic!("negative rootpage should fail load"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("rootpage -7") || message.contains("invalid rootpage"),
+            "unexpected load error: {message}"
+        );
     }
 
     #[test]
     fn test_load_from_sqlite_rejects_rootpage_above_supported_range() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("compat_corrupt_rootpage_large.db");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("compat_corrupt_rootpage_large.db");
 
-            {
-                let conn = rusqlite::Connection::open(&db_path).unwrap();
-                conn.execute_batch(
-                    r"
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r"
                 CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
                 INSERT INTO docs VALUES (1, 'hello');
                 PRAGMA writable_schema = ON;
                 UPDATE sqlite_master SET rootpage = 2147483648 WHERE name = 'docs';
                 PRAGMA writable_schema = OFF;
                 ",
-                )
-                .unwrap();
-            }
+            )
+            .unwrap();
+        }
 
-            let err = match load_test_db(&db_path).await {
-                Ok(_) => panic!("oversized rootpage should fail load"),
-                Err(err) => err,
-            };
-            let message = err.to_string();
-            assert!(
-                message.contains("supported range")
-                    || message.contains("out-of-range")
-                    || message.contains("2147483648"),
-                "unexpected load error: {message}"
-            );
-        });
+        let err = match load_test_db(&db_path) {
+            Ok(_) => panic!("oversized rootpage should fail load"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("supported range")
+                || message.contains("out-of-range")
+                || message.contains("2147483648"),
+            "unexpected load error: {message}"
+        );
     }
 
     #[test]
     fn test_load_from_sqlite_rejects_index_rootpage_above_supported_range() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("compat_corrupt_index_rootpage_large.db");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("compat_corrupt_index_rootpage_large.db");
 
-            {
-                let conn = rusqlite::Connection::open(&db_path).unwrap();
-                conn.execute_batch(
-                    r"
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r"
                 CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
                 CREATE INDEX docs_title_idx ON docs(title);
                 PRAGMA writable_schema = ON;
                 UPDATE sqlite_master SET rootpage = 2147483648 WHERE name = 'docs_title_idx';
                 PRAGMA writable_schema = OFF;
                 ",
-                )
-                .unwrap();
-            }
+            )
+            .unwrap();
+        }
 
-            let err = match load_test_db(&db_path).await {
-                Ok(_) => panic!("oversized index rootpage should fail load"),
-                Err(err) => err,
-            };
-            let message = err.to_string();
-            assert!(
-                message.contains("docs_title_idx") && message.contains("2147483648"),
-                "unexpected load error: {message}"
-            );
-        });
-    }
-
-    #[test]
-    fn test_load_from_sqlite_rejects_explicit_index_with_missing_key_column() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("compat_corrupt_index_key_column.db");
-
-            {
-                let sqlite = rusqlite::Connection::open(&db_path).unwrap();
-                sqlite
-                    .execute_batch(
-                        r"
-                CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
-                CREATE INDEX docs_title_idx ON docs(title);
-                PRAGMA writable_schema = ON;
-                UPDATE sqlite_master
-                SET sql = 'CREATE INDEX docs_title_idx ON docs(missing_title)'
-                WHERE name = 'docs_title_idx';
-                PRAGMA writable_schema = OFF;
-                ",
-                    )
-                    .unwrap();
-            }
-
-            let error = load_test_db(&db_path)
-                .await
-                .expect_err("compat reload must reject an unresolved explicit-index key");
-            assert!(matches!(&error, FrankenError::DatabaseCorrupt { .. }));
-            let message = error.to_string();
-            assert!(
-                message.contains("docs_title_idx") && message.contains("missing_title"),
-                "unexpected malformed-index compat-load error: {message}"
-            );
-        });
-    }
-
-    #[test]
-    fn test_load_from_sqlite_rejects_schema_qualified_persisted_create_index_sql() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("compat_schema_qualified_index_sql.db");
-            {
-                let sqlite = rusqlite::Connection::open(&db_path).unwrap();
-                sqlite
-                    .execute_batch(
-                        r"
-                CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
-                CREATE INDEX docs_title_idx ON docs(title);
-                PRAGMA writable_schema = ON;
-                UPDATE sqlite_master
-                SET sql = 'CREATE INDEX main.docs_title_idx ON docs(title)'
-                WHERE name = 'docs_title_idx';
-                PRAGMA writable_schema = OFF;
-                ",
-                    )
-                    .unwrap();
-            }
-
-            let error = load_test_db(&db_path)
-                .await
-                .expect_err("compat load must reject schema-qualified index SQL");
-            assert!(matches!(&error, FrankenError::DatabaseCorrupt { .. }));
-            let message = error.to_string();
-            assert!(
-                message.contains("docs_title_idx") && message.contains("schema-qualified"),
-                "unexpected schema-qualified-index compat-load error: {message}"
-            );
-        });
-    }
-
-    #[test]
-    fn test_load_from_sqlite_rejects_known_invalid_index_functions() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            for (case, create_sql, expected) in [
-                (
-                    "random",
-                    "CREATE INDEX docs_title_idx ON docs(random())",
-                    "non-deterministic",
-                ),
-                (
-                    "aggregate",
-                    "CREATE INDEX docs_title_idx ON docs(sum(title))",
-                    "aggregate",
-                ),
-                (
-                    "wrong_arity",
-                    "CREATE INDEX docs_title_idx ON docs(lower(title, title))",
-                    "wrong number of arguments",
-                ),
-                (
-                    "current_timestamp",
-                    "CREATE INDEX docs_title_idx ON docs(CURRENT_TIMESTAMP)",
-                    "non-deterministic",
-                ),
-            ] {
-                let db_path = dir
-                    .path()
-                    .join(format!("compat_invalid_index_function_{case}.db"));
-                {
-                    let sqlite = rusqlite::Connection::open(&db_path).unwrap();
-                    sqlite
-                        .execute_batch(
-                            r"
-                        CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
-                        CREATE INDEX docs_title_idx ON docs(title);
-                        PRAGMA writable_schema = ON;
-                        ",
-                        )
-                        .unwrap();
-                    sqlite
-                        .execute(
-                            "UPDATE sqlite_master SET sql = ?1 WHERE name = 'docs_title_idx'",
-                            [create_sql],
-                        )
-                        .unwrap();
-                    sqlite
-                        .execute_batch("PRAGMA writable_schema = OFF;")
-                        .unwrap();
-                }
-
-                let error = load_test_db(&db_path)
-                    .await
-                    .expect_err("known-invalid persisted index function must fail compat load");
-                assert!(matches!(&error, FrankenError::DatabaseCorrupt { .. }));
-                let message = error.to_string().to_ascii_lowercase();
-                assert!(
-                    message.contains("docs_title_idx") && message.contains(expected),
-                    "unexpected compat persisted-function error for `{create_sql}`: {error}"
-                );
-            }
-        });
+        let err = match load_test_db(&db_path) {
+            Ok(_) => panic!("oversized index rootpage should fail load"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("docs_title_idx") && message.contains("2147483648"),
+            "unexpected load error: {message}"
+        );
     }
 
     #[test]
     fn test_load_from_sqlite_rejects_invalid_utf8_in_sqlite_master_record() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("compat_corrupt_master_utf8.db");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("compat_corrupt_master_utf8.db");
 
-            {
-                let conn = rusqlite::Connection::open(&db_path).unwrap();
-                conn.execute_batch(
-                    r"
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r"
                 CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
                 INSERT INTO docs VALUES (1, 'hello');
                 PRAGMA writable_schema = ON;
@@ -8451,50 +5714,43 @@ PRAGMA integrity_check;
                 WHERE name = 'docs';
                 PRAGMA writable_schema = OFF;
                 ",
-                )
-                .unwrap();
-            }
+            )
+            .unwrap();
+        }
 
-            let err = load_test_db(&db_path)
-                .await
-                .expect_err("invalid sqlite_master text should fail");
-            let message = err.to_string();
-            assert!(
-                message.contains("sqlite_master row")
-                    || message.contains("valid SQLite record")
-                    || message.contains("payload"),
-                "unexpected load error: {message}"
-            );
-        });
+        let err = load_test_db(&db_path).expect_err("invalid sqlite_master text should fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("sqlite_master row")
+                || message.contains("valid SQLite record")
+                || message.contains("payload"),
+            "unexpected load error: {message}"
+        );
     }
 
     #[test]
     fn test_load_from_sqlite_rejects_invalid_utf8_in_table_record() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("compat_corrupt_table_utf8.db");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("compat_corrupt_table_utf8.db");
 
-            {
-                let conn = rusqlite::Connection::open(&db_path).unwrap();
-                conn.execute_batch(
-                    r"
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r"
                 CREATE TABLE docs (title TEXT);
                 INSERT INTO docs VALUES (CAST(x'FF' AS TEXT));
                 ",
-                )
-                .unwrap();
-            }
+            )
+            .unwrap();
+        }
 
-            let err = load_test_db(&db_path)
-                .await
-                .expect_err("invalid table text should fail");
-            let message = err.to_string();
-            assert!(
-                message.contains("table `docs`")
-                    || message.contains("valid SQLite record")
-                    || message.contains("payload"),
-                "unexpected load error: {message}"
-            );
-        });
+        let err = load_test_db(&db_path).expect_err("invalid table text should fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("table `docs`")
+                || message.contains("valid SQLite record")
+                || message.contains("payload"),
+            "unexpected load error: {message}"
+        );
     }
 }
