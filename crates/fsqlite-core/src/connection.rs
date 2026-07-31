@@ -491,6 +491,7 @@ mod trigger_probe_site {
     pub(super) const FIRE_TRIGGERS: u8 = 4;
     pub(super) const FRAME_PUSH: u8 = 5;
     pub(super) const TRIGGER_REENTRY: u8 = 6;
+    pub(super) const FK_ACTION: u8 = 7;
 
     pub(super) const fn name(site: u8) -> &'static str {
         match site {
@@ -500,6 +501,7 @@ mod trigger_probe_site {
             FIRE_TRIGGERS => "fire_{before,after}_triggers",
             FRAME_PUSH => "push_trigger_frame",
             TRIGGER_REENTRY => "execute_bound_trigger_statement",
+            FK_ACTION => "execute_fk_{delete,update}_action",
             _ => "unknown",
         }
     }
@@ -9773,6 +9775,8 @@ struct FkCascadeDepthGuard<'a> {
 
 impl<'a> FkCascadeDepthGuard<'a> {
     fn enter(depth: &'a Cell<usize>) -> Self {
+        #[cfg(test)]
+        record_trigger_stack_probe(trigger_probe_site::FK_ACTION);
         depth.set(depth.get() + 1);
         Self { depth }
     }
@@ -118360,6 +118364,34 @@ mod tests {
         conn
     }
 
+    /// Build a linear FK graph with `depth` `ON DELETE CASCADE` edges and one
+    /// live row per table.
+    async fn build_fk_cascade_chain(depth: usize) -> Connection {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").await.unwrap();
+        conn.execute("CREATE TABLE fk_0 (id INTEGER PRIMARY KEY);")
+            .await
+            .unwrap();
+        for level in 1..=depth {
+            conn.execute(&format!(
+                "CREATE TABLE fk_{level} (\
+                 id INTEGER PRIMARY KEY, \
+                 parent_id INTEGER REFERENCES fk_{}(id) ON DELETE CASCADE\
+                 );",
+                level - 1
+            ))
+            .await
+            .unwrap();
+        }
+        conn.execute("INSERT INTO fk_0 VALUES (1);").await.unwrap();
+        for level in 1..=depth {
+            conn.execute(&format!("INSERT INTO fk_{level} VALUES (1, 1);"))
+                .await
+                .unwrap();
+        }
+        conn
+    }
+
     /// Drive a probe workload, optionally without the TRACE-level test
     /// subscriber that `asupersync::test_utils::run_test` installs globally.
     /// The subscriber changes which branches of the statement dispatcher are
@@ -118477,6 +118509,253 @@ mod tests {
                 super::trigger_probe_site::name(next_site),
                 addr.saturating_sub(next_addr),
             );
+        }
+    }
+
+    /// Diagnostic counterpart to `diag_trigger_stack_bytes_per_level` for
+    /// nested `ON DELETE CASCADE` actions. The chain remains below
+    /// `MAX_FK_CASCADE_DEPTH`, so it measures the real recursive FK path
+    /// without relying on a test-only depth override.
+    #[test]
+    #[ignore = "diagnostic measurement, not a regression assertion"]
+    fn diag_fk_cascade_stack_bytes_per_level() {
+        const PROBE_DEPTH: usize = 40;
+        let quiet = probe_quiet();
+        let handle = std::thread::Builder::new()
+            .name("fk-cascade-stack-probe".to_owned())
+            .stack_size(512 * 1024 * 1024)
+            .spawn(move || {
+                let base_marker: usize = 0;
+                let thread_base = std::ptr::from_ref(&base_marker) as usize;
+                block_on_probe(quiet, || async {
+                    let conn = build_fk_cascade_chain(PROBE_DEPTH).await;
+                    arm_trigger_stack_probe();
+                    conn.execute("DELETE FROM fk_0 WHERE id = 1;")
+                        .await
+                        .unwrap();
+                    let rows = conn
+                        .query(&format!("SELECT COUNT(*) FROM fk_{PROBE_DEPTH};"))
+                        .await
+                        .unwrap();
+                    assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(0));
+                });
+                (thread_base, take_trigger_stack_probe())
+            })
+            .expect("spawn FK cascade stack probe thread");
+        let (thread_base, samples) = handle.join().expect("FK cascade probe thread panicked");
+        let frames: Vec<usize> = samples
+            .iter()
+            .filter(|(site, _)| *site == super::trigger_probe_site::FK_ACTION)
+            .map(|(_, addr)| *addr)
+            .collect();
+        assert_eq!(
+            frames.len(),
+            PROBE_DEPTH,
+            "probe should record one FK action per cascade edge"
+        );
+        let deltas: Vec<usize> = frames
+            .windows(2)
+            .map(|window| window[0].saturating_sub(window[1]))
+            .collect();
+        let steady = &deltas[2..];
+        let total: usize = steady.iter().sum();
+        let mean = total / steady.len();
+        let min = *steady.iter().min().unwrap();
+        let max = *steady.iter().max().unwrap();
+        let base = thread_base.saturating_sub(frames[0]);
+        println!("=== FK cascade recursion native-stack measurement (raw Connection API) ===");
+        println!("tracing subscriber installed: {}", !quiet);
+        println!("levels sampled: {}", frames.len());
+        println!("base stack consumed before first FK action: {base} bytes");
+        println!("steady-state per level: mean={mean} min={min} max={max}");
+        for stack_mib in [1_usize, 2, 4, 8, 16, 32] {
+            let budget = stack_mib * 1024 * 1024;
+            let usable = budget.saturating_sub(base);
+            println!(
+                "  {stack_mib:>2} MiB stack -> predicted max depth ~= {} levels",
+                usable / mean.max(1)
+            );
+        }
+
+        println!("--- per-site attribution (one steady-state recursion cycle) ---");
+        let cycle_start = samples
+            .iter()
+            .position(|(site, addr)| {
+                *site == super::trigger_probe_site::FK_ACTION && *addr == frames[4]
+            })
+            .expect("locate steady-state FK cycle start");
+        let cycle_end = samples
+            .iter()
+            .position(|(site, addr)| {
+                *site == super::trigger_probe_site::FK_ACTION && *addr == frames[5]
+            })
+            .expect("locate next FK cycle start");
+        for window in samples[cycle_start..=cycle_end].windows(2) {
+            let (site, addr) = window[0];
+            let (next_site, next_addr) = window[1];
+            println!(
+                "  {:>46} -> {:<46} {:>8} bytes",
+                super::trigger_probe_site::name(site),
+                super::trigger_probe_site::name(next_site),
+                addr.saturating_sub(next_addr),
+            );
+        }
+    }
+
+    /// Run a bounded FK cascade on an explicitly sized stack. The final-table
+    /// row count is printed rather than asserted so the out-of-process matrix
+    /// can distinguish native stack aborts from the current depth-cap behavior.
+    #[test]
+    #[ignore = "diagnostic measurement, not a regression assertion"]
+    fn diag_fk_cascade_depth_survival() {
+        let stack_mib: usize = std::env::var("FSQLITE_PROBE_STACK_MIB")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1);
+        let depth: usize = std::env::var("FSQLITE_PROBE_DEPTH")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8);
+        let quiet = probe_quiet();
+        std::thread::Builder::new()
+            .name("fk-cascade-depth-survival".to_owned())
+            .stack_size(stack_mib * 1024 * 1024)
+            .spawn(move || {
+                block_on_probe(quiet, || async {
+                    let conn = build_fk_cascade_chain(depth).await;
+                    conn.execute("DELETE FROM fk_0 WHERE id = 1;")
+                        .await
+                        .unwrap();
+                    let rows = conn
+                        .query(&format!("SELECT COUNT(*) FROM fk_{depth};"))
+                        .await
+                        .unwrap();
+                    println!(
+                        "PROBE_FK_RESULT stack_mib={stack_mib} depth={depth} remaining={:?}",
+                        row_values(&rows[0])[0]
+                    );
+                });
+            })
+            .expect("spawn FK cascade survival thread")
+            .join()
+            .expect("FK cascade survival thread panicked");
+        println!("PROBE_FK_SURVIVED stack_mib={stack_mib} depth={depth}");
+    }
+
+    /// One-command, one-binary profile receipt for trigger and FK native-stack
+    /// behavior. Every potentially aborting candidate runs in a child process
+    /// so a stack overflow cannot terminate the matrix driver itself.
+    #[test]
+    #[ignore = "diagnostic measurement, not a regression assertion"]
+    fn diag_runtime_stack_profile_suite() {
+        fn run_child(
+            test_name: &str,
+            stack_mib: Option<usize>,
+            depth_or_limit: Option<(&str, usize)>,
+        ) -> std::process::Output {
+            let mut command = std::process::Command::new(
+                std::env::current_exe().expect("locate current test executable"),
+            );
+            command
+                .arg(test_name)
+                .arg("--ignored")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env("FSQLITE_PROBE_QUIET", "1");
+            if let Some(stack_mib) = stack_mib {
+                command.env("FSQLITE_PROBE_STACK_MIB", stack_mib.to_string());
+            }
+            if let Some((name, value)) = depth_or_limit {
+                command.env(name, value.to_string());
+            }
+            command.output().expect("run stack probe child")
+        }
+
+        fn print_child_receipt(label: &str, output: &std::process::Output) {
+            println!("=== {label} ===");
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            if !output.status.success() {
+                eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+            }
+            assert!(output.status.success(), "{label} child failed");
+        }
+
+        let trigger_bytes = run_child(
+            "connection::tests::diag_trigger_stack_bytes_per_level",
+            None,
+            None,
+        );
+        print_child_receipt("trigger byte attribution", &trigger_bytes);
+        let fk_bytes = run_child(
+            "connection::tests::diag_fk_cascade_stack_bytes_per_level",
+            None,
+            None,
+        );
+        print_child_receipt("FK byte attribution", &fk_bytes);
+
+        println!("=== trigger clean-error versus native-abort boundary ===");
+        for stack_mib in [1_usize, 2, 4, 8, 16] {
+            let succeeds = |limit| {
+                let output = run_child(
+                    "connection::tests::diag_trigger_limit_fires_before_abort",
+                    Some(stack_mib),
+                    Some(("FSQLITE_PROBE_LIMIT", limit)),
+                );
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("PROBE_LIMIT_CLEAN")
+            };
+            let mut max_clean = 1_usize;
+            assert!(
+                succeeds(max_clean),
+                "limit 1 must fit every supported stack"
+            );
+            let mut first_failure = 2_usize;
+            while first_failure <= 512 && succeeds(first_failure) {
+                max_clean = first_failure;
+                first_failure *= 2;
+            }
+            if first_failure > 512 {
+                println!(
+                    "PROBE_TRIGGER_BOUNDARY stack_mib={stack_mib} max_clean=>=512 first_failure=unknown"
+                );
+                continue;
+            }
+            while first_failure - max_clean > 1 {
+                let candidate = max_clean + (first_failure - max_clean) / 2;
+                if succeeds(candidate) {
+                    max_clean = candidate;
+                } else {
+                    first_failure = candidate;
+                }
+            }
+            println!(
+                "PROBE_TRIGGER_BOUNDARY stack_mib={stack_mib} \
+                 max_clean={max_clean} first_native_abort={first_failure}"
+            );
+        }
+
+        println!("=== FK cascade survival and semantic boundary ===");
+        for stack_mib in [1_usize, 2, 4, 8, 16] {
+            for depth in [8_usize, 16, 24, 32, 40, 48, 49, 50, 51] {
+                let output = run_child(
+                    "connection::tests::diag_fk_cascade_depth_survival",
+                    Some(stack_mib),
+                    Some(("FSQLITE_PROBE_DEPTH", depth)),
+                );
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let marker = stdout
+                    .lines()
+                    .find(|line| line.starts_with("PROBE_FK_RESULT"))
+                    .unwrap_or("PROBE_FK_RESULT missing");
+                println!(
+                    "PROBE_FK_MATRIX status={} {marker}",
+                    if output.status.success() {
+                        "survived"
+                    } else {
+                        "native_abort"
+                    }
+                );
+            }
         }
     }
 
