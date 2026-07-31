@@ -12364,6 +12364,25 @@ impl Connection {
                         "CREATE VIEW",
                         create_view.name.schema.as_deref().unwrap_or(&target_schema),
                     )?;
+                    let target_exists = self.with_attached_connection(&target_schema, |conn| {
+                        Ok(conn
+                            .view_index_for_scope(
+                                &create_view.name.name,
+                                PragmaSchemaScope::Main,
+                            )
+                            .is_some()
+                            || conn.table_exists_for_scope(
+                                &create_view.name.name,
+                                PragmaSchemaScope::Main,
+                            ))
+                    })?;
+                    if !target_exists {
+                        validate_persistent_view_schema_references(
+                            &create_view.query,
+                            &create_view.name.name,
+                            &target_schema,
+                        )?;
+                    }
                     let mut rewritten = create_view.clone();
                     rewritten.name.schema = None;
                     // The attached database is the child connection's MAIN.
@@ -44289,7 +44308,11 @@ impl Connection {
             }
             self.rebuild_schema_indices();
             self.validate_schema_index();
-            self.increment_schema_cookie().await?;
+            if dropped_connection_local {
+                self.note_temp_schema_change();
+            } else {
+                self.increment_schema_cookie().await?;
+            }
         }
         Ok(pending_shadow_drops)
     }
@@ -46792,6 +46815,9 @@ impl Connection {
                 "table {view_name} already exists"
             )));
         }
+        if !target_is_temp {
+            validate_persistent_view_schema_references(&stmt.query, view_name, "main")?;
+        }
         let create_sql = stmt.to_string();
         self.views.borrow_mut().push(ViewDef {
             name: view_name.clone(),
@@ -46804,9 +46830,10 @@ impl Connection {
         if !target_is_temp {
             self.insert_sqlite_master_row("view", view_name, view_name, 0, &create_sql)
                 .await?;
+            self.increment_schema_cookie().await?;
+        } else {
+            self.note_temp_schema_change();
         }
-
-        self.increment_schema_cookie().await?;
         Ok(())
     }
 
@@ -73964,6 +73991,32 @@ fn strip_attached_schema_from_select(select: &mut SelectStatement, target_schema
             name.schema = None;
         }
     });
+}
+
+/// Persistent views belong to exactly one database schema. SQLite defers
+/// ordinary relation existence checks until the view is used, but rejects a
+/// definition that explicitly names any different database at CREATE time.
+fn validate_persistent_view_schema_references(
+    select: &SelectStatement,
+    view_name: &str,
+    owner_schema: &str,
+) -> Result<()> {
+    let mut foreign_schema = None;
+    visit_select_qualified_names(select, &mut |name| {
+        if foreign_schema.is_none()
+            && let Some(schema) = name.schema.as_deref()
+            && !schema.eq_ignore_ascii_case(owner_schema)
+        {
+            foreign_schema = Some(schema.to_owned());
+        }
+        Ok(())
+    })?;
+    if let Some(schema) = foreign_schema {
+        return Err(FrankenError::FunctionError(format!(
+            "view {view_name} cannot reference objects in database {schema}"
+        )));
+    }
+    Ok(())
 }
 
 /// Pin every catalog relation in a persistent view body to its owning MAIN
@@ -132822,9 +132875,11 @@ mod tests {
             conn.execute("CREATE VIEW main.same_name AS SELECT 1 AS value;")
                 .await
                 .unwrap();
+            let persistent_cookie = conn.schema_cookie();
             conn.execute("CREATE TEMP VIEW temp.same_name AS SELECT 2 AS value;")
                 .await
                 .unwrap();
+            assert_eq!(conn.schema_cookie(), persistent_cookie);
 
             let bare = conn.query("SELECT value FROM same_name;").await.unwrap();
             let main = conn
@@ -132851,7 +132906,9 @@ mod tests {
                 .unwrap();
             assert_eq!(persisted[0].values(), &[SqliteValue::Integer(1)]);
 
+            let cookie_before_temp_drop = conn.schema_cookie();
             conn.execute("DROP VIEW same_name;").await.unwrap();
+            assert_eq!(conn.schema_cookie(), cookie_before_temp_drop);
             assert!(
                 conn.view_index_for_scope("same_name", PragmaSchemaScope::Temp)
                     .is_none()
@@ -132919,6 +132976,45 @@ mod tests {
                     "unexpected error for `{sql}`: {error:?}"
                 );
             }
+
+            for (sql, expected_schema) in [
+                (
+                    "CREATE VIEW main.cross_temp AS SELECT * FROM temp.base;",
+                    "temp",
+                ),
+                (
+                    "CREATE VIEW main.cross_aux AS SELECT * FROM aux.missing;",
+                    "aux",
+                ),
+                (
+                    "CREATE VIEW aux.cross_main AS SELECT * FROM main.base;",
+                    "main",
+                ),
+            ] {
+                let error = conn.execute(sql).await.unwrap_err();
+                let expected = format!(
+                    "view {} cannot reference objects in database {expected_schema}",
+                    if expected_schema == "main" {
+                        "cross_main"
+                    } else if expected_schema == "temp" {
+                        "cross_temp"
+                    } else {
+                        "cross_aux"
+                    }
+                );
+                assert!(
+                    matches!(error, FrankenError::FunctionError(message) if message == expected),
+                    "unexpected cross-schema error for `{sql}`: {error:?}"
+                );
+            }
+
+            // Object lookup precedes the cross-schema definition check for an
+            // existing IF NOT EXISTS target, matching SQLite's no-op behavior.
+            conn.execute(
+                "CREATE VIEW IF NOT EXISTS main.owner_view AS SELECT * FROM aux.missing;",
+            )
+            .await
+            .unwrap();
         });
     }
 
