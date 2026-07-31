@@ -123,10 +123,10 @@ The revised bootstrap rule requires an enumerated artifact-specific exact bindin
 
 1. A strong connection retains a generation authority for A.
 2. A cooperative peer enters through a weaker constructor.
-3. The peer attempts an in-place main-image rewrite or validated-image publication that preserves file identity.
+3. The peer attempts generation-changing publication: replacement of the main object or installation of an independently produced full logical image, including identity-preserving VACUUM/validated-image installation.
 4. The strong connection resumes with stale caches or artifact state.
 
-Every cooperative publication entrypoint must acquire a namespace-wide exclusive gate that conflicts with the strong lifetime lease. Constructor conformance and publication exclusion are separate properties.
+Every cooperative generation-changing publication entrypoint must acquire a namespace-wide exclusive gate that conflicts with the strong lifetime lease. Ordinary writes, authority-admitted recovery, and checkpoint remain generation-preserving I/O through the retained authority. Constructor conformance and publication exclusion are separate properties.
 
 ## Required proof matrix
 
@@ -143,7 +143,7 @@ Every cooperative publication entrypoint must acquire a namespace-wide exclusive
 | Rollback journal | Exercise hot and non-hot journal inputs | Recovery runs only with an exact binding witness; canonical/format-valid ambiguity refuses before replay |
 | Auxiliary artifacts | Enable WAL-FEC, DB-FEC, MVCC history/witness, and parallel-WAL separately | Each uses the authority or returns typed unsupported before effects |
 | Post-return main reads | Force WAL refresh, export, copy, checkpoint support, and header/conflict reads | No path selects a new authoritative main handle |
-| Main publication | Invoke VACUUM and every validated-image/in-place publication route through strong, weak, pager, compatibility, async, and C entrypoints | A strong connection refuses its own publication before effects; every peer route is excluded while any generation authority is live |
+| Generation-changing publication | Invoke object replacement and independently produced full-image VACUUM/validated-image installation through strong, weak, pager, compatibility, async, and C entrypoints; separately run ordinary writes, admitted recovery, and checkpoint | Strong publication refuses before effects; peer publication is excluded while authority is live; generation-preserving I/O remains enabled through retained authority |
 | Alias handling | Exercise symlink, hard-link, reparse, mount/path alias, case, and relative-path inputs | Supported profiles prove secure admission; ambiguous inputs refuse |
 | Parent replacement | Replace a parent between canonicalization and sidecar acquisition | No universal prevention claim; stronger profiles prove directory authority, otherwise threat limitation is explicit |
 | Filesystem qualification | Run on local qualified filesystems and representative remote/virtual filesystems | Unknown or unproved filesystems refuse exact mode rather than silently weakening it |

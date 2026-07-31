@@ -7,7 +7,7 @@ type: "rfc"
 
 # RFC: Generation-Stable, Sidecar-Proven Existing-Runtime Open
 
-**Status:** Revised after round-2 synthesis; proposed for re-review
+**Status:** Revised after round-3 synthesis; proposed for re-review
 **Date:** 2026-07-31
 **Owner issue:** [frankensqlite#308](https://github.com/Dicklesworthstone/frankensqlite/issues/308)
 **Decision:** Agent Kernel decision 87
@@ -32,9 +32,9 @@ The public API for the first implementation is one safe constructor:
 Connection::open_existing_generation_bound(path, options)
 ```
 
-Capability construction and consumption remain crate-private and sealed. Pager/connection construction consumes authority issued by this constructor without independently reopening the main file by pathname.
+Authority construction and consumption remain engine-internal and sealed across `fsqlite-vfs`, `fsqlite-pager`, and `fsqlite-core`. Cross-crate representations have only the visibility required for owner-controlled composition; their fields and minting operations remain inaccessible to downstream callers, and they are not a supported public capability API. Pager/connection construction consumes authority issued by the safe constructor without independently reopening the main file by pathname.
 
-The first implementation refuses operations that replace the canonical main generation while the connection remains live. Every cooperative publication route, including weaker connection and pager entrypoints, must acquire one namespace-wide exclusive publication gate that conflicts with every live generation authority. Atomic live generation-authority rotation is a separate future decision.
+The first implementation refuses generation-changing publication while the connection remains live. Every cooperative generation-changing publication route, including weaker connection and pager entrypoints, must acquire one namespace-wide exclusive publication gate that conflicts with every live generation authority. Atomic live generation-authority rotation is a separate future decision.
 
 This RFC decides architecture only. It does not authorize implementation, release, pin rotation, downstream integration, task-4195 resumption, or activation.
 
@@ -217,9 +217,11 @@ A sidecar not present at linearization may later be created only through the aut
 
 ### Generation transition invariant
 
-Every cooperative route capable of publishing or rewriting a main image must acquire the same namespace-wide exclusive publication authority. This includes ordinary and expected-identity connections, pager-level APIs, compatibility/async/C entrypoints, VACUUM paths, and any internal validated-image publication path. Weaker APIs may remain non-conforming for exact admission, but they cannot bypass a live generation authority. Publication may proceed only when no generation authority holds the conflicting lifetime lease.
+**Generation-changing publication** means replacing the main-file object or installing an independently produced logical database image, including a full-image VACUUM or validated-image installation that preserves file identity but invalidates generation-wide caches or artifact state. It does not include ordinary pager writes, authority-admitted WAL or rollback recovery, or checkpoint materialization performed through the retained generation authority; those are generation-preserving I/O and remain subject to the authority and sidecar rules without acquiring the exclusive publication gate.
 
-A cooperative transition from main generation A to B—or an in-place main-image rewrite that preserves file identity—may publish only after it holds that exclusive authority and has one of the following outcomes for every recovery-bearing artifact:
+Every cooperative route capable of generation-changing publication must acquire the same namespace-wide exclusive publication authority. This includes ordinary and expected-identity connections, pager-level APIs, compatibility/async/C entrypoints, VACUUM paths, and any internal validated-image publication path. Weaker APIs may remain non-conforming for exact admission, but they cannot bypass a live generation authority. Publication may proceed only when no generation authority holds the conflicting lifetime lease.
+
+A cooperative transition from main generation A to B—or an identity-preserving generation-changing publication—may proceed only after it holds that exclusive authority and has one of the following outcomes for every recovery-bearing artifact:
 
 1. cleanly drained and retired;
 2. explicitly transferred through an owner-proved transition operation; or
@@ -267,9 +269,9 @@ Platform-required identity probes are observational only. Their types and owners
 
 The first generation-bound contract does not rotate authority.
 
-Any operation invoked through a generation-bound connection that would replace, republish, or rewrite the authoritative main image—including validated database-image publication and in-place publication that preserves file identity—must return a typed `GenerationRotationUnsupported` or equivalent before replacement effects.
+Any generation-changing publication invoked through a generation-bound connection must return a typed `GenerationRotationUnsupported` or equivalent before publication effects. Ordinary pager writes, authority-admitted recovery, and checkpoint remain lawful generation-preserving operations through the retained authority.
 
-Every cooperative publication route, including routes entered through weaker constructors or pager APIs, must first acquire the namespace-wide exclusive publication authority. That acquisition conflicts with every live generation authority. A weaker connection may retain its separately documented publication behavior only when no generation-bound authority is live; it cannot publish around the strong contract.
+Every cooperative generation-changing publication route, including routes entered through weaker constructors or pager APIs, must first acquire the namespace-wide exclusive publication authority. That acquisition conflicts with every live generation authority. A weaker connection may retain its separately documented publication behavior only when no generation-bound authority is live; it cannot publish around the strong contract.
 
 A future rotation protocol must atomically replace main handle, identity, namespace binding, admitted sidecar state, WAL backend, pager caches, and every dependent lease. It requires a separate decision and proof matrix.
 
@@ -378,7 +380,7 @@ Implementation acceptance requires:
 6. non-empty WAL/SHM and rollback recovery only for artifact families with an enumerated exact-binding rule; otherwise deterministic pre-effect provenance refusal;
 7. coverage of WAL-FEC, DB-FEC, MVCC history/witness, and parallel-WAL or typed unsupported refusal;
 8. post-return WAL refresh, export, copy, and auxiliary-read proof;
-9. namespace-wide exclusion of every cooperative publication route while any generation authority is live, plus pre-effect refusal when publication is invoked through the strong connection;
+9. namespace-wide exclusion of every cooperative generation-changing publication route while any generation authority is live, plus pre-effect refusal when such publication is invoked through the strong connection and positive proof that ordinary writes, admitted recovery, and checkpoint remain generation-preserving;
 10. symlink, hard-link, reparse, parent, and filesystem-profile tests;
 11. actual io_uring submission/completion proof separate from fallback;
 12. Windows probe non-authority and weak-identity profile tests;

@@ -42,7 +42,7 @@ Canonical sibling spelling does not prove that a pre-existing WAL or journal bel
 - absence of recovery-bearing sidecars is a valid clean bootstrap;
 - a pre-existing recovery-bearing artifact is admitted only by an enumerated artifact-specific rule that binds it to the exact main state;
 - canonical name, format, checksum, page-size, or replay compatibility alone are not provenance;
-- cooperating publication routes cannot rewrite or replace the main while a generation authority is live;
+- cooperating routes cannot perform generation-changing publication while a generation authority is live;
 - cooperating generation transitions cannot publish a replacement main while stale or ambiguous recovery artifacts remain;
 - sidecars created or rotated after admission are created only through the retained generation authority; and
 - ambiguity causes typed refusal before database effects.
@@ -62,7 +62,9 @@ The API must not claim universal hostile namespace ownership. Environments requi
 
 ### Live main-generation replacement
 
-A connection that retains generation A cannot silently continue after an operation publishes or rewrites the main image, even when the file identity remains unchanged. Every cooperative publication route—including weaker connection and pager entrypoints—must acquire one namespace-wide exclusive publication gate that conflicts with every live generation authority. The first contract must refuse publication invoked through a generation-bound connection before effects. A future separately decided protocol may atomically rotate the complete generation authority.
+A connection that retains generation A cannot silently continue after **generation-changing publication**: replacement of the main-file object or installation of an independently produced logical database image, including identity-preserving full-image VACUUM/validated-image installation that invalidates generation-wide caches or artifact state. Every cooperative generation-changing publication route—including weaker connection and pager entrypoints—must acquire one namespace-wide exclusive publication gate that conflicts with every live generation authority. The first contract must refuse such publication invoked through a generation-bound connection before effects.
+
+Ordinary pager writes, authority-admitted WAL or rollback recovery, and checkpoint materialization are generation-preserving I/O. They remain lawful through the retained authority and do not acquire the exclusive publication gate. A future separately decided protocol may atomically rotate the complete generation authority.
 
 ### Artifact coverage
 
@@ -150,7 +152,7 @@ A reviewed owner contract must prove, for each explicitly supported backend and 
 
 - authoritative main I/O descends from the admitted main handle;
 - cooperative sidecar membership is established at admission or by generation-owned creation;
-- cooperative publication is excluded namespace-wide while a generation authority is live;
+- cooperative generation-changing publication is excluded namespace-wide while a generation authority is live, without blocking ordinary writes, admitted recovery, or checkpoint;
 - cooperative generation replacement cannot leave stale artifacts attributed to the new main;
 - pre-existing recovery artifacts without an exact owner binding rule refuse before recovery;
 - unsupported artifact families, filesystems, aliases, and replacement operations refuse before database effects;
