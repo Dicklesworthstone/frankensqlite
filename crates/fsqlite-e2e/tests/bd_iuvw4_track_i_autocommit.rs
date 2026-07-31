@@ -1,9 +1,9 @@
-//! Track I autocommit retained-txn test coverage for `bd-iuvw4`.
+//! Track I autocommit durability coverage for `bd-iuvw4`.
 //!
-//! Tests verify that retained autocommit transactions:
-//! - Reduce begin/commit overhead for consecutive autocommit writes
+//! Tests verify that successful autocommit statements:
+//! - Commit before returning success
 //! - Maintain read-after-write correctness
-//! - Flush properly on connection close
+//! - Remain durable across connection close and reopen
 //! - Work correctly with interleaved read/write patterns
 #![recursion_limit = "512"]
 
@@ -62,67 +62,128 @@ fn rows_per_sec(rows: i64, elapsed: Duration) -> f64 {
     rows as f64 / secs
 }
 
+async fn fsqlite_count(conn: &fsqlite::Connection, sql: &str) -> i64 {
+    let rows = conn.query(sql).await.expect("query fsqlite row count");
+    match rows.as_slice() {
+        [row] => match row.get(0) {
+            Some(SqliteValue::Integer(count)) => *count,
+            other => panic!("expected one INTEGER count, got {other:?}"),
+        },
+        other => panic!("expected one count row, got {other:?}"),
+    }
+}
+
 #[test]
-fn bd_iuvw4_track_i_retained_autocommit_reduces_flush_overhead() {
+fn bd_iuvw4_track_i_each_success_is_immediately_visible() {
     asupersync::test_utils::run_test(|| async {
         let _guard = TRACK_I_E2E_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
         let temp = tempdir().expect("tempdir");
-        let fsqlite_db = temp.path().join("track_i_retained_autocommit.db");
+        let fsqlite_db = temp.path().join("track_i_immediate_visibility.db");
 
         let conn = open_fsqlite(&fsqlite_db).await;
         assert!(
             conn.is_concurrent_mode_default(),
             "Track I tests must keep concurrent_mode_default enabled"
         );
+        conn.execute("PRAGMA fsqlite.concurrent_mode = OFF")
+            .await
+            .expect("select serialized pager path");
 
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
             .await
             .expect("create table");
-
-        const INSERT_COUNT: i64 = 100;
-
-        let (_result, profile) = capture_hot_path_metrics(|| async {
-            for rowid in 1..=INSERT_COUNT {
-                conn.execute(&format!("INSERT INTO t VALUES ({rowid}, 'v{rowid}')"))
-                    .await
-                    .expect("autocommit insert");
-            }
-        })
-        .await;
-
-        // With retained autocommit, we should see reuse instead of full begin/commit per statement.
-        // The exact number depends on flush intervals, but we expect significantly fewer flushes
-        // than INSERT_COUNT.
-        let flush_count = profile.retained_autocommit_flushes;
-        let reuse_count = profile.retained_autocommit_reuses;
-
-        // Verify correctness: all rows should be queryable
-        let rows = conn
-            .query("SELECT COUNT(*) FROM t")
+        let fsqlite_journal_mode = conn
+            .query("PRAGMA journal_mode")
             .await
-            .expect("count query")
-            .into_iter()
-            .map(|row| match row.get(0) {
-                Some(SqliteValue::Integer(count)) => *count,
-                other => panic!("expected INTEGER count, got {other:?}"),
-            })
-            .next()
-            .expect("count result");
-        assert_eq!(rows, INSERT_COUNT, "all rows should be persisted");
-
-        eprintln!(
-            "INFO bead_id={BEAD_ID} scenario=RETAINED-AUTOCOMMIT-100 inserts={} flushes={} reuses={} parks={} replay_command={REPLAY_COMMAND}",
-            INSERT_COUNT, flush_count, reuse_count, profile.retained_autocommit_parks,
+            .expect("read fsqlite journal mode");
+        assert_eq!(
+            fsqlite_journal_mode[0].get(0),
+            Some(&SqliteValue::Text("wal".into())),
+            "FrankenSQLite writer must report WAL mode"
+        );
+        let live_c_observer = open_sqlite(&fsqlite_db);
+        let c_journal_mode: String = live_c_observer
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("read C SQLite journal mode");
+        assert_eq!(
+            c_journal_mode.to_ascii_lowercase(),
+            "wal",
+            "C SQLite observer must report WAL mode"
         );
 
-        // If retained autocommit is working, flushes should be much less than INSERT_COUNT
-        // Allow up to INSERT_COUNT for systems where retained autocommit may not be active
-        assert!(
-            flush_count <= INSERT_COUNT as u64,
-            "flush count should not exceed insert count: flushes={flush_count}"
+        const INSERT_COUNT: i64 = 100;
+        let mut fsqlite_observer = None;
+
+        for rowid in 1..=INSERT_COUNT {
+            conn.execute(&format!("INSERT INTO t VALUES ({rowid}, 'v{rowid}')"))
+                .await
+                .expect("autocommit insert");
+
+            if fsqlite_observer.is_none() {
+                fsqlite_observer = Some(open_fsqlite(&fsqlite_db).await);
+            }
+            let visible_count =
+                fsqlite_count(fsqlite_observer.as_ref().unwrap(), "SELECT COUNT(*) FROM t").await;
+            assert_eq!(
+                visible_count, rowid,
+                "successful autocommit INSERT must be visible to another FrankenSQLite connection before returning"
+            );
+
+            if rowid == 1 {
+                let live_c_count = live_c_observer
+                    .query_row("SELECT COUNT(*) FROM t", [], |row| row.get::<_, i64>(0));
+                eprintln!(
+                    "INFO bead_id={BEAD_ID} scenario=AUTOCOMMIT-VISIBILITY-BOUNDARY boundary=live_c_reader fsqlite_journal_mode=wal c_journal_mode={c_journal_mode} result={live_c_count:?}"
+                );
+
+                fsqlite_observer
+                    .take()
+                    .expect("fresh FrankenSQLite observer")
+                    .close()
+                    .await
+                    .expect("close fresh FrankenSQLite observer before checkpoint");
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .await
+                    .expect("checkpoint committed row");
+                let post_checkpoint_count: i64 = live_c_observer
+                    .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+                    .expect("C SQLite count after FrankenSQLite checkpoint");
+                eprintln!(
+                    "INFO bead_id={BEAD_ID} scenario=AUTOCOMMIT-VISIBILITY-BOUNDARY boundary=post_checkpoint_c_reader count={post_checkpoint_count}"
+                );
+                assert_eq!(
+                    post_checkpoint_count, 1,
+                    "C SQLite must see the committed row after an explicit FrankenSQLite checkpoint"
+                );
+            }
+        }
+
+        fsqlite_observer
+            .take()
+            .expect("FrankenSQLite observer")
+            .close()
+            .await
+            .expect("close FrankenSQLite observer");
+        drop(live_c_observer);
+        conn.close().await.expect("close FrankenSQLite writer");
+
+        let post_close_c_observer = open_sqlite(&fsqlite_db);
+        let post_close_count: i64 = post_close_c_observer
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .expect("C SQLite count after FrankenSQLite close");
+        eprintln!(
+            "INFO bead_id={BEAD_ID} scenario=AUTOCOMMIT-VISIBILITY-BOUNDARY boundary=post_close_c_reader count={post_close_count}"
+        );
+        assert_eq!(
+            post_close_count, INSERT_COUNT,
+            "C SQLite must see every committed row after the FrankenSQLite writer closes"
+        );
+
+        eprintln!(
+            "INFO bead_id={BEAD_ID} scenario=IMMEDIATE-AUTOCOMMIT-VISIBILITY inserts={INSERT_COUNT} replay_command={REPLAY_COMMAND}",
         );
     });
 }
@@ -197,7 +258,7 @@ fn bd_iuvw4_track_i_read_after_write_returns_correct_data() {
 }
 
 #[test]
-fn bd_iuvw4_track_i_connection_close_flushes_pending_writes() {
+fn bd_iuvw4_track_i_connection_close_preserves_committed_writes() {
     asupersync::test_utils::run_test(|| async {
         let _guard = TRACK_I_E2E_LOCK
             .lock()
@@ -220,7 +281,14 @@ fn bd_iuvw4_track_i_connection_close_flushes_pending_writes() {
                     .await
                     .expect("insert");
             }
-            // Connection drops here - should flush all pending writes
+            let observer = open_sqlite(&fsqlite_db);
+            let count: i64 = observer
+                .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+                .expect("observe rows before writer close");
+            assert_eq!(
+                count, INSERT_COUNT,
+                "all successful writes must already be committed before close"
+            );
         }
 
         // Second connection: verify all rows are visible
@@ -245,7 +313,7 @@ fn bd_iuvw4_track_i_connection_close_flushes_pending_writes() {
         }
 
         eprintln!(
-            "INFO bead_id={BEAD_ID} scenario=CLOSE-FLUSH inserts={INSERT_COUNT} replay_command={REPLAY_COMMAND}"
+            "INFO bead_id={BEAD_ID} scenario=CLOSE-REOPEN-DURABILITY inserts={INSERT_COUNT} replay_command={REPLAY_COMMAND}"
         );
     });
 }
@@ -323,14 +391,18 @@ fn bd_iuvw4_track_i_autocommit_10k_throughput_with_oracle() {
 
         assert_eq!(fsqlite_count, INSERT_COUNT, "fsqlite row count mismatch");
         assert_eq!(sqlite_count, INSERT_COUNT, "sqlite row count mismatch");
+        assert_eq!(
+            profile.prepared_direct_insert_autocommit_executions, INSERT_COUNT as u64,
+            "benchmark freshness: every measured FrankenSQLite INSERT must increment the direct autocommit execution counter"
+        );
 
         eprintln!(
-            "INFO bead_id={BEAD_ID} scenario=AUTOCOMMIT-10K inserts={} fsqlite_rows_per_sec={:.1} sqlite_rows_per_sec={:.1} flushes={} reuses={} replay_command={REPLAY_COMMAND}",
+            "INFO bead_id={BEAD_ID} scenario=AUTOCOMMIT-10K inserts={} fsqlite_rows_per_sec={:.1} sqlite_rows_per_sec={:.1} direct_autocommit_execs={} commit_roundtrip_ns={} replay_command={REPLAY_COMMAND}",
             INSERT_COUNT,
             rows_per_sec(INSERT_COUNT, fsqlite_elapsed),
             rows_per_sec(INSERT_COUNT, sqlite_elapsed),
-            profile.retained_autocommit_flushes,
-            profile.retained_autocommit_reuses,
+            profile.prepared_direct_insert_autocommit_executions,
+            profile.commit_txn_roundtrip_time_ns,
         );
     });
 }
@@ -399,14 +471,16 @@ fn bd_iuvw4_track_i_interleaved_read_write_correctness() {
             .expect("final count result");
 
         assert_eq!(final_count, CYCLE_COUNT, "final count mismatch");
+        assert_eq!(
+            profile.prepared_direct_insert_autocommit_executions, CYCLE_COUNT as u64,
+            "profile freshness: every interleaved INSERT must increment the direct autocommit execution counter"
+        );
 
         eprintln!(
-            "INFO bead_id={BEAD_ID} scenario=INTERLEAVED cycles={} flushes={} read_after_write_flushes={} overlay_hits={} overlay_misses={} replay_command={REPLAY_COMMAND}",
+            "INFO bead_id={BEAD_ID} scenario=INTERLEAVED cycles={} direct_autocommit_execs={} commit_roundtrip_ns={} replay_command={REPLAY_COMMAND}",
             CYCLE_COUNT,
-            profile.retained_autocommit_flushes,
-            profile.retained_autocommit_read_after_write_flushes,
-            profile.retained_autocommit_overlay_hits,
-            profile.retained_autocommit_overlay_misses,
+            profile.prepared_direct_insert_autocommit_executions,
+            profile.commit_txn_roundtrip_time_ns,
         );
     });
 }

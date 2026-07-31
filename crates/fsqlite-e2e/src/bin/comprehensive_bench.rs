@@ -33,6 +33,8 @@ use rand::SeedableRng as _;
 use rand::rngs::StdRng;
 #[cfg(feature = "bridge-experiment")]
 use rand::seq::SliceRandom as _;
+#[cfg(feature = "bridge-experiment")]
+use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tracing_subscriber::prelude::*;
@@ -66,7 +68,7 @@ const CONCURRENT_WRITERS_SECTION_TITLE: &str =
     "Concurrent Writers — C SQLite WAL vs FrankenSQLite MVCC";
 const DEFAULT_BENCH_PAGE_SIZE_BYTES: u32 = 4096;
 #[cfg(feature = "bridge-experiment")]
-const BRIDGE_REPORT_SCHEMA_V2: &str = "fsqlite-e2e.bridge-experiment.v2";
+const BRIDGE_REPORT_SCHEMA_V3: &str = "fsqlite-e2e.bridge-experiment.v3";
 #[cfg(feature = "bridge-experiment")]
 const BRIDGE_INSERT_SQL: &str = "INSERT INTO bridge_probe(id, value) VALUES (?1, ?2)";
 #[cfg(feature = "bridge-experiment")]
@@ -528,12 +530,131 @@ fn collect_rusqlite_rows<P: rusqlite::Params>(
     stmt.query_map(params, move |row| {
         let mut values = Vec::with_capacity(col_count);
         for idx in 0..col_count {
-            let value = row.get(idx).unwrap_or(rusqlite::types::Value::Null);
+            let value = row.get(idx)?;
             values.push(value);
         }
         Ok(values)
     })?
     .collect::<Result<Vec<_>, _>>()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedQueryReceipt {
+    row_count: usize,
+    row_multiset_sha256: String,
+}
+
+fn append_normalized_value(bytes: &mut Vec<u8>, tag: u8, payload: &[u8]) {
+    bytes.push(tag);
+    bytes.extend_from_slice(
+        &u64::try_from(payload.len())
+            .expect("benchmark value length must fit u64")
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(payload);
+}
+
+fn normalized_rusqlite_row(row: &[rusqlite::types::Value]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(
+        &u64::try_from(row.len())
+            .expect("benchmark column count must fit u64")
+            .to_le_bytes(),
+    );
+    for value in row {
+        match value {
+            rusqlite::types::Value::Null => append_normalized_value(&mut bytes, b'n', &[]),
+            rusqlite::types::Value::Integer(value) => {
+                append_normalized_value(&mut bytes, b'i', &value.to_le_bytes());
+            }
+            rusqlite::types::Value::Real(value) => {
+                append_normalized_value(&mut bytes, b'r', &value.to_bits().to_le_bytes());
+            }
+            rusqlite::types::Value::Text(value) => {
+                append_normalized_value(&mut bytes, b't', value.as_bytes());
+            }
+            rusqlite::types::Value::Blob(value) => {
+                append_normalized_value(&mut bytes, b'b', value);
+            }
+        }
+    }
+    bytes
+}
+
+fn normalized_fsqlite_row(row: &fsqlite::Row) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(
+        &u64::try_from(row.values().len())
+            .expect("benchmark column count must fit u64")
+            .to_le_bytes(),
+    );
+    for value in row.values() {
+        match value {
+            fsqlite::SqliteValue::Null => append_normalized_value(&mut bytes, b'n', &[]),
+            fsqlite::SqliteValue::Integer(value) => {
+                append_normalized_value(&mut bytes, b'i', &value.to_le_bytes());
+            }
+            fsqlite::SqliteValue::Float(value) => {
+                append_normalized_value(&mut bytes, b'r', &value.to_bits().to_le_bytes());
+            }
+            fsqlite::SqliteValue::Text(value) => {
+                append_normalized_value(&mut bytes, b't', value.as_bytes());
+            }
+            fsqlite::SqliteValue::Blob(value) => {
+                append_normalized_value(&mut bytes, b'b', value);
+            }
+        }
+    }
+    bytes
+}
+
+fn normalized_query_receipt(mut rows: Vec<Vec<u8>>) -> NormalizedQueryReceipt {
+    rows.sort_unstable();
+    let row_count = rows.len();
+    let mut hasher = Sha256::new();
+    hasher.update(
+        u64::try_from(row_count)
+            .expect("benchmark row count must fit u64")
+            .to_le_bytes(),
+    );
+    for row in rows {
+        hasher.update(
+            u64::try_from(row.len())
+                .expect("normalized benchmark row length must fit u64")
+                .to_le_bytes(),
+        );
+        hasher.update(row);
+    }
+    NormalizedQueryReceipt {
+        row_count,
+        row_multiset_sha256: lowercase_hex(hasher.finalize().as_ref()),
+    }
+}
+
+fn normalized_rusqlite_receipt(rows: &[Vec<rusqlite::types::Value>]) -> NormalizedQueryReceipt {
+    normalized_query_receipt(
+        rows.iter()
+            .map(|row| normalized_rusqlite_row(row))
+            .collect(),
+    )
+}
+
+fn normalized_fsqlite_receipt(rows: &[fsqlite::Row]) -> NormalizedQueryReceipt {
+    normalized_query_receipt(rows.iter().map(normalized_fsqlite_row).collect())
+}
+
+fn assert_cross_engine_query_receipt(
+    context: &str,
+    csqlite_rows: &[Vec<rusqlite::types::Value>],
+    fsqlite_rows: &[fsqlite::Row],
+) -> NormalizedQueryReceipt {
+    let csqlite = normalized_rusqlite_receipt(csqlite_rows);
+    let fsqlite = normalized_fsqlite_receipt(fsqlite_rows);
+    assert_eq!(
+        fsqlite, csqlite,
+        "{context}: FrankenSQLite and C SQLite returned different normalized row multisets"
+    );
+    csqlite
 }
 
 fn fsqlite_integer(row: &fsqlite::Row, column: usize, context: &str) -> i64 {
@@ -1144,6 +1265,7 @@ struct CliOptions {
     print_json_schema: bool,
     allow_unverified_provenance: bool,
     bridge_experiment: bool,
+    verify_bridge_report: Option<String>,
     bridge_samples: usize,
     bridge_operations: usize,
     bridge_seed: u64,
@@ -1344,13 +1466,15 @@ struct JsonBenchmarkProvenance {
 }
 
 #[cfg(feature = "bridge-experiment")]
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 enum BridgeArm {
     PerOperationBlockOn,
     #[serde(rename = "inside_existing_runtime")]
     SingleRuntimeEntry,
     WorkerSyncFacade,
+    AaInsideRuntimeBaseline,
+    AaInsideRuntimeReplicate,
 }
 
 #[cfg(feature = "bridge-experiment")]
@@ -1366,12 +1490,14 @@ impl BridgeArm {
             Self::PerOperationBlockOn => "per_operation_block_on",
             Self::SingleRuntimeEntry => "inside_existing_runtime",
             Self::WorkerSyncFacade => "worker_sync_facade",
+            Self::AaInsideRuntimeBaseline => "aa_inside_runtime_baseline",
+            Self::AaInsideRuntimeReplicate => "aa_inside_runtime_replicate",
         }
     }
 }
 
 #[cfg(feature = "bridge-experiment")]
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 enum BridgeWorkload {
     ReadyFuture,
@@ -1391,7 +1517,7 @@ impl BridgeWorkload {
 }
 
 #[cfg(feature = "bridge-experiment")]
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct JsonBridgeSample {
     workload: BridgeWorkload,
     operation_count: usize,
@@ -1407,10 +1533,34 @@ struct JsonBridgeSample {
     worker_commands_inside_timed_region: usize,
     worker_open_handshakes_total: usize,
     effective_settings: BTreeMap<String, String>,
+    exact_arm_route_receipt: JsonBridgeRouteReceipt,
     oracle_kind: String,
     checksum_count: i64,
     checksum_sum: i64,
     checksum_exact_rows: i64,
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+// Each boolean is an independently validated receipt field in the retained
+// schema; collapsing them would erase which route invariant was actually seen.
+#[allow(clippy::struct_excessive_bools)]
+struct JsonBridgeRouteReceipt {
+    scope: String,
+    exact_schema_sql_and_connection_state: bool,
+    same_prepared_object_as_timed_region: bool,
+    compat_trace_registration_state: String,
+    fused_entry_control_mode_state: String,
+    statement_debug_enabled: bool,
+    statement_reuse_info_enabled: bool,
+    profiler_enabled_during_probe: bool,
+    profiler_enabled_during_timing: bool,
+    expected_lane: String,
+    prepared_insert_fast_lane_hits: u64,
+    prepared_insert_instrumented_lane_hits: u64,
+    prepared_direct_insert_executions: u64,
+    verified: bool,
+    validation_errors: Vec<String>,
 }
 
 #[cfg(feature = "bridge-experiment")]
@@ -1471,8 +1621,26 @@ struct JsonBridgeConfig {
     warmup_policy: String,
     timed_region: String,
     arm_contracts: BTreeMap<String, String>,
+    aa_null_policy: String,
     affinity_policy: String,
     max_load_average_1m: Option<f64>,
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Serialize, PartialEq)]
+// These booleans are independent replay requirements consumed by the
+// fail-closed outer runner and must remain separately serialized.
+#[allow(clippy::struct_excessive_bools)]
+struct JsonBridgeReplayContract {
+    verifier_command: String,
+    outer_runner: String,
+    minimum_independent_seeds: usize,
+    primary_contrast_family_size: usize,
+    simultaneous_confidence_level: f64,
+    aa_null_required: bool,
+    external_watchdog_required: bool,
+    frozen_binary_receipt_required: bool,
+    manifest_must_be_written_last: bool,
 }
 
 #[cfg(feature = "bridge-experiment")]
@@ -1507,6 +1675,7 @@ struct JsonBridgeReport {
     host_state_checkpoints: Vec<JsonBridgeHostState>,
     host_state_after: JsonBridgeHostState,
     config: JsonBridgeConfig,
+    replay_contract: JsonBridgeReplayContract,
     raw_samples: Vec<JsonBridgeSample>,
     arm_statistics: Vec<JsonBridgeArmStats>,
     paired_comparisons: Vec<JsonBridgePairedComparison>,
@@ -4162,18 +4331,18 @@ fn bridge_json_schema() -> serde_json::Value {
     let environment = comprehensive["properties"]["environment"].clone();
     serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/bridge-experiment.v2.json",
+        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/bridge-experiment.v3.json",
         "title": "FrankenSQLite async bridge experiment report",
         "type": "object",
         "additionalProperties": false,
         "required": [
             "schema_version", "generated_at_utc", "provenance", "environment",
             "host_state_before", "host_state_checkpoints", "host_state_after",
-            "config", "raw_samples",
+            "config", "replay_contract", "raw_samples",
             "arm_statistics", "paired_comparisons", "ready_runtime_entry_regression"
         ],
         "properties": {
-            "schema_version": {"const": BRIDGE_REPORT_SCHEMA_V2},
+            "schema_version": {"const": BRIDGE_REPORT_SCHEMA_V3},
             "generated_at_utc": {"type": "string"},
             "provenance": {
                 "allOf": [
@@ -4200,6 +4369,7 @@ fn bridge_json_schema() -> serde_json::Value {
             },
             "host_state_after": {"$ref": "#/$defs/host_state"},
             "config": {"$ref": "#/$defs/config"},
+            "replay_contract": {"$ref": "#/$defs/replay_contract"},
             "raw_samples": {
                 "type": "array",
                 "minItems": 1,
@@ -4222,7 +4392,9 @@ fn bridge_json_schema() -> serde_json::Value {
                 "enum": [
                     "per_operation_block_on",
                     "inside_existing_runtime",
-                    "worker_sync_facade"
+                    "worker_sync_facade",
+                    "aa_inside_runtime_baseline",
+                    "aa_inside_runtime_replicate"
                 ]
             },
             "workload": {
@@ -4292,7 +4464,7 @@ fn bridge_json_schema() -> serde_json::Value {
                     "samples_per_arm", "raw_insert_operations",
                     "ready_operation_counts", "order_seed", "ordering_policy",
                     "warmup_policy", "timed_region", "arm_contracts",
-                    "affinity_policy", "max_load_average_1m"
+                    "aa_null_policy", "affinity_policy", "max_load_average_1m"
                 ],
                 "properties": {
                     "samples_per_arm": {
@@ -4316,14 +4488,19 @@ fn bridge_json_schema() -> serde_json::Value {
                         "required": [
                             "per_operation_block_on",
                             "inside_existing_runtime",
-                            "worker_sync_facade"
+                            "worker_sync_facade",
+                            "aa_inside_runtime_baseline",
+                            "aa_inside_runtime_replicate"
                         ],
                         "properties": {
                             "per_operation_block_on": {"type": "string"},
                             "inside_existing_runtime": {"type": "string"},
-                            "worker_sync_facade": {"type": "string"}
+                            "worker_sync_facade": {"type": "string"},
+                            "aa_inside_runtime_baseline": {"type": "string"},
+                            "aa_inside_runtime_replicate": {"type": "string"}
                         }
                     },
+                    "aa_null_policy": {"type": "string", "minLength": 1},
                     "affinity_policy": {"type": "string"},
                     "max_load_average_1m": {
                         "type": ["number", "null"],
@@ -4343,7 +4520,8 @@ fn bridge_json_schema() -> serde_json::Value {
                     "engine_dml_future_calls_inside_timed_region",
                     "worker_commands_total", "worker_commands_inside_timed_region",
                     "worker_open_handshakes_total", "effective_settings", "oracle_kind",
-                    "checksum_count", "checksum_sum", "checksum_exact_rows"
+                    "exact_arm_route_receipt", "checksum_count", "checksum_sum",
+                    "checksum_exact_rows"
                 ],
                 "properties": {
                     "workload": {"$ref": "#/$defs/workload"},
@@ -4351,7 +4529,7 @@ fn bridge_json_schema() -> serde_json::Value {
                     "block_index": {"type": "integer", "minimum": 0},
                     "order_slot": {"type": "integer", "minimum": 0},
                     "arm": {"$ref": "#/$defs/arm"},
-                    "elapsed_ns": {"type": "integer", "minimum": 0},
+                    "elapsed_ns": {"type": "integer", "minimum": 1},
                     "runtime_entries_total": {"type": "integer", "minimum": 0},
                     "runtime_entries_inside_timed_region": {
                         "type": "integer", "minimum": 0
@@ -4373,6 +4551,7 @@ fn bridge_json_schema() -> serde_json::Value {
                         "type": "object",
                         "additionalProperties": {"type": "string"}
                     },
+                    "exact_arm_route_receipt": {"$ref": "#/$defs/route_receipt"},
                     "oracle_kind": {"type": "string"},
                     "checksum_count": {"type": "integer"},
                     "checksum_sum": {"type": "integer"},
@@ -4403,6 +4582,67 @@ fn bridge_json_schema() -> serde_json::Value {
                         }
                     }
                 ]
+            },
+            "route_receipt": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "scope", "exact_schema_sql_and_connection_state",
+                    "same_prepared_object_as_timed_region",
+                    "compat_trace_registration_state",
+                    "fused_entry_control_mode_state", "statement_debug_enabled",
+                    "statement_reuse_info_enabled", "profiler_enabled_during_probe",
+                    "profiler_enabled_during_timing", "expected_lane",
+                    "prepared_insert_fast_lane_hits",
+                    "prepared_insert_instrumented_lane_hits",
+                    "prepared_direct_insert_executions", "verified",
+                    "validation_errors"
+                ],
+                "properties": {
+                    "scope": {"type": "string", "minLength": 1},
+                    "exact_schema_sql_and_connection_state": {"type": "boolean"},
+                    "same_prepared_object_as_timed_region": {"type": "boolean"},
+                    "compat_trace_registration_state": {"type": "string", "minLength": 1},
+                    "fused_entry_control_mode_state": {"type": "string", "minLength": 1},
+                    "statement_debug_enabled": {"type": "boolean"},
+                    "statement_reuse_info_enabled": {"type": "boolean"},
+                    "profiler_enabled_during_probe": {"type": "boolean"},
+                    "profiler_enabled_during_timing": {"type": "boolean"},
+                    "expected_lane": {"type": "string", "minLength": 1},
+                    "prepared_insert_fast_lane_hits": {"type": "integer", "minimum": 0},
+                    "prepared_insert_instrumented_lane_hits": {"type": "integer", "minimum": 0},
+                    "prepared_direct_insert_executions": {"type": "integer", "minimum": 0},
+                    "verified": {"type": "boolean"},
+                    "validation_errors": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1}
+                    }
+                }
+            },
+            "replay_contract": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "verifier_command", "outer_runner", "minimum_independent_seeds",
+                    "primary_contrast_family_size", "simultaneous_confidence_level",
+                    "aa_null_required", "external_watchdog_required",
+                    "frozen_binary_receipt_required", "manifest_must_be_written_last"
+                ],
+                "properties": {
+                    "verifier_command": {"type": "string", "minLength": 1},
+                    "outer_runner": {"type": "string", "minLength": 1},
+                    "minimum_independent_seeds": {"type": "integer", "minimum": 20},
+                    "primary_contrast_family_size": {"const": 6},
+                    "simultaneous_confidence_level": {
+                        "type": "number",
+                        "minimum": 0.991,
+                        "maximum": 0.992
+                    },
+                    "aa_null_required": {"const": true},
+                    "external_watchdog_required": {"const": true},
+                    "frozen_binary_receipt_required": {"const": true},
+                    "manifest_must_be_written_last": {"const": true}
+                }
             },
             "arm_statistics": {
                 "type": "object",
@@ -5248,6 +5488,9 @@ Flags:
   --bridge-experiment  Run the standalone three-arm async bridge experiment.
                        It remains diagnostic until isolated-cpuset/full-dynticks/IRQ
                        receipts are implemented; use --allow-unverified-provenance.
+  --verify-bridge-report <path>
+                       Fail closed unless a retained bridge report satisfies the
+                       v3 replay, route, A/A, sample-count, and oracle contracts.
   --bridge-samples <n> Samples per bridge arm; multiple of 48 and at least 48
                        (default: 96).
   --bridge-operations <n>
@@ -5269,6 +5512,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
         print_json_schema: false,
         allow_unverified_provenance: false,
         bridge_experiment: false,
+        verify_bridge_report: None,
         bridge_samples: 96,
         bridge_operations: 1_000,
         bridge_seed: 0x4653_514c_4954_4530,
@@ -5328,6 +5572,14 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
                 options.emit_html = false;
                 index += 1;
             }
+            "--verify-bridge-report" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "expected a path after --verify-bridge-report".to_owned())?;
+                options.verify_bridge_report = Some(value.clone());
+                options.emit_html = false;
+                index += 2;
+            }
             "--bridge-samples" => {
                 let value = args
                     .get(index + 1)
@@ -5374,6 +5626,20 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
                     .to_owned(),
             );
         }
+    }
+    if options.verify_bridge_report.is_some()
+        && (options.bridge_experiment
+            || options.quick
+            || options.filter.is_some()
+            || options.html_path.is_some()
+            || options.emit_timestamped_json
+            || options.json_out_path.is_some()
+            || options.json_stdout)
+    {
+        return Err(
+            "--verify-bridge-report cannot be combined with benchmark or report-output flags"
+                .to_owned(),
+        );
     }
 
     Ok(options)
@@ -8077,6 +8343,7 @@ mod tests {
                 print_json_schema: false,
                 allow_unverified_provenance: false,
                 bridge_experiment: false,
+                verify_bridge_report: None,
                 bridge_samples: 96,
                 bridge_operations: 1_000,
                 bridge_seed: 0x4653_514c_4954_4530,
@@ -8584,6 +8851,55 @@ mod tests {
     }
 
     #[test]
+    fn normalized_query_receipt_is_typed_and_order_independent() {
+        let first = vec![
+            vec![
+                rusqlite::types::Value::Integer(7),
+                rusqlite::types::Value::Text("seven".to_owned()),
+            ],
+            vec![
+                rusqlite::types::Value::Null,
+                rusqlite::types::Value::Blob(vec![0, 1, 2]),
+            ],
+        ];
+        let mut reversed = first.clone();
+        reversed.reverse();
+        assert_eq!(
+            normalized_rusqlite_receipt(&first),
+            normalized_rusqlite_receipt(&reversed),
+            "row ordering must not change the multiset receipt"
+        );
+
+        let typed_drift = vec![
+            vec![
+                rusqlite::types::Value::Real(7.0),
+                rusqlite::types::Value::Text("seven".to_owned()),
+            ],
+            first[1].clone(),
+        ];
+        assert_ne!(
+            normalized_rusqlite_receipt(&first).row_multiset_sha256,
+            normalized_rusqlite_receipt(&typed_drift).row_multiset_sha256,
+            "INTEGER and REAL values must not normalize to the same digest"
+        );
+        assert_eq!(normalized_rusqlite_receipt(&first).row_count, 2);
+    }
+
+    #[test]
+    fn collect_rusqlite_rows_propagates_column_decode_errors() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open C SQLite fixture");
+        let mut stmt = conn
+            .prepare("SELECT CAST(x'80' AS TEXT)")
+            .expect("prepare invalid-UTF-8 text fixture");
+        let error = collect_rusqlite_rows(&mut stmt, [])
+            .expect_err("invalid UTF-8 TEXT must not be silently rewritten as NULL");
+        assert!(
+            matches!(error, rusqlite::Error::Utf8Error(0, _)),
+            "unexpected invalid-text decode error: {error}"
+        );
+    }
+
+    #[test]
     fn ci_regression_gate_tracks_multithread_p95_ratio() {
         let mut report = BenchReport::new();
         let section = report.add_section(CONCURRENT_WRITERS_SECTION_TITLE, "test");
@@ -8952,6 +9268,28 @@ mod tests {
             } else {
                 bridge_expected_effective_settings()
             },
+            exact_arm_route_receipt: if workload == BridgeWorkload::ReadyFuture {
+                bridge_ready_route_receipt()
+            } else {
+                JsonBridgeRouteReceipt {
+                    scope: "test exact-arm route".to_owned(),
+                    exact_schema_sql_and_connection_state: true,
+                    same_prepared_object_as_timed_region: workload
+                        == BridgeWorkload::PreparedInsert,
+                    compat_trace_registration_state: "none_by_construction".to_owned(),
+                    fused_entry_control_mode_state: "auto_by_construction".to_owned(),
+                    statement_debug_enabled: false,
+                    statement_reuse_info_enabled: false,
+                    profiler_enabled_during_probe: true,
+                    profiler_enabled_during_timing: false,
+                    expected_lane: "prepared_insert_fast_lane".to_owned(),
+                    prepared_insert_fast_lane_hits: 1,
+                    prepared_insert_instrumented_lane_hits: 0,
+                    prepared_direct_insert_executions: 1,
+                    verified: true,
+                    validation_errors: Vec::new(),
+                }
+            },
             oracle_kind: "test_fixture".to_owned(),
             checksum_count: checksum.0,
             checksum_sum: checksum.1,
@@ -9005,7 +9343,7 @@ mod tests {
         bridge_provenance.validation_errors =
             vec!["test fixture models the diagnostic-only bridge contract".to_owned()];
         let report = JsonBridgeReport {
-            schema_version: BRIDGE_REPORT_SCHEMA_V2.to_owned(),
+            schema_version: BRIDGE_REPORT_SCHEMA_V3.to_owned(),
             generated_at_utc: "2026-07-26T00:00:01Z".to_owned(),
             provenance: bridge_provenance,
             environment: DetectedEnvironment {
@@ -9050,9 +9388,29 @@ mod tests {
                         BridgeArm::WorkerSyncFacade.id().to_owned(),
                         "test".to_owned(),
                     ),
+                    (
+                        BridgeArm::AaInsideRuntimeBaseline.id().to_owned(),
+                        "test".to_owned(),
+                    ),
+                    (
+                        BridgeArm::AaInsideRuntimeReplicate.id().to_owned(),
+                        "test".to_owned(),
+                    ),
                 ]),
+                aa_null_policy: "test".to_owned(),
                 affinity_policy: "test".to_owned(),
                 max_load_average_1m: Some(1.0),
+            },
+            replay_contract: JsonBridgeReplayContract {
+                verifier_command: "test".to_owned(),
+                outer_runner: "test".to_owned(),
+                minimum_independent_seeds: 20,
+                primary_contrast_family_size: 6,
+                simultaneous_confidence_level: 0.991_667,
+                aa_null_required: true,
+                external_watchdog_required: true,
+                frozen_binary_receipt_required: true,
+                manifest_must_be_written_last: true,
             },
             raw_samples: vec![sample],
             arm_statistics: vec![JsonBridgeArmStats {
@@ -9142,6 +9500,21 @@ mod tests {
         }
         assert!(bridge_two_arm_orders(99, &mut rng).is_err());
 
+        let aa_orders = bridge_aa_null_orders(48, &mut rng)
+            .expect("complete A/A complementary pairs should be valid");
+        for pair in aa_orders.chunks_exact(2) {
+            for order in pair {
+                assert_eq!(order[0], order[3]);
+                assert_eq!(order[1], order[2]);
+                assert_ne!(order[0], order[1]);
+                assert!(order.iter().all(|arm| matches!(
+                    arm,
+                    BridgeArm::AaInsideRuntimeBaseline | BridgeArm::AaInsideRuntimeReplicate
+                )));
+            }
+            assert_ne!(pair[0][0], pair[1][0]);
+        }
+
         let orders = bridge_three_arm_orders(6, &mut rng)
             .expect("two complete carryover cycles should be valid");
         let mut position_counts = BTreeMap::new();
@@ -9225,6 +9598,49 @@ mod tests {
         assert!(
             bridge_balanced_ready_count_orders(&operation_counts, 10, &mut rng).is_err(),
             "an incomplete Williams cycle must fail instead of silently biasing positions"
+        );
+    }
+
+    #[cfg(feature = "bridge-experiment")]
+    #[test]
+    fn bridge_verifier_schedule_replays_every_raw_sample_slot() {
+        let ready_operation_counts = [1_usize, 10, 100, 1_000];
+        let schedule =
+            bridge_verifier_expected_schedule(48, &ready_operation_counts, 100, 0x4653_514c)
+                .expect("canonical bridge schedule should be constructible");
+        assert_eq!(schedule.len(), 48 * 15);
+        assert_eq!(
+            schedule
+                .keys()
+                .filter(|(family, _, _)| *family == "ready")
+                .count(),
+            48 * 8
+        );
+        assert_eq!(
+            schedule
+                .keys()
+                .filter(|(family, _, _)| *family == "prepared")
+                .count(),
+            48 * 2
+        );
+        assert_eq!(
+            schedule
+                .keys()
+                .filter(|(family, _, _)| *family == "aa_raw")
+                .count(),
+            48 * 2
+        );
+        assert_eq!(
+            schedule
+                .keys()
+                .filter(|(family, _, _)| *family == "mechanism_raw")
+                .count(),
+            48 * 3
+        );
+        assert!(
+            schedule.iter().all(|((family, _, _), (operations, _))| {
+                *family == "ready" || *operations == 100
+            })
         );
     }
 
@@ -9457,7 +9873,14 @@ mod tests {
         assert_eq!(sample.worker_open_handshakes_total, 1);
         assert_eq!(
             sample.worker_commands_total,
-            bridge_pragmas().len() + 5 + 7 + 3
+            bridge_pragmas().len() + 5 + 9 + 3
+        );
+        assert!(sample.exact_arm_route_receipt.verified);
+        assert_eq!(
+            sample
+                .exact_arm_route_receipt
+                .prepared_insert_fast_lane_hits,
+            1
         );
         assert_eq!(sample.oracle_kind, "untimed_exact_id_value_domain_query");
         assert_eq!((sample.checksum_count, sample.checksum_sum), (3, 3));
@@ -10680,21 +11103,57 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
 
         // Scalar subquery in SELECT.
         eprint!("    Scalar subquery in SELECT... ");
-        let cs = {
-            let mut stmt = cs_conn.prepare(
-                "SELECT p.name, (SELECT c.name FROM categories c WHERE c.id = p.category_id) AS cat_name FROM products p LIMIT 100"
-            ).unwrap();
-            measure(&format!("cs_scalar_sub_{count}"), 100, || {
-                let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
-            })
+        const SCALAR_SUBQUERY_SQL: &str = "SELECT p.name, \
+             (SELECT c.name FROM categories c WHERE c.id = p.category_id) AS cat_name \
+             FROM products p LIMIT 100";
+        let scalar_csqlite_oracle = {
+            let mut stmt = cs_conn.prepare(SCALAR_SUBQUERY_SQL).unwrap();
+            collect_rusqlite_rows(&mut stmt, []).unwrap()
         };
-        let fs_stmt = fs_prepare(
-            &fs_conn,
-            "SELECT p.name, (SELECT c.name FROM categories c WHERE c.id = p.category_id) AS cat_name FROM products p LIMIT 100",
+        let scalar_fsqlite_stmt = fs_prepare(&fs_conn, SCALAR_SUBQUERY_SQL);
+        let scalar_fsqlite_oracle = fsqlite_e2e::block_on(scalar_fsqlite_stmt.query()).unwrap();
+        let scalar_receipt = assert_cross_engine_query_receipt(
+            "scalar-subquery benchmark oracle",
+            &scalar_csqlite_oracle,
+            &scalar_fsqlite_oracle,
         );
-        let fs = measure(&format!("fs_scalar_sub_{count}"), 100, || {
-            std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
-        });
+        assert_eq!(
+            scalar_receipt.row_count, 100,
+            "scalar-subquery benchmark must return its declared LIMIT cardinality"
+        );
+        let cs = {
+            let mut stmt = cs_conn.prepare(SCALAR_SUBQUERY_SQL).unwrap();
+            measure(
+                &format!("cs_scalar_sub_{count}"),
+                scalar_receipt.row_count,
+                || {
+                    let rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
+                    std::hint::black_box(rows);
+                },
+            )
+        };
+        let fs = measure(
+            &format!("fs_scalar_sub_{count}"),
+            scalar_receipt.row_count,
+            || {
+                let rows = fsqlite_e2e::block_on(scalar_fsqlite_stmt.query()).unwrap();
+                std::hint::black_box(rows);
+            },
+        );
+        let scalar_csqlite_postflight = {
+            let mut stmt = cs_conn.prepare(SCALAR_SUBQUERY_SQL).unwrap();
+            collect_rusqlite_rows(&mut stmt, []).unwrap()
+        };
+        let scalar_fsqlite_postflight = fsqlite_e2e::block_on(scalar_fsqlite_stmt.query()).unwrap();
+        assert_eq!(
+            assert_cross_engine_query_receipt(
+                "scalar-subquery benchmark postflight",
+                &scalar_csqlite_postflight,
+                &scalar_fsqlite_postflight,
+            ),
+            scalar_receipt,
+            "scalar-subquery result changed during measurement"
+        );
         eprintln!(
             "C={} F={}",
             format_duration(cs.median()),
@@ -10706,25 +11165,32 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
             Some(fs),
         );
 
-        // Parameter-varying EXISTS subquery. Varying the bound prevents a
-        // one-entry exact-result cache from turning this into a warmed-result
-        // lookup while C SQLite still executes the query.
-        eprint!("    EXISTS subquery (parameter-varying)... ");
+        // A unique, result-neutral nonce prevents an exact-result cache hit
+        // without changing the logical work from one measured invocation to
+        // the next. This matters because `measure` is duration-bounded: the
+        // two engines may retain different iteration counts, so varying the
+        // cardinality-producing threshold would compare different workload
+        // mixes.
+        eprint!("    EXISTS subquery (cache-busting fixed work)... ");
         let exists_sql = "SELECT COUNT(*) FROM products p WHERE EXISTS \
             (SELECT 1 FROM categories c \
-             WHERE c.id = p.category_id AND c.id <= ?1)";
+             WHERE c.id = p.category_id \
+             AND c.id <= ?1 + (?2 - ?2))";
         #[allow(clippy::cast_possible_wrap)]
         let cat_count_i64 = cat_count as i64;
         let oracle_threshold = cat_count_i64.min(5);
         let expected_exists: i64 = cs_conn
-            .query_row(exists_sql, rusqlite::params![oracle_threshold], |row| {
-                row.get(0)
-            })
+            .query_row(
+                exists_sql,
+                rusqlite::params![oracle_threshold, 0_i64],
+                |row| row.get(0),
+            )
             .unwrap();
         let exists_probe = fs_prepare(&fs_conn, exists_sql);
-        let actual_exists = fsqlite_e2e::block_on(
-            exists_probe.query_row_with_params(&[fsqlite::SqliteValue::Integer(oracle_threshold)]),
-        )
+        let actual_exists = fsqlite_e2e::block_on(exists_probe.query_row_with_params(&[
+            fsqlite::SqliteValue::Integer(oracle_threshold),
+            fsqlite::SqliteValue::Integer(0),
+        ]))
         .unwrap();
         assert_eq!(
             fsqlite_integer(&actual_exists, 0, "EXISTS oracle"),
@@ -10735,10 +11201,11 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
             let mut stmt = cs_conn.prepare(exists_sql).unwrap();
             let mut iteration = 0_i64;
             measure(&format!("cs_exists_{count}"), 1, || {
-                let threshold = 1 + iteration % cat_count_i64;
                 iteration += 1;
                 let value: i64 = stmt
-                    .query_row(rusqlite::params![threshold], |row| row.get(0))
+                    .query_row(rusqlite::params![oracle_threshold, iteration], |row| {
+                        row.get(0)
+                    })
                     .unwrap();
                 std::hint::black_box(value);
             })
@@ -10746,43 +11213,64 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
         let fs = {
             let stmt = fs_prepare(&fs_conn, exists_sql);
             let mut iteration = 0_i64;
-            measure(&format!("fs_exists_{count}"), 1, || {
-                let threshold = 1 + iteration % cat_count_i64;
+            let measurement = measure(&format!("fs_exists_{count}"), 1, || {
                 iteration += 1;
-                let row = fsqlite_e2e::block_on(
-                    stmt.query_row_with_params(&[fsqlite::SqliteValue::Integer(threshold)]),
-                )
+                let row = fsqlite_e2e::block_on(stmt.query_row_with_params(&[
+                    fsqlite::SqliteValue::Integer(oracle_threshold),
+                    fsqlite::SqliteValue::Integer(iteration),
+                ]))
                 .unwrap();
                 std::hint::black_box(fsqlite_integer(&row, 0, "EXISTS measurement"));
-            })
+            });
+            let postflight = fsqlite_e2e::block_on(stmt.query_row_with_params(&[
+                fsqlite::SqliteValue::Integer(oracle_threshold),
+                fsqlite::SqliteValue::Integer(iteration + 1),
+            ]))
+            .unwrap();
+            assert_eq!(
+                fsqlite_integer(&postflight, 0, "EXISTS postflight"),
+                expected_exists,
+                "FrankenSQLite EXISTS result changed during measurement"
+            );
+            measurement
         };
+        let csqlite_exists_postflight: i64 = cs_conn
+            .query_row(
+                exists_sql,
+                rusqlite::params![oracle_threshold, i64::MAX],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            csqlite_exists_postflight, expected_exists,
+            "C SQLite EXISTS result changed during measurement"
+        );
         eprintln!(
             "C={} F={}",
             format_duration(cs.median()),
             format_duration(fs.median())
         );
         section.add_row(
-            &format!("{count} rows / EXISTS subquery (parameter-varying)"),
+            &format!("{count} rows / EXISTS subquery (cache-busting fixed work)"),
             Some(cs),
             Some(fs),
         );
 
-        // Parameter-varying IN subquery. The previous constant `id <= 5`
-        // shape measured FrankenSQLite's warmed exact-result cache after the
-        // warmups, rather than general subquery execution (bd-czzlp).
-        eprint!("    IN subquery (parameter-varying)... ");
+        // Use the same cache-busting fixed-work contract for IN.
+        eprint!("    IN subquery (cache-busting fixed work)... ");
         let in_sql = "SELECT COUNT(*) FROM products \
             WHERE category_id IN \
-            (SELECT id FROM categories WHERE id <= ?1)";
+            (SELECT id FROM categories WHERE id <= ?1 + (?2 - ?2))";
         let expected_in: i64 = cs_conn
-            .query_row(in_sql, rusqlite::params![oracle_threshold], |row| {
+            .query_row(in_sql, rusqlite::params![oracle_threshold, 0_i64], |row| {
                 row.get(0)
             })
             .unwrap();
         let in_probe = fs_prepare(&fs_conn, in_sql);
-        let actual_in = fsqlite_e2e::block_on(
-            in_probe.query_row_with_params(&[fsqlite::SqliteValue::Integer(oracle_threshold)]),
-        )
+        let actual_in = fsqlite_e2e::block_on(in_probe.query_row_with_params(&[
+            fsqlite::SqliteValue::Integer(oracle_threshold),
+            fsqlite::SqliteValue::Integer(0),
+        ]))
         .unwrap();
         assert_eq!(
             fsqlite_integer(&actual_in, 0, "IN-subquery oracle"),
@@ -10793,10 +11281,11 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
             let mut stmt = cs_conn.prepare(in_sql).unwrap();
             let mut iteration = 0_i64;
             measure(&format!("cs_in_sub_{count}"), 1, || {
-                let threshold = 1 + iteration % cat_count_i64;
                 iteration += 1;
                 let value: i64 = stmt
-                    .query_row(rusqlite::params![threshold], |row| row.get(0))
+                    .query_row(rusqlite::params![oracle_threshold, iteration], |row| {
+                        row.get(0)
+                    })
                     .unwrap();
                 std::hint::black_box(value);
             })
@@ -10804,50 +11293,106 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
         let fs_stmt = fs_prepare(&fs_conn, in_sql);
         let mut fs_iteration = 0_i64;
         let fs = measure(&format!("fs_in_sub_{count}"), 1, || {
-            let threshold = 1 + fs_iteration % cat_count_i64;
             fs_iteration += 1;
-            let row = fsqlite_e2e::block_on(
-                fs_stmt.query_row_with_params(&[fsqlite::SqliteValue::Integer(threshold)]),
-            )
+            let row = fsqlite_e2e::block_on(fs_stmt.query_row_with_params(&[
+                fsqlite::SqliteValue::Integer(oracle_threshold),
+                fsqlite::SqliteValue::Integer(fs_iteration),
+            ]))
             .unwrap();
             std::hint::black_box(fsqlite_integer(&row, 0, "IN-subquery measurement"));
         });
+        let csqlite_in_postflight: i64 = cs_conn
+            .query_row(
+                in_sql,
+                rusqlite::params![oracle_threshold, i64::MAX],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let fsqlite_in_postflight = fsqlite_e2e::block_on(fs_stmt.query_row_with_params(&[
+            fsqlite::SqliteValue::Integer(oracle_threshold),
+            fsqlite::SqliteValue::Integer(fs_iteration + 1),
+        ]))
+        .unwrap();
+        assert_eq!(
+            csqlite_in_postflight, expected_in,
+            "C SQLite IN-subquery result changed during measurement"
+        );
+        assert_eq!(
+            fsqlite_integer(&fsqlite_in_postflight, 0, "IN-subquery postflight"),
+            expected_in,
+            "FrankenSQLite IN-subquery result changed during measurement"
+        );
         eprintln!(
             "C={} F={}",
             format_duration(cs.median()),
             format_duration(fs.median())
         );
         section.add_row(
-            &format!("{count} rows / IN subquery (parameter-varying)"),
+            &format!("{count} rows / IN subquery (cache-busting fixed work)"),
             Some(cs),
             Some(fs),
         );
 
         // CTE (non-recursive).
         eprint!("    CTE (non-recursive)... ");
+        const NON_RECURSIVE_CTE_SQL: &str = "WITH top_cats AS \
+             (SELECT category_id, SUM(price) AS total FROM products \
+              GROUP BY category_id ORDER BY total DESC LIMIT 5) \
+             SELECT p.name, p.price FROM products p \
+             JOIN top_cats tc ON p.category_id = tc.category_id";
+        let cte_csqlite_oracle = {
+            let mut stmt = cs_conn.prepare(NON_RECURSIVE_CTE_SQL).unwrap();
+            collect_rusqlite_rows(&mut stmt, []).unwrap()
+        };
+        let cte_fsqlite_stmt = fs_prepare(&fs_conn, NON_RECURSIVE_CTE_SQL);
+        let cte_fsqlite_oracle = fsqlite_e2e::block_on(cte_fsqlite_stmt.query()).unwrap();
+        let cte_receipt = assert_cross_engine_query_receipt(
+            "non-recursive CTE benchmark oracle",
+            &cte_csqlite_oracle,
+            &cte_fsqlite_oracle,
+        );
+        assert!(
+            cte_receipt.row_count > 0,
+            "non-recursive CTE benchmark must return at least one row"
+        );
         let cs = {
-            let mut stmt = cs_conn.prepare(
-                "WITH top_cats AS (SELECT category_id, SUM(price) AS total FROM products GROUP BY category_id ORDER BY total DESC LIMIT 5) \
-                 SELECT p.name, p.price FROM products p JOIN top_cats tc ON p.category_id = tc.category_id"
-            ).unwrap();
-            measure(&format!("cs_cte_{count}"), count, || {
-                let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
+            let mut stmt = cs_conn.prepare(NON_RECURSIVE_CTE_SQL).unwrap();
+            measure(&format!("cs_cte_{count}"), cte_receipt.row_count, || {
+                let rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
+                std::hint::black_box(rows);
             })
         };
-        let fs_stmt = fs_prepare(
-            &fs_conn,
-            "WITH top_cats AS (SELECT category_id, SUM(price) AS total FROM products GROUP BY category_id ORDER BY total DESC LIMIT 5) \
-             SELECT p.name, p.price FROM products p JOIN top_cats tc ON p.category_id = tc.category_id",
-        );
-        let fs = measure(&format!("fs_cte_{count}"), count, || {
-            std::hint::black_box(fsqlite_e2e::block_on(fs_stmt.query()).unwrap());
+        let fs = measure(&format!("fs_cte_{count}"), cte_receipt.row_count, || {
+            let rows = fsqlite_e2e::block_on(cte_fsqlite_stmt.query()).unwrap();
+            std::hint::black_box(rows);
         });
+        let cte_csqlite_postflight = {
+            let mut stmt = cs_conn.prepare(NON_RECURSIVE_CTE_SQL).unwrap();
+            collect_rusqlite_rows(&mut stmt, []).unwrap()
+        };
+        let cte_fsqlite_postflight = fsqlite_e2e::block_on(cte_fsqlite_stmt.query()).unwrap();
+        assert_eq!(
+            assert_cross_engine_query_receipt(
+                "non-recursive CTE benchmark postflight",
+                &cte_csqlite_postflight,
+                &cte_fsqlite_postflight,
+            ),
+            cte_receipt,
+            "non-recursive CTE result changed during measurement"
+        );
         eprintln!(
             "C={} F={}",
             format_duration(cs.median()),
             format_duration(fs.median())
         );
-        section.add_row(&format!("{count} rows / CTE + JOIN"), Some(cs), Some(fs));
+        section.add_row(
+            &format!(
+                "{count} input rows / CTE + JOIN ({} output rows)",
+                cte_receipt.row_count
+            ),
+            Some(cs),
+            Some(fs),
+        );
     }
 
     // This exact SUM shape is intentionally specialized by FrankenSQLite.
@@ -11784,6 +12329,124 @@ fn bridge_checksum_from_row(
 }
 
 #[cfg(feature = "bridge-experiment")]
+struct BridgeRouteProbeState {
+    profiler_previously_enabled: bool,
+    statement_debug_enabled: bool,
+    statement_reuse_info_enabled: bool,
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_begin_exact_route_probe() -> BridgeRouteProbeState {
+    let state = BridgeRouteProbeState {
+        profiler_previously_enabled: hot_path_profile_enabled(),
+        statement_debug_enabled: tracing::enabled!(
+            target: "fsqlite.statement",
+            tracing::Level::DEBUG
+        ),
+        statement_reuse_info_enabled: tracing::enabled!(
+            target: "fsqlite.statement_reuse",
+            tracing::Level::INFO
+        ),
+    };
+    reset_hot_path_profile();
+    set_hot_path_profile_enabled(true);
+    state
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_finish_exact_route_probe(
+    state: BridgeRouteProbeState,
+    workload: BridgeWorkload,
+    same_prepared_object_as_timed_region: bool,
+) -> JsonBridgeRouteReceipt {
+    let profile = hot_path_profile_snapshot();
+    set_hot_path_profile_enabled(state.profiler_previously_enabled);
+    reset_hot_path_profile();
+
+    let mut validation_errors = Vec::new();
+    if state.statement_debug_enabled {
+        validation_errors.push(
+            "fsqlite.statement DEBUG tracing was enabled during the exact-arm route probe"
+                .to_owned(),
+        );
+    }
+    if state.statement_reuse_info_enabled {
+        validation_errors.push(
+            "fsqlite.statement_reuse INFO tracing was enabled during the exact-arm route probe"
+                .to_owned(),
+        );
+    }
+    if state.profiler_previously_enabled {
+        validation_errors.push(
+            "hot-path profiling was already enabled and would instrument the timed region"
+                .to_owned(),
+        );
+    }
+    if profile.prepared_insert_fast_lane_hits != 1 {
+        validation_errors.push(format!(
+            "exact-arm route probe expected one prepared INSERT fast-lane hit, observed {}",
+            profile.prepared_insert_fast_lane_hits
+        ));
+    }
+    if profile.prepared_insert_instrumented_lane_hits != 0 {
+        validation_errors.push(format!(
+            "exact-arm route probe observed {} instrumented prepared INSERT hits",
+            profile.prepared_insert_instrumented_lane_hits
+        ));
+    }
+    if profile.prepared_direct_insert_executions != 1 {
+        validation_errors.push(format!(
+            "exact-arm route probe expected one prepared direct INSERT execution, observed {}",
+            profile.prepared_direct_insert_executions
+        ));
+    }
+
+    JsonBridgeRouteReceipt {
+        scope: format!(
+            "untimed sentinel on the exact {} schema, SQL, public API, transaction state, and connection immediately before warmup/timing",
+            workload.id()
+        ),
+        exact_schema_sql_and_connection_state: true,
+        same_prepared_object_as_timed_region,
+        compat_trace_registration_state: "none_by_construction_on_harness_owned_fresh_connection"
+            .to_owned(),
+        fused_entry_control_mode_state: "auto_by_construction_on_harness_owned_fresh_connection"
+            .to_owned(),
+        statement_debug_enabled: state.statement_debug_enabled,
+        statement_reuse_info_enabled: state.statement_reuse_info_enabled,
+        profiler_enabled_during_probe: true,
+        profiler_enabled_during_timing: state.profiler_previously_enabled,
+        expected_lane: "prepared_insert_fast_lane".to_owned(),
+        prepared_insert_fast_lane_hits: profile.prepared_insert_fast_lane_hits,
+        prepared_insert_instrumented_lane_hits: profile.prepared_insert_instrumented_lane_hits,
+        prepared_direct_insert_executions: profile.prepared_direct_insert_executions,
+        verified: validation_errors.is_empty(),
+        validation_errors,
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_ready_route_receipt() -> JsonBridgeRouteReceipt {
+    JsonBridgeRouteReceipt {
+        scope: "ready-future control has no SQL execution route".to_owned(),
+        exact_schema_sql_and_connection_state: true,
+        same_prepared_object_as_timed_region: true,
+        compat_trace_registration_state: "not_applicable".to_owned(),
+        fused_entry_control_mode_state: "not_applicable".to_owned(),
+        statement_debug_enabled: false,
+        statement_reuse_info_enabled: false,
+        profiler_enabled_during_probe: false,
+        profiler_enabled_during_timing: false,
+        expected_lane: "ready_future_control".to_owned(),
+        prepared_insert_fast_lane_hits: 0,
+        prepared_insert_instrumented_lane_hits: 0,
+        prepared_direct_insert_executions: 0,
+        verified: true,
+        validation_errors: Vec::new(),
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
 fn bridge_sample_ready_per_operation(
     operation_count: usize,
     block_index: usize,
@@ -11830,6 +12493,7 @@ fn bridge_sample_ready_per_operation(
         worker_commands_inside_timed_region: 0,
         worker_open_handshakes_total: 0,
         effective_settings: BTreeMap::new(),
+        exact_arm_route_receipt: bridge_ready_route_receipt(),
         oracle_kind: "untimed_ready_sentinel_plus_control_flow_completion_count".to_owned(),
         checksum_count: completion_count,
         checksum_sum: 0,
@@ -11877,6 +12541,7 @@ fn bridge_sample_ready_single_runtime(
         worker_commands_inside_timed_region: 0,
         worker_open_handshakes_total: 0,
         effective_settings: BTreeMap::new(),
+        exact_arm_route_receipt: bridge_ready_route_receipt(),
         oracle_kind: "untimed_ready_sentinel_plus_control_flow_completion_count".to_owned(),
         checksum_count: completion_count,
         checksum_sum: 0,
@@ -11921,11 +12586,38 @@ fn bridge_sample_insert_per_operation(
         "per-operation arm begin",
     )?;
 
-    let (elapsed, affected_total) = match workload {
+    let (elapsed, affected_total, exact_arm_route_receipt) = match workload {
         BridgeWorkload::PreparedInsert => {
             let statement = bridge_result(
                 bridge_block_on(&mut runtime_entries, conn.prepare(BRIDGE_INSERT_SQL)),
                 "per-operation arm prepare",
+            )?;
+            let route_state = bridge_begin_exact_route_probe();
+            let route_affected = bridge_block_on(
+                &mut runtime_entries,
+                statement.execute_with_params(&[
+                    fsqlite::SqliteValue::Integer(-2),
+                    fsqlite::SqliteValue::Integer(-2),
+                ]),
+            );
+            let exact_arm_route_receipt =
+                bridge_finish_exact_route_probe(route_state, workload, true);
+            let route_affected =
+                bridge_result(route_affected, "per-operation prepared exact-route probe")?;
+            bridge_verify_affected_rows(
+                route_affected,
+                "per-operation prepared exact-route probe",
+            )?;
+            let route_deleted = bridge_result(
+                bridge_block_on(
+                    &mut runtime_entries,
+                    conn.execute("DELETE FROM bridge_probe WHERE id = -2"),
+                ),
+                "per-operation prepared exact-route cleanup",
+            )?;
+            bridge_verify_affected_rows(
+                route_deleted,
+                "per-operation prepared exact-route cleanup",
             )?;
             let warm_affected = bridge_result(
                 bridge_block_on(
@@ -11963,9 +12655,33 @@ fn bridge_sample_insert_per_operation(
             }
             let elapsed = start.elapsed();
             drop(statement);
-            (elapsed, affected_total)
+            (elapsed, affected_total, exact_arm_route_receipt)
         }
         BridgeWorkload::RawExecuteWithParams => {
+            let route_state = bridge_begin_exact_route_probe();
+            let route_affected = bridge_block_on(
+                &mut runtime_entries,
+                conn.execute_with_params(
+                    BRIDGE_INSERT_SQL,
+                    &[
+                        fsqlite::SqliteValue::Integer(-2),
+                        fsqlite::SqliteValue::Integer(-2),
+                    ],
+                ),
+            );
+            let exact_arm_route_receipt =
+                bridge_finish_exact_route_probe(route_state, workload, false);
+            let route_affected =
+                bridge_result(route_affected, "per-operation raw exact-route probe")?;
+            bridge_verify_affected_rows(route_affected, "per-operation raw exact-route probe")?;
+            let route_deleted = bridge_result(
+                bridge_block_on(
+                    &mut runtime_entries,
+                    conn.execute("DELETE FROM bridge_probe WHERE id = -2"),
+                ),
+                "per-operation raw exact-route cleanup",
+            )?;
+            bridge_verify_affected_rows(route_deleted, "per-operation raw exact-route cleanup")?;
             let warm_affected = bridge_result(
                 bridge_block_on(
                     &mut runtime_entries,
@@ -12006,7 +12722,7 @@ fn bridge_sample_insert_per_operation(
                 )?;
                 affected_total = affected_total.saturating_add(affected);
             }
-            (start.elapsed(), affected_total)
+            (start.elapsed(), affected_total, exact_arm_route_receipt)
         }
         BridgeWorkload::ReadyFuture => unreachable!(),
     };
@@ -12059,6 +12775,7 @@ fn bridge_sample_insert_per_operation(
         worker_commands_inside_timed_region: 0,
         worker_open_handshakes_total: 0,
         effective_settings,
+        exact_arm_route_receipt,
         oracle_kind: "untimed_exact_id_value_domain_query".to_owned(),
         checksum_count: checksum.0,
         checksum_sum: checksum.1,
@@ -12080,7 +12797,8 @@ fn bridge_sample_insert_single_runtime(
     if workload == BridgeWorkload::ReadyFuture {
         return Err("ready-future workload is not an insert workload".to_owned());
     }
-    let (elapsed, checksum, effective_settings) = runtime.block_on(async {
+    let (elapsed, checksum, effective_settings, exact_arm_route_receipt) =
+        runtime.block_on(async {
         let conn = bridge_result(
             fsqlite::Connection::open(":memory:").await,
             "single-runtime arm open",
@@ -12124,11 +12842,34 @@ fn bridge_sample_insert_single_runtime(
         )?;
         bridge_result(conn.execute("BEGIN").await, "single-runtime arm begin")?;
 
-        let (elapsed, affected_total) = match workload {
+        let (elapsed, affected_total, exact_arm_route_receipt) = match workload {
             BridgeWorkload::PreparedInsert => {
                 let statement = bridge_result(
                     conn.prepare(BRIDGE_INSERT_SQL).await,
                     "single-runtime arm prepare",
+                )?;
+                let route_state = bridge_begin_exact_route_probe();
+                let route_affected = statement
+                    .execute_with_params(&[
+                        fsqlite::SqliteValue::Integer(-2),
+                        fsqlite::SqliteValue::Integer(-2),
+                    ])
+                    .await;
+                let exact_arm_route_receipt =
+                    bridge_finish_exact_route_probe(route_state, workload, true);
+                let route_affected =
+                    bridge_result(route_affected, "single-runtime prepared exact-route probe")?;
+                bridge_verify_affected_rows(
+                    route_affected,
+                    "single-runtime prepared exact-route probe",
+                )?;
+                let route_deleted = bridge_result(
+                    conn.execute("DELETE FROM bridge_probe WHERE id = -2").await,
+                    "single-runtime prepared exact-route cleanup",
+                )?;
+                bridge_verify_affected_rows(
+                    route_deleted,
+                    "single-runtime prepared exact-route cleanup",
                 )?;
                 let warm_affected = bridge_result(
                     statement
@@ -12165,9 +12906,35 @@ fn bridge_sample_insert_single_runtime(
                 }
                 let elapsed = start.elapsed();
                 drop(statement);
-                (elapsed, affected_total)
+                (elapsed, affected_total, exact_arm_route_receipt)
             }
             BridgeWorkload::RawExecuteWithParams => {
+                let route_state = bridge_begin_exact_route_probe();
+                let route_affected = conn
+                    .execute_with_params(
+                        BRIDGE_INSERT_SQL,
+                        &[
+                            fsqlite::SqliteValue::Integer(-2),
+                            fsqlite::SqliteValue::Integer(-2),
+                        ],
+                    )
+                    .await;
+                let exact_arm_route_receipt =
+                    bridge_finish_exact_route_probe(route_state, workload, false);
+                let route_affected =
+                    bridge_result(route_affected, "single-runtime raw exact-route probe")?;
+                bridge_verify_affected_rows(
+                    route_affected,
+                    "single-runtime raw exact-route probe",
+                )?;
+                let route_deleted = bridge_result(
+                    conn.execute("DELETE FROM bridge_probe WHERE id = -2").await,
+                    "single-runtime raw exact-route cleanup",
+                )?;
+                bridge_verify_affected_rows(
+                    route_deleted,
+                    "single-runtime raw exact-route cleanup",
+                )?;
                 let warm_affected = bridge_result(
                     conn.execute_with_params(
                         BRIDGE_INSERT_SQL,
@@ -12205,7 +12972,7 @@ fn bridge_sample_insert_single_runtime(
                     )?;
                     affected_total = affected_total.saturating_add(affected);
                 }
-                (start.elapsed(), affected_total)
+                (start.elapsed(), affected_total, exact_arm_route_receipt)
             }
             BridgeWorkload::ReadyFuture => unreachable!(),
         };
@@ -12231,8 +12998,13 @@ fn bridge_sample_insert_single_runtime(
         let checksum =
             bridge_checksum_from_row(&checksum_row, operation_count, "single-runtime checksum")?;
         bridge_result(conn.close().await, "single-runtime arm close")?;
-        Ok::<_, String>((elapsed, checksum, effective_settings))
-    })?;
+        Ok::<_, String>((
+            elapsed,
+            checksum,
+            effective_settings,
+            exact_arm_route_receipt,
+        ))
+        })?;
 
     Ok(JsonBridgeSample {
         workload,
@@ -12249,6 +13021,7 @@ fn bridge_sample_insert_single_runtime(
         worker_commands_inside_timed_region: 0,
         worker_open_handshakes_total: 0,
         effective_settings,
+        exact_arm_route_receipt,
         oracle_kind: "untimed_exact_id_value_domain_query".to_owned(),
         checksum_count: checksum.0,
         checksum_sum: checksum.1,
@@ -12315,6 +13088,30 @@ fn bridge_sample_insert_worker(
     bridge_worker_command(&mut worker_commands, result, "worker arm create schema")?;
     let result = conn.begin_transaction_sync();
     bridge_worker_command(&mut worker_commands, result, "worker arm begin")?;
+
+    let route_state = bridge_begin_exact_route_probe();
+    let route_result = conn.execute_with_params_sync(
+        BRIDGE_INSERT_SQL,
+        &[
+            fsqlite::SqliteValue::Integer(-2),
+            fsqlite::SqliteValue::Integer(-2),
+        ],
+    );
+    let exact_arm_route_receipt =
+        bridge_finish_exact_route_probe(route_state, BridgeWorkload::RawExecuteWithParams, false);
+    let route_affected = bridge_worker_command(
+        &mut worker_commands,
+        route_result,
+        "worker raw exact-route probe",
+    )?;
+    bridge_verify_affected_rows(route_affected, "worker raw exact-route probe")?;
+    let route_result = conn.execute_sync("DELETE FROM bridge_probe WHERE id = -2");
+    let route_deleted = bridge_worker_command(
+        &mut worker_commands,
+        route_result,
+        "worker raw exact-route cleanup",
+    )?;
+    bridge_verify_affected_rows(route_deleted, "worker raw exact-route cleanup")?;
 
     let result = conn.execute_with_params_sync(
         BRIDGE_INSERT_SQL,
@@ -12385,6 +13182,7 @@ fn bridge_sample_insert_worker(
         worker_commands_inside_timed_region: timed_worker_commands,
         worker_open_handshakes_total: 1,
         effective_settings,
+        exact_arm_route_receipt,
         oracle_kind: "untimed_exact_id_value_domain_query".to_owned(),
         checksum_count: checksum.0,
         checksum_sum: checksum.1,
@@ -12635,7 +13433,9 @@ fn bridge_ready_regression(
         match sample.arm {
             BridgeArm::PerOperationBlockOn => pair.0.push(sample.elapsed_ns as f64),
             BridgeArm::SingleRuntimeEntry => pair.1.push(sample.elapsed_ns as f64),
-            BridgeArm::WorkerSyncFacade => {
+            BridgeArm::WorkerSyncFacade
+            | BridgeArm::AaInsideRuntimeBaseline
+            | BridgeArm::AaInsideRuntimeReplicate => {
                 return Err("ready-future control unexpectedly contains worker samples".to_owned());
             }
         }
@@ -12728,23 +13528,41 @@ fn bridge_two_arm_orders(
     block_count: usize,
     rng: &mut StdRng,
 ) -> Result<Vec<[BridgeArm; 4]>, String> {
+    bridge_complementary_two_arm_orders(
+        block_count,
+        rng,
+        BridgeArm::PerOperationBlockOn,
+        BridgeArm::SingleRuntimeEntry,
+    )
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_aa_null_orders(
+    block_count: usize,
+    rng: &mut StdRng,
+) -> Result<Vec<[BridgeArm; 4]>, String> {
+    bridge_complementary_two_arm_orders(
+        block_count,
+        rng,
+        BridgeArm::AaInsideRuntimeBaseline,
+        BridgeArm::AaInsideRuntimeReplicate,
+    )
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_complementary_two_arm_orders(
+    block_count: usize,
+    rng: &mut StdRng,
+    first_arm: BridgeArm,
+    second_arm: BridgeArm,
+) -> Result<Vec<[BridgeArm; 4]>, String> {
     if block_count == 0 || block_count % 2 != 0 {
         return Err(format!(
             "two-arm ordering requires complete complementary ABBA/BAAB block pairs, got {block_count} blocks"
         ));
     }
-    let abba = [
-        BridgeArm::PerOperationBlockOn,
-        BridgeArm::SingleRuntimeEntry,
-        BridgeArm::SingleRuntimeEntry,
-        BridgeArm::PerOperationBlockOn,
-    ];
-    let baab = [
-        BridgeArm::SingleRuntimeEntry,
-        BridgeArm::PerOperationBlockOn,
-        BridgeArm::PerOperationBlockOn,
-        BridgeArm::SingleRuntimeEntry,
-    ];
+    let abba = [first_arm, second_arm, second_arm, first_arm];
+    let baab = [second_arm, first_arm, first_arm, second_arm];
     let mut orders = Vec::with_capacity(block_count);
     while orders.len() < block_count {
         if rng.random::<bool>() {
@@ -12842,9 +13660,9 @@ fn bridge_collect_samples(
         .len()
         .saturating_mul(options.bridge_samples)
         .saturating_mul(2)
-        .saturating_add(options.bridge_samples.saturating_mul(5));
+        .saturating_add(options.bridge_samples.saturating_mul(7));
     let mut samples = Vec::with_capacity(estimated);
-    let mut host_state_checkpoints = Vec::with_capacity(block_count.saturating_mul(3));
+    let mut host_state_checkpoints = Vec::with_capacity(block_count.saturating_mul(4));
 
     eprintln!(
         "bridge ready-future control: operations={ready_operation_counts:?}, samples/arm/count={}",
@@ -12867,7 +13685,9 @@ fn bridge_collect_samples(
                         block_index,
                         order_slot,
                     )?,
-                    BridgeArm::WorkerSyncFacade => unreachable!(),
+                    BridgeArm::WorkerSyncFacade
+                    | BridgeArm::AaInsideRuntimeBaseline
+                    | BridgeArm::AaInsideRuntimeReplicate => unreachable!(),
                 };
                 samples.push(sample);
             }
@@ -12896,8 +13716,37 @@ fn bridge_collect_samples(
                     block_index,
                     order_slot,
                 )?,
-                BridgeArm::WorkerSyncFacade => unreachable!(),
+                BridgeArm::WorkerSyncFacade
+                | BridgeArm::AaInsideRuntimeBaseline
+                | BridgeArm::AaInsideRuntimeReplicate => unreachable!(),
             };
+            samples.push(sample);
+        }
+        host_state_checkpoints.push(capture_bridge_host_state());
+    }
+
+    eprintln!(
+        "bridge A/A null control: operations={}, samples/arm={}",
+        options.bridge_operations, options.bridge_samples
+    );
+    let aa_null_orders = bridge_aa_null_orders(block_count, &mut rng)?;
+    for (block_index, order) in aa_null_orders.iter().copied().enumerate() {
+        for (order_slot, arm) in order.into_iter().enumerate() {
+            let mut sample = bridge_sample_insert_single_runtime(
+                runtime,
+                BridgeWorkload::RawExecuteWithParams,
+                options.bridge_operations,
+                block_index,
+                order_slot,
+            )?;
+            match arm {
+                BridgeArm::AaInsideRuntimeBaseline | BridgeArm::AaInsideRuntimeReplicate => {
+                    sample.arm = arm;
+                }
+                BridgeArm::PerOperationBlockOn
+                | BridgeArm::SingleRuntimeEntry
+                | BridgeArm::WorkerSyncFacade => unreachable!(),
+            }
             samples.push(sample);
         }
         host_state_checkpoints.push(capture_bridge_host_state());
@@ -12927,6 +13776,9 @@ fn bridge_collect_samples(
                 BridgeArm::WorkerSyncFacade => {
                     bridge_sample_insert_worker(options.bridge_operations, block_index, order_slot)?
                 }
+                BridgeArm::AaInsideRuntimeBaseline | BridgeArm::AaInsideRuntimeReplicate => {
+                    unreachable!()
+                }
             };
             samples.push(sample);
         }
@@ -12934,6 +13786,111 @@ fn bridge_collect_samples(
     }
 
     Ok((samples, host_state_checkpoints))
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_sample_contract_errors(
+    samples: &[JsonBridgeSample],
+    options: &CliOptions,
+    ready_operation_counts: &[usize],
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut counts: BTreeMap<(BridgeWorkload, BridgeArm), usize> = BTreeMap::new();
+    for sample in samples {
+        *counts.entry((sample.workload, sample.arm)).or_default() += 1;
+        if sample.elapsed_ns == 0 {
+            errors.push(format!(
+                "{} arm {} block {} slot {} recorded a zero-duration sample",
+                sample.workload.id(),
+                sample.arm.id(),
+                sample.block_index,
+                sample.order_slot
+            ));
+        }
+        if !sample.exact_arm_route_receipt.verified {
+            errors.push(format!(
+                "{} arm {} block {} slot {} failed exact-arm routing: {}",
+                sample.workload.id(),
+                sample.arm.id(),
+                sample.block_index,
+                sample.order_slot,
+                sample.exact_arm_route_receipt.validation_errors.join("; ")
+            ));
+        }
+        if sample
+            .exact_arm_route_receipt
+            .profiler_enabled_during_timing
+        {
+            errors.push(format!(
+                "{} arm {} block {} slot {} would profile the timed region",
+                sample.workload.id(),
+                sample.arm.id(),
+                sample.block_index,
+                sample.order_slot
+            ));
+        }
+        let expected_count = i64::try_from(sample.operation_count).unwrap_or(i64::MAX);
+        if sample.checksum_count != expected_count || sample.checksum_exact_rows != expected_count {
+            errors.push(format!(
+                "{} arm {} block {} slot {} has invalid completion/cardinality receipt",
+                sample.workload.id(),
+                sample.arm.id(),
+                sample.block_index,
+                sample.order_slot
+            ));
+        }
+    }
+
+    let ready_expected = options
+        .bridge_samples
+        .saturating_mul(ready_operation_counts.len());
+    for arm in [
+        BridgeArm::PerOperationBlockOn,
+        BridgeArm::SingleRuntimeEntry,
+    ] {
+        let actual = counts
+            .get(&(BridgeWorkload::ReadyFuture, arm))
+            .copied()
+            .unwrap_or(0);
+        if actual != ready_expected {
+            errors.push(format!(
+                "ready-future arm {} retained {actual} samples, expected {ready_expected}",
+                arm.id()
+            ));
+        }
+    }
+    for (workload, arms) in [
+        (
+            BridgeWorkload::PreparedInsert,
+            &[
+                BridgeArm::PerOperationBlockOn,
+                BridgeArm::SingleRuntimeEntry,
+            ][..],
+        ),
+        (
+            BridgeWorkload::RawExecuteWithParams,
+            &[
+                BridgeArm::PerOperationBlockOn,
+                BridgeArm::SingleRuntimeEntry,
+                BridgeArm::WorkerSyncFacade,
+                BridgeArm::AaInsideRuntimeBaseline,
+                BridgeArm::AaInsideRuntimeReplicate,
+            ][..],
+        ),
+    ] {
+        for &arm in arms {
+            let actual = counts.get(&(workload, arm)).copied().unwrap_or(0);
+            if actual != options.bridge_samples {
+                errors.push(format!(
+                    "{} arm {} retained {actual} samples, expected {}",
+                    workload.id(),
+                    arm.id(),
+                    options.bridge_samples
+                ));
+            }
+        }
+    }
+    errors
 }
 
 #[cfg(feature = "bridge-experiment")]
@@ -12964,6 +13921,15 @@ fn bridge_build_comparisons(
         BridgeArm::SingleRuntimeEntry,
         2,
         seed ^ 0x2000,
+    )?);
+    comparisons.push(bridge_paired_comparison(
+        samples,
+        BridgeWorkload::RawExecuteWithParams,
+        operation_count,
+        BridgeArm::AaInsideRuntimeReplicate,
+        BridgeArm::AaInsideRuntimeBaseline,
+        2,
+        seed ^ 0x2800,
     )?);
     for (index, (numerator, denominator)) in [
         (
@@ -13062,6 +14028,9 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
 
     let (samples, host_state_checkpoints) =
         bridge_collect_samples(&runtime, options, &ready_operation_counts)?;
+    for error in bridge_sample_contract_errors(&samples, options, &ready_operation_counts) {
+        provenance.add_validation_error(format!("bridge sample contract: {error}"));
+    }
     for (index, checkpoint) in host_state_checkpoints.iter().enumerate() {
         let phase = format!("measurement checkpoint {index}");
         bridge_validate_host_state(
@@ -13115,7 +14084,7 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
     }
 
     let report = JsonBridgeReport {
-        schema_version: BRIDGE_REPORT_SCHEMA_V2.to_owned(),
+        schema_version: BRIDGE_REPORT_SCHEMA_V3.to_owned(),
         generated_at_utc: chrono_stamp(),
         provenance,
         environment,
@@ -13128,10 +14097,10 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
             ready_operation_counts,
             order_seed: options.bridge_seed,
             ordering_policy:
-                "seeded balanced Latin/Williams order with reversed pairs for ready operation counts and full eight-block Williams-cycle bootstrap clusters at the fixed four-count matrix; randomized complementary ABBA/BAAB two-block clusters with two-block bootstrap resampling for retained-prepared two-arm self-carryover balance; complete randomized three-block rotation cycles with mirrored ABC-CBA sequences and three-block bootstrap clusters for exact three-arm position and within-block first-order carryover balance; transitions across complete design clusters are randomized but not asserted exactly balanced"
+                "seeded balanced Latin/Williams order with reversed pairs for ready operation counts and full eight-block Williams-cycle bootstrap clusters at the fixed four-count matrix; randomized complementary ABBA/BAAB two-block clusters with two-block bootstrap resampling for retained-prepared and A/A two-arm self-carryover balance; complete randomized three-block rotation cycles with mirrored ABC-CBA sequences and three-block bootstrap clusters for exact three-arm position and within-block first-order carryover balance; transitions across complete design clusters are randomized but not asserted exactly balanced"
                     .to_owned(),
             warmup_policy:
-                "thread-local runtime prewarmed once; every database sample warms its exact DML path before timing"
+                "thread-local runtime prewarmed once; every DML sample runs an untimed exact-arm routing sentinel, removes it, then warms its exact DML path before timing"
                     .to_owned(),
             timed_region:
                 "per-operation arm times N complete thread-local Runtime::block_on entries; existing-runtime arm times N awaits inside an already-entered runtime; worker arm times N complete public facade calls; open, PRAGMAs, schema, transaction begin/commit, checksum, and close excluded"
@@ -13152,11 +14121,36 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
                     "public AsyncConnection synchronous facade: each timed call clones SQL and parameters, allocates a response channel, crosses the worker channel, schedules the worker, and drives the engine future with futures-lite::block_on"
                     .to_owned(),
                 ),
+                (
+                    BridgeArm::AaInsideRuntimeBaseline.id().to_owned(),
+                    "first independently constructed database fixture using the exact inside-existing-runtime raw-DML implementation"
+                        .to_owned(),
+                ),
+                (
+                    BridgeArm::AaInsideRuntimeReplicate.id().to_owned(),
+                    "second independently constructed database fixture using the exact inside-existing-runtime raw-DML implementation"
+                        .to_owned(),
+                ),
             ]),
+            aa_null_policy:
+                "raw-DML A/A uses independent fixtures and complementary ABBA/BAAB clusters; the outer runner must reject a publication candidate whose preregistered null envelope is exceeded"
+                    .to_owned(),
             affinity_policy:
                 "expected affinity must exactly match /proc/self/status, select one or two distinct physical cores on one NUMA node, exclude SMT siblings, and preserve topology throughout the run"
                     .to_owned(),
             max_load_average_1m,
+        },
+        replay_contract: JsonBridgeReplayContract {
+            verifier_command:
+                "comprehensive-bench --verify-bridge-report <report.json>".to_owned(),
+            outer_runner: "scripts/run_gate0_async_bridge.sh".to_owned(),
+            minimum_independent_seeds: 20,
+            primary_contrast_family_size: 6,
+            simultaneous_confidence_level: 0.991_667,
+            aa_null_required: true,
+            external_watchdog_required: true,
+            frozen_binary_receipt_required: true,
+            manifest_must_be_written_last: true,
         },
         raw_samples: samples,
         arm_statistics: statistics,
@@ -13180,6 +14174,1113 @@ fn run_bridge_experiment(args: &[String], options: &CliOptions) -> Result<(), St
         print_json_report(&report);
     }
     Ok(())
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+// These booleans report distinct verifier conclusions and are intentionally
+// retained as independently machine-checkable fields.
+#[allow(clippy::struct_excessive_bools)]
+struct JsonBridgeVerificationReceipt {
+    schema_version: String,
+    report_path: String,
+    report_sha256: String,
+    report_size_bytes: u64,
+    validation_scope: String,
+    report_contract_verified: bool,
+    diagnostic_only: bool,
+    inner_provenance_citable: bool,
+    inner_provenance_status: String,
+    order_seed: u64,
+    samples_per_arm: usize,
+    raw_sample_count: usize,
+    exact_route_receipts_verified: usize,
+    sample_counts: BTreeMap<String, usize>,
+    exact_schedule_verified: bool,
+    paired_comparisons_verified: usize,
+    arm_statistics_recomputed: bool,
+    ready_regression_recomputed: bool,
+    aa_null_comparison_verified: bool,
+    replay_contract_verified: bool,
+    frozen_verifier_binary_sha256: String,
+}
+
+#[cfg(feature = "bridge-experiment")]
+type BridgeScheduleKey = (&'static str, usize, usize);
+
+#[cfg(feature = "bridge-experiment")]
+type BridgeScheduleValue = (usize, BridgeArm);
+
+#[cfg(feature = "bridge-experiment")]
+type BridgeSchedule = BTreeMap<BridgeScheduleKey, BridgeScheduleValue>;
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_verifier_object<'a>(
+    value: &'a serde_json::Value,
+    context: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, String> {
+    value
+        .as_object()
+        .ok_or_else(|| format!("{context} must be a JSON object"))
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_verifier_member<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<&'a serde_json::Value, String> {
+    object
+        .get(key)
+        .ok_or_else(|| format!("{context} is missing `{key}`"))
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_verifier_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<&'a str, String> {
+    bridge_verifier_member(object, key, context)?
+        .as_str()
+        .ok_or_else(|| format!("{context}.{key} must be a string"))
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_verifier_bool(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<bool, String> {
+    bridge_verifier_member(object, key, context)?
+        .as_bool()
+        .ok_or_else(|| format!("{context}.{key} must be a boolean"))
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_verifier_u64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<u64, String> {
+    bridge_verifier_member(object, key, context)?
+        .as_u64()
+        .ok_or_else(|| format!("{context}.{key} must be a non-negative integer"))
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_verifier_usize(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<usize, String> {
+    usize::try_from(bridge_verifier_u64(object, key, context)?)
+        .map_err(|_| format!("{context}.{key} exceeds usize::MAX"))
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_verifier_i64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<i64, String> {
+    bridge_verifier_member(object, key, context)?
+        .as_i64()
+        .ok_or_else(|| format!("{context}.{key} must be an i64 integer"))
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_verifier_array<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<&'a [serde_json::Value], String> {
+    bridge_verifier_member(object, key, context)?
+        .as_array()
+        .map(Vec::as_slice)
+        .ok_or_else(|| format!("{context}.{key} must be an array"))
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_verifier_exact_keys(
+    object: &serde_json::Map<String, serde_json::Value>,
+    expected: &[&str],
+    context: &str,
+) -> Result<(), String> {
+    let mut unexpected = object
+        .keys()
+        .filter(|key| !expected.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut missing = expected
+        .iter()
+        .filter(|key| !object.contains_key(**key))
+        .map(|key| (*key).to_owned())
+        .collect::<Vec<_>>();
+    unexpected.sort();
+    missing.sort();
+    if unexpected.is_empty() && missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{context} key set drifted; missing={missing:?}, unexpected={unexpected:?}"
+        ))
+    }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_verifier_require(
+    condition: bool,
+    message: impl FnOnce() -> String,
+) -> Result<(), String> {
+    if condition { Ok(()) } else { Err(message()) }
+}
+
+#[cfg(feature = "bridge-experiment")]
+fn bridge_verifier_expected_schedule(
+    samples_per_arm: usize,
+    ready_operation_counts: &[usize],
+    raw_insert_operations: usize,
+    seed: u64,
+) -> Result<BridgeSchedule, String> {
+    let block_count = samples_per_arm / 2;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut schedule = BTreeMap::new();
+    let mut insert = |family, block_index, order_slot, operation_count, arm| {
+        if schedule
+            .insert((family, block_index, order_slot), (operation_count, arm))
+            .is_some()
+        {
+            Err(format!(
+                "generated duplicate {family} schedule entry at block {block_index} slot {order_slot}"
+            ))
+        } else {
+            Ok(())
+        }
+    };
+
+    let ready_count_orders =
+        bridge_balanced_ready_count_orders(ready_operation_counts, block_count, &mut rng)?;
+    let ready_arm_orders = bridge_two_arm_orders(block_count, &mut rng)?;
+    for (block_index, count_order) in ready_count_orders.iter().enumerate() {
+        for (count_slot, &operation_count) in count_order.iter().enumerate() {
+            for (arm_slot, arm) in ready_arm_orders[block_index].into_iter().enumerate() {
+                insert(
+                    "ready",
+                    block_index,
+                    count_slot.saturating_mul(4).saturating_add(arm_slot),
+                    operation_count,
+                    arm,
+                )?;
+            }
+        }
+    }
+
+    for (block_index, order) in bridge_two_arm_orders(block_count, &mut rng)?
+        .into_iter()
+        .enumerate()
+    {
+        for (order_slot, arm) in order.into_iter().enumerate() {
+            insert(
+                "prepared",
+                block_index,
+                order_slot,
+                raw_insert_operations,
+                arm,
+            )?;
+        }
+    }
+    for (block_index, order) in bridge_aa_null_orders(block_count, &mut rng)?
+        .into_iter()
+        .enumerate()
+    {
+        for (order_slot, arm) in order.into_iter().enumerate() {
+            insert(
+                "aa_raw",
+                block_index,
+                order_slot,
+                raw_insert_operations,
+                arm,
+            )?;
+        }
+    }
+    for (block_index, order) in bridge_three_arm_orders(block_count, &mut rng)?
+        .into_iter()
+        .enumerate()
+    {
+        for (order_slot, arm) in order.into_iter().enumerate() {
+            insert(
+                "mechanism_raw",
+                block_index,
+                order_slot,
+                raw_insert_operations,
+                arm,
+            )?;
+        }
+    }
+    Ok(schedule)
+}
+
+#[cfg(feature = "bridge-experiment")]
+#[allow(clippy::too_many_lines)]
+fn verify_bridge_report_file(path: &str) -> Result<JsonBridgeVerificationReceipt, String> {
+    const TOP_LEVEL_KEYS: &[&str] = &[
+        "schema_version",
+        "generated_at_utc",
+        "provenance",
+        "environment",
+        "host_state_before",
+        "host_state_checkpoints",
+        "host_state_after",
+        "config",
+        "replay_contract",
+        "raw_samples",
+        "arm_statistics",
+        "paired_comparisons",
+        "ready_runtime_entry_regression",
+    ];
+    const SAMPLE_KEYS: &[&str] = &[
+        "workload",
+        "operation_count",
+        "block_index",
+        "order_slot",
+        "arm",
+        "elapsed_ns",
+        "runtime_entries_total",
+        "runtime_entries_inside_timed_region",
+        "caller_future_completions_inside_timed_region",
+        "engine_dml_future_calls_inside_timed_region",
+        "worker_commands_total",
+        "worker_commands_inside_timed_region",
+        "worker_open_handshakes_total",
+        "effective_settings",
+        "exact_arm_route_receipt",
+        "oracle_kind",
+        "checksum_count",
+        "checksum_sum",
+        "checksum_exact_rows",
+    ];
+    const ROUTE_KEYS: &[&str] = &[
+        "scope",
+        "exact_schema_sql_and_connection_state",
+        "same_prepared_object_as_timed_region",
+        "compat_trace_registration_state",
+        "fused_entry_control_mode_state",
+        "statement_debug_enabled",
+        "statement_reuse_info_enabled",
+        "profiler_enabled_during_probe",
+        "profiler_enabled_during_timing",
+        "expected_lane",
+        "prepared_insert_fast_lane_hits",
+        "prepared_insert_instrumented_lane_hits",
+        "prepared_direct_insert_executions",
+        "verified",
+        "validation_errors",
+    ];
+
+    let report_path = std::path::Path::new(path);
+    let report_bytes = std::fs::read(report_path)
+        .map_err(|error| format!("could not read bridge report `{path}`: {error}"))?;
+    let report_size_bytes = u64::try_from(report_bytes.len())
+        .map_err(|_| format!("bridge report `{path}` exceeds u64::MAX bytes"))?;
+    let report_sha256 = sha256_bytes(&report_bytes);
+    let report: serde_json::Value = serde_json::from_slice(&report_bytes)
+        .map_err(|error| format!("bridge report `{path}` is not valid JSON: {error}"))?;
+    let root = bridge_verifier_object(&report, "bridge report")?;
+    bridge_verifier_exact_keys(root, TOP_LEVEL_KEYS, "bridge report")?;
+    bridge_verifier_require(
+        bridge_verifier_string(root, "schema_version", "bridge report")? == BRIDGE_REPORT_SCHEMA_V3,
+        || format!("bridge report schema must be `{BRIDGE_REPORT_SCHEMA_V3}`"),
+    )?;
+
+    let provenance = bridge_verifier_object(
+        bridge_verifier_member(root, "provenance", "bridge report")?,
+        "bridge report.provenance",
+    )?;
+    let runtime_bridge =
+        bridge_verifier_string(provenance, "runtime_bridge", "bridge report.provenance")?;
+    bridge_verifier_require(
+        runtime_bridge == "three_arm_per_operation_inside_existing_runtime_worker_sync_facade",
+        || format!("unexpected runtime bridge `{runtime_bridge}`"),
+    )?;
+    let inner_provenance_citable =
+        bridge_verifier_bool(provenance, "citable", "bridge report.provenance")?;
+    bridge_verifier_require(!inner_provenance_citable, || {
+        "bridge v3 reports must remain explicitly non-citable".to_owned()
+    })?;
+    let inner_provenance_status =
+        bridge_verifier_string(provenance, "status", "bridge report.provenance")?.to_owned();
+    bridge_verifier_require(
+        inner_provenance_status == "unverified_explicit_override",
+        || {
+            format!(
+                "bridge report must record the explicit diagnostic override, got `{inner_provenance_status}`"
+            )
+        },
+    )?;
+    let mut reported_validation_errors =
+        bridge_verifier_array(provenance, "validation_errors", "bridge report.provenance")?
+            .iter()
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    "bridge report.provenance.validation_errors must contain strings".to_owned()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    reported_validation_errors.sort();
+    reported_validation_errors.dedup();
+    let mut expected_validation_errors = measurement_design_validation_errors(runtime_bridge);
+    expected_validation_errors.sort();
+    bridge_verifier_require(
+        reported_validation_errors == expected_validation_errors,
+        || {
+            format!(
+                "bridge provenance contains failures beyond the two diagnostic-only outer-environment blockers: {reported_validation_errors:?}"
+            )
+        },
+    )?;
+
+    let binary_sha256 =
+        bridge_verifier_string(provenance, "binary_sha256", "bridge report.provenance")?;
+    let current_executable = std::env::current_exe()
+        .map_err(|error| format!("could not identify verifier executable: {error}"))?;
+    let frozen_verifier_binary_sha256 = sha256_file(&current_executable)
+        .map_err(|error| format!("could not hash verifier executable: {error}"))?;
+    bridge_verifier_require(binary_sha256 == frozen_verifier_binary_sha256, || {
+        format!(
+            "report binary SHA-256 `{binary_sha256}` does not match verifier binary `{frozen_verifier_binary_sha256}`"
+        )
+    })?;
+
+    let build = bridge_verifier_object(
+        bridge_verifier_member(provenance, "build", "bridge report.provenance")?,
+        "bridge report.provenance.build",
+    )?;
+    bridge_verifier_require(
+        bridge_verifier_bool(
+            build,
+            "verbose_build_log_verified",
+            "bridge report.provenance.build",
+        )?,
+        || "bridge report does not verify its verbose build-log receipt".to_owned(),
+    )?;
+    let selected_profile =
+        bridge_verifier_string(build, "selected_profile", "bridge report.provenance.build")?;
+    bridge_verifier_require(
+        matches!(selected_profile, "release" | "release-perf"),
+        || format!("unsupported bridge profile `{selected_profile}`"),
+    )?;
+    let runtime_source = bridge_verifier_object(
+        bridge_verifier_member(provenance, "runtime_source", "bridge report.provenance")?,
+        "bridge report.provenance.runtime_source",
+    )?;
+    bridge_verifier_require(
+        !bridge_verifier_bool(
+            runtime_source,
+            "git_dirty",
+            "bridge report.provenance.runtime_source",
+        )?,
+        || "bridge report source checkout was dirty".to_owned(),
+    )?;
+    bridge_verifier_require(
+        bridge_verifier_string(
+            runtime_source,
+            "git_commit_sha",
+            "bridge report.provenance.runtime_source",
+        )? == bridge_verifier_string(build, "git_commit_sha", "bridge report.provenance.build")?,
+        || "runtime source SHA does not match build source SHA".to_owned(),
+    )?;
+
+    let config = bridge_verifier_object(
+        bridge_verifier_member(root, "config", "bridge report")?,
+        "bridge report.config",
+    )?;
+    bridge_verifier_exact_keys(
+        config,
+        &[
+            "samples_per_arm",
+            "raw_insert_operations",
+            "ready_operation_counts",
+            "order_seed",
+            "ordering_policy",
+            "warmup_policy",
+            "timed_region",
+            "arm_contracts",
+            "aa_null_policy",
+            "affinity_policy",
+            "max_load_average_1m",
+        ],
+        "bridge report.config",
+    )?;
+    let samples_per_arm = bridge_verifier_usize(config, "samples_per_arm", "bridge report.config")?;
+    bridge_verifier_require(samples_per_arm >= 48 && samples_per_arm % 48 == 0, || {
+        format!("samples_per_arm must be a multiple of 48 and at least 48, got {samples_per_arm}")
+    })?;
+    let raw_insert_operations =
+        bridge_verifier_usize(config, "raw_insert_operations", "bridge report.config")?;
+    bridge_verifier_require(raw_insert_operations > 0, || {
+        "bridge report.config.raw_insert_operations must be positive".to_owned()
+    })?;
+    bridge_expected_checksum(raw_insert_operations)?;
+    let ready_operation_counts =
+        bridge_verifier_array(config, "ready_operation_counts", "bridge report.config")?
+            .iter()
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| {
+                        "bridge report.config.ready_operation_counts must contain usize integers"
+                            .to_owned()
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    bridge_verifier_require(ready_operation_counts == [1, 10, 100, 1_000], || {
+        format!(
+            "ready operation-count matrix drifted from [1, 10, 100, 1000]: {ready_operation_counts:?}"
+        )
+    })?;
+    let order_seed = bridge_verifier_u64(config, "order_seed", "bridge report.config")?;
+    let arm_contracts = bridge_verifier_object(
+        bridge_verifier_member(config, "arm_contracts", "bridge report.config")?,
+        "bridge report.config.arm_contracts",
+    )?;
+    bridge_verifier_exact_keys(
+        arm_contracts,
+        &[
+            "per_operation_block_on",
+            "inside_existing_runtime",
+            "worker_sync_facade",
+            "aa_inside_runtime_baseline",
+            "aa_inside_runtime_replicate",
+        ],
+        "bridge report.config.arm_contracts",
+    )?;
+    for (arm, contract) in arm_contracts {
+        bridge_verifier_require(
+            contract
+                .as_str()
+                .is_some_and(|contract| !contract.is_empty()),
+            || format!("arm contract `{arm}` must be a nonempty string"),
+        )?;
+    }
+    bridge_verifier_require(
+        !bridge_verifier_string(config, "aa_null_policy", "bridge report.config")?.is_empty(),
+        || "bridge report.config.aa_null_policy must be nonempty".to_owned(),
+    )?;
+    for field in [
+        "ordering_policy",
+        "warmup_policy",
+        "timed_region",
+        "affinity_policy",
+    ] {
+        bridge_verifier_require(
+            !bridge_verifier_string(config, field, "bridge report.config")?.is_empty(),
+            || format!("bridge report.config.{field} must be nonempty"),
+        )?;
+    }
+
+    let replay = bridge_verifier_object(
+        bridge_verifier_member(root, "replay_contract", "bridge report")?,
+        "bridge report.replay_contract",
+    )?;
+    bridge_verifier_exact_keys(
+        replay,
+        &[
+            "verifier_command",
+            "outer_runner",
+            "minimum_independent_seeds",
+            "primary_contrast_family_size",
+            "simultaneous_confidence_level",
+            "aa_null_required",
+            "external_watchdog_required",
+            "frozen_binary_receipt_required",
+            "manifest_must_be_written_last",
+        ],
+        "bridge report.replay_contract",
+    )?;
+    bridge_verifier_require(
+        bridge_verifier_usize(
+            replay,
+            "minimum_independent_seeds",
+            "bridge report.replay_contract",
+        )? >= 20,
+        || "bridge replay contract requires at least twenty independent seeds".to_owned(),
+    )?;
+    bridge_verifier_require(
+        bridge_verifier_u64(
+            replay,
+            "primary_contrast_family_size",
+            "bridge report.replay_contract",
+        )? == 6,
+        || "bridge replay contract must preregister six profile-level contrasts".to_owned(),
+    )?;
+    let simultaneous_confidence_level = bridge_verifier_member(
+        replay,
+        "simultaneous_confidence_level",
+        "bridge report.replay_contract",
+    )?
+    .as_f64()
+    .ok_or_else(|| {
+        "bridge report.replay_contract.simultaneous_confidence_level must be numeric".to_owned()
+    })?;
+    bridge_verifier_require(
+        (simultaneous_confidence_level - 0.991_667).abs() <= 0.000_001,
+        || {
+            format!(
+                "bridge simultaneous confidence level drifted from 0.991667: {simultaneous_confidence_level}"
+            )
+        },
+    )?;
+    for field in [
+        "aa_null_required",
+        "external_watchdog_required",
+        "frozen_binary_receipt_required",
+        "manifest_must_be_written_last",
+    ] {
+        bridge_verifier_require(
+            bridge_verifier_bool(replay, field, "bridge report.replay_contract")?,
+            || format!("bridge replay contract requires `{field}`"),
+        )?;
+    }
+    bridge_verifier_require(
+        bridge_verifier_string(replay, "verifier_command", "bridge report.replay_contract")?
+            == "comprehensive-bench --verify-bridge-report <report.json>",
+        || "bridge replay contract names an unexpected verifier command".to_owned(),
+    )?;
+    bridge_verifier_require(
+        bridge_verifier_string(replay, "outer_runner", "bridge report.replay_contract")?
+            == "scripts/run_gate0_async_bridge.sh",
+        || "bridge replay contract names an unexpected outer runner".to_owned(),
+    )?;
+
+    let raw_samples = bridge_verifier_array(root, "raw_samples", "bridge report")?;
+    let expected_raw_sample_count = samples_per_arm
+        .checked_mul(15)
+        .ok_or_else(|| "bridge expected sample count overflowed usize".to_owned())?;
+    bridge_verifier_require(raw_samples.len() == expected_raw_sample_count, || {
+        format!(
+            "bridge report retained {} raw samples, expected {expected_raw_sample_count}",
+            raw_samples.len()
+        )
+    })?;
+    let expected_settings = bridge_expected_effective_settings();
+    let mut sample_counts = BTreeMap::new();
+    let mut observed_schedule = BTreeMap::new();
+    let mut observed_schedule_sequence = Vec::with_capacity(raw_samples.len());
+    let mut verified_samples = Vec::with_capacity(raw_samples.len());
+    let mut exact_route_receipts_verified = 0_usize;
+    for (index, sample_value) in raw_samples.iter().enumerate() {
+        let context = format!("bridge report.raw_samples[{index}]");
+        let sample = bridge_verifier_object(sample_value, &context)?;
+        bridge_verifier_exact_keys(sample, SAMPLE_KEYS, &context)?;
+        let typed_sample = serde_json::from_value::<JsonBridgeSample>(sample_value.clone())
+            .map_err(|error| format!("{context} does not decode as an exact v3 sample: {error}"))?;
+        let workload_kind = typed_sample.workload;
+        let arm_kind = typed_sample.arm;
+        let workload = workload_kind.id();
+        let arm = arm_kind.id();
+        let operation_count = typed_sample.operation_count;
+        bridge_verifier_require(typed_sample.elapsed_ns > 0, || {
+            format!("{context}.elapsed_ns must be positive")
+        })?;
+        let valid_arm_workload = match workload {
+            "ready_future" => {
+                ready_operation_counts.contains(&operation_count)
+                    && matches!(arm, "per_operation_block_on" | "inside_existing_runtime")
+            }
+            "prepared_insert" => {
+                operation_count == raw_insert_operations
+                    && matches!(arm, "per_operation_block_on" | "inside_existing_runtime")
+            }
+            "raw_execute_with_params" => {
+                operation_count == raw_insert_operations
+                    && matches!(
+                        arm,
+                        "per_operation_block_on"
+                            | "inside_existing_runtime"
+                            | "worker_sync_facade"
+                            | "aa_inside_runtime_baseline"
+                            | "aa_inside_runtime_replicate"
+                    )
+            }
+            _ => false,
+        };
+        bridge_verifier_require(valid_arm_workload, || {
+            format!(
+                "{context} has invalid workload/operation-count/arm tuple ({workload}, {operation_count}, {arm})"
+            )
+        })?;
+        *sample_counts
+            .entry(format!("{workload}|{operation_count}|{arm}"))
+            .or_default() += 1;
+
+        let expected_checksum = if workload == "ready_future" {
+            (
+                i64::try_from(operation_count)
+                    .map_err(|_| format!("{context} operation count exceeds i64::MAX"))?,
+                0,
+            )
+        } else {
+            bridge_expected_checksum(operation_count)?
+        };
+        bridge_verifier_require(
+            bridge_verifier_i64(sample, "checksum_count", &context)? == expected_checksum.0
+                && bridge_verifier_i64(sample, "checksum_sum", &context)? == expected_checksum.1
+                && bridge_verifier_i64(sample, "checksum_exact_rows", &context)?
+                    == expected_checksum.0,
+            || format!("{context} failed its exact completion/cardinality/checksum oracle"),
+        )?;
+
+        let effective_settings = bridge_verifier_object(
+            bridge_verifier_member(sample, "effective_settings", &context)?,
+            &format!("{context}.effective_settings"),
+        )?;
+        if workload == "ready_future" {
+            bridge_verifier_require(effective_settings.is_empty(), || {
+                format!("{context} ready-future control unexpectedly records database settings")
+            })?;
+        } else {
+            let observed_settings = effective_settings
+                .iter()
+                .map(|(key, value)| {
+                    value
+                        .as_str()
+                        .map(|value| (key.clone(), value.to_owned()))
+                        .ok_or_else(|| {
+                            format!("{context}.effective_settings.{key} must be a string")
+                        })
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            bridge_verifier_require(observed_settings == expected_settings, || {
+                format!("{context} effective settings drifted: {observed_settings:?}")
+            })?;
+        }
+
+        let route = bridge_verifier_object(
+            bridge_verifier_member(sample, "exact_arm_route_receipt", &context)?,
+            &format!("{context}.exact_arm_route_receipt"),
+        )?;
+        let route_context = format!("{context}.exact_arm_route_receipt");
+        bridge_verifier_exact_keys(route, ROUTE_KEYS, &route_context)?;
+        bridge_verifier_require(
+            bridge_verifier_bool(route, "verified", &route_context)?,
+            || format!("{route_context} is not verified"),
+        )?;
+        bridge_verifier_require(
+            bridge_verifier_array(route, "validation_errors", &route_context)?.is_empty(),
+            || format!("{route_context} retained validation errors"),
+        )?;
+        bridge_verifier_require(
+            bridge_verifier_bool(
+                route,
+                "exact_schema_sql_and_connection_state",
+                &route_context,
+            )?,
+            || format!("{route_context} did not preserve exact schema/SQL/connection state"),
+        )?;
+        bridge_verifier_require(
+            !bridge_verifier_bool(route, "statement_debug_enabled", &route_context)?
+                && !bridge_verifier_bool(route, "statement_reuse_info_enabled", &route_context)?
+                && !bridge_verifier_bool(route, "profiler_enabled_during_timing", &route_context)?,
+            || format!("{route_context} records timed instrumentation"),
+        )?;
+        if workload == "ready_future" {
+            bridge_verifier_require(
+                bridge_verifier_string(route, "scope", &route_context)?
+                    == "ready-future control has no SQL execution route"
+                    && bridge_verifier_string(route, "expected_lane", &route_context)?
+                        == "ready_future_control"
+                    && bridge_verifier_bool(
+                        route,
+                        "same_prepared_object_as_timed_region",
+                        &route_context,
+                    )?
+                    && bridge_verifier_string(
+                        route,
+                        "compat_trace_registration_state",
+                        &route_context,
+                    )? == "not_applicable"
+                    && bridge_verifier_string(
+                        route,
+                        "fused_entry_control_mode_state",
+                        &route_context,
+                    )? == "not_applicable"
+                    && !bridge_verifier_bool(
+                        route,
+                        "profiler_enabled_during_probe",
+                        &route_context,
+                    )?
+                    && bridge_verifier_u64(
+                        route,
+                        "prepared_insert_fast_lane_hits",
+                        &route_context,
+                    )? == 0
+                    && bridge_verifier_u64(
+                        route,
+                        "prepared_insert_instrumented_lane_hits",
+                        &route_context,
+                    )? == 0
+                    && bridge_verifier_u64(
+                        route,
+                        "prepared_direct_insert_executions",
+                        &route_context,
+                    )? == 0,
+                || format!("{route_context} has an invalid ready-future route receipt"),
+            )?;
+        } else {
+            let expected_scope = format!(
+                "untimed sentinel on the exact {workload} schema, SQL, public API, transaction state, and connection immediately before warmup/timing"
+            );
+            bridge_verifier_require(
+                bridge_verifier_string(route, "scope", &route_context)? == expected_scope
+                    && bridge_verifier_string(route, "expected_lane", &route_context)?
+                        == "prepared_insert_fast_lane"
+                    && bridge_verifier_bool(
+                        route,
+                        "profiler_enabled_during_probe",
+                        &route_context,
+                    )?
+                    && bridge_verifier_u64(
+                        route,
+                        "prepared_insert_fast_lane_hits",
+                        &route_context,
+                    )? == 1
+                    && bridge_verifier_u64(
+                        route,
+                        "prepared_insert_instrumented_lane_hits",
+                        &route_context,
+                    )? == 0
+                    && bridge_verifier_u64(
+                        route,
+                        "prepared_direct_insert_executions",
+                        &route_context,
+                    )? == 1
+                    && bridge_verifier_string(
+                        route,
+                        "compat_trace_registration_state",
+                        &route_context,
+                    )? == "none_by_construction_on_harness_owned_fresh_connection"
+                    && bridge_verifier_string(
+                        route,
+                        "fused_entry_control_mode_state",
+                        &route_context,
+                    )? == "auto_by_construction_on_harness_owned_fresh_connection"
+                    && bridge_verifier_bool(
+                        route,
+                        "same_prepared_object_as_timed_region",
+                        &route_context,
+                    )? == (workload == "prepared_insert"),
+                || format!("{route_context} does not prove the exact expected INSERT lane"),
+            )?;
+        }
+        exact_route_receipts_verified = exact_route_receipts_verified.saturating_add(1);
+
+        let runtime_entries_inside =
+            bridge_verifier_usize(sample, "runtime_entries_inside_timed_region", &context)?;
+        let caller_completions = bridge_verifier_usize(
+            sample,
+            "caller_future_completions_inside_timed_region",
+            &context,
+        )?;
+        let engine_calls = bridge_verifier_usize(
+            sample,
+            "engine_dml_future_calls_inside_timed_region",
+            &context,
+        )?;
+        let worker_commands_inside =
+            bridge_verifier_usize(sample, "worker_commands_inside_timed_region", &context)?;
+        let worker_handshakes =
+            bridge_verifier_usize(sample, "worker_open_handshakes_total", &context)?;
+        let arm_counters_valid = match arm {
+            "per_operation_block_on" => {
+                runtime_entries_inside == operation_count
+                    && caller_completions == operation_count
+                    && engine_calls
+                        == if workload == "ready_future" {
+                            0
+                        } else {
+                            operation_count
+                        }
+                    && worker_commands_inside == 0
+                    && worker_handshakes == 0
+            }
+            "inside_existing_runtime"
+            | "aa_inside_runtime_baseline"
+            | "aa_inside_runtime_replicate" => {
+                runtime_entries_inside == 0
+                    && caller_completions == operation_count
+                    && engine_calls
+                        == if workload == "ready_future" {
+                            0
+                        } else {
+                            operation_count
+                        }
+                    && worker_commands_inside == 0
+                    && worker_handshakes == 0
+            }
+            "worker_sync_facade" => {
+                runtime_entries_inside == 0
+                    && caller_completions == 0
+                    && engine_calls == operation_count
+                    && worker_commands_inside == operation_count
+                    && worker_handshakes == 1
+            }
+            _ => false,
+        };
+        bridge_verifier_require(arm_counters_valid, || {
+            format!("{context} mechanism counters contradict arm `{arm}`")
+        })?;
+
+        let dml_runtime_overhead = bridge_pragmas()
+            .len()
+            .checked_add(if workload_kind == BridgeWorkload::PreparedInsert {
+                16
+            } else {
+                15
+            })
+            .ok_or_else(|| format!("{context} runtime-entry overhead overflowed usize"))?;
+        let expected_runtime_entries_total = match arm_kind {
+            BridgeArm::PerOperationBlockOn => operation_count
+                .checked_add(if workload_kind == BridgeWorkload::ReadyFuture {
+                    1
+                } else {
+                    dml_runtime_overhead
+                })
+                .ok_or_else(|| format!("{context} runtime-entry total overflowed usize"))?,
+            BridgeArm::SingleRuntimeEntry
+            | BridgeArm::AaInsideRuntimeBaseline
+            | BridgeArm::AaInsideRuntimeReplicate => 1,
+            BridgeArm::WorkerSyncFacade => 0,
+        };
+        bridge_verifier_require(
+            typed_sample.runtime_entries_total == expected_runtime_entries_total,
+            || {
+                format!(
+                    "{context}.runtime_entries_total was {}, expected {expected_runtime_entries_total}",
+                    typed_sample.runtime_entries_total
+                )
+            },
+        )?;
+        let expected_worker_commands_total = if arm_kind == BridgeArm::WorkerSyncFacade {
+            operation_count
+                .checked_add(bridge_pragmas().len())
+                .and_then(|total| total.checked_add(14))
+                .ok_or_else(|| format!("{context} worker-command total overflowed usize"))?
+        } else {
+            0
+        };
+        bridge_verifier_require(
+            typed_sample.worker_commands_total == expected_worker_commands_total,
+            || {
+                format!(
+                    "{context}.worker_commands_total was {}, expected {expected_worker_commands_total}",
+                    typed_sample.worker_commands_total
+                )
+            },
+        )?;
+
+        let expected_oracle_kind = if workload_kind == BridgeWorkload::ReadyFuture {
+            "untimed_ready_sentinel_plus_control_flow_completion_count"
+        } else {
+            "untimed_exact_id_value_domain_query"
+        };
+        bridge_verifier_require(typed_sample.oracle_kind == expected_oracle_kind, || {
+            format!(
+                "{context}.oracle_kind was `{}`, expected `{expected_oracle_kind}`",
+                typed_sample.oracle_kind
+            )
+        })?;
+
+        let schedule_family = match (workload_kind, arm_kind) {
+            (BridgeWorkload::ReadyFuture, _) => "ready",
+            (BridgeWorkload::PreparedInsert, _) => "prepared",
+            (
+                BridgeWorkload::RawExecuteWithParams,
+                BridgeArm::AaInsideRuntimeBaseline | BridgeArm::AaInsideRuntimeReplicate,
+            ) => "aa_raw",
+            (BridgeWorkload::RawExecuteWithParams, _) => "mechanism_raw",
+        };
+        let schedule_key = (
+            schedule_family,
+            typed_sample.block_index,
+            typed_sample.order_slot,
+        );
+        observed_schedule_sequence.push((
+            schedule_family,
+            typed_sample.block_index,
+            typed_sample.order_slot,
+            operation_count,
+            arm_kind,
+        ));
+        bridge_verifier_require(
+            observed_schedule
+                .insert(schedule_key, (operation_count, arm_kind))
+                .is_none(),
+            || {
+                format!(
+                    "{context} duplicates schedule entry {schedule_family} block {} slot {}",
+                    typed_sample.block_index, typed_sample.order_slot
+                )
+            },
+        )?;
+        verified_samples.push(typed_sample);
+    }
+
+    let expected_schedule = bridge_verifier_expected_schedule(
+        samples_per_arm,
+        &ready_operation_counts,
+        raw_insert_operations,
+        order_seed,
+    )?;
+    bridge_verifier_require(observed_schedule == expected_schedule, || {
+        "bridge raw-sample schedule assignments do not exactly replay the seeded v3 design"
+            .to_owned()
+    })?;
+    let family_rank = |family: &str| match family {
+        "ready" => 0_u8,
+        "prepared" => 1,
+        "aa_raw" => 2,
+        "mechanism_raw" => 3,
+        _ => u8::MAX,
+    };
+    let mut expected_schedule_sequence = expected_schedule
+        .iter()
+        .map(
+            |(&(family, block_index, order_slot), &(operation_count, arm))| {
+                (family, block_index, order_slot, operation_count, arm)
+            },
+        )
+        .collect::<Vec<_>>();
+    expected_schedule_sequence.sort_by_key(|(family, block_index, order_slot, _, _)| {
+        (family_rank(family), *block_index, *order_slot)
+    });
+    bridge_verifier_require(
+        observed_schedule_sequence == expected_schedule_sequence,
+        || "bridge raw-sample array order does not match the seeded v3 execution order".to_owned(),
+    )?;
+
+    for &ready_count in &ready_operation_counts {
+        for arm in ["per_operation_block_on", "inside_existing_runtime"] {
+            let key = format!("ready_future|{ready_count}|{arm}");
+            bridge_verifier_require(sample_counts.get(&key) == Some(&samples_per_arm), || {
+                format!(
+                    "bridge report has {:?} samples for `{key}`, expected {samples_per_arm}",
+                    sample_counts.get(&key)
+                )
+            })?;
+        }
+    }
+    for arm in ["per_operation_block_on", "inside_existing_runtime"] {
+        let key = format!("prepared_insert|{raw_insert_operations}|{arm}");
+        bridge_verifier_require(sample_counts.get(&key) == Some(&samples_per_arm), || {
+            format!(
+                "bridge report has {:?} samples for `{key}`, expected {samples_per_arm}",
+                sample_counts.get(&key)
+            )
+        })?;
+    }
+    for arm in [
+        "per_operation_block_on",
+        "inside_existing_runtime",
+        "worker_sync_facade",
+        "aa_inside_runtime_baseline",
+        "aa_inside_runtime_replicate",
+    ] {
+        let key = format!("raw_execute_with_params|{raw_insert_operations}|{arm}");
+        bridge_verifier_require(sample_counts.get(&key) == Some(&samples_per_arm), || {
+            format!(
+                "bridge report has {:?} samples for `{key}`, expected {samples_per_arm}",
+                sample_counts.get(&key)
+            )
+        })?;
+    }
+
+    let recomputed_comparisons = bridge_build_comparisons(
+        &verified_samples,
+        &ready_operation_counts,
+        raw_insert_operations,
+        order_seed,
+    )?;
+    let recomputed_comparisons_json = serde_json::to_value(&recomputed_comparisons)
+        .map_err(|error| format!("could not serialize recomputed bridge comparisons: {error}"))?;
+    bridge_verifier_require(
+        bridge_verifier_member(root, "paired_comparisons", "bridge report")?
+            == &recomputed_comparisons_json,
+        || {
+            "bridge report paired comparisons do not exactly match statistics recomputed from raw samples"
+                .to_owned()
+        },
+    )?;
+    let aa_null_comparison_verified = recomputed_comparisons.iter().any(|comparison| {
+        comparison.workload == BridgeWorkload::RawExecuteWithParams
+            && comparison.operation_count == raw_insert_operations
+            && comparison.numerator == BridgeArm::AaInsideRuntimeReplicate
+            && comparison.denominator == BridgeArm::AaInsideRuntimeBaseline
+    });
+    bridge_verifier_require(aa_null_comparison_verified, || {
+        "bridge report omitted the preregistered raw-DML A/A comparison".to_owned()
+    })?;
+
+    let recomputed_arm_statistics = bridge_arm_statistics(&verified_samples);
+    let recomputed_arm_statistics_json =
+        serde_json::to_value(&recomputed_arm_statistics).map_err(|error| {
+            format!("could not serialize recomputed bridge arm statistics: {error}")
+        })?;
+    bridge_verifier_require(
+        bridge_verifier_member(root, "arm_statistics", "bridge report")?
+            == &recomputed_arm_statistics_json,
+        || {
+            "bridge report arm statistics do not exactly match statistics recomputed from raw samples"
+                .to_owned()
+        },
+    )?;
+
+    let recomputed_ready_regression = bridge_ready_regression(
+        &verified_samples,
+        ready_operation_counts.len().saturating_mul(2),
+        order_seed ^ 0x4000,
+    )?;
+    let recomputed_ready_regression_json = serde_json::to_value(&recomputed_ready_regression)
+        .map_err(|error| format!("could not serialize recomputed ready regression: {error}"))?;
+    bridge_verifier_require(
+        bridge_verifier_member(root, "ready_runtime_entry_regression", "bridge report")?
+            == &recomputed_ready_regression_json,
+        || {
+            "bridge report ready-runtime regression does not exactly match the regression recomputed from raw samples"
+                .to_owned()
+        },
+    )?;
+
+    Ok(JsonBridgeVerificationReceipt {
+        schema_version: "fsqlite-e2e.bridge-verification-receipt.v1".to_owned(),
+        report_path: report_path
+            .canonicalize()
+            .unwrap_or_else(|_| report_path.to_path_buf())
+            .to_string_lossy()
+            .into_owned(),
+        report_sha256,
+        report_size_bytes,
+        validation_scope:
+            "exact v3 seeded schedule, mechanism totals, route/oracle/sample contracts, and all arm statistics, paired comparisons, bootstrap intervals, and ready-runtime regression recomputed from raw samples; the report remains diagnostic until the outer runner independently proves topology, watchdog, profile ordering, multiplicity, A/A acceptance, and manifest receipts"
+                .to_owned(),
+        report_contract_verified: true,
+        diagnostic_only: true,
+        inner_provenance_citable,
+        inner_provenance_status,
+        order_seed,
+        samples_per_arm,
+        raw_sample_count: raw_samples.len(),
+        exact_route_receipts_verified,
+        sample_counts,
+        exact_schedule_verified: true,
+        paired_comparisons_verified: recomputed_comparisons.len(),
+        arm_statistics_recomputed: true,
+        ready_regression_recomputed: true,
+        aa_null_comparison_verified,
+        replay_contract_verified: true,
+        frozen_verifier_binary_sha256,
+    })
 }
 
 #[cfg(not(feature = "bridge-experiment"))]
@@ -13241,6 +15342,25 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if let Some(path) = options.verify_bridge_report.as_deref() {
+        #[cfg(feature = "bridge-experiment")]
+        match verify_bridge_report_file(path) {
+            Ok(receipt) => print_json_report(&receipt),
+            Err(error) => {
+                eprintln!("ERROR: {error}");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(not(feature = "bridge-experiment"))]
+        {
+            let _ = path;
+            eprintln!(
+                "ERROR: bridge report verification requires rebuilding with `--features bridge-experiment`"
+            );
+            std::process::exit(1);
+        }
+        return;
+    }
     if options.print_json_schema {
         if options.bridge_experiment {
             #[cfg(feature = "bridge-experiment")]

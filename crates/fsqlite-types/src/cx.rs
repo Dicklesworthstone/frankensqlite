@@ -1206,6 +1206,12 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
                 .children
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Cancellation propagation also prunes dead links, but a
+            // long-lived uncancelled parent can create many short-lived
+            // operation children. Prune opportunistically on creation so
+            // those Weak tombstones stay bounded without requiring a later
+            // cancellation sweep.
+            children.retain(|child| child.strong_count() > 0);
             children.push(Arc::downgrade(&child.inner));
         }
         if let Some(reason) = self.cancel_reason() {
@@ -2209,6 +2215,34 @@ mod tests {
         };
         assert_eq!(live_count, 1, "only the live child should remain linked");
         assert!(live_child.is_cancel_requested());
+    }
+
+    #[test]
+    fn test_create_child_prunes_weak_tombstones_without_cancellation() {
+        let parent = Cx::<FullCaps>::new();
+
+        for _ in 0..1_024 {
+            drop(parent.create_child());
+        }
+        let live_child = parent.create_child();
+
+        let children = parent
+            .inner
+            .children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            children.len(),
+            1,
+            "uncancelled parents must not retain dropped operation-child tombstones"
+        );
+        assert_eq!(
+            children.iter().filter_map(Weak::upgrade).count(),
+            1,
+            "the sole retained link must be the live child"
+        );
+        drop(children);
+        assert!(!live_child.is_cancel_requested());
     }
 
     #[test]

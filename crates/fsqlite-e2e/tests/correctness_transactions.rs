@@ -37,9 +37,8 @@ const SCENARIO_COMPLETENESS_BEAD_ID: &str = "bd-mblr.4";
 const SCENARIO_COMPLETENESS_SEED: u64 = 0x006D_626C_722E_3400;
 const SCENARIO_COMPLETENESS_REPLAY: &str =
     "cargo test -p fsqlite-e2e --test correctness_transactions -- --nocapture --test-threads=1";
-const RETAINED_AUTOCOMMIT_CRASH_HELPER_DB_PATH_ENV: &str =
-    "FSQLITE_RETAINED_AUTOCOMMIT_CRASH_DB_PATH";
-const RETAINED_AUTOCOMMIT_CRASH_HELPER_TEST: &str = "retained_autocommit_crash_helper_entrypoint";
+const AUTOCOMMIT_CRASH_HELPER_DB_PATH_ENV: &str = "FSQLITE_AUTOCOMMIT_CRASH_DB_PATH";
+const AUTOCOMMIT_CRASH_HELPER_TEST: &str = "autocommit_crash_helper_entrypoint";
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -187,22 +186,23 @@ impl Drop for HotPathProfileGuard {
     }
 }
 
-fn spawn_retained_autocommit_crash_helper(db_path: &Path) {
+fn spawn_autocommit_crash_helper(db_path: &Path) {
     let helper_status = Command::new(env::current_exe().expect("current_exe"))
         .arg("--exact")
-        .arg(RETAINED_AUTOCOMMIT_CRASH_HELPER_TEST)
+        .arg(AUTOCOMMIT_CRASH_HELPER_TEST)
         .arg("--ignored")
         .arg("--nocapture")
-        .env(
-            RETAINED_AUTOCOMMIT_CRASH_HELPER_DB_PATH_ENV,
-            db_path.as_os_str(),
-        )
+        .env(AUTOCOMMIT_CRASH_HELPER_DB_PATH_ENV, db_path.as_os_str())
         .status()
-        .expect("spawn retained-autocommit crash helper");
+        .expect("spawn autocommit crash helper");
 
     assert!(
         !helper_status.success(),
-        "retained-autocommit crash helper should abort"
+        "autocommit crash helper should abort"
+    );
+    assert!(
+        db_path.with_extension("returned").exists(),
+        "helper must prove every INSERT returned success before aborting"
     );
 }
 
@@ -1185,11 +1185,11 @@ fn txn_checkpoint_all_modes_with_data() {
 }
 
 #[test]
-fn txn_file_backed_retained_autocommit_interleaved_read_write_close_reopen_matches_rusqlite() {
+fn txn_file_backed_autocommit_is_immediately_visible_and_durable() {
     asupersync::test_utils::run_test(|| async {
         let tmp = tempdir().expect("tempdir");
-        let c_path = tmp.path().join("oracle_retained_autocommit.db");
-        let f_path = tmp.path().join("candidate_retained_autocommit.db");
+        let c_path = tmp.path().join("oracle_autocommit.db");
+        let f_path = tmp.path().join("candidate_autocommit.db");
         let f_path_string = f_path.to_string_lossy().into_owned();
 
         let c_conn = rusqlite::Connection::open(&c_path).expect("open csqlite db");
@@ -1199,11 +1199,12 @@ fn txn_file_backed_retained_autocommit_interleaved_read_write_close_reopen_match
         f_conn
             .execute("PRAGMA fsqlite.concurrent_mode = OFF;")
             .await
-            .expect("disable concurrent mode for deterministic retained-autocommit coverage");
+            .expect("select serialized pager path for deterministic durability coverage");
 
         let schema_sql = "CREATE TABLE msgs(id INTEGER PRIMARY KEY, val TEXT NOT NULL);";
         c_conn.execute(schema_sql, []).expect("csqlite schema");
         f_conn.execute(schema_sql).await.expect("fsqlite schema");
+        let f_observer = rusqlite::Connection::open(&f_path).expect("open external observer");
 
         for step in 1_u32..=24 {
             let rowid = i64::from(step);
@@ -1216,6 +1217,11 @@ fn txn_file_backed_retained_autocommit_interleaved_read_write_close_reopen_match
                 csqlite_query_values(&c_conn, &point_lookup_sql),
                 fsqlite_query_values(&f_conn, &point_lookup_sql).await,
                 "read-after-write point lookup diverged after INSERT step {step}"
+            );
+            assert_eq!(
+                csqlite_query_values(&f_observer, &point_lookup_sql),
+                csqlite_query_values(&c_conn, &point_lookup_sql),
+                "successful INSERT must be visible to an external SQLite reader at step {step}"
             );
 
             if step.is_multiple_of(6) {
@@ -1241,7 +1247,12 @@ fn txn_file_backed_retained_autocommit_interleaved_read_write_close_reopen_match
         assert_eq!(
             csqlite_query_values(&c_conn, post_delete_sql),
             fsqlite_query_values(&f_conn, post_delete_sql).await,
-            "post-delete retained autocommit state diverged before close"
+            "post-delete autocommit state diverged before close"
+        );
+        assert_eq!(
+            csqlite_query_values(&f_observer, post_delete_sql),
+            csqlite_query_values(&c_conn, post_delete_sql),
+            "successful DELETE must be externally visible before close"
         );
 
         let full_dump_sql = "SELECT id, val FROM msgs ORDER BY id;";
@@ -1249,7 +1260,7 @@ fn txn_file_backed_retained_autocommit_interleaved_read_write_close_reopen_match
         let before_close_f = fsqlite_query_values(&f_conn, full_dump_sql).await;
         assert_eq!(
             before_close_c, before_close_f,
-            "file-backed retained autocommit should match the oracle before close"
+            "file-backed autocommit should match the oracle before close"
         );
 
         f_conn.close().await.expect("close fsqlite connection");
@@ -1262,21 +1273,17 @@ fn txn_file_backed_retained_autocommit_interleaved_read_write_close_reopen_match
         assert_eq!(
             csqlite_query_values(&reopened_c, full_dump_sql),
             fsqlite_query_values(&reopened_f, full_dump_sql).await,
-            "close+reopen must flush retained autocommit state identically to the oracle"
+            "close+reopen must preserve already-committed autocommit state"
         );
     });
 }
 
 #[test]
-fn txn_file_backed_retained_autocommit_schema_change_boundary_matches_rusqlite() {
+fn txn_file_backed_autocommit_schema_change_boundary_matches_rusqlite() {
     asupersync::test_utils::run_test(|| async {
         let tmp = tempdir().expect("tempdir");
-        let c_path = tmp
-            .path()
-            .join("oracle_retained_autocommit_schema_change.db");
-        let f_path = tmp
-            .path()
-            .join("candidate_retained_autocommit_schema_change.db");
+        let c_path = tmp.path().join("oracle_autocommit_schema_change.db");
+        let f_path = tmp.path().join("candidate_autocommit_schema_change.db");
         let f_path_string = f_path.to_string_lossy().into_owned();
 
         let c_conn = rusqlite::Connection::open(&c_path).expect("open csqlite db");
@@ -1286,7 +1293,7 @@ fn txn_file_backed_retained_autocommit_schema_change_boundary_matches_rusqlite()
         f_conn
             .execute("PRAGMA fsqlite.concurrent_mode = OFF;")
             .await
-            .expect("disable concurrent mode for deterministic retained-autocommit coverage");
+            .expect("select serialized pager path for deterministic durability coverage");
 
         let schema_sql = "CREATE TABLE msgs(id INTEGER PRIMARY KEY, val TEXT NOT NULL);";
         c_conn.execute(schema_sql, []).expect("csqlite schema");
@@ -1302,7 +1309,7 @@ fn txn_file_backed_retained_autocommit_schema_change_boundary_matches_rusqlite()
         assert_eq!(
             csqlite_query_values(&c_conn, "SELECT id, val FROM msgs ORDER BY id;"),
             fsqlite_query_values(&f_conn, "SELECT id, val FROM msgs ORDER BY id;").await,
-            "same-connection retained read-after-write should match before the schema boundary"
+            "same-connection read-after-write should match before the schema boundary"
         );
 
         let ddl_sql = "CREATE TABLE aux_msgs(id INTEGER PRIMARY KEY, note TEXT NOT NULL);";
@@ -1328,7 +1335,7 @@ fn txn_file_backed_retained_autocommit_schema_change_boundary_matches_rusqlite()
         assert_eq!(
             csqlite_query_values(&c_conn, "SELECT id, val FROM msgs ORDER BY id;"),
             fsqlite_query_values(&f_conn, "SELECT id, val FROM msgs ORDER BY id;").await,
-            "schema boundary should preserve previously retained rows"
+            "schema boundary should preserve previously committed rows"
         );
 
         c_conn
@@ -1356,7 +1363,7 @@ fn txn_file_backed_retained_autocommit_schema_change_boundary_matches_rusqlite()
         assert_eq!(
             csqlite_query_values(&reopened_c, msgs_dump_sql),
             fsqlite_query_values(&reopened_f, msgs_dump_sql).await,
-            "schema-boundary retained-autocommit state must match after close+reopen"
+            "schema-boundary autocommit state must match after close+reopen"
         );
         assert_eq!(
             csqlite_query_values(&reopened_c, aux_dump_sql),
@@ -1367,14 +1374,14 @@ fn txn_file_backed_retained_autocommit_schema_change_boundary_matches_rusqlite()
 }
 
 #[test]
-fn txn_file_backed_retained_autocommit_10k_profile_matches_rusqlite_after_close_reopen() {
+fn txn_file_backed_autocommit_10k_matches_rusqlite_after_close_reopen() {
     asupersync::test_utils::run_test(|| async {
         const ROW_COUNT: i64 = 10_000;
 
         let _profile_guard = HotPathProfileGuard::new();
         let tmp = tempdir().expect("tempdir");
-        let c_path = tmp.path().join("oracle_retained_autocommit_10k.db");
-        let f_path = tmp.path().join("candidate_retained_autocommit_10k.db");
+        let c_path = tmp.path().join("oracle_autocommit_10k.db");
+        let f_path = tmp.path().join("candidate_autocommit_10k.db");
         let f_path_string = f_path.to_string_lossy().into_owned();
 
         let c_conn = rusqlite::Connection::open(&c_path).expect("open csqlite db");
@@ -1384,7 +1391,7 @@ fn txn_file_backed_retained_autocommit_10k_profile_matches_rusqlite_after_close_
         f_conn
             .execute("PRAGMA fsqlite.concurrent_mode = OFF;")
             .await
-            .expect("disable concurrent mode for deterministic retained-autocommit coverage");
+            .expect("select serialized pager path for deterministic durability coverage");
 
         let schema_sql = "CREATE TABLE msgs(id INTEGER PRIMARY KEY, val TEXT NOT NULL);";
         c_conn.execute(schema_sql, []).expect("csqlite schema");
@@ -1399,33 +1406,29 @@ fn txn_file_backed_retained_autocommit_10k_profile_matches_rusqlite_after_close_
         }
         let elapsed = started.elapsed();
         let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.prepared_direct_insert_autocommit_executions, ROW_COUNT as u64,
+            "profile freshness: every measured FrankenSQLite INSERT must increment the direct autocommit execution counter"
+        );
 
         eprintln!(
-            "bd-iuvw4 retained-autocommit-10k elapsed_ms={} reuses={} parks={} flushes={}",
+            "bd-iuvw4 autocommit-10k elapsed_ms={} direct_autocommit_execs={} commit_roundtrip_ns={}",
             elapsed.as_millis(),
-            profile.retained_autocommit_reuses,
-            profile.retained_autocommit_parks,
-            profile.retained_autocommit_flushes
-        );
-
-        assert!(
-            profile.retained_autocommit_reuses >= 9_000,
-            "10k pure-write autocommit should heavily reuse the retained txn path: {profile:?}"
-        );
-        assert!(
-            profile.retained_autocommit_parks >= profile.retained_autocommit_reuses,
-            "10k pure-write autocommit should keep re-parking the retained txn across the reused fast path: {profile:?}"
-        );
-        assert!(
-            profile.retained_autocommit_flushes <= 64,
-            "10k pure-write autocommit should batch flushes rather than flushing every statement: {profile:?}"
+            profile.prepared_direct_insert_autocommit_executions,
+            profile.commit_txn_roundtrip_time_ns,
         );
 
         let full_dump_sql = "SELECT id, val FROM msgs ORDER BY id;";
         assert_eq!(
             csqlite_query_values(&c_conn, full_dump_sql),
             fsqlite_query_values(&f_conn, full_dump_sql).await,
-            "10k retained autocommit state diverged before close"
+            "10k autocommit state diverged before close"
+        );
+        let f_observer = rusqlite::Connection::open(&f_path).expect("open external observer");
+        assert_eq!(
+            csqlite_query_values(&f_observer, full_dump_sql),
+            csqlite_query_values(&c_conn, full_dump_sql),
+            "10k successful autocommit writes must be externally visible before close"
         );
 
         f_conn.close().await.expect("close fsqlite connection");
@@ -1438,54 +1441,64 @@ fn txn_file_backed_retained_autocommit_10k_profile_matches_rusqlite_after_close_
         assert_eq!(
             csqlite_query_values(&reopened_c, full_dump_sql),
             fsqlite_query_values(&reopened_f, full_dump_sql).await,
-            "10k retained autocommit close+reopen must match the oracle"
+            "10k autocommit close+reopen must match the oracle"
         );
     });
 }
 
 #[test]
-fn txn_file_backed_retained_autocommit_crash_recovery_discards_unflushed_batch() {
+fn txn_file_backed_autocommit_crash_recovery_keeps_every_successful_statement() {
     asupersync::test_utils::run_test(|| async {
         let tmp = tempdir().expect("tempdir");
-        let db_path = tmp.path().join("retained_autocommit_crash_recovery.db");
+        let db_path = tmp.path().join("autocommit_crash_recovery.db");
         let f_path_string = db_path.to_string_lossy().into_owned();
 
-        spawn_retained_autocommit_crash_helper(&db_path);
+        spawn_autocommit_crash_helper(&db_path);
 
         let reopened_f = fsqlite::Connection::open(&f_path_string)
             .await
             .expect("reopen fsqlite db");
         let reopened_c = rusqlite::Connection::open(&db_path).expect("reopen csqlite db");
         let dump_sql = "SELECT id, val FROM msgs ORDER BY id;";
-        let expected = vec![vec![
-            SqlValue::Integer(1),
-            SqlValue::Text("committed".to_owned()),
-        ]];
+        let expected = vec![
+            vec![
+                SqlValue::Integer(1),
+                SqlValue::Text("committed_1".to_owned()),
+            ],
+            vec![
+                SqlValue::Integer(2),
+                SqlValue::Text("committed_2".to_owned()),
+            ],
+            vec![
+                SqlValue::Integer(3),
+                SqlValue::Text("committed_3".to_owned()),
+            ],
+        ];
 
         assert_eq!(
             csqlite_query_values(&reopened_c, dump_sql),
             expected,
-            "stock SQLite should recover only the flushed retained-autocommit prefix"
+            "stock SQLite should recover every statement that returned success"
         );
         assert_eq!(
             fsqlite_query_values(&reopened_f, dump_sql).await,
             expected,
-            "FrankenSQLite should recover only the flushed retained-autocommit prefix"
+            "FrankenSQLite should recover every statement that returned success"
         );
     });
 }
 
 #[test]
-#[ignore = "invoked via subprocess by retained-autocommit crash-recovery test"]
-fn retained_autocommit_crash_helper_entrypoint() {
+#[ignore = "invoked via subprocess by autocommit crash-recovery test"]
+fn autocommit_crash_helper_entrypoint() {
     asupersync::test_utils::run_test(|| async {
-        let Ok(db_path) = env::var(RETAINED_AUTOCOMMIT_CRASH_HELPER_DB_PATH_ENV) else {
+        let Ok(db_path) = env::var(AUTOCOMMIT_CRASH_HELPER_DB_PATH_ENV) else {
             return;
         };
 
         let conn = fsqlite::Connection::open(&db_path)
             .await
-            .expect("open retained-autocommit crash db");
+            .expect("open autocommit crash db");
         conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;")
             .await
             .expect("disable concurrent mode");
@@ -1508,22 +1521,21 @@ fn retained_autocommit_crash_helper_entrypoint() {
             .await
             .expect("create table");
 
-        conn.execute("INSERT INTO msgs VALUES (1, 'committed');")
+        conn.execute("INSERT INTO msgs VALUES (1, 'committed_1');")
             .await
-            .expect("insert flushed retained prefix");
-        conn.execute("BEGIN;")
+            .expect("insert committed row 1");
+        conn.execute("INSERT INTO msgs VALUES (2, 'committed_2');")
             .await
-            .expect("explicit begin should flush retained prefix");
-        conn.execute("COMMIT;")
+            .expect("insert committed row 2");
+        conn.execute("INSERT INTO msgs VALUES (3, 'committed_3');")
             .await
-            .expect("finish explicit boundary");
+            .expect("insert committed row 3");
 
-        conn.execute("INSERT INTO msgs VALUES (2, 'pending_2');")
-            .await
-            .expect("insert first unflushed retained row");
-        conn.execute("INSERT INTO msgs VALUES (3, 'pending_3');")
-            .await
-            .expect("insert second unflushed retained row");
+        std::fs::write(
+            Path::new(&db_path).with_extension("returned"),
+            b"all autocommit statements returned success",
+        )
+        .expect("write success sentinel");
 
         std::process::abort();
     });

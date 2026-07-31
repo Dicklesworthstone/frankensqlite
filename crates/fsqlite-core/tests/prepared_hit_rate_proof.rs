@@ -474,9 +474,9 @@ fn test_b3_small_3col_autocommit_direct_insert_profile_breakdown() {
             profile.commit_txn_roundtrip_time_ns as f64 / 1000.0 / ROWS as f64
         );
         eprintln!(
-            "retained_autocommit: reuses={} parks={} memory_fast_begins={}",
-            profile.retained_autocommit_reuses,
-            profile.retained_autocommit_parks,
+            "committed_cached_writer: reuses={} parks={} memory_fast_begins={}",
+            profile.cached_write_txn_reuses,
+            profile.cached_write_txn_parks,
             profile.memory_autocommit_fast_path_begins,
         );
         eprintln!(
@@ -507,13 +507,13 @@ fn test_b3_small_3col_autocommit_direct_insert_profile_breakdown() {
             "the direct insert profile must expose btree insert cost for the small_3col shape: {profile:?}"
         );
         assert!(
-            profile.retained_autocommit_parks >= ROWS as u64 - 1,
-            "autocommit INSERT should park the retained write transaction for the next statement: {profile:?}"
+            profile.cached_write_txn_parks >= ROWS as u64 - 1,
+            "autocommit INSERT should commit and park the reusable write handle for the next statement: {profile:?}"
         );
         assert!(
-            profile.retained_autocommit_reuses >= ROWS as u64 - 2
+            profile.cached_write_txn_reuses >= ROWS as u64 - 2
                 || profile.memory_autocommit_fast_path_begins >= 1,
-            "the small_3col autocommit probe should stay on the retained write-txn path after the first statement: {profile:?}"
+            "the small_3col autocommit probe should stay on the committed cached-writer path after the first statement: {profile:?}"
         );
     });
 }

@@ -126,9 +126,8 @@ use fsqlite_types::opcode::{Opcode, P4};
 #[cfg(not(test))]
 use fsqlite_types::record::set_record_profile_enabled;
 use fsqlite_types::record::{
-    ColumnOffset, NumericColumnValue, PrecomputedRecordHeader, RecordHotPathProfileSnapshot,
-    RecordProfileScope, decode_column_from_offset, decode_numeric_column_from_offset, encode_batch,
-    enter_record_profile_scope, parse_record, parse_record_header_into, parse_record_into,
+    PrecomputedRecordHeader, RecordHotPathProfileSnapshot, RecordProfileScope, encode_batch,
+    enter_record_profile_scope, parse_record, parse_record_into,
     parse_record_projected_column_offsets, record_profile_enabled, record_profile_snapshot,
     reset_record_profile, serialize_record, serialize_record_iter_into,
     serialize_record_iter_with_precomputed_header_into,
@@ -674,13 +673,6 @@ static FSQLITE_COMMIT_REFRESH_COUNT: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_MEMDB_REFRESH_COUNT: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CACHED_WRITE_TXN_REUSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CACHED_WRITE_TXN_PARKS: AtomicU64 = AtomicU64::new(0);
-// bd-otbu1 / I1: Retained autocommit counters for file-backed databases.
-static FSQLITE_RETAINED_AUTOCOMMIT_REUSES: AtomicU64 = AtomicU64::new(0);
-static FSQLITE_RETAINED_AUTOCOMMIT_PARKS: AtomicU64 = AtomicU64::new(0);
-static FSQLITE_RETAINED_AUTOCOMMIT_FLUSHES: AtomicU64 = AtomicU64::new(0);
-static FSQLITE_RETAINED_AUTOCOMMIT_READ_AFTER_WRITE_FLUSHES: AtomicU64 = AtomicU64::new(0);
-static FSQLITE_RETAINED_AUTOCOMMIT_OVERLAY_HITS: AtomicU64 = AtomicU64::new(0);
-static FSQLITE_RETAINED_AUTOCOMMIT_OVERLAY_MISSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_TABLE_ENGINE_FRESH_ALLOCS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_TABLE_ENGINE_REUSES: AtomicU64 = AtomicU64::new(0);
@@ -985,13 +977,6 @@ pub struct HotPathProfileSnapshot {
     pub pager_commit: PagerCommitProfileSnapshot,
     pub cached_write_txn_reuses: u64,
     pub cached_write_txn_parks: u64,
-    // bd-otbu1 / I1: Retained autocommit counters for file-backed databases.
-    pub retained_autocommit_reuses: u64,
-    pub retained_autocommit_parks: u64,
-    pub retained_autocommit_flushes: u64,
-    pub retained_autocommit_read_after_write_flushes: u64,
-    pub retained_autocommit_overlay_hits: u64,
-    pub retained_autocommit_overlay_misses: u64,
     pub column_default_evaluation_passes: u64,
     pub prepared_table_engine_fresh_allocs: u64,
     pub prepared_table_engine_reuses: u64,
@@ -1411,12 +1396,6 @@ pub fn reset_hot_path_profile() {
     FSQLITE_MEMDB_REFRESH_COUNT.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CACHED_WRITE_TXN_REUSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CACHED_WRITE_TXN_PARKS.store(0, AtomicOrdering::Relaxed);
-    FSQLITE_RETAINED_AUTOCOMMIT_REUSES.store(0, AtomicOrdering::Relaxed);
-    FSQLITE_RETAINED_AUTOCOMMIT_PARKS.store(0, AtomicOrdering::Relaxed);
-    FSQLITE_RETAINED_AUTOCOMMIT_FLUSHES.store(0, AtomicOrdering::Relaxed);
-    FSQLITE_RETAINED_AUTOCOMMIT_READ_AFTER_WRITE_FLUSHES.store(0, AtomicOrdering::Relaxed);
-    FSQLITE_RETAINED_AUTOCOMMIT_OVERLAY_HITS.store(0, AtomicOrdering::Relaxed);
-    FSQLITE_RETAINED_AUTOCOMMIT_OVERLAY_MISSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_TABLE_ENGINE_FRESH_ALLOCS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_TABLE_ENGINE_REUSES.store(0, AtomicOrdering::Relaxed);
@@ -1655,17 +1634,6 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
         pager_commit: pager_commit_profile_snapshot(),
         cached_write_txn_reuses: FSQLITE_CACHED_WRITE_TXN_REUSES.load(AtomicOrdering::Relaxed),
         cached_write_txn_parks: FSQLITE_CACHED_WRITE_TXN_PARKS.load(AtomicOrdering::Relaxed),
-        retained_autocommit_reuses: FSQLITE_RETAINED_AUTOCOMMIT_REUSES
-            .load(AtomicOrdering::Relaxed),
-        retained_autocommit_parks: FSQLITE_RETAINED_AUTOCOMMIT_PARKS.load(AtomicOrdering::Relaxed),
-        retained_autocommit_flushes: FSQLITE_RETAINED_AUTOCOMMIT_FLUSHES
-            .load(AtomicOrdering::Relaxed),
-        retained_autocommit_read_after_write_flushes:
-            FSQLITE_RETAINED_AUTOCOMMIT_READ_AFTER_WRITE_FLUSHES.load(AtomicOrdering::Relaxed),
-        retained_autocommit_overlay_hits: FSQLITE_RETAINED_AUTOCOMMIT_OVERLAY_HITS
-            .load(AtomicOrdering::Relaxed),
-        retained_autocommit_overlay_misses: FSQLITE_RETAINED_AUTOCOMMIT_OVERLAY_MISSES
-            .load(AtomicOrdering::Relaxed),
         column_default_evaluation_passes: FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES
             .load(AtomicOrdering::Relaxed),
         prepared_table_engine_fresh_allocs: FSQLITE_PREPARED_TABLE_ENGINE_FRESH_ALLOCS
@@ -4331,7 +4299,6 @@ fn record_prepared_update_delete_fallback(reason: PreparedUpdateDeleteFallbackRe
 #[derive(Debug, Clone)]
 struct PreparedUpdateDeleteFastPath {
     kind: PreparedDmlKind,
-    table_name: String,
     rollback_on_constraint_violation: bool,
     preserve_prior_changes_on_constraint_violation: bool,
     skip_statement_savepoint_in_explicit_txn: bool,
@@ -4461,8 +4428,7 @@ struct PreparedDirectSimpleUpdate {
     /// here because the gate forbids updating the IPK.
     assignments: Vec<(usize, PreparedDirectSimpleSetValue)>,
     /// True when every non-IPK column is assigned by this UPDATE, so execution
-    /// can synthesize the new record without decoding the old payload unless a
-    /// retained aggregate cache needs the old value.
+    /// can synthesize the new record without decoding the old payload.
     assigns_all_non_ipk_columns: bool,
     /// Single REAL-column assignment that can patch the existing fixed-width
     /// record value in place when the old payload is also REAL.
@@ -4960,170 +4926,11 @@ impl PreparedQueryFastPath {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RetainedAutocommitOverlayFastPath {
-    CountStar {
-        root_page: i32,
-    },
-    CountStarSum {
-        root_page: i32,
-        sum_column_index: usize,
-        rowid_alias_column_index: Option<usize>,
-    },
-    RowidLookup {
-        root_page: i32,
-        parameter_index: usize,
-        rowid_alias_column_index: Option<usize>,
-    },
-    ProjectedRowidLookup {
-        root_page: i32,
-        parameter_index: usize,
-        rowid_alias_column_index: Option<usize>,
-        projections: Arc<[PreparedMemValueSource]>,
-    },
-    IndexedEqualityLookup {
-        root_page: i32,
-        column_index: usize,
-        parameter_index: usize,
-        rowid_alias_column_index: Option<usize>,
-        projections: Option<Arc<[PreparedMemValueSource]>>,
-    },
-    RowidRangeScan {
-        root_page: i32,
-        lower_parameter_index: usize,
-        upper_parameter_index: usize,
-        rowid_alias_column_index: Option<usize>,
-    },
-    CountStarRowidRange {
-        root_page: i32,
-        lower_parameter_index: usize,
-        upper_parameter_index: usize,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RetainedAutocommitCountSumCache {
-    root_page: i32,
-    sum_column_index: usize,
-    rowid_alias_column_index: Option<usize>,
-    sum_non_null_count: i64,
-    row: Row,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RetainedAutocommitIndexedEqualityCache {
-    root_page: i32,
-    column_index: usize,
-    probe_value: SqliteValue,
-    rowid_alias_column_index: Option<usize>,
-    projections: Option<Arc<[PreparedMemValueSource]>>,
-    rows: Vec<Row>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StorageCountCacheEntry {
     commit_seq: CommitSeq,
     schema_generation: u64,
     count: i64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RetainedAutocommitCountSumInterest {
-    root_page: i32,
-    sum_column_index: usize,
-    rowid_alias_column_index: Option<usize>,
-    schema_cookie: u32,
-    schema_generation: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetainedCountSumIntegerValue {
-    Null,
-    Integer(i64),
-}
-
-impl RetainedCountSumIntegerValue {
-    const fn is_non_null(self) -> bool {
-        matches!(self, Self::Integer(_))
-    }
-
-    const fn unwrap_or_zero(self) -> i64 {
-        match self {
-            Self::Null => 0,
-            Self::Integer(value) => value,
-        }
-    }
-}
-
-impl RetainedAutocommitCountSumCache {
-    fn matches(
-        &self,
-        root_page: i32,
-        sum_column_index: usize,
-        rowid_alias_column_index: Option<usize>,
-    ) -> bool {
-        self.root_page == root_page
-            && self.sum_column_index == sum_column_index
-            && self.rowid_alias_column_index == rowid_alias_column_index
-    }
-}
-
-impl RetainedAutocommitIndexedEqualityCache {
-    fn matches(
-        &self,
-        root_page: i32,
-        column_index: usize,
-        probe_value: &SqliteValue,
-        rowid_alias_column_index: Option<usize>,
-        projections: Option<&[PreparedMemValueSource]>,
-    ) -> bool {
-        self.root_page == root_page
-            && self.column_index == column_index
-            && self.probe_value == *probe_value
-            && self.rowid_alias_column_index == rowid_alias_column_index
-            && self.projections.as_deref() == projections
-    }
-}
-
-impl RetainedAutocommitCountSumInterest {
-    fn matches_current(self, conn: &Connection, root_page: i32) -> Option<(usize, Option<usize>)> {
-        (self.root_page == root_page
-            && self.schema_cookie == conn.schema_cookie()
-            && self.schema_generation == conn.schema_generation())
-        .then_some((self.sum_column_index, self.rowid_alias_column_index))
-    }
-}
-
-impl RetainedAutocommitOverlayFastPath {
-    fn read_shape(&self) -> &'static str {
-        match self {
-            Self::CountStar { .. } => "count_star",
-            Self::CountStarSum { .. } => "count_star_sum",
-            Self::RowidLookup { .. } => "rowid_lookup",
-            Self::ProjectedRowidLookup { .. } => "projected_rowid_lookup",
-            Self::IndexedEqualityLookup { projections, .. } => {
-                if projections.is_some() {
-                    "projected_indexed_equality_lookup"
-                } else {
-                    "indexed_equality_lookup"
-                }
-            }
-            Self::RowidRangeScan { .. } => "rowid_range_scan",
-            Self::CountStarRowidRange { .. } => "count_star_rowid_range",
-        }
-    }
-
-    fn root_page(&self) -> i32 {
-        match self {
-            Self::CountStar { root_page }
-            | Self::CountStarSum { root_page, .. }
-            | Self::RowidLookup { root_page, .. }
-            | Self::ProjectedRowidLookup { root_page, .. }
-            | Self::IndexedEqualityLookup { root_page, .. }
-            | Self::RowidRangeScan { root_page, .. }
-            | Self::CountStarRowidRange { root_page, .. } => *root_page,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -8929,41 +8736,10 @@ pub struct Connection {
     cached_write_txn: RefCell<Option<TransactionKind>>,
     /// Schema cookie at the time `cached_write_txn` was captured.
     cached_write_txn_cookie: Cell<u32>,
-    /// True when the parked retained writer already left `self.db` as an exact
+    /// True when the parked committed writer already left `self.db` as an exact
     /// row mirror for its committed sequence, so an equality-seq refresh
     /// should keep the current MemDatabase instead of rebuilding from storage.
     cached_write_txn_memdb_row_mirror_exact: Cell<bool>,
-    // ── bd-otbu1 / I1: Retained autocommit transaction for batched writes ───
-    /// Retained write transaction for autocommit fast path batching.
-    ///
-    /// Unlike `cached_write_txn` (for `:memory:`) which commits each statement,
-    /// this keeps the transaction UNCOMMITTED across multiple autocommit writes.
-    /// File-backed databases use it to batch commit/publish work, and private
-    /// `:memory:` connections can also use it when per-statement commit-side
-    /// maintenance is not required. Flushed on adaptive threshold (256 pure
-    /// writes, 16 mixed), read-after-write overlap, error, or connection close
-    /// (bd-m1nte / I2).
-    retained_autocommit_txn: RefCell<Option<TransactionKind>>,
-    /// Number of statements executed in the current retained autocommit batch.
-    /// Flush is triggered when this reaches the adaptive threshold (bd-m1nte / I2).
-    retained_autocommit_stmt_count: Cell<u32>,
-    /// Tables modified in the current retained autocommit batch (lowercased).
-    /// Used to detect read-after-write and trigger flush before SELECT.
-    retained_autocommit_dirty_tables: RefCell<HashSet<String>>,
-    /// Cached retained-overlay COUNT(*)+SUM(col) result for the current
-    /// uncommitted autocommit batch.
-    ///
-    /// The retained overlay is only used when this connection has private
-    /// uncommitted writes. Repeated aggregate reads between writes see the
-    /// same snapshot, so the first scan can seed this row and later reads can
-    /// return it without walking every B-tree cell again. Exact numeric INSERTs
-    /// update the cached row in place; other writes and every flush clear it
-    /// before it can observe stale rows.
-    retained_autocommit_count_sum_cache: RefCell<Option<RetainedAutocommitCountSumCache>>,
-    /// Cached retained-overlay indexed equality result for the current
-    /// uncommitted autocommit batch.
-    retained_autocommit_indexed_equality_cache:
-        RefCell<Option<RetainedAutocommitIndexedEqualityCache>>,
     /// Exact committed COUNT(*) results for private `:memory:` tables whose
     /// MemDatabase row mirror is deliberately lazy.
     ///
@@ -8973,28 +8749,6 @@ pub struct Connection {
     /// cache lets benchmark-style warmups pay that scan once and later
     /// query_row calls reuse it until the commit sequence or schema changes.
     storage_count_cache: RefCell<HashMap<i32, StorageCountCacheEntry>>,
-    /// Shape of the most recently prepared `COUNT(*) + SUM(col)` memory-table
-    /// aggregate eligible for retained-overlay caching.
-    ///
-    /// This is deliberately only an interest marker, not a result. If the first
-    /// retained autocommit write can be applied as an exact delta, we can seed
-    /// the aggregate from the still-clean `MemDatabase` mirror before applying
-    /// the delta. Without this marker, the first aggregate after a retained
-    /// write batch begins has to scan the transaction B-tree just to create the
-    /// cache used by later reads.
-    retained_autocommit_count_sum_interest: RefCell<Option<RetainedAutocommitCountSumInterest>>,
-    /// Set by a direct INSERT that has already applied an exact delta to
-    /// `retained_autocommit_count_sum_cache`. The following dirty-table mark
-    /// consumes this bit and preserves the cache instead of clearing it.
-    retained_autocommit_count_sum_cache_preserve_next_write: Cell<bool>,
-    /// bd-m1nte / I2: Number of write statements in the current retained batch.
-    retained_autocommit_write_count: Cell<u32>,
-    /// bd-m1nte / I2: Number of read statements observed since last flush.
-    /// A non-zero value indicates mixed workload → lower flush threshold.
-    retained_autocommit_read_count: Cell<u32>,
-    /// PRAGMA fsqlite.autocommit_retain: enable/disable retained autocommit
-    /// batching. Default: true.
-    autocommit_retain_enabled: Cell<bool>,
     /// Cached VDBE engine for reuse across autocommit statements.
     ///
     /// Instead of allocating a fresh `VdbeEngine` (21+ collection allocs) for
@@ -10115,17 +9869,7 @@ impl Connection {
             cached_write_txn: RefCell::new(None),
             cached_write_txn_cookie: Cell::new(0),
             cached_write_txn_memdb_row_mirror_exact: Cell::new(false),
-            retained_autocommit_txn: RefCell::new(None),
-            retained_autocommit_stmt_count: Cell::new(0),
-            retained_autocommit_dirty_tables: RefCell::new(HashSet::new()),
-            retained_autocommit_count_sum_cache: RefCell::new(None),
-            retained_autocommit_indexed_equality_cache: RefCell::new(None),
             storage_count_cache: RefCell::new(HashMap::new()),
-            retained_autocommit_count_sum_interest: RefCell::new(None),
-            retained_autocommit_count_sum_cache_preserve_next_write: Cell::new(false),
-            retained_autocommit_write_count: Cell::new(0),
-            retained_autocommit_read_count: Cell::new(0),
-            autocommit_retain_enabled: Cell::new(true),
             cached_vdbe_engine: RefCell::new(None),
             statement_parse_scratch: RefCell::new(StatementParseScratch::default()),
             prepared_direct_insert_record_scratch: RefCell::new(Vec::new()),
@@ -10544,17 +10288,7 @@ impl Connection {
             cached_write_txn: RefCell::new(None),
             cached_write_txn_cookie: Cell::new(0),
             cached_write_txn_memdb_row_mirror_exact: Cell::new(false),
-            retained_autocommit_txn: RefCell::new(None),
-            retained_autocommit_stmt_count: Cell::new(0),
-            retained_autocommit_dirty_tables: RefCell::new(HashSet::new()),
-            retained_autocommit_count_sum_cache: RefCell::new(None),
-            retained_autocommit_indexed_equality_cache: RefCell::new(None),
             storage_count_cache: RefCell::new(HashMap::new()),
-            retained_autocommit_count_sum_interest: RefCell::new(None),
-            retained_autocommit_count_sum_cache_preserve_next_write: Cell::new(false),
-            retained_autocommit_write_count: Cell::new(0),
-            retained_autocommit_read_count: Cell::new(0),
-            autocommit_retain_enabled: Cell::new(true),
             cached_vdbe_engine: RefCell::new(None),
             statement_parse_scratch: RefCell::new(StatementParseScratch::default()),
             prepared_direct_insert_record_scratch: RefCell::new(Vec::new()),
@@ -10989,15 +10723,6 @@ impl Connection {
             || !self.live_vtab_transactions.borrow().is_empty()
         {
             return Err(FrankenError::Busy);
-        }
-
-        // A retained autocommit batch still counts as an active pager
-        // transaction on the backend (`inner.active_transactions > 0`), so
-        // `export_database_bytes` will reject the export with Busy. Flush the
-        // retained batch before touching snapshots so the pager sees zero
-        // active txns by the time we ask it to copy the file.
-        if self.retained_autocommit_txn.borrow().is_some() {
-            self.flush_retained_autocommit_txn(cx).await?;
         }
 
         self.invalidate_cached_read_snapshot(cx).await;
@@ -15082,30 +14807,6 @@ impl Connection {
                 result?;
             }
         }
-        // bd-otbu1 / I1: Flush retained autocommit transaction on close.
-        // Unlike cached_write_txn, retained_autocommit_txn has UNCOMMITTED writes.
-        if let Some(mut retained) = self.retained_autocommit_txn.get_mut().take() {
-            let result = if close_memory_db {
-                retained.rollback(&cx).await
-            } else {
-                retained.commit(&cx).await
-            };
-            if !best_effort {
-                result?;
-            }
-            self.retained_autocommit_stmt_count.set(0);
-            self.retained_autocommit_dirty_tables.get_mut().clear();
-            self.retained_autocommit_count_sum_cache.get_mut().take();
-            self.retained_autocommit_indexed_equality_cache
-                .get_mut()
-                .take();
-            self.retained_autocommit_count_sum_cache_preserve_next_write
-                .set(false);
-            // bd-m1nte / I2: Reset adaptive flush counters on close.
-            self.retained_autocommit_write_count.set(0);
-            self.retained_autocommit_read_count.set(0);
-        }
-
         let live_vtab_txn_open = !self.live_vtab_transactions.get_mut().is_empty();
         let had_active_txn = self.active_txn.get_mut().is_some();
         let txn_was_open = *self.in_transaction.get_mut() || had_active_txn || live_vtab_txn_open;
@@ -16329,41 +16030,6 @@ impl Connection {
         }
         let op_cx = self.op_cx_after_background_status();
         if self
-            .retained_autocommit_overlay_dirty_fast_path(stmt)
-            .is_some()
-        {
-            let _overlay_entry_proof = stmt
-                .ensure_schema_unchanged_with_prebound_publication(&op_cx)
-                .await?;
-            if let Some(mut rows) = self
-                .try_execute_retained_autocommit_query_fast_path(stmt, params, &op_cx)
-                .await?
-            {
-                let fast_path =
-                    stmt.prepared_query_fast_path_metadata("retained overlay query fast path")?;
-                fast_path.record_query_hit();
-                if hot_path_profile_enabled() {
-                    FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
-                }
-                if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
-                    tracing::debug!(
-                        target: "fsqlite.execute_path",
-                        path = "fast",
-                        reason = "retained_autocommit_overlay_query",
-                    );
-                }
-                if stmt.distinct {
-                    let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
-                    dedup_rows_collated(&mut rows, &stmt.distinct_collations, &coll_snap);
-                }
-                if let Some(limit_clause) = stmt.post_distinct_limit.as_ref() {
-                    apply_limit_clause(&mut rows, limit_clause);
-                }
-                self.note_connection_statement_execution_count(1);
-                return Ok(rows);
-            }
-        }
-        if self
             .prepare_clean_memory_prepared_memdb_fast_path(stmt, &op_cx)
             .await?
             && let Some(mut rows) = self.try_execute_prepared_query_fast_path(stmt, params)?
@@ -16559,40 +16225,6 @@ impl Connection {
         if stmt.may_observe_change_tracking {
             self.sync_change_tracking_context();
         }
-        if self
-            .retained_autocommit_overlay_dirty_fast_path(stmt)
-            .is_some()
-        {
-            let op_cx = self.op_cx_after_background_status();
-            let _overlay_entry_proof = stmt
-                .ensure_schema_unchanged_with_prebound_publication(&op_cx)
-                .await?;
-            if let Some(rows) = self
-                .try_execute_retained_autocommit_query_fast_path(stmt, params, &op_cx)
-                .await?
-            {
-                let fast_path = stmt.prepared_query_fast_path_metadata(
-                    "retained overlay streaming query fast path",
-                )?;
-                fast_path.record_query_hit();
-                if hot_path_profile_enabled() {
-                    FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
-                }
-                if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
-                    tracing::debug!(
-                        target: "fsqlite.execute_path",
-                        path = "fast_streaming",
-                        reason = "retained_autocommit_overlay_query",
-                    );
-                }
-                self.note_connection_statement_execution_count(1);
-                for row in rows {
-                    f(&row)?;
-                }
-                return Ok(());
-            }
-        }
-
         let can_stream_with_row_handler = stmt.db.is_some()
             && stmt.deferred_query_statement.is_none()
             && !stmt.distinct
@@ -16685,34 +16317,6 @@ impl Connection {
             self.sync_change_tracking_context();
         }
         let op_cx = self.op_cx_after_background_status();
-        if self
-            .retained_autocommit_overlay_dirty_fast_path(stmt)
-            .is_some()
-        {
-            let _overlay_entry_proof = stmt
-                .ensure_schema_unchanged_with_prebound_publication(&op_cx)
-                .await?;
-            if let Some(row_outcome) = self
-                .try_execute_retained_autocommit_query_row_fast_path(stmt, params, &op_cx)
-                .await?
-            {
-                let fast_path =
-                    stmt.prepared_query_fast_path_metadata("retained overlay query row fast path")?;
-                fast_path.record_query_row_hit();
-                if hot_path_profile_enabled() {
-                    FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
-                }
-                if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
-                    tracing::debug!(
-                        target: "fsqlite.execute_path",
-                        path = "fast",
-                        reason = "retained_autocommit_overlay_query_row",
-                    );
-                }
-                self.note_connection_statement_execution_count(1);
-                return direct_query_row_outcome_result(row_outcome);
-            }
-        }
         if self
             .prepare_clean_memory_prepared_memdb_fast_path(stmt, &op_cx)
             .await?
@@ -16897,92 +16501,6 @@ impl Connection {
         row_result
     }
 
-    fn retained_autocommit_overlay_fast_path(
-        stmt: &PreparedStatement<'_>,
-    ) -> Option<RetainedAutocommitOverlayFastPath> {
-        let fast_path = stmt.prepared_query_fast_path.as_ref()?;
-        match fast_path {
-            PreparedQueryFastPath::SimpleCountStar { root_page } => {
-                Some(RetainedAutocommitOverlayFastPath::CountStar {
-                    root_page: *root_page,
-                })
-            }
-            PreparedQueryFastPath::SimpleCountStarSum {
-                root_page,
-                sum_column_index,
-                rowid_alias_column_index,
-            } => Some(RetainedAutocommitOverlayFastPath::CountStarSum {
-                root_page: *root_page,
-                sum_column_index: *sum_column_index,
-                rowid_alias_column_index: *rowid_alias_column_index,
-            }),
-            PreparedQueryFastPath::SimpleRowidLookup {
-                root_page,
-                parameter_index,
-                rowid_alias_column_index,
-            } => Some(RetainedAutocommitOverlayFastPath::RowidLookup {
-                root_page: *root_page,
-                parameter_index: *parameter_index,
-                rowid_alias_column_index: *rowid_alias_column_index,
-            }),
-            PreparedQueryFastPath::SimpleProjectedRowidLookup {
-                root_page,
-                parameter_index,
-                rowid_alias_column_index,
-                projections,
-            } => Some(RetainedAutocommitOverlayFastPath::ProjectedRowidLookup {
-                root_page: *root_page,
-                parameter_index: *parameter_index,
-                rowid_alias_column_index: *rowid_alias_column_index,
-                projections: Arc::clone(projections),
-            }),
-            PreparedQueryFastPath::SimpleIndexedEqualityLookup {
-                root_page,
-                column_index,
-                parameter_index,
-                rowid_alias_column_index,
-                projections,
-                ..
-            } => Some(RetainedAutocommitOverlayFastPath::IndexedEqualityLookup {
-                root_page: *root_page,
-                column_index: *column_index,
-                parameter_index: *parameter_index,
-                rowid_alias_column_index: *rowid_alias_column_index,
-                projections: projections.as_ref().map(Arc::clone),
-            }),
-            PreparedQueryFastPath::SimpleRowidRangeScan {
-                root_page,
-                lower_parameter_index,
-                upper_parameter_index,
-                rowid_alias_column_index,
-            } => Some(RetainedAutocommitOverlayFastPath::RowidRangeScan {
-                root_page: *root_page,
-                lower_parameter_index: *lower_parameter_index,
-                upper_parameter_index: *upper_parameter_index,
-                rowid_alias_column_index: *rowid_alias_column_index,
-            }),
-            PreparedQueryFastPath::SimpleCountStarRowidRange {
-                root_page,
-                lower_parameter_index,
-                upper_parameter_index,
-            } => Some(RetainedAutocommitOverlayFastPath::CountStarRowidRange {
-                root_page: *root_page,
-                lower_parameter_index: *lower_parameter_index,
-                upper_parameter_index: *upper_parameter_index,
-            }),
-            PreparedQueryFastPath::SimpleFullTableScan { .. }
-            | PreparedQueryFastPath::SimpleOrderByLimit { .. }
-            | PreparedQueryFastPath::SimpleLimitedScalarRowidSubquery { .. }
-            | PreparedQueryFastPath::SimpleCountLikePattern { .. }
-            | PreparedQueryFastPath::SimpleCountIndexedRowidProbe { .. }
-            | PreparedQueryFastPath::SimpleStringScalarProjection { .. }
-            | PreparedQueryFastPath::SimpleGroupConcatByColumn { .. }
-            | PreparedQueryFastPath::SimpleIndexedTwoTableJoin { .. }
-            | PreparedQueryFastPath::SimpleInnerJoinGroupedAggregate { .. }
-            | PreparedQueryFastPath::TopCategoryCteJoin { .. } => None,
-        }
-    }
-
     fn prepared_memdb_query_fast_path_ready_with_mode(
         &self,
         stmt: &PreparedStatement<'_>,
@@ -17008,7 +16526,6 @@ impl Connection {
         self.pager.is_memory()
             && !self.in_transaction.get()
             && !self.active_txn_is_open_or_borrowed()
-            && self.retained_autocommit_txn.borrow().is_none()
             && self.pending_memdb_direct_upserts.borrow().is_empty()
             && stmt.prepared_query_fast_path.is_some()
     }
@@ -17021,7 +16538,6 @@ impl Connection {
             && !self.in_transaction.get()
             && !self.active_txn_is_open_or_borrowed()
             && self.pending_memdb_direct_upserts.borrow().is_empty()
-            && self.retained_autocommit_dirty_tables.borrow().is_empty()
             && stmt.prepared_query_fast_path.is_some()
     }
 
@@ -17060,7 +16576,6 @@ impl Connection {
         !self.pager.is_memory()
             && !self.in_transaction.get()
             && !self.active_txn_is_open_or_borrowed()
-            && self.retained_autocommit_txn.borrow().is_none()
             && self.pending_memdb_direct_upserts.borrow().is_empty()
             && !self.memdb_requires_active_txn_reload.get()
             && stmt
@@ -17115,13 +16630,9 @@ impl Connection {
             return Ok(None);
         }
         if self
-            .retained_autocommit_txn
+            .pending_memdb_direct_upserts
             .try_borrow()
-            .map_or(true, |retained| retained.is_some())
-            || self
-                .pending_memdb_direct_upserts
-                .try_borrow()
-                .map_or(true, |pending| !pending.is_empty())
+            .map_or(true, |pending| !pending.is_empty())
         {
             return Ok(None);
         }
@@ -17187,899 +16698,6 @@ impl Connection {
             },
         );
         Ok(Some(count))
-    }
-
-    fn retained_autocommit_overlay_dirty_fast_path(
-        &self,
-        stmt: &PreparedStatement<'_>,
-    ) -> Option<RetainedAutocommitOverlayFastPath> {
-        if self.retained_autocommit_txn.borrow().is_none() {
-            return None;
-        }
-        let overlay = Self::retained_autocommit_overlay_fast_path(stmt)?;
-        let root_page_dirty = self
-            .table_schema_by_root_page(overlay.root_page())
-            .is_some_and(|table| {
-                self.retained_autocommit_dirty_tables
-                    .borrow()
-                    .contains(&table.name.to_lowercase())
-            });
-        let parsed_read_overlap = if root_page_dirty {
-            true
-        } else if let Some(statement) = &stmt.deferred_query_statement {
-            match statement.as_ref() {
-                Statement::Select(select) => {
-                    let read_tables = Self::extract_table_names_from_select(select);
-                    self.retained_autocommit_has_dirty_overlap(&read_tables)
-                }
-                _ => false,
-            }
-        } else {
-            match parse_single_statement(stmt.sql.as_ref()) {
-                Ok(Statement::Select(select)) => {
-                    let read_tables = Self::extract_table_names_from_select(&select);
-                    self.retained_autocommit_has_dirty_overlap(&read_tables)
-                }
-                _ => false,
-            }
-        };
-        let overlaps_dirty = root_page_dirty || parsed_read_overlap;
-        if overlaps_dirty { Some(overlay) } else { None }
-    }
-
-    fn record_retained_autocommit_overlay_hit(&self, read_shape: &'static str) {
-        if hot_path_profile_enabled() {
-            FSQLITE_RETAINED_AUTOCOMMIT_OVERLAY_HITS.fetch_add(1, AtomicOrdering::Relaxed);
-        }
-        tracing::debug!(
-            target: "fsqlite.retained_autocommit_overlay",
-            action = "hit",
-            overlay_reason = "same_connection_private_view",
-            read_shape,
-        );
-    }
-
-    fn record_retained_autocommit_overlay_miss(
-        &self,
-        read_shape: &'static str,
-        overlay_reason: &'static str,
-    ) {
-        if hot_path_profile_enabled() {
-            FSQLITE_RETAINED_AUTOCOMMIT_OVERLAY_MISSES.fetch_add(1, AtomicOrdering::Relaxed);
-        }
-        tracing::debug!(
-            target: "fsqlite.retained_autocommit_overlay",
-            action = "miss",
-            overlay_reason,
-            read_shape,
-        );
-    }
-
-    async fn decode_table_row_values_from_payload(
-        &self,
-        table: &TableSchema,
-        rowid: i64,
-        payload: &[u8],
-        rowid_alias_column_index: Option<usize>,
-    ) -> Result<Vec<SqliteValue>> {
-        if table.without_rowid {
-            return Err(FrankenError::NotImplemented(format!(
-                "retained autocommit overlay does not support WITHOUT ROWID table `{}`",
-                table.name
-            )));
-        }
-
-        let values = parse_record(payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "table `{}` rowid {rowid} payload is not a valid SQLite record",
-                table.name
-            ),
-        })?;
-        self.inflate_table_row_values_for_storage_reload(
-            table,
-            rowid,
-            &values,
-            rowid_alias_column_index,
-        )
-        .await
-    }
-
-    fn numeric_column_value_from_sqlite_value(value: SqliteValue) -> NumericColumnValue {
-        match value {
-            SqliteValue::Null => NumericColumnValue::Null,
-            SqliteValue::Integer(n) => NumericColumnValue::Integer(n),
-            SqliteValue::Float(f) => NumericColumnValue::Float(f),
-            SqliteValue::Text(_) | SqliteValue::Blob(_) => NumericColumnValue::NonNumeric,
-        }
-    }
-
-    async fn projected_table_row_numeric_sum_value_from_payload(
-        &self,
-        table: &TableSchema,
-        rowid: i64,
-        payload: &[u8],
-        rowid_alias_column_index: Option<usize>,
-        column_index: usize,
-    ) -> Result<NumericColumnValue> {
-        if table.without_rowid {
-            return Err(FrankenError::NotImplemented(format!(
-                "retained autocommit overlay does not support WITHOUT ROWID table `{}`",
-                table.name
-            )));
-        }
-
-        let projected =
-            parse_record_projected_column_offsets(payload, column_index, rowid_alias_column_index)
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "table `{}` rowid {rowid} payload is not a valid SQLite record",
-                        table.name
-                    ),
-                })?;
-        let column_count = projected.column_count;
-        let num_columns = table.columns.len();
-
-        if column_count > num_columns {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "table `{}` rowid {rowid} payload has {column_count} columns; expected at most {num_columns}",
-                    table.name
-                ),
-            });
-        }
-
-        if let Some(ipk_idx) = rowid_alias_column_index {
-            if column_count == num_columns {
-                let alias_offset = if ipk_idx == column_index {
-                    projected.primary.as_ref()
-                } else {
-                    projected.secondary.as_ref()
-                }
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "table `{}` rowid {rowid} payload is missing INTEGER PRIMARY KEY alias column",
-                        table.name
-                    ),
-                })?;
-                let alias_value =
-                    decode_column_from_offset(payload, alias_offset, record_profile_enabled())
-                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "table `{}` rowid {rowid} INTEGER PRIMARY KEY alias column is not a valid SQLite record value",
-                                table.name
-                            ),
-                        })?;
-                match alias_value {
-                    SqliteValue::Null => {}
-                    SqliteValue::Integer(encoded_rowid) if encoded_rowid == rowid => {}
-                    SqliteValue::Integer(encoded_rowid) => {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "table `{}` rowid {rowid} stores inconsistent INTEGER PRIMARY KEY alias value {encoded_rowid}",
-                                table.name
-                            ),
-                        });
-                    }
-                    other => {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "table `{}` rowid {rowid} stores non-integer INTEGER PRIMARY KEY alias value {other:?}",
-                                table.name
-                            ),
-                        });
-                    }
-                }
-            } else {
-                let values = self
-                    .decode_table_row_values_from_payload(
-                        table,
-                        rowid,
-                        payload,
-                        rowid_alias_column_index,
-                    )
-                    .await?;
-                let value = memdb_row_value_with_rowid_alias(
-                    rowid,
-                    &values,
-                    column_index,
-                    rowid_alias_column_index,
-                );
-                return Ok(Self::numeric_column_value_from_sqlite_value(value));
-            }
-
-            if column_index == ipk_idx {
-                return Ok(NumericColumnValue::Integer(rowid));
-            }
-        }
-
-        if column_index >= num_columns {
-            return Ok(NumericColumnValue::Null);
-        }
-
-        if let Some(column_offset) = projected.primary.as_ref() {
-            return decode_numeric_column_from_offset(payload, column_offset).ok_or_else(|| {
-                FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "table `{}` rowid {rowid} column {column_index} is not a valid SQLite record value",
-                        table.name
-                    ),
-                }
-            });
-        }
-
-        let default_value = match table
-            .columns
-            .get(column_index)
-            .and_then(|column| column.default_value.as_ref())
-        {
-            Some(default_sql) => {
-                self.evaluate_column_default_value(Some(default_sql))
-                    .await?
-            }
-            None => SqliteValue::Null,
-        };
-        Ok(Self::numeric_column_value_from_sqlite_value(default_value))
-    }
-
-    async fn projected_table_row_value_from_payload(
-        &self,
-        table: &TableSchema,
-        rowid: i64,
-        payload: &[u8],
-        rowid_alias_column_index: Option<usize>,
-        column_index: usize,
-        column_offsets: &mut Vec<ColumnOffset>,
-    ) -> Result<SqliteValue> {
-        if table.without_rowid {
-            return Err(FrankenError::NotImplemented(format!(
-                "retained autocommit overlay does not support WITHOUT ROWID table `{}`",
-                table.name
-            )));
-        }
-
-        let column_count = parse_record_header_into(payload, column_offsets).ok_or_else(|| {
-            FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "table `{}` rowid {rowid} payload is not a valid SQLite record",
-                    table.name
-                ),
-            }
-        })?;
-        let num_columns = table.columns.len();
-
-        if column_count > num_columns {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "table `{}` rowid {rowid} payload has {column_count} columns; expected at most {num_columns}",
-                    table.name
-                ),
-            });
-        }
-
-        if let Some(ipk_idx) = rowid_alias_column_index {
-            if column_count == num_columns {
-                let alias_offset =
-                    column_offsets
-                        .get(ipk_idx)
-                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "table `{}` rowid {rowid} payload is missing INTEGER PRIMARY KEY alias column",
-                                table.name
-                            ),
-                        })?;
-                let alias_value =
-                    decode_column_from_offset(payload, alias_offset, record_profile_enabled())
-                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "table `{}` rowid {rowid} INTEGER PRIMARY KEY alias column is not a valid SQLite record value",
-                                table.name
-                            ),
-                        })?;
-                match alias_value {
-                    SqliteValue::Null => {}
-                    SqliteValue::Integer(encoded_rowid) if encoded_rowid == rowid => {}
-                    SqliteValue::Integer(encoded_rowid) => {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "table `{}` rowid {rowid} stores inconsistent INTEGER PRIMARY KEY alias value {encoded_rowid}",
-                                table.name
-                            ),
-                        });
-                    }
-                    other => {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "table `{}` rowid {rowid} stores non-integer INTEGER PRIMARY KEY alias value {other:?}",
-                                table.name
-                            ),
-                        });
-                    }
-                }
-            } else {
-                let values = self
-                    .decode_table_row_values_from_payload(
-                        table,
-                        rowid,
-                        payload,
-                        rowid_alias_column_index,
-                    )
-                    .await?;
-                return Ok(memdb_row_value_with_rowid_alias(
-                    rowid,
-                    &values,
-                    column_index,
-                    rowid_alias_column_index,
-                ));
-            }
-
-            if column_index == ipk_idx {
-                return Ok(SqliteValue::Integer(rowid));
-            }
-        }
-
-        if column_index >= num_columns {
-            return Ok(SqliteValue::Null);
-        }
-
-        if let Some(column_offset) = column_offsets.get(column_index) {
-            return decode_column_from_offset(payload, column_offset, record_profile_enabled())
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "table `{}` rowid {rowid} column {column_index} is not a valid SQLite record value",
-                        table.name
-                    ),
-                });
-        }
-
-        let default_value = match table
-            .columns
-            .get(column_index)
-            .and_then(|column| column.default_value.as_ref())
-        {
-            Some(default_sql) => {
-                self.evaluate_column_default_value(Some(default_sql))
-                    .await?
-            }
-            None => SqliteValue::Null,
-        };
-        Ok(default_value)
-    }
-
-    async fn row_from_txn_payload(
-        &self,
-        table: &TableSchema,
-        rowid: i64,
-        payload: &[u8],
-        rowid_alias_column_index: Option<usize>,
-    ) -> Result<Row> {
-        Ok(Row {
-            values: self
-                .decode_table_row_values_from_payload(
-                    table,
-                    rowid,
-                    payload,
-                    rowid_alias_column_index,
-                )
-                .await?,
-        })
-    }
-
-    async fn row_from_txn_value_sources(
-        &self,
-        table: &TableSchema,
-        rowid: i64,
-        payload: &[u8],
-        rowid_alias_column_index: Option<usize>,
-        sources: &[PreparedMemValueSource],
-    ) -> Result<Row> {
-        let values = self
-            .decode_table_row_values_from_payload(table, rowid, payload, rowid_alias_column_index)
-            .await?;
-        Ok(row_from_memdb_value_sources(
-            rowid,
-            &values,
-            sources,
-            rowid_alias_column_index,
-        ))
-    }
-
-    async fn retained_autocommit_count_star_sum_row_in_txn(
-        &self,
-        cx: &Cx,
-        txn: &mut TransactionKind,
-        table: &TableSchema,
-        sum_column_index: usize,
-        rowid_alias_column_index: Option<usize>,
-    ) -> Result<(Row, i64)> {
-        let Some(root) = PageNumber::new(u32::try_from(table.root_page).unwrap_or(0)) else {
-            return Ok((
-                Row {
-                    values: vec![SqliteValue::Integer(0), SqliteValue::Null],
-                },
-                0,
-            ));
-        };
-        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
-        let mut count = 0_i64;
-        let mut sum_non_null_count = 0_i64;
-        let mut int_sum: i64 = 0;
-        let mut float_sum: f64 = 0.0;
-        let mut float_err = 0.0;
-        let mut all_int = true;
-        let mut int_overflowed = false;
-        let mut has_any_non_null = false;
-        let mut needs_fallback = false;
-
-        if cursor.first(cx).await? {
-            loop {
-                let value = {
-                    let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
-                    self.projected_table_row_numeric_sum_value_from_payload(
-                        table,
-                        rowid,
-                        payload.as_ref(),
-                        rowid_alias_column_index,
-                        sum_column_index,
-                    )
-                    .await?
-                };
-                count = count.checked_add(1).ok_or_else(|| {
-                    FrankenError::Internal(format!(
-                        "table row count exceeds i64 for root page {}",
-                        table.root_page
-                    ))
-                })?;
-                match value {
-                    NumericColumnValue::Null => {}
-                    NumericColumnValue::Integer(n) => {
-                        sum_non_null_count += 1;
-                        has_any_non_null = true;
-                        if all_int && !int_overflowed {
-                            if let Some(sum) = int_sum.checked_add(n) {
-                                int_sum = sum;
-                            } else {
-                                int_overflowed = true;
-                            }
-                        }
-                        #[allow(clippy::cast_precision_loss)]
-                        {
-                            kbn_step(&mut float_sum, &mut float_err, n as f64);
-                        }
-                    }
-                    NumericColumnValue::Float(f) => {
-                        sum_non_null_count += 1;
-                        has_any_non_null = true;
-                        all_int = false;
-                        kbn_step(&mut float_sum, &mut float_err, f);
-                    }
-                    NumericColumnValue::NonNumeric => {
-                        sum_non_null_count += 1;
-                        needs_fallback = true;
-                    }
-                }
-                if !cursor.next(cx).await? {
-                    break;
-                }
-            }
-        }
-
-        let sum = if needs_fallback {
-            let mut sum_values: Vec<SqliteValue> = Vec::new();
-            let mut column_offsets = Vec::new();
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
-            if cursor.first(cx).await? {
-                loop {
-                    let value = {
-                        let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
-                        self.projected_table_row_value_from_payload(
-                            table,
-                            rowid,
-                            payload.as_ref(),
-                            rowid_alias_column_index,
-                            sum_column_index,
-                            &mut column_offsets,
-                        )
-                        .await?
-                    };
-                    if !value.is_null() {
-                        sum_values.push(value);
-                    }
-                    if !cursor.next(cx).await? {
-                        break;
-                    }
-                }
-            }
-            let sum_refs = sum_values.iter().collect::<Vec<_>>();
-            self.compute_sum_aggregate_with_registry(&sum_refs)?
-        } else if !has_any_non_null {
-            SqliteValue::Null
-        } else if all_int && int_overflowed {
-            return Err(FrankenError::IntegerOverflow);
-        } else if all_int {
-            SqliteValue::Integer(int_sum)
-        } else {
-            SqliteValue::Float(float_sum + float_err)
-        };
-
-        Ok((
-            Row {
-                values: vec![SqliteValue::Integer(count), sum],
-            },
-            sum_non_null_count,
-        ))
-    }
-
-    async fn retained_autocommit_indexed_equality_rows_in_txn(
-        &self,
-        cx: &Cx,
-        txn: &mut TransactionKind,
-        table: &TableSchema,
-        column_index: usize,
-        probe_value: &SqliteValue,
-        rowid_alias_column_index: Option<usize>,
-        projections: Option<&[PreparedMemValueSource]>,
-    ) -> Result<Vec<Row>> {
-        let Some(root) = PageNumber::new(u32::try_from(table.root_page).unwrap_or(0)) else {
-            return Ok(Vec::new());
-        };
-        if let Some(rows) = self.retained_autocommit_indexed_equality_cache_rows(
-            table.root_page,
-            column_index,
-            probe_value,
-            rowid_alias_column_index,
-            projections,
-        ) {
-            return Ok(rows);
-        }
-        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
-        let mut rows = Vec::new();
-        let mut column_offsets = Vec::new();
-        if cursor.first(cx).await? {
-            loop {
-                let rowid = cursor.rowid(cx).await?;
-                let payload = cursor.payload(cx).await?;
-                let value = self
-                    .projected_table_row_value_from_payload(
-                        table,
-                        rowid,
-                        &payload,
-                        rowid_alias_column_index,
-                        column_index,
-                        &mut column_offsets,
-                    )
-                    .await?;
-                if value == *probe_value {
-                    rows.push(match projections {
-                        Some(projections) => {
-                            self.row_from_txn_value_sources(
-                                table,
-                                rowid,
-                                &payload,
-                                rowid_alias_column_index,
-                                projections,
-                            )
-                            .await?
-                        }
-                        None => {
-                            self.row_from_txn_payload(
-                                table,
-                                rowid,
-                                &payload,
-                                rowid_alias_column_index,
-                            )
-                            .await?
-                        }
-                    });
-                }
-                if !cursor.next(cx).await? {
-                    break;
-                }
-            }
-        }
-        self.store_retained_autocommit_indexed_equality_cache(
-            table.root_page,
-            column_index,
-            probe_value,
-            rowid_alias_column_index,
-            projections,
-            &rows,
-        );
-        Ok(rows)
-    }
-
-    async fn try_execute_retained_autocommit_query_fast_path(
-        &self,
-        stmt: &PreparedStatement<'_>,
-        params: &[SqliteValue],
-        cx: &Cx,
-    ) -> Result<Option<Vec<Row>>> {
-        let Some(overlay) = self.retained_autocommit_overlay_dirty_fast_path(stmt) else {
-            return Ok(None);
-        };
-        let read_shape = overlay.read_shape();
-        let Some(table) = self.table_schema_by_root_page(overlay.root_page()) else {
-            self.record_retained_autocommit_overlay_miss(read_shape, "missing_table_schema");
-            return Ok(None);
-        };
-        let maybe_rows = {
-            let mut retained = self.retained_autocommit_txn.borrow_mut();
-            let txn = retained.as_mut().ok_or_else(|| {
-                FrankenError::internal(
-                    "retained autocommit transaction disappeared before overlay query",
-                )
-            })?;
-            match overlay {
-                RetainedAutocommitOverlayFastPath::CountStar { .. } => {
-                    let count = self
-                        .count_btree_entries_in_txn(cx, txn, table.root_page, true)
-                        .await?;
-                    let count = i64::try_from(count).map_err(|_| {
-                        FrankenError::Internal(format!(
-                            "table row count exceeds i64 for root page {}",
-                            table.root_page
-                        ))
-                    })?;
-                    Some(vec![Row {
-                        values: vec![SqliteValue::Integer(count)],
-                    }])
-                }
-                RetainedAutocommitOverlayFastPath::CountStarSum {
-                    root_page,
-                    sum_column_index,
-                    rowid_alias_column_index,
-                } => {
-                    if let Some(row) = self.retained_autocommit_count_sum_cache_row(
-                        root_page,
-                        sum_column_index,
-                        rowid_alias_column_index,
-                    ) {
-                        Some(vec![row])
-                    } else {
-                        let (row, sum_non_null_count) = self
-                            .retained_autocommit_count_star_sum_row_in_txn(
-                                cx,
-                                txn,
-                                &table,
-                                sum_column_index,
-                                rowid_alias_column_index,
-                            )
-                            .await?;
-                        self.store_retained_autocommit_count_sum_cache(
-                            root_page,
-                            sum_column_index,
-                            rowid_alias_column_index,
-                            sum_non_null_count,
-                            &row,
-                        );
-                        Some(vec![row])
-                    }
-                }
-                RetainedAutocommitOverlayFastPath::RowidLookup {
-                    parameter_index,
-                    rowid_alias_column_index,
-                    ..
-                } => {
-                    let rowid = match params.get(parameter_index) {
-                        Some(SqliteValue::Integer(rowid)) => *rowid,
-                        _ => return Ok(None),
-                    };
-                    let Some(root) = PageNumber::new(u32::try_from(table.root_page).unwrap_or(0))
-                    else {
-                        return Ok(Some(Vec::new()));
-                    };
-                    let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
-                    if !cursor.table_move_to(cx, rowid).await?.is_found() {
-                        Some(Vec::new())
-                    } else {
-                        let payload = cursor.payload(cx).await?;
-                        Some(vec![
-                            self.row_from_txn_payload(
-                                &table,
-                                rowid,
-                                &payload,
-                                rowid_alias_column_index,
-                            )
-                            .await?,
-                        ])
-                    }
-                }
-                RetainedAutocommitOverlayFastPath::ProjectedRowidLookup {
-                    parameter_index,
-                    rowid_alias_column_index,
-                    projections,
-                    ..
-                } => {
-                    let rowid = match params.get(parameter_index) {
-                        Some(SqliteValue::Integer(rowid)) => *rowid,
-                        _ => return Ok(None),
-                    };
-                    let Some(root) = PageNumber::new(u32::try_from(table.root_page).unwrap_or(0))
-                    else {
-                        return Ok(Some(Vec::new()));
-                    };
-                    let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
-                    if !cursor.table_move_to(cx, rowid).await?.is_found() {
-                        Some(Vec::new())
-                    } else {
-                        let payload = cursor.payload(cx).await?;
-                        Some(vec![
-                            self.row_from_txn_value_sources(
-                                &table,
-                                rowid,
-                                &payload,
-                                rowid_alias_column_index,
-                                projections.as_ref(),
-                            )
-                            .await?,
-                        ])
-                    }
-                }
-                RetainedAutocommitOverlayFastPath::IndexedEqualityLookup {
-                    column_index,
-                    parameter_index,
-                    rowid_alias_column_index,
-                    projections,
-                    ..
-                } => {
-                    let Some(probe_value) = params.get(parameter_index) else {
-                        return Ok(None);
-                    };
-                    if matches!(probe_value, SqliteValue::Null) {
-                        Some(Vec::new())
-                    } else {
-                        let SqliteValue::Text(_) = probe_value else {
-                            return Ok(None);
-                        };
-                        Some(
-                            self.retained_autocommit_indexed_equality_rows_in_txn(
-                                cx,
-                                txn,
-                                &table,
-                                column_index,
-                                probe_value,
-                                rowid_alias_column_index,
-                                projections.as_deref(),
-                            )
-                            .await?,
-                        )
-                    }
-                }
-                RetainedAutocommitOverlayFastPath::RowidRangeScan {
-                    lower_parameter_index,
-                    upper_parameter_index,
-                    rowid_alias_column_index,
-                    ..
-                } => {
-                    let lower = match params.get(lower_parameter_index) {
-                        Some(SqliteValue::Integer(lower)) => *lower,
-                        _ => return Ok(None),
-                    };
-                    let upper = match params.get(upper_parameter_index) {
-                        Some(SqliteValue::Integer(upper)) => *upper,
-                        _ => return Ok(None),
-                    };
-                    if lower >= upper {
-                        Some(Vec::new())
-                    } else {
-                        let Some(root) =
-                            PageNumber::new(u32::try_from(table.root_page).unwrap_or(0))
-                        else {
-                            return Ok(Some(Vec::new()));
-                        };
-                        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
-                        let _ = cursor.table_move_to(cx, lower).await?;
-                        let mut rows = Vec::new();
-                        while !cursor.eof() {
-                            let rowid = cursor.rowid(cx).await?;
-                            if rowid >= upper {
-                                break;
-                            }
-                            let payload = cursor.payload(cx).await?;
-                            rows.push(
-                                self.row_from_txn_payload(
-                                    &table,
-                                    rowid,
-                                    &payload,
-                                    rowid_alias_column_index,
-                                )
-                                .await?,
-                            );
-                            if !cursor.next(cx).await? {
-                                break;
-                            }
-                        }
-                        Some(rows)
-                    }
-                }
-                RetainedAutocommitOverlayFastPath::CountStarRowidRange {
-                    lower_parameter_index,
-                    upper_parameter_index,
-                    ..
-                } => {
-                    let lower = match params.get(lower_parameter_index) {
-                        Some(SqliteValue::Integer(lower)) => *lower,
-                        _ => return Ok(None),
-                    };
-                    let upper = match params.get(upper_parameter_index) {
-                        Some(SqliteValue::Integer(upper)) => *upper,
-                        _ => return Ok(None),
-                    };
-                    let count = if lower >= upper {
-                        0_i64
-                    } else {
-                        let Some(root) =
-                            PageNumber::new(u32::try_from(table.root_page).unwrap_or(0))
-                        else {
-                            return Ok(Some(vec![Row {
-                                values: vec![SqliteValue::Integer(0)],
-                            }]));
-                        };
-                        let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
-                        let _ = cursor.table_move_to(cx, lower).await?;
-                        let mut count = 0_i64;
-                        while !cursor.eof() {
-                            let rowid = cursor.rowid(cx).await?;
-                            if rowid >= upper {
-                                break;
-                            }
-                            count = count.checked_add(1).ok_or_else(|| {
-                                FrankenError::Internal(format!(
-                                    "table row range count exceeds i64 for root page {}",
-                                    table.root_page
-                                ))
-                            })?;
-                            if !cursor.next(cx).await? {
-                                break;
-                            }
-                        }
-                        count
-                    };
-                    Some(vec![Row {
-                        values: vec![SqliteValue::Integer(count)],
-                    }])
-                }
-            }
-        };
-
-        match maybe_rows {
-            Some(rows) => {
-                if self.retained_autocommit_batch_active() {
-                    self.retained_autocommit_note_read();
-                }
-                self.record_retained_autocommit_overlay_hit(read_shape);
-                Ok(Some(rows))
-            }
-            None => {
-                self.record_retained_autocommit_overlay_miss(read_shape, "unsupported_params");
-                Ok(None)
-            }
-        }
-    }
-
-    async fn try_execute_retained_autocommit_query_row_fast_path(
-        &self,
-        stmt: &PreparedStatement<'_>,
-        params: Option<&[SqliteValue]>,
-        cx: &Cx,
-    ) -> Result<Option<QueryRowCollectionOutcome>> {
-        let empty_params = [];
-        let params = params.unwrap_or(&empty_params);
-        let Some(rows) = self
-            .try_execute_retained_autocommit_query_fast_path(stmt, params, cx)
-            .await?
-        else {
-            return Ok(None);
-        };
-        let outcome = match rows.len() {
-            0 => QueryRowCollectionOutcome::NoRows,
-            1 => QueryRowCollectionOutcome::Row(
-                rows.into_iter()
-                    .next()
-                    .expect("single-row retained overlay result must contain one row"),
-            ),
-            _ => QueryRowCollectionOutcome::MultipleRows,
-        };
-        Ok(Some(outcome))
     }
 
     fn prepared_indexed_equality_cache_key(
@@ -18388,13 +17006,12 @@ impl Connection {
         // Falls back to the registered sum aggregate for Text/Blob values so
         // their numeric coercion remains centralized. SUM only reports integer
         // overflow if the final aggregate stayed all-integer.
-        let (row, sum_non_null_count, cacheable) = {
+        let row = {
             let db = self.db.borrow();
             let Some(table) = db.get_table(root_page) else {
                 return Ok(None);
             };
             let mut count = 0_i64;
-            let mut sum_non_null_count = 0_i64;
             let mut int_sum: i64 = 0;
             let mut float_sum: f64 = 0.0;
             let mut float_err: f64 = 0.0;
@@ -18417,7 +17034,6 @@ impl Connection {
                 match &value {
                     SqliteValue::Null => {}
                     SqliteValue::Integer(n) => {
-                        sum_non_null_count += 1;
                         has_any_non_null = true;
                         if all_int && !int_overflowed {
                             match int_sum.checked_add(*n) {
@@ -18431,7 +17047,6 @@ impl Connection {
                         }
                     }
                     SqliteValue::Float(f) => {
-                        sum_non_null_count += 1;
                         has_any_non_null = true;
                         all_int = false;
                         kbn_step(&mut float_sum, &mut float_err, *f);
@@ -18444,7 +17059,7 @@ impl Connection {
                     }
                 }
             }
-            let (sum, cacheable) = if needs_fallback {
+            let sum = if needs_fallback {
                 // Rare path: Text/Blob values present. Use registered aggregate.
                 drop(db);
                 let registry = self.func_registry.borrow();
@@ -18467,44 +17082,20 @@ impl Connection {
                         sum_func.step(&mut sum_state, std::slice::from_ref(&value))?;
                     }
                 }
-                (sum_func.finalize(sum_state)?, false)
+                sum_func.finalize(sum_state)?
             } else if !has_any_non_null {
-                (SqliteValue::Null, true)
+                SqliteValue::Null
             } else if all_int && int_overflowed {
                 return Err(FrankenError::IntegerOverflow);
             } else if all_int {
-                (SqliteValue::Integer(int_sum), true)
+                SqliteValue::Integer(int_sum)
             } else {
-                (SqliteValue::Float(float_sum + float_err), true)
+                SqliteValue::Float(float_sum + float_err)
             };
-            (
-                Row {
-                    values: vec![SqliteValue::Integer(count), sum],
-                },
-                sum_non_null_count,
-                cacheable,
-            )
-        };
-        if cacheable && self.pager.is_memory() {
-            let cache_already_current = self
-                .retained_autocommit_count_sum_cache
-                .borrow()
-                .as_ref()
-                .is_some_and(|cache| {
-                    cache.matches(root_page, sum_column_index, rowid_alias_column_index)
-                        && cache.sum_non_null_count == sum_non_null_count
-                        && cache.row.values() == row.values()
-                });
-            if !cache_already_current {
-                self.store_retained_autocommit_count_sum_cache(
-                    root_page,
-                    sum_column_index,
-                    rowid_alias_column_index,
-                    sum_non_null_count,
-                    &row,
-                );
+            Row {
+                values: vec![SqliteValue::Integer(count), sum],
             }
-        }
+        };
         Ok(Some(row))
     }
 
@@ -19789,7 +18380,6 @@ impl Connection {
         &self,
         execution_cx: &Cx,
         statement_kind: &'static str,
-        dirty_table_name: Option<&str>,
         rollback_on_constraint_violation: bool,
         preserve_prior_changes_on_constraint_violation: bool,
         skip_statement_savepoint_in_explicit_txn: bool,
@@ -19882,10 +18472,9 @@ impl Connection {
         let autocommit_resolve_start =
             (direct_insert_autocommit_candidate && was_auto).then(Instant::now);
         let resolve_result = self
-            .resolve_autocommit_txn_with_dirty_table_and_capture_and_cx(
+            .resolve_autocommit_txn_with_capture_and_schema_boundary_and_cx(
                 was_auto,
                 execution_ok,
-                dirty_table_name,
                 capture_time_travel_snapshot,
                 false,
                 execution_cx,
@@ -20065,7 +18654,6 @@ impl Connection {
             .execute_prepared_dml_entry(
                 execution_cx,
                 "insert",
-                Some(table_name),
                 rollback_on_constraint_violation,
                 preserve_prior_changes_on_constraint_violation,
                 skip_statement_savepoint_in_explicit_txn,
@@ -20216,19 +18804,10 @@ impl Connection {
             );
         let ok = result.is_ok() || commit_autocommit_on_error;
         let autocommit_resolve_start = hot_path_profile_enabled().then(Instant::now);
-        if matches!(result.as_ref(), Ok(0)) {
-            // A zero-row direct INSERT (for example INSERT OR IGNORE on a
-            // duplicate key) did not mutate the table. If an earlier retained
-            // statement in the same parked batch already made the transaction
-            // dirty, the commit resolver will still run the retained parking
-            // branch; preserve any count+sum cache through that no-op mark.
-            self.preserve_retained_autocommit_count_sum_cache_for_noop_write();
-        }
         let resolve_result = self
-            .resolve_autocommit_txn_with_dirty_table_and_capture_and_cx(
+            .resolve_autocommit_txn_with_capture_and_schema_boundary_and_cx(
                 was_auto,
                 ok,
-                Some(table_name),
                 capture_time_travel_snapshot,
                 false,
                 execution_cx,
@@ -20340,7 +18919,6 @@ impl Connection {
             .execute_prepared_dml_entry(
                 execution_cx,
                 "insert",
-                Some(table_name),
                 rollback_on_constraint_violation,
                 preserve_prior_changes_on_constraint_violation,
                 skip_statement_savepoint_in_explicit_txn,
@@ -20843,7 +19421,6 @@ impl Connection {
             self.finish_prepared_direct_simple_insert_after_storage(
                 direct,
                 rowid,
-                conflict_action,
                 mem_row_values,
                 track_memdb_delta,
                 defer_memdb_upsert,
@@ -20861,7 +19438,6 @@ impl Connection {
         &self,
         direct: &PreparedDirectSimpleInsert,
         rowid: i64,
-        conflict_action: fsqlite_ast::ConflictAction,
         mem_row_values: &mut PreparedDirectInsertRowScratch,
         track_memdb_delta: bool,
         defer_memdb_upsert: bool,
@@ -20876,20 +19452,11 @@ impl Connection {
         {
             mem_row_values[ipk_idx] = SqliteValue::Integer(rowid);
         }
-        if !matches!(conflict_action, fsqlite_ast::ConflictAction::Replace) {
-            self.retained_autocommit_count_sum_cache_note_insert(
-                direct.root_page,
-                mem_row_values.as_slice(),
-            );
-        } else {
-            self.clear_retained_autocommit_count_sum_cache_for_root(direct.root_page);
-        }
         let memdb_apply_start = profile_enabled.then(Instant::now);
         if track_memdb_delta {
             // Explicit transactions still need exact deferred row deltas because
             // SAVEPOINT / in-txn reads can force a MemDatabase boundary before
-            // COMMIT. Autocommit `:memory:` writes do not: both retained-
-            // autocommit batches and the cached-write-txn fast path leave the
+            // COMMIT. The committed cached-write-txn fast path can leave the
             // compatibility mirror stale and repair it lazily on the next read
             // boundary.
             if used_preserialized_record {
@@ -21030,10 +19597,7 @@ impl Connection {
         let defer_lazy_memdb_materialization = track_memdb_delta
             && !defer_memdb_upsert
             && !direct_insert_requires_fk_check
-            && (self.pager.is_memory()
-                || (self.retained_autocommit_batch_active()
-                    && self.retained_autocommit_stmt_count.get()
-                        < self.adaptive_flush_threshold()));
+            && self.pager.is_memory();
         let can_use_prebuilt_constant_record = direct.prebuilt_constant_record.is_some()
             && (!track_memdb_delta || defer_lazy_memdb_materialization);
         let can_use_prebuilt_constant_record =
@@ -21057,17 +19621,14 @@ impl Connection {
                 self.eval_prepared_direct_simple_insert_explicit_rowid_only(direct, params)?;
         } else {
             mem_row_values.clear();
-            let retained_autocommit_direct_batch = self.retained_autocommit_batch_active()
-                && self.retained_autocommit_stmt_count.get() < self.adaptive_flush_threshold();
             let can_try_preserialized_record = self.pager.is_memory()
-                && (self.in_transaction.get() || retained_autocommit_direct_batch)
+                && self.in_transaction.get()
                 && (!track_memdb_delta || defer_lazy_memdb_materialization)
                 && !direct_insert_requires_fk_check
                 && !matches!(
                     direct.or_conflict,
                     Some(fsqlite_ast::ConflictAction::Replace)
-                )
-                && self.retained_autocommit_count_sum_cache.borrow().is_none();
+                );
             if can_try_preserialized_record {
                 let maybe_record_scratch = {
                     let mut record_scratch =
@@ -21204,8 +19765,7 @@ impl Connection {
             && !matches!(
                 direct.or_conflict,
                 Some(fsqlite_ast::ConflictAction::Replace)
-            )
-            && self.retained_autocommit_count_sum_cache.borrow().is_none();
+            );
         if self.pending_direct_insert_page_run_requires_flush_before_insert(
             direct,
             explicit_rowid,
@@ -21242,14 +19802,10 @@ impl Connection {
                     &FSQLITE_PREPARED_DIRECT_INSERT_BTREE_INSERT_TIME_NS,
                     btree_insert_start,
                 );
-                let conflict_action = direct
-                    .or_conflict
-                    .unwrap_or(fsqlite_ast::ConflictAction::Abort);
                 return Ok(Some(
                     self.finish_prepared_direct_simple_insert_after_storage(
                         direct,
                         rowid,
-                        conflict_action,
                         &mut mem_row_values,
                         track_memdb_delta,
                         defer_memdb_upsert,
@@ -21542,12 +20098,8 @@ impl Connection {
             return Ok((0, false));
         }
 
-        self.maybe_seed_retained_autocommit_count_sum_cache_from_clean_memdb(direct.root_page);
-        let cache_tracks_root =
-            self.retained_autocommit_count_sum_cache_tracks_root(direct.root_page);
-        let can_skip_old_payload_decode = !cache_tracks_root && direct.assigns_all_non_ipk_columns;
-        if !cache_tracks_root
-            && prepared_direct_update_fixed_real_for_bench_enabled()
+        let can_skip_old_payload_decode = direct.assigns_all_non_ipk_columns;
+        if prepared_direct_update_fixed_real_for_bench_enabled()
             && let Some(outcome) = self
                 .try_execute_prepared_direct_simple_update_fixed_width_real(
                     execution_cx,
@@ -21577,10 +20129,9 @@ impl Connection {
             lazy_new_values = self.prepared_direct_update_row_scratch.borrow_mut();
             &mut *lazy_new_values
         };
-        let old_cached_sum_value = if can_skip_old_payload_decode {
+        if can_skip_old_payload_decode {
             new_values.clear();
             new_values.resize(direct.columns.len(), SqliteValue::Null);
-            None
         } else {
             cursor.payload_into(execution_cx, payload_buf).await?;
 
@@ -21599,16 +20150,7 @@ impl Connection {
                 new_values.push(SqliteValue::Null);
             }
             new_values.truncate(direct.columns.len());
-            if cache_tracks_root {
-                self.retained_autocommit_count_sum_cache_project_value(
-                    direct.root_page,
-                    rowid,
-                    new_values.as_slice(),
-                )
-            } else {
-                None
-            }
-        };
+        }
 
         // Apply each SET assignment with column-affinity coercion and NOT NULL
         // validation. IPK columns cannot appear here (gate rejects).
@@ -21617,16 +20159,6 @@ impl Connection {
                 direct, params, *col_idx, set_value,
             )?;
         }
-        let new_cached_sum_value = if cache_tracks_root {
-            self.retained_autocommit_count_sum_cache_project_value(
-                direct.root_page,
-                rowid,
-                new_values.as_slice(),
-            )
-        } else {
-            None
-        };
-
         // Re-NULL out IPK storage slots so the serialized record matches the
         // insert path (value comes from the btree key).
         for (col_idx, column) in direct.columns.iter().enumerate() {
@@ -21658,12 +20190,6 @@ impl Connection {
                 .table_insert_prechecked_absent(execution_cx, rowid, record_scratch.as_slice())
                 .await?;
         }
-        self.retained_autocommit_count_sum_cache_note_update(
-            direct.root_page,
-            old_cached_sum_value,
-            new_cached_sum_value,
-        );
-
         Ok((1, true))
     }
 
@@ -21759,7 +20285,6 @@ impl Connection {
                         .fetch_add(1, AtomicOrdering::Relaxed);
                 }
                 self.store_pending_direct_update_leaf_patch_run(direct, patch.column_index, run);
-                self.retained_autocommit_count_sum_cache_note_update(direct.root_page, None, None);
                 return Ok(Some((1, true)));
             }
         }
@@ -21812,7 +20337,6 @@ impl Connection {
                 .await?;
         }
 
-        self.retained_autocommit_count_sum_cache_note_update(direct.root_page, None, None);
         Ok(Some((1, true)))
     }
 
@@ -22028,35 +20552,10 @@ impl Connection {
                 }
                 self.store_pending_direct_delete_leaf_run(direct, run);
                 self.qf_record_delete(root_page, rowid);
-                self.retained_autocommit_count_sum_cache_note_delete(root_page, None);
                 return Ok((1, true));
             }
         }
 
-        self.maybe_seed_retained_autocommit_count_sum_cache_from_clean_memdb(root_page);
-        let tracks_count_sum_cache =
-            self.retained_autocommit_count_sum_cache_tracks_root(root_page);
-        let old_cached_sum_value = if tracks_count_sum_cache {
-            let _statement_scratch_reset = PreparedDirectInsertScratchResetGuard { conn: self };
-            let mut payload_buf = self.prepared_direct_insert_cell_scratch.borrow_mut();
-            payload_buf.clear();
-            cursor.payload_into(execution_cx, &mut payload_buf).await?;
-            let mut old_values = self.prepared_direct_update_row_scratch.borrow_mut();
-            old_values.clear();
-            parse_record_into(&payload_buf, &mut old_values).ok_or_else(|| {
-                FrankenError::DatabaseCorrupt {
-                    detail: "prepared direct delete: failed to parse existing row payload"
-                        .to_owned(),
-                }
-            })?;
-            self.retained_autocommit_count_sum_cache_project_value(
-                root_page,
-                rowid,
-                old_values.as_slice(),
-            )
-        } else {
-            None
-        };
         let physical_delete_start = profile_direct_delete.then(Instant::now);
         let delete_result = cursor.delete(execution_cx).await;
         record_hot_path_duration(
@@ -22066,7 +20565,6 @@ impl Connection {
         delete_result?;
         // IMPL-9a: maintenance — filter now learns the rowid is absent.
         self.qf_record_delete(root_page, rowid);
-        self.retained_autocommit_count_sum_cache_note_delete(root_page, old_cached_sum_value);
         Ok((1, true))
     }
 
@@ -22994,7 +21492,6 @@ impl Connection {
         }
 
         let fast_path = stmt.prepared_update_delete_fast_path()?;
-        let table_name = fast_path.table_name.as_str();
         let has_direct_shape = match kind {
             PreparedDmlKind::Update => fast_path.direct_simple_update.is_some(),
             PreparedDmlKind::Delete => fast_path.direct_simple_delete.is_some(),
@@ -23067,19 +21564,10 @@ impl Connection {
                 Err(error) if error_is_constraint_violation(error)
             );
         let ok = result.is_ok() || commit_autocommit_on_error;
-        if matches!(result.as_ref(), Ok(0)) {
-            // Direct rowid UPDATE/DELETE can be a true no-op. In a retained
-            // autocommit batch with older pending writes, the resolver still
-            // sees a dirty transaction and parks it again; do not let that
-            // bookkeeping invalidate an aggregate cache for a table that this
-            // statement did not change.
-            self.preserve_retained_autocommit_count_sum_cache_for_noop_write();
-        }
         let resolve_result = self
-            .resolve_autocommit_txn_with_dirty_table_and_capture_and_cx(
+            .resolve_autocommit_txn_with_capture_and_schema_boundary_and_cx(
                 was_auto,
                 ok,
-                Some(table_name),
                 false,
                 false,
                 execution_cx,
@@ -23225,8 +21713,6 @@ impl Connection {
                 .execute_prepared_dml_entry(
                     execution_cx,
                     kind.statement_kind(),
-                    stmt.precompiled_dml()
-                        .map(|dispatch| dispatch.table_name.as_str()),
                     rollback_on_constraint_violation,
                     preserve_prior_changes_on_constraint_violation,
                     vdbe_skip_statement_savepoint_in_explicit_txn,
@@ -23290,12 +21776,6 @@ impl Connection {
                     .execute_prepared_dml_entry(
                         execution_cx,
                         kind.statement_kind(),
-                        stmt.precompiled_dml()
-                            .map(|dispatch| dispatch.table_name.as_str())
-                            .or_else(|| {
-                                stmt.prepared_update_delete_fast_path()
-                                    .map(|fast_path| fast_path.table_name.as_str())
-                            }),
                         rollback_on_constraint_violation,
                         preserve_prior_changes_on_constraint_violation,
                         vdbe_skip_statement_savepoint_in_explicit_txn,
@@ -23375,12 +21855,6 @@ impl Connection {
             .execute_prepared_dml_entry(
                 execution_cx,
                 kind.statement_kind(),
-                stmt.precompiled_dml()
-                    .map(|dispatch| dispatch.table_name.as_str())
-                    .or_else(|| {
-                        stmt.prepared_update_delete_fast_path()
-                            .map(|fast_path| fast_path.table_name.as_str())
-                    }),
                 rollback_on_constraint_violation,
                 preserve_prior_changes_on_constraint_violation,
                 vdbe_skip_statement_savepoint_in_explicit_txn,
@@ -24002,27 +22476,8 @@ impl Connection {
 
     /// Commit epoch used for prepared-template cache identity, both on insert
     /// and on lookup.
-    ///
-    /// When a retained (deferred-finalization) autocommit transaction is pending
-    /// on this connection, the finalized `stable_commit_seq` floor has not yet
-    /// advanced to cover that write even though the template was compiled
-    /// against its (already MemDB-visible) row image. `next_commit_seq` is the
-    /// sequence the retained commit will eventually claim, so folding it in via
-    /// `max` keeps insert and lookup observing the *same* epoch while the
-    /// retained transaction is still pending — without it the insert recorded a
-    /// higher epoch (`next`) than the immediate lookup compared against
-    /// (`stable`), so every freshly inserted template missed and was evicted on
-    /// the very next lookup. Computing the epoch identically on both paths is
-    /// what makes the entry reusable; a cross-connection commit still raises
-    /// `stable_commit_seq` past this value, so the bd-#70 stale-read wedge keeps
-    /// invalidating non-direct-DML plans.
     fn prepared_cache_commit_epoch(&self) -> u64 {
-        let stable = self.current_global_commit_seq().get();
-        if self.retained_autocommit_txn.borrow().is_some() {
-            stable.max(self.next_commit_seq.load(AtomicOrdering::Acquire))
-        } else {
-            stable
-        }
+        self.current_global_commit_seq().get()
     }
 
     fn lookup_prepared_cache(&self, key: u64, sql: &str) -> Option<Arc<PreparedCacheEntry>> {
@@ -24056,10 +22511,9 @@ impl Connection {
     ) -> Arc<PreparedCacheEntry> {
         // bd-#70 plan-cache epoch wedge: snapshot the current finalized commit
         // epoch so cross-connection commits invalidate the template at the next
-        // lookup (see `matches_cache_identity`). The retained-autocommit fold is
-        // applied identically here and in `lookup_prepared_cache` via
-        // `prepared_cache_commit_epoch`, so a freshly inserted template hits on
-        // its very next lookup while a retained write is still pending.
+        // lookup (see `matches_cache_identity`). Use the same helper here and
+        // in `lookup_prepared_cache` so a freshly inserted template can hit on
+        // its next lookup while the finalized epoch is unchanged.
         let commit_epoch = self.prepared_cache_commit_epoch();
         let mut cache = self.prepared_cache.borrow_mut();
         let entry = Arc::new(PreparedCacheEntry {
@@ -24485,438 +22939,6 @@ impl Connection {
         }
     }
 
-    fn retained_autocommit_batch_active(&self) -> bool {
-        self.retained_autocommit_stmt_count.get() > 0
-    }
-
-    fn clear_retained_autocommit_count_sum_cache(&self) {
-        self.retained_autocommit_count_sum_cache.borrow_mut().take();
-        self.retained_autocommit_count_sum_cache_preserve_next_write
-            .set(false);
-    }
-
-    fn clear_retained_autocommit_count_sum_cache_for_root(&self, root_page: i32) {
-        let cleared = {
-            let mut cache_slot = self.retained_autocommit_count_sum_cache.borrow_mut();
-            let should_clear = cache_slot
-                .as_ref()
-                .is_some_and(|cache| cache.root_page == root_page);
-            if should_clear {
-                cache_slot.take();
-            }
-            should_clear
-        };
-        if cleared {
-            self.retained_autocommit_count_sum_cache_preserve_next_write
-                .set(false);
-        }
-    }
-
-    fn clear_retained_autocommit_indexed_equality_cache(&self) {
-        self.retained_autocommit_indexed_equality_cache
-            .borrow_mut()
-            .take();
-    }
-
-    fn retained_autocommit_indexed_equality_cache_rows(
-        &self,
-        root_page: i32,
-        column_index: usize,
-        probe_value: &SqliteValue,
-        rowid_alias_column_index: Option<usize>,
-        projections: Option<&[PreparedMemValueSource]>,
-    ) -> Option<Vec<Row>> {
-        self.retained_autocommit_indexed_equality_cache
-            .borrow()
-            .as_ref()
-            .filter(|cache| {
-                cache.matches(
-                    root_page,
-                    column_index,
-                    probe_value,
-                    rowid_alias_column_index,
-                    projections,
-                )
-            })
-            .map(|cache| cache.rows.clone())
-    }
-
-    fn store_retained_autocommit_indexed_equality_cache(
-        &self,
-        root_page: i32,
-        column_index: usize,
-        probe_value: &SqliteValue,
-        rowid_alias_column_index: Option<usize>,
-        projections: Option<&[PreparedMemValueSource]>,
-        rows: &[Row],
-    ) {
-        *self.retained_autocommit_indexed_equality_cache.borrow_mut() =
-            Some(RetainedAutocommitIndexedEqualityCache {
-                root_page,
-                column_index,
-                probe_value: probe_value.clone(),
-                rowid_alias_column_index,
-                projections: projections.map(Arc::from),
-                rows: rows.to_vec(),
-            });
-    }
-
-    fn remember_retained_autocommit_count_sum_interest(
-        &self,
-        root_page: i32,
-        sum_column_index: usize,
-        rowid_alias_column_index: Option<usize>,
-    ) {
-        if !self.pager.is_memory() {
-            return;
-        }
-        *self.retained_autocommit_count_sum_interest.borrow_mut() =
-            Some(RetainedAutocommitCountSumInterest {
-                root_page,
-                sum_column_index,
-                rowid_alias_column_index,
-                schema_cookie: self.schema_cookie(),
-                schema_generation: self.schema_generation(),
-            });
-    }
-
-    fn finish_retained_autocommit_count_sum_cache_flush(&self, commit_succeeded: bool) {
-        if commit_succeeded && self.pager.is_memory() {
-            self.retained_autocommit_count_sum_cache_preserve_next_write
-                .set(false);
-        } else {
-            self.clear_retained_autocommit_count_sum_cache();
-        }
-    }
-
-    fn retained_autocommit_count_sum_cache_row(
-        &self,
-        root_page: i32,
-        sum_column_index: usize,
-        rowid_alias_column_index: Option<usize>,
-    ) -> Option<Row> {
-        self.retained_autocommit_count_sum_cache
-            .borrow()
-            .as_ref()
-            .filter(|cache| cache.matches(root_page, sum_column_index, rowid_alias_column_index))
-            .map(|cache| cache.row.clone())
-    }
-
-    fn store_retained_autocommit_count_sum_cache(
-        &self,
-        root_page: i32,
-        sum_column_index: usize,
-        rowid_alias_column_index: Option<usize>,
-        sum_non_null_count: i64,
-        row: &Row,
-    ) {
-        *self.retained_autocommit_count_sum_cache.borrow_mut() =
-            Some(RetainedAutocommitCountSumCache {
-                root_page,
-                sum_column_index,
-                rowid_alias_column_index,
-                sum_non_null_count,
-                row: row.clone(),
-            });
-    }
-
-    fn preserve_retained_autocommit_count_sum_cache_for_noop_write(&self) {
-        if self.retained_autocommit_count_sum_cache.borrow().is_some() {
-            self.retained_autocommit_count_sum_cache_preserve_next_write
-                .set(true);
-        }
-    }
-
-    fn maybe_seed_retained_autocommit_count_sum_cache_from_clean_memdb(&self, root_page: i32) {
-        if !self.pager.is_memory()
-            || self.in_transaction.get()
-            || !self.memdb_storage_count_shortcuts_safe.get()
-            || self.retained_autocommit_stmt_count.get() != 0
-            || self.retained_autocommit_count_sum_cache.borrow().is_some()
-        {
-            return;
-        }
-        let Some((sum_column_index, rowid_alias_column_index)) = self
-            .retained_autocommit_count_sum_interest
-            .borrow()
-            .as_ref()
-            .and_then(|interest| interest.matches_current(self, root_page))
-        else {
-            return;
-        };
-        let _ =
-            self.prepared_count_star_sum_row(root_page, sum_column_index, rowid_alias_column_index);
-    }
-
-    fn retained_autocommit_count_sum_cache_note_insert(
-        &self,
-        root_page: i32,
-        values: &[SqliteValue],
-    ) {
-        self.maybe_seed_retained_autocommit_count_sum_cache_from_clean_memdb(root_page);
-        let mut cache_slot = self.retained_autocommit_count_sum_cache.borrow_mut();
-        let Some(cache) = cache_slot.as_mut() else {
-            return;
-        };
-        if cache.root_page != root_page {
-            return;
-        }
-        let Some(sum_value) = values.get(cache.sum_column_index) else {
-            drop(cache_slot);
-            self.clear_retained_autocommit_count_sum_cache_for_root(root_page);
-            return;
-        };
-        if Self::retained_autocommit_count_sum_cache_apply_insert_delta(
-            &mut cache.row,
-            &mut cache.sum_non_null_count,
-            sum_value,
-        ) {
-            self.retained_autocommit_count_sum_cache_preserve_next_write
-                .set(true);
-        } else {
-            drop(cache_slot);
-            self.clear_retained_autocommit_count_sum_cache_for_root(root_page);
-        }
-    }
-
-    fn retained_autocommit_count_sum_cache_apply_insert_delta(
-        row: &mut Row,
-        sum_non_null_count: &mut i64,
-        sum_value: &SqliteValue,
-    ) -> bool {
-        let [count_value, sum_slot] = row.values.as_mut_slice() else {
-            return false;
-        };
-        let SqliteValue::Integer(count) = count_value else {
-            return false;
-        };
-        let Some(next_count) = count.checked_add(1) else {
-            return false;
-        };
-
-        let (next_sum, non_null_delta) = match (sum_slot.clone(), sum_value) {
-            (current, SqliteValue::Null) => (current, 0),
-            (SqliteValue::Null, SqliteValue::Integer(n)) => (SqliteValue::Integer(*n), 1),
-            (SqliteValue::Integer(current), SqliteValue::Integer(n)) => {
-                if let Some(sum) = current.checked_add(*n) {
-                    (SqliteValue::Integer(sum), 1)
-                } else {
-                    return false;
-                }
-            }
-            (SqliteValue::Float(current), SqliteValue::Integer(n)) =>
-            {
-                #[allow(clippy::cast_precision_loss)]
-                (SqliteValue::Float(current + *n as f64), 1)
-            }
-            (SqliteValue::Null, SqliteValue::Float(n)) => (SqliteValue::Float(*n), 1),
-            (SqliteValue::Integer(current), SqliteValue::Float(n)) =>
-            {
-                #[allow(clippy::cast_precision_loss)]
-                (SqliteValue::Float(current as f64 + *n), 1)
-            }
-            (SqliteValue::Float(current), SqliteValue::Float(n)) => {
-                (SqliteValue::Float(current + *n), 1)
-            }
-            _ => return false,
-        };
-
-        let Some(next_non_null_count) = sum_non_null_count.checked_add(non_null_delta) else {
-            return false;
-        };
-        *count_value = SqliteValue::Integer(next_count);
-        *sum_non_null_count = next_non_null_count;
-        *sum_slot = next_sum;
-        true
-    }
-
-    fn retained_autocommit_count_sum_cache_project_value(
-        &self,
-        root_page: i32,
-        rowid: i64,
-        values: &[SqliteValue],
-    ) -> Option<SqliteValue> {
-        let cache_slot = self.retained_autocommit_count_sum_cache.borrow();
-        let cache = cache_slot.as_ref()?;
-        if cache.root_page != root_page {
-            return None;
-        }
-        if cache.rowid_alias_column_index == Some(cache.sum_column_index) {
-            Some(SqliteValue::Integer(rowid))
-        } else {
-            values.get(cache.sum_column_index).cloned()
-        }
-    }
-
-    fn retained_autocommit_count_sum_cache_tracks_root(&self, root_page: i32) -> bool {
-        self.retained_autocommit_count_sum_cache
-            .borrow()
-            .as_ref()
-            .is_some_and(|cache| cache.root_page == root_page)
-    }
-
-    fn retained_autocommit_count_sum_cache_note_update(
-        &self,
-        root_page: i32,
-        old_sum_value: Option<SqliteValue>,
-        new_sum_value: Option<SqliteValue>,
-    ) {
-        let mut cache_slot = self.retained_autocommit_count_sum_cache.borrow_mut();
-        let Some(cache) = cache_slot.as_mut() else {
-            return;
-        };
-        if cache.root_page != root_page {
-            return;
-        }
-        let (Some(old_sum_value), Some(new_sum_value)) = (old_sum_value, new_sum_value) else {
-            drop(cache_slot);
-            self.clear_retained_autocommit_count_sum_cache_for_root(root_page);
-            return;
-        };
-        if Self::retained_autocommit_count_sum_cache_apply_update_delta(
-            &mut cache.row,
-            &mut cache.sum_non_null_count,
-            &old_sum_value,
-            &new_sum_value,
-        ) {
-            self.retained_autocommit_count_sum_cache_preserve_next_write
-                .set(true);
-        } else {
-            drop(cache_slot);
-            self.clear_retained_autocommit_count_sum_cache_for_root(root_page);
-        }
-    }
-
-    fn retained_autocommit_count_sum_cache_note_delete(
-        &self,
-        root_page: i32,
-        old_sum_value: Option<SqliteValue>,
-    ) {
-        let mut cache_slot = self.retained_autocommit_count_sum_cache.borrow_mut();
-        let Some(cache) = cache_slot.as_mut() else {
-            return;
-        };
-        if cache.root_page != root_page {
-            return;
-        }
-        let Some(old_sum_value) = old_sum_value else {
-            drop(cache_slot);
-            self.clear_retained_autocommit_count_sum_cache_for_root(root_page);
-            return;
-        };
-        if Self::retained_autocommit_count_sum_cache_apply_delete_delta(
-            &mut cache.row,
-            &mut cache.sum_non_null_count,
-            &old_sum_value,
-        ) {
-            self.retained_autocommit_count_sum_cache_preserve_next_write
-                .set(true);
-        } else {
-            drop(cache_slot);
-            self.clear_retained_autocommit_count_sum_cache_for_root(root_page);
-        }
-    }
-
-    fn retained_autocommit_count_sum_cache_integer_value(
-        value: &SqliteValue,
-    ) -> Option<RetainedCountSumIntegerValue> {
-        match value {
-            SqliteValue::Null => Some(RetainedCountSumIntegerValue::Null),
-            SqliteValue::Integer(n) => Some(RetainedCountSumIntegerValue::Integer(*n)),
-            _ => None,
-        }
-    }
-
-    fn retained_autocommit_count_sum_cache_apply_update_delta(
-        row: &mut Row,
-        sum_non_null_count: &mut i64,
-        old_sum_value: &SqliteValue,
-        new_sum_value: &SqliteValue,
-    ) -> bool {
-        let old_value = match Self::retained_autocommit_count_sum_cache_integer_value(old_sum_value)
-        {
-            Some(value) => value,
-            None => return false,
-        };
-        let new_value = match Self::retained_autocommit_count_sum_cache_integer_value(new_sum_value)
-        {
-            Some(value) => value,
-            None => return false,
-        };
-        let [_, sum_slot] = row.values.as_mut_slice() else {
-            return false;
-        };
-
-        let current_sum = match sum_slot {
-            SqliteValue::Null if *sum_non_null_count == 0 => 0,
-            SqliteValue::Integer(n) => *n,
-            _ => return false,
-        };
-        let next_non_null_count = *sum_non_null_count + i64::from(new_value.is_non_null())
-            - i64::from(old_value.is_non_null());
-        if next_non_null_count < 0 {
-            return false;
-        }
-
-        let old_delta = old_value.unwrap_or_zero();
-        let new_delta = new_value.unwrap_or_zero();
-        let Some(next_sum) = current_sum
-            .checked_sub(old_delta)
-            .and_then(|sum| sum.checked_add(new_delta))
-        else {
-            return false;
-        };
-        *sum_non_null_count = next_non_null_count;
-        *sum_slot = if next_non_null_count == 0 {
-            SqliteValue::Null
-        } else {
-            SqliteValue::Integer(next_sum)
-        };
-        true
-    }
-
-    fn retained_autocommit_count_sum_cache_apply_delete_delta(
-        row: &mut Row,
-        sum_non_null_count: &mut i64,
-        old_sum_value: &SqliteValue,
-    ) -> bool {
-        let old_value = match Self::retained_autocommit_count_sum_cache_integer_value(old_sum_value)
-        {
-            Some(value) => value,
-            None => return false,
-        };
-        let [count_value, sum_slot] = row.values.as_mut_slice() else {
-            return false;
-        };
-        let SqliteValue::Integer(count) = count_value else {
-            return false;
-        };
-        let Some(next_count) = count.checked_sub(1) else {
-            return false;
-        };
-        let current_sum = match sum_slot {
-            SqliteValue::Null if *sum_non_null_count == 0 => 0,
-            SqliteValue::Integer(n) => *n,
-            _ => return false,
-        };
-        let next_non_null_count = *sum_non_null_count - i64::from(old_value.is_non_null());
-        if next_non_null_count < 0 {
-            return false;
-        }
-
-        let Some(next_sum) = current_sum.checked_sub(old_value.unwrap_or_zero()) else {
-            return false;
-        };
-        *count_value = SqliteValue::Integer(next_count);
-        *sum_non_null_count = next_non_null_count;
-        *sum_slot = if next_non_null_count == 0 {
-            SqliteValue::Null
-        } else {
-            SqliteValue::Integer(next_sum)
-        };
-        true
-    }
-
     fn should_use_statement_savepoint(
         &self,
         was_auto: bool,
@@ -24925,7 +22947,7 @@ impl Connection {
         self.active_txn_is_open_or_borrowed()
             && self.internal_statement_savepoint_depth.get() == 0
             && !preserve_prior_changes_on_constraint_violation
-            && (!was_auto || self.retained_autocommit_batch_active())
+            && !was_auto
     }
 
     /// Execute a parsed statement, handling both DDL (CREATE TABLE) and
@@ -25156,33 +23178,6 @@ impl Connection {
             {
                 self.invalidate_cached_write_txn(&op_cx).await;
             }
-            let retained_boundary_flush_required = self.retained_autocommit_txn.borrow().is_some()
-                && (schema_change_boundary
-                    || matches!(
-                        statement.as_ref(),
-                        Statement::Pragma(_)
-                            | Statement::Vacuum(_)
-                            | Statement::Attach(_)
-                            | Statement::Detach(_)
-                    ));
-            if retained_boundary_flush_required {
-                // Schema/pager boundaries must not reuse a parked retained
-                // autocommit batch because they need a fresh durable view.
-                self.flush_retained_autocommit_txn(&op_cx).await?;
-            }
-            // bd-otbu1 / I1: Flush retained autocommit if read touches dirty tables.
-            // This preserves read-after-write semantics for any retained batch.
-            if !is_txn_control
-                && !is_write
-                && self.retained_autocommit_txn.borrow().is_some()
-                && matches!(statement.as_ref(), Statement::Select(select) if {
-                    // Extract table names from the SELECT's FROM clause.
-                    let read_tables = Self::extract_table_names_from_select(select);
-                    self.retained_autocommit_has_dirty_overlap(&read_tables)
-                })
-            {
-                self.flush_retained_autocommit_txn_for_read(&op_cx).await?;
-            }
             let was_auto = if is_txn_control {
                 false // transaction-control manages its own transactions
             } else if is_write {
@@ -25207,11 +23202,6 @@ impl Connection {
                     self.txn_metrics_note_write();
                 } else if matches!(statement.as_ref(), Statement::Select(_)) {
                     self.txn_metrics_note_read();
-                    // bd-m1nte / I2: Track reads during an active retained batch
-                    // to detect mixed workloads and lower the flush threshold.
-                    if self.retained_autocommit_batch_active() {
-                        self.retained_autocommit_note_read();
-                    }
                 }
             }
             let use_statement_savepoint = self.should_use_statement_savepoint(
@@ -25292,11 +23282,6 @@ impl Connection {
                 // autocommit statement must commit them rather than roll back.
                 || matches!(result.as_ref(), Err(FrankenError::RaiseFail(_))));
             let ok = result.is_ok() || commit_autocommit_on_error;
-            let dirty_table_name = if is_write {
-                Self::extract_written_table_name(statement.as_ref())
-            } else {
-                None
-            };
             // bd-xvv8f: an autocommit DDL statement applies its connection-local
             // schema mutation (and bumps `schema_cookie`) eagerly, before the
             // implicit commit below. If that commit fails — e.g. a concurrent writer
@@ -25314,10 +23299,9 @@ impl Connection {
                 self.force_full_schema_reload_once.set(true);
             }
             let resolve_result = self
-                .resolve_autocommit_txn_with_dirty_table_and_capture_and_cx(
+                .resolve_autocommit_txn_with_capture_and_schema_boundary_and_cx(
                     was_auto,
                     ok,
-                    dirty_table_name,
                     capture_time_travel_snapshot,
                     schema_change_boundary,
                     &op_cx,
@@ -25327,12 +23311,6 @@ impl Connection {
                 self.force_full_schema_reload_once.set(false);
             }
             resolve_result?;
-            if ok && writable_schema_dml {
-                let flush_retained = self.retained_autocommit_txn.borrow().is_some();
-                if flush_retained {
-                    self.flush_retained_autocommit_txn(&op_cx).await?;
-                }
-            }
             if statement_reuse_enabled || compat_trace_profile_enabled {
                 let elapsed_ns = execution_started
                     .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
@@ -27748,7 +25726,7 @@ impl Connection {
         S: std::ops::AsyncFnMut(&JoinTableSource) -> Result<Option<Vec<Vec<SqliteValue>>>>,
     {
         let prep_cx = self.op_cx_after_background_status();
-        self.prepare_streaming_join_select_read_boundary(select_stmt, &prep_cx)
+        self.prepare_streaming_join_select_read_boundary(&prep_cx)
             .await?;
         let Some(prepared) = self
             .prepare_simple_join_select_rows_with_scanner(
@@ -27766,11 +25744,7 @@ impl Connection {
         Ok(true)
     }
 
-    async fn prepare_streaming_join_select_read_boundary(
-        &self,
-        select_stmt: &fsqlite_ast::SelectStatement,
-        cx: &Cx,
-    ) -> Result<()> {
+    async fn prepare_streaming_join_select_read_boundary(&self, cx: &Cx) -> Result<()> {
         let pending_memdb_direct_upserts = !self.pending_memdb_direct_upserts.borrow().is_empty();
         let should_refresh_active_txn_memdb = self.active_txn.borrow().is_some()
             && (self.memdb_requires_active_txn_reload.get()
@@ -27784,16 +25758,9 @@ impl Connection {
         self.refresh_memdb_from_cached_write_txn_if_stale(cx)
             .await?;
 
-        if self.retained_autocommit_txn.borrow().is_some() {
-            let read_tables = Self::extract_table_names_from_select(select_stmt);
-            if self.retained_autocommit_has_dirty_overlap(&read_tables) {
-                self.flush_retained_autocommit_txn_for_read(cx).await?;
-            }
-        }
-
         if self.pager.is_memory() {
             // :memory: read boundaries must not blindly reload from pager
-            // because a parked local txn may still be authoritative. The
+            // because a parked committed writer may still be authoritative. The
             // targeted repairs above are the safe fast path for this mode.
             return Ok(());
         }
@@ -30026,7 +27993,6 @@ impl Connection {
             && self.prepared_update_can_skip_statement_savepoint_in_explicit_txn(update);
         PreparedUpdateDeleteFastPath {
             kind: PreparedDmlKind::Update,
-            table_name: table_name.to_owned(),
             rollback_on_constraint_violation: update.or_conflict
                 == Some(fsqlite_ast::ConflictAction::Rollback),
             preserve_prior_changes_on_constraint_violation: update.or_conflict
@@ -30067,7 +28033,6 @@ impl Connection {
         };
         PreparedUpdateDeleteFastPath {
             kind: PreparedDmlKind::Delete,
-            table_name: table_name.to_owned(),
             rollback_on_constraint_violation: false,
             preserve_prior_changes_on_constraint_violation: false,
             skip_statement_savepoint_in_explicit_txn: static_fallback_reason.is_none()
@@ -32294,11 +30259,6 @@ impl Connection {
         };
 
         let sum_column_index = select_table_column_index(table, table_label, sum_arg)?;
-        self.remember_retained_autocommit_count_sum_interest(
-            table.root_page,
-            sum_column_index,
-            rowid_alias_column_index,
-        );
         Some(PreparedQueryFastPath::SimpleCountStarSum {
             root_page: table.root_page,
             sum_column_index,
@@ -33920,7 +31880,7 @@ impl Connection {
             return Ok(None);
         }
         let prep_cx = self.op_cx_after_background_status();
-        self.prepare_streaming_join_select_read_boundary(select_stmt, &prep_cx)
+        self.prepare_streaming_join_select_read_boundary(&prep_cx)
             .await?;
         let prepared = self
             .prepare_simple_join_select_rows_with_scanner(
@@ -37061,13 +35021,16 @@ impl Connection {
         let begin_setup_start = hot_path_profile_enabled().then(Instant::now);
         let is_concurrent = mode == TransactionMode::Concurrent;
 
-        // Persistent write transaction reuse: if we have a cached write
-        // transaction from a prior :memory: autocommit write, reuse it.
+        // Persistent committed-writer reuse: if we have a cached write
+        // transaction from a prior :memory: autocommit write, reuse it for the
+        // next statement, including reads. A read must stay on this handle so
+        // it observes the committed pages retained in the transaction read
+        // cache; finalizing the handle and immediately opening a fresh reader
+        // can otherwise bind to a stale pager-cache image.
         // The transaction was committed via commit_and_retain() — its write-set
         // is cleared but the pager writer state remains active, so we skip
         // pager.begin() + Mutex lock entirely.
         if self.pager.is_memory()
-            && mode != TransactionMode::ReadOnly
             && self.cached_write_txn.borrow().is_some()
             && self.cached_write_txn_cookie.get() == *self.schema_cookie.borrow()
         {
@@ -37078,12 +35041,14 @@ impl Connection {
                     "cached write transaction missing despite reuse guard".to_string(),
                 )
             })?;
-            self.cached_write_txn_memdb_row_mirror_exact.set(false);
+            if mode != TransactionMode::ReadOnly {
+                self.cached_write_txn_memdb_row_mirror_exact.set(false);
+            }
             *self.active_txn.borrow_mut() = Some(txn);
             self.concurrent_txn.set(false);
             *self.concurrent_session_id.borrow_mut() = None;
             self.txn_metrics_mark_started();
-            if hot_path_profile_enabled() {
+            if mode != TransactionMode::ReadOnly && hot_path_profile_enabled() {
                 FSQLITE_CACHED_WRITE_TXN_REUSES.fetch_add(1, AtomicOrdering::Relaxed);
             }
             record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
@@ -37092,46 +35057,6 @@ impl Connection {
 
         // Discard stale cached write transaction if present.
         self.invalidate_cached_write_txn(cx).await;
-
-        // bd-otbu1 / I1: Retained autocommit transaction reuse for batched
-        // writes. Unlike cached_write_txn which commits each statement, this
-        // keeps writes UNCOMMITTED across multiple autocommit statements.
-        if mode != TransactionMode::ReadOnly
-            && self.autocommit_retain_enabled.get()
-            && self.retained_autocommit_txn.borrow().is_some()
-        {
-            // Invalidate any stale read snapshot first.
-            self.invalidate_cached_read_snapshot(cx).await;
-            let txn = self
-                .retained_autocommit_txn
-                .borrow_mut()
-                .take()
-                .ok_or_else(|| {
-                    FrankenError::Internal(
-                        "retained autocommit transaction missing despite reuse guard".to_string(),
-                    )
-                })?;
-            *self.active_txn.borrow_mut() = Some(txn);
-            // Retained autocommit always uses serialized mode (not concurrent)
-            // to simplify conflict handling within the retained batch.
-            self.concurrent_txn.set(false);
-            *self.concurrent_session_id.borrow_mut() = None;
-            self.txn_metrics_mark_started();
-            if hot_path_profile_enabled() {
-                FSQLITE_RETAINED_AUTOCOMMIT_REUSES.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
-            return Ok(true);
-        }
-
-        // Discard stale retained autocommit transaction if present but not reusable.
-        if self.retained_autocommit_txn.borrow().is_some() {
-            // Flush rather than discard to preserve uncommitted writes.
-            if let Err(error) = self.flush_retained_autocommit_txn(cx).await {
-                record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
-                return Err(error);
-            }
-        }
 
         // Persistent read-only snapshot reuse: if we have a cached read-only
         // pager transaction from a prior autocommit SELECT, reuse it instead
@@ -37335,7 +35260,7 @@ impl Connection {
     async fn invalidate_cached_write_txn(&self, cx: &Cx) {
         let invalidated_cached_writer =
             if let Some(mut txn) = self.cached_write_txn.borrow_mut().take() {
-                // The retained transaction has already committed its write-set.
+                // The cached transaction has already committed its write-set.
                 // We need to finalize it properly (release writer state in pager).
                 let _ = txn.commit(cx).await;
                 true
@@ -37346,111 +35271,6 @@ impl Connection {
         if invalidated_cached_writer {
             self.clear_prepared_direct_insert_append_hint();
         }
-    }
-
-    // ── bd-otbu1 / I1: Retained autocommit transaction methods ───────────────
-
-    /// Flush the retained autocommit transaction: commit and clear state.
-    /// Called when: adaptive threshold reached, read-after-write, error, connection close.
-    async fn flush_retained_autocommit_txn(&self, cx: &Cx) -> Result<()> {
-        let Some(txn) = self.retained_autocommit_txn.borrow_mut().take() else {
-            return Ok(());
-        };
-        if hot_path_profile_enabled() {
-            FSQLITE_RETAINED_AUTOCOMMIT_FLUSHES.fetch_add(1, AtomicOrdering::Relaxed);
-        }
-
-        if self.active_txn.borrow().is_some() {
-            *self.retained_autocommit_txn.borrow_mut() = Some(txn);
-            return Err(FrankenError::internal(
-                "cannot flush retained autocommit transaction while another transaction is active",
-            ));
-        }
-
-        *self.active_txn.borrow_mut() = Some(txn);
-        let pending_flush_result = self.flush_pending_direct_write_runs(cx).await;
-        let Some(mut txn) = self.active_txn.borrow_mut().take() else {
-            return Err(FrankenError::internal(
-                "retained autocommit transaction disappeared during pending write flush",
-            ));
-        };
-        if let Err(error) = pending_flush_result {
-            *self.retained_autocommit_txn.borrow_mut() = Some(txn);
-            return Err(error);
-        }
-
-        let txn_had_pending_writes = txn.has_pending_writes();
-        // Commit the accumulated writes. If that fails, match the normal
-        // autocommit cleanup path by explicitly rolling the pager txn back and
-        // restoring the MemDatabase mirror before we clear connection state.
-        let commit_result = match txn.commit(cx).await {
-            Ok(()) => Ok(()),
-            Err(commit_error) => {
-                let rollback_result = txn.rollback(cx).await;
-                let rollback_succeeded = rollback_result.is_ok();
-                match rollback_result {
-                    Ok(()) => {
-                        let reload_result = if txn_had_pending_writes && rollback_succeeded {
-                            self.reload_memdb_from_pager(cx).await
-                        } else {
-                            Ok(())
-                        };
-                        match reload_result {
-                            Ok(()) => Err(commit_error),
-                            Err(reload_error) => Err(reload_error),
-                        }
-                    }
-                    Err(rollback_error) => Err(rollback_error),
-                }
-            }
-        };
-        // Clear state regardless of commit outcome.
-        self.clear_pending_memdb_direct_upserts();
-        self.retained_autocommit_stmt_count.set(0);
-        self.retained_autocommit_dirty_tables.borrow_mut().clear();
-        self.finish_retained_autocommit_count_sum_cache_flush(commit_result.is_ok());
-        self.clear_retained_autocommit_indexed_equality_cache();
-        self.clear_prepared_direct_insert_append_hint();
-        // bd-m1nte / I2: Reset adaptive flush counters.
-        self.retained_autocommit_write_count.set(0);
-        self.retained_autocommit_read_count.set(0);
-        // Advance commit clock if commit succeeded.
-        if commit_result.is_ok() {
-            if !self.pager.is_memory() && self.pager.journal_mode() == JournalMode::Wal {
-                self.pager.checkpoint(cx, CheckpointMode::Passive).await?;
-            }
-            let committed_seq = self.advance_commit_clock_without_memdb_visibility();
-            self.finish_commit_clock(committed_seq);
-            self.memdb_storage_count_shortcuts_safe.set(false);
-            self.memdb_rows_loaded.set(false);
-            self.emit_differential_commit_invalidations(committed_seq);
-        }
-        commit_result
-    }
-
-    /// Flush retained autocommit transaction due to read-after-write.
-    /// Called before SELECT when dirty tables overlap with tables being read.
-    async fn flush_retained_autocommit_txn_for_read(&self, cx: &Cx) -> Result<()> {
-        if self.retained_autocommit_txn.borrow().is_none() {
-            return Ok(());
-        }
-        if hot_path_profile_enabled() {
-            FSQLITE_RETAINED_AUTOCOMMIT_READ_AFTER_WRITE_FLUSHES
-                .fetch_add(1, AtomicOrdering::Relaxed);
-        }
-        self.flush_retained_autocommit_txn(cx).await?;
-        // A read is about to execute against this connection, so eagerly
-        // realign the local execution image with the freshly committed pager
-        // state instead of depending on a later begin-time staleness check.
-        self.reload_memdb_from_pager(cx).await
-    }
-
-    /// Check if any tables in the read set overlap with the retained dirty set.
-    fn retained_autocommit_has_dirty_overlap(&self, read_tables: &[String]) -> bool {
-        let dirty = self.retained_autocommit_dirty_tables.borrow();
-        read_tables
-            .iter()
-            .any(|t| dirty.contains(&t.to_lowercase()))
     }
 
     async fn finish_prepared_read_autocommit(
@@ -37475,42 +35295,6 @@ impl Connection {
         self.refresh_memdb_from_cached_write_txn_if_stale(cx)
             .await?;
 
-        if self.retained_autocommit_txn.borrow().is_some() {
-            // bd-m1nte / I2: Track reads from prepared statements for adaptive threshold.
-            if self.retained_autocommit_batch_active() {
-                self.retained_autocommit_note_read();
-            }
-            let statement = if let Some(statement) = &stmt.deferred_query_statement {
-                Arc::clone(statement)
-            } else {
-                self.cached_parse_single(stmt.sql.as_ref())?
-            };
-
-            if let Statement::Select(select) = statement.as_ref() {
-                let read_tables = Self::extract_table_names_from_select(select);
-                if self.retained_autocommit_has_dirty_overlap(&read_tables) {
-                    let overlay_fast_path = Self::retained_autocommit_overlay_fast_path(stmt);
-                    let read_shape = overlay_fast_path
-                        .as_ref()
-                        .map(RetainedAutocommitOverlayFastPath::read_shape)
-                        .unwrap_or("generic_select");
-                    if overlay_fast_path.is_none() {
-                        self.record_retained_autocommit_overlay_miss(
-                            read_shape,
-                            "unsupported_read_shape",
-                        );
-                    }
-                    tracing::debug!(
-                        target: "fsqlite.retained_autocommit_overlay",
-                        action = "flush",
-                        flush_reason = "dirty_overlap_prepared_read",
-                        read_shape,
-                    );
-                    self.flush_retained_autocommit_txn_for_read(cx).await?;
-                }
-            }
-        }
-
         if self.committed_pager_refresh_allowed() {
             let hydrate_file_backed_fast_path = stmt
                 .prepared_query_fast_path
@@ -37532,78 +35316,13 @@ impl Connection {
         }
 
         // Match the generic statement path: establish an autocommit read
-        // snapshot after any retained-autocommit flush so prepared reads see
-        // the same pager/memdb view as ad-hoc SELECT execution.
+        // snapshot so prepared reads see the same pager/memdb view as ad-hoc
+        // SELECT execution.
         self.ensure_autocommit_txn_mode_with_cx(TransactionMode::ReadOnly, cx, None)
             .await
     }
 
-    /// Mark a table as dirty in the retained autocommit batch.
-    fn retained_autocommit_mark_dirty(&self, table_name: &str) {
-        let table_name = table_name.to_lowercase();
-        self.retained_autocommit_dirty_tables
-            .borrow_mut()
-            .insert(table_name.clone());
-        self.clear_retained_autocommit_indexed_equality_cache();
-
-        let dirty_root_page = self
-            .schema
-            .borrow()
-            .iter()
-            .find(|table| table.name.eq_ignore_ascii_case(&table_name))
-            .map(|table| table.root_page);
-        let preserve_next = self
-            .retained_autocommit_count_sum_cache_preserve_next_write
-            .replace(false);
-        let should_clear = self
-            .retained_autocommit_count_sum_cache
-            .borrow()
-            .as_ref()
-            .is_some_and(|cache| {
-                let dirty_matches_cache = dirty_root_page
-                    .map(|root_page| root_page == cache.root_page)
-                    .unwrap_or(true);
-                let exact_insert_delta_already_applied =
-                    preserve_next && dirty_root_page == Some(cache.root_page);
-                dirty_matches_cache && !exact_insert_delta_already_applied
-            });
-        if should_clear {
-            self.clear_retained_autocommit_count_sum_cache();
-        }
-    }
-
-    /// bd-m1nte / I2: Compute adaptive flush threshold based on workload pattern.
-    ///
-    /// - Pure INSERT/UPDATE/DELETE workload (no reads): 256 statements
-    /// - Mixed read/write workload: 16 statements (read-after-write consistency)
-    ///
-    /// Immediate flush on error is handled separately in the error-park path.
-    fn adaptive_flush_threshold(&self) -> u32 {
-        if self.retained_autocommit_read_count.get() > 0 {
-            // Mixed workload: low threshold for read-after-write consistency.
-            16
-        } else {
-            // Pure write workload: high threshold for throughput.
-            256
-        }
-    }
-
-    /// bd-m1nte / I2: Record a write statement in the retained autocommit batch.
-    fn retained_autocommit_note_write(&self) {
-        self.retained_autocommit_write_count
-            .set(self.retained_autocommit_write_count.get() + 1);
-    }
-
-    /// bd-m1nte / I2: Record a read statement observed while a retained batch is active.
-    fn retained_autocommit_note_read(&self) {
-        self.retained_autocommit_read_count
-            .set(self.retained_autocommit_read_count.get() + 1);
-    }
-
-    /// Extract table names from a SELECT statement for retained dirty overlap
-    /// checks. This must recurse through derived tables, CTE bodies, compound
-    /// SELECTs, and scalar subqueries so read-after-write detection cannot be
-    /// bypassed by wrapping a dirty-table read in another query shape.
+    /// Extract table names from a SELECT statement.
     fn extract_table_names_from_select(select: &SelectStatement) -> Vec<String> {
         let mut tables = Vec::new();
         let _ = visit_select_qualified_names(select, &mut |name| {
@@ -37611,19 +35330,6 @@ impl Connection {
             Ok(())
         });
         tables
-    }
-
-    /// Extract the table name being written by a DML statement.
-    fn extract_written_table_name(statement: &Statement) -> Option<&str> {
-        match statement {
-            // InsertStatement.table is QualifiedName
-            Statement::Insert(insert) => Some(insert.table.name.as_str()),
-            // UpdateStatement.table is QualifiedTableRef whose .name is QualifiedName
-            Statement::Update(update) => Some(update.table.name.name.as_str()),
-            // DeleteStatement.table is QualifiedTableRef whose .name is QualifiedName
-            Statement::Delete(delete) => Some(delete.table.name.name.as_str()),
-            _ => None,
-        }
     }
 
     fn statement_is_writable_schema_dml(&self, statement: &Statement) -> bool {
@@ -38247,7 +35953,6 @@ impl Connection {
             && self.in_transaction.get()
             && self.savepoints.borrow().is_empty()
             && self.internal_statement_savepoint_depth.get() == 0
-            && self.retained_autocommit_count_sum_cache.borrow().is_none()
     }
 
     fn store_pending_direct_delete_leaf_run(
@@ -38270,7 +35975,6 @@ impl Connection {
             && self.in_transaction.get()
             && self.savepoints.borrow().is_empty()
             && self.internal_statement_savepoint_depth.get() == 0
-            && self.retained_autocommit_count_sum_cache.borrow().is_none()
     }
 
     fn staged_direct_delete_leaf_runs_accept(
@@ -38447,7 +36151,6 @@ impl Connection {
                     .fetch_add(1, AtomicOrdering::Relaxed);
             }
             self.qf_record_delete(direct.root_page, rowid);
-            self.retained_autocommit_count_sum_cache_note_delete(direct.root_page, None);
             Ok(Some((1, true)))
         } else {
             if profile_delete_leaf_run {
@@ -38547,7 +36250,6 @@ impl Connection {
                 FSQLITE_PREPARED_DIRECT_UPDATE_LEAF_PATCH_RUN_ACTIVE_HITS
                     .fetch_add(1, AtomicOrdering::Relaxed);
             }
-            self.retained_autocommit_count_sum_cache_note_update(direct.root_page, None, None);
             Ok(Some((1, true)))
         } else {
             if profile_update_leaf_patch_run {
@@ -38959,11 +36661,11 @@ impl Connection {
         &self,
         hint: Option<PreparedDirectInsertAppendHint>,
     ) {
-        // Keep the hint inside explicit transactions and across retained
-        // :memory: autocommit commits. The latter reuses the same writer txn,
-        // so clearing the right-edge leaf hint would force the next statement
-        // back through a fresh `cursor.last()` walk for an otherwise monotonic
-        // append workload.
+        // Keep the hint inside explicit transactions and across committed
+        // cached-writer reuse on `:memory:`. The latter reuses the same writer
+        // handle, so clearing the right-edge leaf hint would force the next
+        // statement back through a fresh `cursor.last()` walk for an otherwise
+        // monotonic append workload.
         let retain_for_memory_autocommit = self.pager.is_memory() && !self.in_transaction.get();
         if !self.in_transaction.get() && !retain_for_memory_autocommit {
             self.clear_prepared_direct_insert_append_hint();
@@ -39039,10 +36741,9 @@ impl Connection {
         capture_time_travel_snapshot: bool,
         cx: &Cx,
     ) -> Result<()> {
-        self.resolve_autocommit_txn_with_dirty_table_and_capture_and_cx(
+        self.resolve_autocommit_txn_with_capture_and_schema_boundary_and_cx(
             was_auto,
             ok,
-            None,
             capture_time_travel_snapshot,
             false,
             cx,
@@ -39053,11 +36754,10 @@ impl Connection {
     // Distinct lifecycle flags; refactoring into an enum would obscure the
     // independent autocommit/ok/capture/schema-boundary axes.
     #[allow(clippy::fn_params_excessive_bools)]
-    async fn resolve_autocommit_txn_with_dirty_table_and_capture_and_cx(
+    async fn resolve_autocommit_txn_with_capture_and_schema_boundary_and_cx(
         &self,
         was_auto: bool,
         ok: bool,
-        dirty_table_name: Option<&str>,
         capture_time_travel_snapshot: bool,
         schema_change_boundary: bool,
         cx: &Cx,
@@ -39096,9 +36796,13 @@ impl Connection {
         let txn_has_pending_writes = txn.has_pending_writes();
         let had_live_vtab_txn = !self.live_vtab_transactions.borrow().is_empty();
 
-        // Persistent read-only snapshot: if the autocommit transaction was
-        // read-only and succeeded, park it for reuse by the next autocommit
-        // read instead of committing (which is a no-op for readers anyway).
+        // Persistent committed-handle reuse: if the autocommit transaction was
+        // read-only and succeeded, park it instead of committing (which is a
+        // no-op for readers anyway). A retained writer handle may also reach
+        // this boundary after serving a read; re-park it as the cached writer
+        // so its committed transaction-read cache remains authoritative for
+        // the next private `:memory:` statement.
+        //
         // Only for :memory: — file-backed databases may have external writers.
         if ok
             && self.pager.is_memory()
@@ -39106,6 +36810,22 @@ impl Connection {
             && !self.concurrent_txn.get()
             && self.live_vtab_transactions.borrow().is_empty()
         {
+            if txn.is_writer() {
+                let cookie = *self.schema_cookie.borrow();
+                if let Some(mut old) = self.cached_write_txn.borrow_mut().take() {
+                    let _ = old.commit(cx).await;
+                }
+                *self.cached_write_txn.borrow_mut() = Some(txn);
+                self.cached_write_txn_cookie.set(cookie);
+                self.cached_write_txn_memdb_row_mirror_exact.set(
+                    self.memdb_rows_loaded.get() && self.memdb_storage_count_shortcuts_safe.get(),
+                );
+                self.concurrent_txn.set(false);
+                *self.concurrent_session_id.borrow_mut() = None;
+                self.txn_metrics_mark_finished();
+                return Ok(());
+            }
+
             // Rollback any previously parked snapshot (possible if a
             // re-entrant connection-fallback subquery parked its own
             // read snapshot while the outer VDBE was executing).
@@ -39157,23 +36877,6 @@ impl Connection {
         }
 
         let is_concurrent_txn = self.concurrent_txn.get();
-        // bd-m1nte / I2: On error with an active retained batch, flush immediately
-        // to commit prior good writes and reset the batch. This prevents error
-        // cascades from accumulating in a single oversized transaction.
-        if !ok
-            && self.retained_autocommit_batch_active()
-            && !is_concurrent_txn
-            && txn_has_pending_writes
-            && self.live_vtab_transactions.borrow().is_empty()
-        {
-            *self.retained_autocommit_txn.borrow_mut() = Some(txn);
-            self.concurrent_txn.set(false);
-            *self.concurrent_session_id.borrow_mut() = None;
-            self.txn_metrics_mark_finished();
-            // Flush the retained batch: commit prior good writes, reset counters.
-            self.flush_retained_autocommit_txn(cx).await?;
-            return Ok(());
-        }
         // Use the pager's lock-free conservative conflict surface here. Pager
         // implementations must include explicit writes plus any freed pages and
         // a shared metadata conflict token needed to serialize commit-time
@@ -39184,16 +36887,15 @@ impl Connection {
             Vec::new()
         };
 
-        let mut retained_autocommit_flush_boundary = false;
-        // Issue #115: the autocommit (single-statement / retained-batch flush)
-        // commit path has the SAME validate→write→publish TOCTOU as the explicit
+        // Issue #115: the autocommit single-statement commit path has the SAME
+        // validate→write→publish TOCTOU as the explicit
         // COMMIT path — two connections doing concurrent autocommit writes can
         // each validate clean, physically write the same freshly-allocated EOF
         // page, and both publish. Hold the shared `concurrent_registry` guard
         // across validate → physical write → publish for the concurrent path.
-        // For the `:memory:` retained-batch and `commit_and_retain` fast paths
-        // (which are `!is_concurrent_txn`) the guard is `None`, so they are
-        // unaffected. On a plan failure the `_with_registry` plan already cleans
+        // For the `:memory:` `commit_and_retain` fast path (which is
+        // `!is_concurrent_txn`) the guard is `None`, so it is unaffected. On a
+        // plan failure the `_with_registry` plan already cleans
         // up the registry and clears `concurrent_session_id`, so the subsequent
         // `abort_current_concurrent_session` early-returns without re-locking;
         // we still drop the guard explicitly first to make that unambiguous.
@@ -39243,63 +36945,14 @@ impl Connection {
                 None
             };
             record_hot_path_duration(&FSQLITE_COMMIT_PRE_TXN_TIME_NS, commit_pre_txn_start);
-            // Retained autocommit batching parks the write transaction
-            // UNCOMMITTED so the next autocommit write can reuse it directly.
-            let can_retain_autocommit_batch = !is_concurrent_txn
-                && txn_has_pending_writes
-                && concurrent_plan.is_none()
-                && !force_immediate_autocommit_commit
-                && self.autocommit_retain_enabled.get()
-                && self.live_vtab_transactions.borrow().is_empty();
-            let can_retain_private_memory_batch = self.pager.is_memory()
-                && !force_immediate_autocommit_commit
-                && !self.has_differential_subscribers();
-            if can_retain_autocommit_batch
-                && (!self.pager.is_memory() || can_retain_private_memory_batch)
-            {
-                let stmt_count = self.retained_autocommit_stmt_count.get();
-                // bd-m1nte / I2: Adaptive flush threshold based on workload pattern.
-                let flush_threshold = self.adaptive_flush_threshold();
-                if stmt_count < flush_threshold {
-                    // Park transaction WITHOUT committing — writes are retained.
-                    *self.retained_autocommit_txn.borrow_mut() = Some(txn);
-                    self.retained_autocommit_stmt_count.set(stmt_count + 1);
-                    if let Some(table_name) = dirty_table_name {
-                        self.retained_autocommit_mark_dirty(table_name);
-                    } else {
-                        self.clear_retained_autocommit_count_sum_cache();
-                    }
-                    self.retained_autocommit_note_write();
-                    self.concurrent_txn.set(false);
-                    *self.concurrent_session_id.borrow_mut() = None;
-                    self.txn_metrics_mark_finished();
-                    self.invalidate_cached_read_snapshot(cx).await;
-                    if hot_path_profile_enabled() {
-                        FSQLITE_RETAINED_AUTOCOMMIT_PARKS.fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                    return Ok(());
-                }
-                // bd-m1nte / I2: Threshold reached — reset adaptive counters and
-                // fall through to a real commit/flush boundary.
-                self.retained_autocommit_stmt_count.set(0);
-                self.retained_autocommit_dirty_tables.borrow_mut().clear();
-                retained_autocommit_flush_boundary = true;
-                self.retained_autocommit_write_count.set(0);
-                self.retained_autocommit_read_count.set(0);
-            }
-
             // :memory: autocommit write fast path: commit_and_retain parks the
             // transaction for reuse, avoiding pager.begin() Mutex on the next stmt.
-            // At a retained-batch flush boundary, release the writer normally;
-            // reusing that boundary txn as the next retained batch seed can
-            // make snapshot validation see pages this connection just committed.
             if self.pager.is_memory()
                 && !is_concurrent_txn
                 && txn_has_pending_writes
                 && concurrent_plan.is_none()
                 && !force_immediate_autocommit_commit
                 && self.live_vtab_transactions.borrow().is_empty()
-                && !retained_autocommit_flush_boundary
             {
                 let commit_txn_roundtrip_start = hot_path_profile_enabled().then(Instant::now);
                 match txn.commit_and_retain(cx).await {
@@ -39322,11 +36975,11 @@ impl Connection {
                         );
                         let defer_memory_post_write_maintenance =
                             !capture_time_travel_snapshot && !self.has_differential_subscribers();
-                        let retained_reload_result = if !capture_time_travel_snapshot {
-                            // Keep the :memory: retained-autocommit commit side
+                        let memdb_reload_result = if !capture_time_travel_snapshot {
+                            // Keep the :memory: commit-and-retain side
                             // near-zero-cost. Even when the MemDatabase mirror
                             // was exact before this statement, do not preserve
-                            // that exactness through the parked writer txn.
+                            // that exactness through the parked committed writer.
                             // Mark the mirror dirty and let the next read
                             // boundary refresh from the cached txn instead of
                             // arming the O(n) row-preserving reload path on
@@ -39336,9 +36989,6 @@ impl Connection {
                             self.memdb_requires_active_txn_reload.set(true);
                             *self.memdb_visible_commit_seq.borrow_mut() = committed_seq;
                             self.clear_pending_memdb_direct_upserts();
-                            if retained_autocommit_flush_boundary {
-                                self.finish_retained_autocommit_count_sum_cache_flush(true);
-                            }
                             Ok(())
                         } else {
                             let hydrate_rows = self.should_eagerly_hydrate_memdb_rows();
@@ -39351,14 +37001,14 @@ impl Connection {
                             )
                             .await
                         };
-                        // Park the retained transaction for the next autocommit.
+                        // Park the committed transaction handle for the next autocommit.
                         let cookie = *self.schema_cookie.borrow();
                         // Discard any stale cached write transaction.
                         if let Some(mut old) = self.cached_write_txn.borrow_mut().take() {
                             let _ = old.commit(cx).await;
                         }
-                        let retained_reload_error = retained_reload_result.err();
-                        if retained_reload_error.is_none() {
+                        let memdb_reload_error = memdb_reload_result.err();
+                        if memdb_reload_error.is_none() {
                             *self.cached_write_txn.borrow_mut() = Some(txn);
                             self.cached_write_txn_cookie.set(cookie);
                             self.cached_write_txn_memdb_row_mirror_exact.set(
@@ -39371,12 +37021,12 @@ impl Connection {
                             if let Err(error) = txn.commit(cx).await {
                                 tracing::warn!(
                                     target: "fsqlite.memdb_refresh",
-                                    "retained commit reload failed and retained txn release also failed: {error}"
+                                    "commit-and-retain reload failed and cached txn release also failed: {error}"
                                 );
                             } else if let Err(error) = self.reload_memdb_from_pager(cx).await {
                                 tracing::warn!(
                                     target: "fsqlite.memdb_refresh",
-                                    "retained commit reload failed and pager reload fallback also failed: {error}"
+                                    "commit-and-retain reload failed and pager reload fallback also failed: {error}"
                                 );
                             }
                         }
@@ -39385,7 +37035,7 @@ impl Connection {
                         self.txn_metrics_mark_finished();
                         // Invalidate read snapshot — it's stale after a write.
                         self.invalidate_cached_read_snapshot(cx).await;
-                        if retained_reload_error.is_none() && hot_path_profile_enabled() {
+                        if memdb_reload_error.is_none() && hot_path_profile_enabled() {
                             FSQLITE_CACHED_WRITE_TXN_PARKS.fetch_add(1, AtomicOrdering::Relaxed);
                         }
                         // Finalize vtab registry: clear dropped instances without
@@ -39421,15 +37071,15 @@ impl Connection {
                             &FSQLITE_FINALIZE_POST_PUBLISH_TIME_NS,
                             finalize_post_publish_start,
                         );
-                        if let Some(error) = retained_reload_error {
+                        if let Some(error) = memdb_reload_error {
                             tracing::warn!(
                                 target: "fsqlite.memdb_refresh",
-                                "retained commit succeeded but memdb reload from retained txn failed: {error}"
+                                "commit-and-retain succeeded but memdb reload from cached txn failed: {error}"
                             );
                         }
                         return Ok(());
                     }
-                    Ok(false) => {} // Not retained — fall through to normal commit
+                    Ok(false) => {} // Handle could not be retained; finish normally.
                     Err(e) => {
                         record_hot_path_duration(
                             &FSQLITE_COMMIT_TXN_ROUNDTRIP_TIME_NS,
@@ -39437,9 +37087,6 @@ impl Connection {
                         );
                         self.txn_metrics_note_rollback();
                         let _ = txn.rollback(cx).await;
-                        if retained_autocommit_flush_boundary {
-                            self.finish_retained_autocommit_count_sum_cache_flush(false);
-                        }
                         self.clear_prepared_direct_insert_append_hint();
                         self.concurrent_txn.set(false);
                         *self.concurrent_session_id.borrow_mut() = None;
@@ -39574,16 +37221,11 @@ impl Connection {
         self.concurrent_txn.set(false);
         *self.concurrent_session_id.borrow_mut() = None;
         self.txn_metrics_mark_finished();
-        // This tail is only reached by autocommit paths that did not park a
-        // retained writer transaction. Any direct-INSERT append hint was
-        // learned inside the implicit transaction that just committed or
-        // rolled back, so its retained leaf image must not survive into the
-        // next statement.
+        // Any direct-INSERT append hint was learned inside the implicit
+        // transaction that just committed or rolled back, so its cached leaf
+        // image must not survive into the next statement.
         self.clear_prepared_direct_insert_append_hint();
 
-        if retained_autocommit_flush_boundary {
-            self.finish_retained_autocommit_count_sum_cache_flush(txn_result.is_ok());
-        }
         if rolled_back_dirty_state {
             self.discard_cached_vdbe_engine();
             self.reload_memdb_from_pager(cx).await?;
@@ -47620,10 +45262,6 @@ impl Connection {
         // already performed the background-status gate for this SQL operation.
         let cx = self.op_cx_after_background_status();
 
-        if self.retained_autocommit_txn.borrow().is_some() {
-            self.flush_retained_autocommit_txn(&cx).await?;
-        }
-
         // Invalidate cached snapshots — explicit BEGIN starts a fresh txn.
         self.invalidate_cached_read_snapshot(&cx).await;
         self.invalidate_cached_write_txn(&cx).await;
@@ -48443,12 +46081,6 @@ impl Connection {
 
     async fn execute_commit_with_cx(&self, cx: &Cx) -> Result<()> {
         if !self.in_transaction.get() {
-            if self.retained_autocommit_txn.borrow().is_some() {
-                self.stmt_microbatch_flush();
-                self.discard_cached_vdbe_engine();
-                self.clear_prepared_direct_insert_append_hint();
-                self.flush_retained_autocommit_txn(cx).await?;
-            }
             return Err(FrankenError::Internal(
                 "cannot commit - no transaction is active".to_owned(),
             ));
@@ -49126,9 +46758,6 @@ impl Connection {
         // If no explicit transaction, implicitly begin one.
         let started_implicit_txn = !self.in_transaction.get();
         if started_implicit_txn {
-            if self.retained_autocommit_txn.borrow().is_some() {
-                self.flush_retained_autocommit_txn(cx).await?;
-            }
             // Discard cached snapshots — implicit transaction starts fresh.
             self.invalidate_cached_read_snapshot(cx).await;
             self.invalidate_cached_write_txn(cx).await;
@@ -51271,24 +48900,6 @@ impl Connection {
                     let alpha = self.ssi_e_process_gate.borrow().config().alpha;
                     Ok(vec![Row {
                         values: vec![SqliteValue::Float(alpha)],
-                    }])
-                }
-            }
-            "fsqlite.autocommit_retain" | "autocommit_retain" => {
-                if let Some(ref val) = pragma.value {
-                    let enabled = parse_pragma_bool(val)?;
-                    if !enabled {
-                        let cx = self.op_cx()?;
-                        self.flush_retained_autocommit_txn(&cx).await?;
-                    }
-                    self.autocommit_retain_enabled.set(enabled);
-                    Ok(vec![Row {
-                        values: vec![SqliteValue::Integer(i64::from(enabled))],
-                    }])
-                } else {
-                    let enabled = self.autocommit_retain_enabled.get();
-                    Ok(vec![Row {
-                        values: vec![SqliteValue::Integer(i64::from(enabled))],
                     }])
                 }
             }
@@ -61352,18 +58963,6 @@ impl Connection {
         self.cte_result_column_names(cte, &[], &mut Vec::new())
     }
 
-    fn compute_sum_aggregate_with_registry(&self, values: &[&SqliteValue]) -> Result<SqliteValue> {
-        let registry = self.func_registry.borrow();
-        let func = registry
-            .find_aggregate("sum", 1)
-            .ok_or_else(|| FrankenError::internal("missing built-in aggregate: sum/1"))?;
-        let mut state = func.initial_state();
-        for value in values {
-            func.step(&mut state, std::slice::from_ref(*value))?;
-        }
-        func.finalize(state)
-    }
-
     fn compute_custom_aggregate_with_registry(
         &self,
         name: &str,
@@ -61811,21 +59410,6 @@ impl Connection {
             self.refresh_memdb_from_active_txn_if_dirty(&op_cx).await?;
         }
         if matches!(statement, Statement::Select(_)) {
-            // T1.6: when an outer connection delegates an attached-schema read
-            // into this attached child via `with_attached_connection`, the
-            // child's prior parent-dispatched writes (INSERT/UPDATE/DELETE)
-            // may still be parked in a retained autocommit transaction. The
-            // normal statement dispatcher would flush that retained txn before
-            // a SELECT whose dirty tables overlap the read set, but we bypass
-            // the dispatcher by calling this helper directly. If we proceed
-            // straight to `reload_memdb_from_pager` with uncommitted writes
-            // still parked, the reload reads the pager's pre-write committed
-            // state and the stripped SELECT observes zero rows. Flush the
-            // retained batch so the subsequent pager reload sees all the
-            // writes the outer connection already dispatched to us.
-            if self.retained_autocommit_txn.borrow().is_some() {
-                self.flush_retained_autocommit_txn(&op_cx).await?;
-            }
             self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)
                 .await?;
             if !self.memdb_rows_loaded.get() {
@@ -104428,11 +102012,6 @@ mod tests {
             conn.execute("CREATE INDEX idx_clean_memory_count_name ON clean_memory_count(name);")
                 .await
                 .unwrap();
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_none(),
-                "explicit setup plus index creation should leave a clean autocommit memory image"
-            );
-
             let stmt = conn
                 .prepare("SELECT COUNT(*) FROM clean_memory_count;")
                 .await
@@ -104582,7 +102161,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prepared_count_star_query_row_refreshes_from_retained_write_txn_before_fast_path() {
+    fn test_prepared_count_star_query_row_refreshes_from_cached_write_txn_before_fast_path() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
@@ -104636,8 +102215,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ad_hoc_count_query_refreshes_from_retained_write_txn_after_prepared_unique_insert_loop()
-    {
+    fn test_ad_hoc_count_query_refreshes_from_cached_write_txn_after_prepared_unique_insert_loop() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
@@ -105485,14 +103063,6 @@ mod tests {
             conn.execute("INSERT INTO prep_count_sum_runtime VALUES (1, 10), (2, 20);")
                 .await
                 .unwrap();
-            let root_page = conn
-                .schema
-                .borrow()
-                .iter()
-                .find(|table| table.name.eq_ignore_ascii_case("prep_count_sum_runtime"))
-                .map(|table| table.root_page)
-                .expect("test table root page");
-
             let stmt = conn
                 .prepare("SELECT COUNT(*), SUM(score) FROM prep_count_sum_runtime;")
                 .await
@@ -105506,12 +103076,6 @@ mod tests {
             let row = stmt.query_row().await.unwrap();
             assert_eq!(row.get(0), Some(&SqliteValue::Integer(2)));
             assert_eq!(row.get(1), Some(&SqliteValue::Integer(30)));
-            assert_eq!(
-                conn.retained_autocommit_count_sum_cache_row(root_page, 1, Some(0))
-                    .as_ref()
-                    .map(Row::values),
-                Some(&[SqliteValue::Integer(2), SqliteValue::Integer(30)][..])
-            );
 
             let profile = super::hot_path_profile_snapshot();
             assert_eq!(
@@ -105561,15 +103125,6 @@ mod tests {
                 )
                 .await?;
 
-                let root_page = conn
-                    .schema
-                    .borrow()
-                    .iter()
-                    .find(|table| table.name.eq_ignore_ascii_case("prep_count_sum_overflow"))
-                    .map(|table| table.root_page)
-                    .ok_or_else(|| {
-                        FrankenError::internal("missing prep_count_sum_overflow schema")
-                    })?;
                 let stmt = conn
                     .prepare("SELECT COUNT(*), SUM(score) FROM prep_count_sum_overflow;")
                     .await?;
@@ -105581,18 +103136,13 @@ mod tests {
                     stmt.query_row().await?.values(),
                     &[SqliteValue::Integer(1), SqliteValue::Integer(i64::MAX)]
                 );
-                assert!(
-                    conn.retained_autocommit_count_sum_cache_row(root_page, 1, Some(0))
-                        .is_some(),
-                    "first read should seed the retained count+sum cache"
-                );
 
                 conn.execute("INSERT INTO prep_count_sum_overflow VALUES (2, 1);")
                     .await?;
                 let err = match stmt.query_row().await {
                     Ok(row) => {
                         return Err(FrankenError::internal(format!(
-                            "all-integer SUM overflow was hidden by the retained cache: {row:?}"
+                            "all-integer SUM overflow was not reported: {row:?}"
                         )));
                     }
                     Err(err) => err,
@@ -107292,7 +104842,7 @@ mod tests {
             ));
 
             let diagnostic = format!(
-                "direct_candidate={} memdb_ready={} rows_loaded={} requires_reload={} count_safe={} in_txn={} active_or_borrowed={} retained_txn={} retained_dirty_empty={} pending_upserts={} cached_write_bound={:?} visible_seq={:?} cached_write_mirror_exact={} fast_path={:?}",
+                "direct_candidate={} memdb_ready={} rows_loaded={} requires_reload={} count_safe={} in_txn={} active_or_borrowed={} pending_upserts={} cached_write_bound={:?} visible_seq={:?} cached_write_mirror_exact={} fast_path={:?}",
                 conn.clean_memory_prepared_memdb_direct_fast_path_candidate(&stmt),
                 conn.prepared_memdb_query_fast_path_ready_with_mode(&stmt, false),
                 conn.memdb_rows_loaded.get(),
@@ -107300,8 +104850,6 @@ mod tests {
                 conn.memdb_storage_count_shortcuts_safe.get(),
                 conn.in_transaction.get(),
                 conn.active_txn_is_open_or_borrowed(),
-                conn.retained_autocommit_txn.borrow().is_some(),
-                conn.retained_autocommit_dirty_tables.borrow().is_empty(),
                 conn.pending_memdb_direct_upserts.borrow().len(),
                 conn.cached_write_txn
                     .borrow()
@@ -107605,7 +105153,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_backed_prepared_query_for_each_flushes_retained_autocommit_before_read() {
+    fn test_file_backed_prepared_query_for_each_observes_committed_write() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard =
                 super::pager_routing_tests::StatementReuseHotPathProfileGuard::new();
@@ -107667,16 +105215,6 @@ mod tests {
                     vec![SqliteValue::Integer(1), SqliteValue::Text("beta".into())],
                     vec![SqliteValue::Integer(2), SqliteValue::Text("beta".into())],
                 ]
-            );
-
-            let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_read_after_write_flushes >= 1,
-                "expected read-after-write flush on file-backed prepared query, got {profile:?}"
-            );
-            assert!(
-                profile.retained_autocommit_overlay_misses >= 1,
-                "unsupported prepared read shape should register an overlay miss before flushing: {profile:?}"
             );
         });
     }
@@ -107752,12 +105290,6 @@ mod tests {
                 ],
                 "fallback prepared query_for_each path should see the just-inserted row"
             );
-
-            let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_read_after_write_flushes >= 1,
-                "fallback prepared query_for_each should flush retained writes before reading: {profile:?}"
-            );
         });
     }
 
@@ -107797,28 +105329,12 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "expected file-backed INSERT to park a retained autocommit transaction",
-            );
-            assert!(
-                conn.retained_autocommit_dirty_tables
-                    .borrow()
-                    .contains("messages"),
-                "expected retained autocommit dirty set to include messages",
-            );
-
             super::reset_hot_path_profile();
             let literal_rows = conn
                 .query(
                     "SELECT id, idx, content FROM messages WHERE conversation_id = 1 ORDER BY idx",
                 )
                 .await;
-            let profile_after_literal = super::hot_path_profile_snapshot();
-            assert!(
-                profile_after_literal.retained_autocommit_read_after_write_flushes >= 1,
-                "expected literal SELECT to trigger read-after-write flush, got {profile_after_literal:?}",
-            );
             let literal_rows = literal_rows.unwrap();
             assert_eq!(
                 literal_rows.len(),
@@ -107833,11 +105349,6 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "expected second INSERT to park a retained autocommit transaction before parameterized read",
-            );
-
             super::reset_hot_path_profile();
             let parameterized_rows = conn
                 .query_with_params(
@@ -107846,11 +105357,6 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let profile_after_param = super::hot_path_profile_snapshot();
-            assert!(
-                profile_after_param.retained_autocommit_read_after_write_flushes >= 1,
-                "expected parameterized SELECT to trigger read-after-write flush, got {profile_after_param:?}",
-            );
             assert_eq!(
                 parameterized_rows.len(),
                 2,
@@ -107860,7 +105366,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_backed_query_with_derived_table_flushes_retained_write() {
+    fn test_file_backed_query_with_derived_table_observes_committed_write() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard =
                 super::pager_routing_tests::StatementReuseHotPathProfileGuard::new();
@@ -107883,11 +105389,6 @@ mod tests {
             conn.execute("INSERT INTO nested_messages VALUES (1, 'derived');")
                 .await
                 .unwrap();
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "expected file-backed INSERT to park a retained autocommit transaction",
-            );
-
             super::reset_hot_path_profile();
             let rows = conn
                 .query(
@@ -107897,28 +105398,19 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_read_after_write_flushes >= 1,
-                "derived-table SELECT should trigger a retained-batch flush: {profile:?}",
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_none(),
-                "derived-table read should flush the retained autocommit batch",
-            );
             assert_eq!(
                 rows.iter().map(row_values).collect::<Vec<_>>(),
                 vec![vec![
                     SqliteValue::Integer(1),
                     SqliteValue::Text("derived".into()),
                 ]],
-                "derived-table SELECT must observe same-connection retained writes",
+                "derived-table SELECT must observe the committed write",
             );
         });
     }
 
     #[test]
-    fn test_file_backed_prepared_cte_query_flushes_retained_write() {
+    fn test_file_backed_prepared_cte_query_observes_committed_write() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard =
                 super::pager_routing_tests::StatementReuseHotPathProfileGuard::new();
@@ -107951,44 +105443,26 @@ mod tests {
             conn.execute("INSERT INTO cte_messages VALUES (1, 'cte');")
                 .await
                 .unwrap();
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "expected file-backed INSERT to park a retained autocommit transaction",
-            );
-
             super::reset_hot_path_profile();
             let row = stmt
                 .query_row_with_params(&[SqliteValue::Integer(1)])
                 .await
                 .unwrap();
-            let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_read_after_write_flushes >= 1,
-                "prepared CTE SELECT should trigger a retained-batch flush: {profile:?}",
-            );
-            assert!(
-                profile.retained_autocommit_overlay_misses >= 1,
-                "prepared CTE SELECT should register an unsupported overlay miss before flushing: {profile:?}",
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_none(),
-                "prepared CTE read should flush the retained autocommit batch",
-            );
             assert_eq!(
                 row.values(),
                 &[SqliteValue::Integer(1), SqliteValue::Text("cte".into())],
-                "prepared CTE SELECT must observe same-connection retained writes",
+                "prepared CTE SELECT must observe the committed write",
             );
         });
     }
 
     #[test]
-    fn test_file_backed_prepared_rowid_lookup_uses_retained_overlay_without_flush() {
+    fn test_file_backed_prepared_rowid_lookup_observes_committed_write() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard =
                 super::pager_routing_tests::StatementReuseHotPathProfileGuard::new();
             let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("retained-overlay-rowid-lookup.db");
+            let db_path = dir.path().join("committed-rowid-lookup.db");
             let conn = Connection::open(db_path.to_string_lossy().into_owned())
                 .await
                 .unwrap();
@@ -108008,8 +105482,6 @@ mod tests {
             conn.execute("INSERT INTO overlay_lookup VALUES (1, 11);")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-
             super::reset_hot_path_profile();
             let row = stmt
                 .query_row_with_params(&[SqliteValue::Integer(1)])
@@ -108019,32 +105491,16 @@ mod tests {
                 row.values(),
                 &[SqliteValue::Integer(1), SqliteValue::Integer(11)]
             );
-
-            let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "expected retained overlay hit for point lookup: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "overlay hit should avoid read-after-write flush: {profile:?}"
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "overlay read should keep the retained autocommit transaction parked"
-            );
         });
     }
 
     #[test]
-    fn test_file_backed_prepared_projected_rowid_lookup_uses_retained_overlay_without_flush() {
+    fn test_file_backed_prepared_projected_rowid_lookup_observes_committed_write() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard =
                 super::pager_routing_tests::StatementReuseHotPathProfileGuard::new();
             let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir
-                .path()
-                .join("retained-overlay-projected-rowid-lookup.db");
+            let db_path = dir.path().join("committed-projected-rowid-lookup.db");
             let conn = Connection::open(db_path.to_string_lossy().into_owned())
                 .await
                 .unwrap();
@@ -108064,28 +105520,12 @@ mod tests {
             conn.execute("INSERT INTO overlay_projected_lookup VALUES (1, 11);")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-
             super::reset_hot_path_profile();
             let row = stmt
                 .query_row_with_params(&[SqliteValue::Integer(1)])
                 .await
                 .unwrap();
             assert_eq!(row.values(), &[SqliteValue::Integer(11)]);
-
-            let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "expected retained overlay hit for projected point lookup: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "projected overlay hit should avoid read-after-write flush: {profile:?}"
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "projected overlay read should keep the retained autocommit transaction parked"
-            );
         });
     }
 
@@ -108111,11 +105551,6 @@ mod tests {
                 .await
                 .unwrap();
             conn.execute("COMMIT").await.unwrap();
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_none(),
-                "explicit setup transaction should leave no retained autocommit overlay"
-            );
-
             let stmt = conn
                 .prepare("SELECT score FROM clean_projected_lookup WHERE id = ?1;")
                 .await
@@ -108135,10 +105570,6 @@ mod tests {
             assert_eq!(
                 profile.direct_rowid_lookup_query_row_hits, 1,
                 "clean file-backed prepared lookup should use the direct MemDB fast path: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_overlay_hits, 0,
-                "clean read should not depend on retained-overlay semantics: {profile:?}"
             );
             assert_eq!(
                 profile.prepared_schema_refreshes, 0,
@@ -108367,14 +105798,12 @@ mod tests {
     }
 
     #[test]
-    fn test_file_backed_prepared_projected_indexed_equality_uses_retained_overlay_without_flush() {
+    fn test_file_backed_prepared_projected_indexed_equality_observes_committed_write() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard =
                 super::pager_routing_tests::StatementReuseHotPathProfileGuard::new();
             let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir
-                .path()
-                .join("retained-overlay-projected-indexed-equality.db");
+            let db_path = dir.path().join("committed-projected-indexed-equality.db");
             let conn = Connection::open(db_path.to_string_lossy().into_owned())
                 .await
                 .unwrap();
@@ -108399,38 +105828,22 @@ mod tests {
             conn.execute("INSERT INTO overlay_projected_indexed VALUES (1, 'beta', 11);")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-
             super::reset_hot_path_profile();
             let row = stmt
                 .query_row_with_params(&[SqliteValue::Text("beta".into())])
                 .await
                 .unwrap();
             assert_eq!(row.values(), &[SqliteValue::Integer(11)]);
-
-            let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "expected retained overlay hit for projected indexed equality: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "projected indexed equality overlay hit should avoid read-after-write flush: {profile:?}"
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "projected indexed equality overlay read should keep the retained autocommit transaction parked"
-            );
         });
     }
 
     #[test]
-    fn test_file_backed_prepared_indexed_equality_retained_overlay_caches_until_write() {
+    fn test_file_backed_prepared_indexed_equality_refreshes_after_committed_write() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard =
                 super::pager_routing_tests::StatementReuseHotPathProfileGuard::new();
             let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("retained-overlay-indexed-cache.db");
+            let db_path = dir.path().join("committed-indexed-refresh.db");
             let conn = Connection::open(db_path.to_string_lossy().into_owned())
                 .await
                 .unwrap();
@@ -108459,8 +105872,6 @@ mod tests {
             conn.execute("INSERT INTO overlay_indexed_cache VALUES (1, 'beta', 11);")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-
             let beta_param = [SqliteValue::Text("beta".into())];
             let rows = stmt.query_with_params(&beta_param).await.unwrap();
             assert_eq!(rows.len(), 1);
@@ -108472,46 +105883,28 @@ mod tests {
                     SqliteValue::Integer(11),
                 ]
             );
-            assert!(
-                conn.retained_autocommit_indexed_equality_cache
-                    .borrow()
-                    .is_some(),
-                "first retained indexed-equality read should seed the exact-shape cache"
-            );
-
             let cached_rows = stmt.query_with_params(&beta_param).await.unwrap();
             assert_eq!(cached_rows, rows);
 
             conn.execute("INSERT INTO overlay_indexed_cache VALUES (2, 'gamma', 22);")
                 .await
                 .unwrap();
-            assert!(
-                conn.retained_autocommit_indexed_equality_cache
-                    .borrow()
-                    .is_none(),
-                "a retained write must clear indexed-equality cache rows before they can go stale"
-            );
-
             let gamma_rows = stmt
                 .query_with_params(&[SqliteValue::Text("gamma".into())])
                 .await
                 .unwrap();
             assert_eq!(gamma_rows.len(), 1);
             assert_eq!(gamma_rows[0].values()[0], SqliteValue::Integer(2));
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "cached overlay reads and invalidating writes should keep the retained batch parked"
-            );
         });
     }
 
     #[test]
-    fn test_file_backed_prepared_indexed_equality_null_param_uses_retained_overlay_without_match() {
+    fn test_file_backed_prepared_indexed_equality_null_param_has_no_match() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard =
                 super::pager_routing_tests::StatementReuseHotPathProfileGuard::new();
             let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("retained-overlay-indexed-null.db");
+            let db_path = dir.path().join("committed-indexed-null.db");
             let conn = Connection::open(db_path.to_string_lossy().into_owned())
                 .await
                 .unwrap();
@@ -108538,38 +105931,22 @@ mod tests {
             conn.execute("INSERT INTO overlay_indexed_null VALUES (1, NULL, 11);")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-
             super::reset_hot_path_profile();
             let error = stmt
                 .query_row_with_params(&[SqliteValue::Null])
                 .await
-                .expect_err("retained overlay equality should not match stored NULL values");
+                .expect_err("equality should not match stored NULL values");
             assert!(matches!(error, FrankenError::QueryReturnedNoRows));
-
-            let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "expected retained overlay hit for NULL indexed equality: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "NULL equality overlay result should avoid read-after-write flush: {profile:?}"
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "NULL equality overlay read should keep the retained autocommit transaction parked"
-            );
         });
     }
 
     #[test]
-    fn test_file_backed_prepared_rowid_range_scan_uses_retained_overlay_without_flush() {
+    fn test_file_backed_prepared_rowid_range_scan_observes_committed_writes() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard =
                 super::pager_routing_tests::StatementReuseHotPathProfileGuard::new();
             let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("retained-overlay-rowid-range.db");
+            let db_path = dir.path().join("committed-rowid-range.db");
             let conn = Connection::open(db_path.to_string_lossy().into_owned())
                 .await
                 .unwrap();
@@ -108593,8 +105970,6 @@ mod tests {
             conn.execute("INSERT INTO overlay_range VALUES (3, 'c');")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-
             super::reset_hot_path_profile();
             let rows = stmt
                 .query_with_params(&[SqliteValue::Integer(2), SqliteValue::Integer(4)])
@@ -108608,30 +105983,16 @@ mod tests {
                     vec![SqliteValue::Integer(3), SqliteValue::Text("c".into())],
                 ]
             );
-
-            let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "expected retained overlay hit for rowid range scan: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "overlay hit should avoid read-after-write flush: {profile:?}"
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "overlay scan should keep the retained autocommit transaction parked"
-            );
         });
     }
 
     #[test]
-    fn test_file_backed_prepared_count_range_uses_retained_overlay_without_flush() {
+    fn test_file_backed_prepared_count_range_observes_committed_writes() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard =
                 super::pager_routing_tests::StatementReuseHotPathProfileGuard::new();
             let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("retained-overlay-count-range.db");
+            let db_path = dir.path().join("committed-count-range.db");
             let conn = Connection::open(db_path.to_string_lossy().into_owned())
                 .await
                 .unwrap();
@@ -108657,38 +106018,22 @@ mod tests {
             conn.execute("INSERT INTO overlay_count_range VALUES (3, 'c');")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-
             super::reset_hot_path_profile();
             let row = stmt
                 .query_row_with_params(&[SqliteValue::Integer(1), SqliteValue::Integer(3)])
                 .await
                 .unwrap();
             assert_eq!(row.get(0), Some(&SqliteValue::Integer(2)));
-
-            let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "expected retained overlay hit for count range query: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "overlay hit should avoid read-after-write flush: {profile:?}"
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "overlay count query should keep the retained autocommit transaction parked"
-            );
         });
     }
 
     #[test]
-    fn test_file_backed_prepared_count_star_uses_retained_overlay_without_flush() {
+    fn test_file_backed_prepared_count_star_observes_committed_writes() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard =
                 super::pager_routing_tests::StatementReuseHotPathProfileGuard::new();
             let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("retained-overlay-count-star.db");
+            let db_path = dir.path().join("committed-count-star.db");
             let conn = Connection::open(db_path.to_string_lossy().into_owned())
                 .await
                 .unwrap();
@@ -108714,35 +106059,19 @@ mod tests {
             conn.execute("INSERT INTO overlay_count_star VALUES (3, 'c');")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-
             super::reset_hot_path_profile();
             let row = stmt.query_row().await.unwrap();
             assert_eq!(row.get(0), Some(&SqliteValue::Integer(3)));
-
-            let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "expected retained overlay hit for count(*) query: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "overlay hit should avoid read-after-write flush: {profile:?}"
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "overlay count(*) query should keep the retained autocommit transaction parked"
-            );
         });
     }
 
     #[test]
-    fn test_file_backed_prepared_count_sum_uses_retained_overlay_without_flush() {
+    fn test_file_backed_prepared_count_sum_observes_committed_update() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard =
                 super::pager_routing_tests::StatementReuseHotPathProfileGuard::new();
             let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("retained-overlay-count-sum.db");
+            let db_path = dir.path().join("committed-count-sum.db");
             let conn = Connection::open(db_path.to_string_lossy().into_owned())
                 .await
                 .unwrap();
@@ -108771,40 +106100,22 @@ mod tests {
             conn.execute("UPDATE overlay_sum SET score = 25 WHERE id = 2;")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-
             super::reset_hot_path_profile();
             let row = stmt.query_row().await.unwrap();
             assert_eq!(
                 row.values(),
                 &[SqliteValue::Integer(3), SqliteValue::Integer(65)]
             );
-
-            let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "expected retained overlay hit for count+sum aggregate: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "overlay hit should avoid read-after-write flush: {profile:?}"
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "overlay aggregate query should keep the retained autocommit transaction parked"
-            );
         });
     }
 
     #[test]
-    fn test_file_backed_prepared_count_sum_overlay_counts_all_rows_after_text_fallback() {
+    fn test_file_backed_prepared_count_sum_counts_all_committed_rows_after_text_fallback() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard =
                 super::pager_routing_tests::StatementReuseHotPathProfileGuard::new();
             let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir
-                .path()
-                .join("retained-overlay-count-sum-text-fallback.db");
+            let db_path = dir.path().join("committed-count-sum-text-fallback.db");
             let conn = Connection::open(db_path.to_string_lossy().into_owned())
                 .await
                 .unwrap();
@@ -108828,33 +106139,15 @@ mod tests {
             conn.execute("INSERT INTO overlay_sum_mixed VALUES (3, 20);")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-
             super::reset_hot_path_profile();
-            let overlay_row = stmt.query_row().await.unwrap();
-
-            let profile = super::hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "expected retained overlay hit for count+sum fallback query: {profile:?}"
-            );
+            let first_row = stmt.query_row().await.unwrap();
+            let second_row = stmt.query_row().await.unwrap();
             assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "overlay hit should avoid read-after-write flush: {profile:?}"
+                first_row.values(),
+                second_row.values(),
+                "repeated count+sum fallback must return the same committed result"
             );
-
-            let cx = conn.op_cx().unwrap();
-            conn.flush_retained_autocommit_txn_for_read(&cx)
-                .await
-                .unwrap();
-
-            let flushed_row = stmt.query_row().await.unwrap();
-            assert_eq!(
-                overlay_row.values(),
-                flushed_row.values(),
-                "overlay count+sum fallback must match the flushed statement result"
-            );
-            assert_eq!(overlay_row.get(0), Some(&SqliteValue::Integer(3)));
+            assert_eq!(first_row.get(0), Some(&SqliteValue::Integer(3)));
         });
     }
 
@@ -131024,76 +128317,10 @@ mod tests {
     }
 
     #[test]
-    fn test_pragma_autocommit_retain_on_off_for_file_backed_connection() {
+    fn test_file_backed_concurrent_autocommit_write_is_immediately_visible() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("pragma-autocommit-retain.db");
-            let conn = Connection::open(db_path.to_string_lossy().into_owned())
-                .await
-                .unwrap();
-
-            let initial = conn
-                .query("PRAGMA fsqlite.autocommit_retain;")
-                .await
-                .unwrap();
-            assert_eq!(row_values(&initial[0]), vec![SqliteValue::Integer(1)]);
-            conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;")
-                .await
-                .unwrap();
-
-            conn.execute("CREATE TABLE pragma_retain_toggle(id INTEGER PRIMARY KEY, val TEXT);")
-                .await
-                .unwrap();
-            conn.execute("INSERT INTO pragma_retain_toggle VALUES (1, 'alpha');")
-                .await
-                .unwrap();
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "file-backed write should park retained autocommit before toggle"
-            );
-
-            conn.execute("PRAGMA fsqlite.autocommit_retain = OFF;")
-                .await
-                .unwrap();
-            assert!(!conn.autocommit_retain_enabled.get());
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_none(),
-                "disabling retain should flush any parked retained autocommit txn"
-            );
-
-            let rows = conn
-                .query("SELECT id, val FROM pragma_retain_toggle WHERE id = 1;")
-                .await
-                .unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(
-                row_values(&rows[0]),
-                vec![SqliteValue::Integer(1), SqliteValue::Text("alpha".into())]
-            );
-
-            let disabled = conn.query("PRAGMA autocommit_retain;").await.unwrap();
-            assert_eq!(row_values(&disabled[0]), vec![SqliteValue::Integer(0)]);
-
-            conn.execute("PRAGMA autocommit_retain = ON;")
-                .await
-                .unwrap();
-            assert!(conn.autocommit_retain_enabled.get());
-
-            let reenabled = conn
-                .query("PRAGMA fsqlite.autocommit_retain;")
-                .await
-                .unwrap();
-            assert_eq!(row_values(&reenabled[0]), vec![SqliteValue::Integer(1)]);
-        });
-    }
-
-    #[test]
-    fn test_file_backed_concurrent_autocommit_write_does_not_leave_retained_dirty_state() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir
-                .path()
-                .join("concurrent-autocommit-no-retained-dirty.db");
+            let db_path = dir.path().join("concurrent-autocommit-visible.db");
             let conn = Connection::open(db_path.to_string_lossy().into_owned())
                 .await
                 .unwrap();
@@ -131103,7 +128330,7 @@ mod tests {
                 "file-backed connections should default to concurrent autocommit mode",
             );
             conn.execute(
-                "CREATE TABLE retained_dirty_guard (
+                "CREATE TABLE committed_write_guard (
                 id INTEGER PRIMARY KEY,
                 val TEXT
             );",
@@ -131111,18 +128338,19 @@ mod tests {
             .await
             .unwrap();
 
-            conn.execute("INSERT INTO retained_dirty_guard VALUES (1, 'alpha');")
+            conn.execute("INSERT INTO committed_write_guard VALUES (1, 'alpha');")
                 .await
                 .unwrap();
 
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_none(),
-                "default concurrent autocommit writes should commit immediately instead of parking a retained writer",
-            );
-            assert!(
-                conn.retained_autocommit_dirty_tables.borrow().is_empty(),
-                "non-retained concurrent autocommit writes must not leave stale retained dirty-table state",
-            );
+            let observer = rusqlite::Connection::open(&db_path).unwrap();
+            let value: String = observer
+                .query_row(
+                    "SELECT val FROM committed_write_guard WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(value, "alpha");
         });
     }
 
@@ -131345,7 +128573,7 @@ mod tests {
             let cx = conn.op_cx().unwrap();
             assert!(
                 conn.cached_write_txn.borrow().is_none(),
-                "DDL autocommit should not retain the cached write txn on :memory:"
+                "DDL autocommit should not leave a cached write txn on :memory:"
             );
             let fresh_read_txn_contains_t = {
                 let mut txn = conn
@@ -137757,7 +134985,7 @@ mod transaction_lifecycle_tests {
             );
             assert!(
                 std::fs::metadata(&wal_path).unwrap().len() >= wal_len_before_drop,
-                "Drop may flush retained commits, but must not remove the WAL needed for recovery"
+                "Drop may grow the WAL while finalizing resources, but must not remove the WAL needed for recovery"
             );
 
             let reopened = Connection::open(&db_str).await.unwrap();
@@ -137778,33 +135006,17 @@ mod transaction_lifecycle_tests {
     }
 
     #[test]
-    fn test_close_in_place_releases_memory_parked_write_transactions() {
+    fn test_close_in_place_releases_memory_cached_write_transaction() {
         asupersync::test_utils::run_test(|| async {
-            let mut retained = Connection::open(":memory:").await.unwrap();
-            retained
-                .execute("CREATE TABLE t (x INTEGER)")
-                .await
-                .unwrap();
-            retained.execute("INSERT INTO t VALUES (1)").await.unwrap();
+            let mut conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER)").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
             assert!(
-                retained.retained_autocommit_txn.borrow().is_some(),
-                "memory autocommit write should park a retained batch before close"
+                conn.cached_write_txn.borrow().is_some(),
+                "memory autocommit write should park a committed cached writer"
             );
-            retained.close_in_place().await.unwrap();
-            assert!(retained.retained_autocommit_txn.borrow().is_none());
-            assert!(retained.cached_write_txn.borrow().is_none());
-
-            let mut cached = Connection::open(":memory:").await.unwrap();
-            cached.autocommit_retain_enabled.set(false);
-            cached.execute("CREATE TABLE t (x INTEGER)").await.unwrap();
-            cached.execute("INSERT INTO t VALUES (1)").await.unwrap();
-            assert!(
-                cached.cached_write_txn.borrow().is_some(),
-                "memory autocommit write should park a cached committed writer when retained batching is disabled"
-            );
-            cached.close_in_place().await.unwrap();
-            assert!(cached.cached_write_txn.borrow().is_none());
-            assert!(cached.retained_autocommit_txn.borrow().is_none());
+            conn.close_in_place().await.unwrap();
+            assert!(conn.cached_write_txn.borrow().is_none());
         });
     }
 
@@ -140930,8 +138142,8 @@ mod autocommit_txn_tests {
         row.values().to_vec()
     }
 
-    fn forced_retained_flush_failure() -> FrankenError {
-        FrankenError::internal("forced retained autocommit flush failure")
+    fn forced_wal_append_failure() -> FrankenError {
+        FrankenError::internal("forced WAL append failure")
     }
 
     #[derive(Debug)]
@@ -140963,7 +138175,7 @@ mod autocommit_txn_tests {
             _page_data: &'a [u8],
             _db_size_if_commit: u32,
         ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
-            Box::pin(async move { Err(forced_retained_flush_failure()) })
+            Box::pin(async move { Err(forced_wal_append_failure()) })
         }
 
         fn append_frames<'a>(
@@ -140971,7 +138183,7 @@ mod autocommit_txn_tests {
             _cx: &'a Cx,
             _frames: &'a [fsqlite_pager::traits::WalFrameRef<'a>],
         ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
-            Box::pin(async move { Err(forced_retained_flush_failure()) })
+            Box::pin(async move { Err(forced_wal_append_failure()) })
         }
 
         fn prepare_append_frames(
@@ -140994,7 +138206,7 @@ mod autocommit_txn_tests {
             _cx: &'a Cx,
             _prepared: &'a mut fsqlite_pager::traits::PreparedWalFrameBatch,
         ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
-            Box::pin(async move { Err(forced_retained_flush_failure()) })
+            Box::pin(async move { Err(forced_wal_append_failure()) })
         }
 
         fn read_page<'a>(
@@ -141056,7 +138268,7 @@ mod autocommit_txn_tests {
         }
     }
 
-    async fn install_failing_retained_flush_wal_backend_with_vfs<V>(
+    async fn install_failing_wal_append_backend_with_vfs<V>(
         pager: &Arc<SimplePager<V>>,
         vfs: &V,
         cx: &Cx,
@@ -141082,34 +138294,28 @@ mod autocommit_txn_tests {
             .expect("install append-failing WAL backend");
     }
 
-    async fn install_failing_retained_flush_wal_backend(conn: &Connection) {
+    async fn install_failing_wal_append_backend(conn: &Connection) {
         let cx = conn.op_cx().unwrap();
         let wal_path = wal_path_for_db_path(&conn.path);
         match &conn.pager {
             PagerBackend::Memory(p) => {
                 let vfs = p.vfs_handle();
-                install_failing_retained_flush_wal_backend_with_vfs(
-                    p,
-                    vfs.as_ref(),
-                    &cx,
-                    &wal_path,
-                )
-                .await;
+                install_failing_wal_append_backend_with_vfs(p, vfs.as_ref(), &cx, &wal_path).await;
             }
             #[cfg(target_os = "linux")]
             PagerBackend::IoUring(p) => {
                 let vfs = IoUringVfs::new();
-                install_failing_retained_flush_wal_backend_with_vfs(p, &vfs, &cx, &wal_path).await;
+                install_failing_wal_append_backend_with_vfs(p, &vfs, &cx, &wal_path).await;
             }
             #[cfg(unix)]
             PagerBackend::Unix(p) => {
                 let vfs = UnixVfs::new();
-                install_failing_retained_flush_wal_backend_with_vfs(p, &vfs, &cx, &wal_path).await;
+                install_failing_wal_append_backend_with_vfs(p, &vfs, &cx, &wal_path).await;
             }
             #[cfg(target_os = "windows")]
             PagerBackend::Windows(p) => {
                 let vfs = fsqlite_vfs::WindowsVfs::new();
-                install_failing_retained_flush_wal_backend_with_vfs(p, &vfs, &cx, &wal_path).await;
+                install_failing_wal_append_backend_with_vfs(p, &vfs, &cx, &wal_path).await;
             }
         }
     }
@@ -141573,10 +138779,10 @@ mod autocommit_txn_tests {
     }
 
     #[test]
-    fn test_retained_autocommit_error_preserves_prior_statement_writes() {
+    fn test_autocommit_error_preserves_prior_committed_statement() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("retained_autocommit_error.db");
+            let db_path = dir.path().join("autocommit-error.db");
             let db_str = db_path.to_str().unwrap();
 
             {
@@ -141591,11 +138797,6 @@ mod autocommit_txn_tests {
                 .await
                 .unwrap();
             conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "first file-backed autocommit write should park a retained txn"
-            );
-            assert_eq!(conn.retained_autocommit_stmt_count.get(), 1);
 
             let err = conn
                 .execute("INSERT INTO t VALUES (1)")
@@ -141607,23 +138808,13 @@ mod autocommit_txn_tests {
                     || err_text.contains("PRIMARY KEY constraint failed"),
                 "expected unique/primary-key violation, got {err}"
             );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_none(),
-                "failed retained autocommit statement should flush the retained batch instead of re-parking it"
-            );
-            assert_eq!(
-                conn.retained_autocommit_stmt_count.get(),
-                0,
-                "flushing the retained batch on error should reset the retained statement count"
-            );
-
             let sqlite_after_error = rusqlite::Connection::open(&db_path).unwrap();
             let count_after_error: i64 = sqlite_after_error
                 .query_row("SELECT COUNT(*) FROM t;", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(
                 count_after_error, 1,
-                "error-triggered flush should preserve and durably publish earlier retained writes"
+                "a later statement error must not roll back a prior successful autocommit statement"
             );
 
             let rows = conn.query("SELECT id FROM t ORDER BY id").await.unwrap();
@@ -141633,10 +138824,10 @@ mod autocommit_txn_tests {
     }
 
     #[test]
-    fn test_retained_autocommit_statement_error_does_not_hide_flush_failure() {
+    fn test_autocommit_commit_failure_is_returned_by_statement() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("retained_autocommit_flush_failure.db");
+            let db_path = dir.path().join("autocommit-commit-failure.db");
             let db_str = db_path.to_string_lossy().into_owned();
 
             let conn = Connection::open(&db_str).await.unwrap();
@@ -141648,33 +138839,22 @@ mod autocommit_txn_tests {
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
                 .await
                 .unwrap();
-            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "first file-backed autocommit write should park a retained txn"
-            );
 
-            install_failing_retained_flush_wal_backend(&conn).await;
+            install_failing_wal_append_backend(&conn).await;
 
             let error = conn
                 .execute("INSERT INTO t VALUES (1)")
                 .await
-                .expect_err("flush failure must override the primary statement error");
+                .expect_err("the statement must report its commit failure");
             assert!(
-                error
-                    .to_string()
-                    .contains("forced retained autocommit flush failure"),
-                "expected retained flush failure to surface, got {error}"
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_none(),
-                "failed retained flush must clear the parked batch"
+                error.to_string().contains("forced WAL append failure"),
+                "expected WAL append failure to surface, got {error}"
             );
             assert!(conn.active_txn.borrow().is_none());
             let same_connection_rows = conn.query("SELECT id FROM t ORDER BY id").await.unwrap();
             assert!(
                 same_connection_rows.is_empty(),
-                "failed retained flush must also restore the current connection's execution image"
+                "failed commit must restore the current connection's execution image"
             );
 
             let reopened = Connection::open(&db_str).await.unwrap();
@@ -141684,18 +138864,16 @@ mod autocommit_txn_tests {
                 .unwrap();
             assert!(
                 rows.is_empty(),
-                "forced append failure must not publish the retained batch"
+                "forced append failure must not publish the failed statement"
             );
         });
     }
 
     #[test]
-    fn test_retained_autocommit_mode_change_does_not_hide_flush_failure() {
+    fn test_autocommit_commit_failure_preserves_prior_successful_statement() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir
-                .path()
-                .join("retained_autocommit_mode_change_flush_failure.db");
+            let db_path = dir.path().join("autocommit-prior-success.db");
             let db_str = db_path.to_string_lossy().into_owned();
 
             let conn = Connection::open(&db_str).await.unwrap();
@@ -141708,34 +138886,24 @@ mod autocommit_txn_tests {
                 .await
                 .unwrap();
             conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "first file-backed autocommit write should park a retained txn"
-            );
 
-            install_failing_retained_flush_wal_backend(&conn).await;
+            install_failing_wal_append_backend(&conn).await;
 
-            let cx = conn.op_cx().unwrap();
             let error = conn
-                .ensure_autocommit_txn_mode_with_cx(TransactionMode::ReadOnly, &cx, None)
+                .execute("INSERT INTO t VALUES (2)")
                 .await
-                .expect_err("mode change should fail if the retained batch cannot flush");
+                .expect_err("the second statement must report its commit failure");
             assert!(
-                error
-                    .to_string()
-                    .contains("forced retained autocommit flush failure"),
-                "expected retained flush failure to surface, got {error}"
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_none(),
-                "failed retained flush must clear the parked batch"
+                error.to_string().contains("forced WAL append failure"),
+                "expected WAL append failure to surface, got {error}"
             );
             assert!(conn.active_txn.borrow().is_none());
             assert!(conn.cached_read_snapshot.borrow().is_none());
             let same_connection_rows = conn.query("SELECT id FROM t ORDER BY id").await.unwrap();
-            assert!(
-                same_connection_rows.is_empty(),
-                "failed retained flush must also restore the current connection's execution image"
+            assert_eq!(same_connection_rows.len(), 1);
+            assert_eq!(
+                same_connection_rows[0].get(0),
+                Some(&SqliteValue::Integer(1))
             );
 
             let reopened = Connection::open(&db_str).await.unwrap();
@@ -141743,19 +138911,23 @@ mod autocommit_txn_tests {
                 .query("SELECT id FROM t ORDER BY id")
                 .await
                 .unwrap();
-            assert!(
-                rows_after_failure.is_empty(),
-                "failed retained flush must not publish the parked batch"
+            assert_eq!(
+                rows_after_failure
+                    .iter()
+                    .map(row_values)
+                    .collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(1)]],
+                "failed second statement must not roll back the prior successful statement"
             );
         });
     }
 
     #[test]
-    fn test_retained_autocommit_basic_100_pure_writes_reuse_single_batch() {
+    fn test_autocommit_100_pure_writes_are_immediately_visible() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("retained_autocommit_batch_reuse.db");
+            let db_path = dir.path().join("autocommit-100-visible.db");
             let db_str = db_path.to_string_lossy().into_owned();
 
             let conn = Connection::open(&db_str).await.unwrap();
@@ -141766,7 +138938,6 @@ mod autocommit_txn_tests {
                 .await
                 .unwrap();
 
-            reset_hot_path_profile();
             for rowid in 1_i64..=100 {
                 conn.execute_with_params(
                     "INSERT INTO batch_reuse (id, val) VALUES (?1, ?2);",
@@ -141777,35 +138948,22 @@ mod autocommit_txn_tests {
                 )
                 .await
                 .unwrap();
-            }
 
-            let profile = hot_path_profile_snapshot();
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "pure-write autocommit workload should keep the retained batch parked"
-            );
-            assert_eq!(conn.retained_autocommit_stmt_count.get(), 100);
-            assert_eq!(
-                profile.retained_autocommit_flushes, 0,
-                "100 pure autocommit inserts should not flush before the adaptive threshold: {profile:?}"
-            );
-            assert!(
-                profile.retained_autocommit_reuses >= 99,
-                "all inserts after the first should reuse the parked retained txn: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_parks, 100,
-                "each successful write should re-park the retained batch: {profile:?}"
-            );
+                let observer = rusqlite::Connection::open(&db_path).unwrap();
+                let visible: i64 = observer
+                    .query_row("SELECT COUNT(*) FROM batch_reuse;", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(visible, rowid);
+            }
         });
     }
 
     #[test]
-    fn test_retained_autocommit_read_after_write_same_row_matches_rusqlite_oracle() {
+    fn test_autocommit_read_after_write_same_row_matches_rusqlite_oracle() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("retained_autocommit_read_after_write.db");
+            let db_path = dir.path().join("autocommit-read-after-write.db");
             let db_str = db_path.to_string_lossy().into_owned();
 
             let conn = Connection::open(&db_str).await.unwrap();
@@ -141853,11 +139011,6 @@ mod autocommit_txn_tests {
                     SqliteValue::Text(o_insert_row.1.into())
                 ]
             );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "point lookup after INSERT should not flush away the retained batch"
-            );
-
             conn.execute("UPDATE rw SET val = 'beta' WHERE id = 1;")
                 .await
                 .unwrap();
@@ -141881,11 +139034,6 @@ mod autocommit_txn_tests {
                     SqliteValue::Text(o_update_row.1.into())
                 ]
             );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "point lookup after UPDATE should keep the retained batch parked"
-            );
-
             conn.execute("DELETE FROM rw WHERE id = 1;").await.unwrap();
             oracle.execute("DELETE FROM rw WHERE id = 1;", []).unwrap();
 
@@ -141899,29 +139047,15 @@ mod autocommit_txn_tests {
                 })
                 .unwrap();
             assert_eq!(i64::try_from(f_delete_rows.len()).unwrap(), o_delete_count);
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "prepared rowid lookup after DELETE should continue reading from the retained batch"
-            );
-
-            let profile = hot_path_profile_snapshot();
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "same-row lookups should stay on the retained overlay path: {profile:?}"
-            );
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 3,
-                "INSERT/UPDATE/DELETE read-after-write sequence should hit the retained overlay for each read: {profile:?}"
-            );
         });
     }
 
     #[test]
-    fn test_retained_autocommit_explicit_begin_flushes_prior_batch() {
+    fn test_explicit_begin_follows_immediately_committed_autocommit_write() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("retained_autocommit_begin_flush.db");
+            let db_path = dir.path().join("autocommit-before-begin.db");
             let db_str = db_path.to_string_lossy().into_owned();
 
             let conn = Connection::open(&db_str).await.unwrap();
@@ -141935,33 +139069,18 @@ mod autocommit_txn_tests {
             conn.execute("INSERT INTO begin_flush VALUES (1, 'autocommit');")
                 .await
                 .unwrap();
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "file-backed autocommit write should park a retained txn before BEGIN"
-            );
-
             {
                 let sqlite_before_begin = rusqlite::Connection::open(&db_path).unwrap();
                 let count_before_begin: i64 = sqlite_before_begin
                     .query_row("SELECT COUNT(*) FROM begin_flush;", [], |row| row.get(0))
                     .unwrap();
                 assert_eq!(
-                    count_before_begin, 0,
-                    "unflushed retained autocommit writes must stay invisible to external readers"
+                    count_before_begin, 1,
+                    "successful autocommit write must be visible before BEGIN returns"
                 );
             }
 
-            reset_hot_path_profile();
             conn.execute("BEGIN;").await.unwrap();
-            let profile = hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_flushes >= 1,
-                "BEGIN should flush the parked retained autocommit batch first: {profile:?}"
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_none(),
-                "explicit BEGIN should consume the parked retained autocommit txn"
-            );
 
             {
                 let sqlite_after_begin = rusqlite::Connection::open(&db_path).unwrap();
@@ -141970,7 +139089,7 @@ mod autocommit_txn_tests {
                     .unwrap();
                 assert_eq!(
                     count_after_begin, 1,
-                    "BEGIN should flush the retained batch so prior writes become durable"
+                    "BEGIN must preserve the previously committed autocommit write"
                 );
             }
 
@@ -142003,14 +139122,11 @@ mod autocommit_txn_tests {
     }
 
     #[test]
-    fn test_retained_autocommit_commit_without_begin_flushes_pending_batch_like_sqlite_autocommit()
-    {
+    fn test_commit_without_begin_errors_after_successful_autocommit_writes() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir
-                .path()
-                .join("retained_autocommit_commit_without_begin_flush.db");
+            let db_path = dir.path().join("autocommit-commit-without-begin.db");
             let db_str = db_path.to_string_lossy().into_owned();
 
             let conn = Connection::open(&db_str).await.unwrap();
@@ -142044,21 +139160,16 @@ mod autocommit_txn_tests {
                     .unwrap();
             }
 
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "autocommit writes should be parked before the explicit COMMIT boundary"
-            );
             let sqlite_before_commit = rusqlite::Connection::open(&db_path).unwrap();
             let count_before_commit: i64 = sqlite_before_commit
                 .query_row("SELECT COUNT(*) FROM commit_flush;", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(
-                count_before_commit, 0,
-                "parked retained writes stay invisible to external readers until a boundary flush"
+                count_before_commit, 3,
+                "successful autocommit writes must already be externally visible"
             );
             drop(sqlite_before_commit);
 
-            reset_hot_path_profile();
             let fsqlite_commit = conn.execute("COMMIT;").await;
             let sqlite_commit = oracle.execute("COMMIT;", []);
             assert!(sqlite_commit.is_err());
@@ -142069,16 +139180,6 @@ mod autocommit_txn_tests {
                     .to_string()
                     .contains("cannot commit - no transaction is active"),
                 "expected SQLite-compatible no-active-transaction error, got {error}"
-            );
-
-            let profile = hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_flushes >= 1,
-                "COMMIT should flush the parked retained-autocommit batch before returning the no-active-transaction error: {profile:?}"
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_none(),
-                "COMMIT boundary should consume the parked retained-autocommit txn"
             );
 
             let mut oracle_stmt = oracle
@@ -142120,17 +139221,17 @@ mod autocommit_txn_tests {
             assert_eq!(
                 durable_count,
                 i64::try_from(oracle_rows.len()).unwrap(),
-                "explicit COMMIT boundary must publish the retained autocommit batch durably"
+                "the no-active-transaction error must not disturb prior autocommit commits"
             );
         });
     }
 
     #[test]
-    fn test_retained_autocommit_connection_close_flushes_pending_batch() {
+    fn test_connection_close_preserves_successful_autocommit_write() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("retained_autocommit_close_flush.db");
+            let db_path = dir.path().join("autocommit-close.db");
             let db_str = db_path.to_string_lossy().into_owned();
 
             let conn = Connection::open(&db_str).await.unwrap();
@@ -142144,18 +139245,13 @@ mod autocommit_txn_tests {
                 .await
                 .unwrap();
 
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "file-backed autocommit write should park a retained txn before close"
-            );
-
             let sqlite_before_close = rusqlite::Connection::open(&db_path).unwrap();
             let count_before_close: i64 = sqlite_before_close
                 .query_row("SELECT COUNT(*) FROM close_flush;", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(
-                count_before_close, 0,
-                "pending retained-autocommit writes must stay invisible before close flushes them"
+                count_before_close, 1,
+                "successful autocommit write must be visible before close"
             );
             drop(sqlite_before_close);
 
@@ -142175,10 +139271,10 @@ mod autocommit_txn_tests {
     }
 
     #[test]
-    fn test_retained_autocommit_adaptive_flush_pure_writes_stays_high() {
+    fn test_autocommit_pure_writes_are_committed() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("retained_autocommit_adaptive_pure.db");
+            let db_path = dir.path().join("autocommit-pure-writes.db");
             let db_str = db_path.to_string_lossy().into_owned();
 
             let conn = Connection::open(&db_str).await.unwrap();
@@ -142201,17 +139297,19 @@ mod autocommit_txn_tests {
                 .unwrap();
             }
 
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-            assert_eq!(conn.retained_autocommit_read_count.get(), 0);
-            assert_eq!(conn.adaptive_flush_threshold(), 256);
+            let observer = rusqlite::Connection::open(&db_path).unwrap();
+            let count: i64 = observer
+                .query_row("SELECT COUNT(*) FROM adaptive_pure;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 4);
         });
     }
 
     #[test]
-    fn test_retained_autocommit_adaptive_flush_mixed_workload_drops_to_16() {
+    fn test_autocommit_mixed_workload_reads_latest_commit() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("retained_autocommit_adaptive_mixed.db");
+            let db_path = dir.path().join("autocommit-mixed.db");
             let db_str = db_path.to_string_lossy().into_owned();
 
             let conn = Connection::open(&db_str).await.unwrap();
@@ -142231,7 +139329,6 @@ mod autocommit_txn_tests {
             conn.execute("INSERT INTO adaptive_mixed VALUES (1, 'alpha');")
                 .await
                 .unwrap();
-            assert_eq!(conn.adaptive_flush_threshold(), 256);
 
             let rows = stmt
                 .query_with_params(&[SqliteValue::Integer(1)])
@@ -142241,20 +139338,21 @@ mod autocommit_txn_tests {
                 row_values(&rows[0]),
                 vec![SqliteValue::Integer(1), SqliteValue::Text("alpha".into()),]
             );
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-            assert!(
-                conn.retained_autocommit_read_count.get() > 0,
-                "mixed workload should record at least one retained read"
-            );
-            assert_eq!(conn.adaptive_flush_threshold(), 16);
+            let observer = rusqlite::Connection::open(&db_path).unwrap();
+            let value: String = observer
+                .query_row("SELECT val FROM adaptive_mixed WHERE id = 1;", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(value, "alpha");
         });
     }
 
     #[test]
-    fn test_retained_autocommit_savepoint_flushes_prior_batch() {
+    fn test_savepoint_follows_immediately_committed_autocommit_write() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("retained_autocommit_savepoint_flush.db");
+            let db_path = dir.path().join("autocommit-savepoint.db");
             let db_str = db_path.to_string_lossy().into_owned();
 
             let conn = Connection::open(&db_str).await.unwrap();
@@ -142269,19 +139367,16 @@ mod autocommit_txn_tests {
             conn.execute("INSERT INTO savepoint_flush VALUES (1, 'alpha');")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-
             let sqlite_before = rusqlite::Connection::open(&db_path).unwrap();
             let count_before: i64 = sqlite_before
                 .query_row("SELECT COUNT(*) FROM savepoint_flush;", [], |row| {
                     row.get(0)
                 })
                 .unwrap();
-            assert_eq!(count_before, 0);
+            assert_eq!(count_before, 1);
             drop(sqlite_before);
 
-            conn.execute("SAVEPOINT retained_sp;").await.unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_none());
+            conn.execute("SAVEPOINT committed_sp;").await.unwrap();
 
             let sqlite_after = rusqlite::Connection::open(&db_path).unwrap();
             let count_after: i64 = sqlite_after
@@ -142296,10 +139391,10 @@ mod autocommit_txn_tests {
     }
 
     #[test]
-    fn test_retained_autocommit_pragma_table_info_flushes_prior_batch() {
+    fn test_pragma_table_info_preserves_committed_autocommit_write() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("retained_autocommit_table_info_flush.db");
+            let db_path = dir.path().join("autocommit-table-info.db");
             let db_str = db_path.to_string_lossy().into_owned();
 
             let conn = Connection::open(&db_str).await.unwrap();
@@ -142317,7 +139412,7 @@ mod autocommit_txn_tests {
             let count_before: i64 = sqlite_before
                 .query_row("SELECT COUNT(*) FROM pragma_flush;", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(count_before, 0);
+            assert_eq!(count_before, 1);
             drop(sqlite_before);
 
             let pragma_rows = conn
@@ -142325,7 +139420,6 @@ mod autocommit_txn_tests {
                 .await
                 .unwrap();
             assert_eq!(pragma_rows.len(), 2);
-            assert!(conn.retained_autocommit_txn.borrow().is_none());
 
             let sqlite_after = rusqlite::Connection::open(&db_path).unwrap();
             let count_after: i64 = sqlite_after
@@ -142336,12 +139430,10 @@ mod autocommit_txn_tests {
     }
 
     #[test]
-    fn test_schema_autocommit_boundaries_do_not_retain_when_capture_disabled() {
+    fn test_schema_autocommit_boundaries_publish_when_capture_disabled() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir
-                .path()
-                .join("schema_autocommit_boundaries_do_not_retain.db");
+            let db_path = dir.path().join("schema-autocommit-boundaries-publish.db");
             let db_str = db_path.to_string_lossy().into_owned();
 
             let conn = Connection::open(&db_str).await.unwrap();
@@ -142352,18 +139444,10 @@ mod autocommit_txn_tests {
             )
             .await
             .unwrap();
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_none(),
-                "CREATE TABLE must publish immediately, not park a retained autocommit txn"
-            );
 
             conn.execute("CREATE INDEX idx_schema_boundary_val ON schema_boundary(val);")
                 .await
                 .unwrap();
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_none(),
-                "CREATE INDEX must publish immediately, not park a retained autocommit txn"
-            );
 
             let rows = conn
                 .query("PRAGMA table_info(schema_boundary);")
@@ -142374,10 +139458,10 @@ mod autocommit_txn_tests {
     }
 
     #[test]
-    fn test_retained_autocommit_pragma_journal_mode_flushes_prior_batch() {
+    fn test_pragma_journal_mode_preserves_committed_autocommit_write() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("retained_autocommit_journal_mode_flush.db");
+            let db_path = dir.path().join("autocommit-journal-mode.db");
             let db_str = db_path.to_string_lossy().into_owned();
 
             let conn = Connection::open(&db_str).await.unwrap();
@@ -142397,7 +139481,7 @@ mod autocommit_txn_tests {
                     row.get(0)
                 })
                 .unwrap();
-            assert_eq!(count_before, 0);
+            assert_eq!(count_before, 1);
             drop(sqlite_before);
 
             let rows = conn.query("PRAGMA journal_mode='delete';").await.unwrap();
@@ -142410,7 +139494,6 @@ mod autocommit_txn_tests {
                 })
                 .unwrap();
             assert_eq!(mode, "delete");
-            assert!(conn.retained_autocommit_txn.borrow().is_none());
 
             let sqlite_after = rusqlite::Connection::open(&db_path).unwrap();
             let count_after: i64 = sqlite_after
@@ -142423,12 +139506,10 @@ mod autocommit_txn_tests {
     }
 
     #[test]
-    fn test_retained_autocommit_schema_change_flushes_prior_batch() {
+    fn test_schema_change_follows_committed_autocommit_write() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir
-                .path()
-                .join("retained_autocommit_schema_change_flush.db");
+            let db_path = dir.path().join("autocommit-schema-change.db");
             let db_str = db_path.to_string_lossy().into_owned();
 
             let conn = Connection::open(&db_str).await.unwrap();
@@ -142446,7 +139527,7 @@ mod autocommit_txn_tests {
             let count_before: i64 = sqlite_before
                 .query_row("SELECT COUNT(*) FROM schema_flush;", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(count_before, 0);
+            assert_eq!(count_before, 1);
             drop(sqlite_before);
 
             conn.execute(
@@ -142454,10 +139535,6 @@ mod autocommit_txn_tests {
             )
             .await
             .unwrap();
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_none(),
-                "CREATE TABLE should flush the parked retained autocommit batch first"
-            );
 
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                 .await
@@ -142468,7 +139545,7 @@ mod autocommit_txn_tests {
                 .unwrap();
             assert_eq!(
                 count_after, 1,
-                "schema change boundary should durably publish prior retained writes"
+                "schema change must preserve the prior committed write"
             );
             let aux_exists: i64 = sqlite_after
                 .query_row(
@@ -142485,12 +139562,10 @@ mod autocommit_txn_tests {
     }
 
     #[test]
-    fn test_retained_autocommit_attach_and_detach_flush_prior_batch() {
+    fn test_attach_and_detach_preserve_committed_autocommit_writes() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir
-                .path()
-                .join("retained_autocommit_attach_detach_flush.db");
+            let db_path = dir.path().join("autocommit-attach-detach.db");
             let db_str = db_path.to_string_lossy().into_owned();
 
             let conn = Connection::open(&db_str).await.unwrap();
@@ -142508,13 +139583,12 @@ mod autocommit_txn_tests {
             let count_before_attach: i64 = sqlite_before_attach
                 .query_row("SELECT COUNT(*) FROM attach_flush;", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(count_before_attach, 0);
+            assert_eq!(count_before_attach, 1);
             drop(sqlite_before_attach);
 
             conn.execute("ATTACH DATABASE ':memory:' AS aux;")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_none());
 
             let sqlite_after_attach = rusqlite::Connection::open(&db_path).unwrap();
             let count_after_attach: i64 = sqlite_after_attach
@@ -142526,17 +139600,15 @@ mod autocommit_txn_tests {
             conn.execute("INSERT INTO attach_flush VALUES (2, 'before_detach');")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
 
             let sqlite_before_detach = rusqlite::Connection::open(&db_path).unwrap();
             let count_before_detach: i64 = sqlite_before_detach
                 .query_row("SELECT COUNT(*) FROM attach_flush;", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(count_before_detach, 1);
+            assert_eq!(count_before_detach, 2);
             drop(sqlite_before_detach);
 
             conn.execute("DETACH DATABASE aux;").await.unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_none());
 
             let sqlite_after_detach = rusqlite::Connection::open(&db_path).unwrap();
             let count_after_detach: i64 = sqlite_after_detach
@@ -142547,10 +139619,10 @@ mod autocommit_txn_tests {
     }
 
     #[test]
-    fn test_retained_autocommit_vacuum_flushes_prior_batch() {
+    fn test_vacuum_preserves_committed_autocommit_write() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("retained_autocommit_vacuum_flush.db");
+            let db_path = dir.path().join("autocommit-vacuum.db");
             let db_str = db_path.to_string_lossy().into_owned();
 
             let conn = Connection::open(&db_str).await.unwrap();
@@ -142568,11 +139640,10 @@ mod autocommit_txn_tests {
             let count_before: i64 = sqlite_before
                 .query_row("SELECT COUNT(*) FROM vacuum_flush;", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(count_before, 0);
+            assert_eq!(count_before, 1);
             drop(sqlite_before);
 
             conn.execute("VACUUM;").await.unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_none());
 
             let sqlite_after = rusqlite::Connection::open(&db_path).unwrap();
             let count_after: i64 = sqlite_after
@@ -150465,11 +147536,6 @@ mod pager_routing_tests {
         // tracing state. Tests that genuinely need scoped tracing install a
         // *local* subscriber via `tracing::subscriber::with_default(...)`
         // instead (see `test_window_eval_trace_span_counter_records_enabled_debug_spans`).
-    }
-
-    async fn flush_retained_autocommit_for_cached_read_test(conn: &Connection) {
-        let cx = conn.op_cx().unwrap();
-        conn.flush_retained_autocommit_txn(&cx).await.unwrap();
     }
 
     async fn open_connection_with_transient_retry(path: &str) -> Connection {
@@ -162603,7 +159669,7 @@ mod pager_routing_tests {
     }
 
     #[test]
-    fn test_prepared_direct_simple_insert_autocommit_retains_memory_append_hint() {
+    fn test_prepared_direct_simple_insert_cached_writer_preserves_memory_append_hint() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
@@ -162628,9 +159694,8 @@ mod pager_routing_tests {
                     .unwrap();
                 assert_eq!(affected, 1);
                 assert!(
-                    conn.retained_autocommit_txn.borrow().is_some()
-                        || conn.cached_write_txn.borrow().is_some(),
-                    "autocommit :memory: insert should park reusable writer state"
+                    conn.cached_write_txn.borrow().is_some(),
+                    "autocommit :memory: insert should park the committed cached writer"
                 );
                 assert_eq!(
                     conn.prepared_direct_insert_append_hint
@@ -162638,7 +159703,7 @@ mod pager_routing_tests {
                         .as_ref()
                         .map(|hint| (hint.root_page, hint.last_rowid)),
                     Some((root_page, id)),
-                    "retained autocommit should keep the table-local append hint hot across statements"
+                    "the committed cached writer should keep the table-local append hint hot across statements"
                 );
                 assert!(
                     conn.prepared_direct_insert_append_hint
@@ -162646,19 +159711,19 @@ mod pager_routing_tests {
                         .as_ref()
                         .and_then(|hint| hint.cached_leaf.as_ref())
                         .is_some(),
-                    "retained autocommit should keep table-local rightmost leaf state hot across statements"
+                    "the committed cached writer should keep table-local rightmost leaf state hot across statements"
                 );
             }
             assert_eq!(
                 conn.pending_memdb_direct_upserts.borrow().len(),
                 0,
-                "retained autocommit should avoid queueing owned MemDatabase row images on the hot write-only path"
+                "the cached writer should avoid queueing owned MemDatabase row images on the hot write-only path"
             );
             assert!(
                 !conn.memdb_rows_loaded.get()
                     && !conn.memdb_storage_count_shortcuts_safe.get()
                     && conn.memdb_requires_active_txn_reload.get(),
-                "retained autocommit should keep the append hint hot while marking the MemDatabase mirror stale for the next read boundary"
+                "the cached writer should keep the append hint hot while marking the MemDatabase mirror stale for the next read boundary"
             );
 
             let rows = conn
@@ -162667,7 +159732,7 @@ mod pager_routing_tests {
                 .unwrap();
             assert!(
                 conn.pending_memdb_direct_upserts.borrow().is_empty(),
-                "retained autocommit read boundary should not need any queued MemDatabase deltas"
+                "the read boundary should not need queued MemDatabase deltas"
             );
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
@@ -162748,7 +159813,6 @@ mod pager_routing_tests {
             let db_path = dir.path().join("normal_autocommit_append_hint.db");
             let db_path = db_path.to_string_lossy().into_owned();
             let conn = Connection::open(db_path).await.unwrap();
-            conn.autocommit_retain_enabled.set(false);
             conn.execute(
             "CREATE TABLE prep_direct_file_autohint (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
         ).await
@@ -162769,7 +159833,7 @@ mod pager_routing_tests {
             );
             assert!(
                 conn.prepared_direct_insert_append_hint.borrow().is_none(),
-                "normal autocommit commit must not leave an append hint whose retained leaf image belongs to the closed implicit transaction"
+                "file-backed autocommit must not leave an append hint whose leaf image belongs to a closed implicit transaction"
             );
 
             let rows = conn
@@ -166088,8 +163152,6 @@ mod pager_routing_tests {
             conn.execute("INSERT INTO prep_cached_read VALUES (1, 'alpha');")
                 .await
                 .unwrap();
-            flush_retained_autocommit_for_cached_read_test(&conn).await;
-
             let stmt = conn
                 .prepare("SELECT val FROM prep_cached_read ORDER BY id LIMIT 1")
                 .await
@@ -166160,7 +163222,6 @@ mod pager_routing_tests {
                 row.values(),
                 &[SqliteValue::Integer(1), SqliteValue::Text("alpha".into())]
             );
-            flush_retained_autocommit_for_cached_read_test(&conn).await;
             let cx = conn.op_cx().unwrap();
             conn.reload_memdb_from_pager_with_mode(&cx, true)
                 .await
@@ -166237,8 +163298,6 @@ mod pager_routing_tests {
             conn.execute("INSERT INTO prep_cached_read_epoch VALUES (1, 'alpha');")
                 .await
                 .unwrap();
-            flush_retained_autocommit_for_cached_read_test(&conn).await;
-
             let stmt = conn
                 .prepare("SELECT val FROM prep_cached_read_epoch ORDER BY id LIMIT 1")
                 .await
@@ -166375,8 +163434,6 @@ mod pager_routing_tests {
             conn.execute("INSERT INTO prep_cached_read_no_rows VALUES (1, 'alpha');")
                 .await
                 .unwrap();
-            flush_retained_autocommit_for_cached_read_test(&conn).await;
-
             let stmt = conn
                 .prepare("SELECT val FROM prep_cached_read_no_rows WHERE id = ?1")
                 .await
@@ -166496,8 +163553,6 @@ mod pager_routing_tests {
             conn.execute("INSERT INTO prep_cached_read_for_each_callback VALUES (1, 'alpha');")
                 .await
                 .unwrap();
-            flush_retained_autocommit_for_cached_read_test(&conn).await;
-
             let stmt = conn
                 .prepare("SELECT val FROM prep_cached_read_for_each_callback WHERE id = ?1")
                 .await
@@ -166829,9 +163884,8 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
             // The prepared statement is testing publication reuse after external
-            // DML, not live writer contention. Release any retained single-writer
-            // state parked on the seeding connection before running the assertion
-            // path on conn1.
+            // DML, not connection lifetime behavior. Release the seeding
+            // connection before running the assertion path on conn1.
             drop(conn2);
 
             reset_hot_path_profile();
@@ -166905,8 +163959,8 @@ mod pager_routing_tests {
                 "default concurrent :memory: autocommit writes should use the isolated memory fast path or reuse a cached write txn: {profile:?}"
             );
             assert!(
-                profile.retained_autocommit_parks >= 1 || profile.cached_write_txn_parks >= 1,
-                "autocommit :memory: writes should park a reusable writer state: {profile:?}"
+                profile.cached_write_txn_parks >= 1,
+                "autocommit :memory: writes should park a committed cached writer: {profile:?}"
             );
         });
     }
@@ -166914,9 +163968,8 @@ mod pager_routing_tests {
     #[test]
     fn test_memory_autocommit_write_txn_parks_and_reuses() {
         asupersync::test_utils::run_test(|| async {
-            // bd-aw0b9: verify that consecutive autocommit writes on :memory:
-            // park the writer state after the first statement and reuse it for
-            // subsequent writes — skipping pager.begin() + Mutex entirely.
+            // Consecutive autocommit writes on :memory: commit each statement,
+            // park the reusable writer handle, and reuse it for later writes.
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE park_test (id INTEGER PRIMARY KEY, val TEXT);")
@@ -166938,8 +163991,8 @@ mod pager_routing_tests {
                 "first write should use memory fast-path begin or reuse cached write txn: {p1:?}"
             );
             assert_eq!(
-                p1.retained_autocommit_parks, 1,
-                "first write should park a retained autocommit batch for reuse: {p1:?}"
+                p1.cached_write_txn_parks, 1,
+                "first write should park a committed cached writer: {p1:?}"
             );
 
             // Second autocommit write: should reuse the writer parked by the
@@ -166950,12 +164003,12 @@ mod pager_routing_tests {
 
             let p2 = hot_path_profile_snapshot();
             assert!(
-                p2.retained_autocommit_reuses >= 1,
-                "second write should reuse the retained autocommit txn (cumulative): {p2:?}"
+                p2.cached_write_txn_reuses >= 1,
+                "second write should reuse the committed cached writer: {p2:?}"
             );
             assert_eq!(
-                p2.retained_autocommit_parks, 2,
-                "second write should also re-park the retained batch: {p2:?}"
+                p2.cached_write_txn_parks, 2,
+                "second write should also re-park the committed cached writer: {p2:?}"
             );
 
             // Third write: verify data correctness across reused transactions.
@@ -166971,10 +164024,10 @@ mod pager_routing_tests {
 
             let p3 = hot_path_profile_snapshot();
             assert!(
-                p3.retained_autocommit_reuses >= 2,
+                p3.cached_write_txn_reuses >= 2,
                 "third write reuses should be cumulative: {p3:?}"
             );
-            assert_eq!(p3.retained_autocommit_parks, 3);
+            assert_eq!(p3.cached_write_txn_parks, 3);
         });
     }
 
@@ -167003,34 +164056,34 @@ mod pager_routing_tests {
             assert_eq!(affected, 1);
             assert!(
                 conn.memdb_requires_active_txn_reload.get(),
-                "retained :memory: autocommit should leave the MemDatabase marked stale instead of doing commit-time row refresh"
+                "cached-writer autocommit should leave the MemDatabase marked stale instead of doing commit-time row refresh"
             );
             assert!(
                 conn.pending_memdb_direct_upserts.borrow().is_empty(),
                 "memory autocommit should not queue deferred MemDatabase row images when the mirror is intentionally stale"
             );
             assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "retained :memory: autocommit should keep the txn parked until a flush boundary"
+                conn.cached_write_txn.borrow().is_some(),
+                "memory autocommit should keep the committed cached writer parked"
             );
             assert_eq!(
                 *conn.schema_cookie.borrow(),
                 schema_cookie_before,
-                "stale retained commit must not perturb the schema cookie for DML"
+                "a cached-writer commit must not perturb the schema cookie for DML"
             );
             assert_eq!(
                 conn.schema_generation.get(),
                 schema_generation_before,
-                "stale retained commit must not advance schema generation for DML"
+                "a cached-writer commit must not advance schema generation for DML"
             );
 
             let rows = conn
                 .query("SELECT id, val FROM dirty_reload_test ORDER BY id;")
                 .await
-                .expect("query should succeed after lazy retained refresh");
+                .expect("query should succeed after lazy cached-writer refresh");
             assert!(
                 !conn.memdb_requires_active_txn_reload.get(),
-                "the first read should consume the deferred retained refresh"
+                "the first read should consume the deferred refresh"
             );
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
@@ -167039,17 +164092,17 @@ mod pager_routing_tests {
     }
 
     #[test]
-    fn test_memory_retained_autocommit_preserves_prepared_insert_append_hint() {
+    fn test_memory_cached_writer_preserves_prepared_insert_append_hint() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
-                "CREATE TABLE retained_append_hint (id INTEGER PRIMARY KEY, val TEXT NOT NULL);",
+                "CREATE TABLE cached_writer_append_hint (id INTEGER PRIMARY KEY, val TEXT NOT NULL);",
             )
             .await
             .unwrap();
             let stmt = conn
-                .prepare("INSERT INTO retained_append_hint VALUES (?1, ('value_' || ?1));")
+                .prepare("INSERT INTO cached_writer_append_hint VALUES (?1, ('value_' || ?1));")
                 .await
                 .unwrap();
 
@@ -167066,15 +164119,15 @@ mod pager_routing_tests {
             let leaf_profile = fsqlite_btree::instrumentation::btree_leaf_reuse_snapshot();
             fsqlite_btree::instrumentation::set_btree_copy_profile_enabled(false);
             assert!(
-                profile.retained_autocommit_reuses >= 7,
-                "prepared autocommit inserts should reuse the retained transaction: {profile:?}"
+                profile.cached_write_txn_reuses >= 7,
+                "prepared autocommit inserts should reuse the committed cached writer: {profile:?}"
             );
             assert!(
                 leaf_profile.fast_table_leaf_payload_appends >= 1,
-                "retained autocommit reuse should preserve the append hint and avoid full-cell assembly after the first append: {leaf_profile:?}"
+                "cached-writer reuse should preserve the append hint and avoid full-cell assembly after the first append: {leaf_profile:?}"
             );
             let count = conn
-                .query_row("SELECT count(*) FROM retained_append_hint;")
+                .query_row("SELECT count(*) FROM cached_writer_append_hint;")
                 .await
                 .unwrap();
             assert_eq!(count.values()[0], SqliteValue::Integer(8));
@@ -167082,24 +164135,22 @@ mod pager_routing_tests {
     }
 
     #[test]
-    fn test_memory_retained_autocommit_prepared_rowid_lookup_uses_overlay_without_flush() {
+    fn test_memory_prepared_rowid_lookup_observes_committed_write() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE mem_retained_read (id INTEGER PRIMARY KEY, val TEXT);")
+            conn.execute("CREATE TABLE mem_committed_read (id INTEGER PRIMARY KEY, val TEXT);")
                 .await
                 .unwrap();
             let stmt = conn
-                .prepare("SELECT * FROM mem_retained_read WHERE id = ?1;")
+                .prepare("SELECT * FROM mem_committed_read WHERE id = ?1;")
                 .await
                 .unwrap();
 
             reset_hot_path_profile();
-            conn.execute("INSERT INTO mem_retained_read VALUES (1, 'alpha');")
+            conn.execute("INSERT INTO mem_committed_read VALUES (1, 'alpha');")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-
             let row = stmt
                 .query_row_with_params(&[SqliteValue::Integer(1)])
                 .await
@@ -167108,230 +164159,143 @@ mod pager_routing_tests {
                 row.values(),
                 &[SqliteValue::Integer(1), SqliteValue::Text("alpha".into())]
             );
-
-            let profile = hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "prepared rowid lookup against dirty retained :memory: batch should use the same-connection overlay: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "supported retained :memory: overlay read should avoid read-after-write flushes: {profile:?}"
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "overlay read should keep the retained :memory: autocommit batch parked"
-            );
         });
     }
 
     #[test]
-    fn test_memory_retained_autocommit_projected_rowid_lookup_uses_overlay_without_flush() {
+    fn test_memory_prepared_projected_rowid_lookup_observes_committed_write() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE mem_retained_projected (id INTEGER PRIMARY KEY, val TEXT);")
-                .await
-                .unwrap();
+            conn.execute(
+                "CREATE TABLE mem_committed_projected (id INTEGER PRIMARY KEY, val TEXT);",
+            )
+            .await
+            .unwrap();
             let stmt = conn
-                .prepare("SELECT val FROM mem_retained_projected WHERE id = ?1;")
+                .prepare("SELECT val FROM mem_committed_projected WHERE id = ?1;")
                 .await
                 .unwrap();
 
             reset_hot_path_profile();
-            conn.execute("INSERT INTO mem_retained_projected VALUES (1, 'alpha');")
+            conn.execute("INSERT INTO mem_committed_projected VALUES (1, 'alpha');")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-
             let row = stmt
                 .query_row_with_params(&[SqliteValue::Integer(1)])
                 .await
                 .unwrap();
             assert_eq!(row.values(), &[SqliteValue::Text("alpha".into())]);
-
-            let profile = hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "projected prepared rowid lookup against dirty retained :memory: batch should use the same-connection overlay: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "supported retained :memory: projected overlay read should avoid read-after-write flushes: {profile:?}"
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "projected overlay read should keep the retained :memory: autocommit batch parked"
-            );
         });
     }
 
     #[test]
-    fn test_memory_retained_autocommit_projected_indexed_equality_uses_overlay_without_flush() {
+    fn test_memory_prepared_projected_indexed_equality_observes_committed_write() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
-            "CREATE TABLE mem_retained_projected_indexed (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score INTEGER NOT NULL);",
+            "CREATE TABLE mem_committed_projected_indexed (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score INTEGER NOT NULL);",
         ).await
         .unwrap();
             conn.execute(
-            "CREATE INDEX mem_retained_projected_indexed_name ON mem_retained_projected_indexed(name);",
+            "CREATE INDEX mem_committed_projected_indexed_name ON mem_committed_projected_indexed(name);",
         ).await
         .unwrap();
             let stmt = conn
-                .prepare("SELECT score FROM mem_retained_projected_indexed WHERE name = ?1;")
+                .prepare("SELECT score FROM mem_committed_projected_indexed WHERE name = ?1;")
                 .await
                 .unwrap();
 
             reset_hot_path_profile();
-            conn.execute("INSERT INTO mem_retained_projected_indexed VALUES (1, 'beta', 11);")
+            conn.execute("INSERT INTO mem_committed_projected_indexed VALUES (1, 'beta', 11);")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-
             let row = stmt
                 .query_row_with_params(&[SqliteValue::Text("beta".into())])
                 .await
                 .unwrap();
             assert_eq!(row.values(), &[SqliteValue::Integer(11)]);
-
-            let profile = hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "projected indexed equality against dirty retained :memory: batch should use the same-connection overlay: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "supported retained :memory: projected indexed equality should avoid read-after-write flushes: {profile:?}"
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "projected indexed equality overlay read should keep the retained :memory: autocommit batch parked"
-            );
         });
     }
 
     #[test]
-    fn test_memory_retained_autocommit_prepared_count_range_uses_overlay_without_flush() {
+    fn test_memory_prepared_count_range_observes_committed_writes() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
-            "CREATE TABLE mem_retained_count_range (id INTEGER PRIMARY KEY, val TEXT NOT NULL);",
+            "CREATE TABLE mem_committed_count_range (id INTEGER PRIMARY KEY, val TEXT NOT NULL);",
         ).await
         .unwrap();
             let stmt = conn
                 .prepare(
-                    "SELECT COUNT(*) FROM mem_retained_count_range WHERE id >= ?1 AND id < ?2;",
+                    "SELECT COUNT(*) FROM mem_committed_count_range WHERE id >= ?1 AND id < ?2;",
                 )
                 .await
                 .unwrap();
 
-            conn.execute("INSERT INTO mem_retained_count_range VALUES (1, 'alpha');")
+            conn.execute("INSERT INTO mem_committed_count_range VALUES (1, 'alpha');")
                 .await
                 .unwrap();
-            conn.execute("INSERT INTO mem_retained_count_range VALUES (2, 'beta');")
+            conn.execute("INSERT INTO mem_committed_count_range VALUES (2, 'beta');")
                 .await
                 .unwrap();
-            conn.execute("INSERT INTO mem_retained_count_range VALUES (3, 'gamma');")
+            conn.execute("INSERT INTO mem_committed_count_range VALUES (3, 'gamma');")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-
             reset_hot_path_profile();
             let row = stmt
                 .query_row_with_params(&[SqliteValue::Integer(1), SqliteValue::Integer(3)])
                 .await
                 .unwrap();
             assert_eq!(row.get(0), Some(&SqliteValue::Integer(2)));
-
-            let profile = hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "prepared count-range query against dirty retained :memory: batch should use the overlay: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "supported retained :memory: count-range query should avoid read-after-write flushes: {profile:?}"
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "overlay count-range read should keep the retained :memory: autocommit batch parked"
-            );
         });
     }
 
     #[test]
-    fn test_memory_retained_autocommit_prepared_count_sum_uses_overlay_without_flush() {
+    fn test_memory_prepared_count_sum_observes_committed_writes() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
-            "CREATE TABLE mem_retained_count_sum (id INTEGER PRIMARY KEY, score INTEGER NOT NULL);",
+            "CREATE TABLE mem_committed_count_sum (id INTEGER PRIMARY KEY, score INTEGER NOT NULL);",
         ).await
         .unwrap();
             let stmt = conn
-                .prepare("SELECT COUNT(*), SUM(score) FROM mem_retained_count_sum;")
+                .prepare("SELECT COUNT(*), SUM(score) FROM mem_committed_count_sum;")
                 .await
                 .unwrap();
 
-            conn.execute("INSERT INTO mem_retained_count_sum VALUES (1, 10);")
+            conn.execute("INSERT INTO mem_committed_count_sum VALUES (1, 10);")
                 .await
                 .unwrap();
-            conn.execute("INSERT INTO mem_retained_count_sum VALUES (2, 20);")
+            conn.execute("INSERT INTO mem_committed_count_sum VALUES (2, 20);")
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-
             reset_hot_path_profile();
             let row = stmt.query_row().await.unwrap();
             assert_eq!(
                 row.values(),
                 &[SqliteValue::Integer(2), SqliteValue::Integer(30)]
             );
-
-            let profile = hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "prepared count+sum query against dirty retained :memory: batch should use the overlay: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "supported retained :memory: count+sum query should avoid read-after-write flushes: {profile:?}"
-            );
-            assert!(
-                conn.retained_autocommit_txn.borrow().is_some(),
-                "overlay count+sum read should keep the retained :memory: autocommit batch parked"
-            );
         });
     }
 
     #[test]
-    fn test_prepared_count_sum_interest_seeds_cache_on_first_direct_insert() {
+    fn test_prepared_count_sum_reflects_direct_insert() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
-                "CREATE TABLE mem_retained_count_sum_interest_insert \
+                "CREATE TABLE mem_committed_count_sum_insert \
              (id INTEGER PRIMARY KEY, name TEXT, score INTEGER NOT NULL);",
             )
             .await
             .unwrap();
-            let root_page = conn
-                .schema
-                .borrow()
-                .iter()
-                .find(|table| {
-                    table
-                        .name
-                        .eq_ignore_ascii_case("mem_retained_count_sum_interest_insert")
-                })
-                .map(|table| table.root_page)
-                .expect("test table root page");
             let seed_insert = conn
                 .prepare(
-                    "INSERT INTO mem_retained_count_sum_interest_insert \
+                    "INSERT INTO mem_committed_count_sum_insert \
                  VALUES (?1, ('name_' || ?1), (?1 * 7));",
                 )
                 .await
@@ -167348,12 +164312,12 @@ mod pager_routing_tests {
             conn.execute("COMMIT;").await.unwrap();
 
             let aggregate = conn
-                .prepare("SELECT COUNT(*), SUM(score) FROM mem_retained_count_sum_interest_insert;")
+                .prepare("SELECT COUNT(*), SUM(score) FROM mem_committed_count_sum_insert;")
                 .await
                 .unwrap();
             let insert = conn
                 .prepare(
-                    "INSERT INTO mem_retained_count_sum_interest_insert \
+                    "INSERT INTO mem_committed_count_sum_insert \
                  VALUES (?1, ('name_' || ?1), (?1 * 7));",
                 )
                 .await
@@ -167364,66 +164328,36 @@ mod pager_routing_tests {
                 .execute_with_params(&[SqliteValue::Integer(3)])
                 .await
                 .unwrap();
-            assert_eq!(
-                conn.retained_autocommit_count_sum_cache_row(root_page, 2, Some(0))
-                    .as_ref()
-                    .map(Row::values),
-                Some(&[SqliteValue::Integer(3), SqliteValue::Integer(42)][..])
-            );
 
             let row = aggregate.query_row().await.unwrap();
             assert_eq!(
                 row.values(),
                 &[SqliteValue::Integer(3), SqliteValue::Integer(42)]
             );
-            let profile = hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "first aggregate after direct insert should use the preseeded cache: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_overlay_misses, 0,
-                "direct-insert seeding should avoid the first retained aggregate miss: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "seeded count+sum cache should avoid a read-after-write flush: {profile:?}"
-            );
         });
     }
 
     #[test]
-    fn test_prepared_count_sum_cache_invalidates_on_direct_insert_or_replace() {
+    fn test_prepared_count_sum_reflects_direct_insert_or_replace() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
-                "CREATE TABLE mem_retained_count_sum_replace \
+                "CREATE TABLE mem_committed_count_sum_replace \
              (id INTEGER PRIMARY KEY, score INTEGER NOT NULL);",
             )
             .await
             .unwrap();
-            let root_page = conn
-                .schema
-                .borrow()
-                .iter()
-                .find(|table| {
-                    table
-                        .name
-                        .eq_ignore_ascii_case("mem_retained_count_sum_replace")
-                })
-                .map(|table| table.root_page)
-                .expect("test table root page");
-            conn.execute("INSERT INTO mem_retained_count_sum_replace VALUES (1, 10), (2, 20);")
+            conn.execute("INSERT INTO mem_committed_count_sum_replace VALUES (1, 10), (2, 20);")
                 .await
                 .unwrap();
 
             let aggregate = conn
-                .prepare("SELECT COUNT(*), SUM(score) FROM mem_retained_count_sum_replace;")
+                .prepare("SELECT COUNT(*), SUM(score) FROM mem_committed_count_sum_replace;")
                 .await
                 .unwrap();
             let replace = conn
-                .prepare("INSERT OR REPLACE INTO mem_retained_count_sum_replace VALUES (?1, ?2);")
+                .prepare("INSERT OR REPLACE INTO mem_committed_count_sum_replace VALUES (?1, ?2);")
                 .await
                 .unwrap();
 
@@ -167432,13 +164366,6 @@ mod pager_routing_tests {
                 row.values(),
                 &[SqliteValue::Integer(2), SqliteValue::Integer(30)]
             );
-            assert_eq!(
-                conn.retained_autocommit_count_sum_cache_row(root_page, 1, Some(0))
-                    .as_ref()
-                    .map(Row::values),
-                Some(&[SqliteValue::Integer(2), SqliteValue::Integer(30)][..])
-            );
-
             reset_hot_path_profile();
             assert_eq!(
                 replace
@@ -167447,12 +164374,6 @@ mod pager_routing_tests {
                     .unwrap(),
                 1
             );
-            assert!(
-                conn.retained_autocommit_count_sum_cache_row(root_page, 1, Some(0))
-                    .is_none(),
-                "INSERT OR REPLACE cannot apply a pure insert delta to a retained aggregate cache"
-            );
-
             let row = aggregate.query_row().await.unwrap();
             assert_eq!(
                 row.values(),
@@ -167463,88 +164384,23 @@ mod pager_routing_tests {
                 profile.prepared_direct_insert_executions >= 1,
                 "INSERT OR REPLACE should exercise the prepared direct insert path: {profile:?}"
             );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "invalidating the cache should still let the retained overlay recompute without flushing: {profile:?}"
-            );
         });
     }
 
     #[test]
-    fn test_count_sum_cache_failed_insert_delta_clears_preserve_bit() {
-        asupersync::test_utils::run_test(|| async {
-            let conn = Connection::open(":memory:").await.unwrap();
-            conn.execute(
-                "CREATE TABLE mem_retained_count_sum_insert_delta_failure \
-             (id INTEGER PRIMARY KEY, score INTEGER NOT NULL);",
-            )
-            .await
-            .unwrap();
-            let root_page = conn
-                .schema
-                .borrow()
-                .iter()
-                .find(|table| {
-                    table
-                        .name
-                        .eq_ignore_ascii_case("mem_retained_count_sum_insert_delta_failure")
-                })
-                .map(|table| table.root_page)
-                .expect("test table root page");
-
-            conn.store_retained_autocommit_count_sum_cache(
-                root_page,
-                1,
-                Some(0),
-                1,
-                &Row {
-                    values: vec![SqliteValue::Integer(1), SqliteValue::Integer(10)],
-                },
-            );
-            conn.retained_autocommit_count_sum_cache_preserve_next_write
-                .set(true);
-
-            conn.retained_autocommit_count_sum_cache_note_insert(root_page, &[]);
-
-            assert!(
-                conn.retained_autocommit_count_sum_cache_row(root_page, 1, Some(0))
-                    .is_none(),
-                "failed insert-delta application must invalidate the retained aggregate cache"
-            );
-            assert!(
-                !conn
-                    .retained_autocommit_count_sum_cache_preserve_next_write
-                    .get(),
-                "failed insert-delta application must not leave the next dirty-table mark in preserve mode"
-            );
-        });
-    }
-
-    #[test]
-    fn test_prepared_count_sum_interest_seeds_cache_on_first_direct_update() {
+    fn test_prepared_count_sum_reflects_direct_update() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
-                "CREATE TABLE mem_retained_count_sum_interest_update \
+                "CREATE TABLE mem_committed_count_sum_update \
              (id INTEGER PRIMARY KEY, name TEXT, score INTEGER NOT NULL);",
             )
             .await
             .unwrap();
-            let root_page = conn
-                .schema
-                .borrow()
-                .iter()
-                .find(|table| {
-                    table
-                        .name
-                        .eq_ignore_ascii_case("mem_retained_count_sum_interest_update")
-                })
-                .map(|table| table.root_page)
-                .expect("test table root page");
             let seed_insert = conn
                 .prepare(
-                    "INSERT INTO mem_retained_count_sum_interest_update \
+                    "INSERT INTO mem_committed_count_sum_update \
                  VALUES (?1, ('name_' || ?1), (?1 * 7));",
                 )
                 .await
@@ -167565,13 +164421,11 @@ mod pager_routing_tests {
             conn.execute("COMMIT;").await.unwrap();
 
             let aggregate = conn
-                .prepare("SELECT COUNT(*), SUM(score) FROM mem_retained_count_sum_interest_update;")
+                .prepare("SELECT COUNT(*), SUM(score) FROM mem_committed_count_sum_update;")
                 .await
                 .unwrap();
             let update = conn
-                .prepare(
-                    "UPDATE mem_retained_count_sum_interest_update SET score = ?1 WHERE id = ?2;",
-                )
+                .prepare("UPDATE mem_committed_count_sum_update SET score = ?1 WHERE id = ?2;")
                 .await
                 .unwrap();
 
@@ -167583,13 +164437,6 @@ mod pager_routing_tests {
                     .unwrap(),
                 1
             );
-            assert_eq!(
-                conn.retained_autocommit_count_sum_cache_row(root_page, 2, Some(0))
-                    .as_ref()
-                    .map(Row::values),
-                Some(&[SqliteValue::Integer(3), SqliteValue::Integer(128)][..])
-            );
-
             let row = aggregate.query_row().await.unwrap();
             assert_eq!(
                 row.values(),
@@ -167600,46 +164447,23 @@ mod pager_routing_tests {
                 profile.prepared_direct_update_executions >= 1,
                 "autocommit UPDATE should use the direct rowid-targeted path: {profile:?}"
             );
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "first aggregate after direct update should use the preseeded cache: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_overlay_misses, 0,
-                "direct-update seeding should avoid the first retained aggregate miss: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "seeded count+sum cache should avoid a read-after-write flush: {profile:?}"
-            );
         });
     }
 
     #[test]
-    fn test_prepared_count_sum_interest_seeds_cache_on_first_direct_delete() {
+    fn test_prepared_count_sum_reflects_direct_delete() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
-                "CREATE TABLE mem_retained_count_sum_interest_delete \
+                "CREATE TABLE mem_committed_count_sum_delete \
              (id INTEGER PRIMARY KEY, name TEXT, score INTEGER NOT NULL);",
             )
             .await
             .unwrap();
-            let root_page = conn
-                .schema
-                .borrow()
-                .iter()
-                .find(|table| {
-                    table
-                        .name
-                        .eq_ignore_ascii_case("mem_retained_count_sum_interest_delete")
-                })
-                .map(|table| table.root_page)
-                .expect("test table root page");
             let seed_insert = conn
                 .prepare(
-                    "INSERT INTO mem_retained_count_sum_interest_delete \
+                    "INSERT INTO mem_committed_count_sum_delete \
                  VALUES (?1, ('name_' || ?1), (?1 * 7));",
                 )
                 .await
@@ -167660,11 +164484,11 @@ mod pager_routing_tests {
             conn.execute("COMMIT;").await.unwrap();
 
             let aggregate = conn
-                .prepare("SELECT COUNT(*), SUM(score) FROM mem_retained_count_sum_interest_delete;")
+                .prepare("SELECT COUNT(*), SUM(score) FROM mem_committed_count_sum_delete;")
                 .await
                 .unwrap();
             let delete = conn
-                .prepare("DELETE FROM mem_retained_count_sum_interest_delete WHERE id = ?1;")
+                .prepare("DELETE FROM mem_committed_count_sum_delete WHERE id = ?1;")
                 .await
                 .unwrap();
 
@@ -167676,13 +164500,6 @@ mod pager_routing_tests {
                     .unwrap(),
                 1
             );
-            assert_eq!(
-                conn.retained_autocommit_count_sum_cache_row(root_page, 2, Some(0))
-                    .as_ref()
-                    .map(Row::values),
-                Some(&[SqliteValue::Integer(2), SqliteValue::Integer(28)][..])
-            );
-
             let row = aggregate.query_row().await.unwrap();
             assert_eq!(
                 row.values(),
@@ -167693,61 +164510,38 @@ mod pager_routing_tests {
                 profile.prepared_direct_delete_executions >= 1,
                 "autocommit DELETE should use the direct rowid-targeted path: {profile:?}"
             );
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "first aggregate after direct delete should use the preseeded cache: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_overlay_misses, 0,
-                "direct-delete seeding should avoid the first retained aggregate miss: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "seeded count+sum cache should avoid a read-after-write flush: {profile:?}"
-            );
         });
     }
 
     #[test]
-    fn test_prepared_count_sum_cache_survives_noop_direct_dml_in_retained_batch() {
+    fn test_prepared_count_sum_remains_correct_after_noop_direct_dml() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
-                "CREATE TABLE mem_retained_count_sum_noop_dml \
+                "CREATE TABLE mem_committed_count_sum_noop_dml \
              (id INTEGER PRIMARY KEY, score INTEGER NOT NULL);",
             )
             .await
             .unwrap();
-            let root_page = conn
-                .schema
-                .borrow()
-                .iter()
-                .find(|table| {
-                    table
-                        .name
-                        .eq_ignore_ascii_case("mem_retained_count_sum_noop_dml")
-                })
-                .map(|table| table.root_page)
-                .expect("test table root page");
-            conn.execute("INSERT INTO mem_retained_count_sum_noop_dml VALUES (1, 10), (2, 20);")
+            conn.execute("INSERT INTO mem_committed_count_sum_noop_dml VALUES (1, 10), (2, 20);")
                 .await
                 .unwrap();
 
             let aggregate = conn
-                .prepare("SELECT COUNT(*), SUM(score) FROM mem_retained_count_sum_noop_dml;")
+                .prepare("SELECT COUNT(*), SUM(score) FROM mem_committed_count_sum_noop_dml;")
                 .await
                 .unwrap();
             let insert = conn
-                .prepare("INSERT INTO mem_retained_count_sum_noop_dml VALUES (?1, ?2);")
+                .prepare("INSERT INTO mem_committed_count_sum_noop_dml VALUES (?1, ?2);")
                 .await
                 .unwrap();
             let update = conn
-                .prepare("UPDATE mem_retained_count_sum_noop_dml SET score = ?2 WHERE id = ?1;")
+                .prepare("UPDATE mem_committed_count_sum_noop_dml SET score = ?2 WHERE id = ?1;")
                 .await
                 .unwrap();
             let delete = conn
-                .prepare("DELETE FROM mem_retained_count_sum_noop_dml WHERE id = ?1;")
+                .prepare("DELETE FROM mem_committed_count_sum_noop_dml WHERE id = ?1;")
                 .await
                 .unwrap();
 
@@ -167761,13 +164555,6 @@ mod pager_routing_tests {
                 .execute_with_params(&[SqliteValue::Integer(3), SqliteValue::Integer(30)])
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-            assert_eq!(
-                conn.retained_autocommit_count_sum_cache_row(root_page, 1, Some(0))
-                    .as_ref()
-                    .map(Row::values),
-                Some(&[SqliteValue::Integer(3), SqliteValue::Integer(60)][..])
-            );
 
             assert_eq!(
                 update
@@ -167777,72 +164564,36 @@ mod pager_routing_tests {
                 0
             );
             assert_eq!(
-                conn.retained_autocommit_count_sum_cache_row(root_page, 1, Some(0))
-                    .as_ref()
-                    .map(Row::values),
-                Some(&[SqliteValue::Integer(3), SqliteValue::Integer(60)][..]),
-                "zero-row direct UPDATE must not invalidate the retained aggregate cache"
-            );
-
-            assert_eq!(
                 delete
                     .execute_with_params(&[SqliteValue::Integer(999)])
                     .await
                     .unwrap(),
                 0
             );
-            assert_eq!(
-                conn.retained_autocommit_count_sum_cache_row(root_page, 1, Some(0))
-                    .as_ref()
-                    .map(Row::values),
-                Some(&[SqliteValue::Integer(3), SqliteValue::Integer(60)][..]),
-                "zero-row direct DELETE must not invalidate the retained aggregate cache"
-            );
-
             reset_hot_path_profile();
             let row = aggregate.query_row().await.unwrap();
             assert_eq!(
                 row.values(),
                 &[SqliteValue::Integer(3), SqliteValue::Integer(60)]
             );
-            let profile = hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "aggregate after no-op DML should use the retained overlay cache: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "no-op DML should not force a retained read-after-write flush: {profile:?}"
-            );
         });
     }
 
     #[test]
-    fn test_memory_retained_autocommit_count_sum_cache_survives_flush_boundary() {
+    fn test_memory_prepared_count_sum_remains_correct_across_commits() {
         asupersync::test_utils::run_test(|| async {
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
-            "CREATE TABLE mem_retained_count_sum_flush (id INTEGER PRIMARY KEY, score INTEGER NOT NULL);",
+            "CREATE TABLE mem_committed_count_sum_refresh (id INTEGER PRIMARY KEY, score INTEGER NOT NULL);",
         ).await
         .unwrap();
-            let root_page = conn
-                .schema
-                .borrow()
-                .iter()
-                .find(|table| {
-                    table
-                        .name
-                        .eq_ignore_ascii_case("mem_retained_count_sum_flush")
-                })
-                .map(|table| table.root_page)
-                .expect("test table root page");
             let stmt = conn
-                .prepare("SELECT COUNT(*), SUM(score) FROM mem_retained_count_sum_flush;")
+                .prepare("SELECT COUNT(*), SUM(score) FROM mem_committed_count_sum_refresh;")
                 .await
                 .unwrap();
             let insert = conn
-                .prepare("INSERT INTO mem_retained_count_sum_flush VALUES (?1, ?2);")
+                .prepare("INSERT INTO mem_committed_count_sum_refresh VALUES (?1, ?2);")
                 .await
                 .unwrap();
 
@@ -167854,34 +164605,16 @@ mod pager_routing_tests {
                 .execute_with_params(&[SqliteValue::Integer(2), SqliteValue::Integer(20)])
                 .await
                 .unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_some());
-
             let row = stmt.query_row().await.unwrap();
             assert_eq!(
                 row.values(),
                 &[SqliteValue::Integer(2), SqliteValue::Integer(30)]
             );
 
-            let cx = conn.op_cx().unwrap();
-            conn.flush_retained_autocommit_txn(&cx).await.unwrap();
-            assert!(conn.retained_autocommit_txn.borrow().is_none());
-            assert_eq!(
-                conn.retained_autocommit_count_sum_cache_row(root_page, 1, Some(0))
-                    .as_ref()
-                    .map(Row::values),
-                Some(&[SqliteValue::Integer(2), SqliteValue::Integer(30)][..])
-            );
-
             insert
                 .execute_with_params(&[SqliteValue::Integer(3), SqliteValue::Integer(30)])
                 .await
                 .unwrap();
-            assert_eq!(
-                conn.retained_autocommit_count_sum_cache_row(root_page, 1, Some(0))
-                    .as_ref()
-                    .map(Row::values),
-                Some(&[SqliteValue::Integer(3), SqliteValue::Integer(60)][..])
-            );
 
             reset_hot_path_profile();
             let row = stmt.query_row().await.unwrap();
@@ -167889,23 +164622,14 @@ mod pager_routing_tests {
                 row.values(),
                 &[SqliteValue::Integer(3), SqliteValue::Integer(60)]
             );
-            let profile = hot_path_profile_snapshot();
-            assert!(
-                profile.retained_autocommit_overlay_hits >= 1,
-                "prepared count+sum query should use the preserved cache through the retained overlay: {profile:?}"
-            );
-            assert_eq!(
-                profile.retained_autocommit_read_after_write_flushes, 0,
-                "preserved cache should avoid a read-after-write flush: {profile:?}"
-            );
         });
     }
 
     #[test]
     fn test_memory_autocommit_write_txn_invalidated_by_ddl() {
         asupersync::test_utils::run_test(|| async {
-            // bd-aw0b9: verify that DDL (schema change) invalidates the retained
-            // writer state so the next write gets a fresh begin path.
+            // DDL invalidates the committed cached writer so the next write
+            // gets a fresh begin path.
             let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE ddl_inv (id INTEGER PRIMARY KEY);")
@@ -167919,15 +164643,15 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
             let p1 = hot_path_profile_snapshot();
-            assert_eq!(p1.retained_autocommit_parks, 1);
+            assert_eq!(p1.cached_write_txn_parks, 1);
 
-            // DDL should invalidate the retained write txn.
+            // DDL should invalidate the cached write transaction.
             conn.execute("CREATE TABLE ddl_inv2 (id INTEGER PRIMARY KEY);")
                 .await
                 .unwrap();
             assert!(
-                conn.retained_autocommit_txn.borrow().is_none(),
-                "DDL should flush/invalidate retained autocommit state"
+                conn.cached_write_txn.borrow().is_none(),
+                "DDL should invalidate the committed cached writer"
             );
 
             reset_hot_path_profile();
@@ -167937,9 +164661,9 @@ mod pager_routing_tests {
             let p2 = hot_path_profile_snapshot();
             assert!(
                 p2.memory_autocommit_fast_path_begins >= 1 || p2.cached_write_txn_reuses >= 1,
-                "write after DDL should rebuild writer state instead of reusing the pre-DDL retained txn: {p2:?}"
+                "write after DDL should rebuild writer state instead of reusing the pre-DDL cached transaction: {p2:?}"
             );
-            assert_eq!(p2.retained_autocommit_reuses, 0);
+            assert_eq!(p2.cached_write_txn_reuses, 0);
         });
     }
 
@@ -167988,8 +164712,8 @@ mod pager_routing_tests {
 
             let seq_after_autocommit = conn.current_global_commit_seq();
             assert!(
-                seq_after_autocommit >= seq_after_ddl,
-                "retained :memory: autocommit batching must not move the visible commit clock backwards"
+                seq_after_autocommit > seq_after_ddl,
+                "successful :memory: autocommit must advance the visible commit clock"
             );
 
             let rows = conn
@@ -167997,15 +164721,15 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
             assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-            let seq_after_flush = conn.current_global_commit_seq();
+            let seq_after_read = conn.current_global_commit_seq();
             assert!(
-                seq_after_flush > seq_after_ddl,
-                "flushing the retained :memory: batch must advance the visible commit clock"
+                seq_after_read >= seq_after_autocommit,
+                "a subsequent read must not move the visible commit clock backwards"
             );
             assert_eq!(
                 conn.last_local_commit_seq(),
-                Some(seq_after_flush.get()),
-                "the retained-batch flush should keep last_local_commit_seq aligned"
+                Some(seq_after_read.get()),
+                "the autocommit should keep last_local_commit_seq aligned"
             );
 
             conn.execute("BEGIN;").await.unwrap();
@@ -168016,7 +164740,7 @@ mod pager_routing_tests {
 
             let seq_after_explicit = conn.current_global_commit_seq();
             assert!(
-                seq_after_explicit > seq_after_flush,
+                seq_after_explicit > seq_after_read,
                 "a later explicit COMMIT must remain strictly monotonic after fast-path autocommit writes"
             );
             assert_eq!(
@@ -169663,14 +166387,6 @@ mod pager_routing_tests {
                 .execute("INSERT INTO sw_begin_reload (id, val) VALUES (1, 'alpha');")
                 .await
                 .unwrap();
-            if conn_a.retained_autocommit_txn.borrow().is_some() {
-                // This regression is about cross-connection committed visibility,
-                // not same-connection retained-batch semantics. Flush conn_a's
-                // parked autocommit write so conn_b begins against a durable
-                // external commit.
-                let cx = conn_a.op_cx().unwrap();
-                conn_a.flush_retained_autocommit_txn(&cx).await.unwrap();
-            }
 
             conn_b.execute("BEGIN;").await.unwrap();
             let rows = conn_b
@@ -178531,13 +175247,8 @@ mod pager_routing_tests {
                 .map(|table| table.root_page)
                 .expect("test table root page");
 
-            // Release cached transactions before raw pager access. The retained
-            // autocommit batch still counts as an active pager transaction, so it
-            // must also be flushed before calling pager.begin().
+            // Release cached transactions before raw pager access.
             let cx = Cx::new();
-            if conn.retained_autocommit_txn.borrow().is_some() {
-                conn.flush_retained_autocommit_txn(&cx).await.unwrap();
-            }
             conn.invalidate_cached_write_txn(&cx).await;
             conn.invalidate_cached_read_snapshot(&cx).await;
             let mut txn = conn
@@ -178594,13 +175305,8 @@ mod pager_routing_tests {
                 })
                 .expect("test index root page");
 
-            // Release cached transactions before raw pager access. The retained
-            // autocommit batch still counts as an active pager transaction, so it
-            // must also be flushed before calling pager.begin().
+            // Release cached transactions before raw pager access.
             let cx = Cx::new();
-            if conn.retained_autocommit_txn.borrow().is_some() {
-                conn.flush_retained_autocommit_txn(&cx).await.unwrap();
-            }
             conn.invalidate_cached_write_txn(&cx).await;
             conn.invalidate_cached_read_snapshot(&cx).await;
             let mut txn = conn
@@ -178691,9 +175397,6 @@ mod pager_routing_tests {
                 .expect("test index root page");
 
             let cx = Cx::new();
-            if conn.retained_autocommit_txn.borrow().is_some() {
-                conn.flush_retained_autocommit_txn(&cx).await.unwrap();
-            }
             conn.invalidate_cached_write_txn(&cx).await;
             conn.invalidate_cached_read_snapshot(&cx).await;
             let mut txn = conn
@@ -178811,9 +175514,6 @@ mod pager_routing_tests {
             let payload = "z".repeat(900);
             let root_is_interior = async || {
                 let cx = Cx::new();
-                if conn.retained_autocommit_txn.borrow().is_some() {
-                    conn.flush_retained_autocommit_txn(&cx).await.unwrap();
-                }
                 conn.invalidate_cached_write_txn(&cx).await;
                 conn.invalidate_cached_read_snapshot(&cx).await;
                 let mut txn = conn
@@ -178847,9 +175547,6 @@ mod pager_routing_tests {
             let lock_page = PageNumber::new(fsqlite_pager::lock_byte_page(conn.pager.page_size()))
                 .expect("lock-byte page number");
             let cx = Cx::new();
-            if conn.retained_autocommit_txn.borrow().is_some() {
-                conn.flush_retained_autocommit_txn(&cx).await.unwrap();
-            }
             conn.invalidate_cached_write_txn(&cx).await;
             conn.invalidate_cached_read_snapshot(&cx).await;
 

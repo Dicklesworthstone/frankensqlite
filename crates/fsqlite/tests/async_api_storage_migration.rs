@@ -7,14 +7,15 @@
 //! async `Connection` API.
 
 use asupersync::runtime::RuntimeBuilder;
+use fsqlite::compat::OpenFlags;
 use fsqlite::{AsyncConnection, FrankenError, SqliteValue};
 use fsqlite_types::cx::Cx;
 
 #[test]
 fn async_facade_drives_file_backed_storage_futures_to_completion() {
     let runtime = RuntimeBuilder::current_thread()
-        // The engine owns a separate large-stack thread. One runtime blocking
-        // slot is therefore sufficient for the sequential response waiters.
+        // The engine owns a separate large-stack thread and async responses are
+        // waker-driven, so the facade does not occupy a blocking-pool slot.
         .blocking_threads(1, 1)
         .build()
         .expect("test runtime should build");
@@ -172,19 +173,19 @@ fn sync_facade_owns_storage_futures_on_its_worker() {
     assert_eq!(row.get(0), Some(&SqliteValue::Integer(2)));
     assert_eq!(row.get(1), Some(&SqliteValue::Text("after".into())));
 
-    let mut streamed_ids = Vec::new();
+    let mut callback_ids = Vec::new();
     connection
         .query_with_params_for_each_sync(
             "SELECT id FROM items WHERE id >= ?1 ORDER BY id",
             &[SqliteValue::Integer(1)],
             |row| {
-                streamed_ids.push(row.get(0).cloned());
+                callback_ids.push(row.get(0).cloned());
                 Ok(())
             },
         )
-        .expect("bounded row stream should complete");
+        .expect("materialized row callbacks should complete");
     assert_eq!(
-        streamed_ids,
+        callback_ids,
         vec![Some(SqliteValue::Integer(1)), Some(SqliteValue::Integer(2))]
     );
 
@@ -282,4 +283,97 @@ fn sync_facade_owns_storage_futures_on_its_worker() {
         .close_sync()
         .expect("explicit sync close should complete");
     assert!(connection.query_sync("SELECT 1").is_err());
+}
+
+#[test]
+fn async_facade_exposes_existing_read_only_and_flag_open_contracts() {
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(1, 1)
+        .build()
+        .expect("test runtime should build");
+
+    runtime.block_on(async {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database_path = directory.path().join("async-open-surfaces.db");
+        let database_path = database_path.to_string_lossy().into_owned();
+
+        let create_cx = Cx::new();
+        let mut created = AsyncConnection::open(&create_cx, database_path.clone())
+            .await
+            .expect("create-capable open should succeed");
+        created
+            .execute_batch(
+                &create_cx,
+                "CREATE TABLE items (id INTEGER PRIMARY KEY);
+                 INSERT INTO items VALUES (1);",
+            )
+            .await
+            .expect("seed should succeed");
+        created
+            .close(&create_cx)
+            .await
+            .expect("created connection should close");
+
+        let existing_cx = Cx::new();
+        let mut existing = AsyncConnection::open_existing(&existing_cx, database_path.clone())
+            .await
+            .expect("existing-only open should succeed");
+        assert_eq!(
+            existing
+                .query(&existing_cx, "SELECT id FROM items")
+                .await
+                .expect("existing connection should query")
+                .len(),
+            1
+        );
+        existing
+            .close(&existing_cx)
+            .await
+            .expect("existing connection should close");
+
+        let read_only_cx = Cx::new();
+        let mut read_only = AsyncConnection::open_read_only(&read_only_cx, database_path.clone())
+            .await
+            .expect("read-only open should succeed");
+        assert_eq!(
+            read_only
+                .query(&read_only_cx, "SELECT id FROM items")
+                .await
+                .expect("read-only connection should query")
+                .len(),
+            1
+        );
+        assert!(
+            read_only
+                .execute(&read_only_cx, "INSERT INTO items VALUES (2)")
+                .await
+                .is_err(),
+            "read-only open must refuse mutation"
+        );
+        read_only
+            .close(&read_only_cx)
+            .await
+            .expect("read-only connection should close");
+
+        let flags_cx = Cx::new();
+        let mut via_flags = AsyncConnection::open_with_flags(
+            &flags_cx,
+            database_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .await
+        .expect("read-only flag open should succeed");
+        assert_eq!(
+            via_flags
+                .query(&flags_cx, "SELECT id FROM items")
+                .await
+                .expect("flag-opened connection should query")
+                .len(),
+            1
+        );
+        via_flags
+            .close(&flags_cx)
+            .await
+            .expect("flag-opened connection should close");
+    });
 }

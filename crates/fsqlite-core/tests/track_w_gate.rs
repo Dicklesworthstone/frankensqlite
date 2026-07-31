@@ -5,7 +5,7 @@
 //! 2. UPDATE/DELETE fast lane verification with fallback attribution.
 //! 3. Mixed OLTP regression: interleaved INSERT/UPDATE/DELETE/SELECT with lane metrics.
 //! 4. W1 — function cache preservation on reusable lane (integration-level).
-//! 5. W9 — retained autocommit overlay (same-connection read-after-write).
+//! 5. W9 — committed autocommit read-after-write.
 //! 6. Cross-connection correctness for prepared DML.
 //!
 //! Run:
@@ -620,7 +620,7 @@ fn wtest_w1_function_cache_preserved_across_prepared_reuse() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 5. W9 — retained autocommit overlay (same-connection read-after-write)
+// 5. W9 — committed autocommit read-after-write
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -672,15 +672,16 @@ fn wtest_w9_same_connection_read_after_write_no_data_loss() {
         }
 
         let snap = hot_path_profile_snapshot();
-        eprintln!("=== W9: Retained autocommit overlay metrics ===");
+        assert_eq!(
+            snap.prepared_direct_insert_autocommit_executions, 50,
+            "W9 freshness: every measured INSERT must increment the direct autocommit execution counter: {snap:?}"
+        );
+        eprintln!("=== W9: Committed cached-writer metrics ===");
         eprintln!(
-            "retained_autocommit: reuses={} parks={} flushes={} raw_flushes={} overlay_hits={} overlay_misses={}",
-            snap.retained_autocommit_reuses,
-            snap.retained_autocommit_parks,
-            snap.retained_autocommit_flushes,
-            snap.retained_autocommit_read_after_write_flushes,
-            snap.retained_autocommit_overlay_hits,
-            snap.retained_autocommit_overlay_misses
+            "cached_write_txn: reuses={} parks={} direct_autocommit_execs={}",
+            snap.cached_write_txn_reuses,
+            snap.cached_write_txn_parks,
+            snap.prepared_direct_insert_autocommit_executions,
         );
         eprintln!("=== END ===");
     });
