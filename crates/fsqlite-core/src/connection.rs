@@ -34690,10 +34690,16 @@ impl Connection {
                 if !view.columns.is_empty() {
                     return view.columns.clone();
                 }
-                let query = view.query.clone();
+                let mut query = view.query.clone();
+                let temporary = view.temporary;
                 drop(views);
                 // A stored view body has its own lexical scope. CTEs visible at
                 // the use site must not leak into its result-column inference.
+                // Persistent views are also owned by MAIN and must not derive
+                // their `*` metadata from a connection-local TEMP shadow.
+                if !temporary {
+                    qualify_persistent_view_relations(&mut query);
+                }
                 return self.select_result_column_names(&query, &[], active_ctes);
             }
         }
@@ -43066,20 +43072,13 @@ impl Connection {
                     let index = columns
                         .iter()
                         .position(|col| col.name.eq_ignore_ascii_case(&column_name))?;
-                    columns[index]
-                        .type_name
-                        .as_ref()
-                        .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"))
-                        .then_some(index)
+                    column_def_is_exact_integer(&columns[index]).then_some(index)
                 });
                 let rowid_col_idx = columns
                     .iter()
                     .enumerate()
                     .find_map(|(i, col)| {
-                        let is_integer = col
-                            .type_name
-                            .as_ref()
-                            .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
+                        let is_integer = column_def_is_exact_integer(col);
                         let pk = col.constraints.iter().find_map(|c| {
                             if let ColumnConstraintKind::PrimaryKey {
                                 autoincrement,
@@ -43217,13 +43216,7 @@ impl Connection {
                                 _ => None,
                             })
                             .unwrap_or((None, None));
-                        let collation = col.constraints.iter().find_map(|c| {
-                            if let ColumnConstraintKind::Collate(ref name) = c.kind {
-                                Some(name.clone())
-                            } else {
-                                None
-                            }
-                        });
+                        let collation = column_def_declared_collation(col);
                         // Per-constraint ON CONFLICT for the column. For the
                         // INTEGER PRIMARY KEY (rowid) the PRIMARY KEY clause
                         // governs the table-row insert; for other columns the
@@ -43357,6 +43350,17 @@ impl Connection {
                         ));
                     }
                 }
+                // Derive SQLite's canonical declaration-slot layout once, then
+                // allocate roots only for materialized slots. A WITHOUT ROWID
+                // PRIMARY KEY still owns an ordinal even though its B-tree is
+                // the table root and no sqlite_schema index row is persisted.
+                let implicit_autoindex_slots = implicit_autoindex_layout(
+                    columns,
+                    constraints,
+                    create.without_rowid,
+                )?;
+                // All validation that can reject the canonical layout must run
+                // before mutating connection-local schema maps.
                 if !create.without_rowid
                     && let Some(idx) = rowid_col_idx
                 {
@@ -43364,107 +43368,19 @@ impl Connection {
                         .borrow_mut()
                         .insert(table_name.to_ascii_lowercase(), idx);
                 }
-                // Collect implicit UNIQUE indexes from column constraints.
                 let mut implicit_indexes = Vec::new();
-                for (decl_col, col) in columns.iter().zip(&col_infos) {
-                    let column_primary_key = decl_col
-                        .constraints
-                        .iter()
-                        .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }));
-                    if col.unique && !col.is_ipk && !(create.without_rowid && column_primary_key) {
-                        let idx_root = self
-                            .allocate_schema_table_root(target_is_temp, 0, true)
-                            .await?;
-                        // Per-constraint ON CONFLICT declared on the column's
-                        // UNIQUE / (non-IPK) PRIMARY KEY clause.
-                        let conflict_action =
-                            decl_col.constraints.iter().find_map(|c| match &c.kind {
-                                ColumnConstraintKind::Unique { conflict }
-                                | ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
-                                _ => None,
-                            });
-                        implicit_indexes.push(IndexSchema {
-                            name: format!(
-                                "sqlite_autoindex_{}_{}",
-                                table_name,
-                                implicit_indexes.len() + 1
-                            ),
-                            root_page: idx_root,
-                            columns: vec![col.name.clone()],
-                            key_expressions: Vec::new(),
-                            key_sort_directions: vec![SortDirection::Asc],
-                            where_clause: None,
-                            is_unique: true,
-                            key_collations: vec![col.collation.clone()],
-                            conflict_action,
-                        });
-                    }
-                }
-                // Collect implicit UNIQUE indexes from table-level constraints.
-                for tc in constraints {
-                    let is_primary_key = matches!(tc.kind, TableConstraintKind::PrimaryKey { .. });
-                    if create.without_rowid && is_primary_key {
+                for (slot_index, slot) in implicit_autoindex_slots.iter().cloned().enumerate() {
+                    if slot.is_hidden_without_rowid_primary_key() {
                         continue;
                     }
-                    if let TableConstraintKind::Unique {
-                        columns: idx_cols, ..
-                    }
-                    | TableConstraintKind::PrimaryKey {
-                        columns: idx_cols, ..
-                    } = &tc.kind
-                    {
-                        let Some(normalized_terms) =
-                            collect_effective_index_terms_for_column_infos(idx_cols, &col_infos)
-                        else {
-                            continue;
-                        };
-                        let col_names: Vec<String> = normalized_terms
-                            .iter()
-                            .map(|term| term.column_name.clone())
-                            .collect();
-                        if !col_names.is_empty() {
-                            let all_ipk = is_primary_key
-                                && normalized_terms.iter().all(|term| {
-                                    rowid_col_idx.is_some_and(|idx| {
-                                        col_infos[idx].name.eq_ignore_ascii_case(&term.column_name)
-                                    })
-                                });
-                            if all_ipk {
-                                continue;
-                            }
-                            let idx_root = self
-                                .allocate_schema_table_root(target_is_temp, 0, true)
-                                .await?;
-                            // Per-constraint ON CONFLICT declared on the
-                            // table-level UNIQUE / PRIMARY KEY constraint.
-                            let conflict_action = match &tc.kind {
-                                TableConstraintKind::Unique { conflict, .. }
-                                | TableConstraintKind::PrimaryKey { conflict, .. } => *conflict,
-                                _ => None,
-                            };
-                            implicit_indexes.push(IndexSchema {
-                                name: format!(
-                                    "sqlite_autoindex_{}_{}",
-                                    table_name,
-                                    implicit_indexes.len() + 1
-                                ),
-                                root_page: idx_root,
-                                columns: col_names,
-                                key_expressions: Vec::new(),
-                                key_sort_directions: normalized_terms
-                                    .iter()
-                                    .map(|term| term.direction.unwrap_or(SortDirection::Asc))
-                                    .collect(),
-                                where_clause: None,
-                                is_unique: true,
-                                key_collations: normalized_terms
-                                    .iter()
-                                    .map(|term| term.collation.clone())
-                                    .collect(),
-                                conflict_action,
-                            });
-                        }
-                    }
+                    let idx_root = self
+                        .allocate_schema_table_root(target_is_temp, 0, true)
+                        .await?;
+                    implicit_indexes.push(slot.into_index_schema(
+                        &table_name,
+                        slot_index + 1,
+                        idx_root,
+                    ));
                 }
 
                 let num_columns = col_infos.len();
@@ -43479,63 +43395,30 @@ impl Connection {
                 {
                     let mut db = self.db.borrow_mut();
                     if let Some(mem_table) = db.get_table_mut(root_page) {
-                        // Column-level UNIQUE/non-IPK-PRIMARY KEY constraints.
-                        for (i, col) in col_infos.iter().enumerate() {
-                            if col.unique && !col.is_ipk {
-                                mem_table.add_unique_column_group_with_collations(
-                                    vec![i],
-                                    vec![col.collation.clone()],
-                                );
-                            }
-                        }
-                        // Table-level UNIQUE/PRIMARY KEY constraints.
-                        for tc in constraints {
-                            let is_primary_key =
-                                matches!(tc.kind, TableConstraintKind::PrimaryKey { .. });
-                            if create.without_rowid && is_primary_key {
-                                continue;
-                            }
-                            if let TableConstraintKind::Unique {
-                                columns: idx_cols, ..
-                            }
-                            | TableConstraintKind::PrimaryKey {
-                                columns: idx_cols, ..
-                            } = &tc.kind
-                            {
-                                let Some(normalized_terms) =
-                                    collect_effective_index_terms_for_column_infos(
-                                        idx_cols, &col_infos,
-                                    )
-                                else {
-                                    continue;
-                                };
-                                let Some(col_indices) = normalized_terms
-                                    .iter()
-                                    .map(|term| {
-                                        col_infos.iter().position(|c| {
-                                            c.name.eq_ignore_ascii_case(&term.column_name)
-                                        })
+                        // Use the same deduplicated layout as physical index
+                        // allocation and reload. Hidden WITHOUT ROWID PK slots
+                        // still describe a real uniqueness contract even though
+                        // they own no separate index root.
+                        for slot in &implicit_autoindex_slots {
+                            let Some(col_indices) = slot
+                                .definition
+                                .columns
+                                .iter()
+                                .map(|column_name| {
+                                    col_infos.iter().position(|column| {
+                                        column.name.eq_ignore_ascii_case(column_name)
                                     })
-                                    .collect::<Option<Vec<_>>>()
-                                else {
-                                    continue;
-                                };
-                                if !col_indices.is_empty() {
-                                    // Skip if this is an IPK-only primary key (already
-                                    // enforced by rowid uniqueness).
-                                    let all_ipk = col_indices.iter().all(|&i| col_infos[i].is_ipk);
-                                    if !all_ipk {
-                                        let collations = normalized_terms
-                                            .into_iter()
-                                            .map(|term| term.collation)
-                                            .collect();
-                                        mem_table.add_unique_column_group_with_collations(
-                                            col_indices,
-                                            collations,
-                                        );
-                                    }
-                                }
-                            }
+                                })
+                                .collect::<Option<Vec<_>>>()
+                            else {
+                                return Err(FrankenError::internal(
+                                    "canonical autoindex layout lost a validated column",
+                                ));
+                            };
+                            mem_table.add_unique_column_group_with_collations(
+                                col_indices,
+                                slot.definition.key_collations.clone(),
+                            );
                         }
                     }
                 }
@@ -86103,6 +85986,45 @@ impl ReconstructedIndexDefinition {
     }
 }
 
+/// One declaration-order slot in SQLite's implicit autoindex layout.
+///
+/// WITHOUT ROWID primary keys retain their slot/name for schema semantics but
+/// use the table B-tree itself, so they must never be inserted into
+/// `TableSchema::indexes` as though they owned an independent root page.
+#[derive(Debug, Clone)]
+pub(crate) struct ImplicitAutoindexSlot {
+    definition: ReconstructedIndexDefinition,
+    primary_key: bool,
+    hidden_without_rowid_primary_key: bool,
+}
+
+impl ImplicitAutoindexSlot {
+    #[must_use]
+    pub(crate) const fn is_hidden_without_rowid_primary_key(&self) -> bool {
+        self.hidden_without_rowid_primary_key
+    }
+
+    #[must_use]
+    pub(crate) fn into_index_schema(
+        self,
+        table_name: &str,
+        ordinal: usize,
+        root_page: i32,
+    ) -> IndexSchema {
+        IndexSchema {
+            name: format!("sqlite_autoindex_{table_name}_{ordinal}"),
+            root_page,
+            columns: self.definition.columns,
+            key_expressions: self.definition.key_expressions,
+            key_sort_directions: self.definition.key_sort_directions,
+            key_collations: self.definition.key_collations,
+            where_clause: self.definition.where_clause,
+            is_unique: self.definition.is_unique,
+            conflict_action: self.definition.conflict_action,
+        }
+    }
+}
+
 fn parse_index_definition_from_create_sql(
     create_sql: &str,
     table_columns: Option<&[ColumnInfo]>,
@@ -86144,9 +86066,13 @@ fn infer_implicit_index_definition_from_master_entries(
             _ => None,
         }
     })?;
-    let definitions = implicit_index_definitions_from_create_table_sql(table_create_sql)?;
+    let slots = implicit_autoindex_layout_from_create_table_sql(table_create_sql)?;
     let definition_index = ordinal.checked_sub(1)?;
-    definitions.get(definition_index).cloned()
+    let slot = slots.get(definition_index)?;
+    if slot.is_hidden_without_rowid_primary_key() {
+        return None;
+    }
+    Some(slot.definition.clone())
 }
 
 fn parse_autoindex_ordinal(index_name: &str, table_name: &str) -> Option<usize> {
@@ -86161,13 +86087,14 @@ fn parse_autoindex_ordinal(index_name: &str, table_name: &str) -> Option<usize> 
     (ordinal.to_string() == suffix).then_some(ordinal)
 }
 
-fn implicit_index_definitions_from_create_table_sql(
+fn implicit_autoindex_layout_from_create_table_sql(
     create_table_sql: &str,
-) -> Option<Vec<ReconstructedIndexDefinition>> {
+) -> Option<Vec<ImplicitAutoindexSlot>> {
     let statement = parse_single_statement(create_table_sql).ok()?;
     let Statement::CreateTable(create_stmt) = statement else {
         return None;
     };
+    let without_rowid = create_stmt.without_rowid;
     let CreateTableBody::Columns {
         columns: column_defs,
         constraints,
@@ -86176,83 +86103,7 @@ fn implicit_index_definitions_from_create_table_sql(
         return Some(Vec::new());
     };
 
-    let mut definitions = Vec::new();
-    for column in &column_defs {
-        let has_unique_constraint = column.constraints.iter().any(|constraint| {
-            matches!(
-                constraint.kind,
-                ColumnConstraintKind::Unique { .. } | ColumnConstraintKind::PrimaryKey { .. }
-            )
-        });
-        let is_ipk = column.type_name.as_ref().is_some_and(|type_name| {
-            type_name.name.eq_ignore_ascii_case("INTEGER")
-                && column.constraints.iter().any(|constraint| {
-                    matches!(
-                        constraint.kind,
-                        ColumnConstraintKind::PrimaryKey {
-                            direction: None | Some(SortDirection::Asc),
-                            ..
-                        }
-                    )
-                })
-        });
-        if has_unique_constraint && !is_ipk {
-            let conflict_action = column.constraints.iter().find_map(|c| match &c.kind {
-                ColumnConstraintKind::Unique { conflict }
-                | ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
-                _ => None,
-            });
-            definitions.push(ReconstructedIndexDefinition {
-                columns: vec![column.name.clone()],
-                key_expressions: Vec::new(),
-                key_sort_directions: vec![SortDirection::Asc],
-                key_collations: vec![column_def_declared_collation(column)],
-                where_clause: None,
-                is_unique: true,
-                conflict_action,
-            });
-        }
-    }
-
-    for constraint in constraints {
-        if let TableConstraintKind::Unique {
-            columns: idx_cols,
-            conflict,
-            ..
-        }
-        | TableConstraintKind::PrimaryKey {
-            columns: idx_cols,
-            conflict,
-            ..
-        } = constraint.kind
-        {
-            if let Some(normalized) =
-                collect_effective_index_terms_for_column_defs(&idx_cols, &column_defs)
-                && !normalized.is_empty()
-            {
-                definitions.push(ReconstructedIndexDefinition {
-                    columns: normalized
-                        .iter()
-                        .map(|term| term.column_name.clone())
-                        .collect(),
-                    key_expressions: Vec::new(),
-                    key_sort_directions: normalized
-                        .iter()
-                        .map(|term| term.direction.unwrap_or(SortDirection::Asc))
-                        .collect(),
-                    key_collations: normalized
-                        .iter()
-                        .map(|term| term.collation.clone())
-                        .collect(),
-                    where_clause: None,
-                    is_unique: true,
-                    conflict_action: conflict,
-                });
-            }
-        }
-    }
-
-    Some(definitions)
+    implicit_autoindex_layout(&column_defs, &constraints, without_rowid).ok()
 }
 
 fn index_definition_from_create_index_statement(
@@ -86318,13 +86169,253 @@ fn extract_simple_index_columns(indexed_terms: &[fsqlite_ast::IndexedColumn]) ->
 }
 
 fn column_def_declared_collation(column: &fsqlite_ast::ColumnDef) -> Option<String> {
-    column.constraints.iter().find_map(|constraint| {
+    // SQLite applies the final column COLLATE clause when a malformed-but-
+    // accepted declaration repeats it. Use the same effective collation for
+    // schema metadata and implicit-index deduplication.
+    column.constraints.iter().rev().find_map(|constraint| {
         if let ColumnConstraintKind::Collate(name) = &constraint.kind {
             Some(name.clone())
         } else {
             None
         }
     })
+}
+
+fn implicit_autoindex_collations_match(lhs: Option<&str>, rhs: Option<&str>) -> bool {
+    match (lhs, rhs) {
+        (None, None) => true,
+        (Some(lhs), Some(rhs)) => lhs.eq_ignore_ascii_case(rhs),
+        (Some(collation), None) | (None, Some(collation)) => {
+            collation.eq_ignore_ascii_case("BINARY")
+        }
+    }
+}
+
+fn implicit_autoindex_keys_match(
+    lhs: &ReconstructedIndexDefinition,
+    rhs: &ReconstructedIndexDefinition,
+) -> bool {
+    lhs.columns.len() == rhs.columns.len()
+        && lhs.key_collations.len() == rhs.key_collations.len()
+        && lhs
+            .columns
+            .iter()
+            .zip(&rhs.columns)
+            .all(|(lhs, rhs)| lhs.eq_ignore_ascii_case(rhs))
+        && lhs
+            .key_collations
+            .iter()
+            .zip(&rhs.key_collations)
+            .all(|(lhs, rhs)| implicit_autoindex_collations_match(lhs.as_deref(), rhs.as_deref()))
+}
+
+fn merge_implicit_autoindex_slot(
+    slots: &mut Vec<ImplicitAutoindexSlot>,
+    mut candidate: ImplicitAutoindexSlot,
+    without_rowid: bool,
+) -> Result<()> {
+    if let Some(existing) = slots
+        .iter_mut()
+        .find(|slot| implicit_autoindex_keys_match(&slot.definition, &candidate.definition))
+    {
+        match (
+            existing.definition.conflict_action,
+            candidate.definition.conflict_action,
+        ) {
+            (Some(existing_action), Some(candidate_action))
+                if existing_action != candidate_action =>
+            {
+                return Err(FrankenError::FunctionError(
+                    "conflicting ON CONFLICT clauses specified".to_owned(),
+                ));
+            }
+            (None, Some(candidate_action)) => {
+                existing.definition.conflict_action = Some(candidate_action);
+            }
+            _ => {}
+        }
+        if candidate.primary_key {
+            existing.primary_key = true;
+            existing.hidden_without_rowid_primary_key = without_rowid;
+        }
+        return Ok(());
+    }
+
+    candidate.hidden_without_rowid_primary_key = without_rowid && candidate.primary_key;
+    slots.push(candidate);
+    Ok(())
+}
+
+fn implicit_autoindex_slot(
+    columns: Vec<String>,
+    directions: Vec<SortDirection>,
+    collations: Vec<Option<String>>,
+    conflict_action: Option<fsqlite_ast::ConflictAction>,
+    primary_key: bool,
+) -> ImplicitAutoindexSlot {
+    ImplicitAutoindexSlot {
+        definition: ReconstructedIndexDefinition {
+            columns,
+            key_expressions: Vec::new(),
+            key_sort_directions: directions,
+            key_collations: collations,
+            where_clause: None,
+            is_unique: true,
+            conflict_action,
+        },
+        primary_key,
+        hidden_without_rowid_primary_key: false,
+    }
+}
+
+pub(crate) fn column_def_is_exact_integer(column: &fsqlite_ast::ColumnDef) -> bool {
+    column.type_name.as_ref().is_some_and(|type_name| {
+        type_name.name.eq_ignore_ascii_case("INTEGER")
+            && type_name.arg1.is_none()
+            && type_name.arg2.is_none()
+    })
+}
+
+/// Reconstruct SQLite's declaration-slot layout for implicit UNIQUE/PRIMARY
+/// KEY indexes. Distinct candidates consume ordinals even when a WITHOUT
+/// ROWID primary key is hidden on the table root. Provisional INTEGER PRIMARY
+/// KEY declarations are handled after ordinary candidates, matching SQLite's
+/// WITHOUT ROWID conversion pass.
+pub(crate) fn implicit_autoindex_layout(
+    columns: &[fsqlite_ast::ColumnDef],
+    constraints: &[fsqlite_ast::TableConstraint],
+    without_rowid: bool,
+) -> Result<Vec<ImplicitAutoindexSlot>> {
+    let mut slots = Vec::new();
+    let mut deferred_integer_primary_keys = Vec::new();
+
+    for column in columns {
+        let collation = column_def_declared_collation(column);
+        let exact_integer = column_def_is_exact_integer(column);
+        for constraint in &column.constraints {
+            let (primary_key, direction, conflict_action, provisional_ipk) = match &constraint.kind
+            {
+                ColumnConstraintKind::Unique { conflict } => {
+                    (false, SortDirection::Asc, *conflict, false)
+                }
+                ColumnConstraintKind::PrimaryKey {
+                    direction,
+                    conflict,
+                    ..
+                } => {
+                    let direction = direction.unwrap_or(SortDirection::Asc);
+                    (
+                        true,
+                        direction,
+                        *conflict,
+                        exact_integer && direction != SortDirection::Desc,
+                    )
+                }
+                _ => continue,
+            };
+            let candidate = implicit_autoindex_slot(
+                vec![column.name.clone()],
+                vec![direction],
+                vec![collation.clone()],
+                conflict_action,
+                primary_key,
+            );
+            if provisional_ipk {
+                deferred_integer_primary_keys.push(candidate);
+            } else {
+                merge_implicit_autoindex_slot(&mut slots, candidate, without_rowid)?;
+            }
+        }
+    }
+
+    for constraint in constraints {
+        let (indexed_columns, primary_key, conflict_action) = match &constraint.kind {
+            TableConstraintKind::Unique {
+                columns, conflict, ..
+            } => (columns, false, *conflict),
+            TableConstraintKind::PrimaryKey {
+                columns, conflict, ..
+            } => (columns, true, *conflict),
+            _ => continue,
+        };
+        let normalized_terms =
+            collect_effective_index_terms_for_column_defs(indexed_columns, columns).ok_or_else(
+                || {
+                    FrankenError::FunctionError(
+                        "expressions prohibited in PRIMARY KEY and UNIQUE constraints".to_owned(),
+                    )
+                },
+            )?;
+        if normalized_terms.is_empty() {
+            continue;
+        }
+        for term in &normalized_terms {
+            if !columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(&term.column_name))
+            {
+                return Err(FrankenError::FunctionError(format!(
+                    "no such column: {}",
+                    term.column_name
+                )));
+            }
+        }
+        let provisional_ipk = primary_key
+            && normalized_terms.len() == 1
+            && columns.iter().any(|column| {
+                column
+                    .name
+                    .eq_ignore_ascii_case(&normalized_terms[0].column_name)
+                    && column_def_is_exact_integer(column)
+            });
+        let mut candidate_collations = normalized_terms
+            .iter()
+            .map(|term| term.collation.clone())
+            .collect::<Vec<_>>();
+        if provisional_ipk {
+            // SQLite rebuilds a deferred table-level INTEGER PRIMARY KEY from
+            // the bare column token during WITHOUT ROWID conversion. The term
+            // direction survives, but an explicit term COLLATE does not; the
+            // column's final declared collation becomes effective instead.
+            candidate_collations[0] = columns
+                .iter()
+                .find(|column| {
+                    column
+                        .name
+                        .eq_ignore_ascii_case(&normalized_terms[0].column_name)
+                })
+                .and_then(column_def_declared_collation);
+        }
+        let candidate = implicit_autoindex_slot(
+            normalized_terms
+                .iter()
+                .map(|term| term.column_name.clone())
+                .collect(),
+            normalized_terms
+                .iter()
+                .map(|term| term.direction.unwrap_or(SortDirection::Asc))
+                .collect(),
+            candidate_collations,
+            conflict_action,
+            primary_key,
+        );
+        if provisional_ipk {
+            deferred_integer_primary_keys.push(candidate);
+        } else {
+            merge_implicit_autoindex_slot(&mut slots, candidate, without_rowid)?;
+        }
+    }
+
+    // A rowid table's provisional INTEGER PRIMARY KEY is the rowid alias and
+    // owns no index slot. WITHOUT ROWID conversion instead appends/promotes it
+    // after all ordinary candidates and binds that final PK slot to the table.
+    if without_rowid {
+        for candidate in deferred_integer_primary_keys {
+            merge_implicit_autoindex_slot(&mut slots, candidate, true)?;
+        }
+    }
+
+    Ok(slots)
 }
 
 fn column_def_collation_by_name(
@@ -110179,21 +110270,22 @@ mod tests {
         FSQLITE_JOIN_EXPR_FALLBACK_SCANS, FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS,
         FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS, FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS,
         FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS, InProcessPageLockTable, IoPollStrategy,
-        MAX_TRIGGER_DEPTH, PagerBackend, PagerPublishedSnapshot, Row, RuntimeConfig,
-        RuntimeContext, SchemaEpoch, SharedRuntimeState, SimplePager, Snapshot,
-        arm_trigger_stack_probe, init_global_runtime, is_implicit_autoindex_entry,
-        bind_placeholders_in_select_for_fallback, canonicalize_select_placeholders,
-        is_correlated_subquery, is_sqlite_master_entry_missing,
-        join_hidden_rowid_projection, join_table_supports_hidden_rowid,
-        lock_unpoisoned, memdb_row_matches_like_fast_path, parse_single_statement,
+        MAX_TRIGGER_DEPTH, PagerBackend, PagerPublishedSnapshot, PragmaSchemaScope, Row,
+        RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState, SimplePager, Snapshot,
+        arm_trigger_stack_probe, bind_placeholders_in_select_for_fallback,
+        canonicalize_select_placeholders, init_global_runtime, is_correlated_subquery,
+        is_implicit_autoindex_entry, is_sqlite_master_entry_missing, join_hidden_rowid_projection,
+        join_table_supports_hidden_rowid, lock_unpoisoned, memdb_row_matches_like_fast_path,
+        parse_single_statement, qualify_persistent_view_relations, resolve_used_window_spec,
         select_contains_any_placeholder, set_trigger_depth_limit_override,
         statement_contains_rewritable_subquery, substitute_outer_refs_in_select,
-        take_trigger_stack_probe, wal_file_present_with_vfs, wal_path_for_db_path,
+        take_trigger_stack_probe, validate_named_window_definitions, visit_select_qualified_names,
+        wal_file_present_with_vfs, wal_path_for_db_path,
     };
     use crate::region::RegionKind;
     use fsqlite_ast::{
-        Expr, FunctionArgs, JoinKind, Literal, PlaceholderType, ResultColumn,
-        SelectCore, SortDirection, Statement,
+        Expr, FunctionArgs, JoinKind, Literal, OrderingTerm, PlaceholderType, ResultColumn,
+        SelectCore, SortDirection, Span, Statement, WindowReference, WindowSpec,
     };
     use fsqlite_btree::BtreeCursorOps;
     use fsqlite_error::{FrankenError, Result};
@@ -110588,6 +110680,218 @@ mod tests {
             &overflowing,
             "link_table",
             None
+        ));
+    }
+
+    #[test]
+    fn test_implicit_autoindex_layout_matches_sqlite_declaration_slots() {
+        fn layout(sql: &str) -> Result<Vec<ImplicitAutoindexSlot>> {
+            let Statement::CreateTable(create) = parse_single_statement(sql)? else {
+                panic!("expected CREATE TABLE: {sql}");
+            };
+            let CreateTableBody::Columns {
+                columns,
+                constraints,
+            } = &create.body
+            else {
+                panic!("expected column declaration: {sql}");
+            };
+            implicit_autoindex_layout(columns, constraints, create.without_rowid)
+        }
+
+        let signature = |sql: &str| {
+            layout(sql)
+                .unwrap()
+                .into_iter()
+                .map(|slot| {
+                    (
+                        slot.primary_key,
+                        slot.hidden_without_rowid_primary_key,
+                        slot.definition.columns,
+                        slot.definition.key_sort_directions,
+                        slot.definition.key_collations,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            signature("CREATE TABLE t(a TEXT PRIMARY KEY, b TEXT UNIQUE) WITHOUT ROWID"),
+            vec![
+                (
+                    true,
+                    true,
+                    vec!["a".to_owned()],
+                    vec![SortDirection::Asc],
+                    vec![None],
+                ),
+                (
+                    false,
+                    false,
+                    vec!["b".to_owned()],
+                    vec![SortDirection::Asc],
+                    vec![None],
+                ),
+            ]
+        );
+        assert_eq!(
+            signature("CREATE TABLE t(a TEXT UNIQUE, b TEXT PRIMARY KEY) WITHOUT ROWID"),
+            vec![
+                (
+                    false,
+                    false,
+                    vec!["a".to_owned()],
+                    vec![SortDirection::Asc],
+                    vec![None],
+                ),
+                (
+                    true,
+                    true,
+                    vec!["b".to_owned()],
+                    vec![SortDirection::Asc],
+                    vec![None],
+                ),
+            ]
+        );
+        assert_eq!(
+            signature("CREATE TABLE t(a INTEGER PRIMARY KEY, b UNIQUE) WITHOUT ROWID"),
+            vec![
+                (
+                    false,
+                    false,
+                    vec!["b".to_owned()],
+                    vec![SortDirection::Asc],
+                    vec![None],
+                ),
+                (
+                    true,
+                    true,
+                    vec!["a".to_owned()],
+                    vec![SortDirection::Asc],
+                    vec![None],
+                ),
+            ]
+        );
+        assert_eq!(
+            signature("CREATE TABLE t(a INTEGER PRIMARY KEY DESC, b UNIQUE) WITHOUT ROWID"),
+            vec![
+                (
+                    true,
+                    true,
+                    vec!["a".to_owned()],
+                    vec![SortDirection::Desc],
+                    vec![None],
+                ),
+                (
+                    false,
+                    false,
+                    vec!["b".to_owned()],
+                    vec![SortDirection::Asc],
+                    vec![None],
+                ),
+            ]
+        );
+        assert_eq!(
+            signature(
+                "CREATE TABLE t(a INTEGER COLLATE RTRIM, b UNIQUE, \
+                 PRIMARY KEY(a COLLATE NOCASE DESC)) WITHOUT ROWID",
+            ),
+            vec![
+                (
+                    false,
+                    false,
+                    vec!["b".to_owned()],
+                    vec![SortDirection::Asc],
+                    vec![None],
+                ),
+                (
+                    true,
+                    true,
+                    vec!["a".to_owned()],
+                    vec![SortDirection::Desc],
+                    vec![Some("RTRIM".to_owned())],
+                ),
+            ]
+        );
+        assert_eq!(
+            signature("CREATE TABLE t(a TEXT, UNIQUE(a ASC), PRIMARY KEY(a DESC)) WITHOUT ROWID",),
+            vec![(
+                true,
+                true,
+                vec!["a".to_owned()],
+                vec![SortDirection::Asc],
+                vec![None],
+            )]
+        );
+        assert_eq!(
+            signature("CREATE TABLE t(a TEXT, PRIMARY KEY(a, a), UNIQUE(a)) WITHOUT ROWID",).len(),
+            2,
+            "raw PK term multiplicity participates in slot identity"
+        );
+        assert_eq!(
+            signature("CREATE TABLE t(a TEXT, PRIMARY KEY(a, a), UNIQUE(a, a)) WITHOUT ROWID",)
+                .len(),
+            1,
+            "equivalent repeated-term definitions deduplicate"
+        );
+        assert_eq!(
+            signature(
+                "CREATE TABLE t(a TEXT COLLATE NOCASE, UNIQUE(a), UNIQUE(a COLLATE BINARY))",
+            )
+            .len(),
+            2
+        );
+        assert_eq!(
+            signature("CREATE TABLE t(a INTEGER PRIMARY KEY, b UNIQUE)"),
+            vec![(
+                false,
+                false,
+                vec!["b".to_owned()],
+                vec![SortDirection::Asc],
+                vec![None],
+            )]
+        );
+        assert_eq!(
+            signature("CREATE TABLE t(a INTEGER(8) PRIMARY KEY, b UNIQUE)"),
+            vec![
+                (
+                    true,
+                    false,
+                    vec!["a".to_owned()],
+                    vec![SortDirection::Asc],
+                    vec![None],
+                ),
+                (
+                    false,
+                    false,
+                    vec!["b".to_owned()],
+                    vec![SortDirection::Asc],
+                    vec![None],
+                ),
+            ]
+        );
+
+        let conflict = layout(
+            "CREATE TABLE t(a TEXT UNIQUE ON CONFLICT IGNORE, \
+             UNIQUE(a) ON CONFLICT REPLACE)",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            conflict,
+            FrankenError::FunctionError(message)
+                if message == "conflicting ON CONFLICT clauses specified"
+        ));
+
+        let expression = layout("CREATE TABLE t(a, UNIQUE(a + 1))").unwrap_err();
+        assert!(matches!(
+            expression,
+            FrankenError::FunctionError(message)
+                if message == "expressions prohibited in PRIMARY KEY and UNIQUE constraints"
+        ));
+        let missing = layout("CREATE TABLE t(a, PRIMARY KEY(missing))").unwrap_err();
+        assert!(matches!(
+            missing,
+            FrankenError::FunctionError(message) if message == "no such column: missing"
         ));
     }
 
@@ -132971,7 +133275,7 @@ mod tests {
             ] {
                 let error = conn.execute(sql).await.unwrap_err();
                 assert!(
-                    matches!(error, FrankenError::FunctionError(message)
+                    matches!(&error, FrankenError::FunctionError(message)
                         if message == "temporary table name must be unqualified"),
                     "unexpected error for `{sql}`: {error:?}"
                 );
@@ -133003,7 +133307,8 @@ mod tests {
                     }
                 );
                 assert!(
-                    matches!(error, FrankenError::FunctionError(message) if message == expected),
+                    matches!(&error, FrankenError::FunctionError(message)
+                        if message.as_str() == expected.as_str()),
                     "unexpected cross-schema error for `{sql}`: {error:?}"
                 );
             }
@@ -133053,8 +133358,7 @@ mod tests {
              later AS (SELECT * FROM base) \
              SELECT * FROM first;",
         )
-        .unwrap()
-        else {
+        .unwrap() else {
             panic!("expected SELECT");
         };
 
@@ -133082,7 +133386,7 @@ mod tests {
             ] {
                 let error = conn.execute(sql).await.unwrap_err();
                 assert!(
-                    matches!(error, FrankenError::FunctionError(message)
+                    matches!(&error, FrankenError::FunctionError(message)
                         if message == "parameters are not allowed in views"),
                     "unexpected error for `{sql}`: {error:?}"
                 );
@@ -133100,7 +133404,7 @@ mod tests {
 
             let error = conn.query("SELECT * FROM v;").await.unwrap_err();
             assert!(
-                matches!(error, FrankenError::FunctionError(message)
+                matches!(&error, FrankenError::FunctionError(message)
                     if message == "expected 1 columns for 'v' but got 2"),
                 "unexpected view arity error: {error:?}"
             );
@@ -158226,6 +158530,167 @@ mod without_rowid_runtime_tests {
     }
 
     #[test]
+    fn test_without_rowid_implicit_autoindex_ordinals_survive_reopen_and_stock_sqlite() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("without_rowid_autoindex_ordinals.db");
+            let db_str = db_path.to_str().unwrap();
+
+            {
+                let conn = Connection::open(db_str).await.unwrap();
+                conn.execute(
+                    "CREATE TABLE wr_col(pk TEXT PRIMARY KEY, u TEXT UNIQUE) WITHOUT ROWID;
+                     CREATE TABLE wr_reversed(u TEXT UNIQUE, pk TEXT PRIMARY KEY) WITHOUT ROWID;
+                     CREATE TABLE wr_table(pk TEXT, u TEXT, PRIMARY KEY(pk), UNIQUE(u)) WITHOUT ROWID;
+                     CREATE TABLE wr_integer(pk INTEGER PRIMARY KEY, u TEXT UNIQUE) WITHOUT ROWID;
+                     INSERT INTO wr_col VALUES ('pk-1', 'u-1');
+                     INSERT INTO wr_reversed VALUES ('u-1', 'pk-1');
+                     INSERT INTO wr_table VALUES ('pk-1', 'u-1');
+                     INSERT INTO wr_integer VALUES (1, 'u-1');",
+                )
+                .await
+                .unwrap();
+
+                for (table, expected_name) in [
+                    ("wr_col", "sqlite_autoindex_wr_col_2"),
+                    ("wr_reversed", "sqlite_autoindex_wr_reversed_1"),
+                    ("wr_table", "sqlite_autoindex_wr_table_2"),
+                    ("wr_integer", "sqlite_autoindex_wr_integer_1"),
+                ] {
+                    let rows = conn
+                        .query(&format!(
+                            "SELECT name FROM sqlite_schema \
+                             WHERE type = 'index' AND tbl_name = '{table}' \
+                             ORDER BY name;"
+                        ))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        rows.iter().map(row_values).collect::<Vec<_>>(),
+                        vec![vec![SqliteValue::Text(expected_name.into())]],
+                        "unexpected physical autoindex rows for {table}"
+                    );
+                }
+                conn.close().await.unwrap();
+            }
+
+            {
+                let conn = Connection::open(db_str).await.unwrap();
+                for (sql, expected) in [
+                    (
+                        "SELECT pk FROM wr_col INDEXED BY sqlite_autoindex_wr_col_2 WHERE u = 'u-1';",
+                        SqliteValue::Text("pk-1".into()),
+                    ),
+                    (
+                        "SELECT pk FROM wr_reversed INDEXED BY sqlite_autoindex_wr_reversed_1 WHERE u = 'u-1';",
+                        SqliteValue::Text("pk-1".into()),
+                    ),
+                    (
+                        "SELECT pk FROM wr_table INDEXED BY sqlite_autoindex_wr_table_2 WHERE u = 'u-1';",
+                        SqliteValue::Text("pk-1".into()),
+                    ),
+                    (
+                        "SELECT pk FROM wr_integer INDEXED BY sqlite_autoindex_wr_integer_1 WHERE u = 'u-1';",
+                        SqliteValue::Integer(1),
+                    ),
+                ] {
+                    let rows = conn.query(sql).await.unwrap();
+                    assert_eq!(rows[0].values(), &[expected], "forced lookup: {sql}");
+                }
+
+                conn.execute(
+                    "INSERT INTO wr_col VALUES ('pk-2', 'u-2');
+                     INSERT INTO wr_reversed VALUES ('u-2', 'pk-2');
+                     INSERT INTO wr_table VALUES ('pk-2', 'u-2');
+                     INSERT INTO wr_integer VALUES (2, 'u-2');",
+                )
+                .await
+                .unwrap();
+                for sql in [
+                    "INSERT INTO wr_col VALUES ('pk-3', 'u-2');",
+                    "INSERT INTO wr_reversed VALUES ('u-2', 'pk-3');",
+                    "INSERT INTO wr_table VALUES ('pk-3', 'u-2');",
+                    "INSERT INTO wr_integer VALUES (3, 'u-2');",
+                ] {
+                    let error = conn.execute(sql).await.unwrap_err();
+                    assert!(
+                        matches!(error, FrankenError::UniqueViolation { .. }),
+                        "duplicate UNIQUE must fail after reload for `{sql}`: {error:?}"
+                    );
+                }
+                conn.close().await.unwrap();
+            }
+
+            let sqlite = rusqlite::Connection::open(db_str).unwrap();
+            let integrity: String = sqlite
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok");
+            let quick: String = sqlite
+                .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(quick, "ok");
+
+            for (table, physical_name, hidden_name) in [
+                (
+                    "wr_col",
+                    "sqlite_autoindex_wr_col_2",
+                    "sqlite_autoindex_wr_col_1",
+                ),
+                (
+                    "wr_reversed",
+                    "sqlite_autoindex_wr_reversed_1",
+                    "sqlite_autoindex_wr_reversed_2",
+                ),
+                (
+                    "wr_table",
+                    "sqlite_autoindex_wr_table_2",
+                    "sqlite_autoindex_wr_table_1",
+                ),
+                (
+                    "wr_integer",
+                    "sqlite_autoindex_wr_integer_1",
+                    "sqlite_autoindex_wr_integer_2",
+                ),
+            ] {
+                let mut statement = sqlite
+                    .prepare(&format!("PRAGMA index_list('{table}');"))
+                    .unwrap();
+                let names = statement
+                    .query_map([], |row| row.get::<_, String>(1))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert!(names.iter().any(|name| name == physical_name), "{names:?}");
+                assert!(names.iter().any(|name| name == hidden_name), "{names:?}");
+            }
+
+            for (sql, expected) in [
+                (
+                    "SELECT pk FROM wr_col INDEXED BY sqlite_autoindex_wr_col_2 WHERE u = 'u-2';",
+                    rusqlite::types::Value::Text("pk-2".to_owned()),
+                ),
+                (
+                    "SELECT pk FROM wr_reversed INDEXED BY sqlite_autoindex_wr_reversed_1 WHERE u = 'u-2';",
+                    rusqlite::types::Value::Text("pk-2".to_owned()),
+                ),
+                (
+                    "SELECT pk FROM wr_table INDEXED BY sqlite_autoindex_wr_table_2 WHERE u = 'u-2';",
+                    rusqlite::types::Value::Text("pk-2".to_owned()),
+                ),
+                (
+                    "SELECT pk FROM wr_integer INDEXED BY sqlite_autoindex_wr_integer_1 WHERE u = 'u-2';",
+                    rusqlite::types::Value::Integer(2),
+                ),
+            ] {
+                let value: rusqlite::types::Value =
+                    sqlite.query_row(sql, [], |row| row.get(0)).unwrap();
+                assert_eq!(value, expected, "stock forced lookup: {sql}");
+            }
+        });
+    }
+
+    #[test]
     fn test_create_without_rowid_table_requires_primary_key() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
@@ -168130,6 +168595,10 @@ mod pager_routing_tests {
         // tracing state. Tests that genuinely need scoped tracing install a
         // *local* subscriber via `tracing::subscriber::with_default(...)`
         // instead (see `test_window_eval_trace_span_counter_records_enabled_debug_spans`).
+    }
+
+    fn row_values(row: &Row) -> Vec<SqliteValue> {
+        row.values().to_vec()
     }
 
     async fn flush_retained_autocommit_for_cached_read_test(conn: &Connection) {

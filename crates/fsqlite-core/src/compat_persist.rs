@@ -44,6 +44,7 @@ use fsqlite_types::record::{
 };
 use fsqlite_types::value::SqliteValue;
 
+use crate::connection::{column_def_is_exact_integer, implicit_autoindex_layout};
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use crate::connection::{eval_join_expr, is_sqlite_truthy};
 use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize};
@@ -755,7 +756,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
 
         // Parse the CREATE TABLE to extract column info and schema decorations.
         let columns = parse_columns_from_sqlite_master_sql(&create_sql);
-        let indexes = extract_unique_constraint_indexes_from_sql(&create_sql, &name);
+        let indexes = extract_unique_constraint_indexes_from_sql(&create_sql, &name)?;
         let primary_key_constraints = extract_primary_key_constraints_from_sql(&create_sql);
         let foreign_keys = extract_foreign_keys_from_sql(&create_sql, &columns);
         let check_constraints = extract_check_constraints_with_owners_from_sql(&create_sql);
@@ -1438,130 +1439,28 @@ pub(crate) fn extract_primary_key_constraints_from_sql(sql: &str) -> Vec<Vec<Str
     primary_keys
 }
 
-fn extract_unique_constraint_indexes_from_sql(sql: &str, table_name: &str) -> Vec<IndexSchema> {
+fn extract_unique_constraint_indexes_from_sql(
+    sql: &str,
+    table_name: &str,
+) -> Result<Vec<IndexSchema>> {
     let Some(Statement::CreateTable(create)) = parse_single_statement(sql) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let CreateTableBody::Columns {
         columns,
         constraints,
     } = &create.body
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
-    let mut indexes = Vec::new();
-    let mut autoindex_ordinal = 1_usize;
-
-    for column in columns {
-        let has_unique_constraint = column.constraints.iter().any(|constraint| {
-            matches!(
-                constraint.kind,
-                ColumnConstraintKind::Unique { .. } | ColumnConstraintKind::PrimaryKey { .. }
-            )
-        });
-        let is_ipk = column.type_name.as_ref().is_some_and(|type_name| {
-            type_name.name.eq_ignore_ascii_case("INTEGER")
-                && column.constraints.iter().any(|constraint| {
-                    matches!(
-                        constraint.kind,
-                        ColumnConstraintKind::PrimaryKey {
-                            direction: None | Some(SortDirection::Asc),
-                            ..
-                        }
-                    )
-                })
-        });
-        if has_unique_constraint && !is_ipk {
-            indexes.push(IndexSchema {
-                name: format!("sqlite_autoindex_{table_name}_{autoindex_ordinal}"),
-                root_page: 0,
-                columns: vec![column.name.clone()],
-                key_expressions: Vec::new(),
-                key_sort_directions: vec![SortDirection::Asc],
-                where_clause: None,
-                is_unique: true,
-                key_collations: vec![column.constraints.iter().find_map(|constraint| {
-                    if let ColumnConstraintKind::Collate(name) = &constraint.kind {
-                        Some(name.clone())
-                    } else {
-                        None
-                    }
-                })],
-                conflict_action: column
-                    .constraints
-                    .iter()
-                    .find_map(|constraint| match &constraint.kind {
-                        ColumnConstraintKind::Unique { conflict }
-                        | ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
-                        _ => None,
-                    }),
-            });
-            autoindex_ordinal += 1;
-        }
-    }
-
-    for constraint in constraints {
-        let (indexed_columns, is_primary_key) = match &constraint.kind {
-            TableConstraintKind::Unique {
-                columns: indexed_columns,
-                ..
-            } => (indexed_columns, false),
-            TableConstraintKind::PrimaryKey {
-                columns: indexed_columns,
-                ..
-            } => (indexed_columns, true),
-            _ => continue,
-        };
-        if is_primary_key
-            && table_primary_key_is_rowid_alias(columns, indexed_columns, create.without_rowid)
-        {
-            continue;
-        }
-        let Some(normalized_terms) = indexed_columns
-            .iter()
-            .map(|indexed_column| {
-                Some((
-                    indexed_column_name(indexed_column)?.to_owned(),
-                    indexed_column_collation(indexed_column),
-                ))
-            })
-            .collect::<Option<Vec<_>>>()
-        else {
-            continue;
-        };
-        let columns = normalized_terms
-            .iter()
-            .map(|(column_name, _)| column_name.clone())
-            .collect::<Vec<_>>();
-        if columns.is_empty() {
-            continue;
-        }
-        indexes.push(IndexSchema {
-            name: format!("sqlite_autoindex_{table_name}_{autoindex_ordinal}"),
-            root_page: 0,
-            columns,
-            key_expressions: Vec::new(),
-            key_sort_directions: indexed_columns
-                .iter()
-                .map(|indexed| indexed.direction.unwrap_or(SortDirection::Asc))
-                .collect(),
-            where_clause: None,
-            is_unique: true,
-            key_collations: normalized_terms
-                .into_iter()
-                .map(|(_, collation)| collation)
-                .collect(),
-            conflict_action: match &constraint.kind {
-                TableConstraintKind::Unique { conflict, .. }
-                | TableConstraintKind::PrimaryKey { conflict, .. } => *conflict,
-                _ => None,
-            },
-        });
-        autoindex_ordinal += 1;
-    }
-
-    indexes
+    let slots = implicit_autoindex_layout(columns, constraints, create.without_rowid)?;
+    Ok(slots
+        .into_iter()
+        .enumerate()
+        .filter(|(_, slot)| !slot.is_hidden_without_rowid_primary_key())
+        .map(|(slot_index, slot)| slot.into_index_schema(table_name, slot_index + 1, 0))
+        .collect())
 }
 
 pub(crate) fn extract_foreign_keys_from_sql(sql: &str, columns: &[ColumnInfo]) -> Vec<FkDef> {
@@ -2690,24 +2589,6 @@ fn loaded_row_values_satisfy_notnull(columns: &[ColumnInfo], values: &[SqliteVal
         })
 }
 
-fn table_primary_key_is_rowid_alias(
-    columns: &[fsqlite_ast::ColumnDef],
-    indexed_columns: &[IndexedColumn],
-    without_rowid: bool,
-) -> bool {
-    if without_rowid || indexed_columns.len() != 1 {
-        return false;
-    }
-    let Some(column_name) = indexed_column_name(&indexed_columns[0]) else {
-        return false;
-    };
-    columns
-        .iter()
-        .find(|column| column.name.eq_ignore_ascii_case(column_name))
-        .and_then(|column| column.type_name.as_ref())
-        .is_some_and(|type_name| type_name.name.eq_ignore_ascii_case("INTEGER"))
-}
-
 fn try_parse_columns_from_create_sql_ast(sql: &str) -> Option<Vec<ColumnInfo>> {
     let Statement::CreateTable(create) = parse_single_statement(sql)? else {
         return None;
@@ -2741,10 +2622,7 @@ pub(crate) fn columns_from_create_table_statement(
                         continue;
                     };
 
-                    let is_integer = columns[index]
-                        .type_name
-                        .as_ref()
-                        .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
+                    let is_integer = column_def_is_exact_integer(&columns[index]);
                     if is_integer && !create.without_rowid {
                         table_pk_rowid_col_idx = Some(index);
                     }
@@ -2758,10 +2636,7 @@ pub(crate) fn columns_from_create_table_statement(
         .iter()
         .enumerate()
         .find_map(|(index, col)| {
-            let is_integer = col
-                .type_name
-                .as_ref()
-                .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
+            let is_integer = column_def_is_exact_integer(col);
             let pk = col.constraints.iter().find_map(|constraint| {
                 if let ColumnConstraintKind::PrimaryKey { direction, .. } = &constraint.kind {
                     if *direction != Some(SortDirection::Desc) {
@@ -2831,7 +2706,7 @@ pub(crate) fn columns_from_create_table_statement(
                         _ => None,
                     })
                     .unwrap_or((None, None));
-                let collation = col.constraints.iter().find_map(|constraint| {
+                let collation = col.constraints.iter().rev().find_map(|constraint| {
                     if let ColumnConstraintKind::Collate(name) = &constraint.kind {
                         Some(name.clone())
                     } else {
@@ -4195,7 +4070,8 @@ PRAGMA integrity_check;
         let indexes = extract_unique_constraint_indexes_from_sql(
             "CREATE TABLE table_owned (id INTEGER, body TEXT, UNIQUE(id))",
             "table_owned",
-        );
+        )
+        .unwrap();
         assert_eq!(indexes.len(), 1);
         assert_eq!(indexes[0].columns, vec!["id"]);
     }
@@ -4855,7 +4731,8 @@ PRAGMA integrity_check;
         let indexes = extract_unique_constraint_indexes_from_sql(
             "CREATE TABLE child (tenant TEXT, slug TEXT, UNIQUE(tenant, slug))",
             "child",
-        );
+        )
+        .unwrap();
         assert_eq!(indexes.len(), 1);
         assert_eq!(indexes[0].columns, vec!["tenant", "slug"]);
         assert!(indexes[0].is_unique);
@@ -4866,7 +4743,8 @@ PRAGMA integrity_check;
         let indexes = extract_unique_constraint_indexes_from_sql(
             "CREATE TABLE metrics (id INTEGER, body TEXT, PRIMARY KEY(id COLLATE NOCASE DESC))",
             "metrics",
-        );
+        )
+        .unwrap();
         assert!(indexes.is_empty(), "{indexes:?}");
     }
 
